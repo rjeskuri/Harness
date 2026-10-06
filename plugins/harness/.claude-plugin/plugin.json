@@ -1,0 +1,7 @@
+{
+  "name": "harness",
+  "version": "0.1.0",
+  "description": "Shared harness: Opus coder, Sonnet quick, Fable reviewer and researcher agents; spec, build, ship, handoff, learn, standup and worklog skills; notification, session brief, secret scan and verify-on-stop hooks",
+  "author": { "name": "Ryan Eskuri" },
+  "keywords": ["harness", "productivity", "multi-project"]
+}

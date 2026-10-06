@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "ryan",
+  "owner": { "name": "Ryan Eskuri" },
+  "description": "Ryan's personal Claude Code harness: shared agents, skills and hooks, plus the companion sprite",
+  "version": "0.1.0",
+  "metadata": { "pluginRoot": "./plugins" },
+  "plugins": [
+    {
+      "name": "harness",
+      "source": "./plugins/harness",
+      "description": "Model-routed agents (Opus coder, Sonnet quick, Fable reviewer and researcher), the spec/build/ship/handoff/learn loop, a cross-project standup, time tracking, and notification, session-brief, secret-scan and verify-on-stop hooks",
+      "category": "productivity"
+    },
+    {
+      "name": "companion",
+      "source": "./plugins/companion",
+      "description": "A Game Boy robot above the prompt that reacts to what the session is doing",
+      "category": "fun"
+    }
+  ]
+}

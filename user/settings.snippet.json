@@ -1,0 +1,10 @@
+{
+  "_comment": "Merged into ~/.claude/settings.json by the install step. Effort is xhigh for every tier (Ryan's choice); change a tier here or per agent with the effort frontmatter field.",
+  "model": "claude-fable-5-1",
+  "effortLevel": "xhigh",
+  "modelSettings": {
+    "claude-fable-5-1": { "effortLevel": "xhigh" },
+    "claude-opus-5-5": { "effortLevel": "xhigh" },
+    "claude-sonnet-5-5": { "effortLevel": "xhigh" }
+  }
+}
