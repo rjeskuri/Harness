@@ -1,0 +1,3 @@
+# Gitignored files to copy into every worktree Claude creates (gitignore syntax).
+.env
+.env.local

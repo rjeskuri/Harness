@@ -1,0 +1,5 @@
+# Claude Code: append these to your .gitignore
+.claude/settings.local.json
+.claude/worktrees/
+CLAUDE.local.md
+.nbout/
