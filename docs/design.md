@@ -20,7 +20,7 @@ Harness/
     .claude-plugin/plugin.json
     agents/   coder.md quick.md reviewer.md researcher.md
     skills/   spec build ship handoff learn standup worklog   (one SKILL.md each)
-    hooks/    hooks.json notify.py session_brief.py after_edit.py verify_on_stop.py
+    hooks/    hooks.json notify.py session_brief.py after_edit.py verify_on_stop.py readonly_bash.py
     bin/      harness-standup harness-worklog harness-projects   (executable python3 scripts, on the Bash PATH while enabled)
     tests/    test_*.py   (python3 -m unittest discover -s plugins/harness/tests)
   plugins/companion/                    plugin "companion" (a mod)
@@ -59,6 +59,12 @@ A marketplace added from a local path loads its plugins in place, so edits in th
 
 The rule itself lives in `user/CLAUDE.md` so the orchestrator applies it in every project. Workflow scripts follow the same tiers: Opus workers, Fable judges.
 
+Facts that shape the routing (verified 2026-10-06, see docs/research/model-routing.md):
+- Delegation is Claude's judgment, steered by each agent's `description` and by naming the agent in CLAUDE.md or a skill; an `@`-mention of the agent in a prompt guarantees it. Ryan is on Claude Max 20x, so the Pro-plan instruction that holds subagents back does not apply.
+- Plugin subagents ignore the `hooks`, `mcpServers` and `permissionMode` frontmatter fields. The reviewer's and researcher's read-only guard is therefore a plugin-level PreToolUse hook on `Bash` (`hooks/readonly_bash.py`) that acts only when the hook's stdin names `agent_type` as one of those agents and exits 0 for everything else.
+- The Agent tool's per-call `model` is an alias (sonnet, opus, haiku, fable); full IDs go in agent frontmatter. `max` effort cannot be saved in settings; `xhigh` can. A top-level `effortLevel` is ignored by Opus 5.5 and Sonnet 5.5, so the per-model `modelSettings` entries carry the defaults.
+- `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` would force one model on every subagent and defeat the tiers; it is not used.
+
 ## Harness plugin
 
 ### Hooks
@@ -76,18 +82,20 @@ All hooks: read JSON from stdin, never raise, exit 0 on their own errors (the on
 - If `worklog/worklog.csv` exists: `Hours this month: <sum of this month's rows>`.
 Skip entirely (print nothing) when the project's `.claude/settings.json` declares its own `SessionStart` hook, so a project with a bespoke brief is not briefed twice. Not a git repo: the heading carries no git facts, and the sections are still read from the directory. The PROGRESS.md scan ignores lines inside code fences, as the handoff parser does.
 
-**after_edit.py** (PostToolUse: `Edit|Write|NotebookEdit`). Two jobs:
+**after_edit.py** (PostToolUse: `Edit|Write|NotebookEdit|Bash`). Hook matchers never see files changed through the shell, so for a `Bash` call the hook takes the files `git status` lists (modified or untracked, regular, under 2 MB, newer than the session's last Bash scan or the last 10 minutes, at most 100) and gives them the same two jobs as an edited file; outside a git repo a Bash call does nothing. Two jobs:
 1. Append the edited file's absolute path (`tool_input.file_path` or `notebook_path`) to `<state>/dirty-<session_id>` so the Stop hook knows a verify run is due.
 2. Secret scan of that file when it exists, is under 2 MB and decodes as UTF-8. High-confidence patterns only: AWS access key id `AKIA[0-9A-Z]{16}`; GitHub tokens `gh[pousr]_[A-Za-z0-9]{36,}` and `github_pat_[A-Za-z0-9_]{22,}`; Slack `xox[baprs]-[A-Za-z0-9-]{10,}`; Google `AIza[0-9A-Za-z_-]{35}`; OpenAI `sk-(proj-)?[A-Za-z0-9_-]{20,}`; Anthropic `sk-ant-[A-Za-z0-9_-]{20,}`; Stripe `sk_live_[A-Za-z0-9]{16,}`; private key blocks `-----BEGIN [A-Z ]*PRIVATE KEY-----`; a Jotform-style `apiKey=[0-9a-f]{32}`; and a generic `(api[_-]?key|secret|token|password)\s*[:=]\s*["'][A-Za-z0-9_\-]{24,}["']`. The Anthropic, OpenAI and Stripe patterns carry a `(?<![A-Za-z0-9_-])` lookbehind so kebab-case words ending in `sk` (`task-`, `risk-`) are not keys; the generic assignment pattern is compiled case-insensitively so `API_KEY = "..."` and `apiKey: "..."` are caught, while the provider patterns stay case-sensitive. Skip a line that contains `example`, `placeholder`, `dummy`, `xxxx`, `<`, `${`, `your_` or `REDACTED` (any case), and skip entirely when `HARNESS_SECRET_SCAN=0` or the file contains `harness: allow-secrets`. On a hit: stderr `SECRET pattern in <path>:<line> (<pattern name>): <first 4 chars>… - remove it before continuing; read secrets from the environment or a file that is gitignored.` and exit 2. Otherwise exit 0 silently.
 
 **verify_on_stop.py** (Stop). Opt-in per project through `CLAUDE_VERIFY_CMD`, read from the environment first and then from `env` in the project's `.claude/settings.json` and `.claude/settings.local.json` (so it works whether or not settings `env` is exported to hooks). Behavior:
-- Exit 0 silently when there is no verify command, no `dirty-<session_id>` file, `background_tasks` is non-empty, or the project's `.claude/settings.json` declares a `Stop` hook of its own (a project with its own verify-on-stop, such as FantasyHockey with the starter kit, is not checked twice).
+- Exit 0 silently when there is no verify command, `background_tasks` is non-empty, or the project's `.claude/settings.json` declares a `Stop` hook of its own (a project with its own verify-on-stop, such as FantasyHockey with the starter kit, is not checked twice). Without a `dirty-<session_id>` file it still watches the working tree: a hash of `git status --porcelain` is stored at every stop; the first stop of a session only stores it, a changed tree counts as dirty and its files join the dirty list, an unchanged tree exits 0.
 - Reset the consecutive-block counter when `stop_hook_active` is false.
-- Fingerprint = sha256 of `git rev-parse HEAD` plus the contents of the dirty files; if it equals the last green fingerprint, exit 0. The last red or timed-out fingerprint is remembered too: a fresh stop (not a continuation) whose fingerprint equals it skips the run and says so in one `systemMessage` line, so a Q&A turn after a failure does not re-run the suite; the two in-turn retries still happen.
+- Fingerprint = sha256 of `git rev-parse HEAD` plus the contents of the dirty files and of every file `git status` lists; if it equals the last green fingerprint, exit 0. The last red or timed-out fingerprint is remembered too, together with the command that produced it: a fresh stop (not a continuation) whose fingerprint and command both match skips the run and says so in one `systemMessage` line, so a Q&A turn after a failure does not re-run the suite, while a corrected `CLAUDE_VERIFY_CMD` runs at once; the two in-turn retries still happen.
 - The command inherits the hook's environment plus `PYTHONDONTWRITEBYTECODE=1` (no stale `.pyc` after a same-second edit). A verify command that leaves a background child holding its stdout is reported as a timeout; such children must redirect their output.
 - Run the command through the shell from the repo root with `CLAUDE_VERIFY_TIMEOUT` seconds (default 300). On timeout or a command that cannot start: `{"systemMessage": "verify_on_stop: ..."}` and exit 0.
 - Pass: record the fingerprint, delete the dirty file, print `{"systemMessage": "verify_on_stop: <command> passed."}`.
 - Fail: at most 2 consecutive blocks: `{"decision": "block", "reason": "<the command> failed:\n<last 60 non-empty lines>\n\nFix the root cause and re-run. Don't delete, skip or loosen tests. If a failure predates your change or is out of scope, say so explicitly."}`. After 2 blocks in a row: `{"systemMessage": "verify_on_stop: still failing after 2 automatic retries; review before trusting this turn."}` and exit 0.
+
+**readonly_bash.py** (PreToolUse: `Bash`). Acts only when the hook's stdin names `agent_type` as `harness:reviewer`, `reviewer`, `harness:researcher` or `researcher`; everyone else gets an immediate exit 0. For those agents it splits the command on shell separators and refuses, with `permissionDecision: deny` and the offending part named, anything that writes files or changes git, package or process state: redirections, `sed -i`, `rm`, `mv`, `cp`, `tee`, `touch`, `chmod`, git subcommands outside the read-only set, installs, Python write calls, `kill`. It is not a sandbox: a test or a script can still write; it closes the routine paths. Plugin subagents ignore frontmatter hooks, which is why the guard lives here.
 
 ### bin tools
 
@@ -119,7 +127,7 @@ Then `## Fleet`: every session from `claude agents --json`, waiting ones first, 
 
 ### Tests (plugins/harness/tests)
 
-`python3 -m unittest discover -s plugins/harness/tests -v` passes, offline, under 30 seconds. Cover at least: the secret scan (a hit, a skipped placeholder line, a clean file), the dirty-file bookkeeping, verify_on_stop's decisions with a fake command (pass, fail, block limit, no command), session_brief's output shape and the skip rule, the registry round trip and `discover`'s path recovery, standup's rendering with a fake registry and a fake `claude agents --json` payload, and worklog's `init` and `describe` plus one block/hours computation on a synthetic transcript. Tests run the scripts as subprocesses or import them by path; they must not touch `~/.claude` (use a temporary HOME and temporary repos).
+`python3 -m unittest discover -s plugins/harness/tests -v` passes, offline, under 30 seconds. Cover at least: the secret scan (a hit, a skipped placeholder line, a clean file), the Bash-edit scan and the stop-time tree check, the read-only guard (deny and allow cases, and that only the two agents are guarded), the dirty-file bookkeeping, verify_on_stop's decisions with a fake command (pass, fail, block limit, no command), session_brief's output shape and the skip rule, the registry round trip and `discover`'s path recovery, standup's rendering with a fake registry and a fake `claude agents --json` payload, and worklog's `init` and `describe` plus one block/hours computation on a synthetic transcript. Tests run the scripts as subprocesses or import them by path; they must not touch `~/.claude` (use a temporary HOME and temporary repos).
 
 ## Companion plugin (the mod)
 

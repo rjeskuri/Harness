@@ -62,7 +62,7 @@ Build repeats until the reviewer passes the change; a small fix skips the spec a
 
 ## The routing rule and the robot, in practice
 
-For anything beyond a small edit, the main session should say it is handing the work to `harness:coder`, a subagent line appears, and the result comes back as a short report with the commands it ran. Before saying done, it should call `harness:reviewer`. The rule is advice in your CLAUDE.md, not enforcement: if a session starts writing a large change itself, say "use the coder", and run `/harness:learn` at the end so the lesson gets recorded.
+For anything beyond a small edit, the main session should say it is handing the work to `harness:coder`, a subagent line appears, and the result comes back as a short report with the commands it ran. Before saying done, it should call `harness:reviewer`. The rule is advice in your CLAUDE.md, not enforcement: if a session starts writing a large change itself, say "use the harness:coder agent", or type @ and pick the agent from the list, which guarantees it runs; then run `/harness:learn` at the end so the lesson gets recorded.
 
 The robot tells you the session's state without reading the transcript.
 
@@ -77,7 +77,7 @@ The robot tells you the session's state without reading the transcript.
 
 The band above the prompt exists in a terminal and in the desktop app, not in the VS Code chat panel. The desktop app draws the robot as an SVG; a terminal draws colored cells: VS Code's integrated terminal, iTerm2 and Ghostty show its four greens exactly, Terminal.app the nearest of 256 colors.
 
-Quota is the thing to watch on a subscription. `/usage` shows the five-hour and seven-day windows, `/cost` what this session has used, `/context` what fills the window. Fable is the most expensive tier, so the routing rule keeps most tokens on Opus. For a simple session you can run the orchestrator itself on Opus with `/model opus`, and `/effort` changes the reasoning effort for the session. The defaults live under `modelSettings` in `~/.claude/settings.json`.
+Quota is the thing to watch on a subscription. You are on Claude Max 20x, and Fable draws on its limits faster than the other models, so the routing rule earns its keep. `/usage` shows the five-hour and seven-day windows, `/cost` what this session has used, `/context` what fills the window. Fable is the most expensive tier, so the routing rule keeps most tokens on Opus. For a simple session you can run the orchestrator itself on Opus with `/model opus`, and `/effort` changes the reasoning effort for the session. The defaults live under `modelSettings` in `~/.claude/settings.json`.
 
 ## When something looks wrong
 
