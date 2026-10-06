@@ -1,0 +1,864 @@
+#!/usr/bin/env python3
+"""
+The work log behind the monthly invoice: hours per day and what was done.
+
+The repo is --repo PATH, else $CLAUDE_PROJECT_DIR, else the git top level of the
+current directory, else the current directory; the log and the timeline below are
+in its worklog/ folder.
+
+Hours are reconstructed from Claude Code's session transcripts for this repo
+(~/.claude/projects/<this repo's path with '/' as '-'>/*.jsonl), which
+timestamp every message in UTC. All sessions are merged into one timeline and
+cut into blocks wherever nothing happened for more than 30 minutes. A block
+counts only if the user wrote at least one message in it, so time an agent works
+alone while the user is away is not billed. A block belongs to the day it started,
+on the clock the Mac showed then; a day's hours are the sum of its blocks,
+rounded to the quarter hour.
+
+The Mac's clock moves when the user travels, so the zone it was on is recorded in
+worklog/timezones.csv (since, zone, evidence): from each `since` instant the
+Mac was on that zone. A past day therefore never moves when the Mac does.
+`init` starts the file on the Mac's zone now.
+`update` refuses when the Mac is on a zone the file does not have yet, or when
+a commit's recorded offset disagrees with the file - `zone` records a change.
+
+The log is worklog/worklog.csv (date, hours, blocks, description, source,
+zone). `update` rewrites the `auto` rows of the days it computes (the last 14
+days by default), keeps a description once written, fills an empty one from
+that day's commit subjects, never touches `manual` rows, and never deletes a
+day whose transcripts may have expired (Claude Code deletes a session about
+30 days after its last activity - run `update` at the end of every working
+session). `describe` writes the description of a day's auto row.
+
+Usage:
+    harness-worklog init                        # the Mac's zone from the 1st of last month
+    harness-worklog init --since 2026-09-01
+    harness-worklog update                      # the last 14 days
+    harness-worklog update --since 2026-09-01
+    harness-worklog describe --date 2026-09-29 --text "Built the export and fixed the totals"
+    harness-worklog zone                        # the zone timeline and the Mac's zone now
+    harness-worklog zone --since 2026-10-02 --zone Europe/London
+    harness-worklog add --date 2026-09-29 --hours 1.5 --description "Call with the program team"
+    harness-worklog export --month 2026-09                    # invoice rows to the screen
+    harness-worklog export --month 2026-09 --rate 60 --out invoice-2026-09.csv
+    harness-worklog --repo ~/code/other update               # a repo other than the current one
+"""
+import argparse
+import csv
+import datetime as dt
+import glob
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+REPO = os.curdir            # the current directory until main() calls use_repo(find_repo(--repo))
+LOG = os.path.join(REPO, "worklog", "worklog.csv")
+ZONES = os.path.join(REPO, "worklog", "timezones.csv")
+TOOL = "harness-worklog"    # how messages name this tool; main() adds --repo when one was given
+COLS = ["date", "hours", "blocks", "description", "source", "zone"]
+ZONE_COLS = ["since", "zone", "evidence"]
+GAP_MINUTES = 30
+WINDOW_DAYS = 14     # update's default window: well inside the transcripts' ~30-day life
+KEEP_DAYS = 29       # a day this recent still has all its transcripts; older rows are never dropped
+UTC = dt.timezone.utc
+LOCALTIME = "/etc/localtime"
+GITHUB = "GitHub"     # the committer of merges made on github.com: UTC, not evidence of the Mac's zone
+
+
+def find_repo(given=None):
+    """The repo: `given` (--repo), else $CLAUDE_PROJECT_DIR, else the git top level of the current
+    directory, else the current directory."""
+    for path in (given, os.environ.get("CLAUDE_PROJECT_DIR")):
+        if path:
+            return os.path.abspath(os.path.expanduser(path))
+    try:
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                             check=True, timeout=10).stdout.strip()
+        if top:
+            return top
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.getcwd()
+
+
+def use_repo(repo):
+    """Work on `repo`: the log is <repo>/worklog/worklog.csv, the timeline <repo>/worklog/timezones.csv."""
+    global REPO, LOG, ZONES
+    REPO = repo
+    LOG = os.path.join(repo, "worklog", "worklog.csv")
+    ZONES = os.path.join(repo, "worklog", "timezones.csv")
+
+
+def rel(path):
+    return os.path.relpath(path, REPO)
+
+
+def transcripts_dir(repo=None):
+    """Claude Code keeps a project's sessions under its path with every non-alphanumeric as '-'."""
+    return os.path.join(os.path.expanduser("~"), ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", repo or REPO))
+
+
+# ------------------------------------------------------------------ zones
+def parse_zone(text):
+    """'+09:00', '-03:30' or an IANA name like 'Asia/Tokyo' -> a tzinfo."""
+    text = (text or "").strip()
+    m = re.fullmatch(r"([+-])(\d{2}):(\d{2})", text)
+    if m:
+        hours, minutes = int(m.group(2)), int(m.group(3))
+        if hours > 14 or minutes >= 60:
+            raise ValueError(f"{text!r}: not a UTC offset")
+        sign = 1 if m.group(1) == "+" else -1
+        return dt.timezone(sign * dt.timedelta(hours=hours, minutes=minutes))
+    from zoneinfo import ZoneInfo
+    try:
+        return ZoneInfo(text)
+    except (KeyError, ValueError):
+        raise ValueError(f"{text!r}: give an offset like +09:00 or a zone name like Asia/Tokyo") from None
+
+
+def parse_instant(text):
+    """An ISO instant with an offset ('...+00:00' or '...Z') -> an aware UTC datetime."""
+    when = dt.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    if when.tzinfo is None:
+        raise ValueError(f"{text!r}: give the offset too, e.g. 2026-09-29T12:37:00+00:00")
+    return when.astimezone(UTC)
+
+
+def offset_text(when):
+    """The UTC offset of an aware datetime as '+09:00'."""
+    minutes = int(when.utcoffset().total_seconds()) // 60
+    sign = "+" if minutes >= 0 else "-"
+    return f"{sign}{abs(minutes) // 60:02d}:{abs(minutes) % 60:02d}"
+
+
+def read_zones(path=None):
+    """[(since UTC, tzinfo, zone text, evidence), ...] in time order; ValueError says what to fix."""
+    path = path or ZONES
+    if not os.path.exists(path):
+        raise ValueError(f"{rel(path)} is missing: it records which zone the Mac was on when "
+                         f"(start it with: {TOOL} init)")
+    out = []
+    with open(path, encoding="utf-8", newline="") as fh:
+        for n, r in enumerate(csv.DictReader(fh), start=2):
+            if None in r:
+                raise ValueError(f"{rel(path)} line {n}: more than {len(ZONE_COLS)} columns "
+                                 "(two rows run together?)")
+            try:
+                out.append((parse_instant(r["since"] or ""), parse_zone(r["zone"]), r["zone"].strip(),
+                            (r.get("evidence") or "").strip()))
+            except (ValueError, KeyError, TypeError) as err:
+                raise ValueError(f"{rel(path)} line {n}: {err}") from None
+    if not out:
+        raise ValueError(f"{rel(path)} has no rows")
+    if any(a[0] >= b[0] for a, b in zip(out, out[1:])):
+        raise ValueError(f"{rel(path)}: the rows must be in time order")
+    return out
+
+
+def zone_at(zones, when):
+    """The zone the Mac was on at instant `when` (the latest row with since <= when); None before the first."""
+    found = None
+    for since, tz, *_ in zones:
+        if since > when:
+            break
+        found = tz
+    return found
+
+
+def system_zone():
+    """(tzinfo, IANA name or None, when /etc/localtime last changed or None) - the Mac's own zone,
+    whatever TZ the shell sets; the process zone only when /etc/localtime cannot be read."""
+    from zoneinfo import ZoneInfo
+    try:
+        name = os.readlink(LOCALTIME).split("zoneinfo/", 1)[1]
+        changed = dt.datetime.fromtimestamp(os.lstat(LOCALTIME).st_mtime, UTC)
+        return ZoneInfo(name), name, changed
+    except (OSError, IndexError, KeyError, ValueError):
+        return dt.datetime.now().astimezone().tzinfo, None, None
+
+
+def inside(a, b, gap):
+    """An instant in the idle stretch (a, b) more than `gap` from both ends: its middle to the hour
+    when that still fits, else to the minute; None when the stretch is too short."""
+    if b - a <= 2 * gap:
+        return None
+    mid = a + (b - a) / 2
+    for t in (mid.replace(minute=0, second=0, microsecond=0), mid.replace(second=0, microsecond=0)):
+        if a + gap < t < b - gap:
+            return t
+    return None
+
+
+def clock_commits(commits, zones, new_tz):
+    """(the last commit on the old clock, the first on new_tz's clock) after the timeline's last row:
+    commits made here whose recorded offset is the timeline's, or new_tz's (either may be None)."""
+    old, new = [], []
+    for c in commits:
+        when, offset, _, _, committer = c
+        tz = zone_at(zones, when)
+        if when <= zones[-1][0] or committer == GITHUB or tz is None:
+            continue
+        timeline, other = when.astimezone(tz).utcoffset(), when.astimezone(new_tz).utcoffset()
+        if timeline != other and offset == timeline:
+            old.append(c)
+        elif timeline != other and offset == other:
+            new.append(c)
+    return (max(old, key=lambda c: c[0]) if old else None, min(new, key=lambda c: c[0]) if new else None)
+
+
+def suggest_since(evts, after, end, changed=None, gap_minutes=GAP_MINUTES):
+    """Where the Mac probably switched zone: an idle instant strictly between `after` (the last sign of
+    the old clock) and `end` (the first sign of the new one, or now), or None. With the clock-change
+    time: that time when nobody was working near it, else the idle stretch just before the session
+    that holds or follows it; without it, the longest idle stretch. A suggestion to check, not a fact."""
+    gap = dt.timedelta(minutes=gap_minutes)
+    times = [t for t, _ in evts if after < t < end]
+    if changed and after < changed < end:
+        if changed - after > gap and end - changed > gap and all(abs(t - changed) > gap for t in times):
+            return changed.replace(second=0, microsecond=0)
+        i = next((k for k, t in enumerate(times) if t >= changed - gap), None)
+        if i is not None:
+            while i > 0 and times[i] - times[i - 1] <= gap:
+                i -= 1
+            found = inside(times[i - 1] if i > 0 else after, times[i], gap)
+            if found:
+                return found
+    bounds = [after] + times + [end]
+    stretches = sorted(zip(bounds, bounds[1:]), key=lambda ab: ab[1] - ab[0], reverse=True)
+    return inside(*stretches[0], gap) if stretches else None
+
+
+def mac_zone_problem(zones, sys_tz, sys_name, now, evts, changed=None, gap_minutes=GAP_MINUTES, commits=()):
+    """None when the timeline's zone now has the Mac's offset now; otherwise what to run."""
+    have = zone_at(zones, now)
+    mac = now.astimezone(sys_tz)
+    if have is not None and now.astimezone(have).utcoffset() == mac.utcoffset():
+        return None
+    last_old, first_new = clock_commits(commits, zones, sys_tz)
+    after = last_old[0] if last_old else zones[-1][0]
+    end = first_new[0] if first_new else now
+    zone_arg = sys_name or offset_text(mac)
+    lo = (f"the last commit on the old clock ({last_old[2]}, {last_old[0]:%Y-%m-%d %H:%M}Z)" if last_old
+          else f"{zones[-1][0]:%Y-%m-%d %H:%M}Z")
+    hi = (f"the first commit on the new clock ({first_new[2]}, {first_new[0]:%Y-%m-%d %H:%M}Z)" if first_new
+          else "now")
+    note = ""
+    if sys_name is None and os.environ.get("TZ"):
+        note = (f"\n(/etc/localtime could not be read, so the shell's TZ={os.environ['TZ']} was used "
+                "as the Mac's zone.)")
+    head = (f"The Mac is on {zone_arg} ({offset_text(mac)}), but {rel(ZONES)} has "
+            f"{zones[-1][2]} since {zones[-1][0]:%Y-%m-%d %H:%M}Z.\n"
+            "Record when the Mac switched - any moment between your last session on the old clock and "
+            f"the first on the new one gives the same hours. It lies after {lo} and before {hi}.\n")
+    since = suggest_since(evts, after, end, changed, gap_minutes) if after < end else None
+    if since is None:
+        return (head + "No idle moment in between to suggest: pick one by hand (if the clock changed during "
+                "a session, any instant between its last commit on the old clock and its first on the new), "
+                f"then run:\n  {TOOL} zone --since <instant>+00:00 --zone {zone_arg}{note}")
+    return (head + "Suggested (the clock change, or the idle stretch before the session after it, or the "
+            "longest idle stretch; check it):\n"
+            f"  {TOOL} zone --since {since:%Y-%m-%dT%H:%M}+00:00 --zone {zone_arg}{note}")
+
+
+# ------------------------------------------------------------ transcripts
+def is_human_message(entry):
+    """A message the user typed: not a tool result, a task notification, a skill load or a summary."""
+    if entry.get("type") != "user" or entry.get("isMeta") or entry.get("isCompactSummary"):
+        return False
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return bool(content.strip()) and not content.lstrip().startswith("<")
+    if isinstance(content, list):
+        texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+        return any(t.strip() and not t.lstrip().startswith("<") for t in texts)
+    return False
+
+
+def events(paths):
+    """(UTC datetime, is the user's message) for every user/assistant entry in the transcripts."""
+    out = []
+    for path in paths:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                stamp = entry.get("timestamp")
+                if entry.get("type") not in ("user", "assistant") or not stamp:
+                    continue
+                when = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(UTC)
+                out.append((when, is_human_message(entry)))
+    return sorted(out, key=lambda e: e[0])
+
+
+def activity_blocks(evts, gap_minutes=GAP_MINUTES):
+    """[(start, end), ...]: runs of events with no pause over gap_minutes, whatever the clock says,
+    kept only when they hold one of the user's messages."""
+    gap = dt.timedelta(minutes=gap_minutes)
+    runs, cur = [], []
+    for e in sorted(evts, key=lambda e: e[0]):
+        if cur and e[0] - cur[-1][0] > gap:
+            runs.append(cur)
+            cur = []
+        cur.append(e)
+    if cur:
+        runs.append(cur)
+    return [(r[0][0], r[-1][0]) for r in runs if any(h for _, h in r)]
+
+
+def day_blocks(evts, zones, gap_minutes=GAP_MINUTES):
+    """{date: [(start, end), ...]} - each block on the Mac's clock when it started, under the date it
+    started on (a session past midnight stays on its first day). Blocks before the timeline are left out."""
+    out = {}
+    for start, end in activity_blocks(evts, gap_minutes):
+        tz = zone_at(zones, start)
+        if tz is None:
+            continue
+        s, e = start.astimezone(tz), end.astimezone(tz)
+        out.setdefault(s.date(), []).append((s, e))
+    return out
+
+
+def day_hours(blocks):
+    """Sum of the blocks, to the nearest quarter hour; at least 0.25 for a day with work."""
+    minutes = sum((end - start).total_seconds() for start, end in blocks) / 60
+    return max(0.25, math.floor(minutes / 15 + 0.5) * 0.25)
+
+
+def zones_text(blocks):
+    """The offsets a day's blocks are written in, in order: '+03:00', or '+08:00/+09:00' on a travel day."""
+    seen = []
+    for s, _ in blocks:
+        if offset_text(s) not in seen:
+            seen.append(offset_text(s))
+    return "/".join(seen)
+
+
+def blocks_text(blocks):
+    """'09:00-09:45, 14:00-14:10'; each block carries its offset when the day has more than one."""
+    mixed = "/" in zones_text(blocks)
+    return ", ".join(f"{s:%H:%M}-{e:%H:%M}" + (f" ({offset_text(s)})" if mixed else "") for s, e in blocks)
+
+
+# -------------------------------------------------------------------- git
+def git_commits(repo=None):
+    """[(UTC instant, recorded offset, short hash, subject, committer name), ...], newest first."""
+    try:
+        text = subprocess.run(["git", "-C", repo or REPO, "log", "--format=%H%x09%aI%x09%cn%x09%s"],
+                              capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    out = []
+    for line in text.splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) < 4:
+            continue
+        sha, stamp, committer, subject = parts
+        when = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        out.append((when.astimezone(UTC), when.utcoffset(), sha[:7], subject.strip(), committer))
+    return out
+
+
+def subjects_by_day(commits, zones, days=None, gap_minutes=GAP_MINUTES):
+    """{'yyyy-mm-dd': [subjects, newest first]} - a commit made during a block (or within gap_minutes
+    after it) goes to that block's day, like its hours; any other to the day on the Mac's clock then."""
+    gap = dt.timedelta(minutes=gap_minutes)
+    spans = [(s, e, d) for d, blocks in (days or {}).items() for s, e in blocks]
+    out = {}
+    for when, _, _, subject, _ in commits:
+        day = next((d for s, e, d in spans if s <= when <= e + gap), None)
+        if day is None:
+            tz = zone_at(zones, when)
+            if tz is None:
+                continue
+            day = when.astimezone(tz).date()
+        out.setdefault(day.isoformat(), []).append(subject)
+    return out
+
+
+def commit_problems(commits, zones, start, ignore=()):
+    """Commits made here from `start` on whose recorded offset disagrees with the timeline - a trip
+    that was never recorded. Merges made on GitHub (UTC) are not evidence and are skipped."""
+    bad = []
+    for when, offset, sha, subject, committer in commits:
+        if when < start or committer == GITHUB or any(sha.startswith(i[:7]) for i in ignore):
+            continue
+        tz = zone_at(zones, when)
+        if tz is not None and when.astimezone(tz).utcoffset() != offset:
+            bad.append(f"{sha} {when:%Y-%m-%d %H:%M}Z was made on {offset_text(when.astimezone(dt.timezone(offset)))}, "
+                       f"the timeline says {offset_text(when.astimezone(tz))} ({subject[:60]})")
+    return bad
+
+
+def since_problems(since, new_tz, zones, evts, commits, now, gap_minutes=GAP_MINUTES):
+    """Why `since` cannot be where the Mac switched to new_tz (empty when it can)."""
+    out = []
+    if since > now:
+        out.append(f"{since:%Y-%m-%d %H:%M}Z is in the future")
+    if since <= zones[-1][0]:
+        out.append(f"{since:%Y-%m-%d %H:%M}Z is not after the last row ({zones[-1][0]:%Y-%m-%d %H:%M}Z); "
+                   f"edit {rel(ZONES)} by hand to correct an older row")
+    last_old, first_new = clock_commits(commits, zones, new_tz)
+    if last_old and last_old[0] >= since:
+        out.append(f"commit {last_old[2]} at {last_old[0]:%Y-%m-%d %H:%M}Z was made on the old clock: "
+                   "the switch came after it")
+    if first_new and first_new[0] < since:
+        out.append(f"commit {first_new[2]} at {first_new[0]:%Y-%m-%d %H:%M}Z was made on the new clock: "
+                   "the switch came before it")
+    gap = dt.timedelta(minutes=gap_minutes)
+    near = [t for t, _ in evts if abs(t - since) <= gap]
+    between = last_old and first_new and last_old[0] < since < first_new[0]
+    if near and not between:
+        out.append(f"{since:%Y-%m-%d %H:%M}Z falls inside a session (activity {near[0]:%H:%M}Z-"
+                   f"{near[-1]:%H:%M}Z): pick a moment when nobody was working (or, if the clock changed "
+                   "during that session, one between its last commit on the old clock and its first on the new)")
+    return out
+
+
+# -------------------------------------------------------------------- log
+def merge(rows, computed, subjects, drop=()):
+    """
+    rows: the log's rows (dicts); computed: {'yyyy-mm-dd': (hours, blocks_text, zones_text)}.
+    Auto rows of computed days are updated (a written description is kept, an empty one filled from
+    commit subjects); auto rows of the `drop` days are removed; manual rows and other days stay.
+    """
+    auto = {r["date"]: r for r in rows if r.get("source") == "auto" and r["date"] not in drop}
+    for day, (hours, blocks, zones) in computed.items():
+        row = auto.get(day) or {"date": day, "description": "", "source": "auto"}
+        row["hours"] = f"{hours:.2f}"
+        row["blocks"] = blocks
+        row["zone"] = zones
+        if not row.get("description", "").strip():
+            row["description"] = "; ".join(reversed(subjects.get(day, [])))
+        auto[day] = row
+    manual = [r for r in rows if r.get("source") != "auto"]
+    return sorted(list(auto.values()) + manual, key=lambda r: (r["date"], r.get("source") != "auto"))
+
+
+def default_since(rows, today):
+    """The last WINDOW_DAYS - reaching back to the last logged day when the log is behind (a missed
+    `update`), but never past the KEEP_DAYS whose transcripts are complete."""
+    auto = [dt.date.fromisoformat(r["date"]) for r in rows if r.get("source") == "auto"]
+    since = today - dt.timedelta(days=WINDOW_DAYS)
+    if auto and max(auto) < since:
+        since = max(max(auto), today - dt.timedelta(days=KEEP_DAYS))
+    return since
+
+
+def window_problems(rows, computed_all, since, today, earliest=None):
+    """Days before --since that are not recomputed but whose recount differs from the log - work that
+    moved across the window's edge, or a day never logged. Only days the log covers and whose
+    transcripts are complete (the last KEEP_DAYS, from the day after the earliest event) are checked."""
+    auto = {r["date"]: r for r in rows if r.get("source") == "auto"}
+    if not auto:
+        return None
+    day = max(dt.date.fromisoformat(min(auto)), today - dt.timedelta(days=KEEP_DAYS), earliest or dt.date.min)
+    bad = []
+    while day < since:
+        logged, recount = auto.get(day.isoformat()), computed_all.get(day.isoformat())
+        was = (logged["hours"], logged["blocks"]) if logged else None
+        becomes = (f"{recount[0]:.2f}", recount[1]) if recount else None
+        if was != becomes:
+            bad.append((day, f"{was[0]} h" if was else "no row", f"{becomes[0]} h" if becomes else "no work"))
+        day += dt.timedelta(days=1)
+    if not bad:
+        return None
+    return (f"days before --since {since} would change but are not recomputed:\n"
+            + "".join(f"  {d}: {a} -> {b}\n" for d, a, b in bad)
+            + f"re-run with --since {bad[0][0]}")
+
+
+def held_days(rows, computed, today, custom_folder):
+    """Auto rows a recount would change although its transcripts may be incomplete: days older than
+    KEEP_DAYS (one of their sessions may have expired), or any day when reading another folder."""
+    floor = (today - dt.timedelta(days=KEEP_DAYS)).isoformat()
+    out = []
+    for r in rows:
+        if r.get("source") != "auto" or r["date"] not in computed or (r["date"] >= floor and not custom_folder):
+            continue
+        hours, blocks, _ = computed[r["date"]]
+        if (r["hours"], r["blocks"]) != (f"{hours:.2f}", blocks):
+            out.append(r["date"])
+    return out
+
+
+def stale_days(rows, computed, since, today, custom_folder):
+    """(droppable, kept): auto rows from --since on that no longer have any work. Only days of the
+    last KEEP_DAYS, read from this repo's own transcripts, may go - older ones may just have expired."""
+    stale = sorted(r["date"] for r in rows
+                   if r.get("source") == "auto" and r["date"] >= since.isoformat() and r["date"] not in computed)
+    floor = max(since, today - dt.timedelta(days=KEEP_DAYS)).isoformat()
+    droppable = [d for d in stale if d >= floor and not custom_folder]
+    return droppable, [d for d in stale if d not in droppable]
+
+
+def update_rows(rows, evts, commits, zones, since, today, gap_minutes=GAP_MINUTES, custom_folder=False,
+                drop_stale=False, rewrite_old=False, ignore=()):
+    """The recount behind `update`, without files or printing: (new rows, computed, dropped, kept, held).
+    Exits with what to fix when the timeline, a commit, the window's edge or a stale row needs a decision."""
+    start = dt.datetime.combine(since, dt.time(), UTC) - dt.timedelta(hours=14)   # the earliest zone
+    early = [s for s, _ in activity_blocks(evts, gap_minutes) if s >= start and zone_at(zones, s) is None]
+    if early:
+        sys.exit(f"work at {early[0]:%Y-%m-%d %H:%M}Z predates {rel(ZONES)}: add an earlier row")
+    bad = commit_problems(commits, zones, start, ignore)
+    if bad:
+        sys.exit(f"commits disagree with {rel(ZONES)} - a zone change is missing or wrong:\n  "
+                 + "\n  ".join(bad) + "\nIf the Mac went to another zone and came back (a trip never "
+                 f"recorded), add both switches to {rel(ZONES)} by hand, in time order (`zone` records only "
+                 "a switch after the last row), then re-run. --ignore-commit HASH is only for a commit not "
+                 "made on this Mac (another machine or author).")
+    days = day_blocks(evts, zones, gap_minutes)
+    computed_all = {d.isoformat(): (day_hours(b), blocks_text(b), zones_text(b)) for d, b in days.items()}
+    if not custom_folder:
+        earliest = evts[0][0].date() + dt.timedelta(days=1) if evts else None
+        problem = window_problems(rows, computed_all, since, today, earliest)
+        if problem:
+            sys.exit(problem)
+    computed = {d: v for d, v in computed_all.items() if d >= since.isoformat()}
+    droppable, kept = stale_days(rows, computed, since, today, custom_folder)
+    if droppable and not drop_stale:
+        old = {r["date"]: r for r in rows if r.get("source") == "auto"}
+        sys.exit("these auto rows no longer have any work (their hours moved to another day):\n"
+                 + "".join(f"  {d}  {old[d]['hours']} h  {old[d].get('description', '')[:90]}\n" for d in droppable)
+                 + "re-run with --drop-stale to remove them; move a written description to its new day by hand")
+    held = [] if rewrite_old else held_days(rows, computed, today, custom_folder)
+    computed = {d: v for d, v in computed.items() if d not in held}
+    new_rows = merge(rows, computed, subjects_by_day(commits, zones, days, gap_minutes), drop=droppable)
+    return new_rows, computed, droppable, kept, held
+
+
+def invoice_rows(rows, month, rate=None):
+    """One row per day of the month (hours summed, descriptions joined) and a total row."""
+    days = {}
+    for r in rows:
+        if not r["date"].startswith(month + "-"):
+            continue
+        d = days.setdefault(r["date"], {"hours": 0.0, "desc": []})
+        d["hours"] += float(r["hours"] or 0)
+        if r.get("description", "").strip():
+            d["desc"].append(r["description"].strip())
+    header = ["Date", "Hours", "Description"] + (["Amount"] if rate is not None else [])
+    out, total = [header], 0.0
+    for day in sorted(days):
+        h = days[day]["hours"]
+        total += h
+        line = [day, f"{h:.2f}", " / ".join(days[day]["desc"])]
+        if rate is not None:
+            line.append(f"{h * rate:.2f}")
+        out.append(line)
+    tail = ["Total", f"{total:.2f}", ""] + ([f"{total * rate:.2f}"] if rate is not None else [])
+    return out + [tail]
+
+
+def read_log(path=None):
+    path = path or LOG
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8", newline="") as fh:
+        return [dict(r) for r in csv.DictReader(fh)]
+
+
+def write_log(rows, path=None):
+    path = path or LOG
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=COLS, extrasaction="ignore", lineterminator="\n")   # as committed
+        w.writeheader()
+        w.writerows(rows)
+
+
+def append_zone(since, zone_text, evidence, path=None):
+    """Add a row to the timeline, on a line of its own, and re-read it (ValueError if it did not land)."""
+    path = path or ZONES
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        needs_newline = False                    # an empty file needs none
+        if fh.tell() > 0:
+            fh.seek(-1, os.SEEK_END)
+            needs_newline = fh.read(1) != b"\n"
+    with open(path, "a", encoding="utf-8", newline="") as fh:
+        if needs_newline:
+            fh.write("\n")
+        csv.writer(fh, lineterminator="\n").writerow([since.isoformat(), zone_text, evidence])
+    last = read_zones(path)[-1]
+    if last[0] != since or last[2] != zone_text:
+        raise ValueError(f"{rel(path)}: the new row is not the last one - check the file")
+
+
+def parse_switch(since_text, zone_text):
+    """`zone --since/--zone` -> (since UTC, tzinfo); a bare date means midnight on the new clock."""
+    new_tz = parse_zone(zone_text)
+    text = (since_text or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return dt.datetime.combine(dt.date.fromisoformat(text), dt.time(), new_tz).astimezone(UTC), new_tz
+    return parse_instant(text), new_tz
+
+
+def first_day(since, old_tz, new_tz):
+    """The first local day a switch at `since` can change, on either clock."""
+    return min(since.astimezone(old_tz).date(), since.astimezone(new_tz).date())
+
+
+def a_date(text):
+    try:
+        return dt.date.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r}: give a date like 2026-09-28")
+
+
+def transcript_events(folder):
+    paths = sorted(glob.glob(os.path.join(folder, "*.jsonl")))
+    if not paths:
+        sys.exit(f"no session transcripts in {folder}")
+    return events(paths)
+
+
+def first_of_previous_month(today):
+    """`init`'s default start: the first day of the month before today's."""
+    return (today.replace(day=1) - dt.timedelta(days=1)).replace(day=1)
+
+
+def start_zones(first, sys_tz, sys_name, now, path=None):
+    """`init`: a new timeline with one row - the Mac's zone now, from midnight of `first` on that clock.
+    (since UTC, zone text); ValueError when the timeline exists or `first` is after today."""
+    path = path or ZONES
+    mac = now.astimezone(sys_tz)
+    zone_text = sys_name or offset_text(mac)
+    if os.path.exists(path):
+        raise ValueError(f"{rel(path)} already exists: `{TOOL} zone` shows it and records a switch "
+                         "(edit it by hand to correct a row)")
+    if first > mac.date():
+        raise ValueError(f"--since {first} is after today ({mac:%Y-%m-%d})")
+    since, _ = parse_switch(first.isoformat(), zone_text)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "x", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(ZONE_COLS)
+        w.writerow([since.isoformat(), zone_text, f"recorded {mac:%Y-%m-%d} by harness-worklog init"])
+    return since, zone_text
+
+
+def describe_rows(rows, day, text, blocks=None):
+    """`describe`: (the log with `day`'s auto row described as `text`, whether that row is new). A day
+    with no auto row gets one with 0.25 h (the next `update` counts its hours) only when `blocks`, its
+    blocks from the transcripts, is not empty; ValueError otherwise. Manual rows are never touched."""
+    key = day.isoformat()
+    auto = [r for r in rows if r.get("source") == "auto" and r["date"] == key]
+    created = not auto
+    if created:
+        if not blocks:
+            raise ValueError(f"{key} has no work in this repo's session transcripts, so it has no auto row to "
+                             f"describe; for work outside Claude Code: {TOOL} add --date {key} --hours H "
+                             "--description \"...\"")
+        auto = [{"date": key, "hours": f"{0.25:.2f}", "blocks": blocks_text(blocks), "description": "",
+                 "source": "auto", "zone": zones_text(blocks)}]
+        rows = sorted(rows + auto, key=lambda r: (r["date"], r.get("source") != "auto"))
+    for r in auto:
+        r["description"] = text
+    return rows, created
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse that reports a bad invocation in one line and exits 1."""
+
+    def error(self, message):
+        sys.exit(f"{self.prog}: error: {message}")
+
+
+def main():
+    global TOOL
+    repo_help = ("the repo (default: $CLAUDE_PROJECT_DIR, else the git top level of the current directory, "
+                 "else the current directory)")
+    ap = Parser(prog="harness-worklog", description="The work log behind the monthly invoice "
+                                                    "(worklog/worklog.csv).")
+    ap.add_argument("--repo", metavar="PATH", help=repo_help)
+    where = argparse.ArgumentParser(add_help=False)      # --repo is also accepted after the subcommand
+    where.add_argument("--repo", metavar="PATH", default=argparse.SUPPRESS, help=repo_help)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    it = sub.add_parser("init", parents=[where], help="start worklog/timezones.csv on the Mac's zone now")
+    it.add_argument("--since", type=a_date, help="the first day it covers (default: the first day of the "
+                                                 "previous month)")
+    up = sub.add_parser("update", parents=[where], help="recompute hours from the session transcripts")
+    up.add_argument("--since", type=a_date, help=f"first day to recompute (default: {WINDOW_DAYS} days ago, "
+                                                 "or the last logged day when the log is behind)")
+    up.add_argument("--gap-minutes", type=int, default=GAP_MINUTES,
+                    help="a longer pause ends a block (default 30)")
+    up.add_argument("--transcripts", default=None, help="default: this repo's Claude Code project folder "
+                                                        "(another folder never drops or changes a logged row "
+                                                        "without --rewrite-old)")
+    up.add_argument("--drop-stale", action="store_true",
+                    help="remove auto rows of recent days that no longer have any work")
+    up.add_argument("--rewrite-old", action="store_true",
+                    help=f"let a recount change logged rows older than {KEEP_DAYS} days (or any, with "
+                         "--transcripts) - only for a deliberate correction whose transcripts are complete")
+    up.add_argument("--ignore-commit", action="append", default=[], metavar="HASH",
+                    help="leave a commit not made on this Mac out of the time-zone check (repeatable)")
+    de = sub.add_parser("describe", parents=[where], help="write the description of a day's auto row")
+    de.add_argument("--date", type=a_date, required=True)
+    de.add_argument("--text", required=True, help="what was done that day, for the client")
+    zn = sub.add_parser("zone", parents=[where], help="show the zone timeline, or record where the Mac switched zone")
+    zn.add_argument("--since", help="when the Mac switched: an ISO instant with offset, or a date "
+                                    "(midnight on the new clock)")
+    zn.add_argument("--zone", help="the new zone: an IANA name like Asia/Tokyo, or an offset like +09:00")
+    zn.add_argument("--evidence", default="", help="why you know (default: 'recorded <today>')")
+    zn.add_argument("--gap-minutes", type=int, default=GAP_MINUTES)
+    zn.add_argument("--transcripts", default=None, help="default: this repo's Claude Code project folder")
+    add = sub.add_parser("add", parents=[where], help="add a manual row (work outside Claude Code)")
+    add.add_argument("--date", type=a_date, required=True)
+    add.add_argument("--hours", type=float, required=True)
+    add.add_argument("--description", required=True)
+    ex = sub.add_parser("export", parents=[where], help="the invoice rows for one month")
+    ex.add_argument("--month", required=True, help="yyyy-mm")
+    ex.add_argument("--rate", type=float, help="hourly rate: adds an Amount column")
+    ex.add_argument("--out", help="write a CSV here (default: print)")
+    args = ap.parse_args()
+    use_repo(find_repo(args.repo))
+    if args.repo:
+        TOOL = f"harness-worklog --repo {shlex.quote(REPO)}"
+
+    if args.cmd in ("update", "zone"):
+        try:
+            zones = read_zones()
+        except ValueError as err:
+            sys.exit(str(err))
+        now = dt.datetime.now(UTC)
+        sys_tz, sys_name, changed = system_zone()
+        folder = args.transcripts or transcripts_dir()
+
+    if args.cmd == "update":
+        evts = transcript_events(folder)
+        commits = git_commits()
+        problem = mac_zone_problem(zones, sys_tz, sys_name, now, evts, changed, args.gap_minutes, commits)
+        if problem:
+            sys.exit(problem)
+        today = now.astimezone(sys_tz).date()
+        rows = read_log()
+        since = args.since or default_since(rows, today)
+        new_rows, computed, dropped, kept, held = update_rows(
+            rows, evts, commits, zones, since, today, args.gap_minutes, bool(args.transcripts),
+            args.drop_stale, args.rewrite_old, args.ignore_commit)
+        write_log(new_rows)
+        old = {r["date"]: r for r in rows if r.get("source") == "auto"}
+        for day in sorted(computed):
+            hours, text, zone = computed[day]
+            note = "description kept" if old.get(day, {}).get("description", "").strip() else "description from commits"
+            print(f"  {day}  {hours:5.2f} h   {text}  [{zone}]   ({note})")
+        for d in held:
+            print(f"  {d}  kept at {old[d]['hours']} h - a recount differs, but its transcripts may be "
+                  "incomplete (--rewrite-old to accept the recount)")
+        for d in dropped:
+            print(f"  {d}  dropped (was {old[d]['hours']} h): {old[d].get('description', '')}")
+        for d in kept:
+            print(f"  {d}  kept - no work found, but its transcripts may have expired ({old[d]['hours']} h)")
+        if not args.since and since < today - dt.timedelta(days=WINDOW_DAYS):
+            print(f"(the log was behind: the window reached back to {since})")
+        print(f"{len(computed)} day(s) since {since} updated in {rel(LOG)}")
+    elif args.cmd == "zone":
+        if not args.since and not args.zone:
+            mac = now.astimezone(sys_tz)
+            print(f"The Mac's zone now: {sys_name or offset_text(mac)} ({offset_text(mac)})"
+                  + (f"; {LOCALTIME} last changed {changed:%Y-%m-%d %H:%M}Z" if changed else ""))
+            print(f"Timeline ({rel(ZONES)}):")
+            for since, _, text, evidence in zones:
+                print(f"  since {since:%Y-%m-%d %H:%M}Z  {text:<16} {evidence}")
+            recent = [c for c in git_commits() if c[0] >= zones[-1][0] and c[4] != GITHUB]
+            by_offset = {}
+            for when, offset, *_ in recent:
+                by_offset.setdefault(offset_text(when.astimezone(dt.timezone(offset))), []).append(when)
+            print("Commit offsets since the last row: "
+                  + (", ".join(f"{o} x{len(w)} ({min(w):%m-%d}..{max(w):%m-%d})" for o, w in by_offset.items())
+                     or "no commits yet"))
+            if zone_at(zones, now) is not None and now.astimezone(zone_at(zones, now)).utcoffset() == mac.utcoffset():
+                print("OK: the Mac's zone matches the timeline.")
+            else:
+                print(mac_zone_problem(zones, sys_tz, sys_name, now, transcript_events(folder), changed,
+                                       args.gap_minutes, git_commits()))
+            return
+        if not (args.since and args.zone):
+            sys.exit("give both --since and --zone (or neither, to see the timeline)")
+        try:
+            since, new_tz = parse_switch(args.since, args.zone)
+        except ValueError as err:
+            sys.exit(str(err))
+        problems = since_problems(since, new_tz, zones, transcript_events(folder), git_commits(), now,
+                                  args.gap_minutes)
+        if problems:
+            sys.exit("not recorded:\n  " + "\n  ".join(problems))
+        evidence = args.evidence.strip() or f"recorded {now.astimezone(sys_tz):%Y-%m-%d}"
+        try:
+            append_zone(since, args.zone.strip(), evidence)
+        except ValueError as err:
+            sys.exit(str(err))
+        print(f"recorded: from {since:%Y-%m-%d %H:%M}Z the Mac was on {args.zone.strip()}")
+        print(f"now run: {TOOL} update --since {first_day(since, zones[-1][1], new_tz)}")
+    elif args.cmd == "init":
+        if not os.path.isdir(REPO):
+            sys.exit(f"{REPO} is not a directory")
+        now = dt.datetime.now(UTC)
+        sys_tz, sys_name, _ = system_zone()
+        first = args.since or first_of_previous_month(now.astimezone(sys_tz).date())
+        try:
+            since, zone_text = start_zones(first, sys_tz, sys_name, now)
+        except ValueError as err:
+            sys.exit(str(err))
+        print(f"created {rel(ZONES)}: the Mac on {zone_text} from {first} ({since:%Y-%m-%d %H:%M}Z)")
+        print(f"now run: {TOOL} update")
+    elif args.cmd == "describe":
+        text = args.text.strip()
+        if not text:
+            sys.exit("--text is empty")
+        rows, blocks = read_log(), None
+        if not any(r.get("source") == "auto" and r["date"] == args.date.isoformat() for r in rows):
+            try:
+                zones = read_zones()
+            except ValueError as err:
+                sys.exit(str(err))
+            paths = sorted(glob.glob(os.path.join(transcripts_dir(), "*.jsonl")))
+            blocks = day_blocks(events(paths), zones).get(args.date)
+        try:
+            rows, created = describe_rows(rows, args.date, text, blocks)
+        except ValueError as err:
+            sys.exit(str(err))
+        write_log(rows)
+        if created:
+            print(f"described {args.date} in a new auto row with 0.25 h; run `{TOOL} update --since "
+                  f"{args.date}` to count its hours")
+        else:
+            print(f"described {args.date} in {rel(LOG)}")
+    elif args.cmd == "add":
+        if not os.path.isdir(REPO):
+            sys.exit(f"{REPO} is not a directory")
+        if not 0 < args.hours <= 24:
+            sys.exit("--hours must be between 0 and 24")
+        rows = read_log() + [{"date": args.date.isoformat(), "hours": f"{args.hours:.2f}", "blocks": "",
+                              "description": args.description.strip(), "source": "manual", "zone": ""}]
+        write_log(sorted(rows, key=lambda r: (r["date"], r.get("source") != "auto")))
+        print(f"added {args.hours:.2f} h on {args.date} (manual)")
+    else:
+        if not re.fullmatch(r"\d{4}-\d{2}", args.month):
+            sys.exit("--month: give yyyy-mm, e.g. 2026-09")
+        rows = invoice_rows(read_log(), args.month, args.rate)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8", newline="") as fh:
+                csv.writer(fh).writerows(rows)
+            print(f"wrote {len(rows) - 2} day(s) to {args.out}; total {rows[-1][1]} h")
+        else:
+            for r in rows:
+                print("  ".join(r))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:                      # the reader went away (| head): stop quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
+    except Exception as err:                     # never a traceback: one line, exit 1
+        sys.exit(f"harness-worklog: {type(err).__name__}: {' '.join(str(err).split())}")

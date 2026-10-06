@@ -25,7 +25,7 @@ cp user/CLAUDE.md ~/.claude/CLAUDE.md
 
 Both plugins install at user scope, so they apply in every project on this machine. A marketplace added from a local path loads its plugins in place: edit a file here, then `/reload-plugins` in an open session or start a new one.
 
-Check it: `claude plugin list` shows both plugins; in a session `/hooks` lists Notification, SessionStart, PostToolUse and Stop, `/` shows the `/harness:` skills, and the robot appears above the prompt.
+Check it: `claude plugin list` shows both plugins; in a session `/hooks` lists Notification, SessionStart, PostToolUse and Stop, `/` shows the `/harness:` skills, and in a terminal session the robot appears above the prompt. The VS Code chat panel has no band above the prompt, so there the robot shows only in the integrated terminal.
 
 ## Model routing
 
@@ -56,7 +56,7 @@ Effort is xhigh for every tier. Change it per agent with the `effort` field in t
 | notify | a permission prompt, idle, a background agent needs input or finished | macOS notification naming the repo (terminal-notifier, else AppleScript, else the terminal bell) |
 | session brief | session start, resume, after compaction | Branch, uncommitted count, last commit, next steps from `docs/agent/handoff.md` or `docs/PROGRESS.md`, pending items from `docs/plans/feature_list.json`, hours this month. Skipped in a project that has its own SessionStart hook |
 | secret scan | after every edit or write | Blocks the edit when the file holds a high-confidence secret pattern (cloud, GitHub, Slack, OpenAI, Anthropic, Stripe, private keys, Jotform-style keys) and tells Claude to remove it |
-| verify on stop | when Claude tries to end a turn after editing | Runs the project's `CLAUDE_VERIFY_CMD` and hands failures back, at most twice in a row. Opt-in per project |
+| verify on stop | when Claude tries to end a turn after editing | Runs the project's `CLAUDE_VERIFY_CMD` and hands failures back, at most twice in a row, and not again until something changes. Opt-in per project; skipped in a project that has its own Stop hook. Hooks run outside the sandbox, so the verify command runs with your full permissions: point it only at test commands you trust |
 
 ## Per-project setup
 
@@ -78,5 +78,5 @@ Projects with their own hooks, skills and agents keep them; the harness adds to 
 ## Troubleshooting
 
 - `claude plugin validate .` checks the marketplace and both plugins; `claude plugin test plugins/companion` runs the mod's tests; `python3 -m unittest discover -s plugins/harness/tests -v` runs the hook and tool tests.
-- `claude --debug hooks` shows every hook run with its exit code and output. `/plugin` in a session shows load errors on its Errors tab.
+- `claude --debug hooks` logs every hook run with its exit code and output to `~/.claude/debug/<session-id>.txt` (or `claude --debug-file /tmp/hooks.log` to pick the file); hook runs are never printed in the terminal. `/plugin` in a session shows load errors on its Errors tab.
 - A hook that misbehaves can be paused for one session with `"disableAllHooks": true` in `.claude/settings.local.json`.

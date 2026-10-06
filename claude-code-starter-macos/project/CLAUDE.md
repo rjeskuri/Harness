@@ -39,5 +39,5 @@ Maintainer notes (HTML comments are stripped before Claude sees this file, so th
 - Run Python through `uv run python`: the system `python3` doesn't have this project's dependencies.
 - <One line per recurring mistake.>
 
-## Compaction
+## Compact Instructions
 When compacting, keep the list of changed files, the path of the current spec or plan, and the latest test result.

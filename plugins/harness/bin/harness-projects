@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""
+The registry of the projects harness-standup reports on: ~/.claude/harness/projects.json,
+{"version": 1, "projects": [{"path": "/abs/path", "name": "HKTrack", "billable": false,
+"client": "", "notes": ""}]}, in the order the standup shows them.
+
+Usage:
+    harness-projects                                  # list (the default)
+    harness-projects add ~/Projects/HKTrack [--name HKTrack] [--billable] [--client C] [--notes T]
+    harness-projects set HKTrack [--billable | --no-billable] [--client C] [--notes T] [--name N]
+    harness-projects remove HKTrack                   # by name or by path
+    harness-projects discover                         # projects with Claude Code sessions, not registered yet
+    Every subcommand takes --json.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+
+VERSION = 1
+WORKTREES = "-claude-worktrees-"   # the session folder of a worktree Claude Code made, not a project of its own
+MAX_FITS = 20                      # paths kept per folder name while recovering it
+
+
+class Problem(Exception):
+    """A bad invocation or an unreadable registry: printed as one line, exit 1."""
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse that reports a bad invocation in one line and exits 1."""
+
+    def error(self, message):
+        sys.exit(f"{self.prog}: error: {message}")
+
+
+def registry_path():
+    return os.path.join(os.path.expanduser("~"), ".claude", "harness", "projects.json")
+
+
+def sessions_root():
+    """Claude Code's per-project session folders."""
+    return os.path.join(os.path.expanduser("~"), ".claude", "projects")
+
+
+def encode(path):
+    """Claude Code's folder name for a project: its path with every non-alphanumeric as '-'."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def absolute(path):
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def same_path(a, b):
+    return os.path.realpath(absolute(a)) == os.path.realpath(absolute(b))
+
+
+def is_project(path):
+    return os.path.exists(os.path.join(path, ".git")) or os.path.isfile(os.path.join(path, "CLAUDE.md"))
+
+
+# --------------------------------------------------------------- registry
+def entry(p):
+    """A registry entry with every field of the schema (unknown fields are kept)."""
+    out = dict(p)
+    out["name"] = str(p.get("name") or os.path.basename(p["path"].rstrip("/")) or p["path"])
+    out["billable"] = bool(p.get("billable", False))
+    out["client"] = str(p.get("client") or "")
+    out["notes"] = str(p.get("notes") or "")
+    return out
+
+
+def load(path=None):
+    """The registry, {"version": 1, "projects": [...]}; an empty one when the file does not exist."""
+    path = path or registry_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {"version": VERSION, "projects": []}
+    except ValueError as err:
+        raise Problem(f"{path} is not valid JSON ({err}); fix it or remove it")
+    except OSError as err:
+        raise Problem(f"cannot read {path}: {err.strerror or err}")
+    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
+        raise Problem(f'{path}: expected {{"version": 1, "projects": [...]}}')
+    if data.get("version", VERSION) != VERSION:
+        raise Problem(f"{path} is version {data.get('version')!r}; this tool reads version {VERSION}")
+    projects = []
+    for n, p in enumerate(data["projects"], start=1):
+        if not isinstance(p, dict) or not isinstance(p.get("path"), str) or not p["path"].strip():
+            raise Problem(f"{path}: project {n} has no path")
+        projects.append(entry(p))
+    return {"version": VERSION, "projects": projects}
+
+
+def save(reg, path=None):
+    """Write the registry: a temporary file in the same folder, renamed over the old one."""
+    path = path or registry_path()
+    folder = os.path.dirname(path)
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".projects-", suffix=".json", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"version": VERSION, "projects": reg["projects"]}, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def find(projects, key):
+    """The index of the project named `key` (in any case) or registered at the path `key`."""
+    for match in (lambda p: p["name"] == key, lambda p: p["name"].casefold() == key.casefold(),
+                  lambda p: same_path(p["path"], key)):
+        hits = [i for i, p in enumerate(projects) if match(p)]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            raise Problem(f"{key!r} matches {len(hits)} projects; give its path instead")
+    raise Problem(f"no registered project named or at {key!r} (harness-projects list shows them)")
+
+
+def check_name(projects, name, skip=None):
+    if not name:
+        raise Problem("the name is empty")
+    for i, p in enumerate(projects):
+        if i != skip and p["name"].casefold() == name.casefold():
+            raise Problem(f"the name {p['name']!r} is taken by {p['path']}; pass --name")
+
+
+# --------------------------------------------------------------- discover
+def recover(name, root=os.sep, cache=None):
+    """The existing directory that Claude Code's session folder `name` stands for, or None.
+
+    The name is the path with every non-alphanumeric character as '-', so the path is rebuilt one
+    directory at a time: an entry fits when its own encoding is the next part of the name, which
+    tries every split of the hyphens into '/' and '-' and also brings back '_', '.' and ' '. A
+    directory that cannot be listed falls back to the hyphens alone. When several paths fit, one
+    with a .git or a CLAUDE.md wins, then the first in name order."""
+    cache = {} if cache is None else cache
+    fits = []
+
+    def walk(folder, rest):
+        if len(fits) >= MAX_FITS:
+            return
+        if not rest:
+            fits.append(folder)
+            return
+        if folder not in cache:
+            try:
+                cache[folder] = sorted(os.listdir(folder))
+            except OSError:
+                cache[folder] = None
+        names = cache[folder]
+        if names is None:          # cannot list it: each hyphen is a '/' or a '-'
+            chunks = rest[1:].split("-")
+            names = ["-".join(chunks[:k]) for k in range(1, len(chunks) + 1)]
+        for entry_name in names:
+            part = "-" + encode(entry_name)
+            if entry_name and (rest == part or rest.startswith(part + "-")):
+                path = os.path.join(folder, entry_name)
+                if os.path.isdir(path):
+                    walk(path, rest[len(part):])
+
+    if name.startswith("-"):
+        walk(root, name)
+    for path in fits:
+        if is_project(path):
+            return path
+    return fits[0] if fits else None
+
+
+def newest_transcript(folder):
+    """The newest mtime among a session folder's *.jsonl files, or None."""
+    stamps = []
+    for path in glob.glob(os.path.join(glob.escape(folder), "*.jsonl")):
+        try:
+            stamps.append(os.path.getmtime(path))
+        except OSError:
+            pass
+    return max(stamps) if stamps else None
+
+
+def age(then, now):
+    """'just now', '5m ago', '3h ago', '2d ago', '4mo ago' or '2y ago'."""
+    s = max(0, now - then)
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return f"{int(s // 60)}m ago"
+    if s < 86400:
+        return f"{int(s // 3600)}h ago"
+    if s < 86400 * 60:
+        return f"{int(s // 86400)}d ago"
+    if s < 86400 * 730:
+        return f"{int(s // (86400 * 30))}mo ago"
+    return f"{int(s // (86400 * 365))}y ago"
+
+
+def candidates(reg):
+    """Projects Claude Code has session folders for that exist, have a .git or a CLAUDE.md and are not
+    registered: [{"path", "name", "folder", "last_session"}], newest session first."""
+    root = sessions_root()
+    try:
+        folders = sorted(os.listdir(root))
+    except OSError:
+        return []
+    cache, out, seen = {}, [], set()
+    for folder in folders:
+        if WORKTREES in folder or not os.path.isdir(os.path.join(root, folder)):
+            continue
+        path = recover(folder, cache=cache)
+        if not path or path in seen or not is_project(path):
+            continue
+        if any(same_path(p["path"], path) for p in reg["projects"]):
+            continue
+        seen.add(path)
+        out.append({"path": path, "name": os.path.basename(path), "folder": folder,
+                    "last_session": newest_transcript(os.path.join(root, folder))})
+    out.sort(key=lambda c: c["last_session"] or 0, reverse=True)
+    return out
+
+
+# --------------------------------------------------------------- output
+def table(rows):
+    """Left-aligned columns, two spaces apart."""
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
+    return "\n".join("  ".join([c.ljust(w) for c, w in zip(r, widths)] + [r[-1]]).rstrip() for r in rows)
+
+
+def summary(verb, p):
+    terms = "billable" + (f", client {p['client']}" if p["client"] else "") if p["billable"] else "not billable"
+    return f"{verb} {p['name']}: {p['path']} ({terms})"
+
+
+def emit(as_json, data, text):
+    print(json.dumps(data, indent=2) if as_json else text)
+
+
+# --------------------------------------------------------------- commands
+def cmd_list(reg, args):
+    if args.json or not reg["projects"]:
+        emit(args.json, reg, "No projects registered. `harness-projects discover` lists candidates; "
+                             "`harness-projects add <path>` registers one.")
+        return
+    rows = [("NAME", "PATH", "BILLABLE", "CLIENT")]
+    rows += [(p["name"], p["path"], "yes" if p["billable"] else "no", p["client"]) for p in reg["projects"]]
+    print(table(rows))
+
+
+def cmd_add(reg, args):
+    path = absolute(args.path)
+    if not os.path.isdir(path):
+        raise Problem(f"not a directory: {path}")
+    for p in reg["projects"]:
+        if same_path(p["path"], path):
+            raise Problem(f"{path} is already registered as {p['name']!r}")
+    name = (os.path.basename(path) if args.name is None else args.name).strip()
+    check_name(reg["projects"], name)
+    new = {"path": path, "name": name, "billable": args.billable, "client": args.client or "",
+           "notes": args.notes or ""}
+    reg["projects"].append(new)
+    save(reg)
+    emit(args.json, new, summary("added", new))
+
+
+def cmd_set(reg, args):
+    if args.billable is None and args.client is None and args.notes is None and args.name is None:
+        raise Problem("nothing to change: give --billable, --no-billable, --client, --notes or --name")
+    i = find(reg["projects"], args.project)
+    p = reg["projects"][i]
+    if args.name is not None:
+        check_name(reg["projects"], args.name.strip(), skip=i)
+        p["name"] = args.name.strip()
+    if args.billable is not None:
+        p["billable"] = args.billable
+    if args.client is not None:
+        p["client"] = args.client
+    if args.notes is not None:
+        p["notes"] = args.notes
+    save(reg)
+    emit(args.json, p, summary("updated", p))
+
+
+def cmd_remove(reg, args):
+    p = reg["projects"].pop(find(reg["projects"], args.project))
+    save(reg)
+    emit(args.json, p, f"removed {p['name']}: {p['path']}")
+
+
+def cmd_discover(reg, args):
+    found = candidates(reg)
+    now = time.time()
+    if args.json:
+        for c in found:
+            c["last_session"] = (dt.datetime.fromtimestamp(c["last_session"]).astimezone().isoformat(timespec="seconds")
+                                 if c["last_session"] else None)
+        emit(True, found, "")
+        return
+    if not found:
+        print("No unregistered projects with a .git or a CLAUDE.md among Claude Code's sessions "
+              f"({sessions_root()}).")
+        return
+    rows = [("PATH", "LAST SESSION")]
+    for c in found:
+        when = c["last_session"]
+        rows.append((c["path"], f"{dt.datetime.fromtimestamp(when):%Y-%m-%d %H:%M} ({age(when, now)})"
+                     if when else "no transcripts"))
+    print(table(rows))
+    print("Register one with: harness-projects add <path> [--billable --client NAME]")
+
+
+def parser():
+    as_json = argparse.ArgumentParser(add_help=False)
+    as_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
+    ap = Parser(prog="harness-projects", description="The project registry behind harness-standup "
+                                                     "(~/.claude/harness/projects.json).")
+    ap.add_argument("--json", action="store_true", help="print JSON")
+    sub = ap.add_subparsers(dest="cmd", metavar="{list,add,set,remove,discover}")
+    sub.add_parser("list", parents=[as_json], help="the registered projects (the default)")
+    add = sub.add_parser("add", parents=[as_json], help="register a project")
+    add.add_argument("path")
+    add.add_argument("--name", help="default: the folder's name")
+    add.add_argument("--billable", action="store_true", help="hours count toward an invoice")
+    add.add_argument("--client", help="who is billed")
+    add.add_argument("--notes")
+    st = sub.add_parser("set", parents=[as_json], help="change a project's fields")
+    st.add_argument("project", help="its name or path")
+    bill = st.add_mutually_exclusive_group()
+    bill.add_argument("--billable", dest="billable", action="store_const", const=True, default=None)
+    bill.add_argument("--no-billable", dest="billable", action="store_const", const=False)
+    st.add_argument("--client")
+    st.add_argument("--notes")
+    st.add_argument("--name")
+    rm = sub.add_parser("remove", parents=[as_json], help="unregister a project")
+    rm.add_argument("project", help="its name or path")
+    sub.add_parser("discover", parents=[as_json], help="projects with Claude Code sessions, not registered yet")
+    return ap
+
+
+def main():
+    args = parser().parse_args()
+    commands = {"list": cmd_list, "add": cmd_add, "set": cmd_set, "remove": cmd_remove, "discover": cmd_discover}
+    try:
+        commands[args.cmd or "list"](load(), args)
+    except Problem as err:
+        sys.exit(f"harness-projects: {err}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:                      # the reader went away (| head): stop quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
+    except Exception as err:                     # never a traceback: one line, exit 1
+        sys.exit(f"harness-projects: {type(err).__name__}: {' '.join(str(err).split())}")

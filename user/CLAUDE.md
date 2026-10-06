@@ -21,3 +21,7 @@
 - Each project gets its own session; `/harness:standup` is the cross-project view, and `claude agents` in a terminal is the console for background sessions.
 - Write `docs/agent/handoff.md` with `/harness:handoff` before clearing context mid-task; the session brief reads it on the next start.
 - On a billable project, run `/harness:worklog` at the end of a working session.
+
+## Compact Instructions
+
+When compacting, keep the list of files changed this session, the path of the current spec or handoff note, the latest test or verify result, and any decision I made in the conversation.

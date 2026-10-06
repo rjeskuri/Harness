@@ -8,7 +8,8 @@ Ryan's personal Claude Code harness. One repository, two plugins, installed once
 2. **Model routing is the main efficiency lever.** Ryan is on a subscription with five-hour and seven-day windows. Fable (the main session) designs, orchestrates and reviews; Opus implements; Sonnet does trivial mechanical work. Effort defaults to xhigh everywhere and is adjustable per agent.
 3. **Deterministic where it must be, advisory where it can be.** Hooks enforce (secret scan, verify before stopping); CLAUDE.md and skills advise.
 4. **Fail open.** A hook that crashes never traps a session: every hook exits 0 on its own errors.
-5. **Standard library only.** Hooks and tools run on the `python3` from Xcode's command line tools (3.9) or newer; nothing to install.
+5. **Hooks run outside the sandbox.** Whatever a hook executes runs with the user's full permissions and without a prompt, so the verify command must be a test command the user trusts, and hook scripts never run code from the edited files.
+6. **Standard library only.** Hooks and tools run on the `python3` from Xcode's command line tools (3.9) or newer; nothing to install.
 
 ## Layout
 
@@ -73,16 +74,17 @@ All hooks: read JSON from stdin, never raise, exit 0 on their own errors (the on
 - If `docs/agent/specs/` has files: `Latest spec: <path>`.
 - If `docs/plans/feature_list.json` exists and is a list with `passes` fields: the first three `passes: false` items.
 - If `worklog/worklog.csv` exists: `Hours this month: <sum of this month's rows>`.
-Skip entirely (print nothing) when the project's `.claude/settings.json` declares its own `SessionStart` hook, so a project with a bespoke brief is not briefed twice. Not a git repo: print only the heading without git facts.
+Skip entirely (print nothing) when the project's `.claude/settings.json` declares its own `SessionStart` hook, so a project with a bespoke brief is not briefed twice. Not a git repo: the heading carries no git facts, and the sections are still read from the directory. The PROGRESS.md scan ignores lines inside code fences, as the handoff parser does.
 
 **after_edit.py** (PostToolUse: `Edit|Write|NotebookEdit`). Two jobs:
 1. Append the edited file's absolute path (`tool_input.file_path` or `notebook_path`) to `<state>/dirty-<session_id>` so the Stop hook knows a verify run is due.
-2. Secret scan of that file when it exists, is under 2 MB and decodes as UTF-8. High-confidence patterns only: AWS access key id `AKIA[0-9A-Z]{16}`; GitHub tokens `gh[pousr]_[A-Za-z0-9]{36,}` and `github_pat_[A-Za-z0-9_]{22,}`; Slack `xox[baprs]-[A-Za-z0-9-]{10,}`; Google `AIza[0-9A-Za-z_-]{35}`; OpenAI `sk-(proj-)?[A-Za-z0-9_-]{20,}`; Anthropic `sk-ant-[A-Za-z0-9_-]{20,}`; Stripe `sk_live_[A-Za-z0-9]{16,}`; private key blocks `-----BEGIN [A-Z ]*PRIVATE KEY-----`; a Jotform-style `apiKey=[0-9a-f]{32}`; and a generic `(api[_-]?key|secret|token|password)\s*[:=]\s*["'][A-Za-z0-9_\-]{24,}["']`. Skip a line that contains `example`, `placeholder`, `dummy`, `xxxx`, `<`, `${`, `your_` or `REDACTED`, and skip entirely when `HARNESS_SECRET_SCAN=0` or the file contains `harness: allow-secrets`. On a hit: stderr `SECRET pattern in <path>:<line> (<pattern name>): <first 4 chars>… - remove it before continuing; read secrets from the environment or a file that is gitignored.` and exit 2. Otherwise exit 0 silently.
+2. Secret scan of that file when it exists, is under 2 MB and decodes as UTF-8. High-confidence patterns only: AWS access key id `AKIA[0-9A-Z]{16}`; GitHub tokens `gh[pousr]_[A-Za-z0-9]{36,}` and `github_pat_[A-Za-z0-9_]{22,}`; Slack `xox[baprs]-[A-Za-z0-9-]{10,}`; Google `AIza[0-9A-Za-z_-]{35}`; OpenAI `sk-(proj-)?[A-Za-z0-9_-]{20,}`; Anthropic `sk-ant-[A-Za-z0-9_-]{20,}`; Stripe `sk_live_[A-Za-z0-9]{16,}`; private key blocks `-----BEGIN [A-Z ]*PRIVATE KEY-----`; a Jotform-style `apiKey=[0-9a-f]{32}`; and a generic `(api[_-]?key|secret|token|password)\s*[:=]\s*["'][A-Za-z0-9_\-]{24,}["']`. The Anthropic, OpenAI and Stripe patterns carry a `(?<![A-Za-z0-9_-])` lookbehind so kebab-case words ending in `sk` (`task-`, `risk-`) are not keys; the generic assignment pattern is compiled case-insensitively so `API_KEY = "..."` and `apiKey: "..."` are caught, while the provider patterns stay case-sensitive. Skip a line that contains `example`, `placeholder`, `dummy`, `xxxx`, `<`, `${`, `your_` or `REDACTED` (any case), and skip entirely when `HARNESS_SECRET_SCAN=0` or the file contains `harness: allow-secrets`. On a hit: stderr `SECRET pattern in <path>:<line> (<pattern name>): <first 4 chars>… - remove it before continuing; read secrets from the environment or a file that is gitignored.` and exit 2. Otherwise exit 0 silently.
 
 **verify_on_stop.py** (Stop). Opt-in per project through `CLAUDE_VERIFY_CMD`, read from the environment first and then from `env` in the project's `.claude/settings.json` and `.claude/settings.local.json` (so it works whether or not settings `env` is exported to hooks). Behavior:
-- Exit 0 silently when there is no verify command, no `dirty-<session_id>` file, or `background_tasks` is non-empty.
+- Exit 0 silently when there is no verify command, no `dirty-<session_id>` file, `background_tasks` is non-empty, or the project's `.claude/settings.json` declares a `Stop` hook of its own (a project with its own verify-on-stop, such as FantasyHockey with the starter kit, is not checked twice).
 - Reset the consecutive-block counter when `stop_hook_active` is false.
-- Fingerprint = sha256 of `git rev-parse HEAD` plus the contents of the dirty files; if it equals the last green fingerprint, exit 0.
+- Fingerprint = sha256 of `git rev-parse HEAD` plus the contents of the dirty files; if it equals the last green fingerprint, exit 0. The last red or timed-out fingerprint is remembered too: a fresh stop (not a continuation) whose fingerprint equals it skips the run and says so in one `systemMessage` line, so a Q&A turn after a failure does not re-run the suite; the two in-turn retries still happen.
+- The command inherits the hook's environment plus `PYTHONDONTWRITEBYTECODE=1` (no stale `.pyc` after a same-second edit). A verify command that leaves a background child holding its stdout is reported as a timeout; such children must redirect their output.
 - Run the command through the shell from the repo root with `CLAUDE_VERIFY_TIMEOUT` seconds (default 300). On timeout or a command that cannot start: `{"systemMessage": "verify_on_stop: ..."}` and exit 0.
 - Pass: record the fingerprint, delete the dirty file, print `{"systemMessage": "verify_on_stop: <command> passed."}`.
 - Fail: at most 2 consecutive blocks: `{"decision": "block", "reason": "<the command> failed:\n<last 60 non-empty lines>\n\nFix the root cause and re-run. Don't delete, skip or loosen tests. If a failure predates your change or is out of scope, say so explicitly."}`. After 2 blocks in a row: `{"systemMessage": "verify_on_stop: still failing after 2 automatic retries; review before trusting this turn."}` and exit 0.
@@ -107,13 +109,13 @@ Executable `python3` scripts (shebang `#!/usr/bin/env python3`, mode 755), `argp
 - latest spec path when `docs/agent/specs/` exists;
 - hours this month from `worklog/worklog.csv` when the project is billable;
 - sessions: entries of `claude agents --json` whose `cwd` is this path (or under it), as `<name> <status> (<waitingFor>)`; the `claude` binary is looked up on PATH, then `~/.local/bin/claude`; if it cannot run, say so once.
-Then `## Fleet`: every session from `claude agents --json`, waiting ones first, with its cwd basename. Output is Markdown; `--json` prints the raw structure. Whole run under 5 seconds; a project that cannot be read gets one line saying so and never stops the others.
+Then `## Fleet`: every session from `claude agents --json`, waiting ones first, with its cwd basename. Output is Markdown; `--json` prints the raw structure. The fleet call and the projects' git calls each get a 4-second budget, so the whole run stays under 5 seconds; a project that cannot be read gets one line saying so and never stops the others.
 
 **harness-worklog**: a generalized copy of `~/jotform-glow-sync/tools/worklog.py` (read it; keep its algorithm, messages and file formats exactly: 30-minute gap blocks, only blocks containing a human message count, day assignment on the Mac's clock at the time, quarter-hour rounding, the time-zone timeline in `worklog/timezones.csv`, descriptions kept once written, manual rows never touched, the window and expiry rules). Changes:
 - The repo is `--repo PATH`, else `CLAUDE_PROJECT_DIR`, else `git rev-parse --show-toplevel` from the cwd, else the cwd. The log is `<repo>/worklog/worklog.csv`, the timeline `<repo>/worklog/timezones.csv`. Messages that mention `tools/worklog.py` say `harness-worklog` instead; "Ryan" becomes "the user" in docstrings (`is_ryans_message` becomes `is_human_message`).
 - New `init [--since YYYY-MM-DD]`: creates `worklog/timezones.csv` with one row, the Mac's current zone from `--since` (default: the first day of the previous month) with evidence `recorded <today> by harness-worklog init`; refuses to overwrite an existing timeline. `update` without a timeline points at `init` instead of at a RUNBOOK.
 - New `describe --date YYYY-MM-DD --text "..."`: sets the description of that day's auto row (creates the row with 0.25 h only if the day has blocks computed; otherwise refuses and suggests `add`).
-- `export` unchanged; `add` unchanged; `zone` unchanged.
+- `export` unchanged; `add` unchanged; `zone` unchanged, except one inherited bug fixed in the copy: `append_zone`'s end-of-file newline check always said a newline was needed, so every appended zone row was preceded by a blank line (the original reads `fh.seek(-1, os.SEEK_END) or fh.read(1)`; the copy seeks, then reads). Tests use a neutral client name, never a real one.
 
 ### Tests (plugins/harness/tests)
 
@@ -121,7 +123,7 @@ Then `## Fleet`: every session from `claude agents --json`, waiting ones first, 
 
 ## Companion plugin (the mod)
 
-A Game Boy style robot that lives in the band above the prompt and reacts to the session. Surfaces: the terminal draws a `Raster`; VS Code and the desktop app draw an `Svg`. Hidden with the `/companion` command (toggle) or its Hide button; the choice persists for the session in `$.state`.
+A Game Boy style robot that lives in the band above the prompt and reacts to the session. Surfaces: the band is raised in the terminal (a `Raster`) and in the desktop app (an `Svg`). The VS Code chat panel does not raise the band, so in VS Code the robot appears only when `claude` runs in the integrated terminal; the `Svg` branch also serves the test kit's vscode and mobile mounts. Hidden with the `/companion` command (toggle) or its Hide button; the choice persists for the session in `$.state`.
 
 ### State (types/index.d.ts)
 
@@ -138,10 +140,10 @@ declare module 'claude-code' {
 
 - `session.start`: register the command `companion` ("Show or hide the companion sprite"); set mood `idle`, note `""`; start a ticker with `$.clock.every(500, ...)` that increments `frame` while the sprite is visible (skip the write while hidden).
 - `prompt.submit`: mood `thinking`, note `""`; `next(e)`.
-- `tool.call`: mood `working`, note from the tool: Bash "running a command"; Edit, Write, NotebookEdit "editing <basename of file_path>"; Read "reading <basename>"; Grep, Glob "searching"; Agent "delegating"; Workflow "orchestrating"; WebFetch, WebSearch "browsing"; otherwise the tool name. Then `const r = await next(e)`; if `r` has `isError` true: mood `sad`, note "that failed", and `$.clock.after(2500, ...)` back to `working` if still sad. Return `r` unchanged.
+- `tool.call`: mood `working`, note from the tool: Bash "running a command"; Edit, Write, NotebookEdit "editing <basename of file_path>"; Read "reading <basename>"; Grep, Glob "searching"; Agent "delegating"; Workflow "orchestrating"; WebFetch, WebSearch "browsing"; otherwise the tool name. Then `const r = await next(e)`; if `r` has `isError` true: mood `sad`, note "that failed", and `$.clock.after(2500, ...)` back to `working` if still sad. Otherwise, on the next tick, a `waiting` look left by this call's permission prompt reverts to `working` (the prompt has been answered by then). Return `r` unchanged.
 - `tool.check`: `const r = await next(e)`; if `r.decision === 'ask'`: mood `waiting`, note "needs you: <tool>". Return `r` unchanged.
 - `turn.complete`: reason `answer`: mood `happy`, note "done", and after 6 s back to `idle` if still happy; `error` or `refusal`: mood `sad`, note "error"; `aborted`: `idle`. `next(e)`.
-- `command.run` `{ command: 'companion' }`: toggle `isHidden`; return `{ text: 'Companion hidden; /companion shows it again.' }` or `{ text: 'Companion shown.' }`.
+- `command.run` `{ command: 'companion' }`: toggle `isHidden`, then set the look to idle (a local command starts no turn, so nothing else would clear a `thinking` left by its `prompt.submit`); return `{ text: 'Companion hidden; /companion shows it again.' }` or `{ text: 'Companion shown.' }`.
 - `ui.render` `{ component: 'AbovePrompt' }`: if `e.props.hasSurvey` or hidden, `next(e)`. Otherwise a `Box` row: the sprite, then a column with `Text bold` "ROBO · <mood>" and `Text dimColor` note, then a `Button key="hide" label="Hide"` whose press sets `isHidden`. When `e.props.bodyColumns < 36`, draw the sprite alone. Read state with `read($, atom)` so the drawing re-runs on writes; write only from handlers and other events with `update($, atom, fn)`.
 
 ### Sprite

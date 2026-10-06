@@ -1,6 +1,6 @@
 # Claude Code starter kit for macOS: Python, Jupyter and SQL
 
-A small, opinionated `.claude/` setup to drop into a repo. It follows the Agentic Coding Playbook: a lean CLAUDE.md, path-scoped rules, hooks for the things that must always happen, skills for workflows you repeat, one fresh-context reviewer, and Claude Code's macOS sandbox. Checked against Claude Code 2.1.283 (September 2026).
+A small, opinionated `.claude/` setup to drop into a repo. It follows Anthropic's own guidance in the Claude Code docs ("Best practices for Claude Code", "How Claude remembers your project" and "Configure the sandboxed Bash tool"): a lean CLAUDE.md, path-scoped rules, hooks for the things that must always happen, skills for workflows you repeat, one fresh-context reviewer, and Claude Code's macOS sandbox. Checked against Claude Code 2.1.283 (September 2026); every claim it makes about Claude Code was re-checked on 2026-10-06, see ../docs/verification.md. (An earlier version cited an "Agentic Coding Playbook"; no Anthropic document by that name exists.)
 
 ```
 project/                          -> copy into your repo root

@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""
+The cross-project standup. For each project in ~/.claude/harness/projects.json (registry order):
+git state, last Claude Code session, next steps (as the session brief reads them), latest spec,
+hours this month on a billable project, and the sessions running in it; then the fleet of every
+running Claude Code session, waiting ones first. Markdown, or --json for the structure behind it.
+
+Usage:
+    harness-standup                  # every registered project
+    harness-standup HKTrack          # one project, by name or path
+    harness-standup --json
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import csv
+import datetime as dt
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+BUDGET = 4            # seconds for the projects' git calls (they run side by side)
+FLEET_TIMEOUT = 4     # seconds for `claude agents --json`, started before the projects and read after
+NEXT_LINES = 5        # next steps per project
+WIDTH = 160           # a longer next-step line is cut
+HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
+NEXT_STEPS = re.compile(r"^(\s*)(#{1,6}\s+|[-*+]\s+)?(\*\*|__)?\s*next steps?\b\s*:?\s*(?:\*\*|__)?\s*:?\s*(.*)$", re.I)
+BOLD_LABEL = re.compile(r"^(\s*)([-*+]\s+)?(\*\*|__)\S")
+
+
+class Problem(Exception):
+    """A bad invocation or an unreadable registry: printed as one line, exit 1."""
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse that reports a bad invocation in one line and exits 1."""
+
+    def error(self, message):
+        sys.exit(f"{self.prog}: error: {message}")
+
+
+def home(*parts):
+    return os.path.join(os.path.expanduser("~"), *parts)
+
+
+def encode(path):
+    """Claude Code's folder name for a project: its path with every non-alphanumeric as '-'."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def same_path(a, b):
+    return os.path.realpath(os.path.abspath(os.path.expanduser(a))) == os.path.realpath(os.path.abspath(os.path.expanduser(b)))
+
+
+def under(cwd, path):
+    """Whether the directory `cwd` is `path` or inside it."""
+    if not isinstance(cwd, str) or not cwd:
+        return False
+    cwd, path = os.path.realpath(cwd), os.path.realpath(path)
+    return cwd == path or cwd.startswith(path.rstrip(os.sep) + os.sep)
+
+
+def age(then, now):
+    """'just now', '5m ago', '3h ago', '2d ago', '4mo ago' or '2y ago'."""
+    s = max(0, now - then)
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return f"{int(s // 60)}m ago"
+    if s < 86400:
+        return f"{int(s // 3600)}h ago"
+    if s < 86400 * 60:
+        return f"{int(s // 86400)}d ago"
+    if s < 86400 * 730:
+        return f"{int(s // (86400 * 30))}mo ago"
+    return f"{int(s // (86400 * 365))}y ago"
+
+
+def stamp(then, now):
+    return {"time": dt.datetime.fromtimestamp(then).astimezone().isoformat(timespec="seconds"), "age": age(then, now)}
+
+
+def clip(line):
+    line = " ".join(line.split())
+    return line if len(line) <= WIDTH else line[:WIDTH - 1].rstrip() + "…"
+
+
+# --------------------------------------------------------------- registry
+def load_projects():
+    """The registered projects in registry order; Problem when the registry cannot be read."""
+    path = home(".claude", "harness", "projects.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except ValueError as err:
+        raise Problem(f"{path} is not valid JSON ({err}); fix it or remove it")
+    except OSError as err:
+        raise Problem(f"cannot read {path}: {err.strerror or err}")
+    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
+        raise Problem(f'{path}: expected {{"version": 1, "projects": [...]}}')
+    if data.get("version", 1) != 1:
+        raise Problem(f"{path} is version {data.get('version')!r}; this tool reads version 1")
+    out = []
+    for p in data["projects"]:
+        if isinstance(p, dict) and isinstance(p.get("path"), str) and p["path"].strip():
+            out.append({"name": str(p.get("name") or os.path.basename(p["path"].rstrip("/")) or p["path"]),
+                        "path": p["path"], "billable": bool(p.get("billable")), "client": str(p.get("client") or "")})
+    return out
+
+
+def pick(projects, key):
+    """The project named `key` (in any case) or registered at the path `key`."""
+    for match in (lambda p: p["name"] == key, lambda p: p["name"].casefold() == key.casefold(),
+                  lambda p: same_path(p["path"], key)):
+        hits = [p for p in projects if match(p)]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            raise Problem(f"{key!r} matches {len(hits)} projects; give its path instead")
+    raise Problem(f"no registered project named or at {key!r} (harness-projects list shows them)")
+
+
+# --------------------------------------------------------------- one project
+def git(path, args, deadline):
+    """A read-only git command in `path` (no optional locks, so the index is never rewritten)."""
+    timeout = max(0.2, deadline - time.monotonic())
+    try:
+        return subprocess.run(["git", "--no-optional-locks", "-C", path] + args, capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL,
+                              env=dict(os.environ, LC_ALL="C"))
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"git {args[0]} timed out") from None
+
+
+def git_state(path, deadline, now):
+    """{"repo": false} outside git; else branch, uncommitted, upstream/ahead/behind and the last commit
+    ({"repo": true, "error": "..."} when git fails)."""
+    try:
+        status = git(path, ["status", "--porcelain=v2", "--branch"], deadline)
+        if status.returncode != 0:
+            if "not a git repository" in status.stderr:
+                return {"repo": False}
+            return {"repo": True, "error": (status.stderr.strip().splitlines() or [f"git status exited {status.returncode}"])[-1]}
+        state = {"repo": True, "branch": None, "detached": False, "uncommitted": 0, "upstream": None,
+                 "ahead": None, "behind": None, "last_commit": None}
+        oid = None
+        for line in status.stdout.splitlines():
+            if line.startswith("# branch.oid "):
+                oid = line.split(" ", 2)[2]
+            elif line.startswith("# branch.head "):
+                head = line.split(" ", 2)[2]
+                state["detached"] = head == "(detached)"
+                state["branch"] = None if state["detached"] else head
+            elif line.startswith("# branch.upstream "):
+                state["upstream"] = line.split(" ", 2)[2]
+            elif line.startswith("# branch.ab "):
+                m = re.match(r"# branch\.ab \+(\d+) -(\d+)", line)
+                if m:
+                    state["ahead"], state["behind"] = int(m.group(1)), int(m.group(2))
+            elif line and not line.startswith("#"):
+                state["uncommitted"] += 1
+        if state["detached"]:
+            state["branch"] = f"detached at {oid[:7]}" if oid and oid != "(initial)" else "detached"
+        log = git(path, ["log", "-1", "--format=%ct%x09%s"], deadline)
+        if log.returncode == 0 and "\t" in log.stdout:
+            when, subject = log.stdout.strip("\n").split("\t", 1)
+            state["last_commit"] = dict(stamp(int(when), now), subject=subject.strip())
+        return state
+    except (TimeoutError, OSError) as err:
+        return {"repo": True, "error": str(err)}
+
+
+def last_session(path):
+    """The newest mtime among the project's Claude Code transcripts, or None."""
+    stamps = []
+    for name in glob.glob(os.path.join(glob.escape(home(".claude", "projects", encode(path))), "*.jsonl")):
+        try:
+            stamps.append(os.path.getmtime(name))
+        except OSError:
+            pass
+    return max(stamps) if stamps else None
+
+
+def read(path):
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def unbullet(line):
+    return re.sub(r"^[-*+]\s+", "", line.strip())
+
+
+def handoff_next(text):
+    """docs/agent/handoff.md: its Next steps section (first 12 lines), else its first 20 lines."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = NEXT_STEPS.match(line)
+        if not m:
+            continue
+        kind_heading, indent = bool(m.group(2) and m.group(2).startswith("#")), len(m.group(1))
+        out = [m.group(4)] if m.group(4).strip() and not kind_heading else []   # "**Next steps**: do X"
+        for nxt in lines[i + 1:]:
+            if HEADING.match(nxt):
+                break
+            label = BOLD_LABEL.match(nxt)
+            if not kind_heading and label and len(label.group(1)) <= indent and bool(label.group(2)) == bool(m.group(2)):
+                break                      # the next **Label** section at the same level
+            if nxt.strip():
+                out.append(nxt)
+        return [unbullet(x) for x in out][:12]
+    return [x.strip() for x in lines if x.strip()][:20]
+
+
+def progress_next(text):
+    """docs/PROGRESS.md: the lines of its last `## ` block that start with Next (at most 6)."""
+    lines = text.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith("## ")]
+    if not starts:
+        return []
+    return [line.strip() for line in lines[starts[-1] + 1:] if line.lstrip().startswith("Next")][:6]
+
+
+def pending_features(path):
+    """docs/plans/feature_list.json: its first three items with passes false, when it is a list with
+    passes fields."""
+    try:
+        data = json.loads(read(path))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list) or not any(isinstance(x, dict) and "passes" in x for x in data):
+        return []
+    out = []
+    for x in data:
+        if isinstance(x, dict) and x.get("passes") is False:
+            text = x.get("description") or x.get("name") or x.get("title") or json.dumps(x, ensure_ascii=False)
+            out.append(f"pending {x['id']}: {text}" if x.get("id") else f"pending: {text}")
+            if len(out) == 3:
+                break
+    return out
+
+
+def next_steps(path):
+    """At most NEXT_LINES lines, from the session brief's sources in its order: the handoff's Next steps,
+    else PROGRESS.md's Next lines; then the feature list's pending items."""
+    handoff, progress = os.path.join(path, "docs", "agent", "handoff.md"), os.path.join(path, "docs", "PROGRESS.md")
+    if os.path.isfile(handoff):
+        lines = handoff_next(read(handoff))
+    elif os.path.isfile(progress):
+        lines = progress_next(read(progress))
+    else:
+        lines = []
+    lines += pending_features(os.path.join(path, "docs", "plans", "feature_list.json"))
+    return [clip(line) for line in lines[:NEXT_LINES]]
+
+
+def latest_spec(path):
+    """The most recently modified file in docs/agent/specs/, relative to the project, or None."""
+    folder = os.path.join(path, "docs", "agent", "specs")
+    if not os.path.isdir(folder):
+        return None
+    with os.scandir(folder) as found:
+        files = [(e.stat().st_mtime, e.name) for e in found if e.is_file() and not e.name.startswith(".")]
+    return os.path.join("docs", "agent", "specs", max(files)[1]) if files else None
+
+
+def hours_this_month(path, today):
+    """The sum of this month's rows of worklog/worklog.csv, or None without one."""
+    log = os.path.join(path, "worklog", "worklog.csv")
+    if not os.path.isfile(log):
+        return None
+    month = today.strftime("%Y-%m-")
+    with open(log, encoding="utf-8", newline="") as fh:
+        return round(sum(float(r.get("hours") or 0) for r in csv.DictReader(fh)
+                         if (r.get("date") or "").startswith(month)), 2)
+
+
+def report(project, deadline, now):
+    """Everything the standup says about one project; one error line when it cannot be read."""
+    out = dict(project, error=None, git=None, last_session=None, next=[], latest_spec=None,
+               hours_this_month=None, sessions=None)
+    try:
+        path = project["path"]
+        if not os.path.isdir(path):
+            out["error"] = "path not found"
+            return out
+        out["git"] = git_state(path, deadline, now)
+        newest = last_session(path)
+        out["last_session"] = stamp(newest, now) if newest else None
+        out["next"] = next_steps(path)
+        out["latest_spec"] = latest_spec(path)
+        if project["billable"]:
+            out["hours_this_month"] = hours_this_month(path, dt.date.fromtimestamp(now))
+    except Exception as err:      # one project never stops the others
+        out["error"] = f"could not read it: {type(err).__name__}: {' '.join(str(err).split())}"
+    return out
+
+
+# --------------------------------------------------------------- fleet
+def claude_binary():
+    found = shutil.which("claude")
+    if found:
+        return found
+    local = home(".local", "bin", "claude")
+    return local if os.path.isfile(local) and os.access(local, os.X_OK) else None
+
+
+def read_fleet(timeout=FLEET_TIMEOUT):
+    """(sessions, None) from `claude agents --json`, or (None, why it could not be read)."""
+    binary = claude_binary()
+    if not binary:
+        return None, "`claude` is not on PATH or in ~/.local/bin"
+    try:
+        p = subprocess.run([binary, "agents", "--json"], capture_output=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None, f"`claude agents --json` timed out after {timeout} s"
+    except OSError as err:
+        return None, f"`claude agents --json` could not start ({err.strerror or err})"
+    if p.returncode != 0:
+        tail = (p.stderr.strip().splitlines() or [""])[-1]
+        return None, f"`claude agents --json` exited {p.returncode}" + (f": {tail}" if tail else "")
+    try:
+        data = json.loads(p.stdout)
+    except ValueError:
+        return None, "`claude agents --json` did not print JSON"
+    if not isinstance(data, list):
+        return None, "`claude agents --json` did not print a JSON array"
+    return [e for e in data if isinstance(e, dict)], None
+
+
+def read_fleet_into(box):
+    """read_fleet() for the reader thread: an unexpected error becomes the reason, never a traceback."""
+    try:
+        box["fleet"] = read_fleet()
+    except Exception as err:
+        box["fleet"] = (None, f"`claude agents --json` failed: {type(err).__name__}: {' '.join(str(err).split())}")
+
+
+def session_text(e):
+    """'<name> <status> (<waitingFor>)'; fields may be absent."""
+    sid = e.get("sessionId")
+    name = e.get("name") or (str(sid)[:8] if sid else None) or (f"pid {e['pid']}" if e.get("pid") else "session")
+    return f"{name} {e.get('status') or 'unknown'}" + (f" ({e['waitingFor']})" if e.get("waitingFor") else "")
+
+
+def fleet_text(e):
+    cwd = e.get("cwd")
+    where = os.path.basename(cwd.rstrip(os.sep)) or cwd if isinstance(cwd, str) and cwd else "unknown cwd"
+    return f"{session_text(e)} in {where}" + (" [background]" if e.get("kind") == "background" else "")
+
+
+# --------------------------------------------------------------- output
+def git_text(g):
+    if not g.get("repo"):
+        return "not a git repo"
+    if g.get("error"):
+        return g["error"]
+    parts = [g["branch"] or "unknown branch", f"{g['uncommitted']} uncommitted"]
+    if g["upstream"]:
+        if g["ahead"] is None:
+            parts.append(f"upstream {g['upstream']} is gone")
+        elif g["ahead"] == g["behind"] == 0:
+            parts.append(f"up to date with {g['upstream']}")
+        else:
+            parts.append(f"{g['ahead']} ahead / {g['behind']} behind {g['upstream']}")
+    c = g["last_commit"]
+    parts.append(f"last commit {c['age']}: {c['subject']}" if c else "no commits yet")
+    return ", ".join(parts)
+
+
+def markdown(reports, fleet, fleet_error, registered):
+    out = []
+    if not registered:
+        out += ["No projects registered: `harness-projects discover` lists candidates, "
+                "`harness-projects add <path>` registers one.", ""]
+    for r in reports:
+        out.append(f"## {r['name']} `{r['path']}`")
+        if r["error"]:
+            out += [f"- {r['error']}", ""]
+            continue
+        out.append(f"- git: {git_text(r['git'])}")
+        out.append(f"- last session: {r['last_session']['age'] if r['last_session'] else 'none recorded'}")
+        if r["next"]:
+            out += ["- next:"] + [f"  - {line}" for line in r["next"]]
+        else:
+            out.append("- next: none recorded")
+        if r["latest_spec"]:
+            out.append(f"- latest spec: {r['latest_spec']}")
+        if r["billable"]:
+            h = r["hours_this_month"]
+            out.append(f"- hours this month: {h:.2f}" if h is not None else "- hours this month: no worklog/worklog.csv")
+        if r["sessions"] is not None:
+            out.append("- sessions: " + (", ".join(session_text(e) for e in r["sessions"]) or "none"))
+        out.append("")
+    out.append("## Fleet")
+    if fleet_error:
+        out.append(f"- could not read the fleet: {fleet_error}")
+    elif not fleet:
+        out.append("- no sessions running")
+    else:
+        out += [f"- {fleet_text(e)}" for e in sorted(fleet, key=lambda e: e.get("status") != "waiting")]
+    return "\n".join(out)
+
+
+def main():
+    ap = Parser(prog="harness-standup", description="The cross-project standup: every registered project, "
+                                                    "then the fleet of running Claude Code sessions.")
+    ap.add_argument("project", nargs="?", help="only this project, by name or path")
+    ap.add_argument("--json", action="store_true", help="print the structure behind the Markdown")
+    args = ap.parse_args()
+    now = time.time()
+    deadline = time.monotonic() + BUDGET
+    try:
+        registered = load_projects()
+        projects = [pick(registered, args.project)] if args.project else registered
+    except Problem as err:
+        sys.exit(f"harness-standup: {err}")
+    box = {}
+    reader = threading.Thread(target=read_fleet_into, args=(box,), daemon=True)
+    reader.start()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(projects)))) as pool:
+        reports = list(pool.map(lambda p: report(p, deadline, now), projects))
+    reader.join(FLEET_TIMEOUT + 1)
+    fleet, fleet_error = box.get("fleet", (None, f"`claude agents --json` timed out after {FLEET_TIMEOUT} s"))
+    if fleet is not None:
+        for r in reports:
+            if not r["error"]:
+                r["sessions"] = [e for e in fleet if under(e.get("cwd"), r["path"])]
+    if args.json:
+        print(json.dumps({"generated": dt.datetime.fromtimestamp(now).astimezone().isoformat(timespec="seconds"),
+                          "projects": reports, "fleet": fleet, "fleet_error": fleet_error}, indent=2,
+                         ensure_ascii=False))
+    else:
+        print(markdown(reports, fleet, fleet_error, bool(registered)))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:                      # the reader went away (| head): stop quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
+    except Exception as err:                     # never a traceback: one line, exit 1
+        sys.exit(f"harness-standup: {type(err).__name__}: {' '.join(str(err).split())}")

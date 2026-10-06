@@ -26,7 +26,7 @@ Eight steps, about twenty minutes, all in a terminal.
 4. **Look around.** Type `/hooks` and expect Notification, SessionStart, PostToolUse and Stop entries from the harness plugin. Type `/plugin`, open the Installed tab, and see harness and companion. Type `/` and scroll to the `/harness:` commands. The robot sits above the prompt; `/companion` hides it, and again shows it.
 5. **Register your projects.** In that session, ask Claude to run `harness-projects discover`, then `harness-projects add <path>` for each repo it found. Mark the client work billable: `harness-projects add ~/jotform-glow-sync --billable --client "Global G.L.O.W."`. Outside a session the tool lives at `~/portfolio_projects/Harness/plugins/harness/bin/harness-projects`.
 6. **Run the first brief.** `/harness:standup` lists each project's state, its next steps and the sessions that are open.
-7. **VS Code needs nothing extra.** The extension reads the same settings files, so the agents, commands and hooks are there too, and the robot draws as an SVG in the panel.
+7. **VS Code: the robot lives in its terminal.** The extension reads the same settings files, so the agents, commands and hooks work in its chat panel too, but the band above the prompt exists only in a terminal and in the desktop app. In VS Code, open the integrated terminal and run `claude` there to see the robot.
 8. **Tidy FantasyHockey when convenient.** Its repo has the kit installed but no commits yet. A session there can commit it, and its verify-on-stop is already configured through `CLAUDE_VERIFY_CMD`.
 
 ## The console: several projects at once
@@ -75,7 +75,7 @@ The robot tells you the session's state without reading the transcript.
 | Bounces with smiling eyes | The turn finished |
 | Antenna droops | A tool call failed or the turn ended in an error |
 
-The VS Code panel and the desktop app draw it as an SVG. A terminal draws colored cells: VS Code's terminal, iTerm2 and Ghostty show its four greens exactly, Terminal.app the nearest of 256 colors.
+The band above the prompt exists in a terminal and in the desktop app, not in the VS Code chat panel. The desktop app draws the robot as an SVG; a terminal draws colored cells: VS Code's integrated terminal, iTerm2 and Ghostty show its four greens exactly, Terminal.app the nearest of 256 colors.
 
 Quota is the thing to watch on a subscription. `/usage` shows the five-hour and seven-day windows, `/cost` what this session has used, `/context` what fills the window. Fable is the most expensive tier, so the routing rule keeps most tokens on Opus. For a simple session you can run the orchestrator itself on Opus with `/model opus`, and `/effort` changes the reasoning effort for the session. The defaults live under `modelSettings` in `~/.claude/settings.json`.
 
@@ -85,9 +85,9 @@ Most problems have a one-command check.
 
 | Symptom | Check |
 | --- | --- |
-| `/hooks` lists nothing from the harness | Trust the folder (start `claude` there and accept), then `/reload-plugins`. `claude --debug hooks` shows every hook run with its exit code |
+| `/hooks` lists nothing from the harness | Trust the folder (start `claude` there and accept), then `/reload-plugins`. `claude --debug hooks` logs every hook run with its exit code to `~/.claude/debug/<session-id>.txt`; it prints nothing in the terminal |
 | A plugin shows an error | `/plugin`, Errors tab. In a terminal, `claude plugin list` and `claude plugin validate ~/portfolio_projects/Harness` |
-| No robot above the prompt | `/companion` toggles it. A survey can hold the band for a while, and a window under 36 columns shows the sprite alone. `claude --debug` writes a line starting `ui.render (AbovePrompt)` when a drawing was refused |
+| No robot above the prompt | `/companion` toggles it. The band exists only in a terminal or the desktop app, never in the VS Code chat panel. A survey can hold it for a while, and a window under 36 columns shows the sprite alone. `claude --debug` writes a line starting `ui.render (AbovePrompt)` when a drawing was refused |
 | Claude keeps working after you expected it to stop | Verify-on-stop ran the project's `CLAUDE_VERIFY_CMD` and it failed; the reason is in the transcript. It gives up after two tries. Raise `CLAUDE_VERIFY_TIMEOUT`, or remove the `env` entry to turn it off |
 | An edit was blocked for a secret | Move the value to the environment or a gitignored file. A fixtures file with fake tokens can carry the line `harness: allow-secrets` |
 | No notifications | `brew list terminal-notifier`; allow terminal-notifier under System Settings, Notifications; check that a Focus mode is not hiding banners |
