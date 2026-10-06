@@ -2,7 +2,7 @@
 
 Ryan's personal Claude Code harness: one repository that installs the same agents, skills, hooks and a companion sprite into every project, without touching any project's own guardrails.
 
-Built 2026-10-06 against Claude Code 2.1.285 (CLI) and 2.1.289 (VS Code extension). The design and every contract live in [docs/design.md](docs/design.md). The starter kit this grew out of is kept under [claude-code-starter-macos/](claude-code-starter-macos/), and its claims were checked one by one in [docs/verification.md](docs/verification.md).
+Built 2026-10-06 against Claude Code 2.1.285 (CLI) and 2.1.289 (VS Code extension). New to the CLI or to harnesses? Start with the [first-run guide](docs/guide.md). The design and every contract live in [docs/design.md](docs/design.md). The starter kit this grew out of is kept under [claude-code-starter-macos/](claude-code-starter-macos/), and its claims were checked one by one in [docs/verification.md](docs/verification.md).
 
 ## What is in here
 
