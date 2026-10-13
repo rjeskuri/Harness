@@ -56,6 +56,59 @@ CODER_ON_CONFIG = (
     "{rel} decides which tests run and how, so it is fixed for this ticket like the "
     "tests. If it has to change, stop and ask the orchestrator."
 )
+BREAKER_ON_TEST = (
+    "Tests are fixed for this ticket: find the cheapest source change that passes them, "
+    "and if there is none, report that."
+)
+# git forms that rewrite the working tree wholesale: they touch every test file.
+BULK_GIT_FORMS = (
+    "git checkout -- .",
+    "git checkout .",
+    "git checkout HEAD -- .",
+    "git checkout -- src",
+    "git checkout HEAD src",
+    "git restore .",
+    "git restore -- .",
+    "git restore --source=HEAD --worktree .",
+    "git restore src",
+    "git reset --hard",
+    "git reset --hard HEAD",
+    "git reset --merge",
+    "git reset --merge ORIG_HEAD",
+    "git stash",
+    "git stash -u",
+    "git stash push",
+    "git stash push -m wip",
+    "git stash pop",
+    "git stash apply",
+    "git stash apply stash@{0}",
+    "git stash drop",
+    "git clean -fd",
+    "git clean -fdx",
+)
+# Writers whose paths cannot be seen: patch reading the files from the diff, find -exec.
+# (command, the part the reason quotes)
+HIDDEN_WRITER_FORMS = (
+    ("patch -p1 < fix.diff", "patch -p1 < fix.diff"),
+    ("patch -R -p1 < fix.diff", "patch -R -p1 < fix.diff"),
+    ("patch -p0 -i fix.diff", "patch -p0 -i fix.diff"),
+    ("patch -d tests -p1 < fix.diff", "patch -d tests -p1 < fix.diff"),
+    ("git diff HEAD | patch -p1", "patch -p1"),
+    (
+        "find . -name '*.py' -exec sed -i '' 's/pass/assert 0/' {} +",
+        "find . -name '*.py' -exec sed -i '' 's/pass/assert 0/' {} +",
+    ),
+    ("find tests -type f -exec rm {} \\;", "find tests -type f -exec rm {} \\;"),
+    (
+        "find . -name '*.py' -execdir perl -pi -e 's/a/b/' {} +",
+        "find . -name '*.py' -execdir perl -pi -e 's/a/b/' {} +",
+    ),
+    ("find . -type f -exec touch {} +", "find . -type f -exec touch {} +"),
+    (
+        "find . -name 'test_*.py' -exec cp /dev/null {} \\;",
+        "find . -name 'test_*.py' -exec cp /dev/null {} \\;",
+    ),
+)
 INLINE = "Write files with Edit or Write so the tests-first rules can see the path."
 NO_RED = (
     "Tests first on t/12: write the tests, then run harness-red check. "
@@ -1079,6 +1132,131 @@ class TestsFirstTests(GuardTestCase):
         reads = """python3 -c "print(open('src/app.py').read())\""""
         self.assertIsNone(self.bash(reads, "harness:coder"))
         self.assertIsNone(self.bash(command, "harness:coder", cwd=self.tmp))  # no repo
+
+    # ---- forms that touch every test file, and writers whose paths cannot be seen
+
+    def commit_test_under_src(self) -> None:
+        """A test file inside src/ on the ticket branch, so a checkout of the src
+        directory reaches a test however the directory is read."""
+        self.write(self.wt / "src/pkg/test_thing.py", "def test_thing():\n    pass\n")
+        self.git(self.wt, "add", "-A")
+        self.git(self.wt, "commit", "-q", "-m", "Add a test under src")
+
+    def assertRefusedAs(self, reason, part: str, why: str) -> None:
+        self.assertIsNotNone(reason, f"{part!r} was allowed")
+        self.assertTrue(reason.startswith(f'Refused "{part}": '), reason)
+        self.assertIn(why, reason)
+
+    def test_bulk_git_forms_are_refused_to_the_coder_and_breaker(self):
+        self.commit_test_under_src()
+        self.cache()
+        self.red()  # a current red run: only the role rules can refuse
+        for command in BULK_GIT_FORMS:
+            with self.subTest(command=command, agent="harness:coder"):
+                self.assertRefusedAs(
+                    self.bash(command, "harness:coder"), command, CODER_ON_TEST
+                )
+            with self.subTest(command=command, agent="harness:test-breaker"):
+                self.assertRefusedAs(
+                    self.bash(command, "harness:test-breaker"), command, BREAKER_ON_TEST
+                )
+
+    def test_bulk_git_forms_are_allowed_to_the_test_author(self):
+        self.commit_test_under_src()
+        self.cache()
+        self.red()
+        for agent in ("harness:test-author", "test-author"):
+            for command in BULK_GIT_FORMS:
+                with self.subTest(command=command, agent=agent):
+                    self.assertIsNone(self.bash(command, agent))
+
+    def test_bulk_git_forms_follow_the_directory(self):
+        self.commit_test_under_src()
+        self.cache()
+        self.red()
+        wt = self.wt
+        for cwd, command, part in (
+            (wt, "cd src && git checkout -- .", "git checkout -- ."),
+            (wt, "cd src && git restore .", "git restore ."),
+            (self.repo, f"git -C {wt} checkout -- .", f"git -C {wt} checkout -- ."),
+            (self.repo, f"git -C {wt} reset --hard", f"git -C {wt} reset --hard"),
+            (self.repo, f"cd {wt} && git stash", "git stash"),
+            (self.repo, f"(cd {wt} && git clean -fd)", "git clean -fd"),
+            (self.repo, f"cd {wt} && patch -p1 < fix.diff", "patch -p1 < fix.diff"),
+        ):
+            with self.subTest(command=command):
+                why = INLINE if "patch" in command else CODER_ON_TEST
+                self.assertRefusedAs(self.bash(command, "harness:coder", cwd), part, why)
+
+    def test_bulk_git_forms_are_refused_in_the_breaker_scratch_worktree(self):
+        self.red()
+        scratch = self.state / "scratch" / "t-12-fix-login"
+        scratch.parent.mkdir(parents=True)
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(scratch), BRANCH)
+        breaker = "harness:test-breaker"
+        for command in (
+            "git checkout -- .",
+            "git reset --hard",
+            "git stash",
+            "git clean -fd",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedAs(
+                    self.bash(command, breaker, cwd=scratch), command, BREAKER_ON_TEST
+                )
+
+    def test_hidden_writers_are_refused_to_the_roles(self):
+        self.cache()
+        self.red()
+        for command, part in HIDDEN_WRITER_FORMS:
+            for agent in ("harness:coder", "harness:test-author", "harness:test-breaker"):
+                with self.subTest(command=command, agent=agent):
+                    reason = self.bash(command, agent)
+                    self.assertRefusedAs(reason, part, INLINE)
+                    self.assertTrue(reason.endswith(INLINE), reason)
+            # the main session, other agents and places outside a repo are left alone
+            with self.subTest(command=command, agent=None):
+                self.assertIsNone(self.bash(command))
+                self.assertIsNone(self.bash(command, "harness:reviewer"))
+                self.assertIsNone(self.bash(command, "harness:coder", cwd=self.tmp))
+
+    def test_reads_and_narrow_forms_stay_allowed(self):
+        self.cache()
+        self.red()
+        for command in (
+            "git stash list",
+            "git stash show",
+            "git stash show -p stash@{0}",
+            "git checkout -- src/app.py",
+            "git restore src/app.py",
+            "git restore --staged .",
+            "git checkout -b spike",
+            "git reset --soft HEAD",
+            "git reset -q HEAD -- tests/test_app.py",
+            "git clean -n",
+            "find . -name '*.py'",
+            "find tests -type f -print",
+            "find . -name '*.py' -exec grep -l login {} +",
+            "find . -exec sed -n 1p {} \\;",
+            "find . -name '*.py' -exec wc -l {} +",
+            "patch --dry-run -p1 < fix.diff",
+            "patch -p1 src/app.py < fix.diff",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(self.bash(command, "harness:coder"))
+
+    def test_bulk_and_hidden_forms_are_left_alone_off_a_ticket_branch(self):
+        self.commit_test_under_src()
+        commands = list(BULK_GIT_FORMS) + [c for c, _ in HIDDEN_WRITER_FORMS]
+        roles = ("harness:coder", "harness:test-breaker", "harness:test-author")
+        for command in commands:  # the main checkout, on main
+            for agent in roles:
+                with self.subTest(command=command, agent=agent, where="main"):
+                    self.assertIsNone(self.bash(command, agent, cwd=self.repo))
+        self.git(self.wt, "switch", "-q", "-c", "feature/login")
+        for command in commands:
+            with self.subTest(command=command, where="feature/login"):
+                self.assertIsNone(self.bash(command, "harness:coder"))
 
     def test_other_branches_and_places_are_left_alone(self):
         self.assertIsNone(self.edit("src/app.py", root=self.repo))  # main
