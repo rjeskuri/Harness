@@ -167,6 +167,9 @@ The harness comments on a ticket as it moves: `Started on <branch> (...)`, `Pull
 
 <the PR body's whole ## Summary section>
 
+Notes:
+<the PR body's ## Notes section, when `harness-pr open --notes` added one>
+
 Files changed (<n>):
 - `<path>`            (one per file, every file the PR changes)
 

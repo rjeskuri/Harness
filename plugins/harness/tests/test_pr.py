@@ -2107,6 +2107,27 @@ class OpenNotes(WorktreeTest):
         self.assertEqual(self.gh_calls(), [])
         self.assertFalse(any(line.startswith("git") and " push " in line for line in self.order()), self.order())
 
+    def test_a_notes_file_with_a_second_level_heading_is_refused(self):
+        """A `## ` line outside a code fence would end the Notes section early and land would drop the rest, so
+        `open` refuses the file before anything is pushed. `###` headings and fenced `## ` lines are fine."""
+        cases = {"Out of scope": "## Out of scope\n- `legacy/frob_old.py` left alone.\n",
+                 "Follow-ups": "Second pass: fixed the loop.\n\n## Follow-ups\nTicket the cleanup.\n",
+                 "Why it rode along": "Text first.\n```\n## fenced, fine\n```\n## Why it rode along   \nmore\n"}
+        for heading, text in cases.items():
+            with self.subTest(heading=heading):
+                self.scenario([])
+                path = write(os.path.join(self.tmp, "second-pass-notes.md"), text)
+                p = self.pr("open", "12", "--verify-log", self.verify_log, "--notes", path, cwd=self.wt)
+                self.assertOneLineError(p, "second-pass-notes.md", heading)
+                self.assertNotIn("unrecognized", p.stderr)
+                self.assertEqual(self.gh_calls(), [])
+                self.assertEqual(self.stub_calls("harness-board"), [])
+                self.assertFalse(any(line.startswith("git") and " push " in line for line in self.order()),
+                                 self.order())
+        # the same file without its heading line is accepted, so the refusal is about the heading
+        body = self.open_body("Second pass: fixed the loop.\n\n### Follow-ups\nTicket the cleanup.\n")
+        self.assertIn("### Follow-ups", body)
+
     # ------------------------------------------------------------------ land
     resolution_calls = LandResolution.resolution_calls
     posted = LandResolution.posted
@@ -2158,6 +2179,28 @@ class OpenNotes(WorktreeTest):
                     self.assertNotIn(left_out, resolution)
                 # the Notes do not swallow the Definition of done that follows them in the PR body
                 self.assertEqual(resolution.count("Definition of done:"), 1)
+
+    def test_notes_do_not_replace_the_resolutions_proof_lines(self):
+        """Notes sit ahead of `## Tests` in the PR body. A `Red run ...` line and a `Verify:` label with a fence
+        inside the Notes are the Notes' own text: the Resolution's red-run and verify lines come from the Tests."""
+        notes = ("Second pass.\n\nRed run of the added test: assertion, exit 1.\n\nVerify:\n```\n"
+                 "notes-only check output\nNOTES VERIFY PASSED\n```\nThat is all.")
+        for fx, red, verify in ((FIXTURE_A, "Red run before implementation (assertion, exit 1)", "OK (skipped=1)"),
+                                (FIXTURE_B, "Red run before implementation (import, exit 2)",
+                                 "VERIFY PASSED: 212 checks, 0 warnings")):
+            with self.subTest(pr=fx["pr"]):
+                resolution = self.land_with_notes(fx, notes)
+                lines = resolution.rstrip().splitlines()
+                self.assertEqual([x for x in lines if x.startswith("Red run before implementation")], [red])
+                self.assertEqual([x for x in lines if x.startswith("Verify: ")], [f"Verify: {verify}"])
+                self.assertNotIn("Verify: NOTES VERIFY PASSED", resolution)
+                # the Notes still appear, whole, ahead of the closing block that holds the real lines
+                self.assertEqual(resolution.count(notes), 1)
+                closing = resolution.index(red)
+                self.assertLess(resolution.index(notes), closing)
+                self.assertLess(closing, resolution.index(f"Verify: {verify}"))
+                pr_line = f"PR: https://github.com/o/r/pull/{fx['pr']}"
+                self.assertLess(resolution.index(f"Verify: {verify}"), resolution.index(pr_line))
 
     def test_resolution_without_notes_has_no_notes(self):
         self.scenario(self.resolution_calls(FIXTURE_A))

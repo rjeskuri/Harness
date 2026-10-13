@@ -671,6 +671,10 @@ def cmd_open(args):
     verify_text = read_text(args.verify_log, "verify log") if args.verify_log else None
     notes_text = read_text(args.notes, "notes file") if args.notes else None
     notes = notes_text.rstrip().strip("\n") if notes_text and notes_text.strip() else None
+    heading = second_level_heading(notes)
+    if heading:
+        raise Problem(f"notes file {args.notes} has a `## {heading}` heading, which would end the Notes section "
+                      "early; use `###` or put it in a code fence")
     findings = load_findings(args.review) if args.review else None
     ticket = show_ticket(repo, number)
     body = pr_body(number, ticket, red_record(repo), verify_text, findings, notes)
@@ -1309,6 +1313,34 @@ def ticket_parent(repo, number):
     return n if isinstance(n, int) and n > 0 else None
 
 
+def second_level_heading(text):
+    """The text of the first `## ` heading outside a code fence in `text`, else None."""
+    fenced = False
+    for line in (text or "").splitlines():
+        if FENCE.match(line):
+            fenced = not fenced
+        elif not fenced:
+            m = HEADING.match(line)
+            if m:
+                return m.group(1).strip()
+    return None
+
+
+def without_section(body, name):
+    """`body` minus the `## <name>` section (heading to the next `## ` heading, fences respected)."""
+    kept, skipping, fenced = [], False, False
+    for line in (body or "").splitlines():
+        if FENCE.match(line):
+            fenced = not fenced
+        elif not fenced:
+            m = HEADING.match(line)
+            if m:
+                skipping = m.group(1).strip().rstrip(":").strip().lower() == name
+        if not skipping:
+            kept.append(line)
+    return "\n".join(kept)
+
+
 def body_sections(body):
     """{lower-cased `## ` heading: its text, surrounding blank lines dropped}; headings in code fences do not
     count."""
@@ -1378,7 +1410,7 @@ def resolution_body(data, files, sha, url):
     the squash sha. What the body lacks is left out."""
     body = data.get("body") or ""
     sections = body_sections(body)
-    red, verify = evidence(body)
+    red, verify = evidence(without_section(body, "notes"))     # the proof lines are the Tests', not the Notes'
     url = data.get("url") or url
     parts = [RESOLUTION]
     if sections.get("summary", "").strip():
