@@ -32,6 +32,7 @@ import signal
 import subprocess
 import sys
 import time
+import unicodedata
 
 GH_BUDGET = 6             # seconds for one project's gh and git calls (the gh calls run side by side)
 STALE_DAYS = 7            # a ticket worktree with no commit for this long and no open PR is stale
@@ -78,9 +79,47 @@ def same_path(a, b):
     return os.path.realpath(os.path.abspath(os.path.expanduser(a))) == os.path.realpath(os.path.abspath(os.path.expanduser(b)))
 
 
+def canonical_path(path):
+    """The real path of `path` with each component spelled as its parent directory lists
+    it, so every spelling of one directory on a case-insensitive file system gives one
+    string. From the first component that cannot be found on, the rest stays as spelled."""
+    real = os.path.realpath(path)
+    done, parts = os.sep, [part for part in real.split(os.sep) if part]
+    for i, part in enumerate(parts):
+        try:
+            names = os.listdir(done)
+        except OSError:
+            return os.path.join(done, *parts[i:])
+        if part not in names:
+            fold = unicodedata.normalize("NFC", part).casefold()
+            given = os.path.join(done, part)
+            for name in names:
+                if unicodedata.normalize("NFC", name).casefold() == fold and same_entry(
+                    given, os.path.join(done, name)
+                ):
+                    part = name
+                    break
+            else:
+                return os.path.join(done, *parts[i:])
+        done = os.path.join(done, part)
+    return done
+
+
+def same_entry(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def path_key(path):
+    """The first 12 hex digits of the sha1 of the path string as it is spelled."""
+    return hashlib.sha1(str(path).encode("utf-8", "surrogateescape")).hexdigest()[:12]
+
+
 def repo_key(path):
-    """The state key of a main working tree: the first 12 hex digits of the sha1 of its real path."""
-    return hashlib.sha1(os.path.realpath(path).encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    """The state key of a main working tree: path_key of its canonical path."""
+    return path_key(canonical_path(path))
 
 
 def age(then, now):
@@ -385,11 +424,11 @@ def run_project(record, filename, projects):
     """The registered project a run belongs to (by its repo field, else its file's key), else a short name."""
     repo = record.get("repo") if isinstance(record.get("repo"), str) else ""
     for p in projects:
-        if repo and (p["name"] == repo or same_path(p["path"], repo)):
+        if repo and (p["name"] == repo or same_path(p["path"], repo) or repo_key(p["path"]) == repo_key(repo)):
             return p["name"]
     key = os.path.basename(filename)[:12]
-    for p in projects:
-        if repo_key(p["path"]) == key:
+    for p in projects:                  # the canonical key, or the old key of the registered spelling
+        if key in (repo_key(p["path"]), path_key(os.path.realpath(p["path"]))):
             return p["name"]
     return (os.path.basename(repo.rstrip("/")) or repo) if repo else key
 
