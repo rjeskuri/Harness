@@ -770,8 +770,25 @@ class Runs(WorkTest):
                  result="API Error: 500 Internal server error while validating the API key"),
             dict(API_401, api_error_status=503,
                  result="API Error: 503 Service unavailable; API key checks are degraded"),
+            # An explicit 429 or 5xx stays transient even when the text names the helper or the workspace header.
+            dict(API_401, api_error_status=503, result=API_401_HELPER["result"].replace("401", "503", 1)),
+            dict(API_401, api_error_status=429, result=API_400_WORKSPACE["result"].replace("400", "429", 1)),
+            # Other 4xx: only the text tells auth from error, and these name neither key, helper nor header.
             dict(API_401, api_error_status=400,
                  result="API Error: 400 prompt is too long: 212000 tokens > 200000 maximum"),
+            dict(API_401, api_error_status=400,
+                 result="API Error: 400 messages.0.content: Input should be a valid list"),
+            dict(API_401, api_error_status=404, result="API Error: 404 model: claude-foo not found"),
+            dict(API_401, api_error_status=413, result="API Error: 413 Request too large"),
+            dict(API_401, api_error_status=400,
+                 result="API Error: 400 invalid_request_error: tool_use ids must be unique"),
+            dict(API_401, api_error_status=408, result="API Error: 408 Request timeout"),
+            dict(API_401, api_error_status=409, result="API Error: 409 Conflict"),
+            # terminal_reason api_error without a status, and nothing about a key in the text.
+            {k: v for k, v in dict(API_401, result="API Error: Connection error.").items()
+             if k != "api_error_status"},
+            {k: v for k, v in dict(API_401, result="API Error: Request timed out.").items()
+             if k != "api_error_status"},
             own_words,
             dict(own_words, result="Your apiKeyHelper script is failing, so I added a retry to it."),
         ]
@@ -783,7 +800,7 @@ class Runs(WorkTest):
 
         # A run that succeeded is ok whatever its text says.
         ok = {"type": "result", "is_error": False, "result": API_400_WORKSPACE["result"]}
-        self.assertEqual(self.sweep_one(30, ok)["outcome"], "ok")
+        self.assertEqual(self.sweep_one(50, ok)["outcome"], "ok")
         self.assertFalse(os.path.exists(self.budgets_path()))
 
     def test_sweep_closes_a_bg_run_on_any_state_that_is_not_live(self):
