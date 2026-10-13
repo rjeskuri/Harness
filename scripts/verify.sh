@@ -4,7 +4,6 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-# No checks yet: add this project's lint and test commands here, one per line.
-true
+python3 -m unittest discover -s plugins/harness/tests
 
 echo VERIFY OK
