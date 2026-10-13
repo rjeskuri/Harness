@@ -621,8 +621,9 @@ class Dispatch(WorkTest):
         self.scenario(issues=[in_progress])
         p = self.ok("dispatch", "--dry-run")                   # three: the fourth dispatch skips it
         self.assertNotIn("would start", p.stdout)
-        self.assertIn("skip #12: 3 runs ended without a pull request in 7 days, the last error", p.stdout)
-        self.assertIn("harness-board status 12 ready", p.stdout)
+        self.assertIn("skip #12: 3 runs ended without a pull request in 7 days (last: error at ", p.stdout)
+        self.assertIn("run it in this session with /harness:work 12, or wait for the window", p.stdout)
+        self.assertNotIn("harness-board status 12 ready", p.stdout)
         data = self.ok_json("dispatch", "--dry-run", "--json")
         self.assertEqual(data["plan"], [])
         self.assertEqual([s["number"] for s in data["skipped"]], [12])
@@ -633,6 +634,345 @@ class Dispatch(WorkTest):
         self.assertEqual(self.claude_calls(), [])
         self.assertEqual(len(self.run_records()), 3)
         self.assertFalse([c for c in self.gh_calls() if c[:2] in (["issue", "edit"], ["issue", "comment"])])
+
+
+IN_PROGRESS = ("task", "status:in-progress", "size:S", "risk:low")
+
+
+class RedispatchCap(WorkTest):
+    """Ticket #29: the redispatch-cap skip names the way forward (finish it in this session), carries its numbers
+    in --json, and `runs` marks the capped ticket's newest ended record. The time in the skip line is the last
+    run's `ended_at` exactly as the record holds it (ISO-8601 UTC, `...Z`), which is how harness-work prints every
+    other time (budget reasons, run records). The cap itself (3 ended runs in 7 days) is unchanged."""
+
+    def ended(self, ticket, outcomes, hours_ago):
+        """One ended headless run per outcome, oldest first; hours_ago[i] is when run i ended. Returns the records."""
+        records = []
+        for i, (outcome, hours) in enumerate(zip(outcomes, hours_ago)):
+            records.append(self.write_run(
+                ticket, id=f"{self.key}-{ticket}-2026100{i + 1}090000", pid=self.dead_pid(),
+                started_at=iso_ago(hours=hours + 1), ended_at=iso_ago(hours=hours), outcome=outcome))
+        return records
+
+    def skip_why(self, ticket, runs, last):
+        return (f"{runs} runs ended without a pull request in 7 days (last: {last['outcome']} at "
+                f"{last['ended_at']}); run it in this session with /harness:work {ticket}, or wait for the window")
+
+    def capped_pair(self):
+        """#12: three ended runs, the last ok; #15: four, the last billing. Both in progress without a PR."""
+        first = self.ended(12, ["error", "error", "ok"], [30, 20, 10])
+        second = self.ended(15, ["error", "ok", "error", "billing"], [60, 50, 40, 5])
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS), issue(15, labels=IN_PROGRESS, title="Second")])
+        return first[-1], second[-1]
+
+    def test_the_skip_names_the_in_session_path_and_the_window(self):
+        last12, last15 = self.capped_pair()
+        why12, why15 = self.skip_why(12, 3, last12), self.skip_why(15, 4, last15)
+
+        p = self.ok("dispatch", "--dry-run")                   # the dry run prints the new line, per ticket
+        self.assertIn("skip #12: " + why12, p.stdout.splitlines())
+        self.assertIn("skip #15: " + why15, p.stdout.splitlines())
+        self.assertNotIn("would start", p.stdout)
+        self.assertNotIn("harness-board status", p.stdout)
+        self.assertNotIn("by hand", p.stdout)
+
+        data = self.ok_json("dispatch", "--dry-run", "--json")   # --json carries the numbers and the advice
+        self.assertEqual(data["plan"], [])
+        by_number = {s["number"]: s for s in data["skipped"]}
+        self.assertEqual(sorted(by_number), [12, 15])
+        self.assertEqual(by_number[12], {"number": 12, "why": why12, "runs": 3, "window_days": 7,
+                                         "advice": "/harness:work 12"})
+        self.assertEqual(by_number[15], {"number": 15, "why": why15, "runs": 4, "window_days": 7,
+                                         "advice": "/harness:work 15"})
+
+        p = self.ok("dispatch")                                # for real: nothing started, the same lines said
+        self.assertIn("skip #12: " + why12, p.stdout.splitlines())
+        self.assertIn("skip #15: " + why15, p.stdout.splitlines())
+        self.assertEqual(self.claude_calls(), [])
+        self.assertEqual(len(self.run_records()), 7)
+        real = self.ok_json("dispatch", "--json")
+        self.assertEqual({s["number"]: (s["why"], s["runs"], s["window_days"], s["advice"]) for s in real["skipped"]},
+                         {12: (why12, 3, 7, "/harness:work 12"), 15: (why15, 4, 7, "/harness:work 15")})
+        self.assertEqual(real["launched"], [])
+        self.assertEqual(self.claude_calls(), [])
+
+    def test_the_skip_text_follows_the_last_run_not_the_first(self):
+        records = self.ended(12, ["billing", "error", "auth"], [40, 30, 20])
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS)])
+        p = self.ok("dispatch", "--dry-run")
+        self.assertIn("skip #12: " + self.skip_why(12, 3, records[-1]), p.stdout.splitlines())
+        for earlier in records[:-1]:
+            self.assertNotIn(earlier["ended_at"], p.stdout)
+
+    def test_a_ticket_under_the_cap_is_redispatched_with_no_skip(self):
+        self.ended(13, ["error", "ok"], [30, 10])                       # two ended runs
+        self.ended(16, ["error", "error", "ok"], [24 * 8, 20, 10])      # three, one outside the 7 days
+        self.scenario(issues=[issue(13, labels=IN_PROGRESS, title="Two"),
+                              issue(16, labels=IN_PROGRESS, title="Straddling")])
+        p = self.ok("dispatch", "--dry-run")
+        self.assertIn("would start #13 Two (again after ok) and launch headless", p.stdout)
+        self.assertIn("would start #16 Straddling (again after ok) and launch headless", p.stdout)
+        self.assertNotIn("skip #", p.stdout)
+        data = self.ok_json("dispatch", "--dry-run", "--json")
+        self.assertEqual(data["skipped"], [])
+        self.assertEqual([row["number"] for row in data["plan"]], [13, 16])
+
+    def test_other_skips_carry_no_cap_fields(self):
+        self.ended(12, ["error", "error", "ok"], [30, 20, 10])
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS), issue(13), issue(14)],
+                      ready=[ready_row(13, "Second"), ready_row(14, "Third")])
+        data = self.ok_json("dispatch", "--dry-run", "--max", "1", "--json")
+        by_number = {s["number"]: s for s in data["skipped"]}
+        self.assertEqual(by_number[14]["why"], "over --max 1")
+        self.assertEqual(sorted(by_number[12]), ["advice", "number", "runs", "why", "window_days"])
+        self.assertNotIn("advice", by_number[14])
+        self.assertNotIn("runs", by_number[14])
+
+    def row_for(self, text, record):
+        [row] = [line for line in text.splitlines() if record["id"] in line]
+        return row
+
+    def test_runs_marks_the_capped_ticket(self):
+        capped = self.ended(12, ["error", "error", "ok"], [30, 20, 10])      # newest ended run is the third
+        also = self.ended(15, ["error", "ok", "error", "billing"], [60, 50, 40, 5])
+        two = self.ended(13, ["error", "ok"], [30, 10])                      # under the cap
+        straddle = self.ended(16, ["error", "error", "ok"], [24 * 8, 20, 10])  # only two inside the 7 days
+        stale = self.ended(17, ["error", "error", "ok"], [24 * 10, 24 * 9, 24 * 8])  # the window has passed
+        self.scenario(issues=[issue(n, labels=IN_PROGRESS) for n in (12, 13, 15, 16, 17)])
+
+        text = self.ok("runs", "--all").stdout
+        self.assertIn("STATE", text.splitlines()[0])
+        self.assertIn("capped", self.row_for(text, capped[-1]))
+        self.assertIn("capped", self.row_for(text, also[-1]))
+        for record in capped[:-1] + also[:-1] + two + straddle + stale:   # only the newest of a capped ticket
+            self.assertNotIn("capped", self.row_for(text, record))
+        self.assertEqual(text.count("capped"), 2)
+        # the mark is added to the state, it does not replace the outcome
+        self.assertIn("ok", self.row_for(text, capped[-1]))
+        self.assertIn("billing", self.row_for(text, also[-1]))
+
+        recent = self.ok("runs").stdout                                  # the default 24 h view marks it too
+        self.assertIn("capped", self.row_for(recent, capped[-1]))
+        self.assertEqual(recent.count("capped"), 2)
+
+    def test_runs_marks_nothing_when_no_ticket_is_capped(self):
+        records = self.ended(12, ["error", "ok"], [30, 10]) + self.ended(13, ["ok"], [5])
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS), issue(13, labels=IN_PROGRESS)])
+        text = self.ok("runs", "--all").stdout
+        for record in records:
+            self.assertIn(record["id"], text)
+        self.assertNotIn("capped", text)
+
+    # ---- what "the cap holds" means: exactly the condition under which dispatch emits the skip
+    def run_at(self, ticket, outcome, started, ended, repo=None):
+        """One ended headless run of `ticket`, started/ended that many hours ago, in `repo` (default: this one)."""
+        self.seq = getattr(self, "seq", 0) + 1
+        repo = repo or os.path.realpath(self.repo)
+        prefix = self.key if repo == os.path.realpath(self.repo) else sha12(repo)
+        return self.write_run(ticket, id=f"{prefix}-{ticket}-20261001{self.seq:06d}", repo=repo,
+                              pid=self.dead_pid(), started_at=iso_ago(hours=started), ended_at=iso_ago(hours=ended),
+                              outcome=outcome)
+
+    def three(self, ticket, repo=None):
+        """Three ended runs inside the window, oldest first."""
+        return [self.run_at(ticket, o, s, e, repo) for o, s, e in (("error", 31, 30), ("error", 21, 20),
+                                                                    ("ok", 11, 10))]
+
+    def with_prs(self, *branches):
+        """Add to the scenario, ahead of its generic `pr list` answer: a pull request for each of these branches."""
+        data = self.read_json(self.scenario_path)
+        data["calls"] = [{"match": ["pr", "list", "--head", b], "stdout_json": [{"number": 99}]}
+                         for b in branches] + data["calls"]
+        write(self.scenario_path, json.dumps(data))
+
+    def live_run_of(self, ticket):
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"/harness:work {ticket}"])
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        return self.write_run(ticket, id=f"{self.key}-{ticket}-20261001999999", pid=live.pid)
+
+    def sibling(self, name="proj2"):
+        path = os.path.join(self.tmp, name)
+        self.git(self.tmp, "clone", "-q", self.origin, path)
+        return os.path.realpath(path)
+
+    def marked(self, *extra):
+        """{ticket: [ids of its records marked capped]} from `runs --all` (plus `extra` flags), the text table and
+        --json both, which must say the same thing."""
+        records = {r["id"]: r for r in self.run_records()}
+        in_text = {}
+        for line in self.ok("runs", "--all", *extra).stdout.splitlines()[1:]:
+            ids = [rid for rid in records if rid in line]
+            self.assertEqual(len(ids), 1, line)
+            if "capped" in line:
+                in_text.setdefault(records[ids[0]]["ticket"], []).append(ids[0])
+        in_json = {}
+        for row in self.ok_json("runs", "--all", *extra, "--json"):
+            if row.get("capped"):
+                self.assertIs(row["capped"], True)
+                in_json.setdefault(row["ticket"], []).append(row["id"])
+        self.assertEqual(in_text, in_json)
+        return in_text
+
+    def skipped_by_cap(self):
+        """(sorted tickets dispatch skips for the cap, the whole dry-run --json)."""
+        data = self.ok_json("dispatch", "--dry-run", "--json")
+        return sorted(s["number"] for s in data["skipped"] if "advice" in s), data
+
+    def test_a_ticket_with_a_pull_request_is_not_capped_and_not_skipped(self):
+        self.three(12)                                       # a pull request exists for t/12-x
+        control = self.three(15)                             # none for t/15-x
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS), issue(15, labels=IN_PROGRESS, title="Second")])
+        self.with_prs("t/12-x")
+        self.assertEqual(self.marked(), {15: [control[-1]["id"]]})
+        capped, data = self.skipped_by_cap()
+        self.assertEqual(capped, [15])
+        self.assertNotIn(12, [s["number"] for s in data["skipped"]])
+        self.assertNotIn(12, [row["number"] for row in data["plan"]])
+
+    def test_a_ticket_with_a_live_run_is_not_capped_and_not_skipped(self):
+        self.three(12)
+        live = self.live_run_of(12)
+        control = self.three(15)
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS), issue(15, labels=IN_PROGRESS, title="Second")])
+        self.assertEqual(self.marked(), {15: [control[-1]["id"]]})
+        capped, data = self.skipped_by_cap()
+        self.assertEqual(capped, [15])
+        self.assertEqual(data["live"], [live["id"]])
+        self.assertNotIn(12, [s["number"] for s in data["skipped"]])
+
+    def test_a_ticket_not_in_progress_or_not_open_is_not_capped_and_not_skipped(self):
+        for n in (12, 13, 14):
+            self.three(n)
+        control = self.three(15)
+        self.scenario(issues=[issue(12, labels=("task", "status:ready", "size:S", "risk:low")),
+                              issue(13, labels=IN_PROGRESS, state="CLOSED"),
+                              issue(14, labels=("task", "status:needs-input", "size:S", "risk:low")),
+                              issue(15, labels=IN_PROGRESS, title="Control")])
+        self.assertEqual(self.marked(), {15: [control[-1]["id"]]})
+        capped, data = self.skipped_by_cap()
+        self.assertEqual(capped, [15])
+        self.assertEqual([s["number"] for s in data["skipped"]], [15])
+
+    def test_runs_of_the_same_ticket_number_in_another_repo_do_not_cap_this_repos_ticket(self):
+        other = self.sibling()
+        self.run_at(12, "error", 31, 30), self.run_at(12, "ok", 21, 20)    # two of ours ...
+        self.run_at(12, "error", 11, 10, repo=other)                       # ... and a foreign one, the newest
+        self.run_at(13, "error", 51, 50, repo=other)                       # a foreign one, the oldest ...
+        self.run_at(13, "error", 31, 30), self.run_at(13, "ok", 21, 20)    # ... and two of ours
+        control = self.three(15)
+        self.scenario(issues=[issue(n, labels=IN_PROGRESS, title=f"T{n}") for n in (12, 13, 15)])
+        self.assertEqual(self.marked(), {15: [control[-1]["id"]]})
+        capped, data = self.skipped_by_cap()
+        self.assertEqual(capped, [15])
+        self.assertEqual([row["number"] for row in data["plan"]], [12, 13])   # two of ours: redispatched
+
+    def test_the_mark_goes_to_the_latest_started_run_as_dispatch_picks_it(self):
+        # #12's runs overlap: the second started before the third but was swept later, so it ENDED newest while the
+        # third STARTED newest. Dispatch reads the record that started last (its outcome is "last: ..."); so does `runs`.
+        self.run_at(12, "error", 50, 40)
+        self.run_at(12, "ok", 45, 2)                                      # newest ended_at
+        newest_started = self.run_at(12, "billing", 30, 20)               # newest started_at
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS)])
+        self.assertEqual(self.marked(), {12: [newest_started["id"]]})
+        p = self.ok("dispatch", "--dry-run")
+        self.assertIn("skip #12: " + self.skip_why(12, 3, newest_started), p.stdout.splitlines())
+
+    def test_runs_json_adds_a_capped_flag_and_leaves_the_state_alone(self):
+        records = self.three(12)
+        under = [self.run_at(13, "error", 31, 30), self.run_at(13, "ok", 11, 10)]
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS), issue(13, labels=IN_PROGRESS, title="Two")])
+        rows = {r["id"]: r for r in self.ok_json("runs", "--all", "--json")}
+        self.assertIs(rows[records[-1]["id"]].get("capped"), True)
+        self.assertEqual(rows[records[-1]["id"]]["state"], "ended ok")        # the state is not mangled
+        for record in records[:-1] + under:
+            self.assertFalse(rows[record["id"]].get("capped"), record["id"])
+            self.assertNotIn("capped", rows[record["id"]]["state"])
+        text = self.ok("runs", "--all").stdout                                  # the table says it in STATE
+        self.assertIn("ended ok capped", self.row_for(text, records[-1]))
+
+    def test_runs_and_dispatch_agree_on_which_tickets_are_capped(self):
+        other = self.sibling()
+        cap12 = self.three(12)
+        cap16 = [self.run_at(16, o, s, e) for o, s, e in (("error", 100, 90), ("error", 80, 70),
+                                                          ("billing", 60, 50), ("auth", 11, 5))]
+        self.three(13)                                                          # has a pull request
+        self.three(14)                                                          # and a live run
+        self.live_run_of(14)
+        self.run_at(17, "error", 31, 30), self.run_at(17, "ok", 21, 20)         # two of ours ...
+        self.run_at(17, "error", 11, 10, repo=other)                            # ... and one foreign
+        self.run_at(18, "error", 24 * 8 + 1, 24 * 8)                            # one outside the window, two inside
+        self.run_at(18, "error", 21, 20), self.run_at(18, "ok", 11, 10)
+        for n in (19, 20, 21):
+            self.three(n)                                                       # ready, closed, needs-input
+        self.run_at(22, "error", 31, 30), self.run_at(22, "ok", 11, 10)         # under the cap
+        self.scenario(issues=[
+            issue(12, labels=IN_PROGRESS), issue(13, labels=IN_PROGRESS), issue(14, labels=IN_PROGRESS),
+            issue(16, labels=IN_PROGRESS), issue(17, labels=IN_PROGRESS), issue(18, labels=IN_PROGRESS),
+            issue(19, labels=("task", "status:ready", "size:S", "risk:low")),
+            issue(20, labels=IN_PROGRESS, state="CLOSED"),
+            issue(21, labels=("task", "status:needs-input", "size:S", "risk:low")),
+            issue(22, labels=IN_PROGRESS)])
+        self.with_prs("t/13-x")
+        marked = self.marked()
+        capped, data = self.skipped_by_cap()
+        self.assertEqual(capped, [12, 16])
+        self.assertEqual(sorted(marked), capped)                  # the same tickets, in `runs` and in `dispatch`
+        self.assertEqual(marked, {12: [cap12[-1]["id"]], 16: [cap16[-1]["id"]]})   # one mark each: its newest run
+
+    def test_a_stale_latest_run_means_no_skip_and_no_mark_whatever_else_ended_in_the_window(self):
+        # #12's latest-started run ended before the 7-day cutoff; three older-started runs of it (overlapping it, swept
+        # late) ended inside the window. Dispatch judges the latest record and moves on: no skip, so no mark either.
+        for outcome, started, ended in (("error", 24 * 10 + 3, 30), ("error", 24 * 10 + 2, 20), ("ok", 24 * 10 + 1, 10)):
+            self.run_at(12, outcome, started, ended)
+        self.run_at(12, "error", 24 * 9, 24 * 8)                          # started last, ended outside the window
+        control = self.three(15)
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS), issue(15, labels=IN_PROGRESS, title="Second")])
+        self.assertEqual(self.marked(), {15: [control[-1]["id"]]})
+        capped, data = self.skipped_by_cap()
+        self.assertEqual(capped, [15])
+        self.assertNotIn(12, [s["number"] for s in data["skipped"]])
+
+    def test_a_dead_unended_run_is_judged_by_its_process_after_the_sweep_as_dispatch_does(self):
+        # `runs` without --sweep leaves a dead process's record un-ended, so the two can only agree once swept:
+        # `runs --sweep` ends it (as dispatch does first) and it counts. #12: two ended runs and a dead un-ended one
+        # make three; #13: two ended and a LIVE un-ended one stay under the cap; #15: three ended is the control.
+        self.run_at(12, "error", 31, 30), self.run_at(12, "error", 21, 20)
+        dead = self.write_run(12, id=f"{self.key}-12-20261001555555", pid=self.dead_pid(), started_at=iso_ago(hours=1))
+        write(dead["log"], "claude exited before printing a result\n")
+        self.run_at(13, "error", 31, 30), self.run_at(13, "error", 21, 20)
+        live = self.live_run_of(13)
+        control = self.three(15)
+        self.scenario(issues=[issue(n, labels=IN_PROGRESS, title=f"T{n}") for n in (12, 13, 15)])
+        marked = self.marked("--sweep")
+        self.assertEqual(marked, {12: [dead["id"]], 15: [control[-1]["id"]]})   # the swept run is #12's newest
+        swept = {r["id"]: r for r in self.run_records()}
+        self.assertTrue(swept[dead["id"]]["ended_at"])
+        self.assertIsNone(swept[live["id"]]["ended_at"])
+        capped, data = self.skipped_by_cap()
+        self.assertEqual(capped, [12, 15])
+        self.assertEqual(sorted(marked), capped)
+        self.assertEqual(data["live"], [live["id"]])
+
+    def test_a_ticket_whose_gh_check_fails_is_neither_skipped_nor_marked(self):
+        # dispatch warns and moves on when it cannot tell whether #12 (pr list) or #13 (issue view) still lacks a pull
+        # request; `runs` must not claim they are capped, and must not crash either. #15 is the control.
+        self.three(12), self.three(13)
+        control = self.three(15)
+        self.scenario(issues=[issue(n, labels=IN_PROGRESS, title=f"T{n}") for n in (12, 13, 15)])
+        data = self.read_json(self.scenario_path)
+        gone = {"stderr": "HTTP 502: Bad gateway (https://api.github.com/graphql)\n", "exit": 1}
+        data["calls"] = [dict(gone, contains=["pr", "list", "--head", "t/12-x"]),
+                         dict(gone, match=["issue", "view", "13"])] + data["calls"]
+        write(self.scenario_path, json.dumps(data))
+        self.assertEqual(self.marked(), {15: [control[-1]["id"]]})
+        capped, data = self.skipped_by_cap()
+        self.assertEqual(capped, [15])
+        self.assertEqual([row["number"] for row in data["plan"]], [])
+        p = self.ok("dispatch", "--dry-run")
+        for n in (12, 13):
+            self.assertIn(f"#{n}: cannot check whether its ended run needs another", p.stderr)
+            self.assertNotIn(f"skip #{n}:", p.stdout)
 
 
 def sha12(path):
@@ -727,7 +1067,8 @@ class DispatchRunsByRepoField(WorkTest):
         self.ended_runs(14, other)                              # the sibling's: never ours to redispatch or cap
         self.scenario(issues=[issue(labels=in_progress), issue(14, labels=in_progress, title="Theirs")])
         p = self.ok("dispatch", "--dry-run")
-        self.assertIn("skip #12: 3 runs ended without a pull request in 7 days, the last error", p.stdout)
+        self.assertIn("skip #12: 3 runs ended without a pull request in 7 days (last: error at ", p.stdout)
+        self.assertIn("run it in this session with /harness:work 12, or wait for the window", p.stdout)
         self.assertNotIn("would start #12", p.stdout)
         self.assertNotIn("#14", p.stdout)
         self.assertIn("No ready tickets.", p.stdout)
