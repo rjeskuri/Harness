@@ -59,6 +59,7 @@ import re
 import shlex
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 MAX_SHOWN = 160
@@ -255,6 +256,39 @@ def existing_dir(path: str) -> str:
     return p
 
 
+def canonical_path(path):
+    """The real path of `path` with each component spelled as its parent directory lists
+    it, so every spelling of one directory on a case-insensitive file system gives one
+    string. From the first component that cannot be found on, the rest stays as spelled."""
+    real = os.path.realpath(path)
+    done, parts = os.sep, [part for part in real.split(os.sep) if part]
+    for i, part in enumerate(parts):
+        try:
+            names = os.listdir(done)
+        except OSError:
+            return os.path.join(done, *parts[i:])
+        if part not in names:
+            fold = unicodedata.normalize("NFC", part).casefold()
+            given = os.path.join(done, part)
+            for name in names:
+                if unicodedata.normalize("NFC", name).casefold() == fold and same_entry(
+                    given, os.path.join(done, name)
+                ):
+                    part = name
+                    break
+            else:
+                return os.path.join(done, *parts[i:])
+        done = os.path.join(done, part)
+    return done
+
+
+def same_entry(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def toplevel(directory: str | None) -> Path | None:
     """The top-level of the working tree holding `directory`, or None outside a repo."""
     if not directory or not os.path.isdir(directory):
@@ -280,7 +314,8 @@ def protected_repo(directory: str) -> tuple[Path, str] | None:
         return None
     top, git_dir, common = lines[:3]
     common_dir = os.path.join(directory, common)  # unchanged when already absolute
-    if os.path.realpath(git_dir) != os.path.realpath(common_dir):
+    # git_dir comes in the on-disk spelling, common_dir in the spelling of `directory`
+    if canonical_path(git_dir) != canonical_path(common_dir):
         return None  # a linked worktree: its branch is never main
     head = git(directory, "symbolic-ref", "--short", "-q", "HEAD")
     branch = head.stdout.strip()
@@ -297,16 +332,17 @@ NOTES_DIR = "docs/agent/"
 
 
 def resolved(path: str) -> str:
-    """The absolute `path` with its nearest existing directory's symlinks resolved."""
+    """The absolute `path` with its nearest existing directory canonical (symlinks
+    resolved, each component spelled as on disk); the rest stays as spelled."""
     base = existing_dir(os.path.dirname(os.path.abspath(path)))
     tail = os.path.relpath(os.path.abspath(path), base)
-    return os.path.normpath(os.path.join(os.path.realpath(base), tail))
+    return os.path.normpath(os.path.join(canonical_path(base), tail))
 
 
 def repo_relative(path: str, top: Path) -> str | None:
     """`path` relative to the repo root `top`, with / separators; None when outside it.
-    The nearest existing directory is resolved, so symlinked spellings still match."""
-    rel = os.path.relpath(resolved(path), os.path.realpath(str(top)))
+    Both sides are canonical, so symlinked and other-case spellings still match."""
+    rel = os.path.relpath(resolved(path), canonical_path(str(top)))
     if rel in (".", "..") or rel.startswith("../"):
         return None
     return rel.replace(os.sep, "/")
@@ -1352,7 +1388,7 @@ def holder(state: dict, path: str | None) -> tuple[Path, str] | None:
     found = repo_at(state, directory)
     if found is None:
         return None
-    rel = os.path.relpath(resolved(path), os.path.realpath(str(found[0])))
+    rel = os.path.relpath(resolved(path), canonical_path(str(found[0])))
     if rel == ".." or rel.startswith("../"):
         return None
     if rel.replace(os.sep, "/").startswith(WORKTREES):
