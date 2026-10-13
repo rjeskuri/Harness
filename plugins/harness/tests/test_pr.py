@@ -1256,6 +1256,268 @@ class Land(WorktreeTest):
         self.assertFalse(self.branch_exists())
 
 
+WORKLOG = "worklog/worklog.csv"
+WORKLOG_BEFORE = "date,project,hours,note\n2026-10-12,harness,2.5,board review\n"
+WORKLOG_LANDED = WORKLOG_BEFORE + "2026-10-13,harness,1.75,\"land, then restore\"\n2026-10-14,jotform,0.5,triage\n"
+IDENTICAL = "(identical to the landed content)"
+
+
+class LandDirtyMain(WorktreeTest):
+    """The main checkout has uncommitted changes when `land` fast-forwards it. The squash merge is a real commit
+    on origin/main (pushed from a second clone, as GitHub's merge would be), and gh reports its sha, so the land's
+    fetch brings it and `git pull --ff-only` has something to apply. A dirty path whose bytes equal the landed
+    commit's is restored and main fast-forwards; any other dirty path, or an untracked file in the way, refuses
+    with the path named and leaves the checkout as it was."""
+
+    land_calls = Land.land_calls
+
+    def setUp(self):
+        super().setUp()
+        self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}}})
+        write(self.state_path("tickets", "12.json"),
+              json.dumps({"number": 12, "parent": {"number": 3, "title": "Widgets", "goal": ""}}))
+        write(os.path.join(self.main, WORKLOG), WORKLOG_BEFORE)
+        write(os.path.join(self.main, "data", "rates.tsv"), "client\trate\nacme\t120\n")
+        write(os.path.join(self.main, "docs", "notes.md"), "# Notes\n")
+        self.git(self.main, "add", "-A")
+        self.git(self.main, "commit", "-q", "-m", "Track the worklog")
+        self.git(self.main, "push", "-q", "origin", "main")
+
+    def landed(self, files):
+        """Push the squash merge of PR #34 to origin/main, changing `files` (path: content, None deletes it);
+        return its sha."""
+        clone = os.path.join(self.tmp, "github")
+        if not os.path.isdir(clone):
+            subprocess.run([GIT, "clone", "-q", self.origin, clone], env=self.env(), check=True, capture_output=True)
+        self.git(clone, "pull", "-q", "--ff-only")
+        for path, text in files.items():
+            if text is None:
+                os.unlink(os.path.join(clone, path))
+            else:
+                write(os.path.join(clone, path), text)
+        self.git(clone, "add", "-A")
+        self.git(clone, "commit", "-q", "-m", "Add the widget (#34)")
+        self.git(clone, "push", "-q", "origin", "main")
+        return self.git(clone, "rev-parse", "HEAD")
+
+    def land(self, sha):
+        merge = {"match": ["pr", "view", "34", "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": sha}}}
+        self.scenario([merge] + self.land_calls())
+        return self.pr("land", "34", cwd=self.main)
+
+    def head(self):
+        return self.git(self.main, "rev-parse", "HEAD")
+
+    def status(self):
+        """{path: the two-letter porcelain code} for the main checkout, untracked files included."""
+        out = subprocess.run([GIT, "-C", self.main, "status", "--porcelain=v1", "--untracked-files=all"],
+                             env=self.env(), capture_output=True, text=True, check=True).stdout
+        return {line[3:]: line[:2] for line in out.splitlines() if line.strip()}
+
+    def read(self, path):
+        with open(os.path.join(self.main, path), "rb") as fh:
+            return fh.read().decode("utf-8")
+
+    def assertRefused(self, p, sha, before, named, untouched):
+        """A refusal: exit 1 with the path(s) named, main's HEAD where it was, nothing reported cleaned, and each
+        file in `untouched` (path: content) still holding the local content. The refusal is one of the land's
+        problems, reported at the end as today: the ticket is still closed, unlabelled and commented, and the
+        summary still prints with main not pulled."""
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        for path in named:
+            self.assertIn(path, p.stderr)
+        self.assertEqual(self.head(), before, "main moved although the land refused")
+        self.assertNotIn("cleaned", p.stdout)
+        self.assertNotIn(IDENTICAL, p.stdout)
+        for path, text in untouched.items():
+            self.assertEqual(self.read(path), text, path)
+        board = self.stub_calls("harness-board")
+        self.assertIn(["close", "12", "--repo", self.main], board)
+        self.assertIn(["comment", "12", "--body", f"Landed in {sha}", "--repo", self.main], board)
+        self.assertIn(["issue", "edit", "12", "--remove-label", "status:in-review"], self.gh_argv())
+        lines = p.stdout.splitlines()
+        self.assertTrue(lines and lines[0].startswith("Merged PR #34"), p.stdout)
+        self.assertTrue(any(line.startswith("Main checkout:") and "main not pulled" in line for line in lines),
+                        p.stdout)
+        self.assertTrue(any(line.startswith("Ticket: #12 closed") for line in lines), p.stdout)
+
+    def cleaned_text(self, p):
+        """The stdout lines that report a restored path, joined; each must say `cleaned`."""
+        cleaned = [line for line in p.stdout.splitlines() if IDENTICAL in line]
+        self.assertTrue(cleaned, p.stdout)
+        self.assertTrue(all("cleaned" in line for line in cleaned), cleaned)
+        return "\n".join(cleaned)
+
+    # ------------------------------------------------------------- broad
+    def test_identical_dirty_paths_are_restored_and_main_fast_forwards(self):
+        sha = self.landed({WORKLOG: WORKLOG_LANDED, "widget.py": "def frob():\n    return 2\n"})
+        before = self.head()
+        self.assertNotEqual(before, sha)
+        write(os.path.join(self.main, WORKLOG), WORKLOG_LANDED)          # the owner's edit, as the chore PR has it
+        self.assertEqual(self.status(), {WORKLOG: " M"})
+        p = self.land(sha)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(self.head(), sha)
+        self.assertEqual(self.status(), {})
+        self.assertEqual(self.read(WORKLOG), WORKLOG_LANDED)
+        self.assertEqual(self.read("widget.py"), "def frob():\n    return 2\n")
+        self.assertIn(f"cleaned {WORKLOG} {IDENTICAL}", p.stdout)
+        self.assertIn("fast-forwarded main", p.stdout)
+
+    def test_a_differing_dirty_path_refuses_and_restores_nothing(self):
+        sha = self.landed({WORKLOG: WORKLOG_LANDED})
+        before = self.head()
+        mine = WORKLOG_LANDED + "2026-10-14,harness,0.25,not in the PR\n"     # one row more than the landed file
+        write(os.path.join(self.main, WORKLOG), mine)
+        p = self.land(sha)
+        self.assertRefused(p, sha, before, [WORKLOG], {WORKLOG: mine})
+        self.assertEqual(self.status(), {WORKLOG: " M"})
+
+    def test_an_untracked_file_in_the_way_refuses(self):
+        sha = self.landed({"docs/widget.md": "# Widget\nIt frobs twice.\n", WORKLOG: WORKLOG_LANDED})
+        before = self.head()
+        write(os.path.join(self.main, "docs", "widget.md"), "# My draft\n")
+        p = self.land(sha)
+        self.assertRefused(p, sha, before, ["docs/widget.md"],
+                           {"docs/widget.md": "# My draft\n", WORKLOG: WORKLOG_BEFORE})
+        self.assertEqual(self.status(), {"docs/widget.md": "??"})
+
+    # ---------------------------------------------------------- specific
+    def test_identical_paths_staged_or_not_are_each_named_and_restored(self):
+        rates = "client\trate\nacme\t135\nglobex\t90\n"
+        notes = "# Notes\n\nLanding restores identical files.\n"
+        sha = self.landed({"data/rates.tsv": rates, "docs/notes.md": notes})
+        write(os.path.join(self.main, "data", "rates.tsv"), rates)
+        write(os.path.join(self.main, "docs", "notes.md"), notes)
+        self.git(self.main, "add", "docs/notes.md")                          # one staged, one only modified
+        self.assertEqual(self.status(), {"data/rates.tsv": " M", "docs/notes.md": "M "})
+        p = self.land(sha)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.head(), sha)
+        self.assertEqual(self.status(), {})
+        self.assertEqual((self.read("data/rates.tsv"), self.read("docs/notes.md")), (rates, notes))
+        text = self.cleaned_text(p)
+        for path in ("data/rates.tsv", "docs/notes.md"):
+            self.assertIn(path, text)
+        self.assertNotIn(WORKLOG, text)                                       # clean before the land: not named
+
+    def test_one_differing_path_among_identical_ones_restores_nothing(self):
+        sha = self.landed({WORKLOG: WORKLOG_LANDED, "README.md": "# proj\n\nThe widget frobs.\n"})
+        before = self.head()
+        write(os.path.join(self.main, WORKLOG), WORKLOG_LANDED)              # identical
+        write(os.path.join(self.main, "README.md"), "# proj\n\nMy own intro.\n")   # differs
+        p = self.land(sha)
+        self.assertRefused(p, sha, before, ["README.md"],
+                           {WORKLOG: WORKLOG_LANDED, "README.md": "# proj\n\nMy own intro.\n"})
+        self.assertEqual(self.status(), {WORKLOG: " M", "README.md": " M"})  # the identical one not restored either
+        problem = [line for line in p.stderr.splitlines() if "README.md" in line]
+        self.assertTrue(problem, p.stderr)
+        for line in problem:
+            self.assertNotIn(WORKLOG, line)                                   # only the differing path is reported
+
+    def refused_case(self, local, staged=None):
+        """Land with the worklog dirty as `local` bytes (and `staged` in the index first, when given) against a
+        landed commit that writes WORKLOG_LANDED; assert a refusal that keeps every byte, index and tree."""
+        sha = self.landed({WORKLOG: WORKLOG_LANDED})
+        before = self.head()
+        path = os.path.join(self.main, WORKLOG)
+        if staged is not None:
+            with open(path, "wb") as fh:
+                fh.write(staged.encode())
+            self.git(self.main, "add", WORKLOG)
+        with open(path, "wb") as fh:
+            fh.write(local.encode())
+        code = self.status()[WORKLOG]
+        p = self.land(sha)
+        self.assertRefused(p, sha, before, [WORKLOG], {WORKLOG: local})
+        self.assertEqual(self.status(), {WORKLOG: code})                      # index and tree as they were
+        return code
+
+    def test_reordered_rows_refuse(self):
+        rows = WORKLOG_LANDED.splitlines(keepends=True)
+        mine = "".join(rows[:-2] + [rows[-1], rows[-2]])
+        self.assertEqual(sorted(mine.splitlines()), sorted(WORKLOG_LANDED.splitlines()))
+        self.assertNotEqual(mine, WORKLOG_LANDED)
+        self.refused_case(mine)
+
+    def test_crlf_line_endings_refuse(self):
+        self.refused_case(WORKLOG_LANDED.replace("\n", "\r\n"))
+
+    def test_a_missing_final_newline_refuses(self):
+        self.refused_case(WORKLOG_LANDED.rstrip("\n"))
+
+    def test_staged_landed_content_with_other_bytes_in_the_tree_keeps_the_edit_and_fast_forwards(self):
+        # The index already holds the landed bytes, so git fast-forwards today and keeps the tree's edit; the land
+        # must not get stricter than that, nor restore (and so drop) the unstaged row.
+        sha = self.landed({WORKLOG: WORKLOG_LANDED})
+        mine = WORKLOG_LANDED + "2026-10-14,harness,3.0,unstaged on top\n"
+        write(os.path.join(self.main, WORKLOG), WORKLOG_LANDED)
+        self.git(self.main, "add", WORKLOG)
+        write(os.path.join(self.main, WORKLOG), mine)
+        self.assertEqual(self.status(), {WORKLOG: "MM"})
+        p = self.land(sha)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(self.head(), sha)
+        self.assertEqual(self.read(WORKLOG), mine)
+        self.assertEqual(self.status(), {WORKLOG: " M"})
+        self.assertNotIn("cleaned", p.stdout)
+        self.assertNotIn(IDENTICAL, p.stdout)
+
+    def test_a_dirty_file_the_merge_deletes_refuses(self):
+        sha = self.landed({"docs/notes.md": None, WORKLOG: WORKLOG_LANDED})
+        before = self.head()
+        mine = "# Notes\n\nStill using these.\n"
+        write(os.path.join(self.main, "docs", "notes.md"), mine)
+        p = self.land(sha)
+        self.assertRefused(p, sha, before, ["docs/notes.md"], {"docs/notes.md": mine, WORKLOG: WORKLOG_BEFORE})
+        self.assertEqual(self.status(), {"docs/notes.md": " M"})
+
+    def test_a_same_length_dirty_path_with_other_bytes_refuses(self):
+        sha = self.landed({WORKLOG: WORKLOG_LANDED})
+        before = self.head()
+        mine = WORKLOG_LANDED.replace("1.75", "1.50")
+        self.assertEqual(len(mine.encode()), len(WORKLOG_LANDED.encode()))
+        self.assertNotEqual(mine, WORKLOG_LANDED)
+        write(os.path.join(self.main, WORKLOG), mine)
+        p = self.land(sha)
+        self.assertRefused(p, sha, before, [WORKLOG], {WORKLOG: mine})
+        self.assertEqual(self.status(), {WORKLOG: " M"})
+
+    def test_an_untracked_file_the_merge_does_not_touch_stays_and_main_fast_forwards(self):
+        sha = self.landed({WORKLOG: WORKLOG_LANDED, "widget.py": "def frob():\n    return 2\n"})
+        write(os.path.join(self.main, WORKLOG), WORKLOG_LANDED)              # identical
+        write(os.path.join(self.main, "scratch", "todo.txt"), "- ask about the rates\n")
+        self.assertEqual(self.status(), {WORKLOG: " M", "scratch/todo.txt": "??"})
+        p = self.land(sha)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.head(), sha)
+        self.assertEqual(self.status(), {"scratch/todo.txt": "??"})
+        self.assertEqual(self.read("scratch/todo.txt"), "- ask about the rates\n")
+        self.assertEqual(self.read(WORKLOG), WORKLOG_LANDED)
+        text = self.cleaned_text(p)
+        self.assertIn(f"cleaned {WORKLOG} {IDENTICAL}", p.stdout)
+        self.assertNotIn("scratch/todo.txt", text)
+
+    def test_a_dirty_path_the_merge_does_not_touch_keeps_its_edit_and_main_fast_forwards(self):
+        sha = self.landed({WORKLOG: WORKLOG_LANDED, "widget.py": "def frob():\n    return 2\n"})
+        notes = "# Notes\n\nA local thought, not in the PR.\n"
+        write(os.path.join(self.main, WORKLOG), WORKLOG_LANDED)              # identical
+        write(os.path.join(self.main, "docs", "notes.md"), notes)            # dirty; the merge leaves it alone
+        self.assertEqual(self.status(), {WORKLOG: " M", "docs/notes.md": " M"})
+        p = self.land(sha)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.head(), sha)
+        self.assertEqual(self.status(), {"docs/notes.md": " M"})
+        self.assertEqual(self.read("docs/notes.md"), notes)
+        self.assertEqual(self.read(WORKLOG), WORKLOG_LANDED)
+        text = self.cleaned_text(p)
+        self.assertIn(f"cleaned {WORKLOG} {IDENTICAL}", p.stdout)
+        self.assertNotIn("docs/notes.md", text)
+
+
 class LandResolution(Land):
     """`land` leaves one `**Resolution**` comment on the ticket, posted through `harness-board comment` before the
     `Landed in` comment. These run the real harness-board (no stubs), so every comment reaches the fake gh's log."""

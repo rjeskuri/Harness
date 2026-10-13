@@ -246,6 +246,61 @@ def listing(paths):
     return shown + (f" and {len(paths) - DIRTY_SHOWN} more" if len(paths) > DIRTY_SHOWN else "")
 
 
+def nul_fields(text):
+    return [field for field in text.split("\0") if field]
+
+
+def tree_entries(path, rev, paths):
+    """{path: (mode, oid)} for `paths` in the commit `rev`; a path the commit lacks is absent."""
+    out = git_ok(path, "--literal-pathspecs", "ls-tree", "-r", "-z", "--full-tree", rev, "--", *paths)
+    entries = {}
+    for field in nul_fields(out):
+        meta, _, name = field.partition("\t")
+        mode, _, oid = meta.split(" ")
+        entries[name] = (mode, oid)
+    return entries
+
+
+def fast_forward_blockers(path, target):
+    """Before `git pull --ff-only` moves the checkout at `path` to `target`: (identical, blocking). `identical`
+    are the dirty paths the fast-forward changes whose working-tree bytes equal `target`'s; `blocking` the
+    paths git would refuse to overwrite that are not identical: a tracked path whose index matches neither the
+    landed version nor (with working-tree edits) HEAD, an untracked file in the way. A path whose index already
+    holds the landed version is git's to keep, so it blocks nothing."""
+    changed = set(nul_fields(git_ok(path, "diff", "--name-only", "-z", "--no-renames", "HEAD", target)))
+    tracked, untracked = set(), set()
+    fields = nul_fields(git_ok(path, "status", "--porcelain=v1", "-z", "--untracked-files=all"))
+    while fields:
+        field = fields.pop(0)
+        code, name = field[:2], field[3:]
+        (untracked if code == "??" else tracked).add(name)
+        if code[0] in "RC" and fields:          # a staged rename or copy: its origin follows
+            tracked.add(fields.pop(0))
+    relevant = sorted((tracked | untracked) & changed)
+    if not relevant:
+        return [], []
+    head, landed = tree_entries(path, "HEAD", relevant), tree_entries(path, target, relevant)
+    index = {}
+    for field in nul_fields(git_ok(path, "--literal-pathspecs", "ls-files", "-s", "-z", "--", *relevant)):
+        meta, _, name = field.partition("\t")
+        mode, oid, stage = meta.split(" ")
+        index[name] = (mode, oid) if stage == "0" and name not in index else ("unmerged", "")
+    files = [name for name in relevant
+             if os.path.isfile(os.path.join(path, name)) and not os.path.islink(os.path.join(path, name))]
+    hashed = dict(zip(files, git_ok(path, "hash-object", "--no-filters", "--", *files).split())) if files else {}
+    identical, blocking = [], []
+    for name in relevant:
+        if name in landed and landed[name][0].startswith("100") and hashed.get(name) == landed[name][1]:
+            identical.append(name)
+        elif name in untracked:
+            blocking.append(name)
+        elif index.get(name) == landed.get(name):
+            continue                            # git keeps the index and the working tree's edit
+        elif index.get(name) != head.get(name) or os.path.lexists(os.path.join(path, name)):
+            blocking.append(name)
+    return identical, blocking
+
+
 # ---------- the state key (the same helpers in every harness tool and hook) ----------
 
 
@@ -1556,14 +1611,37 @@ def cmd_land(args):
     if fetched.returncode != 0:
         problems.append(f"git fetch --prune failed: {last_line(fetched.stderr)}")
     on = current_branch(main)
+    cleaned = []
     if on == "main":
-        pulled = git(main, "pull", "--ff-only", timeout=PUSH_TIMEOUT)
-        if pulled.returncode != 0:
-            problems.append(f"git pull --ff-only failed: {last_line(pulled.stderr)}")
-        main_line = "fetched and fast-forwarded main" if pulled.returncode == 0 else "fetched; main not pulled"
+        # what the pull brings in: main's upstream after the fetch, else the merge commit; no sha, no comparison
+        identical, blocking, restored = [], [], None
+        target = sha and (git(main, "rev-parse", "--verify", "--quiet", "@{upstream}^{commit}").stdout.strip()
+                          or sha)
+        if target and git(main, "merge-base", "--is-ancestor", "HEAD", target).returncode == 0:
+            try:
+                identical, blocking = fast_forward_blockers(main, target)
+            except Problem as err:
+                warn(f"could not compare the main checkout with the landed content: {err}")
+        if blocking:
+            problems.append(f"the main checkout {main} has uncommitted changes that differ from the landed content "
+                            f"and that the fast-forward would overwrite: {listing(blocking)}; main not pulled")
+        elif identical:
+            restored = git(main, "--literal-pathspecs", "checkout", target, "--", *identical)
+            if restored.returncode != 0:
+                problems.append(f"git checkout {target[:12]} -- {listing(identical)} failed: "
+                                f"{last_line(restored.stderr)}; main not pulled")
+        if blocking or (restored is not None and restored.returncode != 0):
+            main_line = "fetched; main not pulled"
+        else:
+            cleaned = identical
+            pulled = git(main, "pull", "--ff-only", timeout=PUSH_TIMEOUT)
+            if pulled.returncode != 0:
+                problems.append(f"git pull --ff-only failed: {last_line(pulled.stderr)}")
+            main_line = "fetched and fast-forwarded main" if pulled.returncode == 0 else "fetched; main not pulled"
     else:
         main_line = f"fetched; on {on or 'a detached HEAD'}, so main was not pulled"
     summary.append(f"Main checkout: {main_line if fetched.returncode == 0 else 'fetch failed'}.")
+    summary.extend(f"  cleaned {name} (identical to the landed content)" for name in cleaned)
 
     made = {}
 
