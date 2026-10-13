@@ -407,17 +407,34 @@ class Render(ScaffoldTest):
         return re.search(r"`" + re.escape(directory.rstrip("/")) + r"/?`", section) is not None
 
     def test_tests_directory_is_detected_on_disk(self):
-        for directory in ("tests", "test", "plugins/harness/tests", "plugins/other/tests"):
-            with self.subTest(directory=directory):
-                root = self.mk("disk-" + directory.replace("/", "-"))
-                self.write(os.path.join(root, directory, "test_a.py"), "pass\n")
+        candidates = ("tests", "test", "plugins/harness/tests", "plugins/other/tests", "plugins/x/tests")
+        for present in (("tests",), ("test",), ("plugins/harness/tests",), ("plugins/other/tests",),
+                        ("tests", "plugins/x/tests"),                  # several on disk: every one is named
+                        ("test", "tests"), ("test", "plugins/harness/tests", "plugins/other/tests")):
+            with self.subTest(present=present):
+                root = self.mk("disk-" + "+".join(d.replace("/", "-") for d in present))
+                for directory in present:
+                    self.write(os.path.join(root, directory, "test_a.py"), "pass\n")
                 self.ok("init", root, "--name", "disk", "--stack", "none")
                 section = self.where(root)
-                self.assertTrue(self.names_dir(section, directory), section)
-                if directory == "test":
-                    self.assertFalse(self.names_dir(section, "tests"), section)    # not the old guess
-                if directory == "tests":
-                    self.assertFalse(self.names_dir(section, "test"), section)
+                for directory in candidates:                          # exactly the ones on disk, no guess
+                    self.assertEqual(self.names_dir(section, directory), directory in present,
+                                     f"{directory}: {section}")
+
+    def test_a_file_named_like_a_tests_directory_is_not_named(self):
+        for rel in ("tests", "test", "plugins/x/tests"):
+            with self.subTest(file=rel):
+                root = self.mk("file-" + rel.replace("/", "-"))
+                self.write(os.path.join(root, rel), "not a directory\n")
+                self.ok("init", root, "--name", "file", "--stack", "none")
+                self.assertFalse(self.names_dir(self.where(root), rel), self.where(root))
+        root = self.mk("file-and-dir")                              # a file next to a real directory
+        self.write(os.path.join(root, "tests"), "not a directory\n")
+        self.write(os.path.join(root, "plugins", "x", "tests", "test_a.py"), "pass\n")
+        self.ok("init", root, "--name", "file", "--stack", "none")
+        section = self.where(root)
+        self.assertTrue(self.names_dir(section, "plugins/x/tests"), section)
+        self.assertFalse(self.names_dir(section, "tests"), section)
 
     def test_tests_directory_comes_from_the_verify_commands_s_argument(self):
         cases = [("python3 -m unittest discover -s plugins/harness/tests", "plugins/harness/tests"),
@@ -436,7 +453,24 @@ class Render(ScaffoldTest):
         cases = [("python3 -m unittest discover --start-directory spec", "spec"),
                  ('python3 -m unittest discover -s "my tests"', "my tests"),
                  ("python3 -m unittest discover -p 'test_*.py' -s checks -t . -v", "checks"),
-                 ("python3 -m unittest discover -v -s suite/unit -p test_x.py", "suite/unit")]
+                 ("python3 -m unittest discover -v -s suite/unit -p test_x.py", "suite/unit"),
+                 # attached values, as argparse accepts them (`python3 -m unittest discover -h`)
+                 ("python3 -m unittest discover --start-directory=spec", "spec"),
+                 ("python3 -m unittest discover -sspec", "spec"),
+                 ("python3 -m unittest discover -s=attached/eq -v", "attached/eq"),
+                 ("python3 -m unittest discover -v --start-directory=suite/long -p 't*.py'", "suite/long"),
+                 ("python3 -m unittest discover -ssuite/short", "suite/short"),
+                 # shell quoting: the argument is the unquoted word
+                 ("python3 -m unittest discover -s 'my tests'", "my tests"),
+                 ("python3 -m unittest discover --start-directory 'single quoted/dir' -v", "single quoted/dir"),
+                 # shell separators inside a quoted argument do not end the command
+                 ("python3 -m unittest discover -p 'test_*;x.py' -s checks", "checks"),
+                 ("python3 -m unittest discover -p 'a|b.py' -s piped/checks", "piped/checks"),
+                 ('python3 -m unittest discover -p "t&x.py" -v -s amp/checks', "amp/checks"),
+                 ("python3 -m unittest discover -p 'x && y' -s 'and checks'", "and checks"),
+                 # the discover command after another one, and before another one
+                 ("make lint && python3 -m unittest discover -s after/and", "after/and"),
+                 ("python3 -m unittest discover -s before/semi; ls -s other", "before/semi")]
         for n, (command, directory) in enumerate(cases):
             with self.subTest(verify=command):
                 root = self.mk(f"sforms{n}")
@@ -445,7 +479,13 @@ class Render(ScaffoldTest):
 
     def test_s_in_other_commands_is_not_a_tests_directory(self):
         for n, (command, wrong) in enumerate([("make -s lint", "lint"), ("pytest -s tests/unit", "tests/unit"),
-                                              ("make -s check && ./lint.sh -s extra", "extra")]):
+                                              ("make -s check && ./lint.sh -s extra", "extra"),
+                                              # -s after the discover command ends belongs to another command
+                                              ("python3 -m unittest discover && ls -s foo", "foo"),
+                                              ("python3 -m unittest discover -v; ls -s bar", "bar"),
+                                              ("python3 -m unittest discover || du -s baz", "baz"),
+                                              ("python3 -m unittest discover | tee -s qux", "qux"),
+                                              ("python3 -m unittest discover -s ok/dir; ls -s other", "other")]):
             with self.subTest(verify=command):
                 root = self.mk(f"sfalse{n}")
                 self.ok("init", root, "--name", f"sfalse{n}", "--stack", "none", "--verify", command)
