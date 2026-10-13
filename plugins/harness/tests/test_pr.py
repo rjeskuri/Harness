@@ -451,6 +451,37 @@ class OpenNoTests(WorktreeTest):
                 self.assertIn("No verify log attached.", body)
                 self.assertNotIn("{{", body)
 
+    def open_body_labels(self, labels, flags, red_status):
+        ticket = dict(board_ticket("low"), flags=list(flags), labels=["task", "status:in-progress", "risk:low"]
+                      + list(labels))
+        self.outputs(**{"harness-board": {"show": {"stdout": json.dumps(ticket)},
+                                          "comment": {"stdout": "https://github.com/o/r/issues/12#c1\n"}},
+                        "harness-red": {"status": red_status}})
+        self.scenario([{"match": ["pr", "list"], "stdout_json": []},
+                       {"match": ["pr", "create"], "stdout": PR_URL + "\n"}])
+        self.ok("open", "12", cwd=self.wt)
+        return next(c for c in self.gh_calls() if c["argv"][:2] == ["pr", "create"])["stdin"]
+
+    def test_the_no_tests_json_object_from_harness_red_is_not_a_red_record(self):
+        # `harness-red status --json` on a no-tests ticket prints {"no_tests": true, ...} and exits 0.
+        base = {"no_tests": True, "ticket": 12, "message": "ticket 12 is no-tests: no red run needed"}
+        for label, obj in (("plain", base),
+                           ("with files", dict(base, run_files=["tests/leak.py"], test_files=["tests/leak2.py"]))):
+            with self.subTest(obj=label):
+                body = self.open_body(["no-tests"], {"stdout": json.dumps(obj)})
+                self.assertIn(NO_TESTS_RED, body.splitlines())
+                self.assertNotIn(NO_RED, body)
+                self.assertNotIn("Test files run", body)
+                self.assertNotIn("tests/leak", body)
+                self.assertNotIn("unknown", body)
+                self.assertNotIn("exit None", body)
+
+    def test_the_body_trusts_flags_not_labels(self):
+        # A `no-tests` label with empty flags: the body keeps the ordinary line.
+        body = self.open_body_labels(["no-tests"], [], {"stderr": "harness-red: No red run recorded\n", "exit": 1})
+        self.assertIn(NO_RED, body)
+        self.assertNotIn(NO_TESTS_RED, body)
+
     def test_other_flags_keep_the_no_red_run_line(self):
         for flags in ([], ["needs-local"], ["priority:high", "needs-local"]):
             with self.subTest(flags=flags):

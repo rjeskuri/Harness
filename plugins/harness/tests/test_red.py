@@ -640,6 +640,41 @@ class NoTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn(self.message(47), p.stdout)
 
+    def test_json_on_a_no_tests_ticket_prints_one_json_object_and_records_nothing(self):
+        # --json keeps its contract: one parseable object, not the plain line.
+        for sub in ("check", "status"):
+            with self.subTest(sub=sub, ticket=12):
+                self.cache(12)
+                self.put("docs/guide.md", "# Guide\n\nA docs-only change.\n")
+                p = self.red(sub, "--json")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(json.loads(p.stdout),
+                                 {"no_tests": True, "ticket": 12, "message": self.message(12)})
+                self.assertIsInstance(json.loads(p.stdout)["ticket"], int)
+                self.assertEqual(len(p.stdout.strip().splitlines()), 1, p.stdout)
+                self.assertFalse(os.path.exists(self.record_path))
+        # Another ticket, another worktree.
+        self.cache(47)
+        wt = self.second_worktree(47, "other-docs")
+        for sub in ("check", "status"):
+            with self.subTest(sub=sub, ticket=47):
+                p = self.red(sub, "--json", "--worktree", wt, cwd=self.tmp)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(json.loads(p.stdout),
+                                 {"no_tests": True, "ticket": 47, "message": self.message(47)})
+                self.assertFalse(os.path.exists(os.path.join(self.state, "red", "t-47-other-docs.json")))
+
+    def test_json_on_an_ordinary_ticket_is_not_the_no_tests_object(self):
+        self.cache(12, ())
+        self.put("tests/test_calc.py", TEST_ADD)
+        p = self.red("check", "--json")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("no_tests", p.stdout)
+        status = self.red("status", "--json")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertNotIn("no_tests", json.loads(status.stdout))
+
     def test_a_ticket_without_the_flag_is_unchanged(self):
         # No cache at all, an empty flag list and other flags: today's behavior, record included.
         for flags in (None, (), ("needs-local", "priority:high")):

@@ -1964,6 +1964,28 @@ class WorkSkill(unittest.TestCase):
         self.assertIn("harness:coder", steps[4])
         self.assertIn("harness:reviewer", steps[5])
 
+    def test_step_one_reads_flags_from_the_board_show_json_not_the_start_json(self):
+        # `harness-work start --json` carries no `flags` key; the flags come from `harness-board show N --json`.
+        start = self.loop_steps()[1]
+        sentences = re.split(r"(?<=[.;])\s+|\n", start)
+        flag_sentences = [s for s in sentences if re.search(r"\bflags\b", s) and "no-tests" in s]
+        self.assertTrue(flag_sentences, f"no sentence in step 1 reads flags for no-tests:\n{start}")
+        for sentence in flag_sentences:
+            self.assertIn("harness-board show", sentence)
+            self.assertIn("--json", sentence)
+        self.assertNotRegex(start.lower(), r"flags[^.]*start json")
+
+    def test_the_design_doc_reads_flags_from_the_board_show_json_not_the_start_json(self):
+        design = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "docs", "design.md")
+        with open(design, encoding="utf-8") as fh:
+            text = fh.read()
+        lines = [ln for ln in text.splitlines()
+                 if "skips the test-author" in ln and "no-tests" in ln and "flags" in ln]
+        self.assertTrue(lines, "design.md has no sentence saying a no-tests ticket skips the test-author")
+        for line in lines:
+            self.assertIn("harness-board show", line)
+            self.assertNotIn("start JSON", line)
+
     def test_the_first_paragraph_says_one_turn_foreground_agents_and_when_the_turn_ends(self):
         para = first_paragraph()
         self.assertEqual(first_paragraph_problems(para), [], para)

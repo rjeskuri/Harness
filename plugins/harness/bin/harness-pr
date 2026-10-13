@@ -643,7 +643,9 @@ def red_record(repo):
         data = json.loads(done.stdout)
     except ValueError:
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict) or data.get("no_tests") is True:    # a no-tests ticket has no red run
+        return None
+    return data
 
 
 def first_paragraph(text):
