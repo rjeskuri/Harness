@@ -565,18 +565,24 @@ def task_resolutions(repo, tasks):
     return out
 
 
-def fitted_resolutions(entries, room):
+def fitted_resolutions(entries, room, newest=0):
     """The (number, heading and lines) Resolutions as context lines within `room`: each printed whole when it
-    fits, in order, and the rest named on one pointer line; never one cut part-way."""
+    fits, in order, and the rest named on one pointer line; never one cut part-way. The last `newest` entries
+    (a ticket's own, one per landing) are fitted newest first, so the oldest landing is the one dropped."""
     blocks = [(number, [""] + block) for number, block in entries]
     if sum(len(block) for _, block in blocks) > room:
         room -= 2                                      # the pointer line and the blank before it
+    split = len(blocks) - newest
+    shown = set()
+    for i in list(range(split)) + list(range(len(blocks) - 1, split - 1, -1)):
+        if len(blocks[i][1]) <= room:
+            shown.add(i)
+            room -= len(blocks[i][1])
     out, left = [], []
-    for number, block in blocks:
-        if len(block) <= room:
+    for i, (number, block) in enumerate(blocks):
+        if i in shown:
             out += block
-            room -= len(block)
-        else:
+        elif number not in left:
             left.append(number)
     if left:
         where = f"gh issue view {left[0]} --comments" if len(left) == 1 else "gh issue view N --comments"
@@ -620,6 +626,7 @@ def context_markdown(record, resolutions=None):
         if text.strip():
             lines += ["", f"## {heading}"] + text.splitlines()
     comments = record["comments"]
+    own = []
     if record.get("status") == "closed":
         own = [(index, body) for index, body in all_resolutions(comments) if body]
         if own:
@@ -631,7 +638,7 @@ def context_markdown(record, resolutions=None):
                 heading = "## Resolution" if len(own) == 1 else f"## Resolution (landing {k} of {len(own)})"
                 entries.append((n, [heading] + body))
     if entries:
-        lines[at:at] = fitted_resolutions(entries, CONTEXT_LINES - len(lines) - 2)
+        lines[at:at] = fitted_resolutions(entries, CONTEXT_LINES - len(lines) - 2, newest=len(own))
     blocks = []
     for c in comments[-COMMENTS_SHOWN:]:
         body = (c["body"] or "").strip("\n").splitlines()

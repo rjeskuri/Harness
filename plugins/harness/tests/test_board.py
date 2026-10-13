@@ -617,6 +617,104 @@ class ShowResolution(BoardTest):
                     self.assertLess(last, first, f"the Resolutions are printed oldest first, newest last, "
                                                  f"one after the other:\n{md}")
 
+    # ------------------------------------------------------------------ a reopened ticket's Resolutions and room
+    def pass_resolution(self, k, nfiles):
+        """Landing k's Resolution: 10 + nfiles + 2 content lines, every one of them its own."""
+        sha = hashlib.sha1(f"pass-{k}".encode()).hexdigest()
+        return resolution(80 + k, sha, f"Landing {k} of the reopened ticket.",
+                          [f"lib/pass{k}/module_{i:02d}.py" for i in range(nfiles)],
+                          [f"- [x] Pass {k} item one", f"- [x] Pass {k} item two"], "assertion",
+                          f"Ran {100 + k} tests OK (pass {k})")
+
+    def reopened_ticket(self, passes, body_lines, others=None, landed=True):
+        """Closed #12 with a Request section of `body_lines` lines, each pass's Resolution (and its `Landed in`
+        when `landed`), and `others` comments (ten later notes by default)."""
+        body = "## Request\n" + "\n".join(f"Request line {i} of a long ticket body." for i in range(body_lines)) \
+            + "\n\n## Definition of done\n- [ ] Lands twice\n"
+        comments = []
+        for k, res in enumerate(passes):
+            sha = content_lines(res)[-1].split()[-1]
+            comments.append(comment("rjeskuri", f"2026-10-0{1 + k}T09:00:00Z", res))
+            if landed:
+                comments.append(comment("rjeskuri", f"2026-10-0{1 + k}T09:01:00Z",
+                                        f"Landed in {sha}\n\n<!-- harness -->"))
+        if others is None:
+            others = [comment("pal", f"2026-10-12T{10 + i:02d}:00:00Z", f"later note {i}") for i in range(10)]
+        data = issue(number=12, state="CLOSED", labels=("task", "size:M", "risk:low"), body=body,
+                     comments=comments + list(others),
+                     parent={"number": 3, "title": "Board v2", "url": "https://github.com/o/r/issues/3"})
+        self.scenario([self.parent_call()] + self.comment_calls(12, data))
+        p = self.ok("show", "12", "--markdown")
+        self.assertNotIn("Traceback", p.stderr)
+        lines = p.stdout.splitlines()
+        self.assertLessEqual(len(lines), 120, p.stdout)
+        return lines
+
+    def printed(self, lines, res):
+        """'whole', 'none' or 'part' for how much of `res` the output carries, judged by its own lines (not the
+        `Files changed (N):`, `Definition of done:` and red-run lines every Resolution may share)."""
+        own = [line for line in content_lines(res)
+               if not line.startswith(("Files changed", "Definition of done:", "Red run before implementation"))]
+        found = [line for line in own if line in lines]
+        return "whole" if len(found) == len(own) else "none" if not found else "part"
+
+    def pointer(self, lines):
+        found = [line for line in lines if "Not shown for lack of room" in line]
+        self.assertEqual(len(found), 1, "want one pointer line:\n" + "\n".join(lines))
+        line = found[0]
+        self.assertIn("gh issue view 12 --comments", line, "the pointer gives the concrete command")
+        self.assertNotIn("gh issue view N", line)
+        self.assertEqual(len(re.findall(r"#12\b", line)), 1, f"the pointer names the ticket once: {line!r}")
+        return line
+
+    def test_closed_task_short_of_room_prints_the_newest_resolutions(self):
+        """When the room left after a long body holds fewer Resolutions than the ticket has, the current landing
+        wins: the oldest are dropped first and named on the pointer line, the ones printed are whole and in
+        chronological order. Two passes with room for one; three passes with room for two."""
+        two = [self.pass_resolution(k, 13) for k in (1, 2)]               # 25 content lines each
+        lines = self.reopened_ticket(two, 65)
+        md = "\n".join(lines)
+        self.assertEqual(self.printed(lines, two[1]), "whole", f"the current landing's Resolution is printed:\n{md}")
+        self.assertEqual(self.printed(lines, two[0]), "none", f"the superseded Resolution is left out:\n{md}")
+        self.pointer(lines)
+
+        three = [self.pass_resolution(k, 13) for k in (1, 2, 3)]
+        lines = self.reopened_ticket(three, 40)
+        md = "\n".join(lines)
+        self.assertEqual([self.printed(lines, res) for res in three], ["none", "whole", "whole"], md)
+        self.assertLess(lines.index(content_lines(three[1])[-1]), lines.index(content_lines(three[2])[0]),
+                        f"printed oldest first, newest last:\n{md}")
+        self.pointer(lines)
+
+    def test_closed_task_with_no_room_for_any_resolution_points_once(self):
+        """An 80-line body and two 30-file Resolutions: neither fits, so neither is printed, and one pointer line
+        names #12 once with the concrete `gh issue view 12 --comments`, as for a single Resolution."""
+        passes = [self.pass_resolution(k, 30) for k in (1, 2)]
+        lines = self.reopened_ticket(passes, 80)
+        self.assertEqual([self.printed(lines, res) for res in passes], ["none", "none"], "\n".join(lines))
+        self.pointer(lines)
+
+    def test_closed_task_keeps_every_resolution_out_of_the_comments(self):
+        """Two Resolutions and three other comments, room for all: both Resolutions print in the Resolution
+        section and the Comments section holds the three others only."""
+        passes = [RES_13_STALE, RES_12]
+        others = [comment("rjeskuri", "2026-10-09T09:00:00Z", "Reopened: it broke the hooks."),
+                  comment("pal", "2026-10-12T10:00:00Z", "Looks right now."),
+                  comment("pal", "2026-10-12T11:00:00Z", "Thanks.")]
+        lines = self.reopened_ticket(passes, 3, others=others, landed=False)
+        md = "\n".join(lines)
+        self.assertEqual([self.printed(lines, res) for res in passes], ["whole", "whole"], md)
+        heads = [i for i, line in enumerate(lines) if line.startswith("## Comments")]
+        self.assertEqual(len(heads), 1, md)
+        section = lines[heads[0]:]
+        self.assertEqual(section[0], "## Comments (newest 3 of 3)", md)
+        for text in ("Reopened: it broke the hooks.", "Looks right now.", "Thanks."):
+            self.assertIn(text, section, md)
+        for res in passes:
+            for line in content_lines(res):
+                self.assertNotIn(line, section, f"a Resolution line in the Comments section: {line!r}\n{md}")
+        self.assertNotIn("**Resolution**", "\n".join(section))
+
     def test_epic_prints_each_closed_tasks_resolution_under_the_task_list(self):
         epic = issue(number=3, title="Board v2", labels=("epic", "status:ready"), body=EPIC_BODY)
         subs = [{"number": 12, "title": "Add the board tool", "state": "closed", "labels": [{"name": "task"}]},

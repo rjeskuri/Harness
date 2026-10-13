@@ -1408,7 +1408,8 @@ def land_ticket(repo, number, sha, pr, resolution, url=None):
     """Close the ticket when GitHub has not, drop its status labels, comment the Resolution (`resolution()`) and
     then `Landed in <sha>` unless the ticket already has this landing's own (a resumed land; this landing's
     `Landed in` there means both are), check its epic. Only this landing's comments count: `Landed in` this sha
-    or this PR, and a Resolution naming this PR's `url`; a reopened ticket's earlier pass leaves its own, which
+    or this PR (with no sha, the Squash commit of this PR's Resolution), and a Resolution naming this PR's
+    `url`; a reopened ticket's earlier pass leaves its own, which
     do not, so its second landing gets a Resolution and `Landed in` of its own. (summary, error)."""
     done = []
     try:
@@ -1428,11 +1429,15 @@ def land_ticket(repo, number, sha, pr, resolution, url=None):
             gh(cmd, repo.main)
             done.append("status labels removed")
         bodies = [(c.get("body") or "").lstrip() for c in as_list(info.get("comments"))]
-        if any(landed_here(b, sha, pr) for b in bodies if not b.startswith(RESOLUTION)):
+        mine = [b for b in bodies if resolution_here(b, url)]
+        # no sha this run: an earlier run of this landing that knew it left it as its Resolution's Squash commit
+        shas = [sha] if sha else [m.group(1) for b in mine
+                                  for m in re.finditer(r"^\s*Squash commit: (\S+)\s*$", b, re.MULTILINE)]
+        if any(landed_here(b, s, pr) for b in bodies if not b.startswith(RESOLUTION) for s in shas or [""]):
             done.append("landed comment already there")
         else:
             # the Resolution goes first: a land that stops between the two still finds `Landed in` missing
-            if not any(resolution_here(b, url) for b in bodies):
+            if not mine:
                 board(repo, "comment", str(number), "--body", resolution())
             board(repo, "comment", str(number), "--body", f"{LANDED} {sha}" if sha else f"{LANDED} PR #{pr}")
             done.append("commented")

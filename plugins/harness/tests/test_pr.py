@@ -1265,7 +1265,8 @@ class LandResolution(Land):
         """The land conversation for the fixture's PR. `view_files`: the files `gh pr view --json` holds (all of
         the fixture's by default; GitHub stops at 100), while the files endpoint always lists them all; `after`:
         the answer to the PR read after the merge (`gh pr view P --json body,...`), in place of the PR's data;
-        `no_sha`: GitHub reports no merge commit, so the land knows no sha and comments `Landed in PR #N`."""
+        `no_sha`: GitHub reports no merge commit (True) or the read fails ("fail"), so the land knows no sha and
+        comments `Landed in PR #N`."""
         pr, sha = str(fx["pr"]), fx["sha"]
         if no_sha:
             fx, sha = dict(fx, sha=""), ""
@@ -1280,7 +1281,8 @@ class LandResolution(Land):
         gate = gate_calls(commits=[pr_commit("a", at(9))], pull=f"repos/o/r/pulls/{pr}")
         return gate + [
                 {"match": ["pr", "view", pr, "--json", "mergeCommit"],
-                 "stdout_json": {"mergeCommit": {"oid": sha} if sha else None}},
+                 **({"stderr": "GraphQL: timeout\n", "exit": 1} if no_sha == "fail"
+                    else {"stdout_json": {"mergeCommit": {"oid": sha} if sha else None}})},
                 {"match": ["pr", "view", pr, "--json", LAND_FIELDS],
                  "stdout_json": land_view(url=url, state=state)},
                 REPO_VIEW,
@@ -1640,6 +1642,29 @@ class LandResolution(Land):
                               no_sha=True)
                     self.assertEqual(self.resolutions(12), [], "this PR's Resolution is there; none again")
                     self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in self.posted(12)], wanted)
+
+    def test_resumed_land_without_a_sha_knows_its_own_landed_comment_by_the_resolutions_squash_sha(self):
+        """The first run knew the sha and posted this PR's Resolution (`Squash commit: S`) and `Landed in S`; the
+        resume cannot read the merge commit (null, or the read fails). `Landed in S` is still this landing's,
+        found through the Squash commit of the Resolution naming this PR, so nothing is posted. An older pass's
+        `Landed in <its sha>`, whose Resolution names another PR, is not: with only this PR's Resolution and
+        that, only `Landed in PR #<pr>` is posted. Both ways round."""
+        for old, new in ((FIXTURE_A, FIXTURE_B), (FIXTURE_B, FIXTURE_A)):
+            first = self.first_pass(old) + [self.REOPENED]
+            self.land(new)                                   # the first run of this landing, sha known
+            res = [b for _, _, b in self.resolutions(12)]
+            mine = [b for _, _, b in self.landed(12)]
+            self.assertIn(f"Squash commit: {new['sha']}", res[0])
+            self.assertEqual([b.replace(HARNESS_MARK, "").strip() for b in mine], [f"Landed in {new['sha']}"])
+            for how in (True, "fail"):
+                for name, kept, wanted in (("both", res + mine, []),
+                                           ("this Resolution only", res, [f"Landed in PR #{new['pr']}"])):
+                    with self.subTest(old=old["pr"], new=new["pr"], merge_commit=how, case=name):
+                        self.land(new, state="MERGED", issue_state="CLOSED", comments=self.as_comments(first + kept),
+                                  no_sha=how)
+                        self.assertEqual(self.resolutions(12), [], "this PR's Resolution is there; none again")
+                        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in self.posted(12)],
+                                         wanted)
 
     # ------------------------------------------------------------------ the PR body's shape
     def one_resolution(self):
