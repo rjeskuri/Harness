@@ -1772,6 +1772,55 @@ class KeptSettings(ScaffoldTest):
                                  if ("may stop" in next(w for w in lines if r in w)) != (r in maybe)]
                         self.assertEqual(wrong, [], f"{mode}: firm or soft is wrong for these\n{lines}")
 
+    # ---------------------------------------------------------------- round 3 of the review of PR #41
+    def test_the_kept_files_own_verify_command_is_the_one_checked(self):
+        """A dispatched run issues the kept file's CLAUDE_VERIFY_CMD (verify_on_stop and the coder read
+        it from settings), so an ask or deny on that command stops the run for sure even when init is not
+        given --verify; the rendered default counts only when the kept file sets no verify command."""
+        _, ref_env = self.reference("python")
+        own = dict(ref_env, CLAUDE_VERIFY_CMD="make check")
+        for kind in ("ask", "deny"):
+            with self.subTest(case="own verify blocked", kind=kind):
+                rules = ["Bash(make:*)", "Bash(make check)", "Bash(make check:*)"]
+                for mode, p in self.both_runs(f"own-{kind}", "python", env=own, **{kind: rules}):
+                    self.assertWarns(mode, p, [(r, kind) for r in rules])
+                    self.assertEqual([w for w in self.warns(p) if "may stop" in w], [], f"{mode}: all are firm")
+            with self.subTest(case="the rendered default is not what this project runs", kind=kind):
+                for mode, p in self.both_runs(f"rendered-{kind}", "python", env=own,
+                                              **{kind: ["Bash(scripts/verify.sh)"]}):
+                    self.assertWarns(mode, p, [])
+            with self.subTest(case="no verify in the kept file falls back to the rendered one", kind=kind):
+                env = {k: v for k, v in ref_env.items() if k != "CLAUDE_VERIFY_CMD"}
+                for mode, p in self.both_runs(f"fallback-{kind}", "python", env=env,
+                                              **{kind: ["Bash(scripts/verify.sh)"]}):
+                    self.assertWarns(mode, p, [("Bash(scripts/verify.sh)", kind), ("CLAUDE_VERIFY_CMD", "env")])
+
+    def test_an_allow_with_a_star_word_covers_the_entries_it_matches(self):
+        """A `*` word in an allow rule matches one or more words, as it does in an ask or deny: `Bash(git *:*)`
+        covers every git entry, `Bash(* commit:*)` only the commit one, and a glob that needs more words than
+        an entry has covers none of them."""
+        git = [r for r in TEMPLATE_ALLOW if r.startswith("Bash(git ")]
+        not_git = [r for r in TEMPLATE_ALLOW if r not in git]
+        table = [(not_git + ["Bash(git *:*)"], []),
+                 (not_git + ["Bash(* commit:*)"], [r for r in git if r != "Bash(git commit:*)"]),
+                 (not_git + ["Bash(git * --amend:*)"], git)]
+        for i, (allow, missing) in enumerate(table):
+            with self.subTest(allow=allow[len(not_git):]):
+                for mode, p in self.both_runs(f"star-allow{i}", allow=allow):
+                    self.assertWarns(mode, p, [(r, "allow") for r in missing])
+
+    def test_a_missing_env_key_warn_names_the_value_to_add(self):
+        """The warn line for an absent env key gives the exact line to add: the key and the value the
+        template renders for this stack and its --verify or default."""
+        for stack, verify in (("python", None), ("node", "npm run check")):
+            _, ref_env = self.reference(stack, verify)
+            with self.subTest(stack=stack, verify=verify):
+                for mode, p in self.both_runs(f"env-value-{stack}", stack, verify, env={}):
+                    self.assertWarns(mode, p, [(k, "env") for k in ref_env])
+                    for key, value in ref_env.items():
+                        line = next(w for w in self.warns(p) if key in w)
+                        self.assertIn(json.dumps({key: value})[1:-1], line, line)
+
 
 # =========================================================================== commit paths
 class Paths(ScaffoldTest):
