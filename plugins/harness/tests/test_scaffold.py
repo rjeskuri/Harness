@@ -1499,6 +1499,25 @@ class KeptSettings(ScaffoldTest):
                                           ask=["Bash(make check:*)", "Bash(make:*)", "Bash(scripts/verify.sh)"]):
                 self.assertWarns(mode, p, [("Bash(scripts/verify.sh)", "ask")])
 
+        # a `*` word anywhere in a rule matches one or more words: the rule stops the loop when it could
+        # match a loop command (or something narrower than one); globs after any other program, or after a
+        # git or gh subcommand the loop does not use, cannot
+        globs = ["Bash(gh * create)", "Bash(git * --force)", "Bash(git * main)", "Bash(* commit)",
+                 "Bash(* push origin)", "Bash(gh * view 42)", "Bash(git * -m Fix)"]
+        harmless = ["Bash(npm * test)", "Bash(docker * create)", "Bash(make * check)", "Bash(git status * main)",
+                    "Bash(gh repo * create)", "Bash(docker * commit)", "Bash(npm * push origin)"]
+        # pins: an exact `git` or `gh` alone is not a loop command; a trailing ` *` is a prefix rule like `:*`
+        pins = ["Bash(git commit *)", "Bash(gh *)"]
+        pin_harmless = ["Bash(git)", "Bash(gh)"]
+        for label, blocking, misses in (("mid-pattern-glob", globs, harmless), ("pins", pins, pin_harmless)):
+            for kind in ("ask", "deny"):
+                n += 1
+                rules = blocking + misses
+                rng.shuffle(rules)
+                with self.subTest(label=label, kind=kind):
+                    for mode, p in self.both_runs(f"glob{n}", "python", **{kind: rules}):
+                        self.assertWarns(mode, p, [(r, kind) for r in blocking])
+
     # ---------------------------------------------------------------- missing allows and env keys
     def test_missing_template_allows_and_env_keys_are_reported(self):
         # each template allow entry missing on its own: one warning naming exactly it
@@ -1554,6 +1573,15 @@ class KeptSettings(ScaffoldTest):
                 self.assertWarns(mode, p, [(r, "allow") for r in node_extras])
             for mode, p in self.both_runs("cross-none", "none", allow=python_allow):
                 self.assertWarns(mode, p, [])
+
+        # a trailing ` *` is a prefix rule in allow too: Bash(git *) covers every git entry, and nothing else
+        git_entries = [r for r in TEMPLATE_ALLOW if r.startswith("Bash(git ")]
+        for allow, missing in (([r for r in TEMPLATE_ALLOW if r not in git_entries] + ["Bash(git *)"], []),
+                               (["Bash(git *)"], [r for r in TEMPLATE_ALLOW if r not in git_entries]),
+                               (without("Bash(git commit:*)") + ["Bash(git commit *)"], [])):
+            with self.subTest(space_star=allow):
+                for mode, p in self.both_runs(f"space-star{len(allow)}", allow=allow):
+                    self.assertWarns(mode, p, [(r, "allow") for r in missing])
 
         # Bash(*) covers every entry of every stack; so do one broad rule per program
         for stack in ("none", "python", "node"):

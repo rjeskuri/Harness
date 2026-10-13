@@ -514,7 +514,8 @@ def preview(root, files, force):
 def bash_rule(rule):
     """(words, prefix) of a Bash permission rule, None for any other rule. `prefix` is true when the rule
     ends in `:*` (or ` *`) and so covers every command that starts with those words; bare `Bash` and
-    `Bash(*)` are the empty prefix. A rule without it matches that one command."""
+    `Bash(*)` are the empty prefix. A rule without it matches that one command. A `*` word elsewhere
+    stays in `words`: it matches one or more words."""
     if rule == "Bash":
         return [], True
     m = re.fullmatch(r"Bash\((.*)\)", rule, re.S)
@@ -527,16 +528,37 @@ def bash_rule(rule):
     return ([] if inner == "*" else inner.split()), prefix or inner == "*"
 
 
+def match_kinds(pattern, prefix, command):
+    """How a rule's words can match a command: {"covers"} when it can match the command itself (or any
+    start of it, for a prefix rule), {"overlaps"} when it can match only longer commands that start with
+    the command. A `*` word matches one or more words."""
+    if not command:
+        return {"covers"} if not pattern else {"overlaps"}
+    if not pattern:
+        return {"covers"} if prefix else set()
+    if pattern[0] == "*":
+        return set().union(*(match_kinds(pattern[1:], prefix, command[k:]) for k in range(1, len(command) + 1)))
+    return match_kinds(pattern[1:], prefix, command[1:]) if pattern[0] == command[0] else set()
+
+
 def stops_run(rule, commands):
-    """Whether an ask or deny rule covers a loop command (its words start with the rule's, at a word
-    boundary) or is narrower than one (starts with the command's words). Any harness-* command counts."""
+    """(firm, command text) when an ask or deny rule covers a loop command (firm) or only overlaps one
+    (it is narrower, or a `*` word could make it match one: not firm); None when it leaves them all
+    alone. Any harness-* command counts."""
     parsed = bash_rule(rule)
     if parsed is None:
-        return False
+        return None
     words, prefix = parsed
     if words[:1] and words[0].startswith("harness-"):
-        return True
-    return any(words[:len(cmd)] == cmd or (prefix and cmd[:len(words)] == words) for cmd in commands)
+        return prefix and len(words) == 1, "harness-*"
+    found = None
+    for cmd in commands:
+        kinds = match_kinds(words, prefix, cmd) if cmd else set()
+        if "covers" in kinds:
+            return True, " ".join(cmd)
+        if kinds and found is None:
+            found = (False, " ".join(cmd))
+    return found
 
 
 def covers(allow_rule, entry):
@@ -587,10 +609,18 @@ def kept_settings_report(root, files):
     except ValueError as err:
         return [f"warn: {KEPT} is not usable settings ({err}), so it was not checked; fix it, or --force "
                 "replaces it with the template"]
-    lines = [f"warn: {KEPT} ask rule {r} stops a dispatched run (a headless run cannot answer an ask); "
-             "move it to allow" for r in dict.fromkeys(ask) if stops_run(r, commands)]
-    lines += [f"warn: {KEPT} deny rule {r} stops a dispatched run (a deny cannot be overridden); remove it "
-              "or narrow it" for r in dict.fromkeys(deny) if stops_run(r, commands)]
+    lines = []
+    for kind, rules, why in (("ask", ask, "a headless run cannot answer an ask"),
+                             ("deny", deny, "a deny cannot be overridden")):
+        for r in dict.fromkeys(rules):
+            hit = stops_run(r, commands)
+            if hit and hit[0]:
+                fix = "move it to allow" if kind == "ask" else "remove it or narrow it"
+                lines.append(f"warn: {KEPT} {kind} rule {r} stops a dispatched run ({why}); {fix}")
+            elif hit:
+                fix = "move it to allow" if kind == "ask" else "narrow it if it does"
+                lines.append(f"warn: {KEPT} {kind} rule {r} may stop a dispatched run: it overlaps the loop "
+                             f"command `{hit[1]}` ({why}); {fix}")
     lines += [f"warn: {KEPT} allow entry {e} is missing, so a dispatched run would be stopped by a prompt "
               "no one can answer; add it to permissions.allow"
               for e in allow_wanted if not any(covers(r, e) for r in allow)]
