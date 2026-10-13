@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Node
+node_modules/
+coverage/
+
+# Secrets: copied into each worktree by .worktreeinclude, never committed
+.env
+.env.*
+!.env.example
+credentials/
+
+# Claude Code
+.claude/settings.local.json
+.claude/worktrees/
+CLAUDE.local.md
+
+# macOS
+.DS_Store

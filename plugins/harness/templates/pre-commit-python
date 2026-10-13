@@ -1,0 +1,32 @@
+#!/bin/sh
+# Format and lint checks on the staged Python files (git config core.hooksPath .githooks).
+# Checks the files as they are in the working tree. Skip once with: git commit --no-verify
+set -f
+IFS='
+'
+files=$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACM -- '*.py')
+[ -n "$files" ] || exit 0
+
+if command -v uv >/dev/null 2>&1 && uv run --quiet ruff --version >/dev/null 2>&1; then
+    use_uv=1
+elif command -v ruff >/dev/null 2>&1; then
+    use_uv=0
+else
+    echo "pre-commit: ruff not found (tried uv run ruff, then ruff); Python checks skipped." >&2
+    exit 0
+fi
+
+run_ruff() {
+    if [ "$use_uv" = 1 ]; then uv run --quiet ruff "$@"; else ruff "$@"; fi
+}
+
+status=0
+run_ruff format --check -- $files || status=1
+run_ruff check -- $files || status=1
+if [ "$status" -ne 0 ]; then
+    echo "pre-commit: ruff failed on the staged Python files:" >&2
+    for f in $files; do echo "  $f" >&2; done
+    echo "Fix them (ruff format, ruff check --fix), git add them, and commit again." >&2
+    exit 1
+fi
+exit 0

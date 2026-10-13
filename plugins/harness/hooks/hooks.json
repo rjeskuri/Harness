@@ -20,7 +20,15 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/readonly_bash.py"], "timeout": 10 }
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/readonly_bash.py"], "timeout": 10 },
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/branch_guard.py"], "timeout": 10 }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/branch_guard.py"], "timeout": 10 },
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/tests_first.py"], "timeout": 10 }
         ]
       }
     ],

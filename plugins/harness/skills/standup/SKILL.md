@@ -10,7 +10,7 @@ allowed-tools:
 ---
 # Standup
 
-1. Run `harness-standup $ARGUMENTS` (it is on PATH while this plugin is enabled; otherwise `python3 "${CLAUDE_PLUGIN_ROOT}/bin/harness-standup"`). It prints one section per registered project and a fleet section listing the Claude sessions that are running, idle or waiting on a permission.
+1. Run `harness-standup $ARGUMENTS` (it is on PATH while this plugin is enabled; otherwise `python3 "${CLAUDE_PLUGIN_ROOT}/bin/harness-standup"`). It prints one section per registered project (git state, board counts, PRs awaiting review, tickets needing input, stale worktrees, next steps, hours), a fleet section listing the Claude sessions that are running, idle or waiting on a permission, and the budget and headless-run state.
 2. If it reports no registered projects, run `harness-projects discover`, show the user the repositories it found, and register the ones they confirm with `harness-projects add <path> [--billable --client <name>]`. Then run the standup again.
-3. Summarize for the user, at most three lines per project: state, blocker or open question, next step. Name any session that is waiting on them first.
+3. Summarize for the user, at most four lines per project: state, PRs awaiting their review (`/harness:land`), tickets that need their input (answer on the ticket, then `/harness:work <n>`), next step. Name any session that is waiting on them first, then any exhausted budget or failed run.
 4. Propose an ordered plan for today with the one project to open first, and ask whether that order is right. Do not start work on another project from this session; each project gets its own session.

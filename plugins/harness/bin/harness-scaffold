@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""
+Sets a project up for the harness: CLAUDE.md, .claude/settings.json, scripts/verify.sh, CI and deploy
+workflows, the PR and issue templates, a pre-commit hook, .gitignore and .worktreeinclude, plus a
+skeleton for the stack. Then commits it (a repo with no commits) or lands it through a ticket and a
+pull request (a repo that already has commits), and optionally creates the GitHub repository and
+registers the project.
+
+Usage:
+    harness-scaffold init [PATH] --name NAME [--stack python|node|none] [--verify CMD] [--test-cmd CMD]
+                          [--github] [--register [--billable] [--client C]] [--no-ci] [--force] [--dry-run]
+    harness-scaffold labels [PATH]          # harness-board labels ensure, for an existing repo
+
+Templates live in ../templates next to this script and are rendered by plain substitution of
+{{name}}, {{pkg}}, {{stack}}, {{verify_cmd}}, {{test_cmd}}, {{python_version}} and {{year}}:
+- Only those known keys are replaced, and never right after a `$`, so GitHub Actions expressions
+  such as ${{ github.ref }} and unknown tokens such as {{number}} pass through untouched.
+- In a text template, a line that holds a placeholder whose value is empty is left out (the none
+  stack has no test command, so CLAUDE.md drops that line).
+- JSON templates (settings.json, package.json) are parsed first and substituted inside their string
+  values, so a command with quotes stays valid JSON; empty env values are dropped from settings.json.
+- A template with a stack variant is looked up as <stem>-<stack><ext> first: verify-python.sh,
+  ci-node.yml, pre-commit-python. The plain file (verify.sh, ci.yml, pre-commit) serves the rest.
+- {{pkg}} is the package name in the stack's own convention: the import name for python
+  (demo-app -> demo_app), the lower-cased name for node.
+
+Rules: an existing file is never overwritten without --force, and each path is reported as
+created, kept or updated. The stack skeleton (pyproject.toml, src/<pkg>/__init__.py,
+tests/test_smoke.py; package.json, tests/smoke.test.js) is written only when the project has no
+manifest yet: an existing pyproject.toml or package.json means the project has its own layout.
+Sibling tools (harness-board, harness-work, harness-pr, harness-projects) are called by name on
+PATH, else from this script's folder. `gh` is os.environ.get("HARNESS_GH", "gh").
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import keyword
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
+HERE = Path(__file__).resolve().parent
+STACKS = ("python", "node", "none")
+PYTHON_VERSION = "3.10"
+NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
+TOKEN = re.compile(r"(?<!\$)\{\{(\w+)\}\}")
+EXCLUDE_LINE = ".claude/worktrees/"
+ADOPT_TITLE = "Adopt the harness scaffold"
+NO_RULESET = ("Branch protection is unavailable on this plan for a private repo; "
+              "the local branch guard is the only block.")
+TOOL_TIMEOUT = 1800          # harness-work start runs the worktree setup (uv sync, npm ci)
+
+# Test runners each stack's settings.json allows on top of the template's list.
+STACK_ALLOW = {
+    "python": ["Bash(uv run pytest:*)", "Bash(uv run ruff:*)", "Bash(python3 -m pytest:*)"],
+    "node": ["Bash(npm test:*)", "Bash(npm run lint:*)", "Bash(node --test:*)"],
+    "none": [],
+}
+
+# The skeleton of each stack: (template, destination). Written only when the manifest is new.
+SKELETON = {
+    "python": [("pyproject.toml", "pyproject.toml"), (None, "src/{pkg}/__init__.py"),
+               ("test_smoke.py", "tests/test_smoke.py")],
+    "node": [("package.json", "package.json"), ("smoke.test.js", "tests/smoke.test.js")],
+    "none": [],
+}
+MANIFEST = {"python": "pyproject.toml", "node": "package.json"}
+INIT_PY = '"""{{name}}."""\n\n__version__ = "0.1.0"\n'
+
+# GitHub reads an issue template from .github/ISSUE_TEMPLATE only with this front matter.
+ISSUE_FRONT = {
+    "task.md": ("Task", "One ticket: request, outline, definition of done, the tests that must pass",
+                ["task", "status:ready"]),
+    "epic.md": ("Epic", "A goal split into sub-issue tasks", ["epic", "status:ready"]),
+}
+
+RULESET = {
+    "name": "main",
+    "target": "branch",
+    "enforcement": "active",
+    "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+    "rules": [
+        {"type": "pull_request", "parameters": {
+            "required_approving_review_count": 0, "dismiss_stale_reviews_on_push": False,
+            "require_code_owner_review": False, "require_last_push_approval": False,
+            "required_review_thread_resolution": False}},
+        {"type": "non_fast_forward"},
+        {"type": "deletion"},
+    ],
+}
+
+
+class Problem(Exception):
+    """A bad invocation or a failed precondition: printed as one line, exit 1."""
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse that reports a bad invocation in one line and exits 1."""
+
+    def error(self, message):
+        sys.exit(f"{self.prog}: error: {message}")
+
+
+def say(text=""):
+    print(text, flush=True)
+
+
+def one_line(text):
+    """The last non-empty line of a command's output, whitespace collapsed."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return " ".join(lines[-1].split()) if lines else ""
+
+
+# --------------------------------------------------------------- processes
+def run(cmd, cwd=None, check=True, input=None, env=None, timeout=300):
+    """Run a command; a missing program or (with check) a non-zero exit becomes a Problem."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, input=input, env=env, capture_output=True, text=True,
+                           timeout=timeout, stdin=None if input is not None else subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise Problem(f"{cmd[0]} not found")
+    except subprocess.TimeoutExpired:
+        raise Problem(f"{' '.join(cmd[:3])} timed out after {timeout} s")
+    if check and p.returncode != 0:
+        why = one_line(p.stderr) or one_line(p.stdout) or f"exit {p.returncode}"
+        raise Problem(f"{' '.join(cmd[:3])} failed: {why}")
+    return p
+
+
+def git(root, *args, check=True):
+    return run(["git", "-C", str(root)] + list(args), check=check)
+
+
+def gh_cmd():
+    return os.environ.get("HARNESS_GH", "gh")
+
+
+def sibling(name):
+    """A sibling bin tool: on PATH, else next to this script."""
+    found = shutil.which(name)
+    if found:
+        return found
+    here = HERE / name
+    if here.is_file() and os.access(here, os.X_OK):
+        return str(here)
+    raise Problem(f"{name} not found on PATH or in {HERE}")
+
+
+def call(name, *args, cwd, project):
+    """Run a sibling tool in `cwd` with CLAUDE_PROJECT_DIR pointing at `project`; its stdout."""
+    env = dict(os.environ, CLAUDE_PROJECT_DIR=str(project))
+    p = run([sibling(name)] + list(args), cwd=cwd, env=env, check=False, timeout=TOOL_TIMEOUT)
+    if p.returncode != 0:
+        why = one_line(p.stderr) or one_line(p.stdout) or f"exit {p.returncode}"
+        raise Problem(f"{name} {' '.join(args[:2])} failed: {why}")
+    return p.stdout
+
+
+def quoted(args):
+    return " ".join(shlex.quote(str(a)) for a in args)
+
+
+# --------------------------------------------------------------- repository
+def toplevel(path):
+    """The repository toplevel containing `path`, or None outside a repository."""
+    if not path.is_dir():
+        return None
+    p = git(path, "rev-parse", "--show-toplevel", check=False)
+    return Path(p.stdout.strip()).resolve() if p.returncode == 0 and p.stdout.strip() else None
+
+
+def has_commits(root):
+    return git(root, "rev-parse", "--verify", "--quiet", "HEAD", check=False).returncode == 0
+
+
+def has_origin(root):
+    return git(root, "remote", "get-url", "origin", check=False).returncode == 0
+
+
+def detect_stack(root):
+    """python when pyproject.toml or a top-level *.py is present, node when package.json is, else none."""
+    if (root / "pyproject.toml").is_file() or any(p.is_file() for p in root.glob("*.py")):
+        return "python"
+    if (root / "package.json").is_file():
+        return "node"
+    return "none"
+
+
+def package_name(name, stack):
+    if stack == "node":
+        return name.lower()
+    pkg = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    if keyword.iskeyword(pkg):
+        return pkg + "_"
+    return "_" + pkg if pkg[0].isdigit() else pkg
+
+
+def default_test_cmd(root, stack):
+    """uv when the project is (or is about to be) a uv project, else the stack's plain runner."""
+    if stack == "python":
+        uv_project = (root / "uv.lock").exists() or not (root / "pyproject.toml").exists()
+        return "uv run pytest -q {files}" if uv_project else "python3 -m pytest -q {files}"
+    if stack == "node":
+        return "npm test -- {files}"
+    return ""
+
+
+# --------------------------------------------------------------- rendering
+def substitute(text, values):
+    return TOKEN.sub(lambda m: values[m.group(1)] if m.group(1) in values else m.group(0), text)
+
+
+def render_text(text, values):
+    """Substitute the known placeholders; drop a line that holds one whose value is empty."""
+    out = []
+    for line in text.splitlines(keepends=True):
+        keys = [m.group(1) for m in TOKEN.finditer(line) if m.group(1) in values]
+        if any(values[k] == "" for k in keys):
+            continue
+        out.append(substitute(line, values))
+    return "".join(out)
+
+
+def render_json(text, values):
+    def walk(node):
+        if isinstance(node, str):
+            return substitute(node, values)
+        if isinstance(node, list):
+            return [walk(x) for x in node]
+        if isinstance(node, dict):
+            return {substitute(k, values): walk(v) for k, v in node.items()}
+        return node
+    return walk(json.loads(text))
+
+
+def template_path(name, stack):
+    stem, ext = os.path.splitext(name)
+    variant = TEMPLATES / f"{stem}-{stack}{ext}"
+    path = variant if variant.is_file() else TEMPLATES / name
+    if not path.is_file():
+        raise Problem(f"template {name} missing from {TEMPLATES}")
+    return path
+
+
+def read_template(name, stack):
+    return template_path(name, stack).read_text(encoding="utf-8")
+
+
+def settings_json(values, stack):
+    data = render_json(read_template("settings.json", stack), values)
+    data["env"] = {k: v for k, v in data.get("env", {}).items() if v != ""}
+    allow = data.setdefault("permissions", {}).setdefault("allow", [])
+    allow.extend(rule for rule in STACK_ALLOW[stack] if rule not in allow)
+    return json.dumps(data, indent=2) + "\n"
+
+
+def issue_template(name, stack, dest, values):
+    title, about, labels = ISSUE_FRONT[dest]
+    front = (f"---\nname: {json.dumps(title)}\nabout: {json.dumps(about)}\ntitle: \"\"\n"
+             f"labels: [{', '.join(json.dumps(x) for x in labels)}]\n---\n\n")
+    return front + render_text(read_template(name, stack), values)
+
+
+def plan(root, stack, values, ci):
+    """[(destination, content, mode)] for every file the scaffold writes into `root`."""
+    files = [
+        ("CLAUDE.md", render_text(read_template("CLAUDE.md", stack), values), 0o644),
+        (".claude/settings.json", settings_json(values, stack), 0o644),
+        ("scripts/verify.sh", render_text(read_template("verify.sh", stack), values), 0o755),
+    ]
+    if ci:
+        files += [(".github/workflows/ci.yml", render_text(read_template("ci.yml", stack), values), 0o644),
+                  (".github/workflows/deploy.yml", render_text(read_template("deploy.yml", stack), values),
+                   0o644)]
+    files += [
+        (".github/pull_request_template.md",
+         render_text(read_template("pull_request_template.md", stack), values), 0o644),
+        (".github/ISSUE_TEMPLATE/task.md", issue_template("ticket_task.md", stack, "task.md", values), 0o644),
+        (".github/ISSUE_TEMPLATE/epic.md", issue_template("ticket_epic.md", stack, "epic.md", values), 0o644),
+        (".githooks/pre-commit", render_text(read_template("pre-commit", stack), values), 0o755),
+        (".gitignore", render_text(read_template("gitignore", stack), values), 0o644),
+        (".worktreeinclude", render_text(read_template("worktreeinclude", stack), values), 0o644),
+    ]
+    manifest = MANIFEST.get(stack)
+    if manifest and (root / manifest).exists():
+        files.append((manifest, None, 0o644))          # the project's own layout: kept, nothing else added
+        return files
+    for template, dest in SKELETON[stack]:
+        dest = dest.format(pkg=values["pkg"])
+        if template is None:
+            content = render_text(INIT_PY, values)
+        elif template.endswith(".json"):
+            content = json.dumps(render_json(read_template(template, stack), values), indent=2) + "\n"
+        else:
+            content = render_text(read_template(template, stack), values)
+        files.append((dest, content, 0o644))
+    return files
+
+
+def status_of(root, dest, content, force):
+    path = root / dest
+    if not path.exists():
+        return "create"
+    if content is None or not force:
+        return "keep"
+    try:
+        same = path.read_text(encoding="utf-8") == content
+    except (OSError, UnicodeDecodeError):
+        same = False
+    return "keep" if same else "update"
+
+
+PAST = {"create": "created", "keep": "kept", "update": "updated"}
+
+
+def write_files(root, files, force, dry):
+    """Write each file per its status, printing `created|kept|updated <path>` (`would ...` when dry).
+    The paths written, or that would be."""
+    written = []
+    for dest, content, mode in files:
+        status = status_of(root, dest, content, force)
+        say(f"would {status} {dest}" if dry else f"{PAST[status]} {dest}")
+        if status == "keep":
+            continue
+        written.append(dest)
+        if dry:
+            continue
+        path = root / dest
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        os.chmod(path, mode)
+    return written
+
+
+def preview(root, files, force):
+    return [(dest, status_of(root, dest, content, force)) for dest, content, _ in files]
+
+
+# --------------------------------------------------------------- steps
+def git_common_dir(root):
+    common = Path(git(root, "rev-parse", "--git-common-dir").stdout.strip())
+    return common if common.is_absolute() else root / common
+
+
+def own_hooks(root):
+    """The project's active hooks in .git/hooks (anything but the *.sample files git init leaves)."""
+    folder = git_common_dir(root) / "hooks"
+    try:
+        return sorted(p.name for p in folder.iterdir() if p.is_file() and not p.name.endswith(".sample"))
+    except OSError:
+        return []
+
+
+def configure_repo(root, force, dry):
+    """core.hooksPath .githooks, and .claude/worktrees/ in .git/info/exclude. A project's own hooks
+    (another core.hooksPath, or scripts in .git/hooks) are kept unless --force."""
+    is_repo = toplevel(root) is not None
+    current = git(root, "config", "--get", "core.hooksPath", check=False).stdout.strip() if is_repo else ""
+    hooks = own_hooks(root) if is_repo and not current else []
+    if current == ".githooks":
+        say("kept core.hooksPath .githooks")
+    elif current and not force:
+        say(f"kept core.hooksPath {current} (the project's own hooks; --force replaces it with .githooks)")
+    elif hooks and not force:
+        say(f"kept .git/hooks ({', '.join(hooks)}): the project's own hooks; --force sets core.hooksPath .githooks")
+    elif dry:
+        say("would set core.hooksPath .githooks")
+    else:
+        git(root, "config", "core.hooksPath", ".githooks")
+        say("set core.hooksPath .githooks")
+
+    if not is_repo:                                 # a dry run before git init
+        say(f"would add {EXCLUDE_LINE} to .git/info/exclude")
+        return
+    exclude = git_common_dir(root) / "info" / "exclude"
+    try:
+        text = exclude.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = None
+    if text is not None and any(ln.strip() in (EXCLUDE_LINE, EXCLUDE_LINE.rstrip("/")) for ln in text.splitlines()):
+        say("kept .git/info/exclude")
+        return
+    if dry:
+        say(f"would add {EXCLUDE_LINE} to .git/info/exclude")
+        return
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    prefix = "" if not text or text.endswith("\n") else "\n"
+    with open(exclude, "a", encoding="utf-8") as fh:
+        fh.write(f"{prefix}{EXCLUDE_LINE}\n")
+    say(f"{'created' if text is None else 'updated'} .git/info/exclude")
+
+
+def lock(root, stack, written, dry):
+    """Create the lock file CI's install step needs when this run made the manifest. Its path or None."""
+    if stack == "python" and "pyproject.toml" in written:
+        cmd, lockfile, ci = ["uv", "lock"], "uv.lock", "uv sync --locked"
+    elif stack == "node" and "package.json" in written:
+        cmd, lockfile, ci = ["npm", "install", "--package-lock-only", "--no-audit", "--no-fund"], \
+            "package-lock.json", "npm ci"
+    else:
+        return None
+    if (root / lockfile).exists():
+        return None
+    if dry:
+        say(f"would run: {quoted(cmd)}")
+        return None
+    hint = f"CI's `{ci}` needs it: run `{quoted(cmd)}` and commit {lockfile}"
+    if not shutil.which(cmd[0]):
+        say(f"note: {cmd[0]} is not on PATH, so there is no {lockfile}; {hint}")
+        return None
+    try:
+        p = run(cmd, cwd=root, check=False, timeout=600)
+        why = None if p.returncode == 0 and (root / lockfile).exists() else \
+            one_line(p.stderr) or one_line(p.stdout) or f"exit {p.returncode}"
+    except Problem as err:                          # a timeout: the scaffold goes on without the lock
+        why = str(err)
+    if why:
+        say(f"note: `{quoted(cmd)}` failed ({why}); {hint}")
+        return None
+    say(f"created {lockfile}")
+    return lockfile
+
+
+def first_commit(root, name, dry):
+    subject = f"Scaffold {name} with the harness"
+    if dry:
+        say(f"would commit everything on main: {subject}")
+        return
+    if git(root, "symbolic-ref", "--short", "HEAD", check=False).stdout.strip() != "main":
+        git(root, "symbolic-ref", "HEAD", "refs/heads/main")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", subject)
+    sha = git(root, "rev-parse", "--short", "HEAD").stdout.strip()
+    say(f"committed {sha} on main: {subject}")
+
+
+def github(root, name, create, push, dry):
+    """The private repository (`create`), main pushed to it (`push`), the labels,
+    delete-branch-on-merge and the ruleset."""
+    gh = gh_cmd()
+    if create:
+        cmd = [gh, "repo", "create", name, "--private", "--source", ".", "--remote", "origin"]
+        if dry:
+            say(f"would run: {quoted(cmd)}")
+        else:
+            out = run(cmd, cwd=root).stdout.strip()
+            say(f"created GitHub repository {out or name}")
+            if not has_origin(root):
+                raise Problem("gh repo create left no origin remote; add it and push main by hand")
+    if push:
+        if dry:
+            say("would run: git push -u origin main")
+        else:
+            run(["git", "-C", str(root), "push", "-u", "origin", "main"], timeout=600)
+            say("pushed main to origin")
+    if dry:
+        say("would run: harness-board labels ensure")
+        say(f"would run: {quoted([gh, 'repo', 'edit', 'O/R', '--delete-branch-on-merge'])}")
+        say(f"would run: {quoted([gh, 'api', '-X', 'POST', 'repos/O/R/rulesets', '--input', '-'])}")
+        return
+    out = call("harness-board", "labels", "ensure", cwd=root, project=root).strip()
+    say(out or "labels ensured")
+    repo = run([gh, "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"], cwd=root).stdout.strip()
+    if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
+        raise Problem(f"gh repo view gave no OWNER/REPO (got {repo!r})")
+    run([gh, "repo", "edit", repo, "--delete-branch-on-merge"], cwd=root)
+    say(f"set delete-branch-on-merge on {repo}")
+    p = run([gh, "api", "-X", "POST", f"repos/{repo}/rulesets", "--input", "-"], cwd=root, check=False,
+            input=json.dumps(RULESET))
+    if p.returncode == 0:
+        say(f"created ruleset main on {repo}")
+    elif "403" in p.stderr or "Upgrade to GitHub Pro" in p.stderr:
+        say(NO_RULESET)
+    else:
+        say(f"warning: ruleset not created on {repo}: {one_line(p.stderr) or one_line(p.stdout)}")
+
+
+def adopt_body(name, stack, values, statuses):
+    added = [d for d, s in statuses if s == "create"]
+    replaced = [d for d, s in statuses if s == "update"]
+    lines = ["## Request",
+             f"Add the harness scaffold to {name} (`harness-scaffold init`, stack {stack}): the files it "
+             "lacks, written on this ticket's branch. Files the project already has are kept.", "",
+             "## Outline",
+             "1. `harness-scaffold init` writes the missing files in this ticket's worktree.",
+             "2. Commit, open the pull request, mark it ready for review.", "",
+             "## Definition of done"]
+    lines += [f"- [ ] `{d}` is added" for d in added]
+    lines += [f"- [ ] `{d}` is replaced by the template" for d in replaced]
+    lines += ["- [ ] No other file changes", "",
+              "## Tests that must pass",
+              f"None: configuration and templates only (`no-tests`). The existing suite (`{values['verify_cmd']}`) "
+              "stays green.", "",
+              "## Context",
+              "- `core.hooksPath` is set to `.githooks`, so the pre-commit hook starts working when this lands.",
+              "- Must not change: the project's existing files"
+              + (", except the ones listed as replaced." if replaced else "."), ""]
+    return "\n".join(lines)
+
+
+def ticket_number(out):
+    try:
+        data = json.loads(out)
+        if isinstance(data, dict) and str(data.get("number", "")).isdigit():
+            return int(data["number"])
+    except ValueError:
+        pass
+    m = re.search(r"#(\d+)", out) or re.search(r"/issues/(\d+)", out)
+    if not m:
+        raise Problem(f"harness-board task create printed no issue number: {one_line(out)!r}")
+    return int(m.group(1))
+
+
+def json_out(name, out):
+    try:
+        data = json.loads(out)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        raise Problem(f"{name} printed no JSON object: {one_line(out)!r}")
+    return data
+
+
+def adopt(root, name, stack, values, files, statuses, force, dry):
+    """The scaffold as a chore ticket: issue, worktree, commit there, pull request, ready."""
+    create = ["harness-board", "task", "create", "--title", ADOPT_TITLE, "--type", "chore", "--no-tests",
+              "--size", "S", "--risk", "low", "--body-file"]
+    if dry:
+        say(f"would run: {quoted(create + ['<body>'])}")
+        say("would run: harness-work start <N> --json")
+        say("would write the files above in that worktree and commit them: Adopt the harness scaffold (#<N>)")
+        say("would run: harness-pr open <N> --json")
+        say("would run: harness-pr ready <P>")
+        return
+    fd, body = tempfile.mkstemp(prefix="harness-scaffold-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(adopt_body(name, stack, values, statuses))
+        out = call(*create, body, cwd=root, project=root)
+    finally:
+        os.unlink(body)
+    n = ticket_number(out)
+    say(f"created ticket #{n}: {ADOPT_TITLE}")
+    started = json_out("harness-work start", call("harness-work", "start", str(n), "--json", cwd=root, project=root))
+    if not started.get("worktree"):
+        raise Problem(f"harness-work start {n} gave no worktree")
+    wt = Path(started["worktree"]).resolve()
+    say(f"started #{n} on {started.get('branch') or '?'} in {wt}")
+    written = write_files(wt, files, force, False)
+    lockfile = lock(wt, stack, written, False)
+    paths = written + ([lockfile] if lockfile else [])
+    if not paths:
+        raise Problem(f"nothing to commit in {wt}; ticket #{n} is open without a pull request")
+    git(wt, "add", "--", *paths)
+    subject = f"{ADOPT_TITLE} (#{n})"
+    git(wt, "commit", "-q", "-m", subject)
+    say(f"committed {git(wt, 'rev-parse', '--short', 'HEAD').stdout.strip()} on {started.get('branch') or '?'}: "
+        f"{subject}")
+    pr = json_out("harness-pr open", call("harness-pr", "open", str(n), "--json", cwd=wt, project=root))
+    if not str(pr.get("number", "")).isdigit():
+        raise Problem(f"harness-pr open {n} gave no PR number")
+    say(f"opened PR #{pr['number']} {pr.get('url', '')}".rstrip())
+    call("harness-pr", "ready", str(pr["number"]), cwd=wt, project=root)
+    say(f"PR #{pr['number']} is ready for review")
+
+
+def register(root, name, billable, client, dry):
+    args = ["add", str(root), "--name", name] + (["--billable"] if billable else []) + \
+        (["--client", client] if client else [])
+    if dry:
+        say(f"would run: harness-projects {quoted(args)}")
+        return
+    p = run([sibling("harness-projects")] + args, check=False, timeout=60)
+    if p.returncode == 0:
+        say(f"registered {name} in the project registry")
+    elif "already registered" in p.stderr:
+        say(f"kept registry entry for {root}")
+    else:
+        raise Problem(f"harness-projects add failed: {one_line(p.stderr) or one_line(p.stdout)}")
+
+
+# --------------------------------------------------------------- commands
+def cmd_init(args):
+    name = args.name.strip()
+    if not NAME_RE.match(name):
+        raise Problem(f"--name {name!r}: use letters, digits, '.', '_' or '-', starting and ending with a "
+                      "letter or digit (it names the GitHub repository and the package)")
+    if (args.billable or args.client) and not args.register:
+        raise Problem("--billable and --client go with --register")
+    root = Path(os.path.abspath(os.path.expanduser(args.path or "."))).resolve()
+    dry = args.dry_run
+    if root.exists() and not root.is_dir():
+        raise Problem(f"not a directory: {root}")
+    stack = args.stack or (detect_stack(root) if root.is_dir() else "none")
+
+    top = toplevel(root)
+    if top is not None and top != root:
+        raise Problem(f"{root} is inside the repository {top}; scaffold its toplevel or a folder outside it")
+    if not root.exists():
+        if dry:
+            say(f"would create {root}")
+        else:
+            root.mkdir(parents=True)
+    if top is None:
+        if dry:
+            say("would run: git init -b main")
+        else:
+            git(root, "init", "-q", "-b", "main")
+            say(f"initialized {root} (git init -b main)")
+    committed = top is not None and has_commits(root)
+
+    values = {
+        "name": name,
+        "pkg": package_name(name, stack),
+        "stack": stack,
+        "verify_cmd": args.verify if args.verify is not None else "scripts/verify.sh",
+        "test_cmd": args.test_cmd if args.test_cmd is not None else default_test_cmd(root, stack),
+        "python_version": PYTHON_VERSION,
+        "year": str(dt.date.today().year),
+    }
+    files = plan(root, stack, values, ci=not args.no_ci)
+
+    if not committed:
+        written = write_files(root, files, args.force, dry)
+        lock(root, stack, written, dry)
+        first_commit(root, name, dry)
+        configure_repo(root, args.force, dry)          # after the commit: the scaffold lands as it is
+        if args.github:
+            github(root, name, create=not has_origin(root), push=True, dry=dry)
+    else:
+        statuses = preview(root, files, args.force)
+        origin = has_origin(root)
+        if all(s == "keep" for _, s in statuses):
+            for dest, _ in statuses:
+                say(f"{'would keep' if dry else 'kept'} {dest}")
+            configure_repo(root, args.force, dry)
+            if args.github:
+                github(root, name, create=not origin, push=not origin, dry=dry)
+            say("nothing to adopt: every scaffold file is already here")
+        else:
+            if not origin and not args.github:
+                raise Problem(f"{root} has commits but no origin remote; adopting the scaffold goes through a "
+                              "ticket and a pull request, so pass --github to create the repository first")
+            configure_repo(root, args.force, dry)
+            if args.github:
+                github(root, name, create=not origin, push=not origin, dry=dry)
+            if dry:
+                for dest, status in statuses:
+                    say(f"would {status} {dest}")
+            adopt(root, name, stack, values, files, statuses, args.force, dry)
+    if args.register:
+        register(root, name, args.billable, args.client, dry)
+
+
+def cmd_labels(args):
+    root = Path(os.path.abspath(os.path.expanduser(args.path or "."))).resolve()
+    top = toplevel(root)
+    if top is None:
+        raise Problem(f"not a git repository: {root}")
+    out = call("harness-board", "labels", "ensure", cwd=top, project=top).strip()
+    say(out or "labels ensured")
+
+
+def parser():
+    ap = Parser(prog="harness-scaffold", description="Set a project up for the harness.")
+    sub = ap.add_subparsers(dest="cmd", metavar="{init,labels}")
+    init = sub.add_parser("init", help="write the scaffold, then commit it or adopt it through a ticket")
+    init.add_argument("path", nargs="?", help="the project folder (default: the current one)")
+    init.add_argument("--name", required=True, help="the project and GitHub repository name")
+    init.add_argument("--stack", choices=STACKS, help="default: detected (pyproject.toml or *.py, package.json)")
+    init.add_argument("--verify", metavar="CMD", help="CLAUDE_VERIFY_CMD (default: scripts/verify.sh)")
+    init.add_argument("--test-cmd", metavar="CMD", help="HARNESS_TEST_CMD, with {files} (default: per stack)")
+    init.add_argument("--github", action="store_true", help="create the private GitHub repository and push main")
+    init.add_argument("--register", action="store_true", help="add the project to the harness-projects registry")
+    init.add_argument("--billable", action="store_true", help="with --register: hours count toward an invoice")
+    init.add_argument("--client", help="with --register: who is billed")
+    init.add_argument("--no-ci", action="store_true", help="skip the CI and deploy workflows")
+    init.add_argument("--force", action="store_true", help="overwrite existing files with the templates")
+    init.add_argument("--dry-run", action="store_true", help="print the plan, write nothing")
+    labels = sub.add_parser("labels", help="harness-board labels ensure for an existing repository")
+    labels.add_argument("path", nargs="?", help="the project folder (default: the current one)")
+    return ap
+
+
+def main():
+    ap = parser()
+    args = ap.parse_args()
+    if not args.cmd:
+        ap.error("give a subcommand: init or labels")
+    try:
+        {"init": cmd_init, "labels": cmd_labels}[args.cmd](args)
+    except Problem as err:
+        sys.exit(f"harness-scaffold: {err}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:                      # the reader went away (| head): stop quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
+    except Exception as err:                     # never a traceback: one line, exit 1
+        sys.exit(f"harness-scaffold: {type(err).__name__}: {' '.join(str(err).split())}")

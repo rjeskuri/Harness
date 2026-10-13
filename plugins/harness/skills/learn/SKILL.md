@@ -22,4 +22,4 @@ For each finding, choose the lightest fix that would have prevented it:
 
 Also flag lines in CLAUDE.md or the rules that this session showed to be stale, wrong or ignored, and propose deleting or tightening them.
 
-Present the proposals as a short numbered list of diffs, each with one line of reasoning. Apply only the ones the user approves. Prefer deleting and tightening over adding: these files stay effective only while they stay short.
+Present the proposals as a short numbered list of diffs, each with one line of reasoning. For the ones the user approves, file a `chore` ticket each with `harness-board task create --type chore --no-tests --size S --risk low --title ... --body-file ...` (body: the proposed diff in a fenced block and the reasoning; `--no-tests` only when the change is docs or config), so the change goes through a branch and a pull request like any other. Nothing is edited on the spot. Without a board (no remote), show the diffs and let the user apply them. Prefer deleting and tightening over adding: these files stay effective only while they stay short.

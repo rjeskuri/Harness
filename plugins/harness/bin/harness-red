@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""
+The red proof: a ticket's new tests fail before the implementation exists, and the source is untouched.
+
+Runs in a ticket worktree (the cwd, or --worktree PATH). The record is written to
+~/.claude/harness/repos/<repo-key>/red/<branch-slug>.json, where tests_first.py looks for it:
+{"branch", "base_sha", "test_files", "run_files", "test_hash", "cmd", "exit", "kind", "tail", "at"}.
+`test_files` (hashed into `test_hash`) is every changed file matching HARNESS_TEST_PATTERNS, fixtures and
+conftest.py included; `run_files`, the ones the command runs, are those whose basename names a test module.
+
+Usage:
+    harness-red check [--base origin/main]   # run the branch's changed tests; red exits 0, anything else 1
+    harness-red status                       # the record for this branch, and current: yes|no
+    harness-red scratch create               # a detached worktree of HEAD for the test-breaker; prints its path
+    harness-red scratch run                  # the record's tests in the scratch: cheat passed (0) or cheat failed (1)
+    harness-red scratch remove
+    check and status take --json; every subcommand takes --worktree PATH.
+
+Settings, from the environment first, then `env` in the worktree's .claude/settings.json, with
+.claude/settings.local.json over it: HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT (comma-separated
+globs), HARNESS_TEST_CMD ({files} becomes the test files, shell-quoted; detected when unset) and
+HARNESS_TEST_TIMEOUT (seconds, default 300).
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+TEST_PATTERNS = ("tests/**,test/**,**/test_*.py,**/*_test.py,**/conftest.py,**/*_test.js,**/*.test.js,"
+                 "**/*.test.ts,**/*_test.ts,spec/**")
+SOURCE_EXEMPT = ("docs/**,**/*.md,.claude/**,.github/**,.githooks/**,**/*.toml,**/*.cfg,**/*.ini,**/*.json,"
+                 "**/*.yaml,**/*.yml,**/*.txt,**/*.lock,.gitignore,.worktreeinclude,LICENSE*")
+DEFAULT_TIMEOUT = 300.0
+TAIL_LINES = 40
+CANNOT_START = (126, 127)          # the shell's "not executable" and "command not found"
+IMPORT_RE = re.compile(r"ModuleNotFoundError|ImportError|No module named|Cannot find module|ERR_MODULE_NOT_FOUND")
+ASSERTION_RE = re.compile(r"AssertionError|assert |FAILED|failed|✗|not ok")
+GREEN = "Tests pass before the implementation; they do not test this change."
+RUNNABLE = ("test_*.py", "*_test.py", "*.test.js", "*_test.js", "*.test.ts", "*_test.ts", "*.test.mjs",
+            "*.spec.js", "*.spec.ts")      # basenames passed as {files}; other test files are hashed, not run
+
+
+class Problem(Exception):
+    """A bad invocation or a failed precondition: printed as one line, exit 1."""
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse that reports a bad invocation in one line and exits 1."""
+
+    def error(self, message):
+        sys.exit(f"{self.prog}: error: {message}")
+
+
+# --------------------------------------------------------------- globs and settings
+def glob_match(pattern, path):
+    """Does the repo-relative `path` match `pattern`? Split on '/', '**' consumes zero or more segments,
+    other segments use fnmatch; a pattern without '/' matches the basename."""
+    pattern = pattern.strip()
+    if not pattern:
+        return False
+    if "/" not in pattern:
+        return fnmatch.fnmatch(path.rsplit("/", 1)[-1], pattern)
+    return _segments_match(pattern.split("/"), path.split("/"))
+
+
+def _segments_match(pats, parts):
+    if not pats:
+        return not parts
+    if pats[0] == "**":
+        return any(_segments_match(pats[1:], parts[i:]) for i in range(len(parts) + 1))
+    return bool(parts) and fnmatch.fnmatch(parts[0], pats[0]) and _segments_match(pats[1:], parts[1:])
+
+
+def settings_env(root):
+    """`env` from the project's settings files; settings.local.json wins over settings.json."""
+    merged = {}
+    for name in ("settings.json", "settings.local.json"):
+        try:
+            with open(os.path.join(root, ".claude", name), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        env = data.get("env") if isinstance(data, dict) else None
+        if isinstance(env, dict):
+            merged.update(env)
+    return merged
+
+
+def setting(name, file_env):
+    """The environment first, then the settings files' `env`; None when unset or blank."""
+    value = os.environ.get(name)
+    if value is not None and value.strip():
+        return value.strip()
+    value = file_env.get(name)
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        text = str(value).strip()
+        return text or None
+    return None
+
+
+def globs(name, file_env, default):
+    raw = setting(name, file_env)
+    return [p.strip() for p in (default if raw is None else raw).split(",") if p.strip()]
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def detect_test_cmd(root, files):
+    """The default HARNESS_TEST_CMD for these test files in this project, or None."""
+    names = [f.rsplit("/", 1)[-1] for f in files]
+    if any(n.endswith(".py") for n in names):
+        if os.path.isfile(os.path.join(root, "uv.lock")):
+            return "uv run pytest -q {files}"
+        if any("pytest" in read_text(os.path.join(root, cfg)) for cfg in ("pyproject.toml", "pytest.ini")):
+            return "python3 -m pytest -q {files}"
+    if any(fnmatch.fnmatch(n, "test_*.py") or fnmatch.fnmatch(n, "*_test.py") for n in names):
+        return "python3 -m unittest {files}"
+    try:
+        with open(os.path.join(root, "package.json"), encoding="utf-8") as fh:
+            scripts = json.load(fh).get("scripts")
+        if isinstance(scripts, dict) and scripts.get("test"):
+            return "npm test -- {files}"
+    except (OSError, ValueError, AttributeError):
+        pass
+    if any(n.endswith(".test.js") for n in names):
+        return "node --test {files}"
+    return None
+
+
+def test_timeout(file_env):
+    raw = setting("HARNESS_TEST_TIMEOUT", file_env)
+    try:
+        value = float(raw) if raw is not None else DEFAULT_TIMEOUT
+    except ValueError:
+        value = DEFAULT_TIMEOUT
+    return value if value > 0 else DEFAULT_TIMEOUT       # also catches nan
+
+
+# --------------------------------------------------------------- git and the repository
+def git(root, *args, check=True):
+    try:
+        p = subprocess.run(["git", "-C", root, *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           encoding="utf-8", errors="surrogateescape", timeout=60)
+    except FileNotFoundError:
+        raise Problem("git is not on PATH")
+    except subprocess.TimeoutExpired:
+        raise Problem(f"git {args[0]} timed out")
+    if check and p.returncode != 0:
+        said = [ln.strip() for ln in p.stderr.splitlines() if ln.strip()]
+        raise Problem(f"git {' '.join(args)} failed: {said[-1] if said else f'exit {p.returncode}'}")
+    return p
+
+
+class Repo:
+    """The worktree harness-red runs in: its top level, branch, settings and the per-repository state paths."""
+
+    def __init__(self, start):
+        start = os.path.abspath(os.path.expanduser(start))
+        if not os.path.isdir(start):
+            raise Problem(f"not a directory: {start}")
+        top = git(start, "rev-parse", "--show-toplevel", check=False)
+        if top.returncode != 0 or not top.stdout.strip():
+            raise Problem(f"not inside a git working tree: {start}")
+        self.top = top.stdout.strip()
+        # The main working tree is the parent of the common git dir, so a linked worktree and its main
+        # checkout share one state directory.
+        common = git(self.top, "rev-parse", "--git-common-dir").stdout.strip()
+        if not os.path.isabs(common):
+            common = os.path.join(self.top, common)
+        self.main = os.path.realpath(os.path.dirname(os.path.abspath(common)))
+        self.key = hashlib.sha1(self.main.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        branch = git(self.top, "symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip()
+        if not branch:
+            raise Problem(f"HEAD is detached in {self.top}; harness-red runs on a ticket branch")
+        self.branch = branch
+        self.slug = branch.replace("/", "-")
+        state = os.path.join(os.path.expanduser("~"), ".claude", "harness", "repos", self.key)
+        self.record_path = os.path.join(state, "red", self.slug + ".json")
+        self.scratch = os.path.join(state, "scratch", self.slug)
+        self.env = settings_env(self.top)
+        self.test_globs = globs("HARNESS_TEST_PATTERNS", self.env, TEST_PATTERNS)
+        self.exempt_globs = globs("HARNESS_SOURCE_EXEMPT", self.env, SOURCE_EXEMPT)
+
+    def classify(self, path):
+        """'test', 'exempt' or 'source'."""
+        if any(glob_match(g, path) for g in self.test_globs):
+            return "test"
+        if any(glob_match(g, path) for g in self.exempt_globs):
+            return "exempt"
+        return "source"
+
+    def test_command(self, files):
+        cmd = setting("HARNESS_TEST_CMD", self.env) or detect_test_cmd(self.top, files)
+        if not cmd:
+            raise Problem("no test command for these files: set HARNESS_TEST_CMD under env in "
+                          ".claude/settings.json ({files} becomes the test files)")
+        return cmd.replace("{files}", " ".join(shlex.quote(f) for f in files))
+
+    def resolve_base(self, base):
+        """The commit `base` names; without one, origin/main when it exists, else main."""
+        for ref in [base] if base else ["origin/main", "main"]:
+            p = git(self.top, "rev-parse", "--verify", "--quiet", ref + "^{commit}", check=False)
+            if p.returncode == 0 and p.stdout.strip():
+                return ref
+        if base:
+            raise Problem(f"unknown base {base!r}")
+        raise Problem("neither origin/main nor main exists here; pass --base REF")
+
+    def changed_paths(self, merge_base):
+        """Paths that differ from the merge base, committed or not, plus what git status lists."""
+        diff = git(self.top, "diff", "--name-only", "--no-renames", "-z", merge_base).stdout
+        paths = {p for p in diff.split("\0") if p}
+        status = git(self.top, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames").stdout
+        for entry in status.split("\0"):
+            if len(entry) > 3:
+                paths.add(entry[3:].rstrip("/"))
+        return sorted(paths)
+
+
+def runnable(files):
+    """The test files the command runs: a test module's basename, not a fixture, helper or conftest.py.
+    None runnable is a failed precondition."""
+    run = [f for f in files if any(fnmatch.fnmatch(f.rsplit("/", 1)[-1], p) for p in RUNNABLE)]
+    if not run:
+        raise Problem(f"No runnable test files among the test changes: {', '.join(files)}. "
+                      f"A runnable test file is named {', '.join(RUNNABLE)}.")
+    return run
+
+
+def test_hash(root, files):
+    """sha256 over, for each file in sorted path order, the path, a newline and its bytes. Raises OSError."""
+    h = hashlib.sha256()
+    for f in sorted(files):
+        h.update(f.encode("utf-8", "surrogateescape") + b"\n")
+        with open(os.path.join(root, f), "rb") as fh:
+            h.update(fh.read())
+    return h.hexdigest()
+
+
+def current(root, record):
+    try:
+        return test_hash(root, record["test_files"]) == record.get("test_hash")
+    except OSError:
+        return False
+
+
+# --------------------------------------------------------------- records
+def load_record(repo):
+    try:
+        with open(repo.record_path, encoding="utf-8") as fh:
+            record = json.load(fh)
+    except FileNotFoundError:
+        raise Problem(f"No red run recorded for {repo.branch}; run harness-red check.")
+    except ValueError as err:
+        raise Problem(f"{repo.record_path} is not valid JSON ({err}); run harness-red check again")
+    files = record.get("test_files") if isinstance(record, dict) else None
+    if not isinstance(files, list) or not files or not all(isinstance(f, str) and f for f in files):
+        raise Problem(f"{repo.record_path} has no test_files; run harness-red check again")
+    return record
+
+
+def save_record(path, record):
+    """A temporary file in the same folder, renamed over the old one."""
+    folder = os.path.dirname(path)
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".red-", suffix=".json", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(record, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# --------------------------------------------------------------- running tests
+def kill_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def run_command(cmd, cwd, timeout):
+    """(exit status, combined output) of `cmd` through the shell. Raises TimeoutExpired or OSError."""
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    # A session of its own, so a timeout or an interrupt can stop the shell and everything it started.
+    proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_group(proc)
+        try:
+            proc.communicate(timeout=5)
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
+        raise
+    except BaseException:
+        kill_group(proc)
+        raise
+    return proc.returncode, out.decode("utf-8", "replace")
+
+
+def tail(text, n=TAIL_LINES):
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    return "\n".join(lines[-n:])
+
+
+def kind_of(code, output):
+    if code == 0:
+        return "green"
+    if IMPORT_RE.search(output):
+        return "import"
+    if ASSERTION_RE.search(output):
+        return "assertion"
+    return "error"
+
+
+def run_tests(repo, files, cwd):
+    """(cmd, exit, output, timed out) for the test files run in `cwd`; refuses a command that cannot start."""
+    cmd = repo.test_command(files)
+    timeout = test_timeout(repo.env)
+    try:
+        code, output = run_command(cmd, cwd, timeout)
+    except subprocess.TimeoutExpired:
+        return cmd, None, f"timed out after {timeout:g}s and was stopped", timeout
+    except OSError as err:
+        raise Problem(f"could not start {cmd}: {err.strerror or err}")
+    if code in CANNOT_START:
+        said = [ln.strip() for ln in output.splitlines() if ln.strip()]
+        raise Problem(f"could not start {cmd}: {said[-1] if said else f'exit {code}'}; set HARNESS_TEST_CMD")
+    return cmd, code, output, None
+
+
+# --------------------------------------------------------------- commands
+def cmd_check(repo, args):
+    base = repo.resolve_base(args.base)
+    mb = git(repo.top, "merge-base", "HEAD", base, check=False)
+    merge_base = mb.stdout.strip()
+    if mb.returncode != 0 or not merge_base:
+        raise Problem(f"HEAD and {base} have no common ancestor")
+    changed = repo.changed_paths(merge_base)
+    tests = [p for p in changed if repo.classify(p) == "test" and os.path.isfile(os.path.join(repo.top, p))]
+    if not tests:
+        raise Problem("No test changes on this branch; write the tests first.")
+    sources = [p for p in changed if repo.classify(p) == "source"]
+    if sources:
+        raise Problem(f"Source already changed before the red run: {', '.join(sources)}. "
+                      "Revert them or move them to the coder step.")
+    run_files = runnable(tests)
+    digest = test_hash(repo.top, tests)
+    cmd, code, output, timed_out = run_tests(repo, run_files, repo.top)
+    if timed_out:
+        raise Problem(f"{cmd} timed out after {timed_out:g}s and was stopped; no red run recorded. "
+                      "Raise HARNESS_TEST_TIMEOUT or fix the hang.")
+    kind = kind_of(code, output)
+    record = {"branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
+              "test_hash": digest, "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),
+              "at": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
+    save_record(repo.record_path, record)
+    if args.json:
+        print(json.dumps(record, indent=2, ensure_ascii=False))
+    elif kind == "green":
+        print(f"green: {len(tests)} test files, exit {code}")
+        print(record["tail"])
+    else:
+        print(f"red ({kind}): {len(tests)} test files, exit {code}")
+        print(record["tail"])
+    if kind == "green":
+        raise Problem(GREEN)
+    return 0
+
+
+def cmd_status(repo, args):
+    record = load_record(repo)
+    fresh = current(repo.top, record)
+    if args.json:
+        print(json.dumps(dict(record, current=fresh), indent=2, ensure_ascii=False))
+        return 0
+    print(f"branch: {record.get('branch', repo.branch)}")
+    print(f"kind: {record.get('kind')} (exit {record.get('exit')})")
+    print(f"at: {record.get('at')}")
+    print(f"base: {record.get('base_sha')}")
+    print(f"cmd: {record.get('cmd')}")
+    print(f"test files: {', '.join(record['test_files'])}")
+    print(f"run files: {', '.join(record.get('run_files') or [])}")
+    print(f"current: {'yes' if fresh else 'no'}")
+    return 0
+
+
+def cmd_scratch_create(repo, args):
+    record = load_record(repo)
+    path = repo.scratch
+    if os.path.exists(path):
+        raise Problem(f"a scratch copy already exists at {path}; harness-red scratch remove first")
+    git(repo.top, "worktree", "prune", check=False)          # forget a scratch deleted by hand
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    git(repo.top, "worktree", "add", "--detach", path, "HEAD")
+    for f in record["test_files"]:                          # the tests that are not committed yet
+        src, dst = os.path.join(repo.top, f), os.path.join(path, f)
+        if not os.path.isfile(src) or (os.path.isfile(dst) and same_bytes(src, dst)):
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+    print(path)
+    return 0
+
+
+def same_bytes(a, b):
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        return fa.read() == fb.read()
+
+
+def cmd_scratch_run(repo, args):
+    record = load_record(repo)
+    if not os.path.isdir(repo.scratch):
+        raise Problem(f"No scratch copy for {repo.branch}; run harness-red scratch create.")
+    cmd, code, output, timed_out = run_tests(repo, runnable(record["test_files"]), repo.scratch)
+    if code == 0:
+        print("cheat passed")
+        print(tail(output))
+        return 0
+    print("cheat failed" + (f" (the tests timed out after {timed_out:g}s)" if timed_out else ""))
+    if not timed_out:
+        print(tail(output))
+    return 1
+
+
+def cmd_scratch_remove(repo, args):
+    path = repo.scratch
+    existed = os.path.exists(path)
+    if existed:
+        p = git(repo.top, "worktree", "remove", "--force", path, check=False)
+        if p.returncode != 0 and os.path.exists(path):
+            shutil.rmtree(path)                             # ours, under ~/.claude/harness, and not a worktree now
+    git(repo.top, "worktree", "prune", check=False)
+    print(f"removed {path}" if existed else f"no scratch copy at {path}")
+    return 0
+
+
+def parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--worktree", metavar="PATH", default=argparse.SUPPRESS,
+                        help="the ticket worktree (default: the cwd)")
+    as_json = argparse.ArgumentParser(add_help=False)
+    as_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
+    ap = Parser(prog="harness-red", description="Proves a ticket's tests fail before the implementation exists.")
+    ap.add_argument("--worktree", metavar="PATH", help="the ticket worktree (default: the cwd)")
+    ap.add_argument("--json", action="store_true", help="print JSON (check, status)")
+    sub = ap.add_subparsers(dest="cmd", metavar="{check,status,scratch}")
+    check = sub.add_parser("check", parents=[common, as_json], help="run the branch's test changes and record red")
+    check.add_argument("--base", metavar="REF", help="default: origin/main when it exists, else main")
+    sub.add_parser("status", parents=[common, as_json], help="the red record for this branch")
+    scratch = sub.add_parser("scratch", parents=[common], help="the test-breaker's working copy")
+    ssub = scratch.add_subparsers(dest="scratch_cmd", metavar="{create,run,remove}")
+    ssub.add_parser("create", parents=[common], help="a detached worktree of HEAD plus uncommitted tests")
+    ssub.add_parser("run", parents=[common], help="the record's tests in the scratch copy")
+    ssub.add_parser("remove", parents=[common], help="remove the scratch copy")
+    return ap
+
+
+def main():
+    ap = parser()
+    args = ap.parse_args()
+    if not args.cmd:
+        ap.error("choose a subcommand: check, status or scratch")
+    if args.cmd == "scratch" and not args.scratch_cmd:
+        ap.error("choose scratch create, run or remove")
+    for sig in (signal.SIGTERM, signal.SIGHUP):             # unwind, so a running test command is killed too
+        signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
+    commands = {"check": cmd_check, "status": cmd_status, "create": cmd_scratch_create, "run": cmd_scratch_run,
+                "remove": cmd_scratch_remove}
+    try:
+        repo = Repo(args.worktree or os.getcwd())
+        code = commands[args.scratch_cmd if args.cmd == "scratch" else args.cmd](repo, args)
+    except Problem as err:
+        sys.stdout.flush()
+        sys.exit(f"harness-red: {err}")
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:                      # the reader went away (| head): stop quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
+    except Exception as err:                     # never a traceback: one line, exit 1
+        sys.exit(f"harness-red: {type(err).__name__}: {' '.join(str(err).split())}")

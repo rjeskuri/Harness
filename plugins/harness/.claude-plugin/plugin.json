@@ -1,7 +1,15 @@
 {
   "name": "harness",
-  "version": "0.1.0",
-  "description": "Shared harness: Opus coder, Sonnet quick, Fable reviewer and researcher agents; spec, build, ship, handoff, learn, standup and worklog skills; notification, session brief, secret scan and verify-on-stop hooks",
-  "author": { "name": "Ryan Eskuri" },
-  "keywords": ["harness", "productivity", "multi-project"]
+  "version": "0.2.0",
+  "description": "Ryan's harness: a GitHub Issues board as the context for every agent, tests-first with a red proof and an adversarial check, a worktree per ticket with a never-on-main guard, a PR loop the user lands from the CLI, label-driven model routing, and the standup, handoff, learn and worklog skills",
+  "author": {
+    "name": "Ryan Eskuri"
+  },
+  "keywords": [
+    "harness",
+    "kanban",
+    "tdd",
+    "productivity",
+    "multi-project"
+  ]
 }

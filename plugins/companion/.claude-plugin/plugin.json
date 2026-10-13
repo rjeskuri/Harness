@@ -1,8 +1,0 @@
-{
-  "name": "companion",
-  "version": "0.1.0",
-  "description": "A Game Boy robot that lives above the prompt and reacts to what the session is doing",
-  "author": { "name": "Ryan Eskuri" },
-  "keywords": ["pixel-art", "companion"],
-  "types": "./types/index.d.ts"
-}

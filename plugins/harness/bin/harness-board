@@ -1,0 +1,932 @@
+#!/usr/bin/env python3
+"""
+The board: a project's GitHub Issues as the harness's tickets. An epic is an issue labeled `epic`, its
+tasks are sub-issues, dependencies are GitHub's blocked-by, and status, type, size, risk and flags are
+labels. `show` keeps a local cache of each ticket at
+~/.claude/harness/repos/<repo-key>/tickets/<N>.json for the hooks and the other harness tools.
+
+Usage:
+    harness-board labels ensure
+    harness-board epic create --title T --body-file F [--size S|M|L] [--risk low|high]
+    harness-board task create --title T --body-file F [--parent N] [--type task|bug|chore|refactor]
+                              [--size S|M|L] [--risk low|high] [--blocked-by N[,N]]
+                              [--no-tests] [--needs-local] [--priority]
+    harness-board show N [--markdown]
+    harness-board ready
+    harness-board status N ready|in-progress|in-review|blocked|needs-input [--comment TEXT]
+    harness-board comment N (--body TEXT | --body-file F)
+    harness-board needs-input N --question TEXT [--evidence-file F]
+    harness-board answers N [--since ISO]
+    harness-board close N [--comment TEXT]
+    harness-board epic-check N
+    harness-board board
+    harness-board tier N
+    Every subcommand takes --repo PATH (default: CLAUDE_PROJECT_DIR, else the cwd's repository) and --json.
+
+gh is HARNESS_GH when set, else `gh` on PATH.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+# name, color, meaning (the meaning is the label's description on GitHub)
+LABELS = [
+    ("epic", "5319E7", "A goal; its tasks are sub-issues"),
+    ("task", "0E8A16", "A unit of work under an epic"),
+    ("bug", "D73A4A", "Something is broken"),
+    ("chore", "BFD4F2", "Upkeep: tooling, config, docs, lessons"),
+    ("refactor", "C2E0C6", "Restructure without changing behavior"),
+    ("status:ready", "0052CC", "Ready to work on"),
+    ("status:in-progress", "FBCA04", "An agent is working on it"),
+    ("status:in-review", "D4C5F9", "A pull request awaits your review"),
+    ("status:blocked", "B60205", "Cannot proceed; see the comments"),
+    ("status:needs-input", "E99695", "Waiting for your answer in a comment"),
+    ("size:S", "C5DEF5", "One sitting, one or two files"),
+    ("size:M", "BFDADC", "A few files, under the size cap"),
+    ("size:L", "F9D0C4", "The cap: about 5 files or 300 lines; anything bigger is split"),
+    ("risk:low", "E6E6E6", "Ordinary change"),
+    ("risk:high", "B60205", "Data loss, money, live systems, security, minors' data"),
+    ("no-tests", "EDEDED", "Docs or config only; exempt from tests-first"),
+    ("needs-local", "FEF2C0", "Needs this Mac's files or credentials"),
+    ("priority:high", "FF7F0E", "Dispatched first"),
+]
+TYPES = ("epic", "bug", "refactor", "chore", "task")          # the first present wins
+TASK_TYPES = ("task", "bug", "chore", "refactor")
+STATUSES = ("ready", "in-progress", "in-review", "blocked", "needs-input")
+STATUS_TITLES = {"ready": "Ready", "in-progress": "In progress", "in-review": "In review", "blocked": "Blocked",
+                 "needs-input": "Needs input"}
+FLAGS = ("no-tests", "needs-local", "priority:high")
+TIERS = ("sonnet", "opus", "fable")
+SECTIONS = [("Request", "request"), ("Outline", "outline"), ("Definition of done", "definition_of_done"),
+            ("Tests that must pass", "tests"), ("Context", "context")]
+ISSUE_FIELDS = "number,title,url,body,labels,state,parent,blockedBy,comments"
+PRESERVED = (("branch", None), ("worktree", None), ("started_at", None), ("attempts", []))
+NEEDS_INPUT = "**Needs your input**"
+EPIC_DONE = "All tasks landed."
+CONTEXT_LINES = 120     # the most lines `show --markdown` prints
+COMMENTS_SHOWN = 10     # the newest comments in the context
+COMMENT_LINES = 20      # lines shown of each
+EVIDENCE_LINES = 60     # lines of evidence in a needs-input comment
+LIST_LIMIT = "200"
+GH_TIMEOUT = 60         # seconds per gh call
+LINK_RETRY_DELAY = 1.0  # seconds before the one retry of a sub-issue link
+DEFAULT_APP = "com.microsoft.VSCode"
+DEFAULT_SOUND = "Glass"
+CHECKBOX = re.compile(r"^[-*+]\s+\[[ xX]\]")
+BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*\S)")
+HEADING = re.compile(r"^##\s+(.*?)\s*#*\s*$")
+FENCE = re.compile(r"^\s{0,3}(```|~~~)")
+
+
+class Problem(Exception):
+    """A bad invocation, a failed precondition or a failed gh call: printed as one line, exit 1."""
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse that reports a bad invocation in one line and exits 1."""
+
+    def error(self, message):
+        sys.exit(f"{self.prog}: error: {message}")
+
+
+def one_line(text):
+    return " ".join(str(text).split())
+
+
+def first_line(text):
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def home(*parts):
+    return os.path.join(os.path.expanduser("~"), *parts)
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(text):
+    """A timezone-aware datetime from ISO-8601 (a trailing Z and a naive time both mean UTC), or None."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    text = text.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        when = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)
+
+
+def as_list(value):
+    """gh lists come as a JSON list or as {"nodes": [...]}; anything else is empty."""
+    if isinstance(value, dict):
+        value = value.get("nodes")
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
+def write_json(path, data):
+    """Write JSON through a temporary file in the same folder, renamed over the old one."""
+    folder = os.path.dirname(path)
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".ticket-", suffix=".json", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# --------------------------------------------------------------- the repository
+def git(path, *args):
+    try:
+        return subprocess.run(["git", "-C", path] + list(args), capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=30)
+    except FileNotFoundError:
+        raise Problem("git not found on PATH") from None
+    except subprocess.TimeoutExpired:
+        raise Problem(f"git {args[0]} timed out in {path}") from None
+
+
+class Repo:
+    """The project: its toplevel, its main working tree, its state key and (on demand) OWNER/REPO."""
+
+    def __init__(self, path):
+        path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isdir(path):
+            raise Problem(f"not a directory: {path}")
+        top = git(path, "rev-parse", "--show-toplevel")
+        if top.returncode != 0 or not top.stdout.strip():
+            raise Problem(f"not a git repository: {path}")
+        self.root = top.stdout.strip()
+        common = git(self.root, "rev-parse", "--git-common-dir")
+        if common.returncode != 0 or not common.stdout.strip():
+            raise Problem(f"git rev-parse --git-common-dir failed in {self.root}: {first_line(common.stderr)}")
+        common_dir = os.path.normpath(os.path.join(self.root, common.stdout.strip()))
+        self.main = os.path.realpath(os.path.dirname(common_dir))
+        self.key = hashlib.sha1(self.main.encode("utf-8")).hexdigest()[:12]
+        self.name = os.path.basename(self.main)
+        remotes = git(self.root, "remote")
+        if remotes.returncode != 0 or not remotes.stdout.split():
+            raise Problem(f"{self.main} has no git remote; the board lives in the project's GitHub repository "
+                          "(gh repo create, or git remote add origin <url>)")
+        self._slug = None
+
+    def slug(self):
+        """OWNER/REPO, from gh repo view (once)."""
+        if self._slug is None:
+            data = gh_json(self, ["repo", "view", "--json", "nameWithOwner"])
+            slug = data.get("nameWithOwner") if isinstance(data, dict) else None
+            if not isinstance(slug, str) or "/" not in slug:
+                raise Problem("gh repo view did not name the repository (nameWithOwner missing)")
+            self._slug = slug
+        return self._slug
+
+    def ticket_path(self, number):
+        return home(".claude", "harness", "repos", self.key, "tickets", f"{number}.json")
+
+
+def open_repo(path):
+    return Repo(path or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+
+
+# --------------------------------------------------------------- gh
+def describe(args):
+    """`gh issue view 12`, `gh api repos/o/r/issues/3/sub_issues`: the call, for an error line."""
+    if args and args[0] == "api":
+        return "gh api " + next((a for a in args[1:] if "/" in a and not a.startswith("-")), "")
+    words = []
+    for arg in args:
+        if arg.startswith("-") or len(words) == 3:
+            break
+        words.append(arg)
+    return "gh " + " ".join(words)
+
+
+def gh(repo, args, stdin=None):
+    """Run gh in the repository; its stdout, or Problem naming the call and gh's first stderr line."""
+    exe = os.environ.get("HARNESS_GH", "gh")
+    io = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
+    try:
+        done = subprocess.run([exe] + list(args), cwd=repo.root, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=GH_TIMEOUT, env=dict(os.environ, GH_PROMPT_DISABLED="1"),
+                              **io)
+    except FileNotFoundError:
+        raise Problem(f"gh not found ({exe}); install it with `brew install gh`, then `gh auth login`") from None
+    except OSError as err:
+        raise Problem(f"cannot run gh ({exe}): {err.strerror or err}") from None
+    except subprocess.TimeoutExpired:
+        raise Problem(f"{describe(args)} timed out after {GH_TIMEOUT} s") from None
+    if done.returncode != 0:
+        raise Problem(f"{describe(args)} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
+    return done.stdout
+
+
+def gh_json(repo, args):
+    out = gh(repo, args)
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise Problem(f"{describe(args)} printed something other than JSON: {first_line(out)[:80]}") from None
+
+
+def created_issue(out):
+    """(number, url) from `gh issue create` output: the last issue URL it printed."""
+    found = re.findall(r"https?://\S+/issues/(\d+)", out)
+    urls = re.findall(r"https?://\S+/issues/\d+", out)
+    if not found:
+        raise Problem(f"gh issue create printed no issue URL: {first_line(out)[:80]}")
+    return int(found[-1]), urls[-1]
+
+
+def label_args(labels):
+    out = []
+    for name in labels:
+        out += ["--label", name]
+    return out
+
+
+def body_file(path):
+    """(the --body-file argument, stdin text): an absolute path, or `-` with stdin read here."""
+    if path == "-":
+        return "-", sys.stdin.read()
+    full = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(full):
+        raise Problem(f"no such file: {path}")
+    return full, None
+
+
+def read_text(path, what):
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError as err:
+        raise Problem(f"cannot read {what} {path}: {err.strerror or err}") from None
+
+
+# --------------------------------------------------------------- labels, tiers, the cache
+def label_names(labels):
+    names = []
+    for label in labels if isinstance(labels, list) else as_list(labels):
+        name = label.get("name") if isinstance(label, dict) else label
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def tier_for(kind, size, risk):
+    """The rubric: size:L or risk:high gives fable; size:S, risk:low and not a bug gives sonnet; else opus."""
+    if size == "L" or risk == "high":
+        return "fable"
+    if size == "S" and risk == "low" and kind != "bug":
+        return "sonnet"
+    return "opus"
+
+
+def classify(names, closed=False):
+    """type, status, size, risk, flags and tier from label names."""
+    present = set(names)
+    kind = next((t for t in TYPES if t in present), "task")
+    status = "closed" if closed else next((s for s in STATUSES if "status:" + s in present), None)
+    size = next((s for s in ("L", "M", "S") if "size:" + s in present), None)
+    risk = "high" if "risk:high" in present else "low" if "risk:low" in present else None
+    return {"type": kind, "status": status, "size": size, "risk": risk,
+            "flags": [f for f in FLAGS if f in present], "tier": tier_for(kind, size, risk)}
+
+
+def read_cache(repo, number):
+    try:
+        with open(repo.ticket_path(number), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def refresh_cache(repo, number, labels=None, status=None):
+    """Bring an existing cache in line after a change made here (best effort: the change itself succeeded)."""
+    record = read_cache(repo, number)
+    if record is None:
+        return
+    if labels is not None:
+        record["labels"] = labels
+        record.update(classify(labels, closed=record.get("status") == "closed"))
+    if status is not None:
+        record["status"] = status
+    try:
+        write_json(repo.ticket_path(number), record)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------- the ticket body
+def split_sections(body):
+    """{lower-cased `## ` heading: its text}; headings inside code fences do not count."""
+    sections, current, fenced = {}, None, False
+    for line in (body or "").splitlines():
+        if FENCE.match(line):
+            fenced = not fenced
+        elif not fenced:
+            m = HEADING.match(line)
+            if m:
+                current = m.group(1).strip().rstrip(":").strip().lower()
+                sections.setdefault(current, [])
+                continue
+        if current is not None:
+            sections[current].append(line)
+    return {k: "\n".join(v).strip("\n") for k, v in sections.items()}
+
+
+def first_paragraph(text):
+    lines = []
+    for line in (text or "").strip().splitlines():
+        if not line.strip():
+            break
+        lines.append(line.strip())
+    return " ".join(lines)
+
+
+def parse_sections(body):
+    raw = split_sections(body)
+    dod = raw.get("definition of done", "")
+    tests = raw.get("tests that must pass", "")
+    items = [m.group(1) for m in (BULLET.match(line) for line in tests.splitlines()) if m]
+    return {"request": raw.get("request", "").strip(), "outline": raw.get("outline", "").strip(),
+            "definition_of_done": [line.strip() for line in dod.splitlines() if CHECKBOX.match(line.strip())],
+            "tests": items or [line.strip() for line in tests.splitlines() if line.strip()],
+            "context": raw.get("context", "").strip()}
+
+
+# --------------------------------------------------------------- show
+def fetch_record(repo, number):
+    """The ticket as the cache schema has it (plus `goal` and `tasks` for an epic), fetched now."""
+    data = gh_json(repo, ["issue", "view", str(number), "--json", ISSUE_FIELDS])
+    if not isinstance(data, dict):
+        raise Problem(f"gh issue view {number} printed no issue")
+    names = label_names(data.get("labels"))
+    closed = str(data.get("state", "")).upper() == "CLOSED"
+    kind = classify(names, closed)
+    record = {"number": int(data.get("number") or number), "title": data.get("title") or "",
+              "url": data.get("url") or "", "type": kind["type"], "status": kind["status"],
+              "size": kind["size"], "risk": kind["risk"], "flags": kind["flags"], "labels": names,
+              "tier": kind["tier"], "parent": None, "blocked_by": [], "body": data.get("body") or "",
+              "sections": parse_sections(data.get("body")), "comments": [], "fetched_at": now_iso()}
+    parent = data.get("parent")
+    if isinstance(parent, dict) and parent.get("number"):
+        if parent.get("body") is None:          # gh's parent field carries no body: the goal needs it
+            pdata = gh_json(repo, ["issue", "view", str(parent["number"]), "--json", "number,title,body"])
+            parent = dict(parent, **(pdata if isinstance(pdata, dict) else {}))
+        record["parent"] = {"number": int(parent["number"]), "title": parent.get("title") or "",
+                            "goal": first_paragraph(split_sections(parent.get("body")).get("goal", ""))}
+    for b in as_list(data.get("blockedBy")):
+        if b.get("number"):
+            record["blocked_by"].append({"number": int(b["number"]), "state": str(b.get("state", "")).upper()})
+    for c in as_list(data.get("comments")):
+        author = c.get("author") if isinstance(c.get("author"), dict) else {}
+        record["comments"].append({"author": author.get("login") or "ghost", "created_at": c.get("createdAt") or "",
+                                   "body": c.get("body") or ""})
+    if record["type"] == "epic":
+        record["goal"] = first_paragraph(split_sections(record["body"]).get("goal", ""))
+        subs = gh_json(repo, ["api", f"repos/{repo.slug()}/issues/{number}/sub_issues?per_page=100"])
+        record["tasks"] = [task_entry(s) for s in (subs if isinstance(subs, list) else []) if isinstance(s, dict)]
+    return record
+
+
+def task_entry(sub):
+    closed = str(sub.get("state", "")).upper() == "CLOSED"
+    kind = classify(label_names(sub.get("labels")), closed)
+    return {"number": sub.get("number"), "title": sub.get("title") or "", "state": "CLOSED" if closed else "OPEN",
+            "type": kind["type"], "status": kind["status"], "size": kind["size"], "risk": kind["risk"],
+            "tier": kind["tier"]}
+
+
+def save_record(repo, record):
+    old = read_cache(repo, record["number"]) or {}
+    for key, default in PRESERVED:
+        record[key] = old.get(key, default)
+    try:
+        write_json(repo.ticket_path(record["number"]), record)
+    except OSError as err:
+        raise Problem(f"cannot write {repo.ticket_path(record['number'])}: {err.strerror or err}") from None
+
+
+def context_markdown(record):
+    """The ticket context: header, epic and blockers, the sections, then the newest comments that fit."""
+    n = record["number"]
+    raw = split_sections(record.get("body"))
+    state = "closed" if record.get("status") == "closed" else "open"
+    lines = [f"# #{n} {record['title']}",
+             f"Labels: {', '.join(record['labels']) or 'none'} (tier {record['tier']}, {state})"]
+    if record.get("url"):
+        lines.append(record["url"])
+    if record.get("goal"):
+        lines.append(f"Goal: {record['goal']}")
+    parent = record.get("parent")
+    if parent:
+        lines.append(f"Epic #{parent['number']}: {parent['title']}")
+        if parent.get("goal"):
+            lines.append(f"Epic goal: {parent['goal']}")
+    if record["blocked_by"]:
+        lines.append("Blocked by: " + ", ".join(f"#{b['number']} ({b['state'].lower() or 'unknown'})"
+                                                for b in record["blocked_by"]))
+    tasks = record.get("tasks")
+    if tasks:
+        done = sum(t["state"] == "CLOSED" for t in tasks)
+        lines += ["", f"## Tasks ({done} of {len(tasks)} closed)"]
+        for t in tasks:
+            detail = "closed" if t["state"] == "CLOSED" else ", ".join(
+                [t["status"] or "no status", t["size"] or "-", t["risk"] or "-", f"tier {t['tier']}"])
+            lines.append(f"- #{t['number']} {t['title']} ({detail})")
+    for heading, _ in SECTIONS:
+        text = raw.get(heading.lower(), "").strip("\n")
+        if text.strip():
+            lines += ["", f"## {heading}"] + text.splitlines()
+    comments = record["comments"]
+    blocks = []
+    for c in comments[-COMMENTS_SHOWN:]:
+        body = (c["body"] or "").strip("\n").splitlines()
+        block = ["", f"**{c['author']}** ({c['created_at'][:10]}):"] + body[:COMMENT_LINES]
+        if len(body) > COMMENT_LINES:
+            block.append(f"[... {len(body) - COMMENT_LINES} more lines]")
+        blocks.append(block)
+    room = CONTEXT_LINES - len(lines) - 2
+    chosen = []
+    for block in reversed(blocks):                     # newest first, whole comments only
+        if len(block) > room:
+            break
+        chosen.insert(0, block)
+        room -= len(block)
+    if chosen:
+        lines += ["", f"## Comments (newest {len(chosen)} of {len(comments)})"]
+        for block in chosen:
+            lines += block
+    elif comments:
+        lines += ["", f"{len(comments)} comments not shown: gh issue view {n} --comments"]
+    if len(lines) > CONTEXT_LINES:
+        lines = lines[:CONTEXT_LINES - 1] + [f"[... cut at {CONTEXT_LINES} lines; harness-board show {n} has it all]"]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------- notifications (as hooks/notify.py)
+def env_setting(name, default):
+    value = os.environ.get(name)
+    return default if value is None else value.strip()
+
+
+def succeeded(cmd):
+    return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=10).returncode == 0
+
+
+def applescript_string(text):
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def notify(message, group):
+    """A macOS notification: terminal-notifier when on PATH, else osascript. Never fails."""
+    title = "Harness"
+    app = env_setting("HARNESS_NOTIFY_APP", DEFAULT_APP)
+    sound = env_setting("HARNESS_NOTIFY_SOUND", DEFAULT_SOUND)
+    try:
+        exe = shutil.which("terminal-notifier")
+        if exe:
+            cmd = [exe, "-title", title, "-message", message, "-group", group]
+            cmd += ["-activate", app] if app else []
+            cmd += ["-sound", sound] if sound else []
+            if succeeded(cmd):
+                return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        exe = shutil.which("osascript")
+        if exe:
+            script = f"display notification {applescript_string(message)} with title {applescript_string(title)}"
+            if sound:
+                script += f" sound name {applescript_string(sound)}"
+            return succeeded([exe, "-e", script])
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return False
+
+
+# --------------------------------------------------------------- output
+def emit(args, data, text):
+    print(json.dumps(data, indent=2, ensure_ascii=False) if args.json else text)
+
+
+def table(rows):
+    """Left-aligned columns, two spaces apart."""
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
+    return "\n".join("  ".join([c.ljust(w) for c, w in zip(r, widths)] + [r[-1]]).rstrip() for r in rows)
+
+
+def issue_line(item):
+    return f"#{item['number']} {item['title']} ({item['type']}, {item['size'] or '-'}, {item['risk'] or '-'})"
+
+
+# --------------------------------------------------------------- commands
+def cmd_labels_ensure(repo, args):
+    for name, color, meaning in LABELS:
+        gh(repo, ["label", "create", name, "--color", color, "--description", meaning, "--force"])
+    emit(args, {"labels": [name for name, _, _ in LABELS], "count": len(LABELS)},
+         f"{len(LABELS)} labels created or updated.")
+
+
+def cmd_epic_create(repo, args):
+    path, stdin = body_file(args.body_file)
+    labels = ["epic", "status:ready"] + ([f"size:{args.size}"] if args.size else []) \
+        + ([f"risk:{args.risk}"] if args.risk else [])
+    out = gh(repo, ["issue", "create", "--title", args.title, "--body-file", path] + label_args(labels), stdin)
+    number, url = created_issue(out)
+    emit(args, {"number": number, "url": url}, f"#{number} {url}")
+
+
+def blocker_numbers(values):
+    out = []
+    for value in values or []:
+        for part in value.split(","):
+            part = part.strip().lstrip("#")
+            if not part:
+                continue
+            if not part.isdigit() or int(part) <= 0:
+                raise Problem(f"--blocked-by: not an issue number: {part!r}")
+            if int(part) not in out:
+                out.append(int(part))
+    return out
+
+
+def link_sub_issue(repo, parent, number):
+    """Link `number` under `parent`, retrying once. (None, id) on success, (the error, id) on failure."""
+    issue_id, error = None, None
+    for attempt in range(2):
+        if attempt:
+            time.sleep(LINK_RETRY_DELAY)
+        try:
+            if issue_id is None:
+                found = gh(repo, ["api", f"repos/{repo.slug()}/issues/{number}", "--jq", ".id"]).strip()
+                if not found.isdigit():
+                    raise Problem(f"gh api repos/{repo.slug()}/issues/{number} gave no numeric id: {found[:40]!r}")
+                issue_id = found
+            gh(repo, ["api", "-X", "POST", f"repos/{repo.slug()}/issues/{parent}/sub_issues",
+                      "-F", f"sub_issue_id={issue_id}"])
+            return None, issue_id
+        except Problem as err:
+            error = err
+    return error, issue_id
+
+
+def cmd_task_create(repo, args):
+    path, stdin = body_file(args.body_file)
+    blockers = blocker_numbers(args.blocked_by)
+    if args.parent:
+        repo.slug()                    # fails before anything is created when gh cannot see the repository
+    labels = [args.type, "status:ready"] + ([f"size:{args.size}"] if args.size else []) \
+        + ([f"risk:{args.risk}"] if args.risk else []) + (["no-tests"] if args.no_tests else []) \
+        + (["needs-local"] if args.needs_local else []) + (["priority:high"] if args.priority else [])
+    out = gh(repo, ["issue", "create", "--title", args.title, "--body-file", path] + label_args(labels), stdin)
+    number, url = created_issue(out)
+    result = {"number": number, "url": url, "parent": args.parent, "linked": None, "blocked_by": []}
+
+    def fail(message):
+        emit(args, result, f"#{number} {url}")
+        raise Problem(f"created #{number} ({url}) but {message}")
+
+    if args.parent:
+        error, issue_id = link_sub_issue(repo, args.parent, number)
+        result["linked"] = error is None
+        if error is not None:
+            slug = repo.slug()
+            skipped = "; blocked-by not added" if blockers else ""
+            id_hint = issue_id or f"$(gh api repos/{slug}/issues/{number} --jq .id)"
+            fail(f"could not link it under #{args.parent} after a retry: {error}{skipped}; link it with: "
+                 f"gh api -X POST repos/{slug}/issues/{args.parent}/sub_issues -F sub_issue_id={id_hint}")
+    for b in blockers:
+        try:
+            gh(repo, ["issue", "edit", str(number), "--add-blocked-by", str(b)])
+        except Problem as err:
+            fail(f"could not mark it blocked by #{b}: {err}")
+        result["blocked_by"].append(b)
+    emit(args, result, f"#{number} {url}")
+
+
+def cmd_show(repo, args):
+    record = fetch_record(repo, args.number)
+    save_record(repo, record)
+    if args.markdown:
+        print(context_markdown(record))
+    else:
+        print(json.dumps(record, indent=2, ensure_ascii=False))
+
+
+def cmd_ready(repo, args):
+    items = gh_json(repo, ["issue", "list", "--state", "open", "--label", "status:ready", "--json",
+                           "number,title,labels,blockedBy", "--limit", LIST_LIMIT])
+    rows = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        names = label_names(item.get("labels"))
+        if "epic" in names:
+            continue
+        if any(str(b.get("state", "")).upper() != "CLOSED" for b in as_list(item.get("blockedBy"))):
+            continue
+        kind = classify(names)
+        rows.append({"number": item.get("number"), "title": item.get("title") or "", "type": kind["type"],
+                     "size": kind["size"], "risk": kind["risk"], "tier": kind["tier"], "flags": kind["flags"]})
+    rows.sort(key=lambda r: ("priority:high" not in r["flags"], r["number"] or 0))
+    if args.json:
+        emit(args, rows, "")
+    elif not rows:
+        print("No ready tickets.")
+    else:
+        print(table([("#", "TITLE", "TYPE", "SIZE", "RISK", "TIER", "FLAGS")]
+                    + [(str(r["number"]), r["title"], r["type"], r["size"] or "-", r["risk"] or "-", r["tier"],
+                        ",".join(r["flags"])) for r in rows]))
+
+
+def set_status(repo, number, status, comment=None):
+    """Swap the status label (remove every other status:*, add the new one), comment when asked."""
+    data = gh_json(repo, ["issue", "view", str(number), "--json", "labels"])
+    names = label_names(data.get("labels") if isinstance(data, dict) else None)
+    new = "status:" + status
+    removed = [name for name in names if name.startswith("status:") and name != new]
+    cmd = ["issue", "edit", str(number), "--add-label", new]
+    for name in removed:
+        cmd += ["--remove-label", name]
+    gh(repo, cmd)
+    if comment:
+        gh(repo, ["issue", "comment", str(number), "--body", comment])
+    labels = [name for name in names if name not in removed] + ([new] if new not in names else [])
+    refresh_cache(repo, number, labels=labels, status=status)
+    return removed
+
+
+def cmd_status(repo, args):
+    removed = set_status(repo, args.number, args.status, args.comment)
+    emit(args, {"number": args.number, "status": args.status, "removed": removed},
+         f"#{args.number} status:{args.status}")
+
+
+def cmd_comment(repo, args):
+    if args.body is not None:
+        out = gh(repo, ["issue", "comment", str(args.number), "--body", args.body])
+    else:
+        path, stdin = body_file(args.body_file)
+        out = gh(repo, ["issue", "comment", str(args.number), "--body-file", path], stdin)
+    url = first_line(out.strip().splitlines()[-1] if out.strip() else "")
+    emit(args, {"number": args.number, "url": url}, url or f"commented on #{args.number}")
+
+
+def needs_input_body(number, question, evidence):
+    parts = [NEEDS_INPUT, question.strip()]
+    lines = (evidence or "").strip("\n").splitlines()
+    if any(line.strip() for line in lines):
+        if len(lines) > EVIDENCE_LINES:
+            keep = EVIDENCE_LINES - 1
+            lines = [f"[... {len(lines) - keep} earlier lines omitted]"] + lines[-keep:]
+        longest = max((len(run) for run in re.findall(r"`{3,}", "\n".join(lines))), default=0)
+        fence = "`" * max(3, longest + 1)
+        parts.append("\n".join([fence] + lines + [fence]))
+    parts.append(f"Reply in a comment; /harness:work {number} picks it up.")
+    return "\n\n".join(parts)
+
+
+def cmd_needs_input(repo, args):
+    if not args.question.strip():
+        raise Problem("--question is empty")
+    evidence = read_text(args.evidence_file, "evidence file") if args.evidence_file else None
+    set_status(repo, args.number, "needs-input")
+    out = gh(repo, ["issue", "comment", str(args.number), "--body",
+                    needs_input_body(args.number, args.question, evidence)])
+    url = first_line(out.strip().splitlines()[-1] if out.strip() else "")
+    notified = notify(f"{repo.name} #{args.number} needs input", f"harness-{repo.key}-{args.number}")
+    emit(args, {"number": args.number, "url": url, "notified": notified}, url or f"#{args.number} needs input")
+
+
+def cmd_answers(repo, args):
+    if args.since is not None:
+        since = parse_iso(args.since)
+        if since is None:
+            raise Problem(f"--since: not an ISO-8601 time: {args.since!r}")
+    else:
+        since = parse_iso((read_cache(repo, args.number) or {}).get("fetched_at"))
+    login = gh(repo, ["api", "user", "--jq", ".login"]).strip()
+    if not login:
+        raise Problem("gh api user printed no login")
+    data = gh_json(repo, ["issue", "view", str(args.number), "--json", "comments"])
+    out = []
+    for c in as_list(data.get("comments") if isinstance(data, dict) else None):
+        author = (c.get("author") or {}).get("login") if isinstance(c.get("author"), dict) else None
+        body = c.get("body") or ""
+        if not author or author.casefold() != login.casefold() or body.lstrip().startswith(NEEDS_INPUT):
+            continue
+        when = parse_iso(c.get("createdAt"))
+        if since is not None and (when is None or when <= since):
+            continue
+        out.append({"author": author, "created_at": c.get("createdAt"), "body": body, "url": c.get("url")})
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+def cmd_close(repo, args):
+    gh(repo, ["issue", "close", str(args.number)] + (["--comment", args.comment] if args.comment else []))
+    refresh_cache(repo, args.number, status="closed")
+    emit(args, {"number": args.number, "closed": True}, f"closed #{args.number}")
+
+
+def cmd_epic_check(repo, args):
+    data = gh_json(repo, ["issue", "view", str(args.number), "--json", "state,subIssuesSummary"])
+    data = data if isinstance(data, dict) else {}
+    summary = data.get("subIssuesSummary") if isinstance(data.get("subIssuesSummary"), dict) else {}
+    total, completed = int(summary.get("total") or 0), int(summary.get("completed") or 0)
+    result = {"number": args.number, "total": total, "completed": completed, "closed": False}
+    if str(data.get("state", "")).upper() == "CLOSED":
+        result["closed"] = True
+        emit(args, result, f"#{args.number} is already closed")
+    elif total > 0 and completed == total:
+        gh(repo, ["issue", "close", str(args.number), "--comment", EPIC_DONE])
+        refresh_cache(repo, args.number, status="closed")
+        result["closed"] = True
+        emit(args, result, f"closed epic #{args.number}: all {total} tasks landed")
+    else:
+        emit(args, result, f"#{args.number}: {completed} of {total} tasks closed; left open")
+
+
+def cmd_board(repo, args):
+    items = gh_json(repo, ["issue", "list", "--state", "open", "--json", "number,title,labels,subIssuesSummary",
+                           "--limit", LIST_LIMIT])
+    groups = {"epics": []}
+    groups.update({s: [] for s in STATUSES})
+    groups["no-status"] = []
+    for item in sorted((i for i in (items if isinstance(items, list) else []) if isinstance(i, dict)),
+                       key=lambda i: i.get("number") or 0):
+        kind = classify(label_names(item.get("labels")))
+        entry = {"number": item.get("number"), "title": item.get("title") or "", "type": kind["type"],
+                 "size": kind["size"], "risk": kind["risk"]}
+        if kind["type"] == "epic":
+            summary = item.get("subIssuesSummary") if isinstance(item.get("subIssuesSummary"), dict) else {}
+            entry.update(total=int(summary.get("total") or 0), completed=int(summary.get("completed") or 0))
+            groups["epics"].append(entry)
+        else:
+            groups[kind["status"] or "no-status"].append(entry)
+    if args.json:
+        emit(args, groups, "")
+        return
+    lines = [f"# Board: {repo.name}"]
+    if groups["epics"]:
+        lines += ["", f"## Epics ({len(groups['epics'])})"]
+        lines += [f"- #{e['number']} {e['title']} ({e['completed']} of {e['total']} tasks closed)"
+                  for e in groups["epics"]]
+    for status in STATUSES:
+        lines += ["", f"## {STATUS_TITLES[status]} ({len(groups[status])})"]
+        lines += ["- " + issue_line(e) for e in groups[status]]
+    if groups["no-status"]:
+        lines += ["", f"## No status ({len(groups['no-status'])})"]
+        lines += ["- " + issue_line(e) for e in groups["no-status"]]
+    print("\n".join(lines))
+
+
+def cmd_tier(repo, args):
+    cached = read_cache(repo, args.number)
+    if cached and isinstance(cached.get("labels"), list):
+        tier, source = classify(label_names(cached["labels"]))["tier"], "cache"
+    elif cached and cached.get("tier") in TIERS:
+        tier, source = cached["tier"], "cache"
+    else:
+        data = gh_json(repo, ["issue", "view", str(args.number), "--json", "labels"])
+        tier, source = classify(label_names(data.get("labels") if isinstance(data, dict) else None))["tier"], "github"
+    emit(args, {"number": args.number, "tier": tier, "source": source}, tier)
+
+
+# --------------------------------------------------------------- arguments
+def issue_number(text):
+    digits = text.lstrip("#")
+    if not digits.isdigit() or int(digits) <= 0:
+        raise argparse.ArgumentTypeError(f"not an issue number: {text!r}")
+    return int(digits)
+
+
+def parser():
+    repo_help = "the project (default: CLAUDE_PROJECT_DIR, else the cwd's repository)"
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--repo", metavar="PATH", default=argparse.SUPPRESS, help=repo_help)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
+    ap = Parser(prog="harness-board", description="The board: GitHub Issues as tickets (epics, tasks, status labels).")
+    ap.add_argument("--repo", metavar="PATH", help=repo_help)
+    ap.add_argument("--json", action="store_true", help="print JSON")
+    sub = ap.add_subparsers(dest="cmd", metavar="{labels,epic,task,show,ready,status,comment,needs-input,answers,"
+                                               "close,epic-check,board,tier}")
+    sub.required = True
+
+    labels = sub.add_parser("labels", help="the board's label set")
+    labels_sub = labels.add_subparsers(dest="action", metavar="{ensure}")
+    labels_sub.required = True
+    labels_sub.add_parser("ensure", parents=[common], help="create or update every board label")
+
+    epic = sub.add_parser("epic", help="epics")
+    epic_sub = epic.add_subparsers(dest="action", metavar="{create}")
+    epic_sub.required = True
+    ec = epic_sub.add_parser("create", parents=[common], help="create an epic (labels epic, status:ready)")
+    ec.add_argument("--title", required=True)
+    ec.add_argument("--body-file", required=True, metavar="F", help="the body (- for stdin)")
+    ec.add_argument("--size", choices=("S", "M", "L"))
+    ec.add_argument("--risk", choices=("low", "high"))
+
+    task = sub.add_parser("task", help="tasks")
+    task_sub = task.add_subparsers(dest="action", metavar="{create}")
+    task_sub.required = True
+    tc = task_sub.add_parser("create", parents=[common], help="create a task, link it under an epic, add blockers")
+    tc.add_argument("--title", required=True)
+    tc.add_argument("--body-file", required=True, metavar="F", help="the body (- for stdin)")
+    tc.add_argument("--parent", type=issue_number, metavar="N", help="the epic to link it under")
+    tc.add_argument("--type", choices=TASK_TYPES, default="task")
+    tc.add_argument("--size", choices=("S", "M", "L"))
+    tc.add_argument("--risk", choices=("low", "high"))
+    tc.add_argument("--blocked-by", action="append", metavar="N[,N]", help="issues that must close first")
+    tc.add_argument("--no-tests", action="store_true", help="docs or config only; exempt from tests-first")
+    tc.add_argument("--needs-local", action="store_true", help="needs this Mac's files or credentials")
+    tc.add_argument("--priority", action="store_true", help="label priority:high")
+
+    show = sub.add_parser("show", parents=[common], help="fetch a ticket, write its cache, print it")
+    show.add_argument("number", type=issue_number, metavar="N")
+    show.add_argument("--markdown", action="store_true", help=f"the ticket context (at most {CONTEXT_LINES} lines)")
+
+    sub.add_parser("ready", parents=[common], help="open, unblocked status:ready tickets in dispatch order")
+
+    status = sub.add_parser("status", parents=[common], help="set a ticket's status label")
+    status.add_argument("number", type=issue_number, metavar="N")
+    status.add_argument("status", choices=STATUSES)
+    status.add_argument("--comment", metavar="TEXT")
+
+    comment = sub.add_parser("comment", parents=[common], help="comment on a ticket")
+    comment.add_argument("number", type=issue_number, metavar="N")
+    body = comment.add_mutually_exclusive_group(required=True)
+    body.add_argument("--body", metavar="TEXT")
+    body.add_argument("--body-file", metavar="F", help="- for stdin")
+
+    ni = sub.add_parser("needs-input", parents=[common], help="ask the user on the ticket and notify")
+    ni.add_argument("number", type=issue_number, metavar="N")
+    ni.add_argument("--question", required=True, metavar="TEXT")
+    ni.add_argument("--evidence-file", metavar="F", help=f"shown fenced, at most {EVIDENCE_LINES} lines (the tail)")
+
+    answers = sub.add_parser("answers", parents=[common], help="your comments on a ticket since a time (JSON)")
+    answers.add_argument("number", type=issue_number, metavar="N")
+    answers.add_argument("--since", metavar="ISO", help="default: the cache's fetched_at")
+
+    close = sub.add_parser("close", parents=[common], help="close a ticket")
+    close.add_argument("number", type=issue_number, metavar="N")
+    close.add_argument("--comment", metavar="TEXT")
+
+    check = sub.add_parser("epic-check", parents=[common], help="close an epic whose tasks are all closed")
+    check.add_argument("number", type=issue_number, metavar="N")
+
+    sub.add_parser("board", parents=[common], help="open issues by status")
+
+    tier = sub.add_parser("tier", parents=[common], help="sonnet, opus or fable from the ticket's labels")
+    tier.add_argument("number", type=issue_number, metavar="N")
+    return ap
+
+
+COMMANDS = {"labels ensure": cmd_labels_ensure, "epic create": cmd_epic_create, "task create": cmd_task_create,
+            "show": cmd_show, "ready": cmd_ready, "status": cmd_status, "comment": cmd_comment,
+            "needs-input": cmd_needs_input, "answers": cmd_answers, "close": cmd_close,
+            "epic-check": cmd_epic_check, "board": cmd_board, "tier": cmd_tier}
+
+
+def main():
+    args = parser().parse_args()
+    name = args.cmd + (f" {args.action}" if getattr(args, "action", None) else "")
+    try:
+        COMMANDS[name](open_repo(getattr(args, "repo", None)), args)
+    except Problem as err:
+        sys.exit(f"harness-board: {one_line(err)}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:                      # the reader went away (| head): stop quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
+    except Exception as err:                     # never a traceback: one line, exit 1
+        sys.exit(f"harness-board: {type(err).__name__}: {one_line(err)}")

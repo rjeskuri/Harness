@@ -3,6 +3,15 @@
 
 Matcher (hooks.json): startup|resume|compact. Adds at most 40 lines of context:
   ## Session brief: <repo> on <branch>, <n> uncommitted, last commit <age>: <subject>
+  - on a ticket branch (t/<N>-...): Ticket #N: <title> (<status>, tier <tier>), up to six
+    definition-of-done lines and Red run: <kind> at <time> (or none), from the ticket
+    cache and red record in ~/.claude/harness/repos/<key>/ (no network);
+  - otherwise, when the repo has an origin remote and gh (HARNESS_GH, else gh on PATH)
+    answers within 3 s: Board: <r> ready, <p> in progress, <v> awaiting your review,
+    <q> needs input (open issues by status label, epics not counted as ready; open
+    non-draft pull requests not opened by a bot);
+  - Budget: <name> exhausted until <time> (<reason>), for each budget that
+    ~/.claude/harness/budgets.json marks exhausted;
   - the Next steps section of docs/agent/handoff.md (first 12 lines), else the file's
     first 20 lines; or, without a handoff, the lines starting with "Next" in the last
     `## ` block of docs/PROGRESS.md (at most 6, none from inside a code fence);
@@ -23,20 +32,33 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import hashlib
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 MAX_LINES = 40
 MAX_LINE_CHARS = 300
 READ_LIMIT = 512 * 1024  # bytes read from any one source file
 # Three git calls at most (rev-parse, status, log): 4 + 8 + 4 s, inside the 20 s that
-# hooks.json gives this hook.
+# hooks.json gives this hook. The ticket and board lines add one quick git call (and the
+# board two gh calls run side by side for at most 3 s), only while the brief has used
+# less than EXTRAS_DEADLINE seconds.
 GIT_TIMEOUT = 4
 STATUS_TIMEOUT = 8
+EXTRA_GIT_TIMEOUT = 2
+GH_TIMEOUT = 3
+EXTRAS_DEADLINE = 14
+
+TICKET_BRANCH = re.compile(r"^t/(\d+)-")
+DOD_LINES = 6
+CHECKBOX_RE = re.compile(r"^(?:[-*+]\s+)?(\[[ xX]\]\s+)?")
 
 HANDOFF = "docs/agent/handoff.md"
 PROGRESS = "docs/PROGRESS.md"
@@ -123,7 +145,8 @@ def declares_session_start(root: Path) -> bool:
 # ---------- heading ----------
 
 
-def heading(root: Path, name: str) -> str:
+def heading(root: Path, name: str) -> tuple[str, str | None]:
+    """The heading line, and the branch (None when detached or unknown)."""
     branch, count, unborn = None, None, False
     try:
         st = git(
@@ -167,7 +190,7 @@ def heading(root: Path, name: str) -> str:
     )
     if facts:
         text += ", " + ", ".join(facts)
-    return text
+    return text, (None if branch == "detached HEAD" else branch)
 
 
 # ---------- handoff and progress notes ----------
@@ -365,10 +388,230 @@ def sections(root: Path) -> list[str]:
     return lines
 
 
+# ---------- ticket, board and budgets ----------
+
+
+def harness_home() -> Path:
+    return Path(os.path.expanduser("~")) / ".claude" / "harness"
+
+
+def repo_state_dir(root: Path) -> Path | None:
+    """~/.claude/harness/repos/<key>, keyed by the real path of the main working tree."""
+    out = git(root, "rev-parse", "--git-common-dir", timeout=EXTRA_GIT_TIMEOUT)
+    common = out.stdout.strip()
+    if out.returncode != 0 or not common:
+        return None
+    main_tree = os.path.dirname(os.path.realpath(os.path.join(str(root), common)))
+    key = hashlib.sha1(main_tree.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    return harness_home() / "repos" / key
+
+
+def read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def one_line(value) -> str:
+    return " ".join(str(value).split())
+
+
+def dod_line(item) -> str:
+    """A definition-of-done item as `- [ ] text` (checkbox kept) or `- text`."""
+    text = one_line(item)
+    box = CHECKBOX_RE.match(text)
+    rest = text[box.end() :]
+    return f"- {box.group(1) or ''}{rest}"
+
+
+def ticket_part(root: Path, branch: str) -> list[str]:
+    """Ticket and red-run lines for a t/<N>-... branch, from the cache files only."""
+    number = str(int(TICKET_BRANCH.match(branch).group(1)))
+    state = repo_state_dir(root)
+    if state is None:
+        return []
+    ticket = read_json(state / "tickets" / f"{number}.json")
+    lines = []
+    if isinstance(ticket, dict):
+        title = one_line(ticket.get("title") or "(no title)")
+        status = one_line(ticket.get("status") or "status unknown")
+        tier = one_line(ticket.get("tier") or "unknown")
+        lines.append(f"Ticket #{number}: {title} ({status}, tier {tier})")
+        sections_ = ticket.get("sections")
+        dod = (
+            sections_.get("definition_of_done") if isinstance(sections_, dict) else None
+        )
+        if isinstance(dod, list):
+            lines.extend(dod_line(d) for d in dod[:DOD_LINES] if str(d).strip())
+    else:
+        lines.append(
+            f"Ticket #{number}: not cached; harness-board show {number} fetches it."
+        )
+    record = read_json(state / "red" / f"{branch.replace('/', '-')}.json")
+    if isinstance(record, dict) and record.get("kind"):
+        when = one_line(record.get("at") or "an unknown time")
+        lines.append(f"Red run: {one_line(record['kind'])} at {when}")
+    else:
+        lines.append("Red run: none")
+    return lines
+
+
+def gh_command() -> str | None:
+    """The gh to run (HARNESS_GH, else gh), or None when it cannot be found."""
+    gh = os.environ.get("HARNESS_GH", "gh")
+    if os.sep in gh:
+        return gh if os.path.isfile(gh) and os.access(gh, os.X_OK) else None
+    return shutil.which(gh)
+
+
+def run_side_by_side(
+    cmds: list[list[str]], cwd: Path, timeout: float
+) -> list[str] | None:
+    """stdout of each command, run at the same time; None when one fails or the time runs
+    out (then every one still running is stopped)."""
+    env = dict(
+        os.environ, GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", NO_COLOR="1"
+    )
+    procs = []
+    try:
+        for cmd in cmds:
+            procs.append(
+                subprocess.Popen(
+                    cmd,
+                    cwd=str(cwd),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    env=env,
+                    start_new_session=True,
+                )
+            )
+        deadline = time.monotonic() + timeout
+        outputs = []
+        for proc in procs:
+            out, _ = proc.communicate(timeout=max(0.0, deadline - time.monotonic()))
+            if proc.returncode != 0:
+                return None
+            outputs.append(out.decode("utf-8", "replace"))
+        return outputs
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    proc.communicate(timeout=1)
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    pass
+
+
+def label_names(issue) -> set[str]:
+    labels = issue.get("labels") if isinstance(issue, dict) else None
+    if not isinstance(labels, list):
+        return set()
+    return {str(lb.get("name")) if isinstance(lb, dict) else str(lb) for lb in labels}
+
+
+def board_part(root: Path) -> list[str]:
+    """Board counts from gh, when the repo has an origin and gh answers in time."""
+    gh = gh_command()
+    if gh is None:
+        return []
+    remote = git(root, "remote", "get-url", "origin", timeout=EXTRA_GIT_TIMEOUT)
+    if remote.returncode != 0 or not remote.stdout.strip():
+        return []
+    outputs = run_side_by_side(
+        [
+            [gh, "issue", "list", "--json", "labels", "--limit", "200"],
+            [gh, "pr", "list", "--json", "isDraft,author", "--limit", "50"],
+        ],
+        root,
+        GH_TIMEOUT,
+    )
+    if outputs is None:
+        return []
+    try:
+        issues, prs = json.loads(outputs[0]), json.loads(outputs[1])
+    except ValueError:
+        return []
+    if not isinstance(issues, list) or not isinstance(prs, list):
+        return []
+    counts = {"ready": 0, "in-progress": 0, "needs-input": 0}
+    for issue in issues:
+        names = label_names(issue)
+        for status in counts:
+            if f"status:{status}" in names and not (
+                status == "ready" and "epic" in names
+            ):
+                counts[status] += 1
+    review = 0
+    for pr in prs:
+        author = pr.get("author") if isinstance(pr, dict) else None
+        bot = isinstance(author, dict) and bool(author.get("is_bot"))
+        if isinstance(pr, dict) and pr.get("isDraft") is False and not bot:
+            review += 1
+    return [
+        f"Board: {counts['ready']} ready, {counts['in-progress']} in progress, "
+        f"{review} awaiting your review, {counts['needs-input']} needs input"
+    ]
+
+
+def parse_time(text: str) -> dt.datetime | None:
+    try:
+        when = dt.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.astimezone()  # naive means local time
+
+
+def budget_part() -> list[str]:
+    """One line per budget that budgets.json marks exhausted until a time still ahead."""
+    budgets = read_json(harness_home() / "budgets.json")
+    if not isinstance(budgets, dict):
+        return []
+    now = dt.datetime.now(dt.timezone.utc)
+    lines = []
+    for name, entry in budgets.items():
+        until = entry.get("exhausted_until") if isinstance(entry, dict) else None
+        when = parse_time(until) if isinstance(until, str) else None
+        if when is None or when <= now:
+            continue
+        reason = one_line(entry.get("reason") or "")
+        line = f"Budget: {name} exhausted until {until.strip()}"
+        lines.append(f"{line} ({reason})" if reason else line)
+    return lines
+
+
+def extras(git_root: Path | None, branch: str | None, started: float) -> list[str]:
+    """The ticket or board lines, then the budget lines; each part fails on its own."""
+    lines: list[str] = []
+    late = time.monotonic() - started >= EXTRAS_DEADLINE
+    try:
+        if git_root is None or late:
+            pass
+        elif branch and TICKET_BRANCH.match(branch):
+            lines.extend(ticket_part(git_root, branch))
+        else:
+            lines.extend(board_part(git_root))
+    except Exception:  # one unreadable source never costs the rest of the brief
+        pass
+    try:
+        lines.extend(budget_part())
+    except Exception:
+        pass
+    return lines
+
+
 # ---------- main ----------
 
 
 def main() -> int:
+    started = time.monotonic()
     data = read_input()
     cwd = Path(
         str(data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
@@ -379,8 +622,10 @@ def main() -> int:
         return 0
     name = root.name or str(root)
     # Outside a git repo the heading has no git facts; the sections come from the cwd.
-    head = f"## Session brief: {name}" if git_root is None else heading(git_root, name)
-    lines = [head, *sections(root)]
+    head, branch = f"## Session brief: {name}", None
+    if git_root is not None:
+        head, branch = heading(git_root, name)
+    lines = [head, *extras(git_root, branch, started), *sections(root)]
     brief = "\n".join(clip(ln) for ln in lines[:MAX_LINES])
 
     out = {"hookEventName": "SessionStart", "additionalContext": brief}
