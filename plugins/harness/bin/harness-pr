@@ -1176,13 +1176,34 @@ def evidence(body):
     return red, verify
 
 
-def resolution_body(data, sha, url):
-    """The `**Resolution**` comment for a landed PR, from `gh pr view --json body,files,url`: the Summary section,
-    the files changed, the Definition of done as landed, the red-run and verify lines, the PR and the squash
-    sha. What the body lacks is left out."""
+def view_files(data):
+    """The changed paths a `gh pr view --json files` answer holds (GitHub stops at 100)."""
+    return [f["path"] for f in as_list(data.get("files")) if isinstance(f, dict) and isinstance(f.get("path"), str)
+            and f["path"]]
+
+
+def changed_files(repo, number, cwd):
+    """Every path PR `number` changes, in GitHub's order, from the paginated files endpoint (`gh pr view --json
+    files` stops at 100). --slurp makes gh print one array of the page arrays instead of the pages back to back."""
+    endpoint = f"repos/{repo.slug()}/pulls/{number}/files?per_page=100"
+    pages = gh_json(["api", endpoint, "--paginate", "--slurp"], cwd)
+    if not isinstance(pages, list):
+        raise Problem(f"gh api {endpoint} printed no list of files")
+    paths = []
+    for page in pages:
+        for f in (page if isinstance(page, list) else [page]):
+            name = f.get("filename") if isinstance(f, dict) else None
+            if isinstance(name, str) and name:
+                paths.append(name)
+    return paths
+
+
+def resolution_body(data, files, sha, url):
+    """The `**Resolution**` comment for a landed PR, from `gh pr view --json body,url` and its changed `files`: the
+    Summary section, the files changed, the Definition of done as landed, the red-run and verify lines, the PR and
+    the squash sha. What the body lacks is left out."""
     body = data.get("body") or ""
     sections = body_sections(body)
-    files = [f["path"] for f in as_list(data.get("files")) if isinstance(f.get("path"), str) and f["path"]]
     red, verify = evidence(body)
     url = data.get("url") or url
     parts = [RESOLUTION]
@@ -1358,9 +1379,22 @@ def cmd_land(args):
     made = {}
 
     def resolution():
-        """The Resolution comment, read from the PR once however many tickets it closes."""
+        """The Resolution comment, read from the PR once however many tickets it closes; every changed file from
+        the files endpoint, or the PR view's (at most 100) when that fails."""
         if "text" not in made:
-            made["text"] = resolution_body(pr_view(repo, number, "body,files,url", main), sha, view.get("url"))
+            try:
+                data = pr_view(repo, number, "body,files,url", main)
+            except Problem as err:
+                raise Problem(f"the Resolution could not be written, so nothing was commented: {err}") from None
+            files = view_files(data)
+            try:
+                listed = changed_files(repo, number, main)
+            except Problem as err:
+                warn(f"could not list PR #{number}'s files ({err}); the Resolution lists the {len(files)} "
+                     "that gh pr view returned")
+            else:
+                files = listed if len(listed) >= len(files) else files
+            made["text"] = resolution_body(data, files, sha, view.get("url"))
         return made["text"]
 
     ticket_lines = []
