@@ -33,7 +33,8 @@ Rules: an existing file is never overwritten without --force, and each path is r
 created, kept or updated. The stack skeleton (pyproject.toml, src/<pkg>/__init__.py,
 tests/test_smoke.py; package.json, tests/smoke.test.js) is written only when the project has no
 manifest of any stack, no Makefile with a test or check target and no tests (a tests/, test/ or spec/
-directory, or a file matching the test patterns); otherwise both --dry-run and the real run say
+directory, or a file matching the test patterns outside dot-directories, node_modules, __pycache__
+and virtualenvs); otherwise both --dry-run and the real run say
 `kept the project's own layout (<what was found>)`.
 Sibling tools (harness-board, harness-work, harness-pr, harness-projects) are called by name on
 PATH, else from this script's folder. `gh` is os.environ.get("HARNESS_GH", "gh").
@@ -88,10 +89,12 @@ TESTS_DIRS = ("tests", "test", "spec")
 # The file-name half of the HARNESS_TEST_PATTERNS default (harness-red, tests_first.py), at any depth;
 # its tests/**, test/** and spec/** are TESTS_DIRS.
 TEST_FILE_PATTERNS = ("test_*.py", "*_test.py", "conftest.py", "*_test.js", "*.test.js", "*.test.ts", "*_test.ts")
-WALK_SKIP = (".git", "node_modules")
+# Not searched for test files, besides every dot-directory and any directory holding a pyvenv.cfg.
+WALK_SKIP = ("node_modules", "__pycache__")
 LAYOUT_SHOWN = 10                                             # loose test files named before `+N more`
-# A rule line: its targets, then `:` or `::` not followed by `=` (that would be a := or ::= assignment).
-MAKE_RULE = re.compile(r"^([^:=#]*?)\s*::?(?!=)")
+# A rule line: its targets, then `:` or `::` followed by neither `=` nor `:` (that would be a :=, ::= or
+# :::= assignment).
+MAKE_RULE = re.compile(r"^([^:=#]*?)\s*::?(?![:=])")
 INIT_PY = '"""{{name}}."""\n\n__version__ = "0.1.0"\n'
 
 # GitHub reads an issue template from .github/ISSUE_TEMPLATE only with this front matter.
@@ -227,8 +230,9 @@ def make_targets(text):
 
 def own_layout(root):
     """What shows the project has its own layout: manifests of any stack, a makefile with a test or
-    check target, tests/, test/ and spec/ directories, and test files anywhere else (.git and
-    node_modules left out). Empty for a new or empty folder, which gets the stack skeleton."""
+    check target, tests/, test/ and spec/ directories, and test files anywhere else (dot-directories,
+    node_modules, __pycache__ and virtualenvs left out). Empty for a new or empty folder, which gets
+    the stack skeleton."""
     try:
         names = set(os.listdir(root))                 # exact names, also on a case-insensitive disk
     except OSError:
@@ -247,7 +251,9 @@ def own_layout(root):
     loose = []
     for here, subdirs, files in os.walk(root):
         top = Path(here) == root
-        subdirs[:] = sorted(d for d in subdirs if d not in WALK_SKIP and not (top and d in dirs))
+        subdirs[:] = sorted(d for d in subdirs
+                            if not d.startswith(".") and d not in WALK_SKIP and not (top and d in dirs)
+                            and not os.path.isfile(os.path.join(here, d, "pyvenv.cfg")))
         rel = Path(here).relative_to(root)
         loose += [(rel / f).as_posix() for f in sorted(files)
                   if any(fnmatch.fnmatchcase(f, p) for p in TEST_FILE_PATTERNS)]
@@ -338,10 +344,11 @@ def tests_dirs(root, stack, verify, layout):
     return found or (["tests"] if skeleton else [])
 
 
-def default_test_cmd(root, stack):
-    """uv when the project is (or is about to be) a uv project, else the stack's plain runner."""
+def default_test_cmd(root, stack, layout):
+    """uv when the project is a uv project (uv.lock) or the skeleton is about to make it one (`layout`,
+    own_layout(root), is empty), else the stack's plain runner."""
     if stack == "python":
-        uv_project = (root / "uv.lock").exists() or not (root / "pyproject.toml").exists()
+        uv_project = (root / "uv.lock").exists() or not layout
         return "uv run pytest -q {files}" if uv_project else "python3 -m pytest -q {files}"
     if stack == "node":
         return "npm test -- {files}"
@@ -775,7 +782,7 @@ def cmd_init(args):
         "pkg": package_name(name, stack),
         "stack": stack,
         "verify_cmd": args.verify if args.verify is not None else "scripts/verify.sh",
-        "test_cmd": args.test_cmd if args.test_cmd is not None else default_test_cmd(root, stack),
+        "test_cmd": args.test_cmd if args.test_cmd is not None else default_test_cmd(root, stack, layout),
         "tests_dirs": ", ".join(f"`{d}/`" for d in tests_dirs(root, stack, args.verify, layout)),
         "python_version": PYTHON_VERSION,
         "year": str(dt.date.today().year),
