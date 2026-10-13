@@ -694,7 +694,8 @@ def pr_body(number, ticket, red, verify_text, findings):
         "tests_list": tests_block(tests, red),
         "red_kind": str(red.get("kind") or "unknown") if red else "none",
         "red_exit": str(red.get("exit")) if red else "-",
-        "red_tail": fence_safe(tail(red.get("tail"), RED_TAIL_LINES)) if red else "No red run recorded on this branch.",
+        "red_tail": "none: the ticket is no-tests" if "no-tests" in (ticket.get("flags") or [])
+        else fence_safe(tail(red.get("tail"), RED_TAIL_LINES)) if red else "No red run recorded on this branch.",
         "verify_tail": fence_safe(tail(verify_text, VERIFY_TAIL_LINES)) if verify_text is not None
         else "No verify log attached.",
         "review_summary": review_summary(findings),

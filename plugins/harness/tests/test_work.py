@@ -1918,6 +1918,52 @@ class WorkSkill(unittest.TestCase):
         self.assertGreater(step.index("--base HEAD"), step.index("harness-red check"), step)
         self.assertRegex(step.lower(), r"\btests?\b|test-author", step)
 
+    def loop_steps(self):
+        """{n: text} of the loop's numbered steps (a step runs to the next numbered line, a heading, or the blank
+        line before an unindented paragraph)."""
+        lines = skill_body().splitlines()
+        steps, number = {}, None
+        for i, line in enumerate(lines):
+            m = re.match(r"^(\d+)[.)]\s+\*\*", line)
+            if m:
+                number = int(m.group(1))
+                steps[number] = [line]
+            elif number is not None and (line.startswith("#") or (line.strip() and not line[0].isspace()
+                                                                  and not lines[i - 1].strip())):
+                number = None
+            elif number is not None:
+                steps[number].append(line)
+        return {n: "\n".join(v) for n, v in steps.items()}
+
+    def test_a_no_tests_ticket_skips_the_test_author_red_check_and_breaker(self):
+        steps = self.loop_steps()
+        for n in (1, 2, 3, 4, 5):
+            self.assertIn(n, steps, f"no numbered step {n} in the loop")
+        start, tests, breaker = steps[1], steps[2], steps[3]
+        # Step 1 reads the flag after `harness-work start` and says the ticket is no-tests.
+        self.assertIn("no-tests", start, start)
+        self.assertRegex(start, r"\bflags\b", start)
+        # Step 2 names the skip and what still runs: the coder, the verify command, the review.
+        low = tests.lower()
+        self.assertIn("no-tests", low, tests)
+        self.assertRegex(low, r"\bskip", tests)
+        for word in ("coder", "verify", "review"):
+            self.assertIn(word, low, f"step 2 does not say the {word} still runs:\n{tests}")
+        # The breaker is skipped too: a no-tests sentence in steps 1-3 names it (or step 3).
+        sentences = re.split(r"(?<=[.;])\s+|\n", "\n".join((start, tests, breaker)).lower())
+        self.assertTrue(any("no-tests" in s and re.search(r"breaker|step 3", s) for s in sentences),
+                        "no sentence says a no-tests ticket skips the breaker")
+        self.assertTrue(any("no-tests" in s and re.search(r"test-author|red check|step 2", s) for s in sentences),
+                        "no sentence says a no-tests ticket skips the test-author and the red check")
+        # Every other ticket keeps the tests-first path, unchanged.
+        self.assertIn("harness:test-author", tests)
+        self.assertIn("harness-red check", tests)
+        self.assertIn("Red: continue", tests)
+        self.assertIn("harness:test-breaker", breaker)
+        self.assertIn("harness-red scratch create", breaker)
+        self.assertIn("harness:coder", steps[4])
+        self.assertIn("harness:reviewer", steps[5])
+
     def test_the_first_paragraph_says_one_turn_foreground_agents_and_when_the_turn_ends(self):
         para = first_paragraph()
         self.assertEqual(first_paragraph_problems(para), [], para)

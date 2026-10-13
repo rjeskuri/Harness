@@ -465,7 +465,29 @@ def run_tests(repo, files, cwd):
 
 
 # --------------------------------------------------------------- commands
+def no_tests_message(repo):
+    """`ticket N is no-tests: no red run needed` when the ticket cache of this t/<n>- branch carries the flag,
+    else None (a missing or corrupt cache, no flags, another branch name: the normal path)."""
+    m = re.match(r"t/(\d+)-", repo.branch)
+    if not m:
+        return None
+    path = os.path.join(os.path.dirname(os.path.dirname(repo.record_path)), "tickets", m.group(1) + ".json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            ticket = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    flags = ticket.get("flags") if isinstance(ticket, dict) else None
+    if isinstance(flags, list) and "no-tests" in flags:
+        return f"ticket {m.group(1)} is no-tests: no red run needed"
+    return None
+
+
 def cmd_check(repo, args):
+    note = no_tests_message(repo)
+    if note:
+        print(note)
+        return 0
     base = repo.resolve_base(args.base)
     mb = git(repo.top, "merge-base", "HEAD", base, check=False)
     merge_base = mb.stdout.strip()
@@ -515,6 +537,10 @@ def cmd_check(repo, args):
 
 
 def cmd_status(repo, args):
+    note = no_tests_message(repo)
+    if note:
+        print(note)
+        return 0
     record = load_record(repo)
     fresh = current(repo.top, record)
     if args.json:

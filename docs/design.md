@@ -228,6 +228,8 @@ harness-pr ready P              refused while the latest harness review has find
 
 Every review finding on the files the ticket touched is fixed before `harness-pr ready`, whatever its severity; only a finding outside the ticket's files becomes a new ticket, and the PR body names it and says why. The skill is one turn, every agent in the foreground: it ends at ready, a posted needs-input question, a `harness-work start` refusal, or the final failure `harness-work attempt` records; without a ticket number, once dispatch has launched the runs, shown its `--dry-run` plan or found no ready tickets.
 
+A ticket whose `flags` (from the start JSON) hold `no-tests` skips the test-author, `harness-red check` and the breaker: the coder implements against the definition of done, the verify command must still pass, and the review still runs.
+
 Failure policy, enforced by `harness-work attempt`: the first failure of a stage retries at the same tier; the second re-runs one tier up; the third calls `harness-board needs-input` with the evidence and stops. A stage is `tests` (red cannot be reached), `breaker` (tests still cheatable after two rounds: proceed, but say so in the PR), `code` (verify not green), `review` (findings not fixed), `ci` (checks red). Any question the agents cannot answer from the ticket, the epic or the code also ends in `needs-input`. A revisit of a ticket with `status:needs-input` and a newer comment by the repository owner passes that comment to the agents as the answer. A revisit of a ticket in `status:in-review` with unresolved review threads from the owner runs the coder on those comments only, then checks and ready again.
 
 ## Hooks
@@ -288,7 +290,7 @@ Cloud dispatch is out of scope for v2: cloud sessions bill the subscription, nee
 
 ### harness-red
 
-Runs in a ticket worktree (cwd, or `--worktree PATH`).
+Runs in a ticket worktree (cwd, or `--worktree PATH`). On a `t/<n>-` branch whose ticket cache (`tickets/<n>.json`) has `no-tests` in `flags`, `check` and `status` print `ticket N is no-tests: no red run needed` and exit 0 with no run and no record (a missing or corrupt cache, absent flags or another branch name take the normal path); `harness-pr open` then writes `none: the ticket is no-tests` in the red block.
 
 - `check [--base origin/main]`:
   1. `merge-base HEAD <base>`; changed paths = `git diff --name-only <merge-base>` plus `git status --porcelain` untracked and modified. Test files = those matching `HARNESS_TEST_PATTERNS`; none → `No test changes on this branch; write the tests first.` exit 1.
