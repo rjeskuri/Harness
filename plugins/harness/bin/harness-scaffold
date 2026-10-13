@@ -27,12 +27,14 @@ Templates live in ../templates next to this script and are rendered by plain sub
   in CMD). Stack none then points CLAUDE_VERIFY_CMD at scripts/verify.sh; python and node keep CMD.
 - {{tests_dirs}} (CLAUDE.md) is the -s directory of a `unittest discover` in --verify, else the tests/,
   test/ and plugins/*/tests directories on disk, else the tests/ of a skeleton about to be written
-  (none when the manifest exists), else empty (the line is dropped).
+  (none when the project keeps its own layout), else empty (the line is dropped).
 
 Rules: an existing file is never overwritten without --force, and each path is reported as
 created, kept or updated. The stack skeleton (pyproject.toml, src/<pkg>/__init__.py,
 tests/test_smoke.py; package.json, tests/smoke.test.js) is written only when the project has no
-manifest yet: an existing pyproject.toml or package.json means the project has its own layout.
+manifest of any stack, no Makefile with a test or check target and no tests (a tests/, test/ or spec/
+directory, or a file matching the test patterns); otherwise both --dry-run and the real run say
+`kept the project's own layout (<what was found>)`.
 Sibling tools (harness-board, harness-work, harness-pr, harness-projects) are called by name on
 PATH, else from this script's folder. `gh` is os.environ.get("HARNESS_GH", "gh").
 """
@@ -40,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fnmatch
 import json
 import keyword
 import os
@@ -70,7 +73,7 @@ STACK_ALLOW = {
     "none": [],
 }
 
-# The skeleton of each stack: (template, destination). Written only when the manifest is new.
+# The skeleton of each stack: (template, destination). Written only when own_layout() finds nothing.
 SKELETON = {
     "python": [("pyproject.toml", "pyproject.toml"), (None, "src/{pkg}/__init__.py"),
                ("test_smoke.py", "tests/test_smoke.py")],
@@ -78,6 +81,17 @@ SKELETON = {
     "none": [],
 }
 MANIFEST = {"python": "pyproject.toml", "node": "package.json"}
+# Any of these, of any stack, means the project has its own layout.
+MANIFESTS = ("pyproject.toml", "package.json", "setup.py", "setup.cfg", "requirements.txt", "Cargo.toml", "go.mod")
+MAKEFILES = ("GNUmakefile", "makefile", "Makefile")           # the names GNU make reads
+TESTS_DIRS = ("tests", "test", "spec")
+# The file-name half of the HARNESS_TEST_PATTERNS default (harness-red, tests_first.py), at any depth;
+# its tests/**, test/** and spec/** are TESTS_DIRS.
+TEST_FILE_PATTERNS = ("test_*.py", "*_test.py", "conftest.py", "*_test.js", "*.test.js", "*.test.ts", "*_test.ts")
+WALK_SKIP = (".git", "node_modules")
+LAYOUT_SHOWN = 10                                             # loose test files named before `+N more`
+# A rule line: its targets, then `:` or `::` not followed by `=` (that would be a := or ::= assignment).
+MAKE_RULE = re.compile(r"^([^:=#]*?)\s*::?(?!=)")
 INIT_PY = '"""{{name}}."""\n\n__version__ = "0.1.0"\n'
 
 # GitHub reads an issue template from .github/ISSUE_TEMPLATE only with this front matter.
@@ -199,6 +213,49 @@ def detect_stack(root):
     return "none"
 
 
+def make_targets(text):
+    """The targets a makefile's rule lines define; recipe lines, comments and assignments are not rules."""
+    targets = set()
+    for line in text.splitlines():
+        if line.startswith("\t"):
+            continue
+        m = MAKE_RULE.match(line.split("#", 1)[0].lstrip(" "))
+        if m:
+            targets.update(m.group(1).split())
+    return targets
+
+
+def own_layout(root):
+    """What shows the project has its own layout: manifests of any stack, a makefile with a test or
+    check target, tests/, test/ and spec/ directories, and test files anywhere else (.git and
+    node_modules left out). Empty for a new or empty folder, which gets the stack skeleton."""
+    try:
+        names = set(os.listdir(root))                 # exact names, also on a case-insensitive disk
+    except OSError:
+        return []
+    found = [m for m in MANIFESTS if m in names and (root / m).is_file()]
+    for name in MAKEFILES:
+        if name in names and (root / name).is_file():
+            try:
+                text = (root / name).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if make_targets(text) & {"test", "check"}:
+                found.append(name)
+    dirs = [d for d in TESTS_DIRS if d in names and (root / d).is_dir()]
+    found += [f"{d}/" for d in dirs]
+    loose = []
+    for here, subdirs, files in os.walk(root):
+        top = Path(here) == root
+        subdirs[:] = sorted(d for d in subdirs if d not in WALK_SKIP and not (top and d in dirs))
+        rel = Path(here).relative_to(root)
+        loose += [(rel / f).as_posix() for f in sorted(files)
+                  if any(fnmatch.fnmatchcase(f, p) for p in TEST_FILE_PATTERNS)]
+    if len(loose) > LAYOUT_SHOWN:
+        loose = loose[:LAYOUT_SHOWN] + [f"+{len(loose) - LAYOUT_SHOWN} more test files"]
+    return found + loose
+
+
 def package_name(name, stack):
     if stack == "node":
         return name.lower()
@@ -268,15 +325,16 @@ def discover_start_dir(command):
     return found or None
 
 
-def tests_dirs(root, stack, verify):
+def tests_dirs(root, stack, verify, layout):
     """The tests directories CLAUDE.md names: the verify command's discover start directory, else those
-    on disk (tests/, test/, plugins/*/tests), else the stack skeleton's tests/, else none."""
+    on disk (tests/, test/, plugins/*/tests), else the stack skeleton's tests/, else none. `layout` is
+    own_layout(root): the skeleton is written only when it is empty."""
     start = discover_start_dir(verify) if verify else None
     if start:
         return [start.rstrip("/") or start]
     found = [d for d in ("tests", "test") if (root / d).is_dir()]
     found += sorted(p.relative_to(root).as_posix() for p in root.glob("plugins/*/tests") if p.is_dir())
-    skeleton = stack in MANIFEST and not (root / MANIFEST[stack]).exists()     # plan() writes it only then
+    skeleton = bool(SKELETON[stack]) and not layout                           # plan() writes it only then
     return found or (["tests"] if skeleton else [])
 
 
@@ -359,8 +417,9 @@ def issue_template(name, stack, dest, values):
     return front + render_text(read_template(name, stack), values)
 
 
-def plan(root, stack, values, ci, verify=None):
-    """[(destination, content, mode)] for every file the scaffold writes into `root`."""
+def plan(root, stack, values, ci, verify=None, layout=()):
+    """[(destination, content, mode)] for every file the scaffold writes into `root`; the stack skeleton
+    only when `layout` (own_layout) is empty."""
     files = [
         ("CLAUDE.md", render_text(read_template("CLAUDE.md", stack), values), 0o644),
         (".claude/settings.json", settings_json(values, stack, verify), 0o644),
@@ -381,7 +440,8 @@ def plan(root, stack, values, ci, verify=None):
     ]
     manifest = MANIFEST.get(stack)
     if manifest and (root / manifest).exists():
-        files.append((manifest, None, 0o644))          # the project's own layout: kept, nothing else added
+        files.append((manifest, None, 0o644))          # reported as kept
+    if layout:                                         # the project's own layout: no skeleton added
         return files
     for template, dest in SKELETON[stack]:
         dest = dest.format(pkg=values["pkg"])
@@ -708,6 +768,7 @@ def cmd_init(args):
             git(root, "init", "-q", "-b", "main")
             say(f"initialized {root} (git init -b main)")
     committed = top is not None and has_commits(root)
+    layout = own_layout(root) if SKELETON[stack] and root.is_dir() else []
 
     values = {
         "name": name,
@@ -715,11 +776,13 @@ def cmd_init(args):
         "stack": stack,
         "verify_cmd": args.verify if args.verify is not None else "scripts/verify.sh",
         "test_cmd": args.test_cmd if args.test_cmd is not None else default_test_cmd(root, stack),
-        "tests_dirs": ", ".join(f"`{d}/`" for d in tests_dirs(root, stack, args.verify)),
+        "tests_dirs": ", ".join(f"`{d}/`" for d in tests_dirs(root, stack, args.verify, layout)),
         "python_version": PYTHON_VERSION,
         "year": str(dt.date.today().year),
     }
-    files = plan(root, stack, values, ci=not args.no_ci, verify=args.verify)
+    files = plan(root, stack, values, ci=not args.no_ci, verify=args.verify, layout=layout)
+    if layout:
+        say(f"kept the project's own layout ({', '.join(layout)}): no {stack} skeleton")
 
     if not committed:
         written = write_files(root, files, args.force, dry)
