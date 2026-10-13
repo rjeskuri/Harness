@@ -1369,6 +1369,9 @@ class TestsFirstTests(GuardTestCase):
             "patch -d $D -p1 < fix.diff",
             "patch -d ${UNSET_DIR}/sub -p1 < fix.diff",
             "find $D -type f -exec rm {} \\;",
+            # one directory resolves outside any repo, another is unknown
+            "find /tmp $D -exec rm {} \\;",
+            "find $D /tmp -exec rm {} \\;",
         ):
             for agent in ("harness:coder", "harness:test-author", "harness:test-breaker"):
                 with self.subTest(command=command, agent=agent):
