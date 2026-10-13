@@ -130,6 +130,8 @@ def write(path, text, mtime=None):
 
 
 def read_json(path):
+    if not os.path.isfile(path):                                  # a failure, not an error, when not written
+        raise AssertionError(f"{path} was not written")
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
 
@@ -273,23 +275,24 @@ class KeyFixture(unittest.TestCase):
         ticket.update(fields)
         return write(os.path.join(state, "tickets", f"{number}.json"), json.dumps(ticket))
 
-    def put_red(self, state, kind="assertion", at="2026-10-13T10:00:00Z", files=("tests/test_app.py",)):
+    def put_red(self, state, kind="assertion", at="2026-10-13T10:00:00Z", files=("tests/test_app.py",),
+                branch=BRANCH, top=None):
         h = hashlib.sha256()
         for name in sorted(files):
-            with open(os.path.join(self.wt, name), "rb") as fh:
+            with open(os.path.join(top or self.wt, name), "rb") as fh:
                 h.update(name.encode("utf-8") + b"\n" + fh.read())
-        record = {"branch": BRANCH, "base_sha": "0" * 40, "test_files": list(files),
+        record = {"branch": branch, "base_sha": "0" * 40, "test_files": list(files),
                   "run_files": list(files), "test_hash": h.hexdigest(),
                   "cmd": "python3 -m unittest tests/test_app.py", "exit": 0 if kind == "green" else 1,
                   "kind": kind, "tail": "AssertionError", "at": at}
-        return write(os.path.join(state, "red", SLUG + ".json"), json.dumps(record))
+        return write(os.path.join(state, "red", branch.replace("/", "-") + ".json"), json.dumps(record))
 
     def state_dirs(self):
         return sorted(os.listdir(self.repos)) if os.path.isdir(self.repos) else []
 
-    def edit_decision(self, path):
+    def edit_decision(self, path, cwd=None):
         """tests_first.py on an Edit of `path`: the deny reason, or None when allowed."""
-        payload = {"session_id": "s", "transcript_path": "/dev/null", "cwd": self.wt,
+        payload = {"session_id": "s", "transcript_path": "/dev/null", "cwd": cwd or self.wt,
                    "permission_mode": "default", "hook_event_name": "PreToolUse", "tool_name": "Edit",
                    "tool_input": {"file_path": path, "old_string": "a", "new_string": "b"},
                    "tool_use_id": "toolu_01"}
@@ -425,6 +428,135 @@ class MainCheckoutOtherSpelling(KeyFixture):
         self.assertEqual(len(read_json(os.path.join(self.canon, "tickets", "13.json"))["attempts"]), 3)
         self.assertIn("Ticket #13: Main ticket (in-progress, tier opus)", self.brief(other))
         self.assertEqual(self.state_dirs(), [self.canon_key])
+
+    # ------------------------------------------------ migration of state under the other spelling's key
+    def old_main_state(self, **fields):
+        """The main checkout on t/13-main-ticket, a ticket cache under sha1 of its other spelling."""
+        self.other = spelled_below(self.main)
+        self.old = os.path.join(self.repos, sha12(self.other))
+        self.assertNotEqual(sha12(self.other), self.canon_key)
+        self.git(self.main, "switch", "-q", "-c", "t/13-main-ticket")
+        attempts = [{"stage": "tests", "tier": "opus", "result": "pass", "at": "2026-10-12T00:00:00Z"}]
+        self.put_ticket(self.old, number=13, **dict(dict(title="Old main ticket", attempts=attempts), **fields))
+
+    def assertMainMoved(self):
+        self.assertFalse(os.path.exists(self.old), "the old key's directory is still there")
+        self.assertEqual(self.state_dirs(), [self.canon_key])
+
+    def test_harness_work_with_repo_in_the_other_spelling_moves_the_old_cache(self):
+        self.old_main_state()
+        self.assertEqual(self.ok("harness-work", "attempt", "13", "code", "fail", "--repo", self.other,
+                                 cwd=self.tmp).stdout.strip(), "retry")
+        self.assertMainMoved()
+        attempts = read_json(os.path.join(self.canon, "tickets", "13.json"))["attempts"]
+        self.assertEqual([(a["stage"], a["result"]) for a in attempts], [("tests", "pass"), ("code", "fail")])
+
+    def test_harness_work_with_project_dir_in_the_other_spelling_moves_the_old_cache(self):
+        self.old_main_state(tier="sonnet")
+        self.assertEqual(self.ok("harness-work", "attempt", "13", "code", "fail", cwd=self.tmp,
+                                 CLAUDE_PROJECT_DIR=self.other).stdout.strip(), "retry")
+        self.assertMainMoved()
+        self.assertEqual(len(read_json(os.path.join(self.canon, "tickets", "13.json"))["attempts"]), 2)
+
+    def test_session_brief_from_the_other_spelling_moves_and_shows_the_old_state(self):
+        self.old_main_state(title="Old main brief", tier="fable")
+        self.put_red(self.old, at="2026-10-04T06:00:00Z", branch="t/13-main-ticket", top=self.main)
+        lines = self.brief(self.other)
+        self.assertIn("Ticket #13: Old main brief (in-progress, tier fable)", lines)
+        self.assertIn("Red run: assertion at 2026-10-04T06:00:00Z", lines)
+        self.assertMainMoved()
+        self.assertTrue(os.path.isfile(os.path.join(self.canon, "red", "t-13-main-ticket.json")))
+        self.assertIn("Ticket #13: Old main brief (in-progress, tier fable)", self.brief(self.main))
+        self.assertMainMoved()
+
+    def test_tests_first_on_a_path_in_the_other_spelling_moves_the_old_red_record(self):
+        self.old_main_state()
+        self.put_red(self.old, branch="t/13-main-ticket", top=self.main)
+        self.assertIsNone(self.edit_decision(os.path.join(self.other, "src", "app.py"), cwd=self.other))
+        self.assertMainMoved()
+        self.assertTrue(os.path.isfile(os.path.join(self.canon, "red", "t-13-main-ticket.json")))
+        self.put_red(self.canon, kind="green", branch="t/13-main-ticket", top=self.main)
+        self.assertTrue(self.edit_decision(os.path.join(self.main, "src", "app.py"), cwd=self.main)
+                        .startswith("The red run on t/13 passed"))
+
+
+@needs_case_insensitive
+class WorktreeReachedInAnotherSpelling(KeyFixture):
+    """The worktree itself reached through another spelling (cwd, payload cwd, edited path)."""
+
+    def check_from_spelled_worktree(self):
+        spelled_wt = spelled_below(self.wt)
+        self.assertFalse(on_disk(spelled_wt))
+        self.put_ticket(self.canon, title="Spelled worktree ticket", tier="sonnet")
+        write(os.path.join(self.wt, "tests", "test_login.py"), FAILING_TEST)
+        self.ok("harness-red", "check", cwd=spelled_wt)
+        self.assertEqual(read_json(os.path.join(self.canon, "red", SLUG + ".json"))["kind"], "assertion")
+        self.assertEqual(self.ok("harness-work", "attempt", "12", "code", "fail", cwd=spelled_wt).stdout.strip(),
+                         "retry")
+        self.assertEqual(len(read_json(os.path.join(self.canon, "tickets", "12.json"))["attempts"]), 1)
+        self.assertIn("Ticket #12: Spelled worktree ticket (in-progress, tier sonnet)", self.brief(spelled_wt))
+        source = os.path.join(spelled_wt, "src", "app.py")
+        self.put_red(self.canon, kind="green")
+        reason = self.edit_decision(source, cwd=spelled_wt)
+        self.assertIsNotNone(reason, "a green red run must refuse the source edit")
+        self.assertTrue(reason.startswith("The red run on t/12 passed"), reason)
+        self.put_red(self.canon)
+        self.assertIsNone(self.edit_decision(source, cwd=spelled_wt))
+        self.assertEqual(self.state_dirs(), [self.canon_key])
+
+    def test_tools_and_hooks_from_a_spelled_worktree_use_the_canonical_key(self):
+        self.check_from_spelled_worktree()
+
+    def test_spelled_worktree_whose_git_file_names_another_spelling(self):
+        self.spell_worktree()
+        self.check_from_spelled_worktree()
+
+
+@needs_case_insensitive
+class WorktreeOutsideTheMainTree(KeyFixture):
+    """A linked worktree outside <main>/.claude/worktrees/, its .git file naming the main tree in another
+    spelling: the key comes from the file system, not from stripping a path suffix."""
+
+    BRANCH2, SLUG2 = "t/14-outside", "t-14-outside"
+
+    def setUp(self):
+        super().setUp()
+        self.wt2 = os.path.join(self.tmp, mixed_name("Wt"))
+        self.git(self.main, "worktree", "add", "-q", self.wt2, "-b", self.BRANCH2, "origin/main")
+        other = spelled_below(self.main)
+        dotgit = os.path.join(self.wt2, ".git")
+        with open(dotgit, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn(self.main + os.sep, text)
+        write(dotgit, text.replace(self.main + os.sep, other + os.sep))
+        if self.git(self.wt2, "rev-parse", "--git-common-dir") != os.path.join(other, ".git"):
+            self.skipTest("git normalised the common dir")
+        self.old = os.path.join(self.repos, sha12(other))
+
+    def test_tools_and_hooks_use_the_canonical_key(self):
+        self.put_ticket(self.canon, number=14, title="Outside ticket")
+        write(os.path.join(self.wt2, "tests", "test_login.py"), FAILING_TEST)
+        self.ok("harness-red", "check", cwd=self.wt2)
+        self.assertEqual(read_json(os.path.join(self.canon, "red", self.SLUG2 + ".json"))["branch"], self.BRANCH2)
+        self.ok("harness-work", "attempt", "14", "code", "fail", cwd=self.wt2)
+        self.assertEqual(len(read_json(os.path.join(self.canon, "tickets", "14.json"))["attempts"]), 1)
+        self.ok("harness-pr", "ultra", "35", cwd=self.wt2)
+        self.assertTrue(os.path.isfile(os.path.join(self.canon, "ultra", "35.json")))
+        lines = self.brief(self.wt2)
+        self.assertIn("Ticket #14: Outside ticket (in-progress, tier opus)", lines)
+        self.assertTrue(any(line.startswith("Red run: assertion at ") for line in lines), lines)
+        self.assertIsNone(self.edit_decision(os.path.join(self.wt2, "src", "app.py"), cwd=self.wt2))
+        self.assertEqual(self.state_dirs(), [self.canon_key])
+
+    def test_old_state_moves_to_the_canonical_key(self):
+        self.put_ticket(self.old, number=14, title="Outside old ticket",
+                        attempts=[{"stage": "tests", "tier": "opus", "result": "pass", "at": "2026-10-12T00:00:00Z"}])
+        self.assertIn("Ticket #14: Outside old ticket (in-progress, tier opus)", self.brief(self.wt2))
+        self.ok("harness-work", "attempt", "14", "code", "fail", cwd=self.wt2)
+        self.assertFalse(os.path.exists(self.old), "the old key's directory is still there")
+        self.assertEqual(self.state_dirs(), [self.canon_key])
+        attempts = read_json(os.path.join(self.canon, "tickets", "14.json"))["attempts"]
+        self.assertEqual([(a["stage"], a["result"]) for a in attempts], [("tests", "pass"), ("code", "fail")])
 
 
 # ================================================================ migration from the old key
@@ -653,6 +785,34 @@ class RunsOfAProjectRegisteredInAnotherSpelling(unittest.TestCase):
             record = dict(extra, id=f"{k}-{ticket}", ticket=ticket, venue="headless", outcome="error", exit=2,
                           started_at=z(2 * 3600), ended_at=z(3600), worktree=None, branch=f"t/{ticket}-x")
             write(os.path.join(self.state, "runs", f"{k}-{ticket}-20261013070000.json"), json.dumps(record))
+
+    def add_old_runs(self):
+        """Run files written before the change, without a repo field: named by sha1 of the registered (other)
+        spelling, the key the tools used then. Plus one of an unregistered repository in another spelling,
+        which belongs to no project. Returns that run's key."""
+        stray = os.path.join(self.tmp, mixed_name("Zz"))
+        os.makedirs(stray)
+        for path, ticket in ((spelled_below(self.proj), 13), (spelled_below(self.other), 6), (spelled_below(stray), 7)):
+            k = sha12(path)
+            record = dict(id=f"{k}-{ticket}", ticket=ticket, venue="headless", outcome="error", exit=2,
+                          started_at=z(2 * 3600), ended_at=z(3000), worktree=None, branch=f"t/{ticket}-old")
+            write(os.path.join(self.state, "runs", f"{k}-{ticket}-20261012070000.json"), json.dumps(record))
+        self.assertNotIn(sha12(spelled_below(self.proj)), (sha12(self.proj), sha12(self.other)))
+        return sha12(spelled_below(stray))
+
+    def expected_with_old_runs(self, stray_key):
+        return sorted([("Other Shop", 5), ("Other Shop", 6), ("Widget Shop", 12), ("Widget Shop", 13),
+                       (stray_key, 7)])
+
+    def test_standup_names_the_project_of_runs_under_the_old_key(self):
+        stray_key = self.add_old_runs()
+        runs = self.run_tool("harness-standup", "--json")["runs"]
+        self.assertEqual(sorted((r["project"], r["ticket"]) for r in runs), self.expected_with_old_runs(stray_key))
+
+    def test_digest_names_the_project_of_runs_under_the_old_key(self):
+        stray_key = self.add_old_runs()
+        runs = self.run_tool("harness-digest", "--json")["runs"]
+        self.assertEqual(sorted((r["project"], r["ticket"]) for r in runs), self.expected_with_old_runs(stray_key))
 
     def run_tool(self, name, *args):
         p = subprocess.run([sys.executable, os.path.join(BIN, name), *args], cwd=self.tmp, env=self.env,
