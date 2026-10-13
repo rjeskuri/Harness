@@ -220,7 +220,7 @@ Failure policy, enforced by `harness-work attempt`: the first failure of a stage
 
 **readonly_bash.py**: GUARDED gains `harness:planner` and `planner`. Otherwise unchanged.
 
-**session_brief.py**: after the heading, when the branch matches `^t/(\d+)-`: `Ticket #N: <title> (<status>, tier <tier>)`, up to six definition-of-done lines, `Red run: <kind> at <time>` or `Red run: none`, from the cache files only (no network). Otherwise, when the repo has an `origin` remote and `gh` answers within 3 s: `Board: <r> ready, <p> in progress, <v> awaiting your review, <q> needs input`. When `budgets.json` marks a budget exhausted: `Budget: api exhausted until <time> (<reason>)`. Still at most 40 lines; the rest as in v1.
+**session_brief.py**: after the heading, when the branch matches `^t/(\d+)-`: `Ticket #N: <title> (<status>, tier <tier>)`, up to six definition-of-done lines, `Red run: <kind> at <time>` or `Red run: none`, from the cache files only (no network). Otherwise, when the repo has an `origin` remote on github.com (other hosts and local paths get no board line) and `gh` answers within 3 s: `Board: <r> ready, <p> in progress, <v> awaiting your review, <q> needs input`. When `budgets.json` marks a budget exhausted: `Budget: api exhausted until <time> (<reason>)`. Still at most 40 lines; the rest as in v1.
 
 `notify.py`, `after_edit.py`, `verify_on_stop.py`: unchanged.
 
@@ -300,7 +300,7 @@ Across the registry: PRs awaiting review (`harness-pr awaiting --all-projects`),
 
 ### harness-standup, harness-projects, harness-worklog
 
-`harness-standup` adds, per project and inside the existing time budget (gh calls run in threads, 6 s): `Board: r ready, p in progress, v in review, q needs input`; `PRs awaiting you:` lines; `Needs input:` lines (title, first line of the question); `Stale worktrees:` lines; and after the fleet section a `## Budgets` line when any budget is exhausted and a `## Runs` section for headless runs alive or failed in the last day. `harness-projects` and `harness-worklog` are unchanged.
+`harness-standup` adds, per project and inside the existing time budget (gh calls run in threads, 6 s): `Board: r ready, p in progress, v in review, q needs input` (only for a project whose `origin` is on github.com); `PRs awaiting you:` lines; `Needs input:` lines (title, first line of the question); `Stale worktrees:` lines; and after the fleet section a `## Budgets` line when any budget is exhausted and a `## Runs` section for headless runs alive or failed in the last day. `harness-projects` and `harness-worklog` are unchanged.
 
 ## Templates
 
