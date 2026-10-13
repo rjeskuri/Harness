@@ -26,8 +26,8 @@ Templates live in ../templates next to this script and are rendered by plain sub
 - --verify CMD replaces the stack's checks in scripts/verify.sh and is written as is (no substitution
   in CMD). Stack none then points CLAUDE_VERIFY_CMD at scripts/verify.sh; python and node keep CMD.
 - {{tests_dirs}} (CLAUDE.md) is the -s directory of a `unittest discover` in --verify, else the tests/,
-  test/ and plugins/*/tests directories on disk, else the stack skeleton's tests/, else empty (the
-  line is dropped).
+  test/ and plugins/*/tests directories on disk, else the tests/ of a skeleton about to be written
+  (none when the manifest exists), else empty (the line is dropped).
 
 Rules: an existing file is never overwritten without --force, and each path is reported as
 created, kept or updated. The stack skeleton (pyproject.toml, src/<pkg>/__init__.py,
@@ -276,7 +276,8 @@ def tests_dirs(root, stack, verify):
         return [start.rstrip("/") or start]
     found = [d for d in ("tests", "test") if (root / d).is_dir()]
     found += sorted(p.relative_to(root).as_posix() for p in root.glob("plugins/*/tests") if p.is_dir())
-    return found or (["tests"] if stack in MANIFEST else [])
+    skeleton = stack in MANIFEST and not (root / MANIFEST[stack]).exists()     # plan() writes it only then
+    return found or (["tests"] if skeleton else [])
 
 
 def default_test_cmd(root, stack):
@@ -682,6 +683,8 @@ def cmd_init(args):
     if not NAME_RE.match(name):
         raise Problem(f"--name {name!r}: use letters, digits, '.', '_' or '-', starting and ending with a "
                       "letter or digit (it names the GitHub repository and the package)")
+    if args.verify is not None and not args.verify.strip():
+        raise Problem("--verify needs a command (a blank one would leave scripts/verify.sh checking nothing)")
     if (args.billable or args.client) and not args.register:
         raise Problem("--billable and --client go with --register")
     root = Path(os.path.abspath(os.path.expanduser(args.path or "."))).resolve()
