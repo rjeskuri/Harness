@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -487,31 +488,77 @@ class ShowResolution(BoardTest):
                 {"contains": [f"repos/o/r/issues/{number}/comments"], "stdout_json": rest},
                 {"contains": [f"repos/o/r/issues/{number}/comments?per_page=100"], "stdout_json": rest}]
 
+    def assertUnderResolutionHeading(self, md, res):
+        """Every content line of `res` is printed after a `## Resolution` heading and before the next `## `
+        heading (the Comments section does not count)."""
+        lines = md.splitlines()
+        self.assertIn("## Resolution", lines, md)
+        start = lines.index("## Resolution")
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+        section = "\n".join(lines[start + 1:end])
+        for line in content_lines(res):
+            self.assertIn(line, section, f"Resolution line missing from the ## Resolution section: {line!r}\n{md}")
+
+    def assertUnderTaskHeading(self, lines, res, number, tasks_at):
+        """Every content line of `res` is printed below the task list, after a heading naming task #number and
+        before the next heading."""
+        own = re.compile(rf"#{number}\b")
+        summary = content_lines(res)[0]
+        at = next((i for i, text in enumerate(lines) if summary in text), None)
+        self.assertIsNotNone(at, f"#{number}'s Resolution missing:\n" + "\n".join(lines))
+        self.assertGreater(at, tasks_at, "the Resolutions go under the task list")
+        head = max(i for i in range(at) if lines[i].startswith("#"))
+        self.assertRegex(lines[head], own, f"the heading above #{number}'s Resolution names the task")
+        self.assertGreater(head, tasks_at)
+        end = next((i for i in range(head + 1, len(lines)) if lines[i].startswith("#")), len(lines))
+        section = "\n".join(lines[head + 1:end])
+        for line in content_lines(res):
+            self.assertIn(line, section, f"#{number}'s Resolution line missing under its heading: {line!r}")
+
+    def parent_call(self):
+        return {"match": ["issue", "view", "3", "--json", "number,title,body"],
+                "stdout_json": {"number": 3, "title": "Board v2", "body": EPIC_BODY}}
+
     def test_closed_task_prints_its_whole_resolution(self):
         """The Resolution is older than the ten newest comments and longer than the 20 lines a comment gets, so
         only a Resolution section shows it: every line of it, files and sha included."""
         data = self.closed_task(12, RES_12, chatter=10)
-        self.scenario([{"match": ["issue", "view", "3", "--json", "number,title,body"],
-                        "stdout_json": {"number": 3, "title": "Board v2", "body": EPIC_BODY}}]
-                      + self.comment_calls(12, data))
+        self.scenario([self.parent_call()] + self.comment_calls(12, data))
         md = self.ok("show", "12", "--markdown").stdout
         self.assertLessEqual(len(md.splitlines()), 120)
-        for line in content_lines(RES_12):
-            self.assertIn(line, md, f"Resolution line missing from show --markdown: {line!r}")
-        self.assertIn("Resolution", md)
+        self.assertUnderResolutionHeading(md, RES_12)
         self.assertIn("## Definition of done", md.splitlines())         # the ticket's own sections stay
 
     def test_closed_task_resolution_follows_the_ticket(self):
         """Another closed task, another Resolution: what is printed is that ticket's comment."""
         data = self.closed_task(14, RES_14, chatter=10, title="Close epics")
-        self.scenario([{"match": ["issue", "view", "3", "--json", "number,title,body"],
-                        "stdout_json": {"number": 3, "title": "Board v2", "body": EPIC_BODY}}]
-                      + self.comment_calls(14, data))
+        self.scenario([self.parent_call()] + self.comment_calls(14, data))
         md = self.ok("show", "14", "--markdown").stdout
-        for line in content_lines(RES_14):
-            self.assertIn(line, md)
+        self.assertUnderResolutionHeading(md, RES_14)
         for line in ("caches each ticket it shows", "Ran 88 tests", "abc123def4567890abc123def4567890abc12345"):
             self.assertNotIn(line, md)
+
+    def test_closed_task_with_two_resolutions_prints_the_newest(self):
+        """Landed, reopened, landed again: the newer Resolution is what landed; the older one is not printed.
+        Run both ways round, so the newer one wins whichever text it is."""
+        stale_only = ("A first attempt at wiring", "harness-wire-old", "STALE VERIFY LINE",
+                      "0a0b0c0d0e0f1a1b1c1d1e1f2a2b2c2d2e2f3a3b")
+        res12_only = ("caches each ticket it shows", "Ran 88 tests", "abc123def4567890abc123def4567890abc12345")
+        for older, newer, absent in ((RES_13_STALE, RES_12, stale_only), (RES_12, RES_13_STALE, res12_only)):
+            with self.subTest(newest=content_lines(newer)[0]):
+                comments = [comment("rjeskuri", "2026-10-07T09:00:00Z", older),
+                            comment("rjeskuri", "2026-10-07T09:01:00Z", "Landed in 0a0b0c\n\n<!-- harness -->"),
+                            comment("rjeskuri", "2026-10-08T09:00:00Z", "Reopened: it broke the hooks."),
+                            comment("rjeskuri", "2026-10-11T09:00:00Z", newer),
+                            comment("rjeskuri", "2026-10-11T09:01:00Z", "Landed in abc123\n\n<!-- harness -->")]
+                comments += [comment("pal", f"2026-10-12T{10 + i:02d}:00:00Z", f"later note {i}") for i in range(10)]
+                data = issue(number=12, state="CLOSED", labels=("task", "size:M", "risk:low"), comments=comments,
+                             parent={"number": 3, "title": "Board v2", "url": "https://github.com/o/r/issues/3"})
+                self.scenario([self.parent_call()] + self.comment_calls(12, data))
+                md = self.ok("show", "12", "--markdown").stdout
+                self.assertUnderResolutionHeading(md, newer)
+                for line in absent:
+                    self.assertNotIn(line, md, "the older Resolution is not printed")
 
     def test_epic_prints_each_closed_tasks_resolution_under_the_task_list(self):
         epic = issue(number=3, title="Board v2", labels=("epic", "status:ready"), body=EPIC_BODY)
@@ -534,15 +581,47 @@ class ShowResolution(BoardTest):
         self.assertLessEqual(len(lines), 120)
         self.assertIn("## Tasks (2 of 3 closed)", lines)
         tasks_at = lines.index("## Tasks (2 of 3 closed)")
-        for res in (RES_12, RES_14):
-            for line in content_lines(res):
-                self.assertIn(line, md, f"closed task's Resolution line missing: {line!r}")
-            summary = content_lines(res)[0]
-            at = next(i for i, text in enumerate(lines) if summary in text)
-            self.assertGreater(at, tasks_at, "the Resolutions go under the task list")
+        for res, number in ((RES_12, 12), (RES_14, 14)):
+            self.assertUnderTaskHeading(lines, res, number, tasks_at)
+        self.assertEqual([line for line in lines if re.search(r"#13\b", line)],
+                         ["- #13 Wire it (in-progress, S, low, tier sonnet)"], "the open task gets no Resolution")
         for line in ("A first attempt at wiring", "harness-wire-old", "STALE VERIFY LINE",
                      "0a0b0c0d0e0f1a1b1c1d1e1f2a2b2c2d2e2f3a3b"):
             self.assertNotIn(line, md, "an open task's Resolution is not printed")
+
+    def epic_with(self, t13_calls):
+        """Epic #3 with closed #12 (a Resolution) and closed #13, whose comments `t13_calls` answers."""
+        epic = issue(number=3, title="Board v2", labels=("epic", "status:ready"), body=EPIC_BODY)
+        subs = [{"number": 12, "title": "Add the board tool", "state": "closed", "labels": [{"name": "task"}]},
+                {"number": 13, "title": "Wire it", "state": "closed", "labels": [{"name": "task"}]}]
+        t12 = self.closed_task(12, RES_12, title="Add the board tool")
+        self.scenario([REPO_VIEW, {"match": ["issue", "view", "3"], "stdout_json": epic},
+                       {"match": ["api", "repos/o/r/issues/3/sub_issues?per_page=100"], "stdout_json": subs}]
+                      + self.comment_calls(12, t12) + t13_calls)
+        p = self.ok("show", "3", "--markdown")
+        self.assertNotIn("Traceback", p.stderr)
+        lines = p.stdout.splitlines()
+        self.assertIn("## Tasks (2 of 2 closed)", lines)
+        self.assertUnderTaskHeading(lines, RES_12, 12, lines.index("## Tasks (2 of 2 closed)"))
+        self.assertEqual([line for line in lines if re.search(r"#13\b", line)], ["- #13 Wire it (closed)"],
+                         "no Resolution text for #13")
+        return p.stdout
+
+    def test_epic_closed_task_without_a_resolution_prints_nothing_for_it(self):
+        """#13 landed before Resolutions existed: only harness comments and `Landed in`."""
+        t13 = issue(number=13, title="Wire it", labels=("task",), state="CLOSED",
+                    comments=[comment("rjeskuri", "2026-10-09T09:00:00Z", "Started on t/13-wire\n\n<!-- harness -->"),
+                              comment("rjeskuri", "2026-10-10T09:00:00Z", "Landed in 77aa88bb\n\n<!-- harness -->")])
+        md = self.epic_with(self.comment_calls(13, t13))
+        self.assertNotIn("77aa88bb", md)
+        self.assertNotIn("t/13-wire", md)
+
+    def test_epic_shows_what_it_can_when_a_tasks_comments_cannot_be_read(self):
+        """Reading #13's comments fails: show still works and prints #12's Resolution."""
+        failing = {"stderr": "HTTP 502: Bad Gateway\n", "exit": 1}
+        self.epic_with([dict(failing, match=["issue", "view", "13"]),
+                        dict(failing, contains=["repos/o/r/issues/13/comments"]),
+                        dict(failing, contains=["repos/o/r/issues/13/comments?per_page=100"])])
 
 
 # ======================================================================= ready

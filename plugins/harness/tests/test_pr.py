@@ -17,6 +17,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -781,11 +782,12 @@ def pr_body_text(fx):
     return "\n".join([
         "Closes #12", "", "## Summary", fx["summary"], "",
         "## Definition of done", *fx["dod"], "",
-        "## Tests", "- `tests/test_widget.py::test_frob`: frobs twice", "", "Test files run: `tests/test_widget.py`",
+        "## Tests", f"- `{fx['test_file']}::test_main`: the main case", "",
+        f"Test files run: `{fx['test_file']}`",
         "", f"Red run before implementation ({fx['red_kind']}, exit {fx['red_exit']}):",
         "```", *fx["red_tail"], "```", "",
         "Verify:", "```", *fx["verify"], "```", "",
-        "## Review", "2 findings: 0 high, 1 medium, 1 low.", "", "## Risks", "None noted."])
+        "## Review", fx["review"], "", "## Risks", "None noted."])
 
 
 def pr_data(fx):
@@ -811,6 +813,8 @@ FIXTURE_A = {
     "red_kind": "assertion", "red_exit": 1,
     "red_tail": ["E   frob() returned 1, wanted 2", "1 failed in 0.12s"],
     "verify": ["verify step: lint clean", "Ran 41 tests in 2.315s", "", "OK (skipped=1)"],
+    "test_file": "tests/test_frob_spec.py",          # in the body's Tests section, not among the changed files
+    "review": "2 findings: 0 high, 1 medium, 1 low.",
 }
 FIXTURE_B = {
     "pr": 57, "sha": "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432",
@@ -822,6 +826,8 @@ FIXTURE_B = {
     "red_kind": "import", "red_exit": 2,
     "red_tail": ["ModuleNotFoundError: No module named 'gizmo'"],
     "verify": ["collected 212 items", "212 passed in 9.80s", "VERIFY PASSED: 212 checks, 0 warnings"],
+    "test_file": "tests/test_gizmo_spec.py",
+    "review": "Harness review (fable): no findings beyond a naming nit.",
 }
 
 
@@ -1008,8 +1014,8 @@ class Land(WorktreeTest):
 
 
 class LandResolution(Land):
-    """`land` leaves one `**Resolution**` comment on the ticket. These run the real harness-board (no stubs), so
-    every comment, however it is posted, reaches the fake gh's log."""
+    """`land` leaves one `**Resolution**` comment on the ticket, posted through `harness-board comment` before the
+    `Landed in` comment. These run the real harness-board (no stubs), so every comment reaches the fake gh's log."""
 
     def resolution_calls(self, fx, state="OPEN", issue_state="OPEN", comments=()):
         pr, sha = str(fx["pr"]), fx["sha"]
@@ -1084,18 +1090,61 @@ class LandResolution(Land):
         """The Resolution carries the PR's summary, every changed file, the checklist as landed, the red-run
         kind and the verify result from the PR body, the PR link and the squash sha, and the harness marker."""
         self.assertTrue(body.lstrip().startswith(RESOLUTION), body)
-        self.assertEqual(body.rstrip().splitlines()[-1].strip(), HARNESS_MARK, body)
-        self.assertIn(fx["summary"], body)
+        lines = body.rstrip().splitlines()
+        self.assertEqual(lines[-1].strip(), HARNESS_MARK, body)
+
+        def first(pred, what):
+            for i, line in enumerate(lines):
+                if pred(line):
+                    return i
+            self.fail(f"{what} missing from the Resolution:\n{body}")
+
+        # the summary, then the changed files (one list line each), then the checklist as landed
+        at_summary = first(lambda line: fx["summary"] in line, "the PR summary")
+        file_lines = {}
+        for i, line in enumerate(lines):
+            m = re.match(r"^\s*[-*+]\s+(.*)$", line)
+            if m:
+                text = m.group(1).replace("`", "").strip()
+                for path in fx["files"]:
+                    if text == path or text.startswith(path + " "):
+                        file_lines.setdefault(path, []).append(i)
         for path in fx["files"]:
-            self.assertIn(path, body, f"changed file {path} missing from the Resolution")
-        for item in fx["dod"]:
-            self.assertIn(item, body, "definition-of-done line missing from the Resolution")
-        self.assertRegex(body, r"(?i)red\b[^\n]*\b" + fx["red_kind"] + r"\b",
-                         "the red-run kind belongs on a line about the red run")
+            self.assertEqual(len(file_lines.get(path, [])), 1,
+                             f"changed file {path} wants exactly one list line of its own:\n{body}")
+        at_files = min(i for found in file_lines.values() for i in found)
+        at_dod = [first(lambda line, item=item: item in line, f"checklist line {item!r}") for item in fx["dod"]]
+        self.assertLess(at_summary, at_files, "the summary comes before the files")
+        self.assertLess(max(i for found in file_lines.values() for i in found), min(at_dod),
+                        "the files come before the checklist")
+        self.assertEqual(at_dod, sorted(at_dod), "the checklist keeps its order")
+
+        # the red-run kind on exactly one line about the red run
+        kind = re.compile(r"\b" + fx["red_kind"] + r"\b")
+        kind_lines = [line for line in lines if kind.search(line)]
+        self.assertEqual(len(kind_lines), 1, f"want one red-run kind line, got {kind_lines}")
+        self.assertRegex(kind_lines[0], r"(?i)\bred\b", "the kind belongs on a line about the red run")
+
+        # the verify result: once, outside any code fence
         last_verify = [line for line in fx["verify"] if line.strip()][-1]
-        self.assertIn(last_verify, body, "the verify result line missing from the Resolution")
+        fenced, where = False, []
+        for line in lines:
+            if line.strip().startswith("```"):
+                fenced = not fenced
+            elif last_verify in line:
+                where.append(fenced)
+        self.assertEqual(where, [False], f"the verify result line {last_verify!r} wants one unfenced line:\n{body}")
+
         self.assertIn(f"https://github.com/o/r/pull/{fx['pr']}", body)
-        self.assertIn(fx["sha"][:12], body, "the squash sha missing from the Resolution")
+        self.assertIn(fx["sha"], body, "the full squash sha missing from the Resolution")
+
+        # what the Resolution leaves out of the PR body: the red tail, the earlier verify lines, the tests
+        # section, the review, the risks and the closing line
+        left_out = fx["red_tail"] + [line for line in fx["verify"] if line.strip()][:-1] + [
+            fx["test_file"], "::test_main", "Test files run", fx["review"], "## Review", "## Risks", "None noted.",
+            "Closes #12", "## Tests"]
+        for text in left_out:
+            self.assertNotIn(text, body, f"the Resolution copies {text!r} from the PR body")
 
     # ------------------------------------------------------------------ fresh lands
     def test_land_posts_one_resolution_after_the_merge(self):
@@ -1107,11 +1156,15 @@ class LandResolution(Land):
         self.assertResolution(body, FIXTURE_A)
         for other in FIXTURE_B["files"] + [FIXTURE_B["summary"], FIXTURE_B["sha"][:12]]:
             self.assertNotIn(other, body)
-        merge = next(i for i, c in enumerate(self.gh_calls()) if c["argv"][:2] == ["pr", "merge"])
+        calls = self.gh_calls()
+        merge = next(i for i, c in enumerate(calls) if c["argv"][:2] == ["pr", "merge"])
         self.assertGreater(index, merge, "the Resolution is posted after the merge")
-        # the Landed comment is unchanged: one, `Landed in <sha>`, as harness-board posts it
+        self.assertEqual(calls[index]["argv"][:3], ["issue", "comment", "12"],
+                         "posted through harness-board comment")
+        # the Landed comment is unchanged: one, `Landed in <sha>`, as harness-board posts it, after the Resolution
         landed = self.landed(12)
         self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed], [f"Landed in {SHA}"])
+        self.assertLess(index, landed[0][0], "the Resolution goes before Landed in, so a resume never misses it")
 
     def test_land_resolution_follows_the_pr_it_lands(self):
         """Another PR, another sha, more files, an unchecked box, an import red run; GitHub closed the ticket."""
