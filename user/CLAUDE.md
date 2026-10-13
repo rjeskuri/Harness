@@ -24,7 +24,7 @@
 
 ## Model routing
 
-- Default: Opus 5.5 at high effort, for the main session and every agent. `harness-board tier N` maps a ticket's labels to a tier: size:S and risk:low on a non-bug gives `sonnet`; size:L or risk:high gives `fable`; otherwise `opus`. Pass that as `model` on the Agent call (and `effort: xhigh` for fable once the Agent tool offers effort).
+- Default: Opus 5.5 at high effort, for the main session and every agent. `harness-board tier N` maps a ticket's labels to a tier: size:S and risk:low on a non-bug gives `sonnet`; size:L or risk:high gives `fable`; otherwise `opus`. Pass that as `model` on the Agent call. When escalating or reviewing on Fable, pass `model: fable` and `effort: xhigh` on the Agent call.
 - Escalation is by failure, recorded with `harness-work attempt`: a stage's first failure retries at the same tier, the second re-runs one tier up, the third stops with needs-input.
 - Fable is for `harness:reviewer` (always) and for escalations. `harness:planner` is Opus at xhigh. `harness:researcher` answers from primary sources. `harness:quick` (Sonnet) does trivial mechanical tasks outside tickets.
 - Parallel work: `/harness:work` with no number dispatches a session per ready ticket. A Workflow is yours to launch when it pays off, Opus workers for coding, Fable for judgment stages. Say what you launched and why.

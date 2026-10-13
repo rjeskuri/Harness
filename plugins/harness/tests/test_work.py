@@ -39,6 +39,17 @@ BRANCH = "t/12-add-the-board-tool"
 SECRET = "fake-key-value-7f3a9c"   # what the key command prints; must never reach argv or env
 DEFAULT_KEY_CMD = "security find-generic-password -s harness-anthropic -w"
 TEN_DAYS_AGO = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%S+0000")
+MARK = "\n\n<!-- harness -->"      # the last line of every comment harness-board posts
+QUESTION = "**Needs your input**\n\nWhich base?\n\nReply in a comment; /harness:work 12 picks it up." + MARK
+CREDENTIALS = {"ANTHROPIC_API_KEY": "sk-ant-fake", "ANTHROPIC_AUTH_TOKEN": "fake-token",
+               "CLAUDE_CODE_OAUTH_TOKEN": "fake-oauth"}
+# What claude 2.1.296 printed for `claude -p ... --output-format json` with an invalid ANTHROPIC_API_KEY (exit 1;
+# stderr held only a connectors warning). subtype says success even so.
+API_401 = {"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
+           "api_error_status": 401, "result": "Invalid API key \u00b7 Fix external API key", "num_turns": 1,
+           "total_cost_usd": 0, "duration_api_ms": 0, "stop_reason": "stop_sequence",
+           "usage": {"fallback_credit": None}}
+CONNECTORS_WARNING = "Warning: some connectors could not be loaded"
 BODY = """## Request
 Add the board tool.
 
@@ -62,8 +73,8 @@ if "--bg" in argv:
 if "-p" in argv:
     time.sleep(float(os.environ.get("FAKECLAUDE_SLEEP", "0.2")))
     if os.environ.get("FAKECLAUDE_MODE") == "billing":
-        print("API Error: 400 Your credit balance is too low to access the Anthropic API.")
-        print(json.dumps({{"type": "result", "is_error": True, "result": "Credit balance is too low"}}))
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
+                          "api_error_status": 400, "result": "Credit balance is too low"}}))
         sys.exit(1)
     print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": "PR #7 ready"}}))
     sys.exit(0)
@@ -104,10 +115,15 @@ def tearDownModule():
 
 
 def issue(number=12, labels=("task", "status:ready", "size:S", "risk:low"), blocked_by=(), state="OPEN",
-          title=TITLE):
+          title=TITLE, comments=()):
     return {"number": number, "title": title, "url": f"https://github.com/o/r/issues/{number}", "body": BODY,
             "labels": [{"name": n} for n in labels], "state": state, "parent": None,
-            "blockedBy": list(blocked_by), "comments": []}
+            "blockedBy": list(blocked_by), "comments": list(comments)}
+
+
+def comment(login, when, body):
+    return {"author": {"login": login}, "createdAt": when, "body": body,
+            "url": f"https://github.com/o/r/issues/12#issuecomment-{abs(hash(body)) % 100000}"}
 
 
 def ready_row(number, title=TITLE, labels=("task", "status:ready", "size:S", "risk:low")):
@@ -308,7 +324,9 @@ class Start(WorkTest):
         self.scenario(issues=[issue()])
 
         data = self.ok_json("start", "12", "--json")
-        self.assertEqual(set(data), {"number", "branch", "worktree", "tier", "context"})
+        self.assertEqual(set(data), {"number", "branch", "worktree", "tier", "previous_status", "waiting", "answers",
+                                     "context"})
+        self.assertEqual((data["previous_status"], data["waiting"], data["answers"]), ("ready", False, []))
         wt = self.worktree_path()
         self.assertEqual((data["number"], data["branch"], data["worktree"], data["tier"]), (12, BRANCH, wt, "sonnet"))
         self.assertTrue(data["context"].startswith("# #12 Add the board tool"), data["context"][:80])
@@ -330,7 +348,8 @@ class Start(WorkTest):
         comment = next(c for c in calls if c[:2] == ["issue", "comment"])
         body = comment[comment.index("--body") + 1]
         self.assertTrue(body.startswith(f"Started on {BRANCH} ("), body)
-        self.assertTrue(body.endswith(", interactive)"), body)
+        self.assertTrue(body.splitlines()[0].endswith(", interactive)"), body)
+        self.assertTrue(body.endswith("<!-- harness -->"), body)           # harness-board marks its comments
 
         again = self.ok("start", "12")                       # the existing worktree is reused
         self.assertEqual(again.stdout.splitlines()[0], wt)
@@ -368,6 +387,48 @@ class Start(WorkTest):
         self.assertTrue(os.path.isfile(os.path.join(wt, "sub", ".env")))
         self.assertFalse(os.path.exists(os.path.join(wt, "debug.log")))
         self.assertFalse(os.path.exists(os.path.join(wt, ".env.sample")))
+
+    def test_start_leaves_an_in_review_ticket_in_review(self):
+        self.scenario(issues=[issue(labels=("task", "status:in-review", "size:S", "risk:low"))])
+        data = self.ok_json("start", "12", "--json")
+        self.assertEqual((data["previous_status"], data["waiting"], data["answers"]), ("in-review", False, []))
+        self.assertEqual(data["worktree"], self.worktree_path())
+        self.assertTrue(os.path.isdir(data["worktree"]))
+        calls = self.gh_calls()
+        self.assertFalse([c for c in calls if c[:2] in (["issue", "edit"], ["issue", "comment"])], calls)
+        self.assertFalse([c for c in calls if c[-2:] == ["--json", "comments"]])   # no answers read
+
+    def needs_input(self, *replies):
+        comments = [comment("rjeskuri", iso_ago(hours=3), QUESTION)] + list(replies)
+        self.scenario(issues=[issue(labels=("task", "status:needs-input", "size:S", "risk:low"), comments=comments)])
+
+    def test_start_on_needs_input_returns_the_owners_answer_and_moves_on(self):
+        self.needs_input(comment("RJeskuri", iso_ago(hours=2), "Use main."),
+                         comment("rjeskuri", iso_ago(hours=1), "Also add a flag."))
+        data = self.ok_json("start", "12", "--json")
+        self.assertEqual((data["previous_status"], data["waiting"]), ("needs-input", False))
+        self.assertEqual([a["body"] for a in data["answers"]], ["Use main.", "Also add a flag."])
+        calls = self.gh_calls()
+        read = calls.index(["issue", "view", "12", "--json", "comments"])
+        edit = next(i for i, c in enumerate(calls) if c[:2] == ["issue", "edit"])
+        self.assertLess(read, edit)
+        self.assertIn("status:in-progress", calls[edit])
+        self.assertIn("status:needs-input", calls[edit])                  # removed
+        first_show = next(i for i, c in enumerate(calls) if c[:3] == ["issue", "view", "12"]
+                          and c[-2:] not in (["--json", "labels"], ["--json", "comments"]))
+        self.assertLess(read, first_show)                                  # answers before show refreshes the cache
+
+        text = self.ok("start", "12").stdout                               # text mode shows the answer too
+        self.assertIn("Use main.", text)
+
+    def test_start_on_needs_input_without_an_answer_waits(self):
+        self.needs_input()
+        data = self.ok_json("start", "12", "--json")
+        self.assertEqual((data["previous_status"], data["waiting"], data["answers"]), ("needs-input", True, []))
+        calls = self.gh_calls()
+        self.assertIn(["issue", "view", "12", "--json", "comments"], calls)
+        self.assertFalse([c for c in calls if c[:2] in (["issue", "edit"], ["issue", "comment"])], calls)
+        self.assertIn("no answer yet", self.ok("start", "12").stdout)
 
     def test_start_refuses_an_epic(self):
         self.scenario(issues=[issue(labels=("epic", "status:ready"), title="The board")],
@@ -454,7 +515,8 @@ class Dispatch(WorkTest):
     def test_headless_launch_bills_through_api_key_helper_and_keeps_the_key_off_argv(self):
         keyfile = write(os.path.join(self.tmp, "key.txt"), SECRET + "\n")
         self.scenario(issues=[issue()], ready=[ready_row(12)])
-        env = self.env(HARNESS_API_KEY_CMD=f"cat {keyfile}", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="parent")
+        env = self.env(HARNESS_API_KEY_CMD=f"cat {keyfile}", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="parent",
+                       **CREDENTIALS)
         p = self.ok("dispatch", env=env)
         self.assertIn(f"#12 headless on {BRANCH} (pid ", p.stdout)
 
@@ -480,8 +542,13 @@ class Dispatch(WorkTest):
         self.assertNotIn(SECRET, json.dumps(call))          # neither argv nor the environment carries the key
         self.assertNotIn("CLAUDECODE", call["env"])
         self.assertNotIn("CLAUDE_CODE_SESSION_ID", call["env"])
+        for name, value in CREDENTIALS.items():                # an exported key would bill instead of the helper
+            self.assertNotIn(name, call["env"])
+            self.assertNotIn(value, json.dumps(call))
         comment = next(c for c in self.gh_calls() if c[:2] == ["issue", "comment"])
-        self.assertTrue(comment[comment.index("--body") + 1].endswith(", headless)"))
+        body = comment[comment.index("--body") + 1]
+        self.assertTrue(body.splitlines()[0].endswith(", headless)"), body)
+        self.assertTrue(body.endswith("<!-- harness -->"), body)
 
         self.assertTrue(wait_for(lambda: pid_gone(record["pid"])))
         [swept] = self.ok_json("runs", "--sweep", "--json")
@@ -500,16 +567,20 @@ class Dispatch(WorkTest):
     def test_falls_back_to_bg_while_the_api_budget_is_exhausted(self):
         self.write_budget("api", 1, "billing: credit balance is too low")
         self.scenario(issues=[issue()], ready=[ready_row(12)])
-        p = self.ok("dispatch")
+        p = self.ok("dispatch", env=self.env(**CREDENTIALS))
         self.assertIn(f"#12 bg on {BRANCH} (id abc123)", p.stdout)
         [call] = self.claude_calls()
         self.assertEqual(call["argv"], ["--bg", "-n", "proj #12 Add the board tool", "/harness:work 12"])
+        for name in CREDENTIALS:                               # the subscription login bills, not an exported key
+            self.assertNotIn(name, call["env"])
         self.assertEqual(os.path.realpath(call["cwd"]), self.worktree_path())
         [record] = self.run_records()
         self.assertEqual((record["venue"], record["bg_id"], record["ended_at"]), ("bg", "abc123", None))
         self.assertNotIn("pid", record)
         comment = next(c for c in self.gh_calls() if c[:2] == ["issue", "comment"])
-        self.assertTrue(comment[comment.index("--body") + 1].endswith(", bg)"))
+        body = comment[comment.index("--body") + 1]
+        self.assertTrue(body.splitlines()[0].endswith(", bg)"), body)
+        self.assertTrue(body.endswith("<!-- harness -->"), body)
 
         # The session is still working: the next dispatch leaves the ticket alone.
         agents = json.dumps([{"id": "abc123", "kind": "background", "state": "working", "cwd": self.worktree_path()}])
@@ -528,15 +599,40 @@ class Dispatch(WorkTest):
         self.assertNotIn("would start", p.stdout)
         self.assertIn("No ready tickets.", p.stdout)
 
+    def test_skips_a_ticket_after_three_ended_runs(self):
+        in_progress = issue(labels=("task", "status:in-progress", "size:S", "risk:low"))
+        for hours in (3, 2):
+            self.write_run(12, id=f"{self.key}-12-2026101309{hours:02d}00", pid=self.dead_pid(),
+                           started_at=iso_ago(hours=hours, minutes=30), ended_at=iso_ago(hours=hours), outcome="error")
+        self.scenario(issues=[in_progress])
+        p = self.ok("dispatch", "--dry-run")                   # two ended runs: a third is launched
+        self.assertIn("would start #12 Add the board tool (again after error)", p.stdout)
+
+        self.write_run(12, id=f"{self.key}-12-20261013100000", pid=self.dead_pid(),
+                       started_at=iso_ago(hours=1, minutes=30), ended_at=iso_ago(hours=1), outcome="error")
+        self.scenario(issues=[in_progress])
+        p = self.ok("dispatch", "--dry-run")                   # three: the fourth dispatch skips it
+        self.assertNotIn("would start", p.stdout)
+        self.assertIn("skip #12: 3 runs ended without a pull request in 7 days, the last error", p.stdout)
+        self.assertIn("harness-board status 12 ready", p.stdout)
+        data = self.ok_json("dispatch", "--dry-run", "--json")
+        self.assertEqual(data["plan"], [])
+        self.assertEqual([s["number"] for s in data["skipped"]], [12])
+
+        p = self.ok("dispatch")                                # for real: nothing started, the skip said
+        self.assertIn("skip #12: 3 runs ended", p.stdout)
+        self.assertIn("No ready tickets.", p.stdout)
+        self.assertEqual(self.claude_calls(), [])
+        self.assertEqual(len(self.run_records()), 3)
+        self.assertFalse([c for c in self.gh_calls() if c[:2] in (["issue", "edit"], ["issue", "comment"])])
+
 
 # =========================================================================== runs
 class Runs(WorkTest):
     def test_sweep_classifies_billing_and_marks_the_api_budget(self):
         record = self.write_run(12, pid=self.dead_pid())
-        write(record["log"], "starting\n"
-              'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance '
-              'is too low to access the Anthropic API."}}\n'
-              + json.dumps({"type": "result", "is_error": True, "result": "Credit balance is too low"}) + "\n")
+        low = dict(API_401, api_error_status=400, result="Credit balance is too low")   # told by the result text
+        write(record["log"], CONNECTORS_WARNING + "\n" + json.dumps(low) + "\n")
         [swept] = self.ok_json("runs", "--sweep", "--json")
         self.assertEqual((swept["id"], swept["outcome"]), (record["id"], "billing"))
         self.assertTrue(swept["ended_at"])
@@ -555,16 +651,62 @@ class Runs(WorkTest):
     def test_sweep_classifies_ok_auth_and_error(self):
         logs = {
             12: json.dumps({"type": "result", "is_error": False, "result": "Fixed the billing page; see 401 and 402."}),
-            13: "Invalid API key · Please run /login",
+            13: "Invalid API key · Please run /login",                  # no JSON result: the API-error lines
             14: "Traceback: something else broke",
+            15: "warning: a hook printed 402 Payment Required",           # not an API-error line
         }
         for n, text in logs.items():
             record = self.write_run(n, pid=self.dead_pid())
             write(record["log"], text + "\n")
         swept = {r["ticket"]: r["outcome"] for r in self.ok_json("runs", "--sweep", "--json")}
-        self.assertEqual(swept, {12: "ok", 13: "auth", 14: "error"})
+        self.assertEqual(swept, {12: "ok", 13: "auth", 14: "error", 15: "error"})
         api = self.read_json(self.budgets_path())["api"]
         self.assertTrue(api["reason"].startswith("auth: Invalid API key"), api["reason"])
+
+    def sweep_one(self, n, result):
+        record = self.write_run(n, pid=self.dead_pid())
+        write(record["log"], CONNECTORS_WARNING + "\n" + json.dumps(result) + "\n")
+        return next(r for r in self.ok_json("runs", "--sweep", "--json") if r["ticket"] == n)
+
+    def test_sweep_reads_the_api_error_fields_of_the_result(self):
+        # Other API errors and the model's own words never exhaust a budget.
+        overloaded = dict(API_401, api_error_status=529, result="Overloaded")
+        own_words = {k: v for k, v in API_401.items() if k not in ("terminal_reason", "api_error_status")}
+        own_words["result"] = "Fix the billing page: 401 handling"
+        for n, result in ((12, overloaded), (13, own_words)):
+            with self.subTest(result=result["result"]):
+                swept = self.sweep_one(n, result)
+                self.assertEqual(swept["outcome"], "error")
+                self.assertIsNone(swept["exit"])
+                self.assertFalse(os.path.exists(self.budgets_path()))
+
+        # The real invalid-key result: auth, and the api budget is marked.
+        self.assertEqual(self.sweep_one(14, API_401)["outcome"], "auth")
+        api = self.read_json(self.budgets_path())["api"]
+        self.iso_close_to(api["exhausted_until"], dt.timedelta(hours=24))
+        self.assertEqual(api["reason"], "auth: API error 401: Invalid API key \u00b7 Fix external API key")
+
+        # The same result with 402: billing.
+        self.ok("budget", "reset", "api")
+        self.assertEqual(self.sweep_one(15, dict(API_401, api_error_status=402))["outcome"], "billing")
+        self.assertTrue(self.read_json(self.budgets_path())["api"]["reason"].startswith("billing: API error 402"))
+
+    def test_sweep_closes_a_bg_run_on_any_state_that_is_not_live(self):
+        for n, bg_id in ((12, "s-blocked"), (13, "s-idle"), (14, "s-done"), (15, "s-archived"), (16, "s-gone"),
+                         (17, "s-nostate")):
+            self.write_run(n, venue="bg", bg_id=bg_id)
+        agents = json.dumps([{"id": "s-blocked", "kind": "background", "state": "blocked"},
+                             {"id": "s-idle", "kind": "background", "state": "idle"},
+                             {"id": "s-done", "kind": "background", "state": "done", "exitCode": 0},
+                             {"id": "s-archived", "kind": "background", "state": "archived"},
+                             {"id": "s-nostate", "kind": "background"}])
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json",
+                                                     env=self.env(FAKECLAUDE_AGENTS=agents))}
+        self.assertEqual({n: rows[n]["outcome"] for n in rows},
+                         {12: None, 13: None, 14: "ok", 15: "archived", 16: "unknown", 17: None})
+        self.assertEqual(rows[14]["exit"], 0)
+        self.assertIsNone(rows[15]["exit"])
+        self.assertEqual((rows[12]["state"], rows[13]["state"], rows[17]["state"]), ("blocked", "idle", "live"))
 
     def test_sweep_leaves_a_live_run_alone(self):
         live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "/harness:work 12"])

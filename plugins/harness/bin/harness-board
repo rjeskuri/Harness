@@ -16,12 +16,15 @@ Usage:
     harness-board status N ready|in-progress|in-review|blocked|needs-input [--comment TEXT]
     harness-board comment N (--body TEXT | --body-file F)
     harness-board needs-input N --question TEXT [--evidence-file F]
-    harness-board answers N [--since ISO]
+    harness-board answers N [--since ISO]   # the owner's replies since the last needs-input question
     harness-board close N [--comment TEXT]
     harness-board epic-check N
     harness-board board
     harness-board tier N
     Every subcommand takes --repo PATH (default: CLAUDE_PROJECT_DIR, else the cwd's repository) and --json.
+
+Every comment posted here ends with the line `<!-- harness -->` (hidden on GitHub), so `answers` can tell the
+harness's own comments, posted under the owner's account, from the owner's replies.
 
 gh is HARNESS_GH when set, else `gh` on PATH.
 """
@@ -72,6 +75,9 @@ SECTIONS = [("Request", "request"), ("Outline", "outline"), ("Definition of done
 ISSUE_FIELDS = "number,title,url,body,labels,state,parent,blockedBy,comments"
 PRESERVED = (("branch", None), ("worktree", None), ("started_at", None), ("attempts", []))
 NEEDS_INPUT = "**Needs your input**"
+MARKER = "<!-- harness -->"     # the last line of every comment posted here
+# the harness's own comments from before the marker, as their bodies start
+HARNESS_PREFIXES = (NEEDS_INPUT, "Started on ", "PR #", "Landed in ")
 EPIC_DONE = "All tasks landed."
 CONTEXT_LINES = 120     # the most lines `show --markdown` prints
 COMMENTS_SHOWN = 10     # the newest comments in the context
@@ -282,6 +288,21 @@ def read_text(path, what):
             return fh.read()
     except OSError as err:
         raise Problem(f"cannot read {what} {path}: {err.strerror or err}") from None
+
+
+def marked(body):
+    """The comment body with MARKER as its own last line (once)."""
+    text = (body or "").rstrip()
+    lines = text.splitlines()
+    if lines and lines[-1].strip() == MARKER:
+        return text
+    return f"{text}\n\n{MARKER}" if text else MARKER
+
+
+def by_harness(body):
+    """Was this comment posted by the harness? The marker, or (older comments) a body the harness writes."""
+    body = body or ""
+    return MARKER in body or body.lstrip().startswith(HARNESS_PREFIXES)
 
 
 # --------------------------------------------------------------- labels, tiers, the cache
@@ -674,7 +695,7 @@ def set_status(repo, number, status, comment=None):
         cmd += ["--remove-label", name]
     gh(repo, cmd)
     if comment:
-        gh(repo, ["issue", "comment", str(number), "--body", comment])
+        gh(repo, ["issue", "comment", str(number), "--body", marked(comment)])
     labels = [name for name in names if name not in removed] + ([new] if new not in names else [])
     refresh_cache(repo, number, labels=labels, status=status)
     return removed
@@ -688,10 +709,11 @@ def cmd_status(repo, args):
 
 def cmd_comment(repo, args):
     if args.body is not None:
-        out = gh(repo, ["issue", "comment", str(args.number), "--body", args.body])
+        out = gh(repo, ["issue", "comment", str(args.number), "--body", marked(args.body)])
     else:
         path, stdin = body_file(args.body_file)
-        out = gh(repo, ["issue", "comment", str(args.number), "--body-file", path], stdin)
+        text = stdin if path == "-" else read_text(path, "body file")
+        out = gh(repo, ["issue", "comment", str(args.number), "--body-file", "-"], marked(text))
     url = first_line(out.strip().splitlines()[-1] if out.strip() else "")
     emit(args, {"number": args.number, "url": url}, url or f"commented on #{args.number}")
 
@@ -707,7 +729,7 @@ def needs_input_body(number, question, evidence):
         fence = "`" * max(3, longest + 1)
         parts.append("\n".join([fence] + lines + [fence]))
     parts.append(f"Reply in a comment; /harness:work {number} picks it up.")
-    return "\n\n".join(parts)
+    return marked("\n\n".join(parts))
 
 
 def cmd_needs_input(repo, args):
@@ -723,31 +745,35 @@ def cmd_needs_input(repo, args):
 
 
 def cmd_answers(repo, args):
+    """The owner's comments after `since`, without the harness's own (posted under the same login). `since`:
+    --since, else the newest needs-input question, else the cache's fetched_at, else no lower bound."""
+    since = None
     if args.since is not None:
         since = parse_iso(args.since)
         if since is None:
             raise Problem(f"--since: not an ISO-8601 time: {args.since!r}")
-    else:
-        since = parse_iso((read_cache(repo, args.number) or {}).get("fetched_at"))
     login = gh(repo, ["api", "user", "--jq", ".login"]).strip()
     if not login:
         raise Problem("gh api user printed no login")
     data = gh_json(repo, ["issue", "view", str(args.number), "--json", "comments"])
-    out = []
+    mine = []
     for c in as_list(data.get("comments") if isinstance(data, dict) else None):
         author = (c.get("author") or {}).get("login") if isinstance(c.get("author"), dict) else None
-        body = c.get("body") or ""
-        if not author or author.casefold() != login.casefold() or body.lstrip().startswith(NEEDS_INPUT):
-            continue
-        when = parse_iso(c.get("createdAt"))
-        if since is not None and (when is None or when <= since):
+        if author and author.casefold() == login.casefold():
+            mine.append((author, c, c.get("body") or "", parse_iso(c.get("createdAt"))))
+    if args.since is None:
+        asked = [when for _, _, body, when in mine if when is not None and body.lstrip().startswith(NEEDS_INPUT)]
+        since = max(asked) if asked else parse_iso((read_cache(repo, args.number) or {}).get("fetched_at"))
+    out = []
+    for author, c, body, when in mine:
+        if by_harness(body) or (since is not None and (when is None or when <= since)):
             continue
         out.append({"author": author, "created_at": c.get("createdAt"), "body": body, "url": c.get("url")})
     print(json.dumps(out, indent=2, ensure_ascii=False))
 
 
 def cmd_close(repo, args):
-    gh(repo, ["issue", "close", str(args.number)] + (["--comment", args.comment] if args.comment else []))
+    gh(repo, ["issue", "close", str(args.number)] + (["--comment", marked(args.comment)] if args.comment else []))
     refresh_cache(repo, args.number, status="closed")
     emit(args, {"number": args.number, "closed": True}, f"closed #{args.number}")
 
@@ -762,7 +788,7 @@ def cmd_epic_check(repo, args):
         result["closed"] = True
         emit(args, result, f"#{args.number} is already closed")
     elif total > 0 and completed == total:
-        gh(repo, ["issue", "close", str(args.number), "--comment", EPIC_DONE])
+        gh(repo, ["issue", "close", str(args.number), "--comment", marked(EPIC_DONE)])
         refresh_cache(repo, args.number, status="closed")
         result["closed"] = True
         emit(args, result, f"closed epic #{args.number}: all {total} tasks landed")
@@ -887,9 +913,11 @@ def parser():
     ni.add_argument("--question", required=True, metavar="TEXT")
     ni.add_argument("--evidence-file", metavar="F", help=f"shown fenced, at most {EVIDENCE_LINES} lines (the tail)")
 
-    answers = sub.add_parser("answers", parents=[common], help="your comments on a ticket since a time (JSON)")
+    answers = sub.add_parser("answers", parents=[common],
+                             help="your replies on a ticket since its last needs-input question (JSON)")
     answers.add_argument("number", type=issue_number, metavar="N")
-    answers.add_argument("--since", metavar="ISO", help="default: the cache's fetched_at")
+    answers.add_argument("--since", metavar="ISO", help="default: the newest needs-input question, else the "
+                                                        "cache's fetched_at, else every reply")
 
     close = sub.add_parser("close", parents=[common], help="close a ticket")
     close.add_argument("number", type=issue_number, metavar="N")

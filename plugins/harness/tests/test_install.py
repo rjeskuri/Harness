@@ -155,8 +155,9 @@ class Install(unittest.TestCase):
         self.assertEqual(self.backups(), [f"settings.json.bak-{today}"])
         with open(f"{self.settings}.bak-{today}", encoding="utf-8") as fh:
             self.assertEqual(fh.read(), original)
-        self.assertIn('~/.claude/settings.json: set model, effortLevel, modelSettings; removed '
-                      'enabledPlugins["companion@ryan"] (backup settings.json.bak-', p.stdout)
+        self.assertIn(f'~/.claude/settings.json: set model, effortLevel; set modelSettings for '
+                      f'{", ".join(snippet["modelSettings"])}; removed enabledPlugins["companion@ryan"] '
+                      f'(backup settings.json.bak-', p.stdout)
 
         plist = os.path.join(self.home, "Library", "LaunchAgents", f"{LABEL}.plist")
         with open(plist, "rb") as fh:
@@ -183,16 +184,43 @@ class Install(unittest.TestCase):
         snippet = read_json(SNIPPET)
         self.assertEqual(read_json(self.settings), {k: snippet[k] for k in ("model", "effortLevel", "modelSettings")})
         self.assertEqual(self.backups(), [])
-        self.assertIn("~/.claude/settings.json: set model, effortLevel, modelSettings (created)", p.stdout)
+        self.assertIn(f'~/.claude/settings.json: set model, effortLevel; set modelSettings for '
+                      f'{", ".join(snippet["modelSettings"])} (created)', p.stdout)
 
-    def test_unreadable_settings_are_left_alone(self):
-        write(self.settings, "{not json")
+    def test_model_settings_merge_per_model_id(self):
+        snippet = read_json(SNIPPET)
+        ids = list(snippet["modelSettings"])
+        self.assertGreaterEqual(len(ids), 2)
+        mine = {ids[0]: snippet["modelSettings"][ids[0]],                       # already as the snippet has it
+                ids[1]: {"effortLevel": "low", "maxEffortLevel": "high"},       # overridden by the snippet
+                "claude-haiku-4-5": {"autoCompactWindow": 200000}}              # not in the snippet: kept
+        write(self.settings, json.dumps({"model": snippet["model"], "effortLevel": snippet["effortLevel"],
+                                         "modelSettings": mine, "theme": "dark"}))
         p = self.install()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        merged = read_json(self.settings)
+        self.assertEqual(merged["modelSettings"], dict(snippet["modelSettings"],
+                                                       **{"claude-haiku-4-5": {"autoCompactWindow": 200000}}))
+        self.assertEqual(merged["theme"], "dark")
+        self.assertIn(f"~/.claude/settings.json: set modelSettings for {', '.join(ids[1:])} (backup ", p.stdout)
+        p = self.install()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("~/.claude/settings.json: already up to date", p.stdout)
+        self.assertEqual(read_json(self.settings), merged)
+
+    def test_unreadable_settings_are_left_alone_and_fail_the_install_at_the_end(self):
+        write(self.settings, "{not json")
+        p = self.install()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn("~/.claude/settings.json: left unchanged, cannot read it", p.stderr)
         with open(self.settings, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "{not json")
         self.assertEqual(self.backups(), [])
+        plist = os.path.join(self.home, "Library", "LaunchAgents", f"{LABEL}.plist")      # the later steps ran
+        self.assertIn(["bootstrap", f"gui/{os.getuid()}", plist], self.lines(self.launch_log))
+        self.assertIn("Done, except the settings merge, which failed", p.stdout)
+        self.assertNotIn("Done. Start", p.stdout)
+        self.assertIn("security add-generic-password", p.stdout)
 
     def test_a_failed_launchagent_does_not_fail_the_install(self):
         p = self.install(LAUNCHCTL_FAIL="bootstrap,load")

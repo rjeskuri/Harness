@@ -23,10 +23,15 @@ already on t/N-*, else a branch origin/t/N-*, else a local t/N-*, else creates t
 (main without an origin) in <main>/.claude/worktrees/t-N-<slug>; a new worktree gets HARNESS_WORKTREE_SETUP
 (environment, then the project's .claude/settings.local.json, then .claude/settings.json) or the detected
 setup (uv sync, npm ci); gitignored files of the main checkout matching .worktreeinclude are copied when
-missing; the ticket goes to status:in-progress unless it is there already.
+missing; the ticket goes to status:in-progress, except from status:in-review (a revision pass keeps its label)
+and from status:needs-input while the owner has not answered. For a needs-input ticket, `harness-board answers N`
+runs first, before anything refreshes the ticket cache. --json prints previous_status (the status before start),
+answers (the owner's replies; [] unless the ticket was needs-input) and waiting (needs-input with no answer).
 
 dispatch: sweeps the runs, then starts and launches each ready ticket (and each in-progress ticket whose last
-run ended without a pull request) that has no live run, up to --max minus the live runs. headless:
+run ended without a pull request, until 3 runs of it ended in the last 7 days) that has no live run, up to --max
+minus the live runs. Launched sessions get neither the dispatching session's identity nor ANTHROPIC_API_KEY,
+ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN. headless:
 `claude -p "/harness:work N"` billed through {"apiKeyHelper": HARNESS_API_KEY_CMD} (the key itself never
 reaches a command line or the environment); bg, the default while the api budget is exhausted:
 `claude --bg -n "<repo> #N <title>" "/harness:work N"`.
@@ -62,6 +67,7 @@ LOG_TAIL = 60                 # lines of a run's log read by the sweep
 TAIL_BYTES = 256 * 1024
 RECENT = dt.timedelta(hours=24)
 REDISPATCH_WINDOW = dt.timedelta(days=7)   # an ended run older than this is not picked up again
+REDISPATCH_MAX = 3            # ended runs of a ticket within the window after which dispatch skips it
 EXHAUST_HOURS = 24.0
 REASON_MAX = 200
 DIRTY_SHOWN = 10
@@ -71,16 +77,31 @@ SETUP_TIMEOUT = 1500          # uv sync, npm ci
 LAUNCH_TIMEOUT = 120          # claude --bg returns once the session is handed to the supervisor
 AGENTS_TIMEOUT = 30
 GH_TIMEOUT = 60
-BILLING_RE = re.compile(r"credit balance|insufficient.*credit|billing|payment required|\b402\b", re.I)
+BILLING_RE = re.compile(r"credit balance|insufficient.*credit|billing_error|payment required|\b402\b", re.I)
 AUTH_RE = re.compile(r"invalid.*api.key|authentication_error|\b401\b", re.I)
+# A log line that is an API error from claude itself: without a JSON result (a crash before one), only these lines
+# are searched for billing and auth wording.
+API_ERROR_RE = re.compile(r"API Error|\"type\"\s*:\s*\"error\"|authentication_error|invalid[ _-]?(?:x-)?api[ _-]?key|"
+                          r"insufficient credits|credit balance|billing_error", re.I)
+# claude -p --output-format json on an API failure (seen with 2.1.296): is_error true, terminal_reason "api_error",
+# api_error_status (401 ...) and claude's own message as the whole `result`. Only then is `result` read, anchored.
+AUTH_STATUSES = (401, 403)
+BILLING_STATUSES = (402,)
+BILLING_RESULT_RE = re.compile(r"^\s*(?:Credit balance is too low|Your credit balance|insufficient credits|billing)",
+                               re.I)
+AUTH_RESULT_RE = re.compile(r"^\s*(?:Invalid API key|Not logged in|authentication)", re.I)
 BG_ID_RE = re.compile(r"backgrounded\s+(?:·|-)\s+(\S+)")
-LIVE_STATES = ("working", "blocked")
-ENDED_STATES = {"done": "ok", "failed": "error", "stopped": "stopped"}
+# `claude agents --json` states of a session still running; any other non-empty state means it ended. Seen on
+# 2026-10-13: `blocked` for a background session; interactive sessions carry no `state` (a `status` instead).
+LIVE_STATES = ("running", "working", "blocked", "idle", "busy", "waiting", "starting")
+ENDED_STATES = {"done": "ok", "failed": "error", "stopped": "stopped"}   # outcome; another ended state is kept as is
 PID_SLACK = 120               # seconds: a process younger than its run record by more is a recycled pid
 # The dispatching session's own identity, which a detached run must not inherit.
 SESSION_ENV = ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION",
                "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET",
                "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_EXECPATH", "CLAUDE_PID", "CLAUDE_EFFORT")
+# Credentials a launched session must not inherit: headless bills through apiKeyHelper, bg through the login.
+CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
 
 
 class Problem(Exception):
@@ -224,8 +245,9 @@ def claude_exe():
 
 
 def child_env():
-    """The environment for a launched session: ours, without the dispatching session's identity."""
-    return {k: v for k, v in os.environ.items() if k not in SESSION_ENV}
+    """The environment for a launched session: ours, without the dispatching session's identity and without
+    credentials that would bill instead of the apiKeyHelper (headless) or the subscription login (bg)."""
+    return {k: v for k, v in os.environ.items() if k not in SESSION_ENV and k not in CREDENTIAL_ENV}
 
 
 # --------------------------------------------------------------- the repository
@@ -498,8 +520,21 @@ def hostname():
     return name[:-len(".local")] if name.endswith(".local") else name
 
 
+def issue_labels(repo, number):
+    issue = gh_json(repo, ["issue", "view", str(number), "--json", "labels"])
+    labels = issue.get("labels") if isinstance(issue, dict) else None
+    return [lb.get("name") for lb in labels or [] if isinstance(lb, dict)]
+
+
 def start_ticket(repo, number, venue):
-    """Everything `start` does except printing; the ticket record, the branch and the worktree."""
+    """Everything `start` does except printing; the ticket record, the branch and the worktree.
+
+    A needs-input ticket's answers are read before `show` refreshes the ticket cache. The status goes to
+    in-progress except from in-review (a revision pass) and from needs-input without an answer (waiting)."""
+    answers = []
+    if "status:needs-input" in issue_labels(repo, number):
+        found = board_json(repo, "answers", number, "--json")
+        answers = found if isinstance(found, list) else []
     record = board_json(repo, "show", number, "--json")
     if not isinstance(record, dict):
         raise Problem(f"harness-board show {number} printed no ticket")
@@ -517,11 +552,14 @@ def start_ticket(repo, number, venue):
         cache["started_at"] = iso(now())
     cache.update(branch=branch, worktree=worktree)
     write_json(repo.ticket_path(number), cache)
-    if record.get("status") != "in-progress":
+    previous = record.get("status")
+    waiting = previous == "needs-input" and not answers
+    if previous not in ("in-progress", "in-review") and not waiting:
         board(repo, "status", number, "in-progress", "--comment", f"Started on {branch} ({hostname()}, {venue})")
     tier = record.get("tier") if record.get("tier") in TIERS else DEFAULT_TIER
     return {"number": number, "branch": branch, "worktree": worktree, "tier": tier,
-            "title": record.get("title") or ""}
+            "title": record.get("title") or "", "previous_status": previous, "answers": answers,
+            "waiting": waiting}
 
 
 # --------------------------------------------------------------- budgets
@@ -659,6 +697,11 @@ def is_bg(record):
     return record.get("venue") == "bg" or bool(record.get("bg_id"))
 
 
+def state_ended(state):
+    """Whether a `claude agents` state means the session ended: any non-empty state that is not a live one."""
+    return bool(state) and state not in LIVE_STATES
+
+
 def run_live(record, agents):
     if record.get("ended_at"):
         return False
@@ -667,7 +710,7 @@ def run_live(record, agents):
         if listing is None:
             return True                                 # cannot tell: never start a second run beside it
         entry = listing.get(str(record.get("bg_id")))
-        return bool(entry) and entry.get("state") in LIVE_STATES
+        return bool(entry) and not state_ended(entry.get("state"))
     return pid_alive(record.get("pid"), parse_iso(record.get("started_at")))
 
 
@@ -712,15 +755,38 @@ def matched_line(lines, pattern):
 def classify(lines):
     """(outcome, reason) of a finished headless run from its log tail.
 
-    A JSON result without is_error is `ok` whatever its text says; otherwise billing and auth errors are
-    told apart by their wording, and anything else is `error`."""
+    With a JSON result: is_error not true is `ok` whatever its text says; an API failure (terminal_reason
+    api_error or an api_error_status) is `auth` on 401 and 403, `billing` on 402, else told by the start of the
+    result text (claude's own message there), else `error`; any other is_error is `error` and its result text (the
+    model's own words) is never read. Without a JSON result, the API-error lines of the tail are searched for
+    billing and auth wording. Only `billing` and `auth` come with a reason."""
     result = last_result(lines)
-    if result is not None and result.get("is_error") is not True:
+    if result is None:
+        lines = [line for line in lines if API_ERROR_RE.search(line)]
+        for outcome, pattern in (("billing", BILLING_RE), ("auth", AUTH_RE)):
+            line = matched_line(lines, pattern)
+            if line:
+                return outcome, line
+        return "error", None
+    if result.get("is_error") is not True:
         return "ok", None
-    for outcome, pattern in (("billing", BILLING_RE), ("auth", AUTH_RE)):
-        line = matched_line(lines, pattern)
-        if line:
-            return outcome, line
+    status = result.get("api_error_status")
+    if isinstance(status, str) and status.strip().isdigit():
+        status = int(status)
+    if isinstance(status, bool) or not isinstance(status, int):
+        status = None
+    if result.get("terminal_reason") != "api_error" and status is None:
+        return "error", None
+    text = one_line(result.get("result") if isinstance(result.get("result"), str) else "")
+    reason = (f"API error {status}: {text}" if status is not None else f"API error: {text}")[:REASON_MAX]
+    if status in AUTH_STATUSES:
+        return "auth", reason
+    if status in BILLING_STATUSES:
+        return "billing", reason
+    if BILLING_RESULT_RE.match(text):
+        return "billing", reason
+    if AUTH_RESULT_RE.match(text):
+        return "auth", reason
     return "error", None
 
 
@@ -742,10 +808,13 @@ def sweep(records, agents):
                 continue
             entry = listing.get(str(record.get("bg_id")))
             state = entry.get("state") if entry else None
-            if entry is not None and state not in ENDED_STATES:
+            if entry is not None and not state_ended(state):
                 continue
             record["ended_at"] = iso(now())
-            record["outcome"] = ENDED_STATES.get(state, "unknown")
+            record["outcome"] = ENDED_STATES.get(state, str(state)) if entry is not None else "unknown"
+            code = entry.get("exitCode", entry.get("exit")) if entry is not None else None
+            if isinstance(code, int) and not isinstance(code, bool):
+                record["exit"] = code               # only when the listing gives one; headless runs keep null
         else:
             if pid_alive(record.get("pid"), parse_iso(record.get("started_at"))):
                 continue
@@ -764,8 +833,8 @@ def run_state(record, agents):
     if is_bg(record):
         listing = agents.get()
         entry = listing.get(str(record.get("bg_id"))) if listing else None
-        if entry and entry.get("state") in LIVE_STATES:
-            return entry["state"]
+        if entry and not state_ended(entry.get("state")):
+            return entry.get("state") or "live"
         return "unknown" if listing is None else "ended (run --sweep)"
     alive = pid_alive(record.get("pid"), parse_iso(record.get("started_at")))
     return f"alive (pid {record.get('pid')})" if alive else "exited (run --sweep)"
@@ -828,14 +897,20 @@ def failed(record, why):
 
 
 def redispatch_candidates(repo, records, live):
-    """In-progress tickets whose last run ended (within the window) without a pull request: dispatched again."""
+    """In-progress tickets whose last run ended (within the window) without a pull request: dispatched again,
+    unless REDISPATCH_MAX runs of the ticket ended within the window. (candidates, skipped)."""
     cutoff = now() - REDISPATCH_WINDOW
-    latest = {}
+    latest, ended_runs = {}, {}
     for record in records:
         n = record.get("ticket")
-        if isinstance(n, int) and (n not in latest or str(record.get("started_at")) > str(latest[n].get("started_at"))):
+        if not isinstance(n, int):
+            continue
+        if n not in latest or str(record.get("started_at")) > str(latest[n].get("started_at")):
             latest[n] = record
-    out = []
+        ended = parse_iso(record.get("ended_at"))
+        if ended is not None and ended >= cutoff:
+            ended_runs[n] = ended_runs.get(n, 0) + 1
+    out, skipped = [], []
     for n, record in sorted(latest.items()):
         ended = parse_iso(record.get("ended_at"))
         if n in live or ended is None or ended < cutoff:
@@ -854,9 +929,15 @@ def redispatch_candidates(repo, records, live):
             continue
         if prs:
             continue
-        out.append({"number": n, "title": issue.get("title") or "", "tier": None,
-                    "again": record.get("outcome") or "ended"})
-    return out
+        again = record.get("outcome") or "ended"
+        if ended_runs.get(n, 0) >= REDISPATCH_MAX:
+            skipped.append({"number": n, "why": f"{ended_runs[n]} runs ended without a pull request in "
+                                                f"{REDISPATCH_WINDOW.days} days, the last {again}; run "
+                                                f"/harness:work {n} by hand, or harness-board status {n} ready "
+                                                "to dispatch it again"})
+            continue
+        out.append({"number": n, "title": issue.get("title") or "", "tier": None, "again": again})
+    return out, skipped
 
 
 # --------------------------------------------------------------- commands
@@ -864,8 +945,15 @@ def cmd_start(repo, args):
     ticket = start_ticket(repo, args.number, args.venue)
     context = board(repo, "show", args.number, "--markdown").rstrip("\n")
     data = {"number": ticket["number"], "branch": ticket["branch"], "worktree": ticket["worktree"],
-            "tier": ticket["tier"], "context": context}
-    emit(args, data, f"{ticket['worktree']}\n\n{context}")
+            "tier": ticket["tier"], "previous_status": ticket["previous_status"], "waiting": ticket["waiting"],
+            "answers": ticket["answers"], "context": context}
+    text = f"{ticket['worktree']}\n\n{context}"
+    if ticket["waiting"]:
+        text += f"\n\n#{ticket['number']} is status:needs-input with no answer yet; its status is unchanged."
+    elif ticket["answers"]:
+        bodies = [str(a.get("body") or "").strip() if isinstance(a, dict) else str(a) for a in ticket["answers"]]
+        text += "\n\n## Answers\n\n" + "\n\n".join(b for b in bodies if b)
+    emit(args, data, text)
 
 
 def cmd_attempt(repo, args):
@@ -914,14 +1002,15 @@ def cmd_dispatch(repo, args):
             live.setdefault(record["ticket"], record)
     ready = board_json(repo, "ready", "--json")
     ready = [r for r in ready if isinstance(r, dict)] if isinstance(ready, list) else []
+    again, capped = redispatch_candidates(repo, mine, live)
     candidates, seen = [], set()
-    for row in redispatch_candidates(repo, mine, live) + ready:
+    for row in again + ready:
         n = row.get("number")
         if isinstance(n, int) and n not in seen:
             seen.add(n)
             candidates.append(row)
     slots = args.max - len(live)
-    plan, skipped = [], []
+    plan, skipped = [], list(capped)
     for row in candidates:
         if row["number"] in live:
             skipped.append({"number": row["number"], "why": f"live run {live[row['number']]['id']}"})
@@ -943,16 +1032,20 @@ def cmd_dispatch(repo, args):
         emit(args, {"venue": venue, "dry_run": True, "live": [r["id"] for r in live.values()],
                     "plan": plan, "skipped": skipped}, "\n".join(lines))
         return
+    if not args.json:
+        for s in capped:
+            print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
-        emit(args, {"venue": venue, "launched": [], "failed": []}, "No ready tickets.")
+        emit(args, {"venue": venue, "launched": [], "failed": [], "skipped": skipped}, "No ready tickets.")
         return
     if slots <= 0:
-        emit(args, {"venue": venue, "launched": [], "failed": []},
+        emit(args, {"venue": venue, "launched": [], "failed": [], "skipped": skipped},
              f"{len(live)} live runs; --max {args.max} reached, nothing launched.")
         return
     if not plan:
-        emit(args, {"venue": venue, "launched": [], "failed": []},
-             "Nothing to launch: " + "; ".join(f"#{s['number']} has a {s['why']}" for s in skipped) + ".")
+        emit(args, {"venue": venue, "launched": [], "failed": [], "skipped": skipped},
+             "Nothing to launch: " + "; ".join(f"#{s['number']} has a {s['why']}" for s in skipped
+                                               if s not in capped) + ".")
         return
     if shutil.which(claude_exe()) is None:
         raise Problem(f"claude not found ({claude_exe()}); nothing started")
@@ -976,7 +1069,7 @@ def cmd_dispatch(repo, args):
             where = f"pid {record['pid']}, log {record['log']}" if venue == "headless" else f"id {record['bg_id']}"
             print(f"#{n} {venue} on {record['branch']} ({where})", flush=True)
     if args.json:
-        emit(args, {"venue": venue, "launched": launched, "failed": failures}, "")
+        emit(args, {"venue": venue, "launched": launched, "failed": failures, "skipped": skipped}, "")
     if failures:
         sys.exit(1)
 
@@ -1128,7 +1221,7 @@ def parser():
     sub.required = True
 
     start = sub.add_parser("start", parents=[with_repo, with_json],
-                           help="branch and worktree for a ticket, status in-progress, its context")
+                           help="branch and worktree for a ticket, status in-progress, its context and answers")
     start.add_argument("number", type=issue_number, metavar="N")
     start.add_argument("--venue", default="interactive", choices=("interactive",) + VENUES,
                        help="named in the start comment (dispatch passes its own)")

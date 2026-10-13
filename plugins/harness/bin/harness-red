@@ -10,6 +10,7 @@ conftest.py included; `run_files`, the ones the command runs, are those whose ba
 
 Usage:
     harness-red check [--base origin/main]   # run the branch's changed tests; red exits 0, anything else 1
+                                             # (no tests ran, or they failed to load: refused, nothing recorded)
     harness-red status                       # the record for this branch, and current: yes|no
     harness-red scratch create               # a detached worktree of HEAD for the test-breaker; prints its path
     harness-red scratch run                  # the record's tests in the scratch: cheat passed (0) or cheat failed (1)
@@ -46,6 +47,15 @@ TAIL_LINES = 40
 CANNOT_START = (126, 127)          # the shell's "not executable" and "command not found"
 IMPORT_RE = re.compile(r"ModuleNotFoundError|ImportError|No module named|Cannot find module|ERR_MODULE_NOT_FOUND")
 ASSERTION_RE = re.compile(r"AssertionError|assert |FAILED|failed|✗|not ok")
+# A run that proves nothing: no record. Exit 5 is pytest's and (3.12+) unittest's "no tests ran".
+NO_TESTS_EXIT = 5
+NO_TESTS_RE = re.compile(r"no tests ran|NO TESTS RAN")
+COLLECTED_NONE_RE = re.compile(r"collected 0 items")
+BAD_SYNTAX_RE = re.compile(r"^[ \t]*(?:E[ \t]+)?(?:SyntaxError|IndentationError|TabError)\b", re.M)  # its own line
+LOAD_ERROR_RE = re.compile(r"error during collection|ERROR collecting")
+MISSING_RE = re.compile(r"ModuleNotFoundError|ImportError: cannot import name|No module named|Cannot find module|"
+                        r"ERR_MODULE_NOT_FOUND")    # the code under test does not exist yet: the usual first red
+NO_TESTS, NOT_LOADED = "no tests ran", "tests failed to load"
 GREEN = "Tests pass before the implementation; they do not test this change."
 RUNNABLE = ("test_*.py", "*_test.py", "*.test.js", "*_test.js", "*.test.ts", "*_test.ts", "*.test.mjs",
             "*.spec.js", "*.spec.ts")      # basenames passed as {files}; other test files are hashed, not run
@@ -331,6 +341,24 @@ def tail(text, n=TAIL_LINES):
     return "\n".join(lines[-n:])
 
 
+def unproven(code, output):
+    """Why a failing run proves nothing, or None. A missing module still counts as red, even when pytest reports
+    it as a collection error; a syntax error in a test file does not."""
+    if code == 0:
+        return None
+    if code == NO_TESTS_EXIT or NO_TESTS_RE.search(output):
+        return NO_TESTS
+    if BAD_SYNTAX_RE.search(output):
+        return NOT_LOADED
+    if MISSING_RE.search(output):
+        return None
+    if LOAD_ERROR_RE.search(output):
+        return NOT_LOADED
+    if COLLECTED_NONE_RE.search(output):
+        return NO_TESTS
+    return None
+
+
 def kind_of(code, output):
     if code == 0:
         return "green"
@@ -378,6 +406,17 @@ def cmd_check(repo, args):
     if timed_out:
         raise Problem(f"{cmd} timed out after {timed_out:g}s and was stopped; no red run recorded. "
                       "Raise HARNESS_TEST_TIMEOUT or fix the hang.")
+    why = unproven(code, output)
+    if why:
+        if args.json:
+            print(json.dumps({"refused": why, "cmd": cmd, "exit": code, "tail": tail(output)}, indent=2,
+                             ensure_ascii=False))
+        else:
+            print(f"{why}: {len(tests)} test files, exit {code}")
+            print(tail(output))
+        fix = ("make the test files define tests the command collects" if why == NO_TESTS
+               else "fix the error its output shows")
+        raise Problem(f"no red run recorded: {why} (exit {code}); {fix}, then run harness-red check again.")
     kind = kind_of(code, output)
     record = {"branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
               "test_hash": digest, "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),

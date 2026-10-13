@@ -25,6 +25,7 @@ TOOL = os.path.join(os.path.dirname(HERE), "bin", "harness-board")
 FAKEGH = os.path.join(HERE, "fakegh.py")
 GIT = shutil.which("git")
 REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
+MARK = "\n\n<!-- harness -->"      # the last line of every comment harness-board posts
 
 # The label table from docs/design.md, the source of truth for `labels ensure`.
 SPEC_COLORS = {
@@ -467,7 +468,7 @@ class Status(BoardTest):
             ["issue", "view", "12", "--json", "labels"],
             ["issue", "edit", "12", "--add-label", "status:in-progress", "--remove-label", "status:ready",
              "--remove-label", "status:blocked"],
-            ["issue", "comment", "12", "--body", "Started on t/12-x"],
+            ["issue", "comment", "12", "--body", "Started on t/12-x" + MARK],
         ])
 
     def test_status_updates_an_existing_cache(self):
@@ -492,8 +493,24 @@ class Status(BoardTest):
         p = self.ok("comment", "12", "--body", "PR #4: https://github.com/o/r/pull/4")
         self.assertEqual(p.stdout.strip(), "https://github.com/o/r/issues/12#issuecomment-1")
         self.ok("close", "12", "--comment", "Done.")
-        self.assertEqual(self.calls(), [["issue", "comment", "12", "--body", "PR #4: https://github.com/o/r/pull/4"],
-                                        ["issue", "close", "12", "--comment", "Done."]])
+        self.assertEqual(self.calls(), [["issue", "comment", "12", "--body",
+                                         "PR #4: https://github.com/o/r/pull/4" + MARK],
+                                        ["issue", "close", "12", "--comment", "Done." + MARK]])
+
+    def test_comment_bodies_from_a_file_or_stdin_are_marked_once(self):
+        self.scenario([], default={"stdout": "https://github.com/o/r/issues/12#issuecomment-1\n"})
+        body = write(os.path.join(self.tmp, "comment.md"), "Line one.\n\nLine two.\n")
+        self.ok("comment", "12", "--body-file", body)
+        p = subprocess.run([sys.executable, TOOL, "comment", "12", "--body-file", "-"], cwd=self.repo,
+                           env=self.env(), input="From stdin.\n", capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.ok("comment", "12", "--body", "Already marked." + MARK + "\n")
+        with open(self.log, encoding="utf-8") as fh:
+            logged = [json.loads(line) for line in fh if line.strip()]
+        self.assertEqual([entry["argv"] for entry in logged[:2]], [["issue", "comment", "12", "--body-file", "-"]] * 2)
+        self.assertEqual([entry["stdin"] for entry in logged[:2]],
+                         ["Line one.\n\nLine two." + MARK, "From stdin." + MARK])
+        self.assertEqual(logged[2]["argv"], ["issue", "comment", "12", "--body", "Already marked." + MARK])
 
     def test_needs_input_label_comment_and_notification(self):
         evidence = write(os.path.join(self.tmp, "evidence.txt"), "\n".join(f"E{i}" for i in range(1, 101)) + "\n")
@@ -507,7 +524,7 @@ class Status(BoardTest):
         expected = ("**Needs your input**\n\n"
                     "Which branch is the base?\n\n"
                     "```\n[... 41 earlier lines omitted]\n" + "\n".join(f"E{i}" for i in range(42, 101)) + "\n```\n\n"
-                    "Reply in a comment; /harness:work 12 picks it up.")
+                    "Reply in a comment; /harness:work 12 picks it up." + MARK)
         self.assertEqual(self.calls(), [
             ["issue", "view", "12", "--json", "labels"],
             ["issue", "edit", "12", "--add-label", "status:needs-input", "--remove-label", "status:in-progress"],
@@ -528,23 +545,57 @@ class Status(BoardTest):
         self.assertFalse(json.loads(p.stdout)["notified"])
         self.assertEqual([n[0] for n in self.notifications()], ["terminal-notifier", "osascript"])
         body = self.calls()[-1][-1]
-        self.assertEqual(body, "**Needs your input**\n\nShip it?\n\nReply in a comment; /harness:work 12 picks it up.")
+        self.assertEqual(body, "**Needs your input**\n\nShip it?\n\nReply in a comment; /harness:work 12 picks it up."
+                         + MARK)
 
 
 # ======================================================================= answers, epic-check, board
 class Answers(BoardTest):
-    def test_only_the_users_comments_after_since_without_the_harness_question(self):
-        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", "old answer"),
-                    comment("rjeskuri", "2026-10-13T11:00:00Z", "**Needs your input**\n\nWhich?"),
-                    comment("someone", "2026-10-13T12:00:00Z", "drive-by"),
-                    comment("RJeskuri", "2026-10-13T13:00:00Z", "Use main.")]
+    QUESTION = "**Needs your input**\n\nWhich base?\n\nReply in a comment; /harness:work 12 picks it up."
+    STARTED = "Started on t/12-add-the-board-tool (mac.local, interactive)"
+
+    def answers(self, comments, *args):
         self.scenario([{"match": ["api", "user"], "stdout": "rjeskuri\n"},
                        {"match": ["issue", "view", "12", "--json", "comments"], "stdout_json": {"comments": comments}}])
-        out = json.loads(self.ok("answers", "12", "--since", "2026-10-13T10:00:00Z").stdout)
-        self.assertEqual([c["body"] for c in out], ["Use main."])
-        self.put_cache(12, {"number": 12, "fetched_at": "2026-10-13T08:00:00Z"})
-        out = json.loads(self.ok("answers", "12").stdout)
-        self.assertEqual([c["body"] for c in out], ["old answer", "Use main."])
+        return [c["body"] for c in json.loads(self.ok("answers", "12", *args).stdout)]
+
+    def test_the_owners_reply_after_the_question_even_after_start_refreshed_the_cache(self):
+        self.put_cache(12, {"number": 12, "fetched_at": "2026-10-13T15:00:00Z"})     # newer than every comment
+        for mark in (MARK, ""):                                       # marked, and from before the marker
+            comments = [comment("rjeskuri", "2026-10-13T11:00:00Z", self.QUESTION + mark),
+                        comment("RJeskuri", "2026-10-13T12:00:00Z", "Use main."),
+                        comment("rjeskuri", "2026-10-13T13:00:00Z", self.STARTED + mark)]
+            self.assertEqual(self.answers(comments), ["Use main."], repr(mark))
+
+    def test_the_newest_question_sets_the_default_since(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                    comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                    comment("rjeskuri", "2026-10-13T11:00:00Z", "**Needs your input**\n\nAnd the name?" + MARK),
+                    comment("someone", "2026-10-13T12:00:00Z", "drive-by"),
+                    comment("rjeskuri", "2026-10-13T13:00:00Z", "Call it export."),
+                    comment("rjeskuri", "2026-10-13T14:00:00Z", "Also add a flag.")]
+        self.assertEqual(self.answers(comments), ["Call it export.", "Also add a flag."])
+
+    def test_without_a_question_the_cache_then_nothing_bounds_it(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", "old note"),
+                    comment("rjeskuri", "2026-10-13T10:00:00Z", "PR #4 ready for review: https://x" + MARK),
+                    comment("rjeskuri", "2026-10-13T11:00:00Z", "Landed in abc1234"),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "new note")]
+        self.assertEqual(self.answers(comments), ["old note", "new note"])              # no cache: every reply
+        self.put_cache(12, {"number": 12, "fetched_at": "2026-10-13T10:30:00Z"})
+        self.assertEqual(self.answers(comments), ["new note"])
+
+    def test_since_overrides_and_harness_comments_stay_out(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", "old answer"),
+                    comment("rjeskuri", "2026-10-13T11:00:00Z", self.QUESTION + MARK),
+                    comment("someone", "2026-10-13T12:00:00Z", "drive-by"),
+                    comment("RJeskuri", "2026-10-13T13:00:00Z", "Use main."),
+                    comment("rjeskuri", "2026-10-13T14:00:00Z", self.STARTED + MARK),
+                    comment("rjeskuri", "2026-10-13T14:30:00Z", "Anything with the marker <!-- harness --> inside")]
+        self.assertEqual(self.answers(comments, "--since", "2026-10-13T08:00:00Z"), ["old answer", "Use main."])
+        self.assertEqual(self.answers(comments, "--since", "2026-10-13T12:30:00Z"), ["Use main."])
+        p = self.board("answers", "12", "--since", "yesterday")
+        self.assertOneLineError(p, "--since: not an ISO-8601 time")
 
 
 class EpicCheck(BoardTest):
@@ -557,7 +608,7 @@ class EpicCheck(BoardTest):
         return [argv for argv in self.calls() if argv[:2] == ["issue", "close"]]
 
     def test_closes_only_when_every_task_is_closed(self):
-        self.assertEqual(self.check(3, 3), [["issue", "close", "3", "--comment", "All tasks landed."]])
+        self.assertEqual(self.check(3, 3), [["issue", "close", "3", "--comment", "All tasks landed." + MARK]])
         self.assertEqual(self.check(3, 2), [])
         self.assertEqual(self.check(0, 0), [])
         self.assertEqual(self.check(2, 2, state="CLOSED"), [])

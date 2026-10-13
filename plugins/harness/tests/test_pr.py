@@ -409,7 +409,8 @@ class Open(WorktreeTest):
         self.assertIn("- [ ] The widget frobs twice", create["stdin"])
         self.assertIn("- `tests/test_widget.py::test_frob`: frobs twice", create["stdin"])
         self.assertIn("Red run before implementation (assertion, exit 1):", create["stdin"])
-        self.assertIn(["issue", "comment", "12", "--body", f"Pull request: {PR_URL}"], [c["argv"] for c in calls])
+        self.assertIn(["issue", "comment", "12", "--body", f"Pull request: {PR_URL}\n\n<!-- harness -->"],
+                      [c["argv"] for c in calls])
         self.assertTrue(os.path.isfile(self.state_path("tickets", "12.json")))
 
 
@@ -883,6 +884,54 @@ class Land(WorktreeTest):
         self.assertEqual(steps, sorted(steps))
         self.assertFalse(os.path.exists(self.wt))
         self.assertFalse(self.branch_exists())
+
+    def test_land_finishes_when_the_worktree_folder_was_removed_by_hand(self):
+        self.scenario(self.land_calls())
+        shutil.rmtree(self.wt)
+        self.assertIn(f"worktree {self.wt}", self.git(self.main, "worktree", "list", "--porcelain"))   # still listed
+        p = self.ok("land", "34", cwd=self.main)
+        m = self.main
+        steps = [self.position("gh pr merge 34"),
+                 self.position(f"git -C {m} worktree prune"),
+                 self.position(f"git -C {m} worktree list --porcelain"),
+                 self.position(f"git -C {m} branch -D {BRANCH}"),
+                 self.position(f"harness-board close 12 --repo {m}"),
+                 self.position(f"harness-board comment 12 --body Landed in {SHA} --repo {m}"),
+                 self.position(f"harness-board epic-check 3 --repo {m}")]
+        self.assertEqual(steps, sorted(steps))
+        self.assertFalse(any("worktree remove" in line for line in self.order()))
+        self.assertFalse(self.branch_exists())
+        self.assertIn(f"Worktree: no worktree for {BRANCH}; branch {BRANCH} deleted.", p.stdout)
+        self.assertIn("Ticket: #12 closed, status labels removed, commented", p.stdout)
+
+    def test_land_goes_on_to_the_ticket_when_a_locked_worktree_is_gone(self):
+        self.scenario(self.land_calls())
+        self.git(self.main, "worktree", "lock", self.wt)       # prune keeps a locked entry
+        shutil.rmtree(self.wt)
+        p = self.pr("land", "34", cwd=self.main)
+        self.assertOneLineError(p, "PR #34 is merged, but", f"git branch -D {BRANCH} failed")
+        self.assertIn(f"Worktree: {self.wt} was already gone; branch {BRANCH} kept.", p.stdout)
+        self.assertFalse(any("worktree remove" in line for line in self.order()))
+        self.assertIn(["close", "12", "--repo", self.main], self.stub_calls("harness-board"))
+        self.assertIn("Ticket: #12 closed, status labels removed, commented", p.stdout)
+
+    def test_land_asks_github_for_the_epic_without_a_cached_parent(self):
+        os.unlink(self.state_path("tickets", "12.json"))
+        parent = {"match": ["api", "repos/o/r/issues/12/parent"], "stdout_json": {"number": 3, "title": "Widgets"}}
+        self.scenario([parent] + self.land_calls())
+        p = self.ok("land", "34", cwd=self.main)
+        self.assertIn(["api", "repos/o/r/issues/12/parent"], self.gh_argv())
+        self.assertIn(["epic-check", "3", "--repo", self.main], self.stub_calls("harness-board"))
+        self.assertIn("epic check: #3: 1 of 2 tasks closed; left open.", p.stdout)
+
+        # A cache without a parent asks too; a 404 means no epic, and the land still succeeds.
+        write(self.state_path("tickets", "12.json"), json.dumps({"number": 12, "parent": None}))
+        none = {"match": ["api", "repos/o/r/issues/12/parent"], "stderr": "gh: Not Found (HTTP 404)\n", "exit": 1}
+        self.scenario([none] + self.land_calls(views=[land_view(state="MERGED")], issue_state="CLOSED"))
+        p = self.ok("land", "34", cwd=self.main)
+        self.assertIn(["api", "repos/o/r/issues/12/parent"], self.gh_argv())
+        self.assertFalse(any(a[0] == "epic-check" for a in self.stub_calls("harness-board")))
+        self.assertNotIn("epic check", p.stdout)
 
     def test_land_on_a_merged_pr_does_not_repeat_the_landed_comment(self):
         landed = {"author": {"login": "rjeskuri"}, "body": f"Landed in {SHA}", "createdAt": "2026-10-13T10:00:00Z"}

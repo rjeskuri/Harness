@@ -1106,13 +1106,27 @@ def worktree_for(main, branch):
 
 
 def ticket_parent(repo, number):
+    """The ticket's epic: `parent` in the ticket cache, else GitHub's sub-issue parent (404: none)."""
     try:
         with open(repo.state("tickets", f"{number}.json"), encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
-        return None
+        data = None
     parent = data.get("parent") if isinstance(data, dict) else None
     n = parent.get("number") if isinstance(parent, dict) else None
+    if isinstance(n, int) and n > 0:
+        return n
+    call = ["api", f"repos/{repo.slug()}/issues/{number}/parent"]
+    done = gh_run(call, repo.main)
+    if done.returncode != 0:
+        if re.search(r"\b404\b|Not Found", (done.stderr or "") + (done.stdout or "")):
+            return None
+        raise Problem(f"{describe(call)} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
+    try:
+        found = json.loads(done.stdout or "null")
+    except ValueError:
+        raise Problem(f"{describe(call)} printed something other than JSON") from None
+    n = found.get("number") if isinstance(found, dict) else None
     return n if isinstance(n, int) and n > 0 else None
 
 
@@ -1217,7 +1231,11 @@ def cmd_land(args):
                 else f'Merged PR #{number} "{title}" into main') + merged_as]
     problems = []
 
+    git(main, "worktree", "prune")            # forget worktrees whose folder was removed by hand
     wt = worktree_for(main, branch) if branch else None
+    vanished = None
+    if wt and not os.path.isdir(wt):          # still listed (locked) but gone from disk: nothing to remove
+        vanished, wt = wt, None
     if wt and os.path.realpath(wt) == main:
         problems.append(f"the main checkout is on {branch}; switch it to main, then git branch -D {branch}")
         summary.append(f"Worktree: the main checkout is on {branch}; nothing removed.")
@@ -1244,7 +1262,8 @@ def cmd_land(args):
             deleted = gone.returncode == 0
             if not deleted:
                 problems.append(f"git branch -D {branch} failed: {last_line(gone.stderr)}")
-        where_line = f"removed {wt}" if wt and not problems else f"kept {wt}" if wt else f"no worktree for {branch}"
+        where_line = (f"removed {wt}" if wt and not problems else f"kept {wt}" if wt
+                      else f"{vanished} was already gone" if vanished else f"no worktree for {branch}")
         branch_line = (f"branch {branch} deleted" if deleted else f"branch {branch} kept" if exists
                        else f"no local branch {branch}")
         summary.append(f"Worktree: {where_line}; {branch_line}.")

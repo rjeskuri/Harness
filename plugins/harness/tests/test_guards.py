@@ -48,6 +48,15 @@ CODER_ON_TEST = (
     "Tests are fixed for this ticket. If a test is wrong, stop and report it; the "
     "orchestrator sends it back to the test-author."
 )
+PUSH_ADVICE = (
+    "main and master change only through a pull request: push the ticket branch and "
+    "open one (harness-pr open <issue#>)."
+)
+CODER_ON_CONFIG = (
+    "{rel} decides which tests run and how, so it is fixed for this ticket like the "
+    "tests. If it has to change, stop and ask the orchestrator."
+)
+INLINE = "Write files with Edit or Write so the tests-first rules can see the path."
 NO_RED = (
     "Tests first on t/12: write the tests, then run harness-red check. "
     "(No red run recorded.)"
@@ -604,6 +613,150 @@ class BranchGuardBashTests(GuardTestCase):
         self.assertIsNone(self.bash("git commit -m x"))
 
 
+    def test_pushes_naming_main_are_refused_from_a_ticket_branch(self):
+        wt = self.worktree(self.repo)
+        for command, why in (
+            ("git push origin HEAD:main", "git push HEAD:main updates main"),
+            (
+                f"git push origin {BRANCH}:main",
+                f"git push {BRANCH}:main updates main",
+            ),
+            (
+                "git push origin HEAD:refs/heads/master",
+                "git push HEAD:refs/heads/master updates master",
+            ),
+            ("git push origin main", "git push main updates main"),
+            ("git push origin :main", "git push :main deletes main"),
+            (
+                "git push --mirror origin",
+                "git push --mirror pushes every branch, main included",
+            ),
+            (
+                "git push --all origin",
+                "git push --all pushes every branch, main included",
+            ),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    self.bash(command, cwd=wt),
+                    f'Refused "{command}": {why}. {PUSH_ADVICE}',
+                )
+        for command in (
+            f"git push -u origin {BRANCH}",
+            "git push origin HEAD",
+            "git push",
+            "git push origin --delete t/3-old",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(self.bash(command, cwd=wt))
+
+    def test_writes_are_judged_by_the_worktree_that_holds_them(self):
+        repo = self.repo
+        nested = repo / ".claude/worktrees/t-13-nested"
+        self.git(repo, "worktree", "add", "-q", "-b", "t/13-nested", str(nested))
+        scratch = self.write(self.outside / "scratch.txt", "a\n")
+        # from the main checkout, on main: a ticket worktree, or outside the repo
+        for command in (
+            f"sed -i '' 's/a/b/' {nested}/src/app.py",
+            f"echo hi > {nested}/src/app.py",
+            f"tee {nested}/notes.txt",
+            f"cp {scratch} .claude/worktrees/t-13-nested/src/",
+            "cd .claude/worktrees/t-13-nested && echo hi > notes.txt",
+            f"sed -i '' 's/a/b/' {scratch}",
+            "git diff > ../outside/x.patch",
+            "make check | tee ../outside/log",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(self.bash(command))
+        # from a ticket worktree into the main checkout, which is on main
+        wt = self.worktree(repo)
+        for command, why in (
+            (
+                f"echo hi > {repo}/src/app.py",
+                f"it writes to {repo}/src/app.py through a redirection",
+            ),
+            (f"sed -i '' 's/a/b/' {repo}/README.md", "sed -i edits files in place"),
+            ("cp src/app.py ../proj/src/", "cp changes ../proj/src/ inside the repo"),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(self.bash(command, cwd=wt), command, why)
+        self.assertIsNone(self.bash("echo hi > src/app.py", cwd=wt))
+
+    def test_the_directory_follows_the_shell(self):
+        refused = ("git commit -m x", "git commit changes main")
+        for command in (
+            "( cd .. ); git commit -m x",
+            f"(cd {self.outside} && ls); git commit -m x",
+            "echo $(cd ..); git commit -m x",
+            "cd ''; git commit -m x",
+            f"cd {self.outside}/missing; git commit -m x",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(self.bash(command), *refused)
+        self.assertRefusedOnMain(
+            self.bash('git -C "" commit -m x'),
+            'git -C "" commit -m x',
+            "git commit changes main",
+        )
+        # a cd that fails before && stops the chain; one made earlier in it succeeds
+        for command in (
+            f"cd {self.outside}/missing && git commit -m x",
+            "git worktree add .claude/worktrees/t-14 -b t/14-x && "
+            "cd .claude/worktrees/t-14 && git commit -m x",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(self.bash(command))
+
+    def test_more_ways_to_change_main(self):
+        for command, why in (
+            ("git --git-dir=.git --work-tree=. commit -m x", "git commit changes main"),
+            ("git -c alias.ci=commit ci -m x", "git commit changes main"),
+            (
+                """python3 -c "open('src/x','w').write('x')\"""",
+                "python opens a file for writing",
+            ),
+            ("git apply ../x.diff", "git apply changes files on main"),
+            ("git rm src/app.py", "git rm changes files on main"),
+            ("git restore src/app.py", "git restore changes files on main"),
+            (
+                "git checkout -- src/app.py",
+                "git checkout of paths changes files on main",
+            ),
+            ("git checkout -B main origin/x", "git checkout -B main resets main"),
+            ("git switch -C main HEAD~1", "git switch -C main resets main"),
+            (
+                "git update-ref refs/heads/main HEAD~1",
+                "git update-ref refs/heads/main moves main",
+            ),
+            ("dd if=/dev/zero of=src/x count=1", "dd changes src/x inside the repo"),
+            ("truncate -s 0 src/app.py", "truncate changes src/app.py inside the repo"),
+            ("perl -0pi -e 's/a/b/' src/app.py", "perl -i edits files in place"),
+            ("awk -i inplace 1 src/app.py", "awk -i inplace edits files in place"),
+            (
+                "echo 0 > .git/refs/heads/main",
+                "it writes to .git/refs/heads/main through a redirection",
+            ),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(self.bash(command), command, why)
+        self.assertRefusedOnMain(
+            self.bash("python3 - <<'PY'\nopen('src/x', 'w')\nPY"),
+            "python3 - <<'PY'",
+            "python opens a file for writing",
+        )
+        for command in (
+            "mkdir -p src/new",
+            "git symbolic-ref --short HEAD",
+            "git apply --check ../x.diff",
+            "git restore --staged src/app.py",
+            "git checkout -b t/14-x origin/main",
+            """python3 -c "print(open('src/app.py').read())\"""",
+            "sed -n 1,5p src/app.py",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(self.bash(command))
+
+
 class ReadonlyPlannerTests(GuardTestCase):
     """readonly_bash.py now keeps the planner read-only too."""
 
@@ -775,12 +928,157 @@ class TestsFirstTests(GuardTestCase):
     def test_patterns_from_environment_and_project_settings(self):
         self.cache()
         settings = {"env": {"HARNESS_TEST_PATTERNS": "checks/**"}}
+        # the worktree's own settings are the agent's to edit, so they do not count
         self.write(self.wt / ".claude/settings.json", json.dumps(settings))
+        self.assertEqual(self.edit("checks/check_app.py"), NO_RED)
+        self.write(self.repo / ".claude/settings.json", json.dumps(settings))
         self.assertIsNone(self.edit("checks/check_app.py"))
         self.assertEqual(self.edit("tests/test_app.py"), NO_RED)  # now source
         env = {"HARNESS_TEST_PATTERNS": "tests/**", "HARNESS_SOURCE_EXEMPT": "src/**"}
         self.assertIsNone(self.edit("src/app.py", env=env))
         self.assertEqual(self.edit("checks/check_app.py", env=env), NO_RED)
+
+    def test_patterns_ignore_settings_local_json(self):
+        self.cache()
+        local = {"env": {"HARNESS_TEST_PATTERNS": "nothing/**"}}
+        self.write(self.repo / ".claude/settings.local.json", json.dumps(local))
+        self.write(self.wt / ".claude/settings.local.json", json.dumps(local))
+        self.assertIsNone(self.edit("tests/test_app.py"))  # still a test
+        self.assertEqual(self.edit("tests/test_app.py", "harness:coder"), CODER_ON_TEST)
+        tracked = {"env": {"HARNESS_TEST_PATTERNS": "checks/**"}}
+        self.write(self.repo / ".claude/settings.json", json.dumps(tracked))
+        self.assertIsNone(self.edit("checks/check_app.py"))
+        self.assertEqual(self.edit("tests/test_app.py"), NO_RED)  # now source
+
+    def test_test_configuration_is_fixed_for_the_coder(self):
+        self.cache()
+        self.red()
+        for rel in (
+            ".claude/settings.json",
+            "pyproject.toml",
+            "pytest.ini",
+            "package.json",
+        ):
+            with self.subTest(rel=rel):
+                self.assertEqual(
+                    self.edit(rel, "harness:coder"), CODER_ON_CONFIG.format(rel=rel)
+                )
+                self.assertTrue(
+                    self.edit(rel, "harness:test-breaker").startswith("Tests are fixed")
+                )
+                self.assertIsNone(self.edit(rel, "harness:test-author"))
+                self.assertIsNone(self.edit(rel))
+
+    def test_a_red_record_needs_a_failure_kind(self):
+        self.cache()
+        self.red()
+        record_path = self.state / "red/t-12-fix-login.json"
+        record = json.loads(record_path.read_text())
+        for kind in (None, "", "passed"):
+            with self.subTest(kind=kind):
+                if kind is None:
+                    record.pop("kind", None)
+                else:
+                    record["kind"] = kind
+                self.write(record_path, json.dumps(record))
+                reason = self.edit("src/app.py", "harness:coder")
+                self.assertIsNotNone(reason)
+                self.assertIn("does not say how the tests failed", reason)
+        for kind in ("assertion", "import", "error"):
+            with self.subTest(kind=kind):
+                record["kind"] = kind
+                self.write(record_path, json.dumps(record))
+                self.assertIsNone(self.edit("src/app.py", "harness:coder"))
+
+    def bash(self, command: str, agent=None, cwd: Path | None = None):
+        payload = self.payload("Bash", {"command": command}, cwd or self.wt, agent)
+        return self.decision(self.run_hook("tests_first.py", payload))
+
+    def test_bash_writes_follow_the_same_rules(self):
+        self.cache()
+        self.red()
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        source = self.write(outside / "x.py", "x = 1\n")
+        wt = self.wt
+        for command in (
+            "sed -i '' 's/pass/assert 0/' tests/test_app.py",
+            "cat > tests/test_app.py <<'EOF'\ndef test_login():\n    pass\nEOF",
+            f"cp {source} tests/test_app.py",
+            f"cp {source} tests/",
+            "git checkout -- tests/test_app.py",
+            "echo x | tee -a tests/test_more.py",
+        ):
+            with self.subTest(command=command):
+                part = command.split("\n", 1)[0].split(" | ")[-1]
+                self.assertEqual(
+                    self.bash(command, "harness:coder"),
+                    f'Refused "{part}": {CODER_ON_TEST}',
+                )
+                self.assertIsNone(self.bash(command, "harness:test-author"))
+        # by path from the main checkout, and through cd
+        for command, part in (
+            (
+                f"sed -i '' 's/a/b/' {wt}/tests/test_app.py",
+                f"sed -i '' 's/a/b/' {wt}/tests/test_app.py",
+            ),
+            (f"cd {wt} && echo x > tests/test_x.py", "echo x > tests/test_x.py"),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    self.bash(command, "harness:coder", cwd=self.repo),
+                    f'Refused "{part}": {CODER_ON_TEST}',
+                )
+        self.assertEqual(
+            self.bash("echo x > src/app.py", "harness:test-author"),
+            f'Refused "echo x > src/app.py": {AUTHOR_ON_SOURCE}',
+        )
+        self.assertIsNone(self.bash("echo x > src/app.py", "harness:coder"))
+        run = f"python3 -m pytest -q > {outside}/log 2>&1"
+        self.assertIsNone(self.bash(run, "harness:coder"))
+        # a source write still needs the red run
+        (self.state / "red/t-12-fix-login.json").unlink()
+        self.assertEqual(
+            self.bash("echo x > src/app.py"), f'Refused "echo x > src/app.py": {NO_RED}'
+        )
+
+    def test_bash_may_write_what_git_ignores(self):
+        self.write(
+            self.wt / ".gitignore", ".pytest_cache/\n*.log\n.claude/settings.local.json\n"
+        )
+        (self.wt / ".pytest_cache").mkdir()
+        author = "harness:test-author"
+        self.assertIsNone(self.bash("rm -rf .pytest_cache", author))
+        self.assertIsNone(self.bash("python3 -m pytest 2>&1 | tee run.log", author))
+        self.assertEqual(
+            self.bash("rm -rf build", author), f'Refused "rm -rf build": {AUTHOR_ON_SOURCE}'
+        )
+        # test configuration stays fixed for the coder, ignored or not
+        rel = ".claude/settings.local.json"
+        self.assertEqual(
+            self.bash(f"echo '{{}}' > {rel}", "harness:coder"),
+            f'Refused "echo \'{{}}\' > {rel}": ' + CODER_ON_CONFIG.format(rel=rel),
+        )
+
+    def test_inline_programs_that_write_are_refused_to_the_roles(self):
+        self.cache()
+        self.red()
+        command = """python3 -c "open('tests/test_app.py', 'w').write('')\""""
+        for agent in ("harness:coder", "harness:test-author", "harness:test-breaker"):
+            with self.subTest(agent=agent):
+                self.assertEqual(
+                    self.bash(command, agent),
+                    f'Refused "{command}": python opens a file for writing. {INLINE}',
+                )
+        heredoc = "node <<'JS'\nrequire('fs').writeFileSync('src/app.py', '')\nJS"
+        reason = self.bash(heredoc, "harness:coder")
+        self.assertIsNotNone(reason)
+        self.assertTrue(reason.endswith(INLINE), reason)
+        self.assertIsNone(self.bash(command))  # the main session
+        self.assertIsNone(self.bash(command, "harness:reviewer"))
+        reads = """python3 -c "print(open('src/app.py').read())\""""
+        self.assertIsNone(self.bash(reads, "harness:coder"))
+        self.assertIsNone(self.bash(command, "harness:coder", cwd=self.tmp))  # no repo
 
     def test_other_branches_and_places_are_left_alone(self):
         self.assertIsNone(self.edit("src/app.py", root=self.repo))  # main
