@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import shutil
 import stat
@@ -1213,6 +1214,509 @@ class Rules(ScaffoldTest):
         sub = self.mk("proj", "sub")
         self.assertOneLineError(self.scaffold("init", sub, "--name", "sub"), "inside the repository")
         self.assertEqual(os.listdir(sub), [])
+
+
+# =========================================================================== kept settings (ticket #31)
+with open(os.path.join(TEMPLATES, "settings.json"), encoding="utf-8") as _fh:
+    _TEMPLATE_SETTINGS = json.load(_fh)
+TEMPLATE_ALLOW = list(_TEMPLATE_SETTINGS["permissions"]["allow"])      # what stack none renders
+TEMPLATE_ENV = list(_TEMPLATE_SETTINGS["env"])                          # what stacks python and node render
+# One rule for each command the loop needs; each is also a template allow entry.
+LOOP_RULES = ["Bash(git add:*)", "Bash(git commit:*)", "Bash(git push:*)", "Bash(git fetch:*)",
+              "Bash(git worktree:*)", "Bash(gh issue:*)", "Bash(gh pr:*)", "Bash(gh api:*)",
+              "Bash(harness-*:*)", "Bash(scripts/verify.sh)"]
+# Rules are Bash command prefixes at word boundaries: a rule that covers a loop command, or sits inside
+# one, blocks the loop.
+BROADER_RULES = ["Bash", "Bash(*)", "Bash(git:*)", "Bash(gh:*)"]
+NARROWER_RULES = ["Bash(git commit -m:*)", "Bash(git push --force:*)", "Bash(git push origin main)",
+                  "Bash(git worktree add:*)", "Bash(gh pr create:*)", "Bash(harness-work:*)"]
+# Share a prefix or a substring with a loop command without being one; non-Bash rules are not commands.
+NEAR_MISSES = ["Bash(git address-book:*)", "Bash(git committer:*)", "Bash(git pushd:*)",
+               "Bash(npm run verify-docs:*)", "Bash(my-gh-pr-tool:*)", "Bash(npm run harness-docs:*)",
+               "Read(./secrets/**)", "Read(./git commit notes/**)", "WebFetch", "Edit(./src/**)"]
+
+# Generated cases: the loop commands as words, pools to extend them with, and words that sit next to them.
+# No pool word is a kind word (ask, deny, allow, env), so a warn line's kind stays unambiguous.
+LOOP_COMMANDS = [["git", "add"], ["git", "commit"], ["git", "push"], ["git", "fetch"], ["git", "worktree"],
+                 ["gh", "issue"], ["gh", "pr"], ["gh", "api"], ["scripts/verify.sh"]]
+SUFFIX_POOL = ["-m", "--amend", "--force", "--no-verify", "origin", "main", "feature/x", "t/7-fix", "-u", "--all",
+               "HEAD~1", "src/app.py", ".", "-q", "--dry-run", "repos/x/y", "create", "view", "list", "42",
+               "--json", "number,title", "-b", "../wt", "--title", "Fix", "-p", "prune", "remove", "upstream",
+               "-v", "docs/a.md", "--state", "open", "-F", "body.md", "--fast", "tests/unit"]
+APPENDED = ["x", "s", "er", "-all", "-tool", "2", "_old", "d"]
+SIBLINGS = {"git": ["status", "diff", "log", "show", "blame", "tag", "stash", "config", "clone", "init",
+                    "rev-parse", "describe", "shortlog", "grep", "notes", "bisect"],
+            "gh": ["repo", "run", "release", "workflow", "gist", "search", "secret", "browse", "codespace", "cache"],
+            "": ["scripts/lint.sh", "scripts/verify-docs.sh", "scripts/deploy.sh"]}
+HARNESS_TOOLS = ["board", "work", "pr", "red", "scaffold", "worklog", "new-tool", "zz"]
+FIRST_ARGS = ["-x", "--collect-only", "run", "lint", "--slow", "-c", "install", "clean", "build", "fmt"]
+
+
+def _bash(words, star):
+    return f"Bash({' '.join(words)}{':*' if star else ''})"
+
+
+def _words(rule):
+    """The command words of a Bash(...) rule, without its trailing :*."""
+    inner = rule[len("Bash("):-1]
+    return (inner[:-2] if inner.endswith(":*") else inner).split()
+
+
+def _unique(rules):
+    return list(dict.fromkeys(rules))
+
+
+def blocking_rules(rng, words):
+    """Rules that stop the command `words`: it exactly and as a prefix, every shorter prefix of it, and it
+    extended by random suffixes, each with and without :*."""
+    rules = [_bash(words, False), _bash(words, True)] + [_bash(words[:i], True) for i in range(1, len(words))]
+    for _ in range(3):
+        tail = rng.sample(SUFFIX_POOL, rng.randint(1, 3))
+        rules += [_bash(words + tail, False), _bash(words + tail, True)]
+    return _unique(rules)
+
+
+def near_miss_rules(rng, words):
+    """Rules next to the command `words` that do not stop it: its last word with letters appended, sibling
+    subcommands, the words after another program, and non-Bash rules naming it."""
+    head, last = words[:-1], words[-1]
+    rules = []
+    for extra in rng.sample(APPENDED, 3):
+        rules += [_bash(head + [last + extra], True), _bash(head + [last + extra, rng.choice(SUFFIX_POOL)], False)]
+    rules += [_bash(head + [other], True) for other in rng.sample(SIBLINGS[" ".join(head)], 3)]
+    rules += [_bash(["echo"] + words, True), _bash(["x" + words[0]] + words[1:], True),
+              f"Read(./{last}/**)", f"Write(./notes/{last}.md)"]
+    return _unique(rules)
+
+
+def harness_rules(rng):
+    """(blocking, near misses) for the harness-* tools."""
+    blocking, misses = ["Bash(harness-*:*)"], ["Bash(harness:*)"]
+    for tool in rng.sample(HARNESS_TOOLS, 3):
+        blocking += blocking_rules(rng, [f"harness-{tool}"])
+        misses += [_bash(["harness", tool], True), _bash([f"harnessx-{tool}"], True),
+                   _bash([f"xharness-{tool}"], True), _bash([f"my-harness-{tool}"], True),
+                   _bash(["echo", f"harness-{tool}"], True), f"Read(./harness-{tool}/**)"]
+    return _unique(blocking), _unique(misses)
+
+
+def verify_rules(rng, verify):
+    """(blocking, near misses) for a verify command: exact, as a prefix, every shorter prefix down to the
+    program alone, extended with more arguments; and the same program with another first argument or a
+    longer first word, another program, and the command after another program."""
+    words = verify.split()
+    tail = rng.sample(SUFFIX_POOL, 2)
+    blocking = _unique([_bash(words, False), _bash(words, True), _bash(words[:1], True)]
+                       + [_bash(words[:i], True) for i in range(2, len(words))]
+                       + [_bash(words + tail[:1], False), _bash(words + tail, True)])
+    first = rng.choice([a for a in FIRST_ARGS if a != words[1]])
+    misses = [_bash([words[0], first], True), _bash([words[0], first] + words[2:], False),
+              _bash([words[0], words[1] + "x"], True), _bash([words[0] + "x"], True), _bash(["echo"] + words, True)]
+    return blocking, _unique(misses)
+
+
+class KeptSettings(ScaffoldTest):
+    """A kept .claude/settings.json is never edited, but init says what in it stops a dispatched run
+    (a headless run cannot answer an ask): every ask or deny rule that covers or overlaps a command the
+    loop needs, every allow entry of the stack's rendered template that no allow rule covers, every env
+    key of that template that is absent. Each is one line starting `warn:` that names the rule, entry or
+    key verbatim and says its kind (ask, deny, allow, env). A file that cannot be read as settings gets
+    one warn line."""
+
+    def reference(self, stack, verify=None):
+        """(allow list, env) of the settings.json the scaffold itself renders for this stack and verify."""
+        cache = self.__dict__.setdefault("_reference", {})
+        if (stack, verify) not in cache:
+            root = os.path.join(self.tmp, f"reference-{len(cache)}")
+            self.ok("init", root, "--name", "ref", "--stack", stack, *(["--verify", verify] if verify else []))
+            data = self.settings(root)
+            cache[(stack, verify)] = (list(data["permissions"]["allow"]), dict(data["env"]))
+        return cache[(stack, verify)]
+
+    def kept(self, name, stack="none", verify=None, ask=(), deny=(), allow=None, env=None, text=None, raw=None):
+        """A folder holding the project's own settings.json (by default the stack's complete one, plus
+        the asks and denies given); returns (root, the file's bytes)."""
+        ref_allow, ref_env = self.reference(stack, verify)
+        data = {"permissions": {"allow": list(ref_allow) if allow is None else list(allow)},
+                "env": dict(ref_env) if env is None else dict(env)}
+        if ask:
+            data["permissions"]["ask"] = list(ask)
+        if deny:
+            data["permissions"]["deny"] = list(deny)
+        root = self.mk(name)
+        path = os.path.join(root, ".claude", "settings.json")
+        self.write(path, text if text is not None else json.dumps(data, indent=2) + "\n")
+        if raw is not None:                          # bytes that need not be UTF-8
+            with open(path, "wb") as fh:
+                fh.write(raw)
+        with open(path, "rb") as fh:
+            return root, fh.read()
+
+    def prepare(self, root, path, mode, stack, verify):
+        """Put the folder on one of init's paths: fresh (no repository), unborn (a repository without
+        commits), adopt (a repository with commits and an origin) or again (a scaffolded project)."""
+        if path == "unborn":
+            self.git(root, "init", "-q", "-b", "main")
+        elif path == "adopt":
+            self.git(root, "init", "-q", "-b", "main")
+            self.write(os.path.join(root, "README.md"), "# kept\n")
+            self.git(root, "add", "-A")
+            self.git(root, "commit", "-q", "-m", "First")
+            self.git(root, "remote", "add", "origin", self.bare(f"origin-{os.path.basename(root)}.git"))
+            self.git(root, "push", "-q", "-u", "origin", "main")
+            if mode == "real":
+                branch = "t/7-adopt-the-harness-scaffold"
+                worktree = os.path.join(root, ".claude", "worktrees", "t-7-adopt-the-harness-scaffold")
+                self.git(root, "worktree", "add", "-q", worktree, "-b", branch, "origin/main")
+                self.stub("harness-board", {"task": "#7 https://github.com/ryan/kept/issues/7\n"})
+                self.stub("harness-work", {"start": json.dumps({"number": 7, "branch": branch, "worktree": worktree,
+                                                                "tier": "sonnet", "context": "# 7"})})
+                self.stub("harness-pr", {"open": json.dumps({"number": 12, "url": "https://x/pull/12"}),
+                                         "ready": "PR #12 ready for review\n"})
+        elif path == "again":
+            self.ok("init", root, "--name", "kept", "--stack", stack, *(["--verify", verify] if verify else []))
+            self.stub("harness-board")
+
+    def both_runs(self, name, stack="none", verify=None, path="fresh", **kw):
+        """Yield (mode, process) for the dry run and the real run, each over its own copy of the same kept
+        file, checking that the file is untouched and still reported as kept."""
+        for mode in ("dry-run", "real"):
+            root, before = self.kept(f"{name}-{mode}", stack, verify, **kw)
+            self.prepare(root, path, mode, stack, verify)
+            args = ["init", root, "--name", "kept", "--stack", stack] + (["--verify", verify] if verify else [])
+            p = self.ok(*args, *(["--dry-run"] if mode == "dry-run" else []))
+            with open(os.path.join(root, ".claude", "settings.json"), "rb") as fh:
+                self.assertEqual(fh.read(), before, f"{mode}: the kept file changed")
+            self.assertTrue(any(ln in ("kept .claude/settings.json", "would keep .claude/settings.json")
+                                for ln in self.lines(p)), p.stdout)
+            yield mode, p
+
+    def warns(self, p):
+        return [ln for ln in (p.stdout + p.stderr).splitlines() if ln.startswith("warn:")]
+
+    def assertWarns(self, mode, p, expected):
+        """Exactly one warn line per (needle, kind) in `expected`, no others; each line names its needle
+        verbatim and carries its kind as a word."""
+        warns = self.warns(p)
+        self.assertEqual(len(warns), len(expected), f"{mode}: {warns}\n{p.stdout}")
+        for needle, kind in expected:
+            lines = [w for w in warns if needle in w]
+            self.assertEqual(len(lines), 1, f"{mode} {needle!r}: {warns}")
+            self.assertRegex(lines[0], rf"\b{kind}\b")
+            opposite = {"ask": "deny", "deny": "ask"}.get(kind)
+            if opposite:
+                self.assertNotRegex(lines[0], rf"\b{opposite}\b")
+
+    # ---------------------------------------------------------------- blocking asks and denies
+    def test_asks_that_stop_a_dispatched_run_are_reported(self):
+        n = 0
+        for kind in ("ask", "deny"):
+            for rule in LOOP_RULES + BROADER_RULES + NARROWER_RULES:
+                n += 1
+                with self.subTest(rule=rule, kind=kind):
+                    for mode, p in self.both_runs(f"block{n}", **{kind: [rule]}):
+                        self.assertWarns(mode, p, [(rule, kind)])
+            for rule in NEAR_MISSES:
+                n += 1
+                with self.subTest(near_miss=rule, kind=kind):
+                    for mode, p in self.both_runs(f"miss{n}", **{kind: [rule]}):
+                        self.assertWarns(mode, p, [])
+
+        # several offenders at once: one line each, each naming only its own rule and its own kind
+        ask = ["Bash(git commit:*)", "Bash(git push --force:*)", "Bash(harness-*:*)", "Read(./notes/**)"]
+        deny = ["Bash(gh pr:*)", "Bash(git add:*)", "Bash(my-gh-pr-tool:*)"]
+        expected = [(r, "ask") for r in ask[:3]] + [(r, "deny") for r in deny[:2]]
+        with self.subTest(kept="many"):
+            for mode, p in self.both_runs("many", ask=ask, deny=deny):
+                self.assertWarns(mode, p, expected)
+
+        # the ticket's example: an ask on git commit and no harness-* allow is exactly two warnings
+        allow = [r for r in TEMPLATE_ALLOW if r != "Bash(harness-*:*)"]
+        with self.subTest(kept="jotform"):
+            for mode, p in self.both_runs("jotform", ask=["Bash(git commit:*)"], allow=allow):
+                self.assertWarns(mode, p, [("Bash(git commit:*)", "ask"), ("Bash(harness-*:*)", "allow")])
+
+        # the verify command is the project's own (the rendered CLAUDE_VERIFY_CMD), not a fixed one
+        table = [("make check", ["Bash(make check:*)", "Bash(make check)", "Bash(make:*)"],
+                  ["Bash(make checkout:*)", "Bash(tox:*)"]),
+                 ("tox -q", ["Bash(tox -q)", "Bash(tox:*)"], ["Bash(make check:*)", "Bash(make:*)"])]
+        for verify, blocking, harmless in table:
+            for kind in ("ask", "deny"):
+                for rule in blocking + harmless:
+                    n += 1
+                    with self.subTest(verify=verify, rule=rule, kind=kind):
+                        for mode, p in self.both_runs(f"verify{n}", "python", verify, **{kind: [rule]}):
+                            self.assertWarns(mode, p, [(rule, kind)] if rule in blocking else [])
+
+        # generated: for every loop command, rules built from it with random suffixes, with and without :*,
+        # and every shorter prefix of it all block; near misses mixed into the same file do not. One file
+        # per command and kind: N blocking rules give exactly N warn lines.
+        rng = random.Random(31)
+        groups = [(" ".join(words), blocking_rules(rng, words), near_miss_rules(rng, words))
+                  for words in LOOP_COMMANDS]
+        groups.append(("harness-*",) + harness_rules(rng))
+        # the cheats' exact cases ride along with the generated ones
+        groups.append(("examples", ["Bash(git commit --amend:*)", "Bash(git push origin feature/x)",
+                                    "Bash(git fetch origin:*)", "Bash(gh issue create:*)", "Bash(gh api repos/x/y:*)",
+                                    "Bash(harness-board show:*)", "Bash(git commit)", "Bash(*)"],
+                       ["Bash(git status:*)", "Bash(gh repo:*)", "Bash(git commitx:*)", "Bash(harness:*)",
+                        "Bash(git push-all:*)"]))
+        for label, blocking, misses in groups:
+            self.assertFalse(set(blocking) & set(misses), label)
+            for kind in ("ask", "deny"):
+                n += 1
+                rules = list(blocking + misses)
+                rng.shuffle(rules)
+                with self.subTest(generated=label, kind=kind, blocking=blocking, misses=misses):
+                    for mode, p in self.both_runs(f"gen{n}", **{kind: rules}):
+                        self.assertWarns(mode, p, [(r, kind) for r in blocking])
+
+        # generated: the verify command varies; its exact form, its :* form, the program alone with :*
+        # (broader) and the command with more arguments (narrower) all block; the same program with another
+        # first argument does not
+        verifies = [("pytest -q", "python"), ("npm test", "node"), ("./ci/run.sh --fast", "python"),
+                    ("python3 -m unittest discover -s tests", "python")]
+        for _ in range(2):
+            program = rng.choice(["make", "tox", "just", "bin/check", "./scripts/ci.sh", "cargo", "nox", "rake"])
+            verifies.append((" ".join([program] + rng.sample(["check", "lint", "ci", "py311", "--all", "quick"],
+                                                              rng.randint(1, 2))), "python"))
+        for verify, stack in verifies:
+            self.assertEqual(self.reference(stack, verify)[1]["CLAUDE_VERIFY_CMD"], verify)
+            blocking, misses = verify_rules(rng, verify)
+            for kind in ("ask", "deny"):
+                n += 1
+                rules = blocking + misses
+                rng.shuffle(rules)
+                with self.subTest(verify=verify, kind=kind, blocking=blocking, misses=misses):
+                    for mode, p in self.both_runs(f"genverify{n}", stack, verify, **{kind: rules}):
+                        self.assertWarns(mode, p, [(r, kind) for r in blocking])
+
+        # stack none renders CLAUDE_VERIFY_CMD as scripts/verify.sh even with --verify: that is the command
+        # a run asks for, and the --verify text (which verify.sh runs) is not
+        self.assertEqual(self.reference("none", "make check")[1]["CLAUDE_VERIFY_CMD"], "scripts/verify.sh")
+        with self.subTest(verify="make check", stack="none"):
+            for mode, p in self.both_runs("verify-none", "none", "make check",
+                                          ask=["Bash(make check:*)", "Bash(make:*)", "Bash(scripts/verify.sh)"]):
+                self.assertWarns(mode, p, [("Bash(scripts/verify.sh)", "ask")])
+
+    # ---------------------------------------------------------------- missing allows and env keys
+    def test_missing_template_allows_and_env_keys_are_reported(self):
+        # each template allow entry missing on its own: one warning naming exactly it
+        for rule in TEMPLATE_ALLOW:
+            with self.subTest(missing_allow=rule):
+                for mode, p in self.both_runs("allow", allow=[r for r in TEMPLATE_ALLOW if r != rule]):
+                    self.assertWarns(mode, p, [(rule, "allow")])
+
+        # no allow entries at all, and no permissions section at all: every entry is named
+        for label, kw in (("empty", {"allow": []}), ("no-permissions", {"text": '{"env": {}}\n'})):
+            with self.subTest(kept=label):
+                for mode, p in self.both_runs(label, **kw):
+                    self.assertWarns(mode, p, [(r, "allow") for r in TEMPLATE_ALLOW]
+                                     + ([("CLAUDE_VERIFY_CMD", "env")] if label == "no-permissions" else []))
+
+        # an entry counts as present when an allow rule covers it: the same rule, a broader one, bare Bash;
+        # a narrower rule, another command, a shorter word, or a non-Bash rule does not
+        not_git = [r for r in TEMPLATE_ALLOW if not r.startswith("Bash(git ")]
+        not_gh = [r for r in TEMPLATE_ALLOW if not r.startswith("Bash(gh ")]
+        without = lambda gone: [r for r in TEMPLATE_ALLOW if r != gone]       # noqa: E731
+        table = [
+            (["Bash"], []),
+            (["Bash(git:*)", "Bash(gh:*)", "Bash(harness-*:*)", "Bash(scripts/verify.sh)"], []),
+            (without("Bash(harness-*:*)") + ["Bash(harness-scaffold:*)"], ["Bash(harness-*:*)"]),
+            (without("Bash(git commit:*)") + ["Bash(git commit -m:*)"], ["Bash(git commit:*)"]),
+            (without("Bash(gh api:*)") + ["Bash(gh:*)"], []),
+            (["Bash(git:*)"], not_git),
+            (["Bash(gh:*)"], not_gh),
+            (["Bash(g:*)", "Bash(gi:*)", "Bash(ghx:*)"], TEMPLATE_ALLOW),
+            (["Read(./**)", "WebFetch", "Edit(./git commit/**)"], TEMPLATE_ALLOW),
+        ]
+        for i, (allow, missing) in enumerate(table):
+            with self.subTest(allow=allow):
+                for mode, p in self.both_runs(f"cover{i}", allow=allow):
+                    self.assertWarns(mode, p, [(r, "allow") for r in missing])
+
+        # the reference list is the template rendered for the stack, its own extras included
+        for stack in ("python", "node"):
+            ref_allow, _ = self.reference(stack)
+            extras = [r for r in ref_allow if r not in TEMPLATE_ALLOW]
+            self.assertTrue(extras, f"stack {stack} renders no extra allow entries")
+            for extra in extras:
+                with self.subTest(stack=stack, missing_extra=extra):
+                    for mode, p in self.both_runs(f"extra-{stack}", stack, allow=[r for r in ref_allow if r != extra]):
+                        self.assertWarns(mode, p, [(extra, "allow")])
+            with self.subTest(stack=stack, template_only=True):
+                for mode, p in self.both_runs(f"template-{stack}", stack, allow=TEMPLATE_ALLOW):
+                    self.assertWarns(mode, p, [(r, "allow") for r in extras])
+        python_allow, _ = self.reference("python")
+        node_extras = [r for r in self.reference("node")[0] if r not in TEMPLATE_ALLOW]
+        with self.subTest(cross_stack=True):         # another stack's extras are neither needed nor enough
+            for mode, p in self.both_runs("cross", "node", allow=python_allow):
+                self.assertWarns(mode, p, [(r, "allow") for r in node_extras])
+            for mode, p in self.both_runs("cross-none", "none", allow=python_allow):
+                self.assertWarns(mode, p, [])
+
+        # Bash(*) covers every entry of every stack; so do one broad rule per program
+        for stack in ("none", "python", "node"):
+            ref_allow, _ = self.reference(stack)
+            programs = _unique(_bash(_words(r)[:1], True) for r in ref_allow if r != "Bash(harness-*:*)")
+            for label, allow in (("star", ["Bash(*)"]), ("programs", programs + ["Bash(harness-*:*)"])):
+                with self.subTest(stack=stack, allow=allow):
+                    for mode, p in self.both_runs(f"broad-{label}-{stack}", stack, allow=allow):
+                        self.assertWarns(mode, p, [])
+
+        # a broader rule of more than one word covers the extras it prefixes (derived from the rendered
+        # extras, e.g. Bash(uv run:*) for Bash(uv run pytest:*)), and only those
+        multiword = 0
+        for stack in ("python", "node"):
+            ref_allow, _ = self.reference(stack)
+            extras = [r for r in ref_allow if r not in TEMPLATE_ALLOW]
+            prefixes = _unique(tuple(_words(e)[:k]) for e in extras for k in range(1, len(_words(e))))
+            for i, prefix in enumerate(prefixes):
+                covered = [e for e in extras if tuple(_words(e)[:len(prefix)]) == prefix]
+                broad = _bash(list(prefix), True)
+                multiword += len(prefix) > 1
+                allow = [r for r in ref_allow if r not in covered] + [broad]
+                with self.subTest(stack=stack, broader=broad, covers=covered):
+                    for mode, p in self.both_runs(f"prefix-{stack}{i}", stack, allow=allow):
+                        self.assertWarns(mode, p, [])
+                if len(prefix) > 1:          # the same broad rule alone leaves the other extras missing
+                    allow = [r for r in ref_allow if r not in extras] + [broad]
+                    with self.subTest(stack=stack, broader=broad, alone=True):
+                        for mode, p in self.both_runs(f"prefix-alone-{stack}{i}", stack, allow=allow):
+                            self.assertWarns(mode, p, [(e, "allow") for e in extras if e not in covered])
+            # the exact command, a narrower rule, a sibling and a longer word cover nothing
+            decoys = []
+            for e in extras:
+                w = _words(e)
+                decoys += [_bash(w, False), _bash(w + ["-q"], True), _bash(w[:-1] + [w[-1] + "x"], True),
+                           _bash(w[:-1] + ["other"], True), _bash(["x" + w[0]], True)]
+                if len(w) > 2:
+                    decoys += [_bash(w[:1] + [w[1] + "x"], True), _bash(w[:1] + ["other"], True)]
+            decoys = [d for d in _unique(decoys) if d not in ref_allow]
+            with self.subTest(stack=stack, decoys=decoys):
+                for mode, p in self.both_runs(f"decoys-{stack}", stack,
+                                              allow=[r for r in ref_allow if r not in extras] + decoys):
+                    self.assertWarns(mode, p, [(e, "allow") for e in extras])
+        self.assertTrue(multiword, "no extra has a prefix of two words or more")
+
+        # the same for the template's own entries: their exact command, a narrower rule or a longer word
+        # does not cover them
+        two_word = [r for r in TEMPLATE_ALLOW if r.startswith(("Bash(git ", "Bash(gh "))]
+        decoys = []
+        for r in two_word:
+            w = _words(r)
+            decoys += [_bash(w, False), _bash(w + ["origin"], True), _bash(w[:-1] + [w[-1] + "s"], True)]
+        with self.subTest(template_decoys=decoys):
+            allow = [r for r in TEMPLATE_ALLOW if r not in two_word] + decoys
+            for mode, p in self.both_runs("template-decoys", allow=allow):
+                self.assertWarns(mode, p, [(r, "allow") for r in two_word])
+
+        # env keys the template sets (stacks python and node set both), missing one at a time, both, or
+        # with no env section at all
+        values = self.reference("python")[1]
+        self.assertEqual(sorted(values), sorted(TEMPLATE_ENV))
+        for missing in ([TEMPLATE_ENV[0]], [TEMPLATE_ENV[1]], list(TEMPLATE_ENV)):
+            with self.subTest(missing_env=missing):
+                env = {k: v for k, v in values.items() if k not in missing}
+                for mode, p in self.both_runs("env", "python", env=env):
+                    self.assertWarns(mode, p, [(k, "env") for k in missing])
+        with self.subTest(no_env_section=True):
+            text = json.dumps({"permissions": {"allow": self.reference("python")[0]}}, indent=2) + "\n"
+            for mode, p in self.both_runs("noenv", "python", text=text):
+                self.assertWarns(mode, p, [(k, "env") for k in TEMPLATE_ENV])
+
+        # stack none does not set HARNESS_TEST_CMD, so its absence is not reported there
+        with self.subTest(stack="none"):
+            for mode, p in self.both_runs("none-env", "none", env={}):
+                self.assertWarns(mode, p, [("CLAUDE_VERIFY_CMD", "env")])
+
+        # allow, env and ask problems in one file are all reported
+        allow = [r for r in python_allow if r != "Bash(gh pr:*)"]
+        for mode, p in self.both_runs("all", "python", ask=["Bash(git push:*)"], allow=allow, env={}):
+            self.assertWarns(mode, p, [("Bash(git push:*)", "ask"), ("Bash(gh pr:*)", "allow")]
+                             + [(k, "env") for k in TEMPLATE_ENV])
+
+    # ---------------------------------------------------------------- nothing to report
+    def test_a_complete_kept_file_reports_nothing_and_is_unchanged(self):
+        python_allow, python_env = self.reference("python")
+        # the stack's own rendered entries; other people's asks and denies, formatted by hand; allow
+        # rules broader than the entries
+        odd = ('{"permissions":{"allow":%s,"ask":["Bash(rm -rf:*)"],"deny":["Bash(curl:*)"]},\n'
+               '    "env":{"CLAUDE_VERIFY_CMD":"make check","HARNESS_TEST_CMD":"make test FILES={files}"}}'
+               % json.dumps(python_allow + ["Bash(make check:*)"]))
+        broad = ["Bash(git:*)", "Bash(gh:*)", "Bash(harness-*:*)", "Bash(scripts/verify.sh)", "Bash(uv:*)",
+                 "Bash(python3:*)"]
+        variants = [("none", "none", {}), ("python", "python", {}), ("node", "node", {}),
+                    ("odd", "python", {"text": odd}), ("bare-bash", "python", {"allow": ["Bash"]}),
+                    ("broad", "python", {"allow": broad}),
+                    ("noise", "python", {"ask": NEAR_MISSES, "deny": NEAR_MISSES})]
+        # generated near misses of every loop command as asks and denies; multi-word broader allows
+        rng = random.Random(3131)
+        noise = _unique([r for words in LOOP_COMMANDS for r in near_miss_rules(rng, words)] + harness_rules(rng)[1])
+        multiword = [r for r in python_allow if r not in ("Bash(uv run pytest:*)", "Bash(uv run ruff:*)",
+                                                          "Bash(python3 -m pytest:*)")]
+        variants += [("generated-noise", "none", {"ask": noise[::2], "deny": noise[1::2]}),
+                     ("star", "node", {"allow": ["Bash(*)"]}),
+                     ("multiword", "python", {"allow": multiword + ["Bash(uv run:*)", "Bash(python3 -m:*)"]})]
+        for label, stack, kw in variants:
+            with self.subTest(kept=label):
+                for mode, p in self.both_runs(f"complete-{label}", stack=stack, **kw):
+                    self.assertWarns(mode, p, [])
+
+        # control: the same complete file with one blocking ask is no longer silent, so "nothing" above
+        # means the check ran and found nothing
+        with self.subTest(kept="control"):
+            for mode, p in self.both_runs("control", stack="python", ask=["Bash(git commit:*)"]):
+                self.assertWarns(mode, p, [("Bash(git commit:*)", "ask")])
+
+        # --force still overwrites the kept file with the template, and there is nothing left to warn about
+        root, _ = self.kept("forced", "python", ask=["Bash(git commit:*)"], allow=[], env={})
+        p = self.ok("init", root, "--name", "forced", "--stack", "python", "--force")
+        self.assertIn("updated .claude/settings.json", self.lines(p))
+        self.assertEqual(self.warns(p), [], p.stdout)
+        settings = self.settings(root)
+        self.assertEqual(settings["env"], python_env)
+        self.assertEqual(settings["permissions"]["allow"], python_allow)
+        self.assertNotIn("ask", settings["permissions"])
+
+    # ---------------------------------------------------------------- a file that is not settings
+    def test_a_kept_file_that_is_not_usable_settings_gets_one_warning(self):
+        allow = list(TEMPLATE_ALLOW)
+        env = {"CLAUDE_VERIFY_CMD": "scripts/verify.sh"}
+        texts = ["{not json", "", "   \n", '{"permissions": ', "<<<<<<< HEAD\n{}\n=======\n{}\n>>>>>>> x\n",
+                 "just words\n"]
+        shapes = [{"permissions": None, "env": env},
+                  {"permissions": {"allow": allow, "ask": "Bash(git commit:*)"}, "env": env},
+                  {"permissions": {"allow": allow, "deny": {"Bash(git push:*)": True}}, "env": env},
+                  {"permissions": {"allow": "Bash"}, "env": env},
+                  {"permissions": {"allow": allow, "ask": [42, None, {"rule": "x"}]}, "env": env},
+                  {"permissions": {"allow": allow + [7]}, "env": env},
+                  # the top level is not an object; a section of the wrong type
+                  [], ["Bash(git commit:*)"], "settings", 42, None, True,
+                  {"env": []}, {"permissions": []}, {"permissions": {"allow": allow}, "env": ["CLAUDE_VERIFY_CMD"]},
+                  {"permissions": {"allow": allow}, "env": "CLAUDE_VERIFY_CMD=scripts/verify.sh"}]
+        cases = [("text", {"text": t}) for t in texts] + [("shape", {"text": json.dumps(s, indent=2) + "\n"})
+                                                          for s in shapes]
+        # bytes that are not UTF-8
+        cases += [("bytes", {"raw": b'{"env": {"CLAUDE_VERIFY_CMD": "caf\xe9"}}\n'}),
+                  ("bytes", {"raw": b"\xff\x80\x00{}"}),
+                  ("bytes", {"raw": json.dumps({"permissions": {"allow": allow}, "env": env}).encode() + b"\xc3"})]
+        for i, (label, kw) in enumerate(cases):
+            with self.subTest(label=label, kept=kw):
+                for mode, p in self.both_runs(f"unusable{i}", **kw):
+                    self.assertEqual(len(self.warns(p)), 1, f"{mode}: {self.warns(p)}\n{p.stdout}")
+
+    # ---------------------------------------------------------------- every init path, no duplicates
+    def test_each_warning_appears_once_on_every_init_path(self):
+        allow = [r for r in self.reference("python")[0] if r != "Bash(harness-*:*)"]
+        env = {k: v for k, v in self.reference("python")[1].items() if k != "HARNESS_TEST_CMD"}
+        expected = [("Bash(git commit:*)", "ask"), ("Bash(gh api:*)", "deny"), ("Bash(harness-*:*)", "allow"),
+                    ("HARNESS_TEST_CMD", "env")]
+        for path in ("fresh", "unborn", "adopt", "again"):
+            with self.subTest(path=path):
+                for mode, p in self.both_runs(f"path-{path}", "python", path=path, ask=["Bash(git commit:*)"],
+                                              deny=["Bash(gh api:*)"], allow=allow, env=env):
+                    self.assertWarns(mode, p, expected)
 
 
 # =========================================================================== commit paths
