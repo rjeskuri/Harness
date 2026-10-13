@@ -772,17 +772,78 @@ def land_view(**over):
     return view
 
 
+HARNESS_MARK = "<!-- harness -->"     # the last line of every comment harness-board posts
+RESOLUTION = "**Resolution**"
+
+
+def pr_body_text(fx):
+    """A PR body as `harness-pr open` renders it from templates/pr_body.md, for the fixture `fx`."""
+    return "\n".join([
+        "Closes #12", "", "## Summary", fx["summary"], "",
+        "## Definition of done", *fx["dod"], "",
+        "## Tests", "- `tests/test_widget.py::test_frob`: frobs twice", "", "Test files run: `tests/test_widget.py`",
+        "", f"Red run before implementation ({fx['red_kind']}, exit {fx['red_exit']}):",
+        "```", *fx["red_tail"], "```", "",
+        "Verify:", "```", *fx["verify"], "```", "",
+        "## Review", "2 findings: 0 high, 1 medium, 1 low.", "", "## Risks", "None noted."])
+
+
+def pr_data(fx):
+    """Everything `gh pr view P --json ...` can say about the fixture's PR after the merge (a superset: the
+    fake answers any field list with it)."""
+    url = f"https://github.com/o/r/pull/{fx['pr']}"
+    return {"number": fx["pr"], "title": "Add the widget (#12)", "url": url, "body": pr_body_text(fx),
+            "files": [{"path": p, "additions": 3 + i, "deletions": i} for i, p in enumerate(fx["files"])],
+            "mergeCommit": {"oid": fx["sha"]}, "headRefName": BRANCH, "baseRefName": "main",
+            "closingIssuesReferences": [{"number": 12}]}
+
+
+TICKET_12_BODY = ("## Request\nAdd a widget that frobs.\n\n## Definition of done\n- [ ] The widget frobs twice\n\n"
+                  "## Tests that must pass\n- `tests/test_widget.py::test_frob`: frobs twice\n")
+
+# Two landings that differ in every part the Resolution copies: PR, squash sha, summary, files, the checklist,
+# the red-run kind and the verify result. Nothing in one appears in the other.
+FIXTURE_A = {
+    "pr": 34, "sha": SHA,
+    "summary": "The widget frobs twice now, and empty input frobs once.",
+    "files": ["widget.py", "tests/test_widget.py", "docs/widget.md"],
+    "dod": ["- [x] The widget frobs twice", "- [x] The docs mention it"],
+    "red_kind": "assertion", "red_exit": 1,
+    "red_tail": ["E   frob() returned 1, wanted 2", "1 failed in 0.12s"],
+    "verify": ["verify step: lint clean", "Ran 41 tests in 2.315s", "", "OK (skipped=1)"],
+}
+FIXTURE_B = {
+    "pr": 57, "sha": "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432",
+    "summary": "Gizmo parsing moves into lib/gizmo with a strict tokenizer.",
+    "files": ["lib/gizmo/__init__.py", "lib/gizmo/tokenizer.py", "bin/gizmo-cli", "tests/test_tokenizer.py",
+              "CHANGELOG.md"],
+    "dod": ["- [x] Tokens round-trip through the parser", "- [ ] The CLI prints a usage line on bad input",
+            "- [x] Changelog entry"],
+    "red_kind": "import", "red_exit": 2,
+    "red_tail": ["ModuleNotFoundError: No module named 'gizmo'"],
+    "verify": ["collected 212 items", "212 passed in 9.80s", "VERIFY PASSED: 212 checks, 0 warnings"],
+}
+
+
 class Land(WorktreeTest):
     def land_calls(self, views=None, issue_state="OPEN", comments=()):
+        """The land conversation; the last entries answer the PR's body and files, the ticket's other fields
+        and a comment posted straight through gh, so the land may read and post the Resolution either way."""
         views = views or [land_view()]
+        issue = {"state": issue_state, "labels": [{"name": "task"}, {"name": "status:in-review"}],
+                 "comments": list(comments)}
         return [{"match": ["pr", "view", "34", "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": SHA}}},
                 {"match": ["pr", "view", "34", "--json", LAND_FIELDS],
                  "responses": [{"stdout_json": v} for v in views]},
                 REPO_VIEW, {"match": ["pr", "merge", "34"], "stdout": ""},
-                {"match": ["issue", "view", "12", "--json", "state,labels,comments"],
-                 "stdout_json": {"state": issue_state, "labels": [{"name": "task"}, {"name": "status:in-review"}],
-                                 "comments": list(comments)}},
-                {"match": ["issue", "edit", "12"], "stdout": ""}]
+                {"match": ["issue", "view", "12", "--json", "state,labels,comments"], "stdout_json": issue},
+                {"match": ["issue", "edit", "12"], "stdout": ""},
+                {"match": ["pr", "view", "34"], "stdout_json": pr_data(FIXTURE_A)},
+                {"match": ["issue", "view", "12"],
+                 "stdout_json": dict(issue, number=12, title="Add the widget", body=TICKET_12_BODY,
+                                     url="https://github.com/o/r/issues/12")},
+                {"match": ["issue", "comment", "12"], "stdout": "https://github.com/o/r/issues/12#issuecomment-1\n"},
+                {"contains": ["repos/o/r/issues/12/comments"], "stdout_json": []}]
 
     def setUp(self):
         super().setUp()
@@ -944,6 +1005,155 @@ class Land(WorktreeTest):
         self.assertIn("landed comment already there", p.stdout)
         self.assertFalse(os.path.exists(self.wt))
         self.assertFalse(self.branch_exists())
+
+
+class LandResolution(Land):
+    """`land` leaves one `**Resolution**` comment on the ticket. These run the real harness-board (no stubs), so
+    every comment, however it is posted, reaches the fake gh's log."""
+
+    def resolution_calls(self, fx, state="OPEN", issue_state="OPEN", comments=()):
+        pr, sha = str(fx["pr"]), fx["sha"]
+        url = f"https://github.com/o/r/pull/{pr}"
+        issue = {"number": 12, "title": "Add the widget", "url": "https://github.com/o/r/issues/12",
+                 "body": TICKET_12_BODY, "state": issue_state,
+                 "labels": [{"name": "task"}, {"name": "status:in-review"}], "comments": list(comments)}
+        rest = [{"body": c["body"], "user": {"login": c["author"]["login"]}, "created_at": c["createdAt"]}
+                for c in comments]
+        return [{"match": ["pr", "view", pr, "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": sha}}},
+                {"match": ["pr", "view", pr, "--json", LAND_FIELDS],
+                 "stdout_json": land_view(url=url, state=state)},
+                REPO_VIEW,
+                {"match": ["pr", "merge", pr], "stdout": ""},
+                {"match": ["pr", "view", pr], "stdout_json": pr_data(fx)},
+                {"match": ["issue", "view", "12"], "stdout_json": issue},
+                {"match": ["issue", "edit", "12"], "stdout": ""},
+                {"match": ["issue", "close", "12"], "stdout": ""},
+                {"match": ["issue", "comment", "12"], "stdout": "https://github.com/o/r/issues/12#issuecomment-9\n"},
+                {"contains": ["repos/o/r/issues/12/comments", "POST"], "stdout_json": {"id": 9}},
+                {"contains": ["repos/o/r/issues/12/comments"], "stdout_json": rest},
+                {"match": ["issue", "view", "3"],
+                 "stdout_json": {"state": "OPEN", "subIssuesSummary": {"total": 2, "completed": 1}}}]
+
+    def land(self, fx, **scenario):
+        self.scenario(self.resolution_calls(fx, **scenario))
+        return self.ok("land", str(fx["pr"]), "--yes", cwd=self.main, stubs=False)
+
+    def posted(self, number=None):
+        """(index in the gh log, issue number, body) of every comment posted: `gh issue comment N`, `gh issue close
+        N --comment` and `gh api repos/o/r/issues/N/comments` with a body."""
+        out = []
+        for i, call in enumerate(self.gh_calls()):
+            a, body, n = call["argv"], None, None
+            if a[:2] in (["issue", "comment"], ["issue", "close"]) and len(a) > 2:
+                n = a[2]
+                for flag in ("--body", "-b", "--comment", "-c"):
+                    if flag in a[:-1]:
+                        body = a[a.index(flag) + 1]
+                for flag in ("--body-file", "-F"):
+                    if flag in a[:-1]:
+                        path = a[a.index(flag) + 1]
+                        if path == "-":
+                            body = call["stdin"]
+                        elif os.path.exists(path):
+                            with open(path, encoding="utf-8") as fh:
+                                body = fh.read()
+            elif a[:1] == ["api"]:
+                target = next((t for t in a if "/issues/" in t and "/comments" in t), None)
+                if target:
+                    n = target.split("/issues/")[1].split("/")[0]
+                    if "--input" in a and call["stdin"].strip():
+                        body = json.loads(call["stdin"]).get("body")
+                    for j, tok in enumerate(a[:-1]):
+                        if tok in ("-f", "-F", "--field", "--raw-field") and a[j + 1].startswith("body="):
+                            body = a[j + 1][len("body="):]
+            if body is not None and (number is None or n == str(number)):
+                out.append((i, n, body))
+        return out
+
+    def resolutions(self, number=None):
+        return [(i, n, b) for i, n, b in self.posted(number) if b.lstrip().startswith(RESOLUTION)]
+
+    def landed(self, number=None):
+        return [(i, n, b) for i, n, b in self.posted(number) if b.lstrip().startswith("Landed in")]
+
+    def as_comments(self, bodies):
+        return [{"author": {"login": "rjeskuri"}, "body": b, "createdAt": f"2026-10-13T1{k}:00:00Z"}
+                for k, b in enumerate(bodies)]
+
+    def assertResolution(self, body, fx):
+        """The Resolution carries the PR's summary, every changed file, the checklist as landed, the red-run
+        kind and the verify result from the PR body, the PR link and the squash sha, and the harness marker."""
+        self.assertTrue(body.lstrip().startswith(RESOLUTION), body)
+        self.assertEqual(body.rstrip().splitlines()[-1].strip(), HARNESS_MARK, body)
+        self.assertIn(fx["summary"], body)
+        for path in fx["files"]:
+            self.assertIn(path, body, f"changed file {path} missing from the Resolution")
+        for item in fx["dod"]:
+            self.assertIn(item, body, "definition-of-done line missing from the Resolution")
+        self.assertRegex(body, r"(?i)red\b[^\n]*\b" + fx["red_kind"] + r"\b",
+                         "the red-run kind belongs on a line about the red run")
+        last_verify = [line for line in fx["verify"] if line.strip()][-1]
+        self.assertIn(last_verify, body, "the verify result line missing from the Resolution")
+        self.assertIn(f"https://github.com/o/r/pull/{fx['pr']}", body)
+        self.assertIn(fx["sha"][:12], body, "the squash sha missing from the Resolution")
+
+    # ------------------------------------------------------------------ fresh lands
+    def test_land_posts_one_resolution_after_the_merge(self):
+        self.land(FIXTURE_A)
+        found = self.resolutions()
+        self.assertEqual(len(found), 1, f"want one Resolution comment, got {len(found)}: {self.posted()}")
+        index, number, body = found[0]
+        self.assertEqual(number, "12")
+        self.assertResolution(body, FIXTURE_A)
+        for other in FIXTURE_B["files"] + [FIXTURE_B["summary"], FIXTURE_B["sha"][:12]]:
+            self.assertNotIn(other, body)
+        merge = next(i for i, c in enumerate(self.gh_calls()) if c["argv"][:2] == ["pr", "merge"])
+        self.assertGreater(index, merge, "the Resolution is posted after the merge")
+        # the Landed comment is unchanged: one, `Landed in <sha>`, as harness-board posts it
+        landed = self.landed(12)
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed], [f"Landed in {SHA}"])
+
+    def test_land_resolution_follows_the_pr_it_lands(self):
+        """Another PR, another sha, more files, an unchecked box, an import red run; GitHub closed the ticket."""
+        self.land(FIXTURE_B, issue_state="CLOSED")
+        found = self.resolutions()
+        self.assertEqual(len(found), 1, f"want one Resolution comment, got {len(found)}: {self.posted()}")
+        _, number, body = found[0]
+        self.assertEqual(number, "12")
+        self.assertResolution(body, FIXTURE_B)
+        for other in FIXTURE_A["files"][2:] + [FIXTURE_A["summary"], FIXTURE_A["sha"][:12], "OK (skipped=1)"]:
+            self.assertNotIn(other, body)
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in self.landed(12)],
+                         [f"Landed in {FIXTURE_B['sha']}"])
+
+    # ------------------------------------------------------------------ resumed lands
+    def land_then_resume(self, fx, keep):
+        """Land once, then land again on the merged PR with the ticket showing the first run's comments that
+        `keep` selects. Returns (Resolutions of the first run, Resolutions and Landed of the second)."""
+        self.land(fx)
+        first = self.resolutions(12)
+        bodies = [b for _, _, b in self.posted(12) if keep(b)]
+        self.land(fx, state="MERGED", issue_state="CLOSED", comments=self.as_comments(bodies))
+        return first, self.resolutions(), self.landed()
+
+    def test_resumed_land_adds_no_second_resolution(self):
+        first, again, landed = self.land_then_resume(FIXTURE_A, keep=lambda b: True)
+        self.assertEqual(len(first), 1, "the first land posts the Resolution")
+        self.assertEqual(again, [], "a resumed land must not post a second Resolution")
+        self.assertEqual(landed, [], "nor a second Landed comment")
+
+    def test_resumed_land_with_only_the_resolution_posts_the_landed_comment(self):
+        first, again, landed = self.land_then_resume(FIXTURE_B, keep=lambda b: b.lstrip().startswith(RESOLUTION))
+        self.assertEqual(len(first), 1, "the first land posts the Resolution")
+        self.assertEqual(again, [], "the Resolution already there is not repeated")
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed],
+                         [f"Landed in {FIXTURE_B['sha']}"])
+
+    def test_resumed_land_after_the_landed_comment_posts_no_resolution(self):
+        first, again, landed = self.land_then_resume(FIXTURE_A, keep=lambda b: b.lstrip().startswith("Landed in"))
+        self.assertEqual(len(first), 1, "the first land posts the Resolution")
+        self.assertEqual(again, [], "once Landed in is on the ticket the land is recorded; no Resolution")
+        self.assertEqual(landed, [])
 
 
 class LandRefusals(PrTest):

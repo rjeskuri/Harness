@@ -416,8 +416,14 @@ class Show(BoardTest):
         subs = [{"number": 12, "title": "Add the board tool", "state": "open",
                  "labels": [{"name": "task"}, {"name": "status:ready"}, {"name": "size:S"}, {"name": "risk:low"}]},
                 {"number": 13, "title": "Wire it", "state": "closed", "labels": [{"name": "task"}]}]
+        closed = issue(number=13, title="Wire it", labels=("task",), state="CLOSED",       # landed before Resolutions
+                       comments=[comment("rjeskuri", "2026-10-11T09:00:00Z", "Landed in abc123\n\n<!-- harness -->")])
         self.scenario([REPO_VIEW, {"match": ["issue", "view", "3"], "stdout_json": epic},
-                       {"match": ["api", "repos/o/r/issues/3/sub_issues?per_page=100"], "stdout_json": subs}])
+                       {"match": ["api", "repos/o/r/issues/3/sub_issues?per_page=100"], "stdout_json": subs},
+                       {"match": ["issue", "view", "13"], "stdout_json": closed},
+                       {"contains": ["repos/o/r/issues/13/comments"], "stdout_json": [
+                           {"body": "Landed in abc123\n\n<!-- harness -->", "user": {"login": "rjeskuri"},
+                            "created_at": "2026-10-11T09:00:00Z"}]}])
         record = json.loads(self.ok("show", "3").stdout)
         self.assertEqual(record["type"], "epic")
         self.assertEqual(record["goal"], "Ship the board so agents read tickets before they work.")
@@ -426,6 +432,117 @@ class Show(BoardTest):
         md = self.ok("show", "3", "--markdown").stdout
         self.assertIn("## Tasks (1 of 2 closed)", md)
         self.assertIn("- #12 Add the board tool (ready, S, low, tier sonnet)", md)
+
+
+# ======================================================================= show: Resolutions
+def resolution(pr, sha, summary, files, dod, red_kind, verify):
+    """A `**Resolution**` comment as `harness-pr land` posts it: summary, files, checklist, evidence, PR, sha."""
+    return "\n".join(["**Resolution**", "", summary, "", f"Files changed ({len(files)}):",
+                      *[f"- `{f}`" for f in files], "", "Definition of done:", *dod, "",
+                      f"Red run before implementation: {red_kind}.", f"Verify: {verify}",
+                      f"PR: https://github.com/o/r/pull/{pr}", f"Squash commit: {sha}", "", "<!-- harness -->"])
+
+
+def content_lines(body):
+    """The lines a printed Resolution must carry: everything but the heading, the marker and blank lines."""
+    return [line for line in body.splitlines() if line.strip() and line.strip() not in ("**Resolution**",
+                                                                                       "<!-- harness -->")]
+
+
+RES_12 = resolution(34, "abc123def4567890abc123def4567890abc12345",
+                    "The board tool lists unblocked tickets and caches each ticket it shows.",
+                    ["plugins/harness/bin/harness-board", "plugins/harness/tests/test_board.py", "docs/design.md",
+                     "plugins/harness/skills/work/SKILL.md", "plugins/harness/hooks/session_brief.py",
+                     "plugins/harness/templates/task.md", "plugins/harness/templates/epic.md", "user/CLAUDE.md",
+                     "scripts/verify.sh", "README.md", "plugins/harness/agents/planner.md"],
+                    ["- [x] `harness-board ready` lists unblocked tickets", "- [x] Labels exist"],
+                    "assertion", "Ran 88 tests in 3.104s OK")
+RES_14 = resolution(41, "5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f",
+                    "Epic checks close the epic when its last task lands.",
+                    ["plugins/harness/bin/harness-pr", "plugins/harness/tests/test_pr.py"],
+                    ["- [x] The epic closes after its last task", "- [ ] The digest says so"],
+                    "import", "VERIFY PASSED 140 checks")
+RES_13_STALE = resolution(38, "0a0b0c0d0e0f1a1b1c1d1e1f2a2b2c2d2e2f3a3b",
+                          "A first attempt at wiring, reverted when the ticket was reopened.",
+                          ["plugins/harness/bin/harness-wire-old"], ["- [x] Wired once"], "assertion",
+                          "STALE VERIFY LINE")
+
+
+class ShowResolution(BoardTest):
+    def closed_task(self, number, res, chatter=0, title=None):
+        """A closed task: harness comments, the Resolution, `Landed in`, then `chatter` short comments after."""
+        comments = [comment("rjeskuri", "2026-10-10T09:00:00Z", "Started on t/x\n\n<!-- harness -->"),
+                    comment("rjeskuri", "2026-10-10T12:00:00Z", "PR #34 opened\n\n<!-- harness -->"),
+                    comment("rjeskuri", "2026-10-11T09:00:00Z", res),
+                    comment("rjeskuri", "2026-10-11T09:01:00Z", "Landed in abc123\n\n<!-- harness -->")]
+        comments += [comment("pal", f"2026-10-12T{10 + i:02d}:00:00Z", f"later note {i}") for i in range(chatter)]
+        return issue(number=number, title=title or f"Task {number}", state="CLOSED",
+                     labels=("task", "size:M", "risk:low"), comments=comments,
+                     parent={"number": 3, "title": "Board v2", "url": "https://github.com/o/r/issues/3"})
+
+    def comment_calls(self, number, data):
+        """gh answers for a task's comments however show asks: issue view (any fields) or the REST endpoint."""
+        rest = [{"body": c["body"], "user": c["author"], "created_at": c["createdAt"]} for c in data["comments"]]
+        return [{"match": ["issue", "view", str(number)], "stdout_json": data},
+                {"contains": [f"repos/o/r/issues/{number}/comments"], "stdout_json": rest},
+                {"contains": [f"repos/o/r/issues/{number}/comments?per_page=100"], "stdout_json": rest}]
+
+    def test_closed_task_prints_its_whole_resolution(self):
+        """The Resolution is older than the ten newest comments and longer than the 20 lines a comment gets, so
+        only a Resolution section shows it: every line of it, files and sha included."""
+        data = self.closed_task(12, RES_12, chatter=10)
+        self.scenario([{"match": ["issue", "view", "3", "--json", "number,title,body"],
+                        "stdout_json": {"number": 3, "title": "Board v2", "body": EPIC_BODY}}]
+                      + self.comment_calls(12, data))
+        md = self.ok("show", "12", "--markdown").stdout
+        self.assertLessEqual(len(md.splitlines()), 120)
+        for line in content_lines(RES_12):
+            self.assertIn(line, md, f"Resolution line missing from show --markdown: {line!r}")
+        self.assertIn("Resolution", md)
+        self.assertIn("## Definition of done", md.splitlines())         # the ticket's own sections stay
+
+    def test_closed_task_resolution_follows_the_ticket(self):
+        """Another closed task, another Resolution: what is printed is that ticket's comment."""
+        data = self.closed_task(14, RES_14, chatter=10, title="Close epics")
+        self.scenario([{"match": ["issue", "view", "3", "--json", "number,title,body"],
+                        "stdout_json": {"number": 3, "title": "Board v2", "body": EPIC_BODY}}]
+                      + self.comment_calls(14, data))
+        md = self.ok("show", "14", "--markdown").stdout
+        for line in content_lines(RES_14):
+            self.assertIn(line, md)
+        for line in ("caches each ticket it shows", "Ran 88 tests", "abc123def4567890abc123def4567890abc12345"):
+            self.assertNotIn(line, md)
+
+    def test_epic_prints_each_closed_tasks_resolution_under_the_task_list(self):
+        epic = issue(number=3, title="Board v2", labels=("epic", "status:ready"), body=EPIC_BODY)
+        subs = [{"number": 12, "title": "Add the board tool", "state": "closed", "labels": [{"name": "task"}]},
+                {"number": 13, "title": "Wire it", "state": "open",
+                 "labels": [{"name": "task"}, {"name": "status:in-progress"}, {"name": "size:S"},
+                            {"name": "risk:low"}]},
+                {"number": 14, "title": "Close epics", "state": "closed", "labels": [{"name": "task"}]}]
+        t12 = self.closed_task(12, RES_12, title="Add the board tool")
+        t14 = self.closed_task(14, RES_14, title="Close epics")
+        # 13 was landed once, then reopened: its old Resolution is not what landed, and it is open
+        t13 = issue(number=13, title="Wire it", labels=("task", "status:in-progress", "size:S", "risk:low"),
+                    comments=[comment("rjeskuri", "2026-10-09T09:00:00Z", RES_13_STALE),
+                              comment("rjeskuri", "2026-10-09T10:00:00Z", "Reopened: it broke the hooks.")])
+        self.scenario([REPO_VIEW, {"match": ["issue", "view", "3"], "stdout_json": epic},
+                       {"match": ["api", "repos/o/r/issues/3/sub_issues?per_page=100"], "stdout_json": subs}]
+                      + self.comment_calls(12, t12) + self.comment_calls(13, t13) + self.comment_calls(14, t14))
+        md = self.ok("show", "3", "--markdown").stdout
+        lines = md.splitlines()
+        self.assertLessEqual(len(lines), 120)
+        self.assertIn("## Tasks (2 of 3 closed)", lines)
+        tasks_at = lines.index("## Tasks (2 of 3 closed)")
+        for res in (RES_12, RES_14):
+            for line in content_lines(res):
+                self.assertIn(line, md, f"closed task's Resolution line missing: {line!r}")
+            summary = content_lines(res)[0]
+            at = next(i for i, text in enumerate(lines) if summary in text)
+            self.assertGreater(at, tasks_at, "the Resolutions go under the task list")
+        for line in ("A first attempt at wiring", "harness-wire-old", "STALE VERIFY LINE",
+                     "0a0b0c0d0e0f1a1b1c1d1e1f2a2b2c2d2e2f3a3b"):
+            self.assertNotIn(line, md, "an open task's Resolution is not printed")
 
 
 # ======================================================================= ready
