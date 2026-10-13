@@ -1767,6 +1767,75 @@ class EndedEarly(WorkTest):
         self.assertEqual([row["number"] for row in data["plan"]], [26])
         self.assertEqual(data["skipped"], [])
 
+    def test_dispatch_asks_gh_about_a_freshly_ended_draft_run_once(self):
+        # The draft case of the gh-once guarantee: #10 and #11 in progress with only a draft PR each (#43, #44),
+        # #7 with no PR, #8 with a ready PR. One dispatch sweeps all four (early, early, early, ok) and redispatches
+        # the three early ones; `issue view` and `pr list --head` are asked exactly once for each early ticket, the
+        # draft's PR number included in that one answer.
+        for n in (7, 8, 10, 11):
+            self.ended_run(n, ROUND2_RESULT)
+        self.write_scenario({7: (IN_PROGRESS, [], []), 8: (IN_PROGRESS, ready_pr(40), ready_pr(40)),
+                             10: (IN_PROGRESS, draft(43), draft(43)), 11: (IN_PROGRESS, draft(44), draft(44))})
+
+        p = self.ok("dispatch", "--dry-run")
+        self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()},
+                         {7: "early", 8: "ok", 10: "early", 11: "early"})
+        starts = {n: [ln for ln in p.stdout.splitlines() if ln.startswith(f"would start #{n} ")] for n in (7, 8, 10, 11)}
+        self.assertEqual({n: len(found) for n, found in starts.items()}, {7: 1, 8: 0, 10: 1, 11: 1}, p.stdout)
+        self.assertIn("#43", starts[10][0])
+        self.assertNotIn("#44", starts[10][0])
+        self.assertIn("#44", starts[11][0])
+        self.assertNotIn("#43", starts[11][0])
+        calls = self.gh_calls()
+        for n in (7, 8, 10, 11):
+            with self.subTest(ticket=n):
+                views = [a for a in calls if a[:3] == ["issue", "view", str(n)]]
+                heads = [a for a in calls if a[:2] == ["pr", "list"] and "--head" in a
+                         and a[a.index("--head") + 1] == f"t/{n}-x"]
+                self.assertLessEqual(len(views), 1, calls)
+                self.assertLessEqual(len(heads), 1, calls)
+                if n != 8:                                  # early needs both facts: asked exactly once each
+                    self.assertEqual((len(views), len(heads)), (1, 1), calls)
+
+    def test_every_pull_request_of_the_branch_counts_and_the_open_draft_is_named(self):
+        # A branch can have several PRs (gh lists them newest first). Early means none of them, in any state, is
+        # ready: an old closed or merged non-draft PR beside an open draft is a normal end, wherever it sits in the
+        # list (a row without isDraft is not a draft). Only drafts, closed ones included, is early, and the state
+        # names the open draft, the newest. gh is asked with --state all; the rows are what it would return.
+        def pr(number, state, is_draft=None):
+            row = {"number": number, "state": state}
+            if is_draft is not None:
+                row["isDraft"] = is_draft
+            return row
+        cases = {   # n: (PRs of any state, newest first; outcome, state)
+            30: ([pr(81, "OPEN", True), pr(80, "CLOSED", False)], "ok", "ended ok"),
+            31: ([pr(83, "OPEN", True), pr(82, "MERGED", False)], "ok", "ended ok"),
+            32: ([pr(85, "OPEN", True), pr(84, "CLOSED", True)], "early", "ended early (draft PR #85)"),
+            33: ([pr(87, "CLOSED", False), pr(86, "OPEN", True)], "ok", "ended ok"),
+            34: ([pr(89, "OPEN", True), pr(88, "MERGED")], "ok", "ended ok"),
+            35: ([pr(93, "OPEN", True), pr(92, "CLOSED", True), pr(91, "CLOSED", True)], "early",
+                 "ended early (draft PR #93)"),
+        }
+        for n in cases:
+            self.ended_run(n, ROUND2_RESULT)
+        self.write_scenario({n: (IN_PROGRESS, [r for r in prs if r["state"] == "OPEN"], prs)
+                             for n, (prs, _o, _s) in cases.items()})
+
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+        self.assertEqual({n: rows[n]["outcome"] for n in rows}, {n: c[1] for n, c in cases.items()})
+        self.assertEqual({n: rows[n]["state"] for n in rows}, {n: c[2] for n, c in cases.items()})
+        self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()}, {n: c[1] for n, c in cases.items()})
+
+        p = self.ok("dispatch", "--dry-run")
+        started = {int(m.group(1)): line for line in p.stdout.splitlines()
+                   for m in [re.match(r"would start #(\d+) ", line)] if m}
+        self.assertEqual(sorted(started), [32, 35], p.stdout)
+        self.assertIn("#85", started[32])
+        self.assertNotIn("#84", started[32])
+        self.assertIn("#93", started[35])
+        self.assertNotIn("#92", started[35])
+        self.assertNotIn("#91", started[35])
+
 
 def draft(number):
     """`pr list` rows: one open draft pull request."""
@@ -1795,16 +1864,19 @@ class RedispatchDraft(WorkTest):
         self.git(self.wt, "push", "-q", "-u", "origin", BRANCH)
         self.dirty = write(os.path.join(self.wt, "board.py"), "def ready():\n    return ['round 2']\n")
 
-    def write_scenario(self, drafts):
-        """drafts: {ticket: (branch, its draft PR number)}; every ticket OPEN and status:in-progress."""
+    def write_scenario(self, drafts, ready=()):
+        """drafts: {ticket: (branch, its draft PR number, or None for no PR)}; every ticket OPEN and
+        status:in-progress. ready: tickets on the board as status:ready (no run, no PR), listed by `harness-board
+        ready`."""
         calls = [{"match": ["issue", "view", str(n)],
                   "stdout_json": issue(n, labels=IN_PROGRESS, title=TITLE if n == 12 else f"Ticket {n}")}
                  for n in drafts]
+        calls += [{"match": ["issue", "view", str(n)], "stdout_json": issue(n, title=f"Ticket {n}")} for n in ready]
         for n, (branch, pr) in drafts.items():
-            calls.append({"contains": ["pr", "list", "--head", branch], "stdout_json": draft(pr)})
+            calls.append({"contains": ["pr", "list", "--head", branch], "stdout_json": draft(pr) if pr else []})
         calls += [
             {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}},
-            {"match": ["issue", "list"], "stdout_json": []},
+            {"match": ["issue", "list"], "stdout_json": [ready_row(n, f"Ticket {n}") for n in ready]},
             {"match": ["issue", "edit"], "stdout": ""},
             {"match": ["issue", "comment"], "stdout": "https://github.com/o/r/issues/12#issuecomment-1\n"},
             {"match": ["pr", "list"], "stdout_json": []},
@@ -1873,6 +1945,7 @@ class RedispatchDraft(WorkTest):
         self.assertNotIn("#58", prompt)
         self.assertIn("uncommitted", prompt.lower())
         self.assertIn("git status", prompt)
+        self.assertIn("review", prompt.lower())                # it reads the PR's review comments first
         self.assertEqual(os.path.realpath(call["cwd"]), self.wt)
         self.assertEqual(read_text(self.dirty), "def ready():\n    return ['round 2']\n")
 
@@ -1907,6 +1980,61 @@ class RedispatchDraft(WorkTest):
         self.assertEqual(sum("capped" in ln for ln in table), 1)
         sessions = [c for c in self.claude_calls() if "-p" in c["argv"] or "--bg" in c["argv"]]
         self.assertEqual(len(sessions), 1)                     # nothing launched after the one run above
+
+    def test_only_a_draft_pull_request_puts_the_pr_and_uncommitted_work_in_the_prompt(self):
+        # One dispatch launches three tickets: #12 after an early run with draft PR #41 (the #31 case), #15 after an
+        # early run with no PR, #16 fresh from the board (status:ready, never run). Only #12's prompt and start
+        # comment name a PR and the uncommitted work; the other two get the plain prompt and no such comment, so the
+        # PR text cannot be a constant of every launch.
+        self.ended_run(12, BRANCH, self.wt)
+        self.ended_run(15, "t/15-x", os.path.join(self.repo, ".claude", "worktrees", "t-15-x"), result=EARLY_RESULT)
+        self.write_scenario({12: (BRANCH, 41), 15: ("t/15-x", None)}, ready=[16])
+
+        p = self.ok("dispatch", "--dry-run")
+        starts = {n: [ln for ln in p.stdout.splitlines() if ln.startswith(f"would start #{n} ")] for n in (12, 15, 16)}
+        self.assertEqual({n: len(found) for n, found in starts.items()}, {12: 1, 15: 1, 16: 1}, p.stdout)
+        self.assertIn("#41", starts[12][0])
+        self.assertIn("(again after early)", starts[15][0])    # no PR: the reason as before #42
+        self.assertNotIn("#41", starts[15][0] + starts[16][0])
+
+        p = self.ok("dispatch", "--max", "3")
+        launched = [r for r in self.run_records() if r.get("ended_at") is None]
+        self.assertEqual(sorted(r["ticket"] for r in launched), [12, 15, 16], p.stdout)
+        for record in launched:
+            self.assertTrue(wait_for(lambda: '"type": "result"' in read_text(record["log"])))
+            self.assertTrue(wait_for(lambda: pid_gone(record["pid"])))
+        prompts = {}
+        for call in self.claude_calls():
+            argv = call["argv"]
+            self.assertEqual(argv[0], "-p", argv)
+            m = re.match(r"/harness:work (\d+)\b", argv[1])
+            self.assertTrue(m, argv[1])
+            prompts[int(m.group(1))] = argv[1]
+        self.assertEqual(sorted(prompts), [12, 15, 16])
+
+        pr_words = re.compile(r"\bPR\b|pull request", re.IGNORECASE)
+        self.assertIn("#41", prompts[12])
+        self.assertIn("uncommitted", prompts[12].lower())
+        self.assertIn("git status", prompts[12])
+        self.assertEqual(prompts[16], "/harness:work 16")     # a plain dispatch: the prompt is unchanged
+        for n in (15, 16):
+            with self.subTest(ticket=n):
+                prompt = prompts[n]
+                self.assertNotIn("uncommitted", prompt.lower())
+                self.assertNotIn("git status", prompt)
+                self.assertNotIn("review", prompt.lower())
+                self.assertNotIn("#41", prompt)
+                self.assertNotRegex(prompt, pr_words)
+
+        self.assertTrue([b for b in self.comment_bodies(12) if "#41" in b and "uncommitted" in b.lower()],
+                        self.comment_bodies(12))
+        self.assertTrue(self.comment_bodies(16))               # the plain "Started on ..." comment
+        for n in (15, 16):
+            with self.subTest(ticket=n, comment=True):
+                for body in self.comment_bodies(n):
+                    self.assertNotIn("uncommitted", body.lower())
+                    self.assertNotIn("#41", body)
+                    self.assertNotRegex(body, pr_words)
 
 
 # =========================================================================== the work skill
