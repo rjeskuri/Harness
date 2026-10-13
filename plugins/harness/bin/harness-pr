@@ -38,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -47,6 +48,7 @@ MARKER = "<!-- harness-review -->"
 BODY_FINDING = re.compile(r"^- (`[^`]*`|\(no path\)) \[(\w+)\] (.*)$")     # a finding listed in a review's body
 REVIEW_COUNT = re.compile(r"^Harness review \([^)]*\): (\d+) findings?\b")
 LANDED = "Landed in"
+RESOLUTION = "**Resolution**"
 HIGH_RISK = "High risk: review the data and live-system paths before merging."
 NO_RISK = "None noted."
 SEVERITIES = ("high", "medium", "low")
@@ -60,6 +62,10 @@ RUN_URL = re.compile(r"/actions/runs/(\d+)")
 PR_URL = re.compile(r"https?://\S+/pull/(\d+)")
 HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
+HEADING = re.compile(r"^##\s+(.*?)\s*#*\s*$")
+FENCE = re.compile(r"^\s{0,3}(```|~~~)")
+RED_LINE = re.compile(r"^red run\b", re.I)
+VERIFY_LABEL = re.compile(r"^(?:#{1,6}\s*)?verify:?\s*$", re.I)
 RED_TAIL_LINES = 15
 VERIFY_TAIL_LINES = 20
 RUN_LOG_LINES = 60
@@ -240,6 +246,78 @@ def listing(paths):
     return shown + (f" and {len(paths) - DIRTY_SHOWN} more" if len(paths) > DIRTY_SHOWN else "")
 
 
+# ---------- the state key (the same helpers in every harness tool and hook) ----------
+
+
+def canonical_path(path):
+    """The real path of `path` with each component spelled as its parent directory lists
+    it, so every spelling of one directory on a case-insensitive file system gives one
+    string. From the first component that cannot be found on, the rest stays as spelled."""
+    real = os.path.realpath(path)
+    done, parts = os.sep, [part for part in real.split(os.sep) if part]
+    for i, part in enumerate(parts):
+        try:
+            names = os.listdir(done)
+        except OSError:
+            return os.path.join(done, *parts[i:])
+        if part not in names:
+            fold = unicodedata.normalize("NFC", part).casefold()
+            given = os.path.join(done, part)
+            for name in names:
+                if unicodedata.normalize("NFC", name).casefold() == fold and same_entry(
+                    given, os.path.join(done, name)
+                ):
+                    part = name
+                    break
+            else:
+                return os.path.join(done, *parts[i:])
+        done = os.path.join(done, part)
+    return done
+
+
+def same_entry(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def path_key(path):
+    """The first 12 hex digits of the sha1 of the path string as it is spelled."""
+    return hashlib.sha1(str(path).encode("utf-8", "surrogateescape")).hexdigest()[:12]
+
+
+def repo_key(path):
+    """The state key of a main working tree: path_key of its canonical path."""
+    return path_key(canonical_path(path))
+
+
+def adopt_old_state(repos, main, *spelled):
+    """The state key of the canonical main tree `main`. When repos/<key> does not exist
+    yet, the directory an earlier version keyed by the spelling in use is renamed to it:
+    the spelling of `main` that one of `spelled` (the main tree as git reported it, the
+    path the tool started from) uses. Only this repository's; when both exist, both stay."""
+    key = path_key(main)
+    target = os.path.join(repos, key)
+    if os.path.lexists(target):
+        return key
+    depth = len(main.split(os.sep))
+    for path in spelled:
+        if not path:
+            continue
+        old = os.sep.join(os.path.realpath(path).split(os.sep)[:depth])
+        if old == main or canonical_path(old) != main:
+            continue
+        source = os.path.join(repos, path_key(old))
+        if os.path.isdir(source):
+            try:
+                os.rename(source, target)
+            except OSError:
+                pass
+            break
+    return key
+
+
 class Repo:
     """The repository: its toplevel (`root`, maybe a linked worktree), its main working tree, the state key
     shared by both, and (on demand) OWNER/REPO."""
@@ -256,8 +334,9 @@ class Repo:
         if common.returncode != 0 or not common.stdout.strip():
             raise Problem(f"git rev-parse --git-common-dir failed in {self.root}: {first_line(common.stderr)}")
         common_dir = os.path.normpath(os.path.join(self.root, common.stdout.strip()))
-        self.main = os.path.realpath(os.path.dirname(common_dir))
-        self.key = hashlib.sha1(self.main.encode("utf-8")).hexdigest()[:12]
+        reported = os.path.realpath(os.path.dirname(common_dir))
+        self.main = canonical_path(reported)
+        self.key = adopt_old_state(home(".claude", "harness", "repos"), self.main, reported, path)
         self.name = os.path.basename(self.main)
         self._slug = None
 
@@ -1227,9 +1306,95 @@ def ticket_parent(repo, number):
     return n if isinstance(n, int) and n > 0 else None
 
 
-def land_ticket(repo, number, sha, pr):
-    """Close the ticket when GitHub has not, drop its status labels, comment `Landed in <sha>` unless a comment
-    already says it (a resumed land), check its epic. (summary, error)."""
+def body_sections(body):
+    """{lower-cased `## ` heading: its text, surrounding blank lines dropped}; headings in code fences do not
+    count."""
+    sections, current, fenced = {}, None, False
+    for line in (body or "").splitlines():
+        if FENCE.match(line):
+            fenced = not fenced
+        elif not fenced:
+            m = HEADING.match(line)
+            if m:
+                current = m.group(1).strip().rstrip(":").strip().lower()
+                sections.setdefault(current, [])
+                continue
+        if current is not None:
+            sections[current].append(line.rstrip())
+    return {k: "\n".join(v).strip("\n") for k, v in sections.items()}
+
+
+def evidence(body):
+    """(the red-run line, the verify result) from a PR body: the `Red run ...` line without its colon, and the
+    last non-empty line of the fence that follows a `Verify:` label or a `## Verify` heading (blank lines may
+    come between). None for what the body lacks."""
+    red = verify = block = None
+    fenced = label = False
+    for line in (body or "").splitlines():
+        text = line.strip()
+        if FENCE.match(line):
+            if block is not None:                  # the verify fence closes
+                verify, block = last_line("\n".join(block)) or None, None
+            elif label and not fenced:             # the verify fence opens
+                block = []
+            fenced, label = not fenced, False
+        elif block is not None:
+            block.append(line)
+        elif not fenced and text:
+            if red is None and RED_LINE.match(text):
+                red = text.rstrip(":").strip()
+            label = verify is None and bool(VERIFY_LABEL.match(text))
+    return red, verify
+
+
+def view_files(data):
+    """The changed paths a `gh pr view --json files` answer holds (GitHub stops at 100)."""
+    return [f["path"] for f in as_list(data.get("files")) if isinstance(f, dict) and isinstance(f.get("path"), str)
+            and f["path"]]
+
+
+def changed_files(repo, number, cwd):
+    """Every path PR `number` changes, in GitHub's order, from the paginated files endpoint (`gh pr view --json
+    files` stops at 100). --slurp makes gh print one array of the page arrays instead of the pages back to back."""
+    endpoint = f"repos/{repo.slug()}/pulls/{number}/files?per_page=100"
+    pages = gh_json(["api", endpoint, "--paginate", "--slurp"], cwd)
+    if not isinstance(pages, list):
+        raise Problem(f"gh api {endpoint} printed no list of files")
+    paths = []
+    for page in pages:
+        for f in (page if isinstance(page, list) else [page]):
+            name = f.get("filename") if isinstance(f, dict) else None
+            if isinstance(name, str) and name:
+                paths.append(name)
+    return paths
+
+
+def resolution_body(data, files, sha, url):
+    """The `**Resolution**` comment for a landed PR, from `gh pr view --json body,url` and its changed `files`: the
+    Summary section, the files changed, the Definition of done as landed, the red-run and verify lines, the PR and
+    the squash sha. What the body lacks is left out."""
+    body = data.get("body") or ""
+    sections = body_sections(body)
+    red, verify = evidence(body)
+    url = data.get("url") or url
+    parts = [RESOLUTION]
+    if sections.get("summary", "").strip():
+        parts += ["", sections["summary"]]
+    if files:
+        parts += ["", f"Files changed ({len(files)}):"] + [f"- `{path}`" for path in files]
+    if sections.get("definition of done", "").strip():
+        parts += ["", "Definition of done:", sections["definition of done"]]
+    closing = ([red] if red else []) + ([f"Verify: {verify}"] if verify else []) \
+        + ([f"PR: {url}"] if url else []) + ([f"Squash commit: {sha}"] if sha else [])
+    if closing:
+        parts += [""] + closing
+    return "\n".join(parts)
+
+
+def land_ticket(repo, number, sha, pr, resolution):
+    """Close the ticket when GitHub has not, drop its status labels, comment the Resolution (`resolution()`) and
+    then `Landed in <sha>` unless the ticket already has them (a resumed land; `Landed in` there means both are),
+    check its epic. (summary, error)."""
     done = []
     try:
         info = gh_json(["issue", "view", str(number), "--json", "state,labels,comments"], repo.main)
@@ -1247,9 +1412,13 @@ def land_ticket(repo, number, sha, pr):
                 cmd += ["--remove-label", name]
             gh(cmd, repo.main)
             done.append("status labels removed")
-        if any(LANDED in (c.get("body") or "") for c in as_list(info.get("comments"))):
+        bodies = [(c.get("body") or "").lstrip() for c in as_list(info.get("comments"))]
+        if any(LANDED in b and not b.startswith(RESOLUTION) for b in bodies):
             done.append("landed comment already there")
         else:
+            # the Resolution goes first: a land that stops between the two still finds `Landed in` missing
+            if not any(b.startswith(RESOLUTION) for b in bodies):
+                board(repo, "comment", str(number), "--body", resolution())
             board(repo, "comment", str(number), "--body", f"{LANDED} {sha}" if sha else f"{LANDED} PR #{pr}")
             done.append("commented")
         parent = ticket_parent(repo, number)
@@ -1396,9 +1565,30 @@ def cmd_land(args):
         main_line = f"fetched; on {on or 'a detached HEAD'}, so main was not pulled"
     summary.append(f"Main checkout: {main_line if fetched.returncode == 0 else 'fetch failed'}.")
 
+    made = {}
+
+    def resolution():
+        """The Resolution comment, read from the PR once however many tickets it closes; every changed file from
+        the files endpoint, or the PR view's (at most 100) when that fails."""
+        if "text" not in made:
+            try:
+                data = pr_view(repo, number, "body,files,url", main)
+            except Problem as err:
+                raise Problem(f"the Resolution could not be written, so nothing was commented: {err}") from None
+            files = view_files(data)
+            try:
+                listed = changed_files(repo, number, main)
+            except Problem as err:
+                warn(f"could not list PR #{number}'s files ({err}); the Resolution lists the {len(files)} "
+                     "that gh pr view returned")
+            else:
+                files = listed if len(listed) >= len(files) else files
+            made["text"] = resolution_body(data, files, sha, view.get("url"))
+        return made["text"]
+
     ticket_lines = []
     for n in tickets:
-        line, error = land_ticket(repo, n, sha, number)
+        line, error = land_ticket(repo, n, sha, number, resolution)
         ticket_lines.append(line)
         if error:
             problems.append(f"ticket #{n}: {error}")
