@@ -803,6 +803,52 @@ class Runs(WorkTest):
         self.assertEqual(self.sweep_one(50, ok)["outcome"], "ok")
         self.assertFalse(os.path.exists(self.budgets_path()))
 
+    def test_sweep_reads_key_and_workspace_in_their_credential_sense_only(self):
+        # The words "key" and "workspace" on their own decide nothing. A 4xx about an unexpected key in the request
+        # schema, a missing workspace file or a keychain read is `error`; the API key named as the credential, the
+        # apiKeyHelper or the anthropic-workspace-id header is `auth`. Interleaved and worded unlike the real probes, so
+        # neither a substring match on either word nor a list of the probes' phrases passes.
+        no_status = {k: v for k, v in API_401.items() if k != "api_error_status"}   # terminal_reason api_error only
+        cases = [
+            # (result, outcome, the start of the api budget's reason when auth, a fragment of the text it must carry)
+            (dict(API_401, api_error_status=400, result="API Error: 400 tools.0.input_schema: unexpected key 'foo'"),
+             "error", None, None),
+            (dict(API_401, api_error_status=400, result="API Error: 400 The provided API key has been disabled"),
+             "auth", "auth: API error 400: ", "has been disabled"),
+            (dict(API_401, api_error_status=400, result="API Error: 400 metadata: key user_id must be a string"),
+             "error", None, None),
+            (dict(API_401, api_error_status=404, result="API Error: 404 workspace file not found: /tmp/x"),
+             "error", None, None),
+            (dict(API_401, api_error_status=404, result="API Error: 404 No API key found for this organization"),
+             "auth", "auth: API error 404: ", "No API key found"),
+            (dict(API_401, api_error_status=422,
+                  result="API Error: 422 The anthropic-workspace-id header names a deleted workspace"),
+             "auth", "auth: API error 422: ", "names a deleted workspace"),
+            (dict(API_401, api_error_status=400, result="API Error: 400 cache_control: unexpected key 'ttl'"),
+             "error", None, None),
+            # terminal_reason api_error without a status: the same words, the same split.
+            (dict(no_status, result="API Error: Connection error while reading keychain"), "error", None, None),
+            (dict(no_status, result="API Error: 400 Unexpected key 'workspace' in request body"), "error", None, None),
+            (dict(no_status, result="apiKeyHelper script is failing: produced no output · Fix the apiKeyHelper "
+                                    "setting"),
+             "auth", "auth: API error: apiKeyHelper script is failing", "produced no output"),
+        ]
+        for n, (result, outcome, prefix, fragment) in enumerate(cases, start=12):
+            with self.subTest(result=result["result"]):
+                self.ok("budget", "reset", "api")
+                swept = self.sweep_one(n, result)
+                self.assertEqual(swept["outcome"], outcome)
+                self.assertEqual(next(r for r in self.run_records() if r["ticket"] == n)["outcome"], outcome)
+                status = self.ok("budget", "status").stdout
+                if outcome == "error":
+                    self.assertIn("api: available", status)
+                    continue
+                self.assertIn("api: exhausted until", status)
+                api = self.read_json(self.budgets_path())["api"]
+                self.iso_close_to(api["exhausted_until"], dt.timedelta(hours=24))
+                self.assertTrue(api["reason"].startswith(prefix), api["reason"])
+                self.assertIn(fragment, api["reason"])
+
     def test_sweep_closes_a_bg_run_on_any_state_that_is_not_live(self):
         for n, bg_id in ((12, "s-blocked"), (13, "s-idle"), (14, "s-done"), (15, "s-archived"), (16, "s-gone"),
                          (17, "s-nostate")):
