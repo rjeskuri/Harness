@@ -12,7 +12,11 @@ Usage:
     harness-pr comments P [--since ISO] [--unresolved] [--json]
     harness-pr awaiting [--all-projects] [--json]
     harness-pr ultra P [--post]
-    harness-pr land P [--yes] [--discard]
+    harness-pr land P [--yes] [--discard] [--accept-findings]
+
+ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has
+findings and no commit newer than it, naming the findings, and refuse when gh cannot tell. --accept-findings on
+land is the only override; ready has none. land on a PR that is already merged skips the check.
 
 The repository is the cwd's (open: --worktree, else the cwd), else CLAUDE_PROJECT_DIR. gh is HARNESS_GH when
 set, else `gh`; claude is HARNESS_CLAUDE, else `claude`; harness-board and harness-red are found on PATH, else
@@ -41,6 +45,8 @@ HERE = Path(__file__).resolve().parent
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 TICKET_BRANCH = re.compile(r"^t/(\d+)-")
 MARKER = "<!-- harness-review -->"
+BODY_FINDING = re.compile(r"^- (`[^`]*`|\(no path\)) \[(\w+)\] (.*)$")     # a finding listed in a review's body
+REVIEW_COUNT = re.compile(r"^Harness review \([^)]*\): (\d+) findings?\b")
 LANDED = "Landed in"
 RESOLUTION = "**Resolution**"
 HIGH_RISK = "High risk: review the data and live-system paths before merging."
@@ -878,10 +884,101 @@ def cmd_checks(args):
     return 1
 
 
+# --------------------------------------------------------------- the review gate
+def api_list(repo, path):
+    """Every item of a REST list endpoint, all pages (gh may print one JSON array per page)."""
+    call = ["api", "--paginate", path]
+    text = gh(call, repo.root).strip()
+    decoder, items, at = json.JSONDecoder(), [], 0
+    while at < len(text):
+        try:
+            page, at = decoder.raw_decode(text, at)
+        except ValueError:
+            raise Problem(f"{describe(call)} printed something other than JSON: {first_line(text[at:])[:80]}") \
+                from None
+        if not isinstance(page, list):
+            raise Problem(f"{describe(call)} printed something other than a list")
+        items += page
+        while at < len(text) and text[at].isspace():
+            at += 1
+    return items
+
+
+def latest_harness_review(reviews):
+    """The submitted review with the newest submitted_at whose body carries the harness marker, or None."""
+    found = [(parse_iso(r.get("submitted_at")), r) for r in reviews
+             if isinstance(r, dict) and MARKER in (r.get("body") or "") and parse_iso(r.get("submitted_at"))]
+    return max(found, key=lambda pair: pair[0])[1] if found else None
+
+
+def short(text, n=100):
+    text = one_line(text)
+    return text if len(text) <= n else text[:n - 3] + "..."
+
+
+def review_findings(repo, slug, number, review):
+    """["path:line [severity] body"] of a harness review: the inline comments and the body's list; [] when it says
+    "no findings". A finding count in the summary with fewer findings found adds one line for the rest."""
+    body = review.get("body") or ""
+    if body.startswith("Harness review: no findings."):
+        return []
+    found = []
+    for line in body.splitlines():
+        m = BODY_FINDING.match(line)
+        if m:
+            found.append(f"{m.group(1).strip('`')} [{m.group(2)}] {short(m.group(3))}")
+    for c in api_list(repo, f"repos/{slug}/pulls/{number}/reviews/{review.get('id')}/comments"):
+        if not isinstance(c, dict):
+            continue
+        text = (c.get("body") or "").replace(MARKER, "").strip()
+        line = c.get("line") or c.get("original_line")
+        place = f"{c.get('path') or '(no path)'}" + (f":{line}" if line else "")
+        found.append(f"{place} {short(text)}")
+    m = REVIEW_COUNT.match(body)
+    declared = int(m.group(1)) if m else 0
+    if declared > len(found):
+        found.append(f"{declared - len(found)} more not listed (see the review)")
+    return found
+
+
+def review_gate(repo, number):
+    """(the latest harness review, its findings) when that review has findings and no commit on the PR is newer
+    than it; else (review or None, []). A failing gh call raises Problem."""
+    slug = repo.slug()
+    review = latest_harness_review(api_list(repo, f"repos/{slug}/pulls/{number}/reviews"))
+    if review is None:
+        return None, []
+    findings = review_findings(repo, slug, number, review)
+    if not findings:
+        return review, []
+    submitted = parse_iso(review.get("submitted_at"))
+    for c in api_list(repo, f"repos/{slug}/pulls/{number}/commits"):
+        meta = c.get("commit") if isinstance(c, dict) else None
+        meta = meta if isinstance(meta, dict) else {}
+        when = None
+        for who in ("committer", "author"):
+            person = meta.get(who)
+            when = when or (parse_iso(person.get("date")) if isinstance(person, dict) else None)
+        if when is not None and when > submitted:
+            return review, []
+    return review, findings
+
+
+def unaddressed(number, review, findings):
+    return (f"PR #{number}: the latest harness review ({review.get('submitted_at')}) has findings and no commit "
+            "after it: " + "; ".join(findings))
+
+
 # --------------------------------------------------------------- ready
 def cmd_ready(args):
     repo = open_repo()
     number = args.number
+    try:
+        review, findings = review_gate(repo, number)
+    except Problem as err:
+        raise Problem(f"cannot check the harness review findings of PR #{number}: {err}") from None
+    if findings:
+        raise Problem(unaddressed(number, review, findings) + f"; fix them, push, then harness-pr ready {number}")
     gh(["pr", "ready", str(number)], repo.root)
     view = pr_view(repo, number, "url,title,closingIssuesReferences")
     url, title = view.get("url") or "", view.get("title") or ""
@@ -1363,6 +1460,23 @@ def merge_preconditions(repo, number, view):
     return view
 
 
+def land_gate(repo, number, accept):
+    """Refuse a PR whose latest harness review has findings and no newer commit, and fail closed when gh cannot
+    tell; with --accept-findings, warn instead."""
+    try:
+        review, findings = review_gate(repo, number)
+    except Problem as err:
+        if not accept:
+            raise Problem(f"cannot check the harness review findings of PR #{number}: {err}") from None
+        warn(f"cannot check the harness review findings of PR #{number} ({err}); landing it (--accept-findings)")
+        return
+    if findings and not accept:
+        raise Problem(unaddressed(number, review, findings)
+                      + f"; fix them and push, or harness-pr land {number} --accept-findings to land it anyway")
+    if findings:
+        warn(unaddressed(number, review, findings) + "; landing it (--accept-findings)")
+
+
 def cmd_land(args):
     """Merge and clean up; on a PR that is already merged (an earlier land stopped at a dirty worktree, or it
     was merged on GitHub), skip the preconditions and the merge and finish the cleanup."""
@@ -1381,6 +1495,7 @@ def cmd_land(args):
         raise Problem(f"PR #{number} is {state.lower()}, not open")
     else:
         view = merge_preconditions(repo, number, view)
+        land_gate(repo, number, args.accept_findings)
     tickets = closing_numbers(view)
     if not tickets:
         warn(f"PR #{number} closes no issue (no Closes #N in its body); no ticket to close")
@@ -1550,6 +1665,8 @@ def parser():
     ld.add_argument("number", type=number_arg, metavar="P")
     ld.add_argument("--yes", action="store_true", help="accepted and ignored (the land skill confirms)")
     ld.add_argument("--discard", action="store_true", help="remove the worktree even with uncommitted changes")
+    ld.add_argument("--accept-findings", action="store_true",
+                    help="land even though the latest harness review has findings and no newer commit")
     return ap
 
 

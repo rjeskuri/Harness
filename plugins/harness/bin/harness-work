@@ -36,6 +36,11 @@ ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN. headless:
 reaches a command line or the environment); bg, the default while the api budget is exhausted:
 `claude --bg -n "<repo> #N <title>" "/harness:work N"`.
 
+runs --sweep: closes the records of runs that ended and classifies each (ok, error, billing, auth; a bg run by its
+`claude agents` state). A headless `ok` whose issue is OPEN and still status:in-progress with no pull request of
+its branch in any state ended early: outcome `early`, shown as `ended early (no PR)`. When gh cannot tell, or the
+record names no repository, it stays `ok` with a warning. One command asks gh once per ticket and branch.
+
 Siblings (harness-board) are found on PATH, else next to this script. gh is HARNESS_GH when set, else `gh`;
 claude is HARNESS_CLAUDE when set, else `claude`.
 """
@@ -881,6 +886,7 @@ def mtime_iso(path):
 
 def sweep(records, agents):
     """Close the records whose run has ended; a billing or auth failure marks the api budget. Saves."""
+    repos = {}
     for record in records:
         if record.get("ended_at"):
             continue
@@ -902,16 +908,39 @@ def sweep(records, agents):
                 continue
             record["ended_at"] = mtime_iso(record.get("log"))
             outcome, reason = classify(log_tail(record.get("log")))
+            if outcome == "ok" and ended_early(record, repos):
+                outcome = "early"
             record["outcome"] = outcome
             if outcome in ("billing", "auth"):
                 exhaust(load_budgets(), "api", f"{outcome}: {reason}", EXHAUST_HOURS)
         save_run(record)
 
 
+def ended_early(record, repos):
+    """Whether an `ok` headless run left its ticket in progress with no pull request: the session ended its turn
+    before the work did. False, with a warning, when the repository or gh cannot tell. `repos` caches Repo by path."""
+    n = record.get("ticket")
+    if not isinstance(n, int):
+        return False
+    path = str(record.get("repo") or "")
+    if not path:                    # never the cwd's repository: its issue n may be another ticket
+        warn(f"#{n}: cannot check whether its run ended early: the run record names no repository")
+        return False
+    try:
+        if path not in repos:
+            repos[path] = Repo(path)
+        return without_pr(repos[path], n, record.get("branch")) is not None
+    except Problem as err:
+        warn(f"#{n}: cannot check whether its run ended early: {err}")
+        return False
+
+
 def run_state(record, agents):
     if record.get("ended_at"):
         exit_code = record.get("exit")
-        return f"exited {exit_code}" if exit_code is not None else f"ended {record.get('outcome') or '?'}"
+        if exit_code is not None:
+            return f"exited {exit_code}"
+        return "ended early (no PR)" if record.get("outcome") == "early" else f"ended {record.get('outcome') or '?'}"
     if is_bg(record):
         listing = agents.get()
         entry = listing.get(str(record.get("bg_id"))) if listing else None
@@ -981,6 +1010,37 @@ def failed(record, why):
     raise Problem(why)
 
 
+WITHOUT_PR = {}     # (main checkout, ticket, branch): the issue, None or the Problem, asked once per command
+
+
+def without_pr(repo, n, branch):
+    """The issue of ticket n when it is OPEN and status:in-progress and `branch` has no pull request in any state,
+    else None. A failing gh call raises Problem. One command asks gh once per ticket and branch: dispatch's sweep
+    and its redispatch share the answer, a failure included."""
+    key = (repo.main, n, branch)
+    if key not in WITHOUT_PR:
+        try:
+            WITHOUT_PR[key] = ask_without_pr(repo, n, branch)
+        except Problem as err:
+            WITHOUT_PR[key] = err
+    found = WITHOUT_PR[key]
+    if isinstance(found, Problem):
+        raise found
+    return found
+
+
+def ask_without_pr(repo, n, branch):
+    issue = gh_json(repo, ["issue", "view", str(n), "--json", "number,title,state,labels"])
+    if not isinstance(issue, dict) or str(issue.get("state", "")).upper() != "OPEN":
+        return None
+    labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
+    if "status:in-progress" not in labels:
+        return None
+    prs = gh_json(repo, ["pr", "list", "--head", str(branch), "--state", "all", "--json", "number",
+                         "--limit", "1"]) if branch else []
+    return None if prs else issue
+
+
 def redispatch_candidates(repo, records, live):
     """In-progress tickets whose last run ended (within the window) without a pull request: dispatched again,
     unless REDISPATCH_MAX runs of the ticket ended within the window. (candidates, skipped)."""
@@ -1001,18 +1061,11 @@ def redispatch_candidates(repo, records, live):
         if n in live or ended is None or ended < cutoff:
             continue
         try:
-            issue = gh_json(repo, ["issue", "view", str(n), "--json", "number,title,state,labels"])
-            if not isinstance(issue, dict) or str(issue.get("state", "")).upper() != "OPEN":
-                continue
-            labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
-            if "status:in-progress" not in labels:
-                continue
-            prs = gh_json(repo, ["pr", "list", "--head", str(record.get("branch") or ""), "--state", "all",
-                                 "--json", "number", "--limit", "1"]) if record.get("branch") else []
+            issue = without_pr(repo, n, record.get("branch"))
         except Problem as err:
             warn(f"#{n}: cannot check whether its ended run needs another: {err}")
             continue
-        if prs:
+        if issue is None:
             continue
         again = record.get("outcome") or "ended"
         if ended_runs.get(n, 0) >= REDISPATCH_MAX:
