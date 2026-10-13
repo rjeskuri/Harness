@@ -32,8 +32,9 @@ Templates live in ../templates next to this script and are rendered by plain sub
 Rules: an existing file is never overwritten without --force, and each path is reported as
 created, kept or updated. A kept .claude/settings.json is never edited, but `warn:` lines (--dry-run
 and the real run alike) name each ask or deny rule that would stop a dispatched run on a loop command
-(git, gh, harness-*, the verify command), each allow entry of the stack's template that no allow rule
-covers and each env key of it that is absent; a file that is not usable settings gets one warn line.
+(git, gh, harness-*, the file's own CLAUDE_VERIFY_CMD, else the rendered one), each allow entry of the
+stack's template that no allow rule covers and each env key of it that is absent, with the value to add;
+a file that is not usable settings gets one warn line.
 The stack skeleton (pyproject.toml, src/<pkg>/__init__.py,
 tests/test_smoke.py; package.json, tests/smoke.test.js) is written only when the project has no
 manifest of any stack, no Makefile with a test or check target and no tests (a tests/, test/ or spec/
@@ -565,15 +566,18 @@ def stops_run(rule, loop, verify):
 
 
 def covers(allow_rule, entry):
-    """Whether an allow rule covers a template entry: the same rule, or a prefix rule whose words start it."""
+    """Whether an allow rule covers a template entry, by match_kinds as an ask or deny is matched (a `*`
+    word matches one or more words): a prefix rule that matches the entry's words or a start of them, or
+    a rule without a prefix that matches an entry without one exactly."""
     a, e = bash_rule(allow_rule), bash_rule(entry)
-    if a is None or e is None:
+    if a is None or e is None or (not a[1] and e[1]):
         return False
-    return (a[1] and e[0][:len(a[0])] == a[0]) or (not a[1] and not e[1] and a[0] == e[0])
+    return "covers" in match_kinds(a[0], a[1], e[0])
 
 
 def read_kept_settings(path):
-    """[ask, deny, allow, env keys] of a kept settings.json; ValueError says why it is not usable."""
+    """[ask, deny, allow, env] of a kept settings.json, env the dict as it is; ValueError says why it is
+    not usable."""
     try:
         text = path.read_bytes().decode("utf-8")
     except UnicodeDecodeError:
@@ -596,22 +600,26 @@ def read_kept_settings(path):
         if not isinstance(rules, list) or not all(isinstance(r, str) for r in rules):
             raise ValueError(f"permissions.{key} is not a list of strings")
         lists.append(rules)
-    return lists + [list(env)]
+    return lists + [env]
 
 
 def kept_settings_report(root, files):
     """The `warn:` lines for a kept .claude/settings.json (never edited): ask and deny rules that stop a
-    dispatched run on a loop command or the verify command, template allow entries that no allow rule
-    covers, and template env keys it lacks. One line when the file is not usable settings."""
+    dispatched run on a loop command or the verify command (the file's own CLAUDE_VERIFY_CMD, which is
+    what a run issues, else the rendered one), template allow entries that no allow rule covers, and
+    template env keys it lacks, each with the value to add. One line when the file is not usable settings."""
     template = json.loads(dict((d, c) for d, c, _ in files)[KEPT])
     allow_wanted = template["permissions"]["allow"]
-    env_wanted = list(template["env"])
-    verify = shell_commands(template["env"].get("CLAUDE_VERIFY_CMD", ""))
+    env_wanted = template["env"]
     try:
         ask, deny, allow, env = read_kept_settings(root / KEPT)
     except ValueError as err:
         return [f"warn: {KEPT} is not usable settings ({err}), so it was not checked; fix it, or --force "
                 "replaces it with the template"]
+    own = env.get("CLAUDE_VERIFY_CMD")
+    if not (isinstance(own, str) and own.strip()):
+        own = env_wanted.get("CLAUDE_VERIFY_CMD", "")
+    verify = shell_commands(own)
     lines = []
     for kind, rules, why in (("ask", ask, "a headless run cannot answer an ask"),
                              ("deny", deny, "a deny cannot be overridden")):
@@ -627,8 +635,8 @@ def kept_settings_report(root, files):
     lines += [f"warn: {KEPT} allow entry {e} is missing, so a dispatched run would be stopped by a prompt "
               "no one can answer; add it to permissions.allow"
               for e in allow_wanted if not any(covers(r, e) for r in allow)]
-    lines += [f"warn: {KEPT} env key {k} is not set (the template sets it); add it to env"
-              for k in env_wanted if k not in env]
+    lines += [f"warn: {KEPT} env key {k} is not set (the template sets it); add {json.dumps({k: v})[1:-1]} "
+              "to env" for k, v in env_wanted.items() if k not in env]
     return lines
 
 
