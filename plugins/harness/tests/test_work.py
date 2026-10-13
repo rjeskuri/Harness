@@ -974,6 +974,49 @@ class RedispatchCap(WorkTest):
             self.assertIn(f"#{n}: cannot check whether its ended run needs another", p.stderr)
             self.assertNotIn(f"skip #{n}:", p.stdout)
 
+    def asked_about(self, ticket):
+        """The gh calls that look the ticket up: its `issue view` and its branch's `pr list`."""
+        return [c for c in self.gh_calls()
+                if c[:3] == ["issue", "view", str(ticket)] or (c[:2] == ["pr", "list"] and f"t/{ticket}-x" in c)]
+
+    def test_runs_asks_gh_only_about_tickets_at_the_cap(self):
+        # #13 (two ended runs) and #16 (three, one outside the window: two inside) are under the cap, so `runs`
+        # has nothing to mark for them and must not spend gh calls on them; #12 is the capped control.
+        self.run_at(13, "error", 31, 30), self.run_at(13, "ok", 11, 10)
+        self.run_at(16, "error", 24 * 8 + 1, 24 * 8), self.run_at(16, "error", 21, 20), self.run_at(16, "ok", 11, 10)
+        control = self.three(12)
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS), issue(13, labels=IN_PROGRESS, title="Two"),
+                              issue(16, labels=IN_PROGRESS, title="Straddling")])
+        self.assertEqual(self.marked(), {12: [control[-1]["id"]]})
+        self.assertTrue(self.asked_about(12))                       # the capped ticket is still checked
+        self.assertEqual(self.asked_about(13), [])
+        self.assertEqual(self.asked_about(16), [])
+
+        os.unlink(self.gh_log)                                      # dispatch still asks about them: candidates
+        data = self.ok_json("dispatch", "--dry-run", "--json")
+        self.assertEqual([row["number"] for row in data["plan"]], [13, 16])
+        self.assertEqual([s["number"] for s in data["skipped"]], [12])
+        self.assertTrue(self.asked_about(13))
+        self.assertTrue(self.asked_about(16))
+
+    def test_runs_outside_a_repository_lists_the_records_marks_nothing_and_asks_gh_nothing(self):
+        records = self.three(12)
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS)])
+        plain = self.mk("not-a-repo")
+        self.assertNotEqual(subprocess.run([GIT, "-C", plain, "rev-parse", "--git-dir"], env=self.env(),
+                                           capture_output=True).returncode, 0)
+        p = self.work("runs", "--all", cwd=plain)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        for record in records:
+            self.assertIn(record["id"], p.stdout)
+        self.assertNotIn("capped", p.stdout)
+        rows = json.loads(self.work("runs", "--all", "--json", cwd=plain).stdout)
+        self.assertEqual(sorted(r["id"] for r in rows), sorted(r["id"] for r in records))
+        self.assertFalse([r for r in rows if r.get("capped")])
+        self.assertEqual(self.gh_calls(), [])
+        # the same records, from inside the repository, are marked: the difference is the cwd alone
+        self.assertEqual(self.marked(), {12: [records[-1]["id"]]})
+
 
 def sha12(path):
     """A path string's key, from first principles: the first 12 hex digits of its sha1."""

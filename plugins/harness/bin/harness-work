@@ -1041,10 +1041,11 @@ def ask_without_pr(repo, n, branch):
     return None if prs else issue
 
 
-def redispatch_candidates(repo, records, live):
+def redispatch_candidates(repo, records, live, *, capped_only=False):
     """In-progress tickets whose last run ended (within the window) without a pull request: dispatched again,
     unless REDISPATCH_MAX runs of the ticket ended within the window. (candidates, skipped, the id of the record
-    each skipped ticket's cap rests on: its latest started)."""
+    each skipped ticket's cap rests on: its latest started). `capped_only` skips the gh check for tickets under
+    the cap, whose answer the caller would discard."""
     cutoff = now() - REDISPATCH_WINDOW
     latest, ended_runs = {}, {}
     for record in records:
@@ -1060,6 +1061,8 @@ def redispatch_candidates(repo, records, live):
     for n, record in sorted(latest.items()):
         ended = parse_iso(record.get("ended_at"))
         if n in live or ended is None or ended < cutoff:
+            continue
+        if capped_only and ended_runs.get(n, 0) < REDISPATCH_MAX:
             continue
         try:
             issue = without_pr(repo, n, record.get("branch"))
@@ -1230,7 +1233,7 @@ def cmd_runs(args):
     try:                    # the tickets dispatch would skip for the cap, in the repository of the cwd
         repo = open_repo(None)
         mine = [r for r in records if of_repo(r, repo)]
-        capped = set(redispatch_candidates(repo, mine, live_runs(mine, agents))[2].values())
+        capped = set(redispatch_candidates(repo, mine, live_runs(mine, agents), capped_only=True)[2].values())
     except Problem:         # not in a repository: nothing to mark
         capped = set()
     shown = []
