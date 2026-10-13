@@ -332,6 +332,118 @@ class Render(ScaffoldTest):
                                                       "HARNESS_TEST_CMD": "tox -e py -- {files}"})
         self.assertIn('`make check ARGS="-x"`', self.read(root, "CLAUDE.md"))
 
+    # ---- --verify is written into scripts/verify.sh (ticket #5)
+    def checks(self, root):
+        """The command lines of scripts/verify.sh: no blanks, comments, shebang, `set -` or `cd`."""
+        lines = [ln.strip() for ln in self.read(root, "scripts", "verify.sh").splitlines()]
+        return [ln for ln in lines if ln and not ln.startswith("#") and not ln.startswith("set -")
+                and not ln.startswith("cd ")]
+
+    def test_verify_is_written_into_verify_sh_and_settings_point_at_it(self):
+        for n, command in enumerate(["python3 -m unittest discover -s plugins/harness/tests",
+                                     "make check", "./run-all-tests.sh --fast",
+                                     'make check ARGS="-x" && echo \'done\'']):
+            with self.subTest(verify=command):
+                root = self.mk(f"verified{n}")
+                self.ok("init", root, "--name", f"verified{n}", "--stack", "none", "--verify", command)
+                checks = self.checks(root)
+                self.assertEqual(checks[-2:], [command, "echo VERIFY OK"], checks)
+                self.assertNotIn("true", checks)                # the placeholder no-op is gone
+                self.assertEqual(self.settings(root)["env"], {"CLAUDE_VERIFY_CMD": "scripts/verify.sh"})
+                script = os.path.join(root, "scripts", "verify.sh")
+                self.assertExecutable(script)
+                self.assertEqual(subprocess.run(["sh", "-n", script]).returncode, 0)
+                self.assertIn("run: scripts/verify.sh", self.read(root, ".github/workflows/ci.yml"))
+
+    def test_verify_sh_actually_runs_the_verify_command(self):
+        root = self.mk("runs")
+        self.ok("init", root, "--name", "runs", "--stack", "none", "--verify", "echo ran-it > marker.txt")
+        script = os.path.join(root, "scripts", "verify.sh")
+        p = subprocess.run(["sh", script], cwd=self.tmp, capture_output=True, text=True)    # from any directory
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.read(root, "marker.txt").strip(), "ran-it")
+        self.assertIn("VERIFY OK", p.stdout)
+
+    def test_a_failing_verify_command_fails_verify_sh(self):
+        root = self.mk("fails")
+        self.ok("init", root, "--name", "fails", "--stack", "none", "--verify", "exit 3")
+        p = subprocess.run(["sh", os.path.join(root, "scripts", "verify.sh")], cwd=self.tmp,
+                           capture_output=True, text=True)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertNotIn("VERIFY OK", p.stdout)
+
+    def test_verify_is_the_last_check_for_python_and_node_too(self):
+        for stack in ("python", "node"):
+            with self.subTest(stack=stack):
+                root = self.mk(f"v-{stack}")
+                self.ok("init", root, "--name", f"v-{stack}", "--stack", stack, "--verify", "make check-all")
+                self.assertEqual(self.checks(root)[-2:], ["make check-all", "echo VERIFY OK"])
+
+    def test_without_verify_the_stack_defaults_are_unchanged(self):
+        root = self.mk("defaults-py")
+        self.ok("init", root, "--name", "defaults-py", "--stack", "python")
+        self.assertEqual(self.checks(root)[-4:], ["uv run ruff check .", "uv run ruff format --check .",
+                                                  "uv run pytest -q", "echo VERIFY OK"])
+        self.assertEqual(self.settings(root)["env"]["CLAUDE_VERIFY_CMD"], "scripts/verify.sh")
+        root = self.mk("defaults-none")
+        self.ok("init", root, "--name", "defaults-none", "--stack", "none")
+        self.assertEqual(self.checks(root), ["true", "echo VERIFY OK"])
+
+    # ---- the tests directory in CLAUDE.md "Where things live" (ticket #5)
+    def where(self, root):
+        text = self.read(root, "CLAUDE.md")
+        return text.split("## Where things live", 1)[1].split("\n## ", 1)[0]
+
+    def names_dir(self, section, directory):
+        return re.search(r"`" + re.escape(directory.rstrip("/")) + r"/?`", section) is not None
+
+    def test_tests_directory_is_detected_on_disk(self):
+        for directory in ("tests", "test", "plugins/harness/tests", "plugins/other/tests"):
+            with self.subTest(directory=directory):
+                root = self.mk("disk-" + directory.replace("/", "-"))
+                self.write(os.path.join(root, directory, "test_a.py"), "pass\n")
+                self.ok("init", root, "--name", "disk", "--stack", "none")
+                section = self.where(root)
+                self.assertTrue(self.names_dir(section, directory), section)
+                if directory == "test":
+                    self.assertFalse(self.names_dir(section, "tests"), section)    # not the old guess
+                if directory == "tests":
+                    self.assertFalse(self.names_dir(section, "test"), section)
+
+    def test_tests_directory_comes_from_the_verify_commands_s_argument(self):
+        cases = [("python3 -m unittest discover -s plugins/harness/tests", "plugins/harness/tests"),
+                 ("python3 -m unittest discover -s spec -v", "spec"),
+                 ("python3 -m unittest discover -s src/pkg/checks/", "src/pkg/checks")]
+        for n, (command, directory) in enumerate(cases):
+            with self.subTest(verify=command):
+                root = self.mk(f"sflag{n}")
+                self.write(os.path.join(root, directory, "test_a.py"), "pass\n")
+                self.ok("init", root, "--name", f"sflag{n}", "--stack", "none", "--verify", command)
+                section = self.where(root)
+                self.assertTrue(self.names_dir(section, directory), section)
+                self.assertFalse(self.names_dir(section, "tests"), section)    # no stale guess next to it
+
+    def test_s_argument_is_named_when_the_directory_does_not_exist_yet(self):
+        root = self.mk("sflag-fresh")
+        self.ok("init", root, "--name", "fresh", "--stack", "none", "--verify",
+                "python3 -m unittest discover -s checks")
+        self.assertTrue(self.names_dir(self.where(root), "checks"), self.where(root))
+
+    def test_stack_skeleton_tests_directory_is_named(self):
+        for stack in ("python", "node"):
+            with self.subTest(stack=stack):
+                root = self.mk(f"skel-{stack}")
+                self.ok("init", root, "--name", f"skel-{stack}", "--stack", stack)
+                self.assertTrue(self.names_dir(self.where(root), "tests"), self.where(root))
+
+    def test_no_tests_directory_is_not_guessed(self):
+        root = self.mk("notests")
+        self.ok("init", root, "--name", "notests", "--stack", "none")
+        section = self.where(root)
+        self.assertFalse(self.names_dir(section, "tests"), section)
+        self.assertFalse(self.names_dir(section, "test"), section)
+        self.assertIn("`scripts/verify.sh`", section)
+
 
 # =========================================================================== rules
 class Rules(ScaffoldTest):
