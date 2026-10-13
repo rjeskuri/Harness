@@ -40,8 +40,9 @@ Allowed always: a linked worktree, a detached HEAD, a repo with no commits, a pa
 any repo, and any repo whose HARNESS_ALLOW_MAIN is 1 (environment first, then `env` in the
 repo's .claude/settings.json, then .claude/settings.local.json).
 
-tests_first.py imports this module for walk(), writes(), git_split(), git_paths() and
-code_writes(); importing it has no side effects.
+tests_first.py imports this module for walk(), writes(), git_split(), git_paths(),
+code_writes() and the helpers and writer tables behind them; importing it has no side
+effects.
 
 A refusal prints {"hookSpecificOutput": {"hookEventName": "PreToolUse",
 "permissionDecision": "deny", "permissionDecisionReason": "..."}} and exits 0. Allowing
@@ -101,11 +102,24 @@ RSYNC_VALUE_OPTIONS = set(
     "--log-file --password-file --compare-dest --copy-dest --link-dest --timeout "
     "--port --remote-option --rsync-path".split()
 )
-PATCH_VALUE_OPTIONS = set(
-    "-p -d -i -o -r -B -D -F -V -z -Y --strip --directory --input --output "
-    "--reject-file --prefix --ifdef --fuzz --version-control --suffix "
-    "--basename-prefix".split()
+# patch (GNU and BSD): the short options that take a value, every long option (getopt
+# accepts any unambiguous prefix of one) and the long options that take a value.
+PATCH_SHORT_VALUES = set("BDFVYdgioprxz")
+PATCH_LONG_OPTIONS = (
+    "--backup --backup-if-mismatch --basename-prefix --batch --binary --check "
+    "--context --debug --directory --dry-run --ed --follow-symlinks --force --forward "
+    "--fuzz --get --help --ifdef --ignore-whitespace --input --merge "
+    "--no-backup-if-mismatch --normal --output --posix --prefix --quiet --quoting-style "
+    "--read-only --reject-file --reject-format --remove-empty-files --reverse "
+    "--set-time --set-utc --silent --strip --suffix --unified --verbose --version "
+    "--version-control".split()
 )
+PATCH_LONG_VALUES = set(
+    "--basename-prefix --debug --directory --fuzz --get --ifdef --input --output "
+    "--prefix --quoting-style --read-only --reject-file --reject-format --strip "
+    "--suffix --version-control".split()
+)
+STASH_VALUE_OPTIONS = {"-m", "--message", "--pathspec-from-file"}
 AWK_VALUE_OPTIONS = set(
     "-i -f -v -F -l -e -E --include --file --assign --field-separator --load --source "
     "--exec".split()
@@ -820,9 +834,16 @@ def checkout_paths(rest: list[str], where: str | None) -> list[str]:
     return []
 
 
+def stash_action(rest: list[str]) -> str:
+    """The git stash subcommand `rest` runs: push when it starts with an option or is
+    empty."""
+    return rest[0] if rest and not rest[0].startswith("-") else "push"
+
+
 def git_paths(sub: str, rest: list[str], where: str | None) -> list[str]:
-    """The working-tree paths git `sub` `rest` writes, relative to `where`: checkout and
-    restore of paths, rm and mv (dry runs and index-only forms write none)."""
+    """The working-tree paths git `sub` `rest` names to write, relative to `where`:
+    checkout and restore of paths, rm, mv, stash push and clean of paths (dry runs and
+    index-only forms write none)."""
     if sub == "checkout":
         return checkout_paths(rest, where)
     if sub == "restore" and not index_only(rest):
@@ -831,6 +852,11 @@ def git_paths(sub: str, rest: list[str], where: str | None) -> list[str]:
         return plain_args(rest)
     if sub == "mv" and not dry_run(rest):
         return plain_args(rest)
+    if sub == "stash" and stash_action(rest) == "push":
+        given = rest[1:] if rest[:1] == ["push"] else rest
+        return plain_args(given, STASH_VALUE_OPTIONS)
+    if sub == "clean" and not dry_run(rest):
+        return plain_args(rest, {"-e", "--exclude"})
     return []
 
 
@@ -1044,6 +1070,62 @@ def chmod_files(args: list[str]) -> list[str]:
     return files
 
 
+def long_option(word: str, names) -> str:
+    """The long option in `names` that `word` (no =value) spells out or abbreviates
+    unambiguously; `word` itself otherwise."""
+    if word in names:
+        return word
+    found = [n for n in names if n.startswith(word)]
+    return found[0] if len(found) == 1 else word
+
+
+def patch_args(args: list[str]) -> tuple[str | None, str | None, list[str], bool]:
+    """(the -d directory, the -o file, the file arguments, whether it is a dry run) for
+    `patch args`. Short options cluster (-Rp1) and a value letter takes the rest of the
+    word or the next one; long options may be abbreviated and take a value after = or
+    as the next word; everything after -- is a file argument."""
+    directory = output = None
+    files: list[str] = []
+    dry = False
+    k = 0
+    while k < len(args):
+        a = args[k]
+        k += 1
+        if a == "--":
+            files.extend(args[k:])
+            break
+        if a.startswith("--"):
+            word, eq, value = a.partition("=")
+            word = long_option(word, PATCH_LONG_OPTIONS)
+            if word in PATCH_LONG_VALUES and not eq:
+                value = args[k] if k < len(args) else ""
+                k += 1
+            if word == "--directory":
+                directory = value
+            elif word == "--output":
+                output = value
+            elif word in ("--dry-run", "--check"):
+                dry = True
+        elif a.startswith("-") and a != "-":
+            letters = a[1:]
+            for j, ch in enumerate(letters):
+                if ch == "C":  # BSD's --check
+                    dry = True
+                if ch in PATCH_SHORT_VALUES:
+                    value = letters[j + 1 :]
+                    if not value:
+                        value = args[k] if k < len(args) else ""
+                        k += 1
+                    if ch == "d":
+                        directory = value
+                    elif ch == "o":
+                        output = value
+                    break
+        else:
+            files.append(a)
+    return directory, output, files, dry
+
+
 def copy_writes(name: str, args: list[str], cwd: str | None, options: set) -> list:
     """(destination as written, path written) for cp, install, ln and mv: the
     destination, or the name each source gets inside it when it is a directory."""
@@ -1151,15 +1233,16 @@ def file_writes(name: str, args: list[str], cwd: str | None) -> list:
             found.append((dest, path, f"{name} changes {dest} inside the repo", True))
         return found
     if name == "patch":
-        if {"--dry-run", "--check", "-C"} & set(args):
+        directory, out, files, dry = patch_args(args)
+        if dry or out == "-":  # -o - writes to standard output
             return []
-        out = option_value(args, ("-o", "--output"))
-        if out is not None:
-            return changes([out])
-        plain = plain_args(args, PATCH_VALUE_OPTIONS)
-        if plain:
-            return changes(plain[:1])
-        where = option_value(args, ("-d", "--directory")) or "."
+        # the output file, else the file to patch (a second one is the diff it reads);
+        # patch changes into the -d directory before anything else
+        named = [out] if out is not None else files[:1]
+        if named:
+            path = os.path.join(directory or "", named[0])
+            return [(named[0], path, f"patch changes {named[0]} inside the repo", True)]
+        where = directory or "."
         return [(where, where, f"patch changes files in {place(where)}", False)]
     return []
 
