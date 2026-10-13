@@ -561,6 +561,150 @@ class RedTest(unittest.TestCase):
         self.assertOneLineError(self.red("scratch", "run"), "No scratch copy for t/12-slug")
 
 
+@unittest.skipUnless(GIT, "git is not installed")
+class NoTests(unittest.TestCase):
+    """A ticket whose cache (<state>/tickets/<N>.json, as harness-board writes it) carries `no-tests` needs no red
+    run: check and status say so and exit 0, and nothing is recorded. Every other ticket is unchanged. Same
+    fixture as RedTest (borrowed, so its tests are not run again here)."""
+    setUp = RedTest.setUp
+    git = RedTest.git
+    red = RedTest.red
+    put = RedTest.put
+    record = RedTest.record
+    assertOneLineError = RedTest.assertOneLineError
+
+    def cache(self, number=12, flags=("no-tests",)):
+        write(os.path.join(self.state, "tickets", f"{number}.json"),
+              json.dumps({"number": number, "title": "A ticket", "flags": list(flags),
+                          "labels": ["task", "status:in-progress"] + list(flags)}))
+
+    def second_worktree(self, number, slug):
+        wt = os.path.join(self.repo, ".claude", "worktrees", f"t-{number}-{slug}")
+        self.git(self.repo, "worktree", "add", "-q", wt, "-b", f"t/{number}-{slug}", "origin/main")
+        return wt
+
+    def message(self, number):
+        return f"ticket {number} is no-tests: no red run needed"
+
+    def test_check_on_a_no_tests_ticket_exits_zero_and_records_nothing(self):
+        self.cache(12)
+        self.put("docs/guide.md", "# Guide\n\nA docs-only change.\n")      # what such a ticket changes
+        p = self.red("check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(self.message(12), p.stdout)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(self.record_path))
+        self.assertFalse(os.path.isdir(os.path.dirname(self.record_path)))
+
+        # The number in the message is the ticket's, not a constant: another ticket, another worktree.
+        self.cache(47)
+        wt = self.second_worktree(47, "other-docs")
+        p = self.red("check", cwd=wt)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(self.message(47), p.stdout)
+        self.assertNotIn("ticket 12", p.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "red", "t-47-other-docs.json")))
+
+        p = self.red("check", "--worktree", wt, cwd=self.tmp)
+        self.assertEqual((p.returncode, self.message(47) in p.stdout), (0, True), p.stdout + p.stderr)
+
+    def test_check_on_a_no_tests_ticket_does_not_run_the_test_command(self):
+        # Tests that would prove red are on the branch, yet a no-tests ticket neither runs them nor records them.
+        self.cache(12)
+        marker = os.path.join(self.tmp, "ran.marker")
+        script = write(os.path.join(self.tmp, "mark.py"), f"open({marker!r}, 'w').close()\n")
+        env = {"HARNESS_TEST_CMD": f"python3 {shlex.quote(script)} {{files}}"}
+        self.put("tests/test_calc.py", TEST_ADD)
+        p = self.red("check", **env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(self.message(12), p.stdout)
+        self.assertFalse(os.path.exists(marker), "the test command ran on a no-tests ticket")
+        self.assertFalse(os.path.exists(self.record_path))
+
+        # An older record is left exactly as it was.
+        write(self.record_path, '{"branch": "t/12-slug", "kept": true}\n')
+        self.assertEqual(self.red("check", **env).returncode, 0)
+        self.assertEqual(read(self.record_path), '{"branch": "t/12-slug", "kept": true}\n')
+
+    def test_status_on_a_no_tests_ticket_says_the_same(self):
+        self.cache(12)
+        p = self.red("status")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(self.message(12), p.stdout)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(self.record_path))
+
+        self.cache(47)
+        wt = self.second_worktree(47, "other-docs")
+        p = self.red("status", "--worktree", wt, cwd=self.tmp)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(self.message(47), p.stdout)
+
+    def test_json_on_a_no_tests_ticket_prints_one_json_object_and_records_nothing(self):
+        # --json keeps its contract: one parseable object, not the plain line.
+        for sub in ("check", "status"):
+            with self.subTest(sub=sub, ticket=12):
+                self.cache(12)
+                self.put("docs/guide.md", "# Guide\n\nA docs-only change.\n")
+                p = self.red(sub, "--json")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(json.loads(p.stdout),
+                                 {"no_tests": True, "ticket": 12, "message": self.message(12)})
+                self.assertIsInstance(json.loads(p.stdout)["ticket"], int)
+                self.assertEqual(len(p.stdout.strip().splitlines()), 1, p.stdout)
+                self.assertFalse(os.path.exists(self.record_path))
+        # Another ticket, another worktree.
+        self.cache(47)
+        wt = self.second_worktree(47, "other-docs")
+        for sub in ("check", "status"):
+            with self.subTest(sub=sub, ticket=47):
+                p = self.red(sub, "--json", "--worktree", wt, cwd=self.tmp)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(json.loads(p.stdout),
+                                 {"no_tests": True, "ticket": 47, "message": self.message(47)})
+                self.assertFalse(os.path.exists(os.path.join(self.state, "red", "t-47-other-docs.json")))
+
+    def test_json_on_an_ordinary_ticket_is_not_the_no_tests_object(self):
+        self.cache(12, ())
+        self.put("tests/test_calc.py", TEST_ADD)
+        p = self.red("check", "--json")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("no_tests", p.stdout)
+        status = self.red("status", "--json")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertNotIn("no_tests", json.loads(status.stdout))
+
+    def test_a_ticket_without_the_flag_is_unchanged(self):
+        # No cache at all, an empty flag list and other flags: today's behavior, record included.
+        for flags in (None, (), ("needs-local", "priority:high")):
+            with self.subTest(flags=flags):
+                if flags is not None:
+                    self.cache(12, flags)
+                self.assertOneLineError(self.red("check"), "No test changes on this branch")
+                self.assertOneLineError(self.red("status"), f"No red run recorded for {BRANCH}")
+                self.assertFalse(os.path.exists(self.record_path))
+        self.put("tests/test_calc.py", TEST_ADD)
+        p = self.red("check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout.splitlines()[0], "red (assertion): 1 test files, exit 1")
+        self.assertNotIn("no-tests", p.stdout)
+        self.assertEqual(set(self.record()), RECORD_KEYS)
+        status = self.red("status")
+        self.assertIn("kind: assertion (exit 1)", status.stdout)
+        self.assertNotIn("no-tests", status.stdout)
+
+    def test_another_tickets_no_tests_flag_does_not_exempt_this_one(self):
+        self.cache(13)                                          # t/12-slug is the branch under test
+        self.assertOneLineError(self.red("check"), "No test changes on this branch")
+        self.assertOneLineError(self.red("status"), f"No red run recorded for {BRANCH}")
+        self.put("tests/test_calc.py", TEST_ADD)
+        p = self.red("check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout.splitlines()[0], "red (assertion): 1 test files, exit 1")
+        self.assertTrue(os.path.isfile(self.record_path))
+
+
 class RedHelpers(unittest.TestCase):
     """The pure parts, imported from the script."""
 

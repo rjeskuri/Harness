@@ -415,6 +415,104 @@ class Open(WorktreeTest):
         self.assertTrue(os.path.isfile(self.state_path("tickets", "12.json")))
 
 
+NO_TESTS_RED = "none: the ticket is no-tests"
+NO_RED = "No red run recorded on this branch."
+
+
+class OpenNoTests(WorktreeTest):
+    """A ticket flagged no-tests has no red run; the body says why instead of "No red run recorded"."""
+
+    def open_body(self, flags, red_status):
+        ticket = dict(board_ticket("low"), flags=list(flags), labels=["task", "status:in-progress", "risk:low"]
+                      + list(flags))
+        self.outputs(**{"harness-board": {"show": {"stdout": json.dumps(ticket)},
+                                          "comment": {"stdout": "https://github.com/o/r/issues/12#c1\n"}},
+                        "harness-red": {"status": red_status}})
+        self.scenario([{"match": ["pr", "list"], "stdout_json": []},
+                       {"match": ["pr", "create"], "stdout": PR_URL + "\n"}])
+        self.ok("open", "12", cwd=self.wt)
+        return next(c for c in self.gh_calls() if c["argv"][:2] == ["pr", "create"])["stdin"]
+
+    def test_the_red_block_says_the_ticket_is_no_tests(self):
+        # harness-red status on a no-tests ticket prints its message and exits 0 (not JSON), or has no record
+        # and exits 1; either way the ticket's flag decides what the body says.
+        for label, red_status in (("message", {"stdout": "ticket 12 is no-tests: no red run needed\n"}),
+                                  ("refusal", {"stderr": "harness-red: No red run recorded\n", "exit": 1})):
+            with self.subTest(red=label):
+                body = self.open_body(["no-tests"], red_status)
+                lines = body.splitlines()
+                self.assertIn(NO_TESTS_RED, lines)
+                self.assertNotIn(NO_RED, body)
+                at = lines.index(NO_TESTS_RED)
+                self.assertTrue(lines[at - 1] == "```" and lines[at + 1] == "```", "\n".join(lines[at - 2:at + 3]))
+                self.assertTrue(lines[at - 2].startswith("Red run before implementation"), lines[at - 2])
+                self.assertEqual(lines[0], "Closes #12")
+                self.assertIn("## Definition of done\n- [ ] The widget frobs twice", body)
+                self.assertIn("No verify log attached.", body)
+                self.assertNotIn("{{", body)
+
+    def open_body_labels(self, labels, flags, red_status):
+        ticket = dict(board_ticket("low"), flags=list(flags), labels=["task", "status:in-progress", "risk:low"]
+                      + list(labels))
+        self.outputs(**{"harness-board": {"show": {"stdout": json.dumps(ticket)},
+                                          "comment": {"stdout": "https://github.com/o/r/issues/12#c1\n"}},
+                        "harness-red": {"status": red_status}})
+        self.scenario([{"match": ["pr", "list"], "stdout_json": []},
+                       {"match": ["pr", "create"], "stdout": PR_URL + "\n"}])
+        self.ok("open", "12", cwd=self.wt)
+        return next(c for c in self.gh_calls() if c["argv"][:2] == ["pr", "create"])["stdin"]
+
+    def test_the_no_tests_json_object_from_harness_red_is_not_a_red_record(self):
+        # `harness-red status --json` on a no-tests ticket prints {"no_tests": true, ...} and exits 0.
+        base = {"no_tests": True, "ticket": 12, "message": "ticket 12 is no-tests: no red run needed"}
+        for label, obj in (("plain", base),
+                           ("with files", dict(base, run_files=["tests/leak.py"], test_files=["tests/leak2.py"]))):
+            with self.subTest(obj=label):
+                body = self.open_body(["no-tests"], {"stdout": json.dumps(obj)})
+                self.assertIn(NO_TESTS_RED, body.splitlines())
+                self.assertNotIn(NO_RED, body)
+                self.assertNotIn("Test files run", body)
+                self.assertNotIn("tests/leak", body)
+                self.assertNotIn("unknown", body)
+                self.assertNotIn("exit None", body)
+
+    def test_the_body_trusts_flags_not_labels(self):
+        # A `no-tests` label with empty flags: the body keeps the ordinary line.
+        body = self.open_body_labels(["no-tests"], [], {"stderr": "harness-red: No red run recorded\n", "exit": 1})
+        self.assertIn(NO_RED, body)
+        self.assertNotIn(NO_TESTS_RED, body)
+
+    def test_other_flags_keep_the_no_red_run_line(self):
+        for flags in ([], ["needs-local"], ["priority:high", "needs-local"]):
+            with self.subTest(flags=flags):
+                body = self.open_body(flags, {"stderr": "harness-red: No red run recorded\n", "exit": 1})
+                self.assertIn(NO_RED, body)
+                self.assertNotIn("no-tests", body)
+
+    def test_a_recorded_red_run_still_prints_its_tail_on_an_ordinary_ticket(self):
+        body = self.open_body(["needs-local"], {"stdout": json.dumps(RED_RECORD)})
+        self.assertIn("Red run before implementation (assertion, exit 1):", body.splitlines())
+        self.assertIn("red line 40", body.splitlines())
+        self.assertNotIn(NO_TESTS_RED, body)
+        self.assertNotIn(NO_RED, body)
+
+    def test_with_the_real_board_tool_the_no_tests_label_reaches_the_body(self):
+        """No stubs: harness-board turns the `no-tests` label into the flag and harness-red has no record."""
+        body = ("## Request\nFix the docs.\n\n## Definition of done\n- [ ] The guide is correct\n\n"
+                "## Tests that must pass\n- None: docs only\n")
+        issue = {"number": 12, "title": "Fix the docs", "url": "https://github.com/o/r/issues/12", "body": body,
+                 "labels": [{"name": "task"}, {"name": "risk:low"}, {"name": "no-tests"}], "state": "OPEN",
+                 "parent": None, "blockedBy": [], "comments": []}
+        self.scenario([{"match": ["issue", "view", "12"], "stdout_json": issue},
+                       {"match": ["pr", "list"], "stdout_json": []},
+                       {"match": ["pr", "create"], "stdout": PR_URL + "\n"},
+                       {"match": ["issue", "comment", "12"], "stdout": "https://github.com/o/r/issues/12#c1\n"}])
+        self.ok("open", "12", "--json", cwd=self.wt, stubs=False)
+        create = next(c for c in self.gh_calls() if c["argv"][:2] == ["pr", "create"])
+        self.assertIn(NO_TESTS_RED, create["stdin"].splitlines())
+        self.assertNotIn(NO_RED, create["stdin"])
+
+
 # =========================================================================== review
 DIFF = """diff --git a/widget.py b/widget.py
 index 1111111..2222222 100644
