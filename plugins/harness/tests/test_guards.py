@@ -70,6 +70,7 @@ BULK_GIT_FORMS = (
     "git restore .",
     "git restore -- .",
     "git restore --source=HEAD --worktree .",
+    "git restore --staged --worktree .",
     "git restore src",
     "git reset --hard",
     "git reset --hard HEAD",
@@ -108,6 +109,27 @@ HIDDEN_WRITER_FORMS = (
         "find . -name 'test_*.py' -exec cp /dev/null {} \\;",
         "find . -name 'test_*.py' -exec cp /dev/null {} \\;",
     ),
+    ("find . -exec mv {} /tmp \\;", "find . -exec mv {} /tmp \\;"),
+    ("find . -exec sh -c 'echo > {}' \\;", "find . -exec sh -c 'echo > {}' \\;"),
+    (
+        "find . -name '*.py' -exec sed --in-place 's/a/b/' {} +",
+        "find . -name '*.py' -exec sed --in-place 's/a/b/' {} +",
+    ),
+    ("find . -exec tee {} \\;", "find . -exec tee {} \\;"),
+    # -i / --input names the diff, not a file to change
+    ("patch -p1 -i fix.py", "patch -p1 -i fix.py"),
+    ("patch -p1 --input=fix.py", "patch -p1 --input=fix.py"),
+)
+# checkout or restore of any directory is bulk, whatever the directory holds; the
+# fixture (commit_directories) makes lib/ (source only), pkg/ (source only) and docs/
+# (no tests at all).
+DIRECTORY_FORMS = (
+    "git checkout -- lib",
+    "git checkout HEAD -- lib/",
+    "git restore pkg/",
+    "git restore --source=HEAD pkg",
+    "git checkout -- docs",
+    "git restore docs",
 )
 INLINE = "Write files with Edit or Write so the tests-first rules can see the path."
 NO_RED = (
@@ -1214,6 +1236,115 @@ class TestsFirstTests(GuardTestCase):
                     self.bash(command, breaker, cwd=scratch), command, BREAKER_ON_TEST
                 )
 
+    def commit_directories(self) -> None:
+        """lib/ and pkg/ with source only, docs/ with no tests, on the ticket branch."""
+        self.write(self.wt / "lib/util.py", "def util():\n    return 1\n")
+        self.write(self.wt / "pkg/mod.py", "def mod():\n    return 2\n")
+        self.write(self.wt / "docs/notes.md", "notes\n")
+        self.git(self.wt, "add", "-A")
+        self.git(self.wt, "commit", "-q", "-m", "Add directories")
+
+    def test_any_directory_checkout_is_bulk(self):
+        self.commit_directories()
+        self.cache()
+        self.red()
+        for command in DIRECTORY_FORMS:
+            with self.subTest(command=command, agent="harness:coder"):
+                self.assertRefusedAs(
+                    self.bash(command, "harness:coder"), command, CODER_ON_TEST
+                )
+            with self.subTest(command=command, agent="harness:test-breaker"):
+                self.assertRefusedAs(
+                    self.bash(command, "harness:test-breaker"), command, BREAKER_ON_TEST
+                )
+        part = "git checkout -- ."
+        self.assertRefusedAs(
+            self.bash(f"cd lib && {part}", "harness:coder"), part, CODER_ON_TEST
+        )
+
+    def other_ticket_worktree(self, name: str, files: dict) -> Path:
+        """A repo `name` holding `files`, its t/12 worktree, and a no-tests ticket cache
+        so that only the role rules can refuse there."""
+        repo = self.make_repo(name, commit=False)
+        for rel, text in files.items():
+            self.write(repo / rel, text)
+        self.git(repo, "add", "-A")
+        self.git(repo, "commit", "-q", "-m", "Initial commit")
+        wt = self.worktree(repo, name=f"{name}-wt")
+        key = hashlib.sha1(str(repo.resolve()).encode()).hexdigest()[:12]
+        ticket = {"number": 12, "type": "chore", "flags": ["no-tests"]}
+        self.write(
+            self.home / ".claude/harness/repos" / key / "tickets/12.json",
+            json.dumps(ticket),
+        )
+        return wt
+
+    def test_bulk_forms_reach_tests_wherever_they_live(self):
+        source = "def login():\n    return None\n"
+        test = "def test_login():\n    pass\n"
+        # no tests/ directory: the only test is lib/test_other.py
+        elsewhere = self.other_ticket_worktree(
+            "elsewhere",
+            {"README.md": "hi\n", "src/app.py": source, "lib/test_other.py": test},
+        )
+        # tests are checks/** by pattern; tests/test_app.py is plain source here
+        patterned = self.other_ticket_worktree(
+            "patterned",
+            {
+                "README.md": "hi\n",
+                "src/app.py": source,
+                "tests/test_app.py": source,
+                "checks/check_app.py": test,
+            },
+        )
+        env = {"HARNESS_TEST_PATTERNS": "checks/**"}
+        # the pattern took effect: tests/test_app.py is the coder's to edit there
+        edit = {"file_path": str(patterned / "tests/test_app.py")}
+        payload = self.payload("Edit", edit, patterned, "harness:coder")
+        self.assertIsNone(self.decision(self.run_hook("tests_first.py", payload, env)))
+        for wt, run_env in ((elsewhere, {}), (patterned, env)):
+            for command in (
+                "git stash",
+                "git stash pop",
+                "git reset --hard",
+                "git checkout -- .",
+                "git restore .",
+                "git clean -fd",
+            ):
+                with self.subTest(repo=wt.name, command=command):
+                    payload = self.payload(
+                        "Bash", {"command": command}, wt, "harness:coder"
+                    )
+                    reason = self.decision(
+                        self.run_hook("tests_first.py", payload, run_env)
+                    )
+                    self.assertRefusedAs(reason, command, CODER_ON_TEST)
+
+    def test_named_paths_are_judged_as_edits_of_them(self):
+        self.cache()
+        self.red()
+        refused = "refused"
+        for command, coder in (
+            ("git stash push -- src/app.py", None),
+            ("git clean -f src/app.py", None),
+            ("patch -p1 README.md < fix.diff", None),
+            ("git stash push -- tests/test_app.py", refused),
+            ("git clean -f tests/test_new.py", refused),
+            ("patch -p1 tests/fixtures/data.txt < fix.diff", refused),
+        ):
+            with self.subTest(command=command):
+                reason = self.bash(command, "harness:coder")
+                if coder is None:
+                    self.assertIsNone(reason)
+                else:
+                    self.assertRefusedAs(reason, command, CODER_ON_TEST)
+        for command in (
+            "patch -p1 README.md < fix.diff",
+            "patch -p1 tests/fixtures/data.txt < fix.diff",
+        ):
+            with self.subTest(command=command, agent="harness:test-author"):
+                self.assertIsNone(self.bash(command, "harness:test-author"))
+
     def test_hidden_writers_are_refused_to_the_roles(self):
         self.cache()
         self.red()
@@ -1243,7 +1374,10 @@ class TestsFirstTests(GuardTestCase):
             "git reset --soft HEAD",
             "git reset -q HEAD -- tests/test_app.py",
             "git clean -n",
+            "git clean --dry-run",
+            "git clean -n -d",
             "find . -name '*.py'",
+            "find . -name 'x.i' -exec sed -n 1p {} \\;",
             "find tests -type f -print",
             "find . -name '*.py' -exec grep -l login {} +",
             "find . -exec sed -n 1p {} \\;",
@@ -1256,7 +1390,12 @@ class TestsFirstTests(GuardTestCase):
 
     def test_bulk_and_hidden_forms_are_left_alone_off_a_ticket_branch(self):
         self.commit_test_under_src()
-        commands = list(BULK_GIT_FORMS) + [c for c, _ in HIDDEN_WRITER_FORMS]
+        self.commit_directories()
+        commands = (
+            list(BULK_GIT_FORMS)
+            + list(DIRECTORY_FORMS)
+            + [c for c, _ in HIDDEN_WRITER_FORMS]
+        )
         roles = ("harness:coder", "harness:test-breaker", "harness:test-author")
         for command in commands:  # the main checkout, on main
             for agent in roles:
