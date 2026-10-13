@@ -440,6 +440,70 @@ class RedTest(unittest.TestCase):
         self.assertIn("ran ['specs/test_calc.py']", p.stdout)
         self.assertEqual(self.record()["cmd"], f"python3 {shlex.quote(runner)} specs/test_calc.py")
 
+    def test_unusable_main_settings_fall_back_to_the_defaults_not_the_worktree(self):
+        main = os.path.join(self.repo, ".claude", "settings.json")
+        cases = [("malformed json", "{not json"), ("empty file", ""), ("top level list", "[]"),
+                 ("env is a list", json.dumps({"env": ["HARNESS_TEST_PATTERNS=specs/**"]})),
+                 ("env is a string", json.dumps({"env": "HARNESS_TEST_PATTERNS=specs/**"})),
+                 ("env is null", json.dumps({"env": None})), ("missing file", None)]
+        for name, content in cases:
+            with self.subTest(name):
+                if content is None:
+                    os.remove(main)
+                else:
+                    write(main, content)
+                self.settings(self.wt, {"HARNESS_TEST_PATTERNS": "checks/**"})     # the decoy the worktree must not win with
+                self.put("tests/test_calc.py", TEST_ADD)
+                try:
+                    p = self.red("check")
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
+                    self.assertEqual(self.record()["test_files"], ["tests/test_calc.py"])      # the defaults
+                    self.put("checks/helper.py", "X = 1\n")
+                    self.assertEqual(self.refused_sources(self.red("check")), ["checks/helper.py"])
+                finally:
+                    for f in ("tests/test_calc.py", "checks/helper.py"):
+                        if os.path.isfile(os.path.join(self.wt, f)):
+                            os.remove(os.path.join(self.wt, f))
+
+    def test_main_setting_values_are_read_like_tests_first(self):
+        # tests_first.setting(): str, int and float count (as text); bool, list and null do not (the defaults apply)
+        self.put("tests/test_calc.py", TEST_ADD)
+        for value in (5, 2.5):
+            with self.subTest(value=value):
+                self.settings(self.repo, {"HARNESS_TEST_PATTERNS": value})
+                p = self.red("check")                                   # the pattern is the text "5": tests/ is no test
+                self.assertOneLineError(p, "No test changes on this branch")
+        for value in (True, False, ["specs/**"], None, {"a": 1}):
+            with self.subTest(value=value):
+                self.settings(self.repo, {"HARNESS_TEST_PATTERNS": value})
+                p = self.red("check")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(self.record()["test_files"], ["tests/test_calc.py"])
+
+    def test_run_from_the_main_checkout_itself(self):
+        self.git(self.repo, "checkout", "-q", "-b", "t/13-main")
+        self.settings(self.repo, {"HARNESS_TEST_PATTERNS": "specs/**"})
+        self.settings(self.repo, {"HARNESS_TEST_PATTERNS": "extra/**"}, local=True)     # still never read
+        self.put("specs/test_calc.py", TEST_ADD, root=self.repo)
+        p = self.red("check", cwd=self.repo)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rec = json.loads(read(os.path.join(self.state, "red", "t-13-main.json")))
+        self.assertEqual((rec["branch"], rec["test_files"]), ("t/13-main", ["specs/test_calc.py"]))
+        for rel in ("extra/helper.py", "tests/test_other.py"):
+            self.put(rel, "X = 1\n", root=self.repo)
+        self.assertEqual(self.refused_sources(self.red("check", cwd=self.repo)),
+                         ["extra/helper.py", "tests/test_other.py"])
+
+    def test_test_timeout_still_comes_from_the_worktree_settings(self):
+        self.settings(self.repo, {"HARNESS_TEST_PATTERNS": "specs/**", "HARNESS_TEST_TIMEOUT": 600})
+        self.settings(self.wt, {"HARNESS_TEST_TIMEOUT": 1, "HARNESS_TEST_PATTERNS": "checks/**"})
+        self.put("specs/test_hang.py", TEST_HANG)
+        started = time.monotonic()
+        p = self.red("check")
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertOneLineError(p, "timed out after 1s", "no red run recorded")
+
     # ------------------------------------------------------------ status
     def test_status_current(self):
         self.assertOneLineError(self.red("status"), f"No red run recorded for {BRANCH}")
