@@ -30,7 +30,12 @@ Templates live in ../templates next to this script and are rendered by plain sub
   (none when the project keeps its own layout), else empty (the line is dropped).
 
 Rules: an existing file is never overwritten without --force, and each path is reported as
-created, kept or updated. The stack skeleton (pyproject.toml, src/<pkg>/__init__.py,
+created, kept or updated. A kept .claude/settings.json is never edited, but `warn:` lines (--dry-run
+and the real run alike) name each ask or deny rule that would stop a dispatched run on a loop command
+(git, gh, harness-*, the file's own CLAUDE_VERIFY_CMD, else the rendered one), each allow entry of the
+stack's template that no allow rule covers and each env key of it that is absent, with the value to add;
+a file that is not usable settings gets one warn line.
+The stack skeleton (pyproject.toml, src/<pkg>/__init__.py,
 tests/test_smoke.py; package.json, tests/smoke.test.js) is written only when the project has no
 manifest of any stack, no Makefile with a test or check target and no tests (a tests/, test/ or spec/
 directory, or a file matching the test patterns outside dot-directories, node_modules, __pycache__
@@ -73,6 +78,12 @@ STACK_ALLOW = {
     "node": ["Bash(npm test:*)", "Bash(npm run lint:*)", "Bash(node --test:*)"],
     "none": [],
 }
+
+# Commands a dispatched run needs, as words: an ask or deny rule on any of them (or inside or around one)
+# stops it, since a headless run cannot answer. The verify command and every harness-* tool come on top.
+LOOP_COMMANDS = [["git", "add"], ["git", "commit"], ["git", "push"], ["git", "fetch"], ["git", "worktree"],
+                 ["gh", "issue"], ["gh", "pr"], ["gh", "api"]]
+KEPT = ".claude/settings.json"
 
 # The skeleton of each stack: (template, destination). Written only when own_layout() finds nothing.
 SKELETON = {
@@ -501,6 +512,134 @@ def preview(root, files, force):
     return [(dest, status_of(root, dest, content, force)) for dest, content, _ in files]
 
 
+def bash_rule(rule):
+    """(words, prefix) of a Bash permission rule, None for any other rule. `prefix` is true when the rule
+    ends in `:*` (or ` *`) and so covers every command that starts with those words; bare `Bash` and
+    `Bash(*)` are the empty prefix. A rule without it matches that one command. A `*` word elsewhere
+    stays in `words`: it matches one or more words."""
+    if rule == "Bash":
+        return [], True
+    m = re.fullmatch(r"Bash\((.*)\)", rule, re.S)
+    if not m:
+        return None
+    inner = m.group(1).strip()
+    prefix = inner.endswith((":*", " *"))
+    if prefix:
+        inner = inner[:-2].strip()
+    return ([] if inner == "*" else inner.split()), prefix or inner == "*"
+
+
+def match_kinds(pattern, prefix, command):
+    """How a rule's words can match a command: {"covers"} when it can match the command itself (or any
+    start of it, for a prefix rule), {"overlaps"} when it can match only longer commands that start with
+    the command. A `*` word matches one or more words."""
+    if not command:
+        return {"covers"} if not pattern else {"overlaps"}
+    if not pattern:
+        return {"covers"} if prefix else set()
+    if pattern[0] == "*":
+        return set().union(*(match_kinds(pattern[1:], prefix, command[k:]) for k in range(1, len(command) + 1)))
+    return match_kinds(pattern[1:], prefix, command[1:]) if pattern[0] == command[0] else set()
+
+
+def stops_run(rule, loop, verify):
+    """(firm, command text) when an ask or deny rule stops a dispatched run for sure: a prefix rule that
+    covers a loop command, or any rule that matches a verify command, which runs verbatim. (False, text)
+    when it only may: it is narrower than a command, a `*` word could make it match one, or it is exactly
+    a loop command, which a run never issues bare. None when it leaves them all alone. Any harness-*
+    command counts."""
+    parsed = bash_rule(rule)
+    if parsed is None:
+        return None
+    words, prefix = parsed
+    if words[:1] and words[0].startswith("harness-"):
+        return prefix and len(words) == 1, "harness-*"
+    found = None
+    for cmds, verbatim in ((verify, True), (loop, False)):
+        for cmd in cmds:
+            kinds = match_kinds(words, prefix, cmd) if cmd else set()
+            if "covers" in kinds and (verbatim or prefix):
+                return True, " ".join(cmd)
+            if kinds and found is None:
+                found = (False, " ".join(cmd))
+    return found
+
+
+def covers(allow_rule, entry):
+    """Whether an allow rule covers a template entry, by match_kinds as an ask or deny is matched (a `*`
+    word matches one or more words): a prefix rule that matches the entry's words or a start of them, or
+    a rule without a prefix that matches an entry without one exactly."""
+    a, e = bash_rule(allow_rule), bash_rule(entry)
+    if a is None or e is None or (not a[1] and e[1]):
+        return False
+    return "covers" in match_kinds(a[0], a[1], e[0])
+
+
+def read_kept_settings(path):
+    """[ask, deny, allow, env] of a kept settings.json, env the dict as it is; ValueError says why it is
+    not usable."""
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("it is not UTF-8")
+    except OSError as err:
+        raise ValueError(f"it cannot be read: {err.strerror or err}")
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        raise ValueError("it is not JSON")
+    if not isinstance(data, dict):
+        raise ValueError("the top level is not an object")
+    perms = data.get("permissions", {})
+    env = data.get("env", {})
+    if not isinstance(perms, dict) or not isinstance(env, dict):
+        raise ValueError("permissions and env must be objects")
+    lists = []
+    for key in ("ask", "deny", "allow"):
+        rules = perms.get(key, [])
+        if not isinstance(rules, list) or not all(isinstance(r, str) for r in rules):
+            raise ValueError(f"permissions.{key} is not a list of strings")
+        lists.append(rules)
+    return lists + [env]
+
+
+def kept_settings_report(root, files):
+    """The `warn:` lines for a kept .claude/settings.json (never edited): ask and deny rules that stop a
+    dispatched run on a loop command or the verify command (the file's own CLAUDE_VERIFY_CMD, which is
+    what a run issues, else the rendered one), template allow entries that no allow rule covers, and
+    template env keys it lacks, each with the value to add. One line when the file is not usable settings."""
+    template = json.loads(dict((d, c) for d, c, _ in files)[KEPT])
+    allow_wanted = template["permissions"]["allow"]
+    env_wanted = template["env"]
+    try:
+        ask, deny, allow, env = read_kept_settings(root / KEPT)
+    except ValueError as err:
+        return [f"warn: {KEPT} is not usable settings ({err}), so it was not checked; fix it, or --force "
+                "replaces it with the template"]
+    own = env.get("CLAUDE_VERIFY_CMD")
+    if not (isinstance(own, str) and own.strip()):
+        own = env_wanted.get("CLAUDE_VERIFY_CMD", "")
+    verify = shell_commands(own)
+    lines = []
+    for kind, rules, why in (("ask", ask, "a headless run cannot answer an ask"),
+                             ("deny", deny, "a deny cannot be overridden")):
+        for r in dict.fromkeys(rules):
+            hit = stops_run(r, LOOP_COMMANDS, verify)
+            if hit and hit[0]:
+                fix = "move it to allow" if kind == "ask" else "remove it or narrow it"
+                lines.append(f"warn: {KEPT} {kind} rule {r} stops a dispatched run ({why}); {fix}")
+            elif hit:
+                fix = "move it to allow" if kind == "ask" else "narrow it if it does"
+                lines.append(f"warn: {KEPT} {kind} rule {r} may stop a dispatched run: it overlaps the loop "
+                             f"command `{hit[1]}` ({why}); {fix}")
+    lines += [f"warn: {KEPT} allow entry {e} is missing, so a dispatched run would be stopped by a prompt "
+              "no one can answer; add it to permissions.allow"
+              for e in allow_wanted if not any(covers(r, e) for r in allow)]
+    lines += [f"warn: {KEPT} env key {k} is not set (the template sets it); add {json.dumps({k: v})[1:-1]} "
+              "to env" for k, v in env_wanted.items() if k not in env]
+    return lines
+
+
 # --------------------------------------------------------------- steps
 def git_common_dir(root):
     common = Path(git(root, "rev-parse", "--git-common-dir").stdout.strip())
@@ -790,6 +929,9 @@ def cmd_init(args):
     files = plan(root, stack, values, ci=not args.no_ci, verify=args.verify, layout=layout)
     if layout:
         say(f"kept the project's own layout ({', '.join(layout)}): no {stack} skeleton")
+    if (root / KEPT).exists() and not args.force:      # --force replaces it with the template
+        for line in kept_settings_report(root, files):
+            say(line)
 
     if not committed:
         written = write_files(root, files, args.force, dry)
