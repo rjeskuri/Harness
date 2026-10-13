@@ -316,6 +316,43 @@ class Digest(unittest.TestCase):
         self.assertEqual(runs, ["- proj #3 headless: auth (exit 1), ended 30m ago",
                                 "- alpha #12 headless: billing (exit 1), ended 2h ago; log /logs/12.log"])
 
+    def test_a_same_day_rerun_keeps_the_window_back_to_the_previous_days_digest(self):
+        # Yesterday's digest was written 6h ago; today's already exists (written a minute ago) and the tool is then
+        # run twice more. Today's file is the one each run rewrites, so it never moves the window: every run lists
+        # #3 (30m), #12 (2h) and #9 (5h), which ended after yesterday's digest but before today's first run. #19
+        # (7h) ended before yesterday's digest, so that digest bounds the window: without it the default window
+        # (a day) would list #19 too; #8 (3d) and #11 (ok) are never listed.
+        self.world()
+        k = key(W["alpha"])
+        write(os.path.join(self.state, "runs", f"{k}-19-1.json"), json.dumps(
+            {"id": f"{k}-19-1", "ticket": 19, "repo": W["alpha"], "venue": "headless", "outcome": "error", "exit": 1,
+             "ended_at": z(7 * 3600)}))
+        now = time.time()
+        today = dt.date.today()
+        folder = os.path.join(self.state, "digest")
+        write(os.path.join(folder, f"{today - dt.timedelta(days=1)}.md"), "yesterday\n", mtime=now - 6 * 3600)
+        write(os.path.join(folder, f"{today - dt.timedelta(days=4)}.md"), "older\n", mtime=now - 4 * DAY)
+        write(os.path.join(folder, f"{today}.md"), "today, first run\n", mtime=now - 60)
+        expected = ["proj #3", "alpha #12", "alpha #9"]
+        for attempt in ("first rerun", "second rerun"):
+            with self.subTest(attempt):
+                p = self.run_tool()
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertIn("## Runs\n", p.stdout)
+                runs = p.stdout.split("## Runs\n", 1)[1].splitlines()
+                tickets = [m.group(1) for line in runs for m in [re.match(r"- (\w+ #\d+) ", line)] if m]
+                self.assertEqual(tickets, expected, runs)
+        data = json.loads(self.run_tool("--json").stdout)
+        self.assertEqual([(r["project"], r["ticket"]) for r in data["runs"]], [("proj", 3), ("alpha", 12), ("alpha", 9)])
+
+        # Without yesterday's digest (only today's and the 4-day-old one), the window reaches back to that older
+        # digest, so #19 (7h) and #8 (3d) join the list: yesterday's digest was what excluded them, and today's
+        # still does not count.
+        os.unlink(os.path.join(folder, f"{today - dt.timedelta(days=1)}.md"))
+        data = json.loads(self.run_tool("--json").stdout)
+        self.assertEqual([(r["project"], r["ticket"]) for r in data["runs"]],
+                         [("proj", 3), ("alpha", 12), ("alpha", 9), ("alpha", 19), ("alpha", 8)])
+
     def test_runs_that_ended_early_are_listed_with_the_failed_ones(self):
         # `early` (harness-work runs --sweep: an ok run that left its ticket in progress with no PR) is listed with
         # billing, auth and error, newest first, within the same window. #15 is #11 (ok, not listed) but for its

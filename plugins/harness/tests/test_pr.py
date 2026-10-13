@@ -673,6 +673,22 @@ GATE_CASES = {
 }
 
 
+GATE_FAILURE_TEXT = "HTTP 502: Bad Gateway (fake)"
+
+
+def gate_failure(entry):
+    return dict(entry, stderr=GATE_FAILURE_TEXT + "\n", exit=1)
+
+
+# Each read the gate makes, failing; placed first in a scenario so it wins over the gate_calls answer.
+GATE_API_FAILURES = {
+    "reviews": gate_failure({"contains": ["api", f"{PULL}/reviews"]}),
+    "review comments": gate_failure({"contains": ["api", f"{PULL}/reviews/101/comments"]}),
+    "commits": gate_failure({"contains": ["api", f"{PULL}/commits"]}),
+}
+GATE_READ_FAILURES = dict(GATE_API_FAILURES, **{"repo view": gate_failure({"match": ["repo", "view"]})})
+
+
 class GateAsserts:
     def assertNamesFindings(self, p, named, not_named):
         said = p.stdout + p.stderr
@@ -755,6 +771,21 @@ class ReadyGate(GateAsserts, PrTest):
         self.assertRefused(p)
         self.assertNamesFindings(p, named, [])
         self.assertRefused(self.run_case(reviews, commits, "--accept-findings"))
+
+    def test_ready_fails_closed_when_a_gate_read_fails(self):
+        # The PR would pass the gate (a commit after the findings), so only the failed read can refuse it.
+        reviews, commits, named, _ = GATE_CASES["a commit after the findings"]
+        self.assertIsNone(named)
+        for what, failing in GATE_READ_FAILURES.items():
+            with self.subTest(what):
+                self.scenario([failing, {"match": ["pr", "ready", "34"], "stdout": ""}, Ready.view(self, [12]),
+                               REPO_VIEW] + gate_calls(reviews, commits))
+                if os.path.exists(self.notify_log):
+                    os.unlink(self.notify_log)
+                p = self.pr("ready", "34")
+                self.assertRefused(p)
+                self.assertIn(GATE_FAILURE_TEXT, p.stderr)
+                self.assertTrue(any(a[:1] == ["api"] or a[:2] == ["repo", "view"] for a in self.gh_argv()))
 
 
 # =========================================================================== comments
@@ -1714,6 +1745,38 @@ class LandGate(GateAsserts, WorktreeTest):
         self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)            # refused without the flag
         p, _, _ = self.land_case("two reviews with findings, a commit between them", "--accept-findings")
         self.assertLanded(p)
+
+    def failing_land(self, failing, *flags):
+        # The PR would land (a commit after the findings), so only the failed read can refuse it.
+        reviews, commits, named, _ = GATE_CASES["a commit after the findings"]
+        self.assertIsNone(named)
+        self.scenario([failing] + Land.land_calls(self, reviews=reviews, commits=commits))
+        return self.pr("land", "34", *flags, cwd=self.main)
+
+    def test_land_fails_closed_when_a_gate_read_fails(self):
+        for what, failing in GATE_READ_FAILURES.items():
+            with self.subTest(what):
+                p = self.failing_land(failing)
+                self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertIn(GATE_FAILURE_TEXT, p.stderr)
+                self.assertFalse([a for a in self.gh_argv() if a[:2] == ["pr", "merge"]], self.gh_argv())
+                self.assertEqual(self.stub_calls("harness-board"), [])
+                self.assertFalse(any("worktree remove" in line or "branch -D" in line for line in self.order()))
+                self.assertTrue(os.path.isdir(self.wt))
+                self.assertTrue(self.branch_exists())
+
+    def test_accept_findings_lands_through_a_failed_gate_read_with_a_warning(self):
+        # gh repo view is left out: the merge itself needs the repository's name, so no flag can land without it.
+        for i, (what, failing) in enumerate(GATE_API_FAILURES.items()):
+            with self.subTest(what):
+                if i:
+                    self.setUp()                                  # a fresh repository and worktree for each case
+                self.assertNotEqual(self.failing_land(failing).returncode, 0)          # refused without the flag
+                self.assertTrue(os.path.isdir(self.wt))
+                p = self.failing_land(failing, "--accept-findings")
+                self.assertLanded(p)
+                self.assertIn(GATE_FAILURE_TEXT, p.stderr)                           # the warning names the failure
 
 
 if __name__ == "__main__":

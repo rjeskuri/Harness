@@ -1391,6 +1391,28 @@ class WorkSkill(unittest.TestCase):
     def closing_section(self):
         return closing_parts(self.closing_lines())
 
+    def revise_step(self):
+        """The revise step: from the numbered step that runs `harness-pr comments ... --unresolved` up to the next
+        top-level numbered step, heading, or unindented paragraph after a blank line (indented sub-items and
+        continuation lines included)."""
+        lines = skill_body().splitlines()
+        start = next((i for i, ln in enumerate(lines) if re.match(r"^\d+[.)]\s", ln)
+                      and "harness-pr comments" in ln and "--unresolved" in ln), None)
+        self.assertIsNotNone(start, "no numbered step runs `harness-pr comments <P> --unresolved`")
+        end = next((j for j in range(start + 1, len(lines))
+                    if re.match(r"^\d+[.)]\s", lines[j]) or lines[j].startswith("#")
+                    or (lines[j].strip() and not lines[j][0].isspace() and not lines[j - 1].strip())), len(lines))
+        return "\n".join(lines[start:end])
+
+    def test_the_revise_step_runs_the_red_check_against_the_branch_tip_for_new_tests(self):
+        # The branch already carries source changes when the owner's comments need new tests, so the default base
+        # refuses ("Source already changed before the red run"); the revise step says to check with --base HEAD.
+        step = self.revise_step()
+        self.assertIn("harness-red check", step, step)
+        self.assertIn("--base HEAD", step, step)
+        self.assertGreater(step.index("--base HEAD"), step.index("harness-red check"), step)
+        self.assertRegex(step.lower(), r"\btests?\b|test-author", step)
+
     def test_the_first_paragraph_says_one_turn_foreground_agents_and_when_the_turn_ends(self):
         para = first_paragraph()
         self.assertEqual(first_paragraph_problems(para), [], para)
