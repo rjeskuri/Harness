@@ -1746,6 +1746,32 @@ class KeptSettings(ScaffoldTest):
                                               deny=["Bash(gh api:*)"], allow=allow, env=env):
                     self.assertWarns(mode, p, expected)
 
+    # ---------------------------------------------------------------- firm or soft
+    def test_a_rule_that_only_overlaps_the_loop_may_stop_it_and_one_that_covers_it_stops_it(self):
+        """A rule that covers a loop command (a prefix of it, or exactly the verify command, which runs
+        verbatim) stops the run; a narrower rule, a mid-pattern glob or an exact rule equal to a loop command
+        that always carries arguments only may stop it. Only the phrase `may stop` is pinned."""
+        firm = ["Bash(git commit:*)", "Bash(git:*)", "Bash(*)", "Bash(harness-*:*)"]
+        soft = ["Bash(git push --force:*)", "Bash(git commit -m:*)", "Bash(gh * create)", "Bash(git * main)",
+                "Bash(git commit)", "Bash(git add)", "Bash(gh pr)", "Bash(* commit)"]
+        # (label, stack, verify, firm rules, soft rules); bare Bash names every rule, so it has a file alone
+        groups = [("loop", "none", None, firm + ["Bash(scripts/verify.sh)"], soft),
+                  ("bare-bash", "none", None, ["Bash"], []),
+                  ("default-verify", "python", None, ["Bash(scripts/verify.sh)"], []),
+                  ("own-verify", "python", "make check", ["Bash(make check)"], [])]
+        rng = random.Random(6)
+        for label, stack, verify, hard, maybe in groups:
+            for kind in ("ask", "deny"):
+                rules = hard + maybe
+                rng.shuffle(rules)
+                with self.subTest(label=label, kind=kind):
+                    for mode, p in self.both_runs(f"firm-{label}-{kind}", stack, verify, **{kind: rules}):
+                        self.assertWarns(mode, p, [(r, kind) for r in rules])
+                        lines = self.warns(p)
+                        wrong = [r for r in rules
+                                 if ("may stop" in next(w for w in lines if r in w)) != (r in maybe)]
+                        self.assertEqual(wrong, [], f"{mode}: firm or soft is wrong for these\n{lines}")
+
 
 # =========================================================================== commit paths
 class Paths(ScaffoldTest):
