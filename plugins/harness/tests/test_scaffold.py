@@ -555,6 +555,552 @@ class Render(ScaffoldTest):
         self.assertIn("`scripts/verify.sh`", section)
 
 
+# =========================================================================== skeleton (ticket #28)
+# The skeleton of each stack, as written into an empty folder for --name demo-app.
+SKELETON_FILES = {"python": ["pyproject.toml", "src/demo_app/__init__.py", "tests/test_smoke.py"],
+                  "node": ["package.json", "tests/smoke.test.js"]}
+LAYOUT = re.compile(r"kept the project's own layout \(([^)]*)\)")
+STATUS_LINE = re.compile(r"^(?:would )?(create|created|keep|kept|update|updated) (\S+)$")
+NORMAL = {"create": "created", "keep": "kept", "update": "updated"}
+MAKEFILE_TARGETS = "py:\n\tpython3 -m unittest discover -s test\n\nlint:\n\techo lint\n"
+
+
+class Skeleton(ScaffoldTest):
+    """The skeleton (manifest, src/<pkg>, smoke test) is written only when the project has no manifest of
+    any stack, no Makefile with a test or check target and no tests directory or test file; otherwise both
+    --dry-run and the real run say `kept the project's own layout (<what was found>)`."""
+
+    # ------------------------------------------------------------ helpers
+    def fixture(self, label, files):
+        root = self.mk(label)
+        for rel, text in files.items():
+            self.write(os.path.join(root, rel), text)
+        return root
+
+    def snapshot(self, root):
+        """{relative path: content} of every file under root, .git left out."""
+        out = {}
+        for here, dirs, names in os.walk(root):
+            dirs[:] = [d for d in dirs if d != ".git"]
+            for name in names:
+                path = os.path.join(here, name)
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    out[os.path.relpath(path, root).replace(os.sep, "/")] = fh.read()
+        return out
+
+    def both(self, root, stack, *extra):
+        """--dry-run first (it must write nothing), then the real run, on the same folder."""
+        before = self.snapshot(root)
+        dry = self.ok("init", root, "--name", "demo-app", "--stack", stack, *extra, "--dry-run")
+        self.assertEqual(self.snapshot(root), before, "--dry-run wrote into the project")
+        real = self.ok("init", root, "--name", "demo-app", "--stack", stack, *extra)
+        return dry, real
+
+    def statuses(self, p):
+        """{path: created|kept|updated} for the scaffold's file lines, `would ...` normalised."""
+        out = {}
+        for line in self.lines(p):
+            m = STATUS_LINE.match(line)
+            if m and not m.group(2).startswith(".git/") and not m.group(2).startswith("core."):
+                out[m.group(2)] = NORMAL.get(m.group(1), m.group(1))
+        return out
+
+    def layout(self, p):
+        """The names inside `kept the project's own layout (...)`, or None when the line is absent."""
+        found = [LAYOUT.search(line) for line in self.lines(p)]
+        found = [m for m in found if m]
+        if not found:
+            return None
+        self.assertEqual(len(found), 1, p.stdout)
+        return {name.strip() for name in found[0].group(1).split(",") if name.strip()}
+
+    def assertSkipped(self, root, stack, before, dry, real, names):
+        """No skeleton file planned or written, the fixture untouched, the reason named in both runs."""
+        for rel in SKELETON_FILES[stack]:
+            if rel in before:
+                continue
+            self.assertFalse(os.path.exists(os.path.join(root, rel)), f"skeleton file written: {rel}")
+            self.assertNotIn(f"created {rel}", self.lines(real))
+            self.assertNotIn(f"would create {rel}", self.lines(dry))
+        if stack == "python" and not any(rel.startswith("src/") for rel in before):
+            self.assertFalse(os.path.exists(os.path.join(root, "src")), "src/<pkg> written")
+        after = self.snapshot(root)
+        for rel, text in before.items():
+            self.assertEqual(after.get(rel), text, f"the project's {rel} changed")
+        for p, which in ((dry, "--dry-run"), (real, "real run")):
+            got = self.layout(p)
+            self.assertIsNotNone(got, f"{which} does not say why the skeleton was skipped:\n{p.stdout}")
+            for name in names:
+                self.assertIn(name, got, f"{which} does not name {name}: {got}")
+        self.assertEqual(self.layout(dry), self.layout(real), "--dry-run and the real run name different things")
+        self.assertEqual(self.statuses(dry), self.statuses(real), "--dry-run and the real run disagree")
+
+    def assertLayoutIs(self, dry, real, expected):
+        """Both runs name exactly `expected` in the layout line: nothing missing, nothing over-reported.
+        The names are joined by `, ` inside the parentheses, as in the ticket's
+        `kept the project's own layout (package.json, test/)`; their order is not pinned."""
+        for p, which in ((dry, "--dry-run"), (real, "real run")):
+            self.assertEqual(self.layout(p), set(expected), f"{which} names the wrong things:\n{p.stdout}")
+            raw = [m.group(1) for m in (LAYOUT.search(line) for line in self.lines(p)) if m][0]
+            self.assertEqual(sorted(raw.split(", ")), sorted(expected),
+                             f"{which} does not join the names with ', ': ({raw})")
+
+    def assertWritten(self, root, stack, dry, real):
+        for rel in SKELETON_FILES[stack]:
+            self.assertTrue(os.path.isfile(os.path.join(root, rel)), f"skeleton file missing: {rel}")
+            self.assertIn(f"created {rel}", self.lines(real))
+            self.assertIn(f"would create {rel}", self.lines(dry))
+        for p in (dry, real):
+            self.assertIsNone(self.layout(p), p.stdout)
+        self.assertEqual(self.statuses(dry), self.statuses(real), "--dry-run and the real run disagree")
+
+    def where(self, root):
+        text = self.read(root, "CLAUDE.md")
+        return text.split("## Where things live", 1)[1].split("\n## ", 1)[0]
+
+    def names_dir(self, section, directory):
+        return re.search(r"`" + re.escape(directory) + r"/?`", section) is not None
+
+    # ------------------------------------------------------------ tests
+    def test_the_jotform_layout_keeps_its_own_layout(self):
+        # package.json, a Makefile with check/test/py targets and tests under test/ (2026-10-14)
+        files = {"package.json": '{"name": "jotform-glow-sync", "scripts": {"test": "make test"}}\n',
+                 "Makefile": "check: lint test\n\ntest:\n\tpython3 -m unittest discover -s test -p '*_test.py'\n\n"
+                             + MAKEFILE_TARGETS,
+                 "test/x_test.py": "import unittest\n",
+                 "sync.py": "print('sync')\n"}
+        root = self.fixture("jotform-glow-sync", files)
+        before = self.snapshot(root)
+        dry, real = self.both(root, "python")
+        self.assertSkipped(root, "python", before, dry, real, ["package.json", "test/"])
+        # exactly these three: test/x_test.py is inside test/ and not named again, sync.py is not a blocker
+        self.assertLayoutIs(dry, real, {"package.json", "Makefile", "test/"})
+        section = self.where(root)
+        self.assertTrue(self.names_dir(section, "test"), section)
+        self.assertFalse(self.names_dir(section, "tests"), section)
+
+    def test_no_skeleton_when_another_stacks_manifest_exists(self):
+        manifests = {"pyproject.toml": "[project]\nname = 'x'\n", "package.json": '{"name": "x"}\n',
+                     "setup.py": "from setuptools import setup\nsetup(name='x')\n",
+                     "setup.cfg": "[metadata]\nname = x\n", "requirements.txt": "requests==2.32.3\n",
+                     "Cargo.toml": "[package]\nname = \"x\"\nversion = \"0.1.0\"\n", "go.mod": "module example.com/x\n"}
+        cases = [("python", m) for m in manifests if m != "pyproject.toml"]
+        cases += [("node", m) for m in ("pyproject.toml", "setup.py", "requirements.txt", "Cargo.toml", "go.mod")]
+        cases += [("python", "pyproject.toml"), ("node", "package.json")]        # the stack's own, as today
+        for stack, manifest in cases:
+            with self.subTest(stack=stack, manifest=manifest):
+                root = self.fixture(f"man-{stack}-{manifest.replace('.', '-')}", {manifest: manifests[manifest]})
+                before = self.snapshot(root)
+                dry, real = self.both(root, stack)
+                self.assertSkipped(root, stack, before, dry, real, [manifest])
+                self.assertLayoutIs(dry, real, {manifest})
+                section = self.where(root)                     # no skeleton, so no tests/ to name
+                self.assertFalse(self.names_dir(section, "tests"), section)
+        with self.subTest(several=True):
+            root = self.fixture("man-several", {"go.mod": manifests["go.mod"],
+                                                "requirements.txt": manifests["requirements.txt"]})
+            before = self.snapshot(root)
+            dry, real = self.both(root, "node")
+            self.assertSkipped(root, "node", before, dry, real, ["go.mod", "requirements.txt"])
+            self.assertLayoutIs(dry, real, {"go.mod", "requirements.txt"})
+        with self.subTest(force=True):                             # --force overwrites files, adds no skeleton
+            root = self.fixture("man-force", {"package.json": manifests["package.json"]})
+            before = self.snapshot(root)
+            dry, real = self.both(root, "python", "--force")
+            self.assertSkipped(root, "python", before, dry, real, ["package.json"])
+            self.assertLayoutIs(dry, real, {"package.json"})
+
+    def test_no_skeleton_when_a_tests_directory_or_makefile_test_target_exists(self):
+        blocking = [
+            ("tests-dir", {"tests/conftest.py": "import pytest\n"}, "tests/"),
+            ("test-dir", {"test/helper.js": "module.exports = {};\n"}, "test/"),
+            ("spec-dir", {"spec/spec_helper.rb": "require 'rspec'\n"}, "spec/"),
+            ("test-pattern-in-test", {"test/x_test.py": "import unittest\n"}, "test/"),
+            ("top-test-prefix", {"test_app.py": "def test_x():\n    pass\n"}, "test_app.py"),
+            ("top-test-suffix", {"app_test.py": "def test_x():\n    pass\n"}, "app_test.py"),
+            ("top-js-test", {"app.test.js": "require('node:test');\n"}, "app.test.js"),
+            ("make-test", {"Makefile": "test:\n\tpython3 -m unittest\n"}, "Makefile"),
+            ("make-check", {"Makefile": "build:\n\techo build\n\ncheck: build\n\techo ok\n"}, "Makefile"),
+        ]
+        for stack in ("python", "node"):
+            for label, files, name in blocking:
+                with self.subTest(stack=stack, blocker=label):
+                    root = self.fixture(f"block-{stack}-{label}", files)
+                    before = self.snapshot(root)
+                    dry, real = self.both(root, stack)
+                    self.assertSkipped(root, stack, before, dry, real, [name])
+                    self.assertLayoutIs(dry, real, {name})          # a file inside the directory is not named
+                    if name != "tests/":
+                        section = self.where(root)
+                        self.assertFalse(self.names_dir(section, "tests"), section)
+                        self.assertFalse(os.path.exists(os.path.join(root, "tests")))
+        # none of these is a manifest, a tests directory, a test file or a test/check target
+        not_blocking = [
+            ("make-no-test-target", {"Makefile": MAKEFILE_TARGETS}),
+            ("make-lookalike-targets", {"Makefile": "pytest:\n\tpytest\n\nrecheck:\n\techo again\n\n"
+                                                    "testing:\n\techo t\n\nci:\n\t$(MAKE) py\n"}),
+            ("readme-and-docs", {"README.md": "# demo\n", "docs/notes.md": "test: notes\n"}),
+            ("non-test-sources", {"tool.py": "print(1)\n", "latest.py": "print(2)\n", "attest.js": "1;\n"}),
+        ]
+        for stack in ("python", "node"):
+            for label, files in not_blocking:
+                with self.subTest(stack=stack, not_blocking=label):
+                    root = self.fixture(f"free-{stack}-{label}", files)
+                    dry, real = self.both(root, stack)
+                    self.assertWritten(root, stack, dry, real)
+                    for rel, text in files.items():
+                        self.assertEqual(self.read(root, rel), text, rel)
+
+    def test_test_files_matching_the_test_patterns_block_at_any_depth_and_are_named_by_path(self):
+        # The HARNESS_TEST_PATTERNS default (harness-red, tests_first.py): **/test_*.py, **/*_test.py,
+        # **/conftest.py, **/*_test.js, **/*.test.js, **/*.test.ts, **/*_test.ts, at any depth.
+        # A file is named by its path relative to the project root, with / separators.
+        cases = ["test_sync.py", "sync_test.py", "conftest.py", "widget_test.js", "widget.test.js",
+                 "widget.test.ts", "widget_test.ts",
+                 "src/pkg/test_core.py", "src/pkg/core_test.py", "pkg/conftest.py", "lib/a.test.js",
+                 "lib/b_test.js", "web/ui/button.test.ts", "web/ui/deep/er/button_test.ts"]
+        for stack in ("python", "node"):
+            for rel in cases:
+                with self.subTest(stack=stack, file=rel):
+                    root = self.fixture(f"pat-{stack}-{rel.replace('/', '-').replace('.', '-')}",
+                                        {rel: "// a test\n" if rel.endswith(("js", "ts")) else "pass\n"})
+                    before = self.snapshot(root)
+                    dry, real = self.both(root, stack)
+                    self.assertSkipped(root, stack, before, dry, real, [rel])
+                    self.assertLayoutIs(dry, real, {rel})
+                    self.assertFalse(os.path.exists(os.path.join(root, "tests")))
+
+    def test_lookalike_names_and_files_in_vcs_or_vendored_folders_do_not_block(self):
+        not_blocking = [
+            ("lookalikes", {"testdata.json": "{}\n", "contest.py": "pass\n", "protest.ts": "export {};\n",
+                            "data/testdata.json": "{}\n", "src/contest.py": "pass\n",
+                            "lib/protest.ts": "export {};\n", "testing.py": "pass\n", "mytest.js": "1;\n",
+                            "latest_tests.txt": "x\n"}),
+            ("node-modules", {"node_modules/x/a.test.js": "1;\n", "node_modules/x/test_x.py": "pass\n",
+                              "node_modules/x/test/index.js": "1;\n", "node_modules/y/conftest.py": "pass\n"}),
+        ]
+        for stack in ("python", "node"):
+            for label, files in not_blocking:
+                with self.subTest(stack=stack, not_blocking=label):
+                    root = self.fixture(f"look-{stack}-{label}", files)
+                    dry, real = self.both(root, stack)
+                    self.assertWritten(root, stack, dry, real)
+                    for rel, text in files.items():
+                        self.assertEqual(self.read(root, rel), text, rel)
+            with self.subTest(stack=stack, not_blocking="dot-git"):
+                root = self.mk(f"look-{stack}-dot-git")                 # an unborn repository
+                self.git(root, "init", "-q", "-b", "main")
+                for rel in (".git/info/sample_test.py", ".git/hooks/test_hook.py", ".git/x/a.test.js",
+                            ".git/conftest.py"):
+                    self.write(os.path.join(root, rel), "pass\n")
+                os.makedirs(os.path.join(root, ".git", "tests"), exist_ok=True)
+                dry, real = self.both(root, stack)
+                self.assertWritten(root, stack, dry, real)
+
+    def test_makefile_target_syntax_that_blocks(self):
+        blocking = [
+            ("several-on-a-line", "lint test: deps\n\techo t\n\ndeps:\n\techo d\n"),
+            ("check-second-on-a-line", "all check:\n\techo ok\n"),
+            ("space-before-colon", "build:\n\techo b\n\ntest :\n\techo t\n"),
+            ("space-before-colon-check", "check : build\n\techo c\n\nbuild:\n\techo b\n"),
+            ("double-colon", "test::\n\techo t\n"),
+            ("double-colon-check-later", "build:\n\techo b\n\nfmt lint check:: build\n\techo c\n"),
+            ("after-other-rules", "build:\n\techo b\n\nlint:\n\techo l\n\ntest: lint\n\techo t\n"),
+            ("tab-separated-targets", "lint\ttest: deps\n\techo t\n"),
+        ]
+        for stack in ("python", "node"):
+            for label, text in blocking:
+                with self.subTest(stack=stack, makefile=label):
+                    root = self.fixture(f"mk-{stack}-{label}", {"Makefile": text})
+                    before = self.snapshot(root)
+                    dry, real = self.both(root, stack)
+                    self.assertSkipped(root, stack, before, dry, real, ["Makefile"])
+                    self.assertLayoutIs(dry, real, {"Makefile"})
+
+    def test_makefile_lines_that_are_not_test_or_check_targets_do_not_block(self):
+        not_blocking = [
+            ("recipe-line", "build:\n\techo test:\n\techo check: done\n"),
+            ("variables", "VAR = test:\nX := check:\nY ?= test: check:\nbuild:\n\techo $(VAR)\n"),
+            ("assignment-to-a-test-variable", "test := unit\ncheck = no\nbuild:\n\techo $(test)\n"),
+            ("comment", "# test: later\n# check: soon\nbuild:\n\techo b\n"),
+            ("test-as-a-prerequisite-only", "build: test check\n\techo b\n"),
+        ]
+        for stack in ("python", "node"):
+            for label, text in not_blocking:
+                with self.subTest(stack=stack, makefile=label):
+                    root = self.fixture(f"mkfree-{stack}-{label}", {"Makefile": text})
+                    dry, real = self.both(root, stack)
+                    self.assertWritten(root, stack, dry, real)
+                    self.assertEqual(self.read(root, "Makefile"), text)
+
+    def test_an_empty_tests_directory_blocks_and_a_file_named_like_one_does_not(self):
+        for stack in ("python", "node"):
+            for directory in ("tests", "test", "spec"):
+                with self.subTest(stack=stack, empty_dir=directory):
+                    root = self.mk(f"emptydir-{stack}-{directory}")
+                    os.makedirs(os.path.join(root, directory))
+                    dry, real = self.both(root, stack)
+                    self.assertSkipped(root, stack, {}, dry, real, [directory + "/"])
+                    self.assertLayoutIs(dry, real, {directory + "/"})
+                    self.assertEqual(os.listdir(os.path.join(root, directory)), [])   # left empty
+            for name in ("test", "spec"):                                 # a regular file, not a directory
+                with self.subTest(stack=stack, file=name):
+                    root = self.fixture(f"plainfile-{stack}-{name}", {name: "not a directory\n"})
+                    dry, real = self.both(root, stack)
+                    self.assertWritten(root, stack, dry, real)
+                    self.assertEqual(self.read(root, name), "not a directory\n")
+            with self.subTest(stack=stack, file="tests"):                 # with a manifest: only it is named
+                root = self.fixture(f"plainfile-{stack}-tests", {"tests": "not a directory\n",
+                                                                  "package.json": '{"name": "x"}\n'})
+                before = self.snapshot(root)
+                dry, real = self.both(root, stack)
+                self.assertSkipped(root, stack, before, dry, real, ["package.json"])
+                self.assertLayoutIs(dry, real, {"package.json"})
+                self.assertEqual(self.read(root, "tests"), "not a directory\n")
+
+    def test_every_loose_test_file_is_named_not_just_the_first(self):
+        # small fixtures only; how a long list is shown is left open
+        cases = [
+            ("spread", ["test_a.py", "lib/b_test.js", "web/c.test.ts"]),
+            ("same-dir-top", ["test_a.py", "a_test.py"]),
+            ("same-dir-nested", ["lib/a.test.js", "lib/b_test.js"]),
+        ]
+        for stack in ("python", "node"):
+            for label, rels in cases:
+                with self.subTest(stack=stack, files=label):
+                    root = self.fixture(f"loose-{stack}-{label}",
+                                        {rel: "// a test\n" if rel.endswith(("js", "ts")) else "pass\n"
+                                         for rel in rels})
+                    before = self.snapshot(root)
+                    dry, real = self.both(root, stack)
+                    self.assertSkipped(root, stack, before, dry, real, rels)
+                    self.assertLayoutIs(dry, real, set(rels))
+                    self.assertFalse(os.path.exists(os.path.join(root, "tests")))
+
+    def test_every_kind_of_blocker_in_one_project_is_named(self):
+        files = {"go.mod": "module example.com/x\n",
+                 "Makefile": "build:\n\techo b\n\ncheck: build\n\techo ok\n",
+                 "spec/spec_helper.rb": "require 'rspec'\n",
+                 "widget.test.js": "require('node:test');\n",
+                 "main.go": "package main\n"}
+        expected = {"go.mod", "Makefile", "spec/", "widget.test.js"}
+        for stack in ("python", "node"):
+            with self.subTest(stack=stack):
+                root = self.fixture(f"combo-{stack}", files)
+                before = self.snapshot(root)
+                dry, real = self.both(root, stack)
+                self.assertSkipped(root, stack, before, dry, real, sorted(expected))
+                self.assertLayoutIs(dry, real, expected)
+
+    def test_gnu_makes_other_makefile_names(self):
+        # GNU make reads GNUmakefile, makefile and Makefile. One file per fixture, so on a case-insensitive
+        # filesystem `makefile` is still listed under the name it was created with, and that name is expected.
+        with_target = {"test": "build:\n\techo b\n\ntest: build\n\techo t\n",
+                       "check": "check:\n\techo ok\n"}
+        for stack in ("python", "node"):
+            for name in ("makefile", "GNUmakefile"):
+                for target, text in with_target.items():
+                    with self.subTest(stack=stack, makefile=name, target=target):
+                        root = self.fixture(f"gnu-{stack}-{name}-{target}", {name: text})
+                        self.assertEqual(os.listdir(root), [name])
+                        before = self.snapshot(root)
+                        dry, real = self.both(root, stack)
+                        self.assertSkipped(root, stack, before, dry, real, [name])
+                        self.assertLayoutIs(dry, real, {name})
+                with self.subTest(stack=stack, makefile=name, target=None):
+                    root = self.fixture(f"gnufree-{stack}-{name}", {name: MAKEFILE_TARGETS})
+                    dry, real = self.both(root, stack)
+                    self.assertWritten(root, stack, dry, real)
+                    self.assertEqual(self.read(root, name), MAKEFILE_TARGETS)
+
+    def test_empty_folder_still_gets_the_skeleton(self):
+        for stack in ("python", "node"):
+            with self.subTest(stack=stack):
+                root = self.mk(f"empty-{stack}")
+                dry, real = self.both(root, stack)
+                self.assertWritten(root, stack, dry, real)
+                expected = set(COMMON_FILES + SKELETON_FILES[stack])
+                self.assertEqual(set(self.snapshot(root)), expected)        # exactly what is written today
+                self.assertEqual({p for p, s in self.statuses(real).items() if s == "created"}, expected)
+                self.assertTrue(self.names_dir(self.where(root), "tests"), self.where(root))
+        with self.subTest(stack="python", folder="missing"):              # a path that does not exist yet
+            root = os.path.join(self.tmp, "fresh-python")
+            self.ok("init", root, "--name", "demo-app", "--stack", "python")
+            self.assertEqual(set(self.snapshot(root)), set(COMMON_FILES + SKELETON_FILES["python"]))
+
+    # ------------------------------------------------------------ review of PR #38
+    def test_dot_directories_virtualenvs_and_pycache_are_not_walked(self):
+        # The walk skips every dot-directory, node_modules, __pycache__ and any directory holding a
+        # pyvenv.cfg (a virtualenv under any name). A plain script beside them still gets the skeleton.
+        venv_cfg = "home = /usr/bin\nversion = 3.12.4\n"
+        not_blocking = [
+            ("dot-venv", {".venv/pyvenv.cfg": venv_cfg,
+                          ".venv/lib/python3.12/site-packages/numpy/tests/test_abc.py": "pass\n",
+                          ".venv/lib/python3.12/site-packages/numpy/conftest.py": "pass\n"}),
+            ("dot-venv-no-cfg", {".venv/lib/python3.12/site-packages/pkg/test_x.py": "pass\n"}),
+            ("dot-tox", {".tox/py312/lib/python3.12/site-packages/pkg/test_x.py": "pass\n",
+                         ".tox/py312/lib/python3.12/site-packages/pkg/a_test.py": "pass\n"}),
+            ("dot-claude-worktree", {".claude/worktrees/t-1-x/tests/test_a.py": "pass\n",
+                                     ".claude/worktrees/t-1-x/src/b_test.py": "pass\n",
+                                     ".claude/worktrees/t-1-x/web/c.test.js": "1;\n"}),
+            ("dot-caches", {".mypy_cache/3.12/conftest.py": "pass\n",
+                            ".pytest_cache/v/test_cache.py": "pass\n", ".hidden/deep/x.test.ts": "1;\n"}),
+            ("venv-by-cfg", {"venv/pyvenv.cfg": venv_cfg,
+                             "venv/lib/python3.12/site-packages/pkg/tests/test_x.py": "pass\n",
+                             "venv/test_y.py": "pass\n"}),
+            ("env-by-cfg", {"env/pyvenv.cfg": venv_cfg,
+                            "env/lib/python3.12/site-packages/pkg/conftest.py": "pass\n"}),
+            ("nested-venv-by-cfg", {"tools/pyenv312/pyvenv.cfg": venv_cfg,
+                                    "tools/pyenv312/lib/python3.12/site-packages/q/q_test.py": "pass\n"}),
+            ("pycache", {"__pycache__/test_x.py": "pass\n", "pkg/__pycache__/conftest.py": "pass\n"}),
+        ]
+        for stack in ("python", "node"):
+            for label, files in not_blocking:
+                with self.subTest(stack=stack, not_blocking=label):
+                    files = dict(files, **{"analysis.py": "print(1)\n"})
+                    root = self.fixture(f"skipdir-{stack}-{label}", files)
+                    dry, real = self.both(root, stack)
+                    self.assertWritten(root, stack, dry, real)
+                    for rel, text in files.items():
+                        self.assertEqual(self.read(root, rel), text, rel)
+
+    def test_a_directory_named_like_a_virtualenv_without_pyvenv_cfg_still_blocks(self):
+        # the name alone is not a virtualenv; skipped directories do not hide the project's own test files
+        venv_cfg = "home = /usr/bin\nversion = 3.12.4\n"
+        cases = [
+            ("env-no-cfg", {"env/test_x.py": "pass\n"}, {"env/test_x.py"}),
+            ("venv-no-cfg", {"venv/lib/pkg/x_test.py": "pass\n"}, {"venv/lib/pkg/x_test.py"}),
+            ("own-beside-skipped", {".venv/pyvenv.cfg": venv_cfg,
+                                    ".venv/lib/python3.12/site-packages/numpy/tests/test_abc.py": "pass\n",
+                                    "env/pyvenv.cfg": venv_cfg, "env/lib/conftest.py": "pass\n",
+                                    "__pycache__/test_c.py": "pass\n",
+                                    ".claude/worktrees/t-1-x/test_w.py": "pass\n",
+                                    "src/pkg/test_core.py": "pass\n"},
+             {"src/pkg/test_core.py"}),
+            ("cfg-in-a-sibling-only", {"a/pyvenv.cfg": venv_cfg, "a/test_in_venv.py": "pass\n",
+                                       "b/test_real.py": "pass\n"}, {"b/test_real.py"}),
+        ]
+        for stack in ("python", "node"):
+            for label, files, expected in cases:
+                with self.subTest(stack=stack, case=label):
+                    root = self.fixture(f"venvname-{stack}-{label}", files)
+                    before = self.snapshot(root)
+                    dry, real = self.both(root, stack)
+                    self.assertSkipped(root, stack, before, dry, real, sorted(expected))
+                    self.assertLayoutIs(dry, real, expected)
+
+    def test_makefile_immediate_assignments_are_not_targets(self):
+        # `::=` (POSIX) and `:::=` (GNU make 4.4) assign a variable; they define no rule
+        not_blocking = [
+            ("posix-immediate", "test ::= unit\nbuild:\n\techo $(test)\n"),
+            ("gnu-immediate", "check:::= x\nbuild:\n\techo b\n"),
+            ("both-no-spaces", "test::=unit\ncheck :::= x\nbuild: deps\n\techo b\n\ndeps:\n\techo d\n"),
+        ]
+        for stack in ("python", "node"):
+            for label, text in not_blocking:
+                with self.subTest(stack=stack, makefile=label):
+                    root = self.fixture(f"mkassign-{stack}-{label}", {"Makefile": text})
+                    dry, real = self.both(root, stack)
+                    self.assertWritten(root, stack, dry, real)
+                    self.assertEqual(self.read(root, "Makefile"), text)
+            with self.subTest(stack=stack, makefile="assignment-and-a-real-test-rule"):
+                text = "X ::= 1\nY :::= 2\ntest::\n\techo $(X)\n"
+                root = self.fixture(f"mkassign-{stack}-real-rule", {"Makefile": text})
+                before = self.snapshot(root)
+                dry, real = self.both(root, stack)
+                self.assertSkipped(root, stack, before, dry, real, ["Makefile"])
+                self.assertLayoutIs(dry, real, {"Makefile"})
+
+    def test_python_test_command_follows_whether_the_skeleton_is_written(self):
+        # uv only when the project is a uv project or the skeleton is about to make it one
+        jotform = {"package.json": '{"name": "jotform-glow-sync", "scripts": {"test": "make test"}}\n',
+                   "Makefile": "check: lint test\n\ntest:\n\tpython3 -m unittest discover -s test -p '*_test.py'\n\n"
+                               + MAKEFILE_TARGETS,
+                   "test/x_test.py": "import unittest\n"}
+        cases = [
+            ("jotform", jotform, "python3 -m pytest -q {files}"),
+            ("requirements-only", {"requirements.txt": "requests==2.32.3\n"}, "python3 -m pytest -q {files}"),
+            ("loose-test-file", {"test_app.py": "def test_x():\n    pass\n"}, "python3 -m pytest -q {files}"),
+            ("make-test-only", {"Makefile": "test:\n\tpython3 -m unittest\n"}, "python3 -m pytest -q {files}"),
+            ("uv-lock-and-requirements", {"uv.lock": "version = 1\n", "requirements.txt": "requests==2.32.3\n"},
+             "uv run pytest -q {files}"),
+            ("pyproject-no-lock", {"pyproject.toml": "[project]\nname = 'x'\n"}, "python3 -m pytest -q {files}"),
+            ("empty", {}, "uv run pytest -q {files}"),
+        ]
+        for label, files, expected in cases:
+            with self.subTest(case=label):
+                root = self.fixture(f"testcmd-{label}", files)
+                self.ok("init", root, "--name", "demo-app", "--stack", "python")
+                self.assertEqual(self.settings(root)["env"]["HARNESS_TEST_CMD"], expected)
+                self.assertEqual(os.path.exists(os.path.join(root, "src", "demo_app")), not files, label)
+
+    def test_a_long_list_of_loose_test_files_is_cut_after_ten(self):
+        rels = [f"t/test_{n:02d}.py" for n in range(12)]
+        for stack in ("python", "node"):
+            with self.subTest(stack=stack):
+                root = self.fixture(f"many-{stack}", {rel: "pass\n" for rel in rels})
+                before = self.snapshot(root)
+                dry, real = self.both(root, stack)
+                self.assertSkipped(root, stack, before, dry, real, [])
+                for p, which in ((dry, "--dry-run"), (real, "real run")):
+                    raw = [m.group(1) for m in (LAYOUT.search(line) for line in self.lines(p)) if m]
+                    self.assertEqual(len(raw), 1, p.stdout)
+                    items = raw[0].split(", ")
+                    self.assertEqual(len(items), 11, f"{which}: ({raw[0]})")
+                    self.assertEqual(items[-1], "+2 more test files", f"{which}: ({raw[0]})")
+                    shown = items[:-1]
+                    self.assertEqual(len(set(shown)), 10, f"{which}: ({raw[0]})")
+                    self.assertTrue(set(shown) <= set(rels), f"{which}: ({raw[0]})")
+
+    def test_the_adopt_path_keeps_the_jotform_layout(self):
+        files = {"package.json": '{"name": "jotform-glow-sync", "scripts": {"test": "make test"}}\n',
+                 "Makefile": "check: lint test\n\ntest:\n\tpython3 -m unittest discover -s test -p '*_test.py'\n\n"
+                             + MAKEFILE_TARGETS,
+                 "test/x_test.py": "import unittest\n",
+                 "sync.py": "print('sync')\n"}
+        root = self.repo_with_commit("jot")
+        for rel, text in files.items():
+            self.write(os.path.join(root, rel), text)
+        self.git(root, "add", "-A")
+        self.git(root, "commit", "-q", "-m", "The project")
+        self.git(root, "remote", "add", "origin", self.bare())
+        self.git(root, "push", "-q", "-u", "origin", "main")
+        main_head = self.git(root, "rev-parse", "HEAD")
+        branch = "t/7-adopt-the-harness-scaffold"
+        worktree = os.path.join(root, ".claude", "worktrees", "t-7-adopt-the-harness-scaffold")
+        self.git(root, "worktree", "add", "-q", worktree, "-b", branch, "origin/main")
+        self.stub("harness-board", {"task": "#7 https://github.com/ryan/jot/issues/7\n"})
+        self.stub("harness-work", {"start": json.dumps({"number": 7, "branch": branch, "worktree": worktree,
+                                                        "tier": "sonnet", "context": "# 7"})})
+        self.stub("harness-pr", {"open": json.dumps({"number": 12, "url": "https://github.com/ryan/jot/pull/12"}),
+                                 "ready": "PR #12 ready for review\n"})
+
+        before = self.snapshot(root)
+        dry = self.ok("init", root, "--name", "jot", "--stack", "python", "--dry-run")
+        self.assertEqual(self.snapshot(root), before, "--dry-run wrote into the project")
+        self.assertEqual(self.calls(), [])
+        real = self.ok("init", root, "--name", "jot", "--stack", "python")
+
+        self.assertLayoutIs(dry, real, {"package.json", "Makefile", "test/"})
+        skeleton = ["pyproject.toml", "src/jot/__init__.py", "tests/test_smoke.py"]
+        for rel in skeleton:
+            self.assertNotIn(f"would create {rel}", self.lines(dry))
+            self.assertNotIn(f"created {rel}", self.lines(real))
+            self.assertFalse(os.path.exists(os.path.join(worktree, rel)), rel)
+            self.assertFalse(os.path.exists(os.path.join(root, rel)), rel)
+        committed = self.git(worktree, "show", "--name-only", "--format=", "HEAD").splitlines()
+        for rel in COMMON_FILES:
+            self.assertIn(rel, committed)
+        for rel in skeleton + list(files):
+            self.assertNotIn(rel, committed)
+        self.assertFalse(os.path.exists(os.path.join(worktree, "src")))
+        self.assertFalse(os.path.exists(os.path.join(worktree, "tests")))
+        for rel, text in files.items():
+            self.assertEqual(self.read(worktree, rel), text, rel)
+        self.assertEqual(self.git(root, "rev-parse", "main"), main_head)
+        self.assertEqual(self.settings(worktree)["env"]["HARNESS_TEST_CMD"], "python3 -m pytest -q {files}")
+
+
 # =========================================================================== rules
 class Rules(ScaffoldTest):
     def test_existing_file_is_kept_without_force(self):
