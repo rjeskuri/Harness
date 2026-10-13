@@ -2,11 +2,11 @@
 """
 The cross-project standup. For each project in ~/.claude/harness/projects.json (registry order):
 git state, last Claude Code session, next steps (as the session brief reads them), latest spec,
-hours this month on a billable project, and the sessions running in it; for a project with an `origin`
-remote, when gh is found (HARNESS_GH, else gh on PATH): the board counts, your pull requests awaiting
-review, the tickets that need your input and the stale ticket worktrees. Then the fleet of every
-running Claude Code session, waiting ones first; the exhausted budgets; and the headless and background
-runs alive or ended in the last 24 hours. Markdown, or --json for the structure behind it.
+hours this month on a billable project, and the sessions running in it; for a project whose `origin`
+remote is on github.com, when gh is found (HARNESS_GH, else gh on PATH): the board counts, your pull
+requests awaiting review, the tickets that need your input and the stale ticket worktrees. Then the
+fleet of every running Claude Code session, waiting ones first; the exhausted budgets; and the headless
+and background runs alive or ended in the last 24 hours. Markdown, or --json for the structure behind it.
 
 Usage:
     harness-standup                  # every registered project
@@ -529,7 +529,8 @@ def label_names(issue):
 def board_report(project, now):
     """The project's board: counts by status, your open non-draft PRs, the needs-input tickets with their
     question and the stale ticket worktrees. Every field None when the path is gone, there is no origin
-    remote or gh is not found; board_error (and the rest None) when the calls fail or run out of time."""
+    remote whose URL contains github.com or gh is not found; board_error (and the rest None) when the
+    calls fail or run out of time."""
     out = {"board": None, "prs_awaiting": None, "needs_input": None, "stale_worktrees": None, "board_error": None}
     deadline = time.monotonic() + GH_BUDGET
     try:
@@ -537,8 +538,8 @@ def board_report(project, now):
         if gh is None or not os.path.isdir(path):
             return out
         remote = git(path, ["remote", "get-url", "origin"], deadline)
-        if remote.returncode != 0 or not remote.stdout.strip():
-            return out
+        if remote.returncode != 0 or "github.com" not in remote.stdout.lower():
+            return out            # no origin, or one gh cannot read (a local path, another host)
         slug = repo_slug(remote.stdout)
         flag = ["-R", slug] if slug else []
         batch = GhBatch(gh, [["issue", "list", "--state", "open", "--json", "labels", "--limit", "200"] + flag,

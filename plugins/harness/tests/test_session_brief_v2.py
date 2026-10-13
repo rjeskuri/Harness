@@ -279,6 +279,23 @@ class BriefV2Tests(unittest.TestCase):
         self.scenario.write_text(json.dumps({"default": {"stdout": "not json"}}))
         self.assertEqual(self.lines(self.repo)[1:], [])
 
+    def test_no_board_line_without_a_github_origin(self):
+        bare = self.tmp / "remote.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(bare)],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        self.git(self.repo, "remote", "add", "origin", str(bare))
+        for url in (str(bare), "https://gitlab.com/o/r.git"):
+            self.git(self.repo, "remote", "set-url", "origin", url)
+            self.gh_scenario(ISSUES, PRS)  # gh would answer
+            self.assertEqual(self.lines(self.repo)[1:], [])
+            self.gh_scenario(ISSUES, PRS, exit_code=4)  # gh would fail, e.g. no token
+            self.assertEqual(self.lines(self.repo)[1:], [])
+        self.assertEqual(self.gh_calls(), [])  # gh never runs
+
     def test_slow_gh_is_cut_off_after_three_seconds(self):
         self.git(self.repo, "remote", "add", "origin", "https://github.com/o/r.git")
         slow = {"PATH": f"{_SHARED['base'] / 'bin-slow'}:{SYSTEM_PATH}"}

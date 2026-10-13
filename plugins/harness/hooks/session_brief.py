@@ -6,10 +6,10 @@ Matcher (hooks.json): startup|resume|compact. Adds at most 40 lines of context:
   - on a ticket branch (t/<N>-...): Ticket #N: <title> (<status>, tier <tier>), up to six
     definition-of-done lines and Red run: <kind> at <time> (or none), from the ticket
     cache and red record in ~/.claude/harness/repos/<key>/ (no network);
-  - otherwise, when the repo has an origin remote and gh (HARNESS_GH, else gh on PATH)
-    answers within 3 s: Board: <r> ready, <p> in progress, <v> awaiting your review,
-    <q> needs input (open issues by status label, epics not counted as ready; open
-    non-draft pull requests not opened by a bot);
+  - otherwise, when the repo's origin remote is on github.com and gh (HARNESS_GH, else gh
+    on PATH) answers within 3 s: Board: <r> ready, <p> in progress, <v> awaiting your
+    review, <q> needs input (open issues by status label, epics not counted as ready;
+    open non-draft pull requests not opened by a bot);
   - Budget: <name> exhausted until <time> (<reason>), for each budget that
     ~/.claude/harness/budgets.json marks exhausted;
   - the Next steps section of docs/agent/handoff.md (first 12 lines), else the file's
@@ -518,13 +518,13 @@ def label_names(issue) -> set[str]:
 
 
 def board_part(root: Path) -> list[str]:
-    """Board counts from gh, when the repo has an origin and gh answers in time."""
+    """Board counts from gh, when the repo's origin is on github.com and gh answers in time."""
     gh = gh_command()
     if gh is None:
         return []
     remote = git(root, "remote", "get-url", "origin", timeout=EXTRA_GIT_TIMEOUT)
-    if remote.returncode != 0 or not remote.stdout.strip():
-        return []
+    if remote.returncode != 0 or "github.com" not in remote.stdout.lower():
+        return []  # no origin, or one gh cannot read (a local path, another host)
     outputs = run_side_by_side(
         [
             [gh, "issue", "list", "--json", "labels", "--limit", "200"],
