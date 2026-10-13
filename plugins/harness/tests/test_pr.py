@@ -1532,11 +1532,16 @@ class LandResolution(Land):
     """`land` leaves one `**Resolution**` comment on the ticket, posted through `harness-board comment` before the
     `Landed in` comment. These run the real harness-board (no stubs), so every comment reaches the fake gh's log."""
 
-    def resolution_calls(self, fx, state="OPEN", issue_state="OPEN", comments=(), view_files=None, after=None):
+    def resolution_calls(self, fx, state="OPEN", issue_state="OPEN", comments=(), view_files=None, after=None,
+                         no_sha=False):
         """The land conversation for the fixture's PR. `view_files`: the files `gh pr view --json` holds (all of
         the fixture's by default; GitHub stops at 100), while the files endpoint always lists them all; `after`:
-        the answer to the PR read after the merge (`gh pr view P --json body,...`), in place of the PR's data."""
+        the answer to the PR read after the merge (`gh pr view P --json body,...`), in place of the PR's data;
+        `no_sha`: GitHub reports no merge commit (True) or the read fails ("fail"), so the land knows no sha and
+        comments `Landed in PR #N`."""
         pr, sha = str(fx["pr"]), fx["sha"]
+        if no_sha:
+            fx, sha = dict(fx, sha=""), ""
         view = pr_data(dict(fx, files=fx["files"] if view_files is None else view_files))
         url = f"https://github.com/o/r/pull/{pr}"
         issue = {"number": 12, "title": "Add the widget", "url": "https://github.com/o/r/issues/12",
@@ -1547,7 +1552,9 @@ class LandResolution(Land):
         # the review gate's reads: no harness review, so the gate lets the land through
         gate = gate_calls(commits=[pr_commit("a", at(9))], pull=f"repos/o/r/pulls/{pr}")
         return gate + [
-                {"match": ["pr", "view", pr, "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": sha}}},
+                {"match": ["pr", "view", pr, "--json", "mergeCommit"],
+                 **({"stderr": "GraphQL: timeout\n", "exit": 1} if no_sha == "fail"
+                    else {"stdout_json": {"mergeCommit": {"oid": sha} if sha else None}})},
                 {"match": ["pr", "view", pr, "--json", LAND_FIELDS],
                  "stdout_json": land_view(url=url, state=state)},
                 REPO_VIEW,
@@ -1746,6 +1753,190 @@ class LandResolution(Land):
         self.assertEqual(len(first), 1, "the first land posts the Resolution")
         self.assertEqual(again, [], "once Landed in is on the ticket the land is recorded; no Resolution")
         self.assertEqual(landed, [])
+
+    # ------------------------------------------------------------------ a reopened ticket's second landing (#24)
+    REOPENED = "Reopened: the first pass broke the hooks."
+
+    def first_pass(self, fx):
+        """Land `fx` on a fresh ticket and return the bodies it posted: its Resolution and `Landed in`."""
+        self.land(fx)
+        bodies = [b for _, _, b in self.posted(12)]
+        self.assertEqual(len(bodies), 2, f"the first pass posts a Resolution and Landed in: {bodies}")
+        return bodies
+
+    def old_resolution(self, pr_line, sha):
+        """A Resolution in the land's format, with the given `PR:` line and squash sha (None: no such line)."""
+        closing = ([pr_line] if pr_line else []) + ([f"Squash commit: {sha}"] if sha else [])
+        return "\n".join([RESOLUTION, "", "A first pass that was reopened.", "", "Files changed (1):",
+                          "- `old/first_pass.py`", "", *closing, "", HARNESS_MARK])
+
+    def assertSecondLanding(self, fx, old_texts):
+        """This land of `fx` posted exactly two comments on #12: a Resolution of `fx` (naming its PR, not an old
+        one) and then `Landed in <fx's sha>`."""
+        posted = self.posted(12)
+        self.assertEqual(len(posted), 2, f"want a Resolution and Landed in for PR #{fx['pr']}, got {posted}")
+        found = self.resolutions(12)
+        self.assertEqual(len(found), 1, f"want one new Resolution, got {posted}")
+        index, _, body = found[0]
+        self.assertResolution(body, fx)
+        for text in old_texts:
+            self.assertNotIn(text, body, "the new Resolution is about this PR only")
+        landed = self.landed(12)
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed], [f"Landed in {fx['sha']}"])
+        self.assertLess(index, landed[0][0], "the Resolution goes before Landed in")
+
+    def test_second_landing_of_a_reopened_ticket_comments_resolution_and_landed_in(self):
+        """A ticket landed once (its Resolution and `Landed in <old sha>` on it), reopened, and landed again by
+        another PR: this landing gets its own Resolution, naming the new PR, and `Landed in <new sha>`. Several
+        pairs, so neither the old nor the new fixture's text can be hard-coded; GitHub has or has not closed it."""
+        for old, new, issue_state in ((FIXTURE_A, FIXTURE_B, "CLOSED"), (FIXTURE_B, FIXTURE_A, "OPEN"),
+                                      (FIXTURE_C, FIXTURE_A, "CLOSED"), (FIXTURE_A, FIXTURE_C, "OPEN")):
+            with self.subTest(old=old["pr"], new=new["pr"]):
+                bodies = self.first_pass(old) + [self.REOPENED]
+                p = self.land(new, issue_state=issue_state, comments=self.as_comments(bodies))
+                self.assertSecondLanding(new, [f"https://github.com/o/r/pull/{old['pr']}", old["sha"],
+                                               old["summary"]])
+                ticket = [line for line in p.stdout.splitlines() if line.startswith("Ticket:")]
+                self.assertEqual(len(ticket), 1, p.stdout)
+                self.assertIn("commented", ticket[0])
+                self.assertNotIn("already there", ticket[0])
+
+    def test_second_landing_ignores_every_shape_of_an_earlier_passs_comments(self):
+        """Only this landing's own text counts as already landed: `Landed in <this sha>` (a whole token) or
+        `Landed in PR #<this PR>`, and a Resolution whose `PR:` line is this PR's URL. An older pass's comments
+        in any shape do not, including ones that share a prefix with this sha, PR number or URL. A Resolution
+        with no `PR:` line names no PR, so it is not this landing's either. Landing FIXTURE_B (PR #57)."""
+        new = FIXTURE_B
+        sha = new["sha"]
+        old_sha = FIXTURE_A["sha"]
+        cases = [
+            ("Landed in PR #34 and its Resolution",
+             [self.old_resolution("PR: https://github.com/o/r/pull/34", old_sha), "Landed in PR #34"]),
+            ("a Resolution with no PR line",
+             [self.old_resolution(None, old_sha), f"Landed in {old_sha}"]),
+            ("PR #570 and pull/570, which start with this PR's number and URL",
+             [self.old_resolution("PR: https://github.com/o/r/pull/570", old_sha), "Landed in PR #570"]),
+            ("a different sha sharing this sha's first 12 characters",
+             [self.old_resolution("PR: https://github.com/o/r/pull/34", sha[:12] + "0" * 28),
+              f"Landed in {sha[:12]}{'0' * 28}"]),
+            ("an abbreviated sha that is a prefix of this one",
+             [self.old_resolution("PR: https://github.com/o/r/pull/34", sha[:7]), f"Landed in {sha[:7]}"]),
+            ("a longer hex token that starts with this sha",
+             [self.old_resolution("PR: https://github.com/o/r/pull/34", sha + "abc"), f"Landed in {sha}abc"]),
+            ("Landed in PR #570 followed by more text",
+             [self.old_resolution("PR: https://github.com/o/r/pull/570", old_sha), "Landed in PR #570, see notes"]),
+            # a Resolution belongs to the PR its `PR:` line names, whatever sha it quotes
+            ("another PR's Resolution quoting this sha, and no Landed in",
+             [self.old_resolution("PR: https://github.com/o/r/pull/34", sha), "Reverted by hand."]),
+            ("another PR's Resolution quoting this sha, and its Landed in",
+             [self.old_resolution("PR: https://github.com/o/r/pull/34", sha), f"Landed in {old_sha}"]),
+        ]
+        for name, old in cases:
+            with self.subTest(name):
+                bodies = [old[0], old[1] + "\n\n" + HARNESS_MARK, self.REOPENED]
+                self.land(new, issue_state="CLOSED", comments=self.as_comments(bodies))
+                self.assertSecondLanding(new, ["A first pass that was reopened.", "old/first_pass.py"])
+
+    def test_resumed_land_posts_only_what_is_missing(self):
+        """A reopened ticket's second land, resumed: the ticket carries the first pass's two comments and some of
+        this landing's. With this PR's Resolution and no `Landed in <this sha>`, only `Landed in` is posted; with
+        both (or `Landed in` alone, which records the land), nothing is; `Landed in PR #<this PR>` counts as this
+        landing's Landed comment too. Run with the fixtures both ways round."""
+        for old, new in ((FIXTURE_A, FIXTURE_B), (FIXTURE_B, FIXTURE_A)):
+            first = self.first_pass(old) + [self.REOPENED]
+            self.land(new)                                   # this landing's own comments, as the land posts them
+            res = [b for _, _, b in self.resolutions(12)]
+            mine = [b for _, _, b in self.landed(12)]
+            self.assertEqual((len(res), len(mine)), (1, 1))
+            by_pr = f"Landed in PR #{new['pr']}\n\n{HARNESS_MARK}"
+            cases = [("this Resolution only", res, [f"Landed in {new['sha']}"]),
+                     ("this Resolution and Landed in", res + mine, []),
+                     ("this Landed in only", mine, []),
+                     ("this Resolution and Landed in PR #", res + [by_pr], [])]
+            for name, kept, wanted in cases:
+                with self.subTest(old=old["pr"], new=new["pr"], case=name):
+                    self.land(new, state="MERGED", issue_state="CLOSED", comments=self.as_comments(first + kept))
+                    self.assertFalse(any(a[:2] == ["pr", "merge"] for a in self.gh_argv()), "no second merge")
+                    self.assertEqual(self.resolutions(12), [], "this PR's Resolution is there; none again")
+                    self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in self.posted(12)], wanted)
+
+    def test_resumed_land_counts_this_prs_resolution_by_its_pr_line(self):
+        """A Resolution is this landing's when its `PR:` line is this PR's URL, whatever sha it quotes or none:
+        then only `Landed in <this sha>` is posted, never a second Resolution. A `Landed in` for this PR with
+        trailing text after the whole number (`PR #57, see notes`) records the land; nothing is posted."""
+        new, old = FIXTURE_B, FIXTURE_A
+        url = f"PR: https://github.com/o/r/pull/{new['pr']}"
+        first = self.first_pass(old) + [self.REOPENED]
+        cases = [("this PR's Resolution without a Squash commit line",
+                  [self.old_resolution(url, None)],
+                  [f"Landed in {new['sha']}"]),
+                 ("this PR's Resolution quoting another sha",
+                  [self.old_resolution(url, FIXTURE_C["sha"])], [f"Landed in {new['sha']}"]),
+                 ("this PR's Resolution and Landed in PR #57 with more text",
+                  [self.old_resolution(url, new["sha"]), f"Landed in PR #{new['pr']}, see notes\n\n{HARNESS_MARK}"],
+                  [])]
+        for name, kept, wanted in cases:
+            with self.subTest(name):
+                self.land(new, state="MERGED", issue_state="CLOSED", comments=self.as_comments(first + kept))
+                self.assertEqual(self.resolutions(12), [], "this PR's Resolution is there; none again")
+                self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in self.posted(12)], wanted)
+
+    def test_land_without_a_merge_sha_on_a_reopened_ticket(self):
+        """GitHub reports no merge commit, so the land comments `Landed in PR #<pr>`. A second landing still gets
+        its own Resolution (naming this PR) and `Landed in PR #<pr>` despite the first pass's comments and an old
+        `Landed in PR #570`; a resume with this PR's Resolution posts only `Landed in PR #<pr>`; with both,
+        nothing; never a second Resolution. Both ways round."""
+        for old, new in ((FIXTURE_A, FIXTURE_B), (FIXTURE_B, FIXTURE_A)):
+            by_pr = f"Landed in PR #{new['pr']}"
+            first = self.first_pass(old) + [f"Landed in PR #{new['pr']}0\n\n{HARNESS_MARK}", self.REOPENED]
+            self.land(new, no_sha=True)                      # this landing's own comments, as the land posts them
+            res = [b for _, _, b in self.resolutions(12)]
+            mine = [b for _, _, b in self.landed(12)]
+            self.assertEqual(len(res), 1)
+            self.assertNotIn("Squash commit", res[0], "no merge sha, no squash line")
+            with self.subTest(old=old["pr"], new=new["pr"], case="second landing"):
+                self.land(new, issue_state="CLOSED", comments=self.as_comments(first), no_sha=True)
+                posted = self.posted(12)
+                self.assertEqual(len(posted), 2, f"want a Resolution and {by_pr}, got {posted}")
+                found = self.resolutions(12)
+                self.assertEqual(len(found), 1, f"want one new Resolution, got {posted}")
+                index, _, body = found[0]
+                self.assertIn(f"PR: https://github.com/o/r/pull/{new['pr']}", body)
+                self.assertIn(new["summary"], body)
+                for text in (f"https://github.com/o/r/pull/{old['pr']}", old["sha"], old["summary"]):
+                    self.assertNotIn(text, body, "the new Resolution is about this PR only")
+                landed = self.landed(12)
+                self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed], [by_pr])
+                self.assertLess(index, landed[0][0], "the Resolution goes before Landed in")
+            for name, kept, wanted in (("this Resolution only", res, [by_pr]), ("both", res + mine, [])):
+                with self.subTest(old=old["pr"], new=new["pr"], case=name):
+                    self.land(new, state="MERGED", issue_state="CLOSED", comments=self.as_comments(first + kept),
+                              no_sha=True)
+                    self.assertEqual(self.resolutions(12), [], "this PR's Resolution is there; none again")
+                    self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in self.posted(12)], wanted)
+
+    def test_resumed_land_without_a_sha_knows_its_own_landed_comment_by_the_resolutions_squash_sha(self):
+        """The first run knew the sha and posted this PR's Resolution (`Squash commit: S`) and `Landed in S`; the
+        resume cannot read the merge commit (null, or the read fails). `Landed in S` is still this landing's,
+        found through the Squash commit of the Resolution naming this PR, so nothing is posted. An older pass's
+        `Landed in <its sha>`, whose Resolution names another PR, is not: with only this PR's Resolution and
+        that, only `Landed in PR #<pr>` is posted. Both ways round."""
+        for old, new in ((FIXTURE_A, FIXTURE_B), (FIXTURE_B, FIXTURE_A)):
+            first = self.first_pass(old) + [self.REOPENED]
+            self.land(new)                                   # the first run of this landing, sha known
+            res = [b for _, _, b in self.resolutions(12)]
+            mine = [b for _, _, b in self.landed(12)]
+            self.assertIn(f"Squash commit: {new['sha']}", res[0])
+            self.assertEqual([b.replace(HARNESS_MARK, "").strip() for b in mine], [f"Landed in {new['sha']}"])
+            for how in (True, "fail"):
+                for name, kept, wanted in (("both", res + mine, []),
+                                           ("this Resolution only", res, [f"Landed in PR #{new['pr']}"])):
+                    with self.subTest(old=old["pr"], new=new["pr"], merge_commit=how, case=name):
+                        self.land(new, state="MERGED", issue_state="CLOSED", comments=self.as_comments(first + kept),
+                                  no_sha=how)
+                        self.assertEqual(self.resolutions(12), [], "this PR's Resolution is there; none again")
+                        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in self.posted(12)],
+                                         wanted)
 
     # ------------------------------------------------------------------ the PR body's shape
     def one_resolution(self):

@@ -3,8 +3,8 @@
 The work log behind the monthly invoice: hours per day and what was done.
 
 The repo is --repo PATH, else $CLAUDE_PROJECT_DIR, else the git top level of the
-current directory, else the current directory; the log and the timeline below are
-in its worklog/ folder.
+current directory, else the current directory (a linked git worktree stands for its
+main checkout); the log and the timeline below are in its worklog/ folder.
 
 Hours are reconstructed from Claude Code's session transcripts for this repo
 (~/.claude/projects/<this repo's path with '/' as '-'>/*.jsonl), which
@@ -69,17 +69,31 @@ LOCALTIME = "/etc/localtime"
 GITHUB = "GitHub"     # the committer of merges made on github.com: UTC, not evidence of the Mac's zone
 
 
+def main_checkout(path):
+    """`path`, or when it is a linked git worktree the main checkout it belongs to (the parent of git's
+    common dir): the log and the session folders are the repo's, not a ticket branch's."""
+    try:
+        out = subprocess.run(["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-dir",
+                              "--git-common-dir"], capture_output=True, text=True, check=True,
+                             timeout=10).stdout.split("\n")
+    except (OSError, subprocess.SubprocessError):
+        return path
+    if len(out) >= 2 and out[0] and out[0] != out[1] and os.path.basename(out[1]) == ".git":
+        return os.path.dirname(out[1])
+    return path
+
+
 def find_repo(given=None):
     """The repo: `given` (--repo), else $CLAUDE_PROJECT_DIR, else the git top level of the current
-    directory, else the current directory."""
+    directory, else the current directory; a linked worktree stands for its main checkout."""
     for path in (given, os.environ.get("CLAUDE_PROJECT_DIR")):
         if path:
-            return os.path.abspath(os.path.expanduser(path))
+            return main_checkout(os.path.abspath(os.path.expanduser(path)))
     try:
         top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
                              check=True, timeout=10).stdout.strip()
         if top:
-            return top
+            return main_checkout(top)
     except (OSError, subprocess.SubprocessError):
         pass
     return os.getcwd()
@@ -97,9 +111,26 @@ def rel(path):
     return os.path.relpath(path, REPO)
 
 
-def transcripts_dir(repo=None):
-    """Claude Code keeps a project's sessions under its path with every non-alphanumeric as '-'."""
-    return os.path.join(os.path.expanduser("~"), ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", repo or REPO))
+def encode_path(path):
+    """Claude Code names a project's session folder after its path, every non-alphanumeric as '-'."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def transcripts_dirs(repo=None):
+    """The repo's session folders: its own, then one per ticket worktree (<repo>/.claude/worktrees/<name>),
+    found by listing ~/.claude/projects since a removed worktree keeps its transcripts."""
+    repo = repo or REPO
+    projects = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    dirs = [os.path.join(projects, encode_path(repo))]
+    prefix = encode_path(os.path.join(repo, ".claude", "worktrees")) + "-"
+    try:
+        names = sorted(os.listdir(projects))
+    except OSError:
+        return dirs
+    for name in names:
+        if len(name) > len(prefix) and name.startswith(prefix) and os.path.isdir(os.path.join(projects, name)):
+            dirs.append(os.path.join(projects, name))
+    return dirs
 
 
 # ------------------------------------------------------------------ zones
@@ -300,9 +331,12 @@ def is_human_message(entry):
 
 
 def events(paths):
-    """(UTC datetime, is the user's message) for every user/assistant entry in the transcripts."""
-    out = []
+    """(UTC datetime, is the user's message) for every user/assistant entry in the transcripts.
+    A session id found in several files (a copy, or a resumed session) counts each entry once: per entry,
+    the most times any one file holds it. An entry without a session id belongs to its file alone."""
+    held = {}    # (session id, entry) -> the most times one file holds it
     for path in paths:
+        seen = {}
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 try:
@@ -313,7 +347,11 @@ def events(paths):
                 if entry.get("type") not in ("user", "assistant") or not stamp:
                     continue
                 when = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(UTC)
-                out.append((when, is_human_message(entry)))
+                key = (entry.get("sessionId") or path, when, is_human_message(entry), entry["type"])
+                seen[key] = seen.get(key, 0) + 1
+        for key, n in seen.items():
+            held[key] = max(held.get(key, 0), n)
+    out = [(when, human) for (_, when, human, _), n in held.items() for _ in range(n)]
     return sorted(out, key=lambda e: e[0])
 
 
@@ -632,10 +670,10 @@ def a_date(text):
         raise argparse.ArgumentTypeError(f"{text!r}: give a date like 2026-09-28")
 
 
-def transcript_events(folder):
-    paths = sorted(glob.glob(os.path.join(folder, "*.jsonl")))
+def transcript_events(folders):
+    paths = sorted(p for folder in folders for p in glob.glob(os.path.join(folder, "*.jsonl")))
     if not paths:
-        sys.exit(f"no session transcripts in {folder}")
+        sys.exit(f"no session transcripts in {folders[0]}")
     return events(paths)
 
 
@@ -709,7 +747,7 @@ def main():
                                                  "or the last logged day when the log is behind)")
     up.add_argument("--gap-minutes", type=int, default=GAP_MINUTES,
                     help="a longer pause ends a block (default 30)")
-    up.add_argument("--transcripts", default=None, help="default: this repo's Claude Code project folder "
+    up.add_argument("--transcripts", default=None, help="default: this repo's Claude Code project folders (its worktrees too) "
                                                         "(another folder never drops or changes a logged row "
                                                         "without --rewrite-old)")
     up.add_argument("--drop-stale", action="store_true",
@@ -728,7 +766,7 @@ def main():
     zn.add_argument("--zone", help="the new zone: an IANA name like Asia/Tokyo, or an offset like +09:00")
     zn.add_argument("--evidence", default="", help="why you know (default: 'recorded <today>')")
     zn.add_argument("--gap-minutes", type=int, default=GAP_MINUTES)
-    zn.add_argument("--transcripts", default=None, help="default: this repo's Claude Code project folder")
+    zn.add_argument("--transcripts", default=None, help="default: this repo's Claude Code project folders (its worktrees too)")
     add = sub.add_parser("add", parents=[where], help="add a manual row (work outside Claude Code)")
     add.add_argument("--date", type=a_date, required=True)
     add.add_argument("--hours", type=float, required=True)
@@ -749,10 +787,10 @@ def main():
             sys.exit(str(err))
         now = dt.datetime.now(UTC)
         sys_tz, sys_name, changed = system_zone()
-        folder = args.transcripts or transcripts_dir()
+        folders = [args.transcripts] if args.transcripts else transcripts_dirs()
 
     if args.cmd == "update":
-        evts = transcript_events(folder)
+        evts = transcript_events(folders)
         commits = git_commits()
         problem = mac_zone_problem(zones, sys_tz, sys_name, now, evts, changed, args.gap_minutes, commits)
         if problem:
@@ -797,7 +835,7 @@ def main():
             if zone_at(zones, now) is not None and now.astimezone(zone_at(zones, now)).utcoffset() == mac.utcoffset():
                 print("OK: the Mac's zone matches the timeline.")
             else:
-                print(mac_zone_problem(zones, sys_tz, sys_name, now, transcript_events(folder), changed,
+                print(mac_zone_problem(zones, sys_tz, sys_name, now, transcript_events(folders), changed,
                                        args.gap_minutes, git_commits()))
             return
         if not (args.since and args.zone):
@@ -806,7 +844,7 @@ def main():
             since, new_tz = parse_switch(args.since, args.zone)
         except ValueError as err:
             sys.exit(str(err))
-        problems = since_problems(since, new_tz, zones, transcript_events(folder), git_commits(), now,
+        problems = since_problems(since, new_tz, zones, transcript_events(folders), git_commits(), now,
                                   args.gap_minutes)
         if problems:
             sys.exit("not recorded:\n  " + "\n  ".join(problems))
@@ -839,7 +877,7 @@ def main():
                 zones = read_zones()
             except ValueError as err:
                 sys.exit(str(err))
-            paths = sorted(glob.glob(os.path.join(transcripts_dir(), "*.jsonl")))
+            paths = sorted(p for d in transcripts_dirs() for p in glob.glob(os.path.join(d, "*.jsonl")))
             blocks = day_blocks(events(paths), zones).get(args.date)
         try:
             rows, created = describe_rows(rows, args.date, text, blocks)
