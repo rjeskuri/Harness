@@ -635,6 +635,127 @@ class Dispatch(WorkTest):
         self.assertFalse([c for c in self.gh_calls() if c[:2] in (["issue", "edit"], ["issue", "comment"])])
 
 
+def sha12(path):
+    """A path string's key, from first principles: the first 12 hex digits of its sha1."""
+    return hashlib.sha1(path.encode("utf-8")).hexdigest()[:12]
+
+
+class DispatchRunsByRepoField(WorkTest):
+    """Which run records dispatch counts as this repository's (ticket #7): a record whose `repo` field is
+    another spelling of the main tree is ours even when its id carries another key (written before the
+    key was canonical); a record of another repository is not ours, even when its path shares a prefix
+    with ours or differs from it only in case. Every record here has an id that does NOT start with this
+    repository's key, so only the repo field can decide."""
+
+    def spelled_repo(self):
+        """The main checkout in another case spelling; the test is skipped where that is another path."""
+        spelled = os.path.join(self.tmp, "PROJ")
+        if not (os.path.exists(spelled) and os.path.samefile(spelled, self.repo)):
+            self.skipTest("two spellings of one path need a case-insensitive file system")
+        self.assertNotEqual(sha12(spelled), self.key)
+        return spelled
+
+    def sibling(self, name="proj2"):
+        """Another repository next to ours whose path starts with ours."""
+        path = os.path.join(self.tmp, name)
+        self.git(self.tmp, "clone", "-q", self.origin, path)
+        self.assertNotEqual(sha12(path), self.key)
+        return path
+
+    def sleeper(self, ticket):
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"/harness:work {ticket}"])
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        return live.pid
+
+    def live_run(self, ticket, repo):
+        rid = f"{sha12(repo)}-{ticket}-20261013110000"
+        return self.write_run(ticket, id=rid, repo=repo, pid=self.sleeper(ticket),
+                              worktree=os.path.join(repo, ".claude", "worktrees", f"t-{ticket}-x"))
+
+    def ended_runs(self, ticket, repo, count=3):
+        for i in range(count):
+            hours = count - i
+            self.write_run(ticket, id=f"{sha12(repo)}-{ticket}-202610130{i}0000", repo=repo, pid=self.dead_pid(),
+                           started_at=iso_ago(hours=hours, minutes=30), ended_at=iso_ago(hours=hours),
+                           outcome="error")
+
+    def test_a_live_run_recorded_in_another_spelling_is_this_repos_and_takes_a_slot(self):
+        spelled = self.spelled_repo()
+        other = self.sibling()
+        ours = self.live_run(13, spelled)
+        theirs = self.live_run(14, other)
+        self.scenario(issues=[issue(), issue(13), issue(14), issue(15)],
+                      ready=[ready_row(12), ready_row(13, "Second"), ready_row(14, "Third"),
+                             ready_row(15, "Fourth")])
+        p = self.ok("dispatch", "--dry-run", "--max", "3")
+        self.assertIn("venue headless, 1 live, 2 of 3 slots free", p.stdout)
+        self.assertIn(f"skip #13: live run {ours['id']}", p.stdout)
+        self.assertNotIn("would start #13", p.stdout)
+        # the sibling's live run on #14 is not ours: #14 is planned here, and the sibling's run is not named
+        self.assertIn("would start #12 Add the board tool (tier sonnet)", p.stdout)
+        self.assertIn("would start #14 Third (tier sonnet)", p.stdout)
+        self.assertNotIn(theirs["id"], p.stdout)
+        self.assertIn("skip #15: over --max 3", p.stdout)
+
+        data = self.ok_json("dispatch", "--dry-run", "--max", "3", "--json")
+        self.assertEqual(data["live"], [ours["id"]])
+        self.assertEqual([row["number"] for row in data["plan"]], [12, 14])
+        self.assertEqual([(s["number"], s["why"]) for s in data["skipped"]],
+                         [(13, f"live run {ours['id']}"), (15, "over --max 3")])
+
+    def test_the_cap_counts_only_this_repos_live_runs_in_any_spelling(self):
+        spelled = self.spelled_repo()
+        first, second = self.live_run(13, spelled), self.live_run(14, self.repo + os.sep)
+        for name in ("proj2", "proj-old"):                     # two live runs elsewhere: not ours
+            self.live_run(20 if name == "proj2" else 21, self.sibling(name))
+        self.scenario(issues=[issue(), issue(13), issue(14)],
+                      ready=[ready_row(12), ready_row(13, "Second"), ready_row(14, "Third")])
+        p = self.ok("dispatch", "--max", "2")                  # for real: both slots are taken by our runs
+        self.assertIn("2 live runs; --max 2 reached, nothing launched.", p.stdout)
+        self.assertEqual(self.claude_calls(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+        data = self.ok_json("dispatch", "--dry-run", "--max", "3", "--json")
+        self.assertEqual(sorted(data["live"]), sorted([first["id"], second["id"]]))
+        self.assertEqual([row["number"] for row in data["plan"]], [12])
+
+    def test_ended_runs_recorded_in_another_spelling_count_toward_the_redispatch_cap(self):
+        spelled = self.spelled_repo()
+        other = self.sibling()
+        in_progress = ("task", "status:in-progress", "size:S", "risk:low")
+        self.ended_runs(12, spelled)                            # ours: three ended, the fourth is skipped
+        self.ended_runs(14, other)                              # the sibling's: never ours to redispatch or cap
+        self.scenario(issues=[issue(labels=in_progress), issue(14, labels=in_progress, title="Theirs")])
+        p = self.ok("dispatch", "--dry-run")
+        self.assertIn("skip #12: 3 runs ended without a pull request in 7 days, the last error", p.stdout)
+        self.assertNotIn("would start #12", p.stdout)
+        self.assertNotIn("#14", p.stdout)
+        self.assertIn("No ready tickets.", p.stdout)
+
+    def test_two_ended_runs_in_another_spelling_redispatch_the_ticket(self):
+        spelled = self.spelled_repo()
+        in_progress = ("task", "status:in-progress", "size:S", "risk:low")
+        self.ended_runs(12, spelled, count=2)
+        self.scenario(issues=[issue(labels=in_progress)])
+        p = self.ok("dispatch", "--dry-run")
+        self.assertIn("would start #12 Add the board tool (again after error) and launch headless", p.stdout)
+
+    def test_a_run_of_a_directory_differing_only_in_case_is_not_ours_on_a_case_sensitive_file_system(self):
+        upper = os.path.join(self.tmp, "PROJ")
+        if os.path.exists(upper):
+            self.skipTest("PROJ is another spelling of proj on this (case-insensitive) file system")
+        self.git(self.tmp, "clone", "-q", self.origin, upper)
+        theirs = self.live_run(13, upper)
+        self.ended_runs(12, upper)
+        in_progress = ("task", "status:in-progress", "size:S", "risk:low")
+        self.scenario(issues=[issue(labels=in_progress), issue(13)], ready=[ready_row(13, "Second")])
+        data = self.ok_json("dispatch", "--dry-run", "--json")
+        self.assertEqual(data["live"], [])
+        self.assertEqual([row["number"] for row in data["plan"]], [13])
+        self.assertEqual(data["skipped"], [])
+        self.assertNotIn(theirs["id"], json.dumps(data))
+
+
 # =========================================================================== runs
 class Runs(WorkTest):
     def test_sweep_classifies_billing_and_marks_the_api_budget(self):

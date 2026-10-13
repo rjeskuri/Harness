@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import unittest
 import uuid
 from importlib.machinery import SourceFileLoader
@@ -81,6 +82,23 @@ def spelled_below(path, base=TEMP_ROOT):
     return os.path.join(base, *[swap(part) for part in rel.split(os.sep)])
 
 
+def nfd_below(path, base=TEMP_ROOT):
+    """`path` with every component below `base` in Unicode NFD (decomposed: "e" + U+0301 for NFC "é")."""
+    rel = os.path.relpath(path, base)
+    assert not rel.startswith(os.pardir), (path, base)
+    return os.path.join(base, *[unicodedata.normalize("NFD", part) for part in rel.split(os.sep)])
+
+
+def nfd_swapped_below(path, base=TEMP_ROOT):
+    """Both at once: every component below `base` case-swapped and in NFD."""
+    return nfd_below(spelled_below(path, base), base)
+
+
+def accented_name(prefix):
+    """A directory name new each run with a precomposed (NFC) "é": prefix + "é" + 6 upper hex + "q"."""
+    return unicodedata.normalize("NFC", prefix + "é") + uuid.uuid4().hex[:6].upper() + "q"
+
+
 def mixed_name(prefix):
     """A directory name new each run, in mixed case: prefix + 6 upper hex digits + "q"."""
     return prefix + uuid.uuid4().hex[:6].upper() + "q"
@@ -115,7 +133,24 @@ def _probe_case_insensitive():
         shutil.rmtree(base, True)
 
 
+def _probe_normalisation_insensitive():
+    """True where a name created in NFC is reached by its NFD spelling and listed as created (APFS)."""
+    base = os.path.realpath(tempfile.mkdtemp(prefix="harness-key-probe-"))
+    try:
+        created = unicodedata.normalize("NFC", "CaféProbe")
+        other = unicodedata.normalize("NFD", created)
+        os.mkdir(os.path.join(base, created))
+        return (created != other and os.path.exists(os.path.join(base, other))
+                and os.path.samefile(os.path.join(base, created), os.path.join(base, other))
+                and os.listdir(base) == [created])
+    finally:
+        shutil.rmtree(base, True)
+
+
 CASE_INSENSITIVE = _probe_case_insensitive()
+NORMALISATION_INSENSITIVE = _probe_normalisation_insensitive()
+needs_normalisation_insensitive = unittest.skipUnless(
+    NORMALISATION_INSENSITIVE, "two Unicode normalisations of one name need a normalisation-insensitive file system")
 needs_case_insensitive = unittest.skipUnless(
     CASE_INSENSITIVE, "two spellings of one path need a case-insensitive file system")
 
@@ -226,10 +261,14 @@ class KeyFixture(unittest.TestCase):
         return subprocess.run([GIT, "-C", cwd, "-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false",
                                *args], env=self.env, capture_output=True, text=True, check=True).stdout.strip()
 
+    def respell(self, path):
+        """Another spelling of `path`: here every component below the system temp root case-swapped."""
+        return spelled_below(path)
+
     def spell_worktree(self):
-        """Point the worktree's .git file at the main tree with every component below the system temp root
-        case-swapped; return that spelling of the main tree."""
-        other = spelled_below(self.main)
+        """Point the worktree's .git file at the main tree in another spelling (self.respell); return that
+        spelling of the main tree."""
+        other = self.respell(self.main)
         dotgit = os.path.join(self.wt, ".git")
         with open(dotgit, encoding="utf-8") as fh:
             text = fh.read()
@@ -238,6 +277,7 @@ class KeyFixture(unittest.TestCase):
         common = self.git(self.wt, "rev-parse", "--git-common-dir")
         if common != os.path.join(other, ".git"):
             self.skipTest(f"git normalised the common dir to {common}")
+        self.assertFalse(on_disk(other), other)                      # really another spelling
         self.old_key = sha12(other)
         self.old = os.path.join(self.repos, self.old_key)
         self.assertNotEqual(self.old_key, self.canon_key)
@@ -687,6 +727,114 @@ class MigrationLowercaseOnDisk(Migration):
 
     def main_name(self):
         return lower_name("rk")
+
+
+# ================================================================ another Unicode normalisation, one key
+# The main tree's name holds a precomposed "é" (NFC, as created). On APFS the decomposed spelling (NFD,
+# "e" + U+0301) reaches the same directory, os.listdir returns the name as created, os.path.realpath keeps the
+# spelling it was given, and git keeps the spelling a worktree's .git file names. So a worktree whose .git file
+# names the main tree in NFD reaches every tool and hook with a main tree that only canonical_path's
+# normalisation (NFC on both sides before casefolding) maps back to the on-disk spelling.
+@needs_normalisation_insensitive
+class OtherNormalisationOneKey(OtherSpellingOneKey):
+    """git names the main tree in NFD; every tool and hook keys by the NFC name the parent lists."""
+
+    def main_name(self):
+        return accented_name("R")
+
+    def respell(self, path):
+        return nfd_below(path)
+
+
+@needs_normalisation_insensitive
+class OtherNormalisationAndCaseOneKey(OtherSpellingOneKey):
+    """git names the main tree case-swapped and in NFD at once."""
+
+    def main_name(self):
+        return accented_name("R")
+
+    def respell(self, path):
+        return nfd_swapped_below(path)
+
+
+@needs_normalisation_insensitive
+class MigrationOtherNormalisation(Migration):
+    """State under sha1 of the NFD spelling moves once to the key of the NFC on-disk name."""
+
+    def main_name(self):
+        return accented_name("R")
+
+    def respell(self, path):
+        return nfd_below(path)
+
+
+STATE_KEY_FILES = [os.path.join(BIN, name) for name in ("harness-board", "harness-digest", "harness-pr",
+                                                         "harness-red", "harness-standup", "harness-work")]
+STATE_KEY_FILES += [os.path.join(HOOKS, name) for name in ("session_brief.py", "tests_first.py")]
+
+
+def load_file(path):
+    """Import a tool or hook by path, as a fresh module, without running its main()."""
+    modname = os.path.basename(path).replace("-", "_").replace(".py", "") + "_norm_test"
+    loader = SourceFileLoader(modname, path)
+    spec = importlib.util.spec_from_loader(modname, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+@needs_normalisation_insensitive
+class CanonicalPathNormalisation(unittest.TestCase):
+    """canonical_path and repo_key in every file that carries them, on names that differ from the on-disk
+    name only in Unicode normalisation (and case): one key across the spellings, the one the parent lists."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mods = {os.path.basename(path): load_file(path) for path in STATE_KEY_FILES}
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="KeyNorm-", dir=W["root"]))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.outer = os.path.join(self.tmp, accented_name("Ou"))                     # NFC on disk
+        self.proj = os.path.join(self.outer, accented_name("R"))                     # NFC on disk
+        # created decomposed: APFS keeps and lists it in NFD, so NFD is its canonical spelling
+        self.decomposed = os.path.join(self.tmp, unicodedata.normalize("NFD", accented_name("De")))
+        self.sibling = os.path.join(self.outer, accented_name("S"))                  # another directory
+        for path in (self.proj, self.decomposed, self.sibling):
+            os.makedirs(path)
+        self.assertTrue(on_disk(self.proj) and on_disk(self.decomposed) and on_disk(self.sibling))
+
+    def cases(self):
+        nfc = lambda p: os.path.join(self.tmp, *[unicodedata.normalize("NFC", part)
+                                                 for part in os.path.relpath(p, self.tmp).split(os.sep)])
+        cases = [(p, self.proj) for p in (nfd_below(self.proj), nfd_swapped_below(self.proj),
+                                          os.path.join(self.outer, unicodedata.normalize(
+                                              "NFD", os.path.basename(self.proj))),
+                                          os.path.join(nfd_below(self.outer), os.path.basename(self.proj)),
+                                          nfd_below(self.proj) + os.sep)]
+        cases += [(p, self.decomposed) for p in (nfc(self.decomposed), spelled(nfc(self.decomposed)))]
+        cases += [(p, self.sibling) for p in (nfd_below(self.sibling), nfd_swapped_below(self.sibling))]
+        for given, canonical in cases:
+            self.assertFalse(on_disk(given.rstrip(os.sep)), given)        # each case really is another spelling
+            self.assertTrue(os.path.samefile(given, canonical), given)
+            self.assertNotEqual(sha12(given.rstrip(os.sep)), sha12(canonical))
+        return cases
+
+    def test_every_normalisation_of_a_path_gives_its_canonical_path_and_key(self):
+        cases = self.cases()
+        for name, mod in self.mods.items():
+            for given, canonical in cases:
+                with self.subTest(file=name, path=given):
+                    self.assertEqual(mod.canonical_path(given), canonical)
+                    self.assertEqual(mod.repo_key(given), sha12(canonical))
+        self.assertEqual(len({sha12(self.proj), sha12(self.decomposed), sha12(self.sibling)}), 3)
+
+    def test_the_on_disk_spelling_keeps_its_own_key(self):
+        for name, mod in self.mods.items():
+            for path in (self.proj, self.decomposed, self.sibling):
+                with self.subTest(file=name, path=path):
+                    self.assertEqual(mod.canonical_path(path), path)
+                    self.assertEqual(mod.repo_key(path), sha12(path))
 
 
 # ================================================================ harness-digest and harness-standup
