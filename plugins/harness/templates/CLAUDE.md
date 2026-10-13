@@ -13,7 +13,7 @@ from the code. When Claude makes the same mistake twice, add one line here.
 - Named test files: `{{test_cmd}}`, with `{files}` replaced by their paths
 
 ## Where things live
-- `tests/`: the test suite.
+- {{tests_dirs}}: the test suite.
 - `scripts/verify.sh`: the checks behind the verify command; `.github/workflows/ci.yml` runs it.
 - `.githooks/pre-commit`: format and lint checks on staged files.
 - `<path>`: <what lives there>
