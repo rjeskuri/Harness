@@ -570,7 +570,7 @@ class Dispatch(WorkTest):
         p = self.ok("dispatch", env=self.env(**CREDENTIALS))
         self.assertIn(f"#12 bg on {BRANCH} (id abc123)", p.stdout)
         [call] = self.claude_calls()
-        self.assertEqual(call["argv"], ["--bg", "-n", "proj #12 Add the board tool", "/harness:work 12"])
+        self.assertEqual(call["argv"], ["--bg", "-n", "proj #12 Add the board tool", "--permission-mode", "auto", "/harness:work 12"])
         for name in CREDENTIALS:                               # the subscription login bills, not an exported key
             self.assertNotIn(name, call["env"])
         self.assertEqual(os.path.realpath(call["cwd"]), self.worktree_path())
