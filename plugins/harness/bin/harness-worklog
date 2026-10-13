@@ -3,8 +3,8 @@
 The work log behind the monthly invoice: hours per day and what was done.
 
 The repo is --repo PATH, else $CLAUDE_PROJECT_DIR, else the git top level of the
-current directory, else the current directory; the log and the timeline below are
-in its worklog/ folder.
+current directory, else the current directory (a linked git worktree stands for its
+main checkout); the log and the timeline below are in its worklog/ folder.
 
 Hours are reconstructed from Claude Code's session transcripts for this repo
 (~/.claude/projects/<this repo's path with '/' as '-'>/*.jsonl), which
@@ -69,17 +69,31 @@ LOCALTIME = "/etc/localtime"
 GITHUB = "GitHub"     # the committer of merges made on github.com: UTC, not evidence of the Mac's zone
 
 
+def main_checkout(path):
+    """`path`, or when it is a linked git worktree the main checkout it belongs to (the parent of git's
+    common dir): the log and the session folders are the repo's, not a ticket branch's."""
+    try:
+        out = subprocess.run(["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-dir",
+                              "--git-common-dir"], capture_output=True, text=True, check=True,
+                             timeout=10).stdout.split("\n")
+    except (OSError, subprocess.SubprocessError):
+        return path
+    if len(out) >= 2 and out[0] and out[0] != out[1] and os.path.basename(out[1]) == ".git":
+        return os.path.dirname(out[1])
+    return path
+
+
 def find_repo(given=None):
     """The repo: `given` (--repo), else $CLAUDE_PROJECT_DIR, else the git top level of the current
-    directory, else the current directory."""
+    directory, else the current directory; a linked worktree stands for its main checkout."""
     for path in (given, os.environ.get("CLAUDE_PROJECT_DIR")):
         if path:
-            return os.path.abspath(os.path.expanduser(path))
+            return main_checkout(os.path.abspath(os.path.expanduser(path)))
     try:
         top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
                              check=True, timeout=10).stdout.strip()
         if top:
-            return top
+            return main_checkout(top)
     except (OSError, subprocess.SubprocessError):
         pass
     return os.getcwd()

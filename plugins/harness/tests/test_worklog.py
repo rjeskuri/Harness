@@ -330,5 +330,224 @@ class WorktreeSessions(unittest.TestCase):
         self.assertEqual((self.day_row()["blocks"], self.day_row()["hours"]), ("10:00-10:30", "0.50"))
 
 
+@unittest.skipUnless(GIT, "git is not installed")
+class RunFromALinkedWorktree(unittest.TestCase):
+    """harness-worklog run from inside a linked git worktree works on the main checkout (PR #33 review).
+
+    A session started in <repo>/.claude/worktrees/t-N-x has CLAUDE_PROJECT_DIR (and the git top level of its
+    cwd) set to the worktree. Whichever way the repo is found (--repo, CLAUDE_PROJECT_DIR, the git top level),
+    a linked worktree resolves to the main checkout (git's common dir, its parent): every session of the repo
+    is counted and the log is <main>/worklog/, never <worktree>/worklog/ on the ticket branch. A directory
+    that is not a git repo, or the main checkout itself, is used as given.
+
+    The fixture is a real git repo with `git worktree add`; the temporary folder is realpath'd up front so the
+    transcript folders are encoded from the same path git reports (/var -> /private/var on macOS).
+    """
+
+    ALL = ("09:00-09:30, 10:10-10:40, 11:20-12:05, 13:00-13:15", "2.00")   # 30 + 30 + 45 + 15 minutes
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="harness-worklog-wt-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = self.mk("home")
+        self.wl = load_tool("harness-worklog")
+        self.tz, _, _ = self.wl.system_zone()
+        self.today = dt.datetime.now(UTC).astimezone(self.tz).date()
+        self.day = self.today - dt.timedelta(days=2)
+        self.env = {k: v for k, v in os.environ.items()
+                    if k not in ("CLAUDE_PROJECT_DIR", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                                 "GIT_COMMON_DIR")}
+        self.env.update(HOME=self.home, GIT_CEILING_DIRECTORIES=self.tmp, GIT_CONFIG_NOSYSTEM="1",
+                        GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.com",
+                        GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.com")
+
+    # ---------------------------------------------------------------- helpers
+    def mk(self, *parts):
+        path = os.path.join(self.tmp, *parts)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def git(self, cwd, *args):
+        # the one commit is dated long before the zone timeline starts, so it is no evidence of the Mac's zone
+        env = dict(self.env, GIT_AUTHOR_DATE="2020-01-01T12:00:00+00:00",
+                   GIT_COMMITTER_DATE="2020-01-01T12:00:00+00:00")
+        p = subprocess.run([GIT, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, f"git {' '.join(args)}: {p.stderr}")
+        return p.stdout.strip()
+
+    def main_repo(self, name):
+        """A git repo at <tmp>/<name> on main with one commit."""
+        main = self.mk(name)
+        self.git(main, "-c", "init.defaultBranch=main", "init", "-q")
+        with open(os.path.join(main, "README.md"), "w", encoding="utf-8") as fh:
+            fh.write("fixture\n")
+        self.git(main, "add", "README.md")
+        self.git(main, "commit", "-q", "-m", "Initial commit")
+        return main
+
+    def add_worktree(self, main, path, branch):
+        self.git(main, "worktree", "add", "-q", "-b", branch, path)
+        self.assertEqual(os.path.realpath(self.git(path, "rev-parse", "--show-toplevel")), path)
+        return path
+
+    def projects(self, path):
+        return os.path.join(self.home, ".claude", "projects", encode(path))
+
+    def at(self, hhmm):
+        hour, minute = (int(x) for x in hhmm.split(":"))
+        return dt.datetime.combine(self.day, dt.time(hour, minute), self.tz)
+
+    def session(self, folder, sid, start, end):
+        """<folder>/<sid>.jsonl: the user's message at `start`, agent replies every 10 minutes until `end`."""
+        def stamp(when):
+            return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        a, b = self.at(start), self.at(end)
+        lines = [json.dumps({"type": "user", "sessionId": sid, "timestamp": stamp(a), "message": {"content": "go"}})]
+        t = a + dt.timedelta(minutes=10)
+        while t < b:
+            lines.append(json.dumps({"type": "assistant", "sessionId": sid, "timestamp": stamp(t)}))
+            t += dt.timedelta(minutes=10)
+        lines.append(json.dumps({"type": "assistant", "sessionId": sid, "timestamp": stamp(b)}))
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, sid + ".jsonl"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+    def run_wl(self, *args, cwd=None, project_dir=None):
+        env = dict(self.env)
+        if project_dir is not None:
+            env["CLAUDE_PROJECT_DIR"] = project_dir
+        return subprocess.run([sys.executable, os.path.join(BIN, "harness-worklog"), *args],
+                              cwd=cwd or self.tmp, env=env, capture_output=True, text=True, timeout=60)
+
+    def since(self):
+        return (self.today - dt.timedelta(days=20)).isoformat()
+
+    def log_row(self, repo):
+        path = os.path.join(repo, "worklog", "worklog.csv")
+        self.assertTrue(os.path.isfile(path), f"no log at {os.path.relpath(path, self.tmp)}")
+        with open(path, encoding="utf-8", newline="") as fh:
+            return next((r for r in csv.DictReader(fh) if r["date"] == self.day.isoformat()), None)
+
+    def fixture(self, name="client-repo"):
+        """A main checkout, the ticket worktree the tool is run from and a sibling worktree, each with a
+        session, plus a removed worktree's transcripts: all four count, on the main checkout's log."""
+        main = self.main_repo(name)
+        here = self.add_worktree(main, os.path.join(main, ".claude", "worktrees", "t-5-here"), "t/5-here")
+        sibling = self.add_worktree(main, os.path.join(main, ".claude", "worktrees", "t-6-sibling"), "t/6-sibling")
+        self.session(self.projects(main), "main-1", "09:00", "09:30")                 # 0.50
+        self.session(self.projects(here), "here-2", "10:10", "10:40")                 # 0.50
+        self.session(self.projects(sibling), "sib-3", "11:20", "12:05")               # 0.75
+        self.session(self.projects(os.path.join(main, ".claude", "worktrees", "t-4-gone")),
+                     "gone-4", "13:00", "13:15")                                       # 0.25
+        return main, here
+
+    def check_main_log(self, main, here, p):
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(here, "worklog")),
+                         "the log was written in the worktree, on the ticket branch")
+        row = self.log_row(main)
+        self.assertIsNotNone(row, p.stdout)
+        # a run that stays on the worktree counts only its own session: ("10:10-10:40", "0.50")
+        self.assertEqual((row["blocks"], row["hours"], row["source"]), self.ALL + ("auto",))
+        self.assertTrue(os.path.isfile(os.path.join(main, "worklog", "timezones.csv")))
+
+    # ------------------------------------------------------------------ tests
+    def test_claude_project_dir_set_to_a_worktree_works_on_the_main_checkout(self):
+        main, here = self.fixture()
+        p = self.run_wl("init", "--since", self.since(), project_dir=here)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        p = self.run_wl("update", project_dir=here)
+        self.check_main_log(main, here, p)
+
+    def test_cwd_in_a_worktree_without_claude_project_dir_works_on_the_main_checkout(self):
+        main, here = self.fixture("acme-app")
+        sub = os.path.join(here, "src", "pkg")                  # anywhere inside the worktree
+        os.makedirs(sub)
+        for cwd in (here, sub):
+            with self.subTest(cwd=os.path.relpath(cwd, self.tmp)):
+                for repo in (main, here):                       # each case starts with no log anywhere
+                    shutil.rmtree(os.path.join(repo, "worklog"), ignore_errors=True)
+                p = self.run_wl("init", "--since", self.since(), cwd=cwd)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.check_main_log(main, here, self.run_wl("update", cwd=cwd))
+
+    def test_repo_option_given_a_worktree_works_on_the_main_checkout(self):
+        main, here = self.fixture("billing-svc")
+        for args in (["--repo", here, "init", "--since", self.since()], ["update", "--repo", here]):
+            p = self.run_wl(*args)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.check_main_log(main, here, p)
+
+    def test_explicit_repo_wins_over_claude_project_dir_and_still_resolves_a_worktree(self):
+        main, here = self.fixture()
+        other = self.main_repo("other-repo")
+        other_wt = self.add_worktree(other, os.path.join(other, ".claude", "worktrees", "t-9-x"), "t/9-x")
+        self.session(self.projects(other), "other-9", "15:00", "15:30")
+        for args in (["--repo", here, "init", "--since", self.since()], ["--repo", here, "update"]):
+            p = self.run_wl(*args, project_dir=other_wt)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.check_main_log(main, here, p)
+        self.assertFalse(os.path.exists(os.path.join(other, "worklog")))
+        self.assertFalse(os.path.exists(os.path.join(other_wt, "worklog")))
+
+    def test_a_worktree_outside_claude_worktrees_resolves_to_its_main_checkout(self):
+        # not under .claude/worktrees: the main checkout must come from git, not from the shape of the path
+        main = self.main_repo("north-star")
+        side = self.add_worktree(main, os.path.join(self.tmp, "side-checkout"), "t/8-side")
+        self.session(self.projects(main), "main-1", "09:00", "09:40")                                  # 0.75
+        self.session(self.projects(os.path.join(main, ".claude", "worktrees", "t-7-a")), "wt-7", "14:00", "14:20")  # 0.25
+        for args in (["init", "--since", self.since()], ["update"]):
+            p = self.run_wl("--repo", side, *args)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(side, "worklog")))
+        row = self.log_row(main)
+        self.assertEqual((row["blocks"], row["hours"]), ("09:00-09:40, 14:00-14:20", "1.00"))
+
+    def test_describe_from_a_worktree_writes_the_main_checkouts_log(self):
+        main, here = self.fixture()
+        self.assertEqual(self.run_wl("--repo", main, "init", "--since", self.since()).returncode, 0)
+        p = self.run_wl("describe", "--date", self.day.isoformat(), "--text", "Billed from the worktree",
+                        project_dir=here)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(here, "worklog")))
+        row = self.log_row(main)
+        # a day with no auto row yet: describe creates it with every block of the repo and the 0.25 h
+        # placeholder (by design, see describe_rows); a run on the worktree alone would show only 10:10-10:40
+        self.assertEqual((row["blocks"], row["hours"], row["description"]),
+                         (self.ALL[0], "0.25", "Billed from the worktree"))
+        # the next update, also from the worktree, counts the hours and keeps the description
+        p = self.run_wl("update", cwd=here)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(here, "worklog")))
+        row = self.log_row(main)
+        self.assertEqual((row["blocks"], row["hours"], row["description"]),
+                         self.ALL + ("Billed from the worktree",))
+
+    # regression guards: paths that are not linked worktrees are used as given (these pass before the fix too)
+    def test_the_main_checkout_itself_is_unchanged(self):
+        main, here = self.fixture()
+        for kwargs in ({"project_dir": main}, {"cwd": main}, {}):
+            args = [] if kwargs else ["--repo", main]
+            with self.subTest(how=next(iter(kwargs), "--repo")):
+                if not os.path.exists(os.path.join(main, "worklog", "timezones.csv")):
+                    self.assertEqual(self.run_wl(*args, "init", "--since", self.since(), **kwargs).returncode, 0)
+                self.check_main_log(main, here, self.run_wl(*args, "update", **kwargs))
+
+    def test_a_directory_that_is_not_a_git_repo_is_used_as_given(self):
+        plain = self.mk("plain-folder")
+        self.session(self.projects(plain), "plain-1", "09:00", "09:30")
+        self.session(self.projects(os.path.join(plain, ".claude", "worktrees", "t-1-x")), "plain-2", "10:10", "10:55")
+        for how, kwargs in (("--repo", {}), ("CLAUDE_PROJECT_DIR", {"project_dir": plain}), ("cwd", {"cwd": plain})):
+            with self.subTest(how=how):
+                args = ["--repo", plain] if how == "--repo" else []
+                shutil.rmtree(os.path.join(plain, "worklog"), ignore_errors=True)
+                p = self.run_wl(*args, "init", "--since", self.since(), **kwargs)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                p = self.run_wl(*args, "update", **kwargs)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                row = self.log_row(plain)
+                self.assertEqual((row["blocks"], row["hours"]), ("09:00-09:30, 10:10-10:55", "1.25"))
+
+
 if __name__ == "__main__":
     unittest.main()
