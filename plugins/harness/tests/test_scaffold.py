@@ -31,7 +31,7 @@ FAKEGH = os.path.join(TESTS, "fakegh.py")
 GIT = shutil.which("git")
 NO_RULESET = ("Branch protection is unavailable on this plan for a private repo; "
               "the local branch guard is the only block.")
-PLACEHOLDER = re.compile(r"(?<!\$)\{\{(name|pkg|stack|verify_cmd|test_cmd|python_version|year)\}\}")
+PLACEHOLDER = re.compile(r"(?<!\$)\{\{(name|pkg|stack|verify_cmd|test_cmd|tests_dirs|python_version|year)\}\}")
 
 COMMON_FILES = ["CLAUDE.md", ".claude/settings.json", "scripts/verify.sh", ".github/workflows/ci.yml",
                 ".github/workflows/deploy.yml", ".github/pull_request_template.md",
@@ -524,6 +524,28 @@ class Render(ScaffoldTest):
                 self.ok("init", root, "--name", f"skel-{stack}", "--stack", stack)
                 self.assertTrue(self.names_dir(self.where(root), "tests"), self.where(root))
 
+    def test_an_existing_manifest_without_a_tests_directory_names_none(self):
+        # the skeleton is skipped when the manifest exists, so there is no tests/ to name
+        for stack, manifest, text in (("python", "pyproject.toml", "[project]\nname = 'x'\n"),
+                                      ("node", "package.json", '{"name": "x"}\n')):
+            with self.subTest(stack=stack):
+                root = self.mk(f"manifest-{stack}")
+                self.write(os.path.join(root, manifest), text)
+                p = self.ok("init", root, "--name", f"manifest-{stack}", "--stack", stack)
+                self.assertIn(f"kept {manifest}", self.lines(p))
+                self.assertFalse(os.path.exists(os.path.join(root, "tests")))
+                section = self.where(root)
+                self.assertFalse(self.names_dir(section, "tests"), section)
+                self.assertFalse(self.names_dir(section, "test"), section)
+            with self.subTest(stack=stack, on_disk="test"):                 # the disk still decides
+                root = self.mk(f"manifest-{stack}-test")
+                self.write(os.path.join(root, manifest), text)
+                self.write(os.path.join(root, "test", "test_a.py"), "pass\n")
+                self.ok("init", root, "--name", f"manifest-{stack}", "--stack", stack)
+                section = self.where(root)
+                self.assertTrue(self.names_dir(section, "test"), section)
+                self.assertFalse(self.names_dir(section, "tests"), section)
+
     def test_no_tests_directory_is_not_guessed(self):
         root = self.mk("notests")
         self.ok("init", root, "--name", "notests", "--stack", "none")
@@ -625,6 +647,20 @@ class Rules(ScaffoldTest):
         self.assertOneLineError(self.scaffold("init", self.tmp + "/x", "--name", "x", "--stack", "rust"), "stack")
         self.assertOneLineError(self.scaffold(), "subcommand")
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "x")))
+
+    def test_a_blank_verify_is_a_one_line_error_and_writes_nothing(self):
+        for n, blank in enumerate(("", "   ", "\t", " \n ")):
+            with self.subTest(verify=blank):
+                fresh = os.path.join(self.tmp, f"blank-fresh{n}")
+                self.assertOneLineError(self.scaffold("init", fresh, "--name", "blank", "--stack", "none",
+                                                      "--verify", blank), "--verify")
+                self.assertFalse(os.path.exists(fresh))
+                for stack in ("none", "python"):
+                    existing = self.mk(f"blank-{stack}{n}")
+                    self.assertOneLineError(self.scaffold("init", existing, "--name", "blank", "--stack", stack,
+                                                          "--verify", blank), "--verify")
+                    self.assertFalse(os.path.exists(os.path.join(existing, "scripts", "verify.sh")))
+                    self.assertEqual(os.listdir(existing), [])
 
     def test_refuses_a_subfolder_of_another_repository(self):
         root = self.repo_with_commit()
