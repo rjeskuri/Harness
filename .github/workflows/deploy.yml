@@ -1,0 +1,28 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Deploy
+        run: |
+          if [ -f scripts/deploy.sh ]; then
+            chmod +x scripts/deploy.sh
+            scripts/deploy.sh
+          else
+            echo "no deploy script"
+          fi
