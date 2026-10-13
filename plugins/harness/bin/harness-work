@@ -869,7 +869,7 @@ def launch(repo, ticket, venue):
         record["pid"] = proc.pid
     else:
         name = f"{repo.name} #{n} {ticket.get('title') or ''}".strip()
-        argv = [claude_exe(), "--bg", "-n", name, prompt]
+        argv = [claude_exe(), "--bg", "-n", name, "--permission-mode", "auto", prompt]
         try:
             done = subprocess.run(argv, cwd=ticket["worktree"], capture_output=True, text=True, errors="replace",
                                   stdin=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT, env=child_env())
