@@ -38,8 +38,9 @@ writes files, patch without a file argument or -o (the diff names the files), an
 with -delete or an -exec, -execdir, -ok or -okdir command that writes files (as the
 walker judges a part), runs git on paths, or is a shell or an interpreter.
 
-<key> is the first 12 hex digits of the sha1 of the real path of the main working tree,
-so a linked worktree shares its main checkout's state. HARNESS_TEST_PATTERNS and
+<key> is the first 12 hex digits of the sha1 of the real path of the main working tree
+with each component spelled as its parent directory lists it, so a linked worktree
+shares its main checkout's state and every spelling of the path gives one key. HARNESS_TEST_PATTERNS and
 HARNESS_SOURCE_EXEMPT come from the environment first, then `env` in the main
 checkout's tracked .claude/settings.json; never from the worktree or from a
 settings.local.json, which an agent could rewrite (a gitignored file is editable on main).
@@ -59,6 +60,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 GIT_TIMEOUT = 3
@@ -229,25 +231,91 @@ def existing_dir(path: str) -> str:
 
 
 def repo_facts(directory: str) -> dict | None:
-    """top (the worktree's top-level), main (the main working tree), branch (None when
-    detached); None outside a repo."""
+    """top (the worktree's top-level) and main (the main working tree), both canonical
+    paths, branch (None when detached) and spelled (the main tree as git reported it and
+    `directory`, for adopt_old_state); None outside a repo."""
     out = git(directory, "rev-parse", "--show-toplevel", "--git-common-dir")
     lines = [ln.strip() for ln in out.stdout.splitlines()]
     if out.returncode != 0 or len(lines) < 2 or not all(lines[:2]):
         return None
-    common = os.path.realpath(os.path.join(directory, lines[1]))
+    reported = os.path.dirname(os.path.realpath(os.path.join(directory, lines[1])))
     head = git(directory, "symbolic-ref", "--short", "-q", "HEAD")
     branch = head.stdout.strip() if head.returncode == 0 else ""
     return {
-        "top": Path(os.path.realpath(lines[0])),
-        "main": Path(os.path.dirname(common)),
+        "top": Path(canonical_path(lines[0])),
+        "main": Path(canonical_path(reported)),
         "branch": branch or None,
+        "spelled": (reported, directory),
     }
 
 
-def repo_key(main_tree: Path) -> str:
-    raw = str(main_tree).encode("utf-8", "surrogateescape")
-    return hashlib.sha1(raw).hexdigest()[:12]
+def canonical_path(path):
+    """The real path of `path` with each component spelled as its parent directory lists
+    it, so every spelling of one directory on a case-insensitive file system gives one
+    string. From the first component that cannot be found on, the rest stays as spelled."""
+    real = os.path.realpath(path)
+    done, parts = os.sep, [part for part in real.split(os.sep) if part]
+    for i, part in enumerate(parts):
+        try:
+            names = os.listdir(done)
+        except OSError:
+            return os.path.join(done, *parts[i:])
+        if part not in names:
+            fold = unicodedata.normalize("NFC", part).casefold()
+            given = os.path.join(done, part)
+            for name in names:
+                if unicodedata.normalize("NFC", name).casefold() == fold and same_entry(
+                    given, os.path.join(done, name)
+                ):
+                    part = name
+                    break
+            else:
+                return os.path.join(done, *parts[i:])
+        done = os.path.join(done, part)
+    return done
+
+
+def same_entry(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def path_key(path):
+    """The first 12 hex digits of the sha1 of the path string as it is spelled."""
+    return hashlib.sha1(str(path).encode("utf-8", "surrogateescape")).hexdigest()[:12]
+
+
+def repo_key(path):
+    """The state key of a main working tree: path_key of its canonical path."""
+    return path_key(canonical_path(path))
+
+
+def adopt_old_state(repos, main, *spelled):
+    """The state key of the canonical main tree `main`. When repos/<key> does not exist
+    yet, the directory an earlier version keyed by the spelling in use is renamed to it:
+    the spelling of `main` that one of `spelled` (the main tree as git reported it, the
+    path the tool started from) uses. Only this repository's; when both exist, both stay."""
+    key = path_key(main)
+    target = os.path.join(repos, key)
+    if os.path.lexists(target):
+        return key
+    depth = len(main.split(os.sep))
+    for path in spelled:
+        if not path:
+            continue
+        old = os.sep.join(os.path.realpath(path).split(os.sep)[:depth])
+        if old == main or canonical_path(old) != main:
+            continue
+        source = os.path.join(repos, path_key(old))
+        if os.path.isdir(source):
+            try:
+                os.rename(source, target)
+            except OSError:
+                pass
+            break
+    return key
 
 
 def harness_home() -> Path:
@@ -256,7 +324,7 @@ def harness_home() -> Path:
 
 def in_scratch(top: Path) -> bool:
     """True for a worktree under ~/.claude/harness/repos/<key>/scratch/."""
-    repos = Path(os.path.realpath(harness_home() / "repos"))
+    repos = Path(canonical_path(harness_home() / "repos"))
     try:
         rel = top.relative_to(repos).parts
     except ValueError:
@@ -265,10 +333,12 @@ def in_scratch(top: Path) -> bool:
 
 
 def relative_path(path: str, top: Path) -> str | None:
-    """`path` relative to the worktree `top`, with / separators; None when outside it."""
+    """`path` relative to the worktree `top`, with / separators; None when outside it.
+    The existing part is spelled canonically, as `top` is, so another spelling of the
+    worktree is not outside it."""
     base = existing_dir(os.path.dirname(path))
     tail = os.path.relpath(path, base)
-    full = os.path.normpath(os.path.join(os.path.realpath(base), tail))
+    full = os.path.normpath(os.path.join(canonical_path(base), tail))
     rel = os.path.relpath(full, str(top))
     if rel == "." or rel == ".." or rel.startswith("../"):
         return None
@@ -313,7 +383,8 @@ def tests_hash(top: Path, files: list[str]) -> str | None:
 
 def source_refusal(facts: dict, number: str) -> str | None:
     """Why a source edit on ticket `number` must wait, or None when the proof is there."""
-    state = harness_home() / "repos" / repo_key(facts["main"])
+    repos = harness_home() / "repos"
+    state = repos / adopt_old_state(str(repos), str(facts["main"]), *facts["spelled"])
     branch = facts["branch"]
     ticket = read_json(state / "tickets" / f"{number}.json")
     flags = []
