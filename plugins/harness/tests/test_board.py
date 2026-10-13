@@ -569,27 +569,53 @@ class ShowResolution(BoardTest):
         for line in ("caches each ticket it shows", "Ran 88 tests", "abc123def4567890abc123def4567890abc12345"):
             self.assertNotIn(line, md)
 
-    def test_closed_task_with_two_resolutions_prints_the_newest(self):
-        """Landed, reopened, landed again: the newer Resolution is what landed; the older one is not printed.
-        Run both ways round, so the newer one wins whichever text it is."""
-        stale_only = ("A first attempt at wiring", "harness-wire-old", "STALE VERIFY LINE",
-                      "0a0b0c0d0e0f1a1b1c1d1e1f2a2b2c2d2e2f3a3b")
-        res12_only = ("caches each ticket it shows", "Ran 88 tests", "abc123def4567890abc123def4567890abc12345")
-        for older, newer, absent in ((RES_13_STALE, RES_12, stale_only), (RES_12, RES_13_STALE, res12_only)):
-            with self.subTest(newest=content_lines(newer)[0]):
-                comments = [comment("rjeskuri", "2026-10-07T09:00:00Z", older),
-                            comment("rjeskuri", "2026-10-07T09:01:00Z", "Landed in 0a0b0c\n\n<!-- harness -->"),
-                            comment("rjeskuri", "2026-10-08T09:00:00Z", "Reopened: it broke the hooks."),
-                            comment("rjeskuri", "2026-10-11T09:00:00Z", newer),
-                            comment("rjeskuri", "2026-10-11T09:01:00Z", "Landed in abc123\n\n<!-- harness -->")]
+    def test_closed_task_prints_every_resolution(self):
+        """Landed, reopened, landed again (#24): each landing's Resolution is printed whole, oldest first and
+        newest last, outside the Comments section (all of them are older than the ten newest comments). Run in
+        several orders and with three passes, so neither "the newest only", "the first only" nor "the last two"
+        passes."""
+        orders = [("stale then 12", [RES_13_STALE, RES_12]),
+                  ("12 then stale", [RES_12, RES_13_STALE]),
+                  ("14 then 12", [RES_14, RES_12]),
+                  ("three passes", [RES_13_STALE, RES_14, RES_12])]
+        for name, passes in orders:
+            with self.subTest(name):
+                comments = [comment("rjeskuri", "2026-10-06T09:00:00Z", "Started on t/x\n\n<!-- harness -->")]
+                for k, res in enumerate(passes):
+                    sha = content_lines(res)[-1].split()[-1]
+                    comments += [comment("rjeskuri", f"2026-10-0{7 + k}T09:00:00Z", res),
+                                 comment("rjeskuri", f"2026-10-0{7 + k}T09:01:00Z",
+                                         f"Landed in {sha}\n\n<!-- harness -->")]
+                    if k < len(passes) - 1:
+                        comments.append(comment("rjeskuri", f"2026-10-0{7 + k}T12:00:00Z",
+                                                f"Reopened after pass {k + 1}: it broke the hooks."))
                 comments += [comment("pal", f"2026-10-12T{10 + i:02d}:00:00Z", f"later note {i}") for i in range(10)]
                 data = issue(number=12, state="CLOSED", labels=("task", "size:M", "risk:low"), comments=comments,
                              parent={"number": 3, "title": "Board v2", "url": "https://github.com/o/r/issues/3"})
                 self.scenario([self.parent_call()] + self.comment_calls(12, data))
                 md = self.ok("show", "12", "--markdown").stdout
-                self.assertUnderResolutionHeading(md, newer)
-                for line in absent:
-                    self.assertNotIn(line, md, "the older Resolution is not printed")
+                lines = md.splitlines()
+                self.assertLessEqual(len(lines), 120, md)
+                heads = [i for i, line in enumerate(lines) if line.startswith("## Resolution")]
+                self.assertTrue(heads, f"no ## Resolution heading:\n{md}")
+                end = next((i for i, line in enumerate(lines) if line.startswith("## Comments")), len(lines))
+                region = lines[heads[0]:end]
+                # each pass's own lines (those no other pass shares), every one printed, in its pass's order
+                spans = []
+                for k, res in enumerate(passes):
+                    others = {line for j, other in enumerate(passes) if j != k for line in content_lines(other)}
+                    own = [line for line in content_lines(res) if line not in others]
+                    at = []
+                    for line in own:
+                        found = [i for i, text in enumerate(region) if line in text]
+                        self.assertTrue(found, f"pass {k + 1}'s Resolution line missing from the Resolution "
+                                               f"section: {line!r}\n{md}")
+                        at.append(found[0])
+                    self.assertEqual(at, sorted(at), f"pass {k + 1}'s Resolution keeps its order:\n{md}")
+                    spans.append((at[0], at[-1]))
+                for (_, last), (first, _) in zip(spans, spans[1:]):
+                    self.assertLess(last, first, f"the Resolutions are printed oldest first, newest last, "
+                                                 f"one after the other:\n{md}")
 
     def test_epic_prints_each_closed_tasks_resolution_under_the_task_list(self):
         epic = issue(number=3, title="Board v2", labels=("epic", "status:ready"), body=EPIC_BODY)

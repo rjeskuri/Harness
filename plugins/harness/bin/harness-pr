@@ -1391,10 +1391,25 @@ def resolution_body(data, files, sha, url):
     return "\n".join(parts)
 
 
-def land_ticket(repo, number, sha, pr, resolution):
+def landed_here(body, sha, pr):
+    """Whether a (non-Resolution) comment records this landing: `Landed in <sha>` with this sha as a whole token,
+    or `Landed in PR #<pr>` with this number as a whole token; an earlier pass's `Landed in` does not count."""
+    marks = [rf"{LANDED} PR #{pr}(?!\d)"] + ([rf"{LANDED} {re.escape(sha)}(?![0-9A-Za-z])"] if sha else [])
+    return any(re.search(mark, body) for mark in marks)
+
+
+def resolution_here(body, url):
+    """Whether a comment is this landing's Resolution: a `**Resolution**` whose `PR:` line is this PR's `url`."""
+    return bool(url) and body.startswith(RESOLUTION) \
+        and any(line.strip() == f"PR: {url}" for line in body.splitlines())
+
+
+def land_ticket(repo, number, sha, pr, resolution, url=None):
     """Close the ticket when GitHub has not, drop its status labels, comment the Resolution (`resolution()`) and
-    then `Landed in <sha>` unless the ticket already has them (a resumed land; `Landed in` there means both are),
-    check its epic. (summary, error)."""
+    then `Landed in <sha>` unless the ticket already has this landing's own (a resumed land; this landing's
+    `Landed in` there means both are), check its epic. Only this landing's comments count: `Landed in` this sha
+    or this PR, and a Resolution naming this PR's `url`; a reopened ticket's earlier pass leaves its own, which
+    do not, so its second landing gets a Resolution and `Landed in` of its own. (summary, error)."""
     done = []
     try:
         info = gh_json(["issue", "view", str(number), "--json", "state,labels,comments"], repo.main)
@@ -1413,11 +1428,11 @@ def land_ticket(repo, number, sha, pr, resolution):
             gh(cmd, repo.main)
             done.append("status labels removed")
         bodies = [(c.get("body") or "").lstrip() for c in as_list(info.get("comments"))]
-        if any(LANDED in b and not b.startswith(RESOLUTION) for b in bodies):
+        if any(landed_here(b, sha, pr) for b in bodies if not b.startswith(RESOLUTION)):
             done.append("landed comment already there")
         else:
             # the Resolution goes first: a land that stops between the two still finds `Landed in` missing
-            if not any(b.startswith(RESOLUTION) for b in bodies):
+            if not any(resolution_here(b, url) for b in bodies):
                 board(repo, "comment", str(number), "--body", resolution())
             board(repo, "comment", str(number), "--body", f"{LANDED} {sha}" if sha else f"{LANDED} PR #{pr}")
             done.append("commented")
@@ -1588,7 +1603,7 @@ def cmd_land(args):
 
     ticket_lines = []
     for n in tickets:
-        line, error = land_ticket(repo, n, sha, number, resolution)
+        line, error = land_ticket(repo, n, sha, number, resolution, view.get("url"))
         ticket_lines.append(line)
         if error:
             problems.append(f"ticket #{n}: {error}")
