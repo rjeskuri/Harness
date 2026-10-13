@@ -636,9 +636,14 @@ class Skeleton(ScaffoldTest):
         self.assertEqual(self.statuses(dry), self.statuses(real), "--dry-run and the real run disagree")
 
     def assertLayoutIs(self, dry, real, expected):
-        """Both runs name exactly `expected` in the layout line: nothing missing, nothing over-reported."""
+        """Both runs name exactly `expected` in the layout line: nothing missing, nothing over-reported.
+        The names are joined by `, ` inside the parentheses, as in the ticket's
+        `kept the project's own layout (package.json, test/)`; their order is not pinned."""
         for p, which in ((dry, "--dry-run"), (real, "real run")):
             self.assertEqual(self.layout(p), set(expected), f"{which} names the wrong things:\n{p.stdout}")
+            raw = [m.group(1) for m in (LAYOUT.search(line) for line in self.lines(p)) if m][0]
+            self.assertEqual(sorted(raw.split(", ")), sorted(expected),
+                             f"{which} does not join the names with ', ': ({raw})")
 
     def assertWritten(self, root, stack, dry, real):
         for rel in SKELETON_FILES[stack]:
@@ -852,6 +857,61 @@ class Skeleton(ScaffoldTest):
                 self.assertSkipped(root, stack, before, dry, real, ["package.json"])
                 self.assertLayoutIs(dry, real, {"package.json"})
                 self.assertEqual(self.read(root, "tests"), "not a directory\n")
+
+    def test_every_loose_test_file_is_named_not_just_the_first(self):
+        # small fixtures only; how a long list is shown is left open
+        cases = [
+            ("spread", ["test_a.py", "lib/b_test.js", "web/c.test.ts"]),
+            ("same-dir-top", ["test_a.py", "a_test.py"]),
+            ("same-dir-nested", ["lib/a.test.js", "lib/b_test.js"]),
+        ]
+        for stack in ("python", "node"):
+            for label, rels in cases:
+                with self.subTest(stack=stack, files=label):
+                    root = self.fixture(f"loose-{stack}-{label}",
+                                        {rel: "// a test\n" if rel.endswith(("js", "ts")) else "pass\n"
+                                         for rel in rels})
+                    before = self.snapshot(root)
+                    dry, real = self.both(root, stack)
+                    self.assertSkipped(root, stack, before, dry, real, rels)
+                    self.assertLayoutIs(dry, real, set(rels))
+                    self.assertFalse(os.path.exists(os.path.join(root, "tests")))
+
+    def test_every_kind_of_blocker_in_one_project_is_named(self):
+        files = {"go.mod": "module example.com/x\n",
+                 "Makefile": "build:\n\techo b\n\ncheck: build\n\techo ok\n",
+                 "spec/spec_helper.rb": "require 'rspec'\n",
+                 "widget.test.js": "require('node:test');\n",
+                 "main.go": "package main\n"}
+        expected = {"go.mod", "Makefile", "spec/", "widget.test.js"}
+        for stack in ("python", "node"):
+            with self.subTest(stack=stack):
+                root = self.fixture(f"combo-{stack}", files)
+                before = self.snapshot(root)
+                dry, real = self.both(root, stack)
+                self.assertSkipped(root, stack, before, dry, real, sorted(expected))
+                self.assertLayoutIs(dry, real, expected)
+
+    def test_gnu_makes_other_makefile_names(self):
+        # GNU make reads GNUmakefile, makefile and Makefile. One file per fixture, so on a case-insensitive
+        # filesystem `makefile` is still listed under the name it was created with, and that name is expected.
+        with_target = {"test": "build:\n\techo b\n\ntest: build\n\techo t\n",
+                       "check": "check:\n\techo ok\n"}
+        for stack in ("python", "node"):
+            for name in ("makefile", "GNUmakefile"):
+                for target, text in with_target.items():
+                    with self.subTest(stack=stack, makefile=name, target=target):
+                        root = self.fixture(f"gnu-{stack}-{name}-{target}", {name: text})
+                        self.assertEqual(os.listdir(root), [name])
+                        before = self.snapshot(root)
+                        dry, real = self.both(root, stack)
+                        self.assertSkipped(root, stack, before, dry, real, [name])
+                        self.assertLayoutIs(dry, real, {name})
+                with self.subTest(stack=stack, makefile=name, target=None):
+                    root = self.fixture(f"gnufree-{stack}-{name}", {name: MAKEFILE_TARGETS})
+                    dry, real = self.both(root, stack)
+                    self.assertWritten(root, stack, dry, real)
+                    self.assertEqual(self.read(root, name), MAKEFILE_TARGETS)
 
     def test_empty_folder_still_gets_the_skeleton(self):
         for stack in ("python", "node"):
