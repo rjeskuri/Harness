@@ -895,6 +895,180 @@ class Runs(WorkTest):
         self.assertIn("ended error", text)
 
 
+# =========================================================================== runs: ended early
+# The result of the headless run of #7 (2026-10-13): the orchestrator launched the test-author in the background and
+# ended its turn; `claude -p` has no next turn, so the process exited `ok` with no red record and no PR.
+EARLY_RESULT = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 6, "duration_ms": 70214,
+                "result": "I've started ticket #7 and the test-author is writing the tests now in the background. "
+                          "Next comes the red check, then the breaker and the coder.",
+                "total_cost_usd": 0.41, "stop_reason": "end_turn"}
+IN_PROGRESS = ("task", "status:in-progress", "size:S", "risk:low")
+
+
+class EndedEarly(WorkTest):
+    def write_scenario(self, tickets):
+        """tickets: {n: (labels, open_prs, all_prs)}. `pr list --head t/<n>-x` gives open_prs; with --state all it
+        gives all_prs (merged and closed included), as real gh does. Any other pr list gives []."""
+        calls = []
+        for n, (labels, open_prs, all_prs) in tickets.items():
+            calls.append({"match": ["issue", "view", str(n)], "stdout_json": issue(n, labels=labels)})
+        for n, (labels, open_prs, all_prs) in tickets.items():
+            calls.append({"contains": ["pr", "list", "--head", f"t/{n}-x", "--state", "all"], "stdout_json": all_prs})
+            calls.append({"contains": ["pr", "list", "--head", f"t/{n}-x"], "stdout_json": open_prs})
+        calls += [
+            {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}},
+            {"match": ["issue", "list"], "stdout_json": []},
+            {"match": ["pr", "list"], "stdout_json": []},
+            {"match": ["api", "user"], "stdout": "rjeskuri\n"},
+        ]
+        write(self.scenario_path, json.dumps({"calls": calls}))
+        state = self.scenario_path + ".state.json"
+        if os.path.exists(state):
+            os.unlink(state)
+
+    def ended_run(self, n, result):
+        """A headless run of ticket n whose process is gone, with `result` (a dict, or raw text) as its log."""
+        record = self.write_run(n, pid=self.dead_pid())
+        text = json.dumps(result) if isinstance(result, dict) else result
+        write(record["log"], CONNECTORS_WARNING + "\n" + text + "\n")
+        return record
+
+    def test_ok_run_on_an_in_progress_ticket_without_a_pr_is_ended_early(self):
+        record = self.ended_run(7, EARLY_RESULT)
+        self.write_scenario({7: (IN_PROGRESS, [], [])})
+
+        text = self.ok("runs", "--sweep").stdout
+        self.assertIn("proj #7", text)
+        self.assertIn("ended early (no PR)", text)
+        self.assertNotIn("ended ok", text)
+
+        [saved] = self.run_records()
+        self.assertEqual((saved["id"], saved["outcome"], saved["exit"]), (record["id"], "early", None))
+        self.assertTrue(saved["ended_at"])
+
+        [row] = self.ok_json("runs", "--json")             # no sweep: the saved outcome alone gives the state
+        self.assertEqual((row["outcome"], row["state"]), ("early", "ended early (no PR)"))
+        self.assertIn("ended early (no PR)", self.ok("runs").stdout)
+        self.assertIn("api: available", self.ok("budget", "status").stdout)   # not a budget failure
+
+        # The redispatch says why it runs the ticket again.
+        p = self.ok("dispatch", "--dry-run")
+        self.assertIn("would start #7 Add the board tool (again after early)", p.stdout)
+
+    def test_sweep_json_reports_early_on_the_sweep_itself(self):
+        self.ended_run(7, EARLY_RESULT)
+        self.write_scenario({7: (IN_PROGRESS, [], [])})
+        [row] = self.ok_json("runs", "--sweep", "--json")
+        self.assertEqual((row["ticket"], row["outcome"], row["state"]), (7, "early", "ended early (no PR)"))
+        self.assertTrue(row["ended_at"])
+
+    def test_sweep_labels_early_only_for_ok_runs_on_in_progress_tickets_without_any_pr(self):
+        own_words = {k: v for k, v in API_401.items() if k not in ("terminal_reason", "api_error_status")}
+        own_words["result"] = "I could not finish: the tests do not import."
+        pr_open = [{"number": 40, "state": "OPEN", "isDraft": True}]
+        pr_merged = [{"number": 41, "state": "MERGED", "isDraft": False}]
+        # n: (log result, labels, open PRs, PRs of any state, outcome)
+        cases = {
+            12: (EARLY_RESULT, IN_PROGRESS, [], [], "early"),
+            13: ({"type": "result", "is_error": False, "result": "PR #31 is ready for review."},
+                 IN_PROGRESS, [], [], "early"),                           # the text claims a PR; there is none
+            14: (EARLY_RESULT, IN_PROGRESS, pr_open, pr_open, "ok"),      # a PR exists: ok
+            15: (EARLY_RESULT, IN_PROGRESS, [], pr_merged, "ok"),          # a merged PR counts (--state all)
+            16: (EARLY_RESULT, ("task", "status:in-review", "size:S", "risk:low"), [], [], "ok"),
+            17: (EARLY_RESULT, ("task", "status:needs-input", "size:S", "risk:low"), [], [], "ok"),
+            18: (EARLY_RESULT, ("task", "status:ready", "size:S", "risk:low"), [], [], "ok"),
+            19: ("Traceback: something else broke", IN_PROGRESS, [], [], "error"),
+            20: (dict(API_401, api_error_status=402), IN_PROGRESS, [], [], "billing"),
+            21: (API_401, IN_PROGRESS, [], [], "auth"),
+            22: (own_words, IN_PROGRESS, [], [], "error"),
+            23: ({"type": "result", "is_error": False, "result": "Done."}, IN_PROGRESS, [], [], "early"),
+        }
+        for n, (result, *_rest) in cases.items():
+            self.ended_run(n, result)
+        self.write_scenario({n: (labels, open_prs, all_prs) for n, (_r, labels, open_prs, all_prs, _o)
+                             in cases.items()})
+
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+        expected = {n: c[-1] for n, c in cases.items()}
+        self.assertEqual({n: rows[n]["outcome"] for n in rows}, expected)
+        saved = {r["ticket"]: r["outcome"] for r in self.run_records()}
+        self.assertEqual(saved, expected)
+        for n, outcome in expected.items():
+            with self.subTest(ticket=n):
+                state = "ended early (no PR)" if outcome == "early" else f"ended {outcome}"
+                self.assertEqual(rows[n]["state"], state)
+
+        text = self.ok("runs").stdout
+        lines = {int(m.group(1)): line for line in text.splitlines()
+                 for m in [re.search(r"proj #(\d+)\b", line)] if m}
+        for n, outcome in expected.items():
+            with self.subTest(ticket=n, text=True):
+                self.assertEqual("ended early (no PR)" in lines[n], outcome == "early", lines[n])
+
+
+# =========================================================================== the work skill
+SKILL = os.path.join(os.path.dirname(HERE), "skills", "work", "SKILL.md")
+
+
+def skill_body():
+    with open(SKILL, encoding="utf-8") as fh:
+        text = fh.read()
+    if text.startswith("---"):
+        text = text.split("\n---", 1)[1].split("\n", 1)[1]           # drop the frontmatter
+    return text
+
+
+def blocks(text):
+    """Blank-line-separated blocks of non-empty lines."""
+    out, cur = [], []
+    for line in text.splitlines():
+        if line.strip():
+            cur.append(line)
+        elif cur:
+            out.append(cur)
+            cur = []
+    if cur:
+        out.append(cur)
+    return out
+
+
+def is_preamble(block):
+    """Headings, the Arguments line and the injected ready-tickets listing come before the instructions."""
+    lines = [ln for ln in block if not ln.lstrip().startswith("#")]
+    return not lines or all(ln.startswith(("Arguments:", "Ready tickets:", "!`")) for ln in lines)
+
+
+LIST_ITEM = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+")
+
+
+class WorkSkill(unittest.TestCase):
+    def test_the_first_paragraph_says_one_turn_foreground_agents_and_when_the_turn_may_end(self):
+        first = next(b for b in blocks(skill_body()) if not is_preamble(b))
+        para = " ".join(ln for ln in first if not ln.lstrip().startswith("#")).lower()
+        self.assertRegex(para, r"\bforeground\b", para)
+        self.assertRegex(para, r"\b(?:one|single) turn\b", para)
+        self.assertRegex(para, r"\bwait", para)                         # wait for each agent's result
+        self.assertRegex(para, r"(?:never|not|n't|no)\b[^.;]*\bbackground\b", para)   # never in the background
+        self.assertIn("harness-pr ready", para)
+        self.assertIn("needs-input", para)
+        self.assertIn("harness-work attempt", para)
+        self.assertRegex(para, r"\bfinal\b[^.;]*\bfailure\b", para)
+
+    def test_the_skill_ends_with_the_closing_checklist(self):
+        body = skill_body()
+        last = blocks(body)[-1]
+        items = [ln for ln in last if LIST_ITEM.match(ln)]
+        self.assertGreaterEqual(len(items), 3, last)
+        self.assertTrue(LIST_ITEM.match(last[-1]), last[-1])          # the file ends on a checklist item
+        # The section holding the closing list: everything after the last heading.
+        section = re.split(r"(?m)^#{1,6} ", body)[-1].lower()
+        checklist = " ".join(ln for ln in section.splitlines() if LIST_ITEM.match(ln))
+        self.assertIn("harness-pr ready", checklist)
+        self.assertIn("needs-input", checklist)
+        self.assertIn("harness-work attempt", checklist)
+        self.assertRegex(checklist, r"\b(?:foreground|background)\b", checklist)
+
+
 # =========================================================================== budget
 class Budget(WorkTest):
     def test_status_exhaust_and_reset(self):
