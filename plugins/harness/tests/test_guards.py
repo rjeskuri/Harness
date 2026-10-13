@@ -874,8 +874,8 @@ class BranchGuardOtherSpellingTests(GuardTestCase):
         self.git(self.repo, "worktree", "add", "-q", "-b", "t/13-nested", str(self.nested))
         spellings = [self.tmp / "PROJ", self.tmp / "Proj", swapped_below(self.repo)]
         lowered = Path(str(self.repo).lower())  # the whole path lowercased, as in the live finding
-        if lowered.exists() and os.path.samefile(lowered, self.repo):
-            spellings.append(lowered)
+        if str(lowered) != str(self.repo) and lowered.exists() and os.path.samefile(lowered, self.repo):
+            spellings.append(lowered)  # only when the temp root really has upper case to lose
         if not (spellings[0].exists() and os.path.samefile(spellings[0], self.repo)):
             self.skipTest("two spellings of one path need a case-insensitive file system")
         for spelled in spellings:
