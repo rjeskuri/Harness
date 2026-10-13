@@ -322,6 +322,124 @@ class RedTest(unittest.TestCase):
         self.git(self.repo, "worktree", "add", "-q", "--detach", detached, "main")
         self.assertOneLineError(self.red("check", "--worktree", detached), "HEAD is detached")
 
+    # ------------------------------------------------------------ which files are tests (ticket #6)
+    # HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT come from the environment, then from `env` in the MAIN
+    # checkout's .claude/settings.json, exactly like hooks/tests_first.py: never from the ticket worktree's
+    # files, never from a settings.local.json (an agent can rewrite those). HARNESS_TEST_CMD stays as it was.
+    def settings(self, root, env, local=False):
+        """Write root/.claude/settings.json (or settings.local.json) with `env`; the test command is kept."""
+        full = dict(env)
+        if not local:
+            full["HARNESS_TEST_CMD"] = "python3 -m unittest {files}"
+        return write(os.path.join(root, ".claude", "settings.local.json" if local else "settings.json"),
+                     json.dumps({"env": full}))
+
+    def refused_sources(self, p):
+        """The paths named by the 'Source already changed' refusal."""
+        self.assertOneLineError(p, "Source already changed before the red run: ")
+        line = p.stderr.strip().split("Source already changed before the red run: ", 1)[1]
+        return line.split(". Revert them", 1)[0].split(", ")
+
+    def test_patterns_from_the_main_checkout_apply_in_the_worktree(self):
+        cases = [("specs/**", "specs/test_calc.py"), ("suite/**", "suite/deep/test_calc.py"),
+                 ("pkg/test_*.py", "pkg/test_calc.py"), ("**/*_test.py", "deep/dir/calc_test.py"),
+                 ("other/**, y/**", "y/test_calc.py"), ("**/test_*.py", "anywhere/test_calc.py")]
+        for patterns, path in cases:
+            with self.subTest(patterns=patterns):
+                self.settings(self.repo, {"HARNESS_TEST_PATTERNS": patterns})
+                self.put(path, TEST_ADD)
+                try:
+                    p = self.red("check")
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertEqual(p.stdout.splitlines()[0], "red (assertion): 1 test files, exit 1")
+                    self.assertEqual(self.record()["test_files"], [path])
+                    self.assertEqual(self.record()["run_files"], [path])
+                    if patterns != "**/test_*.py":          # tests/ is then not a test folder: source
+                        self.put("tests/test_other.py", TEST_SUB)
+                        self.assertEqual(self.refused_sources(self.red("check")), ["tests/test_other.py"])
+                finally:                                    # the next case starts from a clean worktree
+                    for f in (path, "tests/test_other.py"):
+                        if os.path.isfile(os.path.join(self.wt, f)):
+                            os.remove(os.path.join(self.wt, f))
+
+    def test_worktree_settings_json_cannot_redefine_the_patterns(self):
+        self.settings(self.wt, {"HARNESS_TEST_PATTERNS": "checks/**"})          # main still has the defaults
+        self.put("tests/test_calc.py", TEST_ADD)
+        p = self.red("check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.record()["test_files"], ["tests/test_calc.py"])
+        self.put("checks/helper.py", "X = 1\n")                                 # a test only by the worktree's patterns
+        self.assertEqual(self.refused_sources(self.red("check")), ["checks/helper.py"])
+
+    def test_settings_local_json_cannot_redefine_the_patterns(self):
+        self.settings(self.repo, {"HARNESS_TEST_PATTERNS": "specs/**"})
+        self.settings(self.wt, {"HARNESS_TEST_PATTERNS": "checks/**"})          # worktree settings.json
+        self.settings(self.wt, {"HARNESS_TEST_PATTERNS": "tests/**"}, local=True)   # worktree settings.local.json
+        self.settings(self.repo, {"HARNESS_TEST_PATTERNS": "extra/**"}, local=True)  # main settings.local.json
+        self.put("specs/test_calc.py", TEST_ADD)
+        p = self.red("check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.record()["test_files"], ["specs/test_calc.py"])
+        for rel in ("checks/helper.py", "tests/helper.py", "extra/helper.py"):  # none of them says "test"
+            self.put(rel, "X = 1\n")
+        self.assertEqual(self.refused_sources(self.red("check")),
+                         ["checks/helper.py", "extra/helper.py", "tests/helper.py"])
+
+    def test_exempt_globs_from_the_main_checkout_only(self):
+        self.settings(self.repo, {"HARNESS_SOURCE_EXEMPT": "notes/**,.claude/**"})   # .claude/**: the worktree's edited settings
+        self.settings(self.wt, {"HARNESS_SOURCE_EXEMPT": "lib/**"})
+        self.settings(self.wt, {"HARNESS_SOURCE_EXEMPT": "vendor/**"}, local=True)
+        self.settings(self.repo, {"HARNESS_SOURCE_EXEMPT": "scratch/**"}, local=True)
+        self.put("tests/test_calc.py", TEST_ADD)
+        self.put("notes/data.py", "X = 1\n")                    # exempt only in the main checkout's settings
+        p = self.red("check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.record()["test_files"], ["tests/test_calc.py"])
+        for rel in ("lib/x.py", "vendor/y.py", "scratch/z.py", "docs/n.md"):    # docs/** is no longer exempt either
+            self.put(rel, "X = 1\n")
+        self.assertEqual(self.refused_sources(self.red("check")),
+                         ["docs/n.md", "lib/x.py", "scratch/z.py", "vendor/y.py"])
+
+    def test_environment_wins_over_the_main_checkout(self):
+        self.settings(self.repo, {"HARNESS_TEST_PATTERNS": "specs/**", "HARNESS_SOURCE_EXEMPT": "notes/**"})
+        self.put("envtests/test_calc.py", TEST_ADD)
+        self.put("notes/data.py", "X = 1\n")                    # exempt through the file: the environment sets only patterns
+        p = self.red("check", HARNESS_TEST_PATTERNS="envtests/**")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.record()["test_files"], ["envtests/test_calc.py"])
+
+        self.put("specs/test_calc.py", TEST_SUB)                # a test in the file, source for the environment
+        self.put("other/data.py", "X = 1\n")
+        p = self.red("check", HARNESS_TEST_PATTERNS="envtests/**", HARNESS_SOURCE_EXEMPT="other/**")
+        self.assertEqual(self.refused_sources(p), ["notes/data.py", "specs/test_calc.py"])
+
+        os.remove(os.path.join(self.wt, "other", "data.py"))      # exempt only through the environment just above
+        p = self.red("check", HARNESS_TEST_PATTERNS="specs/**, envtests/**")     # the environment can widen it too
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.record()["test_files"], ["envtests/test_calc.py", "specs/test_calc.py"])
+
+    def test_blank_environment_falls_back_to_the_main_checkout(self):
+        self.settings(self.repo, {"HARNESS_TEST_PATTERNS": "specs/**"})
+        self.put("specs/test_calc.py", TEST_ADD)
+        p = self.red("check", HARNESS_TEST_PATTERNS="  ", HARNESS_SOURCE_EXEMPT="")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.record()["test_files"], ["specs/test_calc.py"])
+        self.put("tests/test_other.py", TEST_SUB)               # not a test under the file's patterns
+        p = self.red("check", HARNESS_TEST_PATTERNS="  ", HARNESS_SOURCE_EXEMPT="")
+        self.assertEqual(self.refused_sources(p), ["tests/test_other.py"])
+
+    def test_test_command_still_comes_from_the_worktree_settings(self):
+        runner = write(os.path.join(self.tmp, "runner.py"), "import sys\nprint('ran', sys.argv[1:])\nsys.exit(1)\n")
+        self.settings(self.repo, {"HARNESS_TEST_PATTERNS": "specs/**"})
+        write(os.path.join(self.wt, ".claude", "settings.json"),
+              json.dumps({"env": {"HARNESS_TEST_CMD": f"python3 {shlex.quote(runner)} {{files}}",
+                                  "HARNESS_TEST_PATTERNS": "checks/**"}}))
+        self.put("specs/test_calc.py", TEST_ADD)
+        p = self.red("check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("ran ['specs/test_calc.py']", p.stdout)
+        self.assertEqual(self.record()["cmd"], f"python3 {shlex.quote(runner)} specs/test_calc.py")
+
     # ------------------------------------------------------------ status
     def test_status_current(self):
         self.assertOneLineError(self.red("status"), f"No red run recorded for {BRANCH}")
