@@ -160,6 +160,27 @@ The existing suite (`<verify command>`) stays green.
 
 Epic body template (`templates/ticket_epic.md`): `## Goal`, `## Why`, `## Scope` and `## Out of scope`, `## Definition of done`, `## Verification` (the end-to-end commands), `## Decisions and open questions`. Tasks are the sub-issues; no task list in the body.
 
+The harness comments on a ticket as it moves: `Started on <branch> (...)`, `Pull request: <url>`, then on landing a `**Resolution**` comment followed by `Landed in <full squash sha>` (the line other tools look for; unchanged). Every one ends with `<!-- harness -->`. The Resolution is the account of what landed, copied from the merged PR, each part left out when the PR body lacks it:
+
+```markdown
+**Resolution**
+
+<the PR body's whole ## Summary section>
+
+Files changed (<n>):
+- `<path>`            (one per file, every file the PR changes)
+
+Definition of done:
+<the PR body's ## Definition of done section as landed, wrapped lines included>
+
+Red run before implementation (<kind>, exit <code>)
+Verify: <the last non-empty line of the verify fence>
+PR: <url>
+Squash commit: <full sha>
+
+<!-- harness -->
+```
+
 ## Agents
 
 | Agent | Model, effort | Tools | Job |
@@ -235,7 +256,7 @@ Failure policy, enforced by `harness-work attempt`: the first failure of a stage
 - `labels ensure`: the label table above, `gh label create <name> --color <hex> --description <text> --force`. Prints how many were created or updated.
 - `epic create --title T --body-file F [--size S] [--risk R]`: labels `epic`, `status:ready`, size and risk when given. Prints `#N <url>`.
 - `task create --title T --body-file F [--parent N] [--type task|bug|chore|refactor] [--size S|M|L] [--risk low|high] [--blocked-by N[,N]] [--no-tests] [--needs-local] [--priority]`: checks the remote and login first (`gh repo view`), creates the issue without `--parent`, then links it with `gh api -X POST repos/O/R/issues/<parent>/sub_issues -F sub_issue_id=<numeric id from gh issue view --json id? no: REST .id>` (the numeric database id, from `gh api repos/O/R/issues/N --jq .id`); a failed link is retried once and then reported with the issue number so no duplicate is ever created. Then `gh issue edit N --add-blocked-by`. Labels: type (default `task`), `status:ready`, size, risk, flags.
-- `show N [--markdown]`: `gh issue view N --json number,title,url,body,labels,state,parent,blockedBy,comments`; when the issue is an epic, `gh api repos/O/R/issues/N/sub_issues` for the tasks with labels and state; parses the body sections (headings `## Request`, `## Outline`, `## Definition of done` as checkbox lines, `## Tests that must pass`, `## Context`); writes the cache (preserving `branch`, `worktree`, `started_at`, `attempts` from an existing cache); prints JSON, or with `--markdown` the ticket context, at most 120 lines: title and labels, the sections, the epic's goal paragraph, blocked-by numbers with state, the last 10 comments (author, date, first 20 lines each).
+- `show N [--markdown]`: `gh issue view N --json number,title,url,body,labels,state,parent,blockedBy,comments`; when the issue is an epic, `gh api repos/O/R/issues/N/sub_issues` for the tasks with labels and state; parses the body sections (headings `## Request`, `## Outline`, `## Definition of done` as checkbox lines, `## Tests that must pass`, `## Context`); writes the cache (preserving `branch`, `worktree`, `started_at`, `attempts` from an existing cache); prints JSON, or with `--markdown` the ticket context, at most 120 lines: title and labels, the sections, the epic's goal paragraph, blocked-by numbers with state, the last 10 comments (author, date, first 20 lines each). A closed ticket's newest `**Resolution**` comment is printed whole under `## Resolution` after the sections (and left out of the comments); an epic's closed tasks each get their newest Resolution under `### #N <title>: Resolution` below the task list (one `gh issue view N --json comments` per closed task, markdown only; a task without one, or whose comments cannot be read, adds nothing). Resolutions come before comments in the 120-line budget: each is printed whole or not at all, and those that do not fit are named on one `Not shown for lack of room` pointer line.
 - `ready`: open issues with `status:ready` and not `epic`, whose `blockedBy` are all closed, `priority:high` first, then lowest number first. Table or JSON (number, title, type, size, risk, tier, flags).
 - `status N <ready|in-progress|in-review|blocked|needs-input> [--comment TEXT]`: removes every `status:*` label, adds the new one, comments when asked.
 - `comment N (--body TEXT | --body-file F)`.
@@ -282,7 +303,7 @@ Runs in a ticket worktree (cwd, or `--worktree PATH`).
 - `comments P [--since ISO] [--unresolved]`: review threads (GraphQL `reviewThreads` with `isResolved`, comments with author, path, line, body, createdAt), reviews and issue comments on the PR, excluding bodies containing `<!-- harness-review -->`; `--unresolved` keeps unresolved threads only. JSON or markdown.
 - `awaiting [--all-projects]`: open, non-draft PRs by the authenticated user: number, title, ticket, age, checks state (one poll), unresolved thread count. `--all-projects` walks the registry.
 - `ultra P [--post]`: `claude ultrareview P --post --json --timeout 30` (post only with `--post`); saves stdout to `ultra/<P>.json`; a non-zero exit whose output mentions credits, billing or balance marks `cloud` exhausted for 24 h; prints the finding count and the highest severities.
-- `land P [--yes] [--discard]`: preconditions: not a draft, `mergeable` not `CONFLICTING` (retry twice on `UNKNOWN`), checks green by one poll (cancelled counts as red), `closingIssuesReferences` non-empty (warn and continue when empty). Then `gh pr merge P -R O/R --squash --delete-branch`; locate the worktree for the head branch in `git worktree list --porcelain`; `git worktree remove` (`--force` only with `--discard`; a dirty worktree otherwise stops after the merge with instructions); `git branch -D <branch>`; in the main checkout `git fetch --prune` and, when it is on main, `git pull --ff-only`; confirm the ticket closed (else `gh issue close`), remove its `status:*` labels, comment `Landed in <merge sha>`; `harness-board epic-check <parent>` when there is a parent. Prints a four-line summary.
+- `land P [--yes] [--discard]`: preconditions: not a draft, `mergeable` not `CONFLICTING` (retry twice on `UNKNOWN`), checks green by one poll (cancelled counts as red), `closingIssuesReferences` non-empty (warn and continue when empty). Then `gh pr merge P -R O/R --squash --delete-branch`; locate the worktree for the head branch in `git worktree list --porcelain`; `git worktree remove` (`--force` only with `--discard`; a dirty worktree otherwise stops after the merge with instructions); `git branch -D <branch>`; in the main checkout `git fetch --prune` and, when it is on main, `git pull --ff-only`; confirm the ticket closed (else `gh issue close`), remove its `status:*` labels, comment the `**Resolution**` (format under The board; body and url from `gh pr view P --json body,files,url`, every changed file from `gh api repos/O/R/pulls/P/files?per_page=100 --paginate --slurp`, or the view's first 100 files with a warning when that call fails; a failed `gh pr view` posts neither comment and names the Resolution in the error) and then `Landed in <merge sha>`, both through `harness-board comment`. Idempotent on resume: no Resolution when the ticket already has one, and neither comment when `Landed in` is already there (the Resolution goes first, so a land stopped between them still posts `Landed in`); `harness-board epic-check <parent>` when there is a parent. Prints a four-line summary.
 
 ### harness-scaffold
 
