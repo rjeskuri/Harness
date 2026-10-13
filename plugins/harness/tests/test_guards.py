@@ -1360,6 +1360,51 @@ class TestsFirstTests(GuardTestCase):
                 self.assertIsNone(self.bash(command, "harness:reviewer"))
                 self.assertIsNone(self.bash(command, "harness:coder", cwd=self.tmp))
 
+    def test_an_unresolvable_directory_judges_the_cwd(self):
+        self.cache()
+        self.red()
+        # the directory is not known until the shell runs it: the worktree is judged
+        for command in (
+            'patch -d "$(pwd)" -p1 < fix.diff',
+            "patch -d $D -p1 < fix.diff",
+            "patch -d ${UNSET_DIR}/sub -p1 < fix.diff",
+            "find $D -type f -exec rm {} \\;",
+        ):
+            for agent in ("harness:coder", "harness:test-author", "harness:test-breaker"):
+                with self.subTest(command=command, agent=agent):
+                    reason = self.bash(command, agent)
+                    self.assertRefusedAs(reason, command, INLINE)
+                    self.assertTrue(reason.endswith(INLINE), reason)
+            with self.subTest(command=command, agent=None):
+                self.assertIsNone(self.bash(command))
+            with self.subTest(command=command, where="outside any repo"):
+                self.assertIsNone(self.bash(command, "harness:coder", cwd=self.tmp))
+
+    def test_a_directory_outside_the_repo_does_not_judge_the_cwd(self):
+        self.cache()
+        self.red()
+        outside = self.tmp / "outside_dir"
+        outside.mkdir()
+        # every directory it writes in resolved outside any repo: the worktree it
+        # runs from is not judged
+        for command in (
+            "find /tmp -exec rm {} \\;",
+            f"find {outside} -type f -exec touch {{}} +",
+            f"find {outside} /tmp -name '*.py' -exec rm {{}} \\;",
+            f"patch -d {outside} -p1 < fix.diff",
+            "patch -d /tmp -p1 < fix.diff",
+        ):
+            for agent in ("harness:coder", "harness:test-author", "harness:test-breaker"):
+                with self.subTest(command=command, agent=agent):
+                    self.assertIsNone(self.bash(command, agent))
+        # the same writers aimed into the worktree are still refused
+        for command in (
+            f"find /tmp {self.wt} -exec rm {{}} \\;",
+            f"patch -d {self.wt} -p1 < fix.diff",
+        ):
+            with self.subTest(command=command, where="in the worktree"):
+                self.assertRefusedAs(self.bash(command, "harness:coder"), command, INLINE)
+
     def test_reads_and_narrow_forms_stay_allowed(self):
         self.cache()
         self.red()
