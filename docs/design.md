@@ -167,6 +167,9 @@ The harness comments on a ticket as it moves: `Started on <branch> (...)`, `Pull
 
 <the PR body's whole ## Summary section>
 
+Notes:
+<the PR body's ## Notes section, when `harness-pr open --notes` added one>
+
 Files changed (<n>):
 - `<path>`            (one per file, every file the PR changes)
 
@@ -216,7 +219,7 @@ harness-red check               proof: tests fail, source untouched; record writ
 test-breaker (tier)             scratch copy; cheat attempt; pass means tests go back to the author (max 2 rounds)
 coder (tier)                    source only; new tests and CLAUDE_VERIFY_CMD green; commits
 reviewer (fable)                findings JSON; split by the ticket's files: the rest become new tickets
-harness-pr open N               push, draft PR from the template (Closes #N, DoD, red proof, verify tail)
+harness-pr open N [--notes F]   push, draft PR from the template (Closes #N, DoD, red proof, verify tail); --notes adds a `## Notes` section (second pass, out-of-scope file) that the Resolution repeats
 harness-pr review P --findings  inline review comments from the findings on the ticket's files
 coder (tier)                    fixes every posted finding, whatever its severity, in commits after the review;
                                 push; the reviewer re-checks and its findings are posted again (max 2 rounds)
@@ -301,7 +304,7 @@ Runs in a ticket worktree (cwd, or `--worktree PATH`).
 
 ### harness-pr
 
-- `open N [--worktree PATH] [--verify-log F] [--review F]`: in the ticket's worktree: refuse with the list when the tree is dirty; `git push -u origin <branch>`; body from `templates/pr_body.md` with the title, `Closes #N`, the definition-of-done checkboxes copied from the ticket, the tests list, the red proof (kind, exit, 15 lines of tail), the verify tail (20 lines of `--verify-log`), the review summary (counts by severity and the high findings from `--review`), a risks line for `risk:high`; `gh pr create --draft --base main --head <branch> --title "<title> (#N)" --body-file`; if a PR for the branch exists, `gh pr edit --body-file` instead; `harness-board comment N` with the PR URL; prints `{"number", "url"}`.
+- `open N [--worktree PATH] [--verify-log F] [--review F] [--notes F]`: in the ticket's worktree: refuse with the list when the tree is dirty, and refuse a `--notes` file that is missing or has a `## ` heading outside a code fence (`###` is fine), both before the push; `git push -u origin <branch>`; body from `templates/pr_body.md` with the title, `Closes #N`, the notes (a `## Notes` section between Summary and Definition of done, only with `--notes`; the Resolution repeats it), the definition-of-done checkboxes copied from the ticket, the tests list, the red proof (kind, exit, 15 lines of tail), the verify tail (20 lines of `--verify-log`), the review summary (counts by severity and the high findings from `--review`), a risks line for `risk:high`; `gh pr create --draft --base main --head <branch> --title "<title> (#N)" --body-file`; if a PR for the branch exists, `gh pr edit --body-file` instead; `harness-board comment N` with the PR URL; prints `{"number", "url"}`.
 - `review P --findings F`: findings JSON list `[{"path", "line", "severity": "high|medium|low", "body"}]`; `gh pr diff P` is parsed to the set of (path, right-side line) in the diff; findings on those lines become inline comments (`path`, `line`, `side: RIGHT`), the rest are listed in the review body; `gh api repos/O/R/pulls/P/reviews --input` with `event: COMMENT` and body `Harness review (<model>): <n> findings, <h> high, <m> medium, <l> low.` followed by the off-diff list and the marker `<!-- harness-review -->`. Zero findings: `gh pr review P --comment -b "Harness review: no findings. Checked: <text from --checked>"` followed by the marker, so it counts as the latest harness review.
 - `checks P [--wait] [--timeout 1200]`: poll `gh pr view P --json statusCheckRollup` every 20 s: no checks after 120 s → `no checks registered` exit 0 with a warning; any `PENDING|QUEUED|IN_PROGRESS` → keep waiting; any `FAILURE|CANCELLED|TIMED_OUT|ERROR|ACTION_REQUIRED|STARTUP_FAILURE` → exit 1 with the names and, for GitHub Actions runs (details URL `/actions/runs/<id>`), the last 60 lines of `gh run view <id> --log-failed`; all `SUCCESS|SKIPPED|NEUTRAL` → exit 0. Without `--wait` one poll.
 - The review gate, in `ready` and `land`: the latest harness review is the review with the newest `submitted_at` whose body carries `<!-- harness-review -->` (`gh api --paginate repos/O/R/pulls/P/reviews`); its findings are its inline comments (`.../reviews/<id>/comments`) and the ``- `path:line` [severity] body`` lines of its body, none for `Harness review: no findings.`; a commit is newer when its committer (else author) date in `.../pulls/P/commits` is after `submitted_at`. Findings and no newer commit: refuse with exit 1, naming each finding. gh failing: refuse (fail closed). No harness review: proceed.
