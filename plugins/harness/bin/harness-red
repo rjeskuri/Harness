@@ -17,9 +17,10 @@ Usage:
     harness-red scratch remove
     check and status take --json; every subcommand takes --worktree PATH.
 
-Settings, from the environment first, then `env` in the worktree's .claude/settings.json, with
-.claude/settings.local.json over it: HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT (comma-separated
-globs), HARNESS_TEST_CMD ({files} becomes the test files, shell-quoted; detected when unset) and
+Settings: HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT (comma-separated globs) come from the
+environment, then `env` in the main checkout's tracked .claude/settings.json only, as in tests_first;
+the others come from the environment, then `env` in the worktree's .claude/settings.json, with
+.claude/settings.local.json over it: HARNESS_TEST_CMD ({files} becomes the test files, shell-quoted; detected when unset) and
 HARNESS_TEST_TIMEOUT (seconds, default 300).
 """
 from __future__ import annotations
@@ -92,10 +93,10 @@ def _segments_match(pats, parts):
     return bool(parts) and fnmatch.fnmatch(parts[0], pats[0]) and _segments_match(pats[1:], parts[1:])
 
 
-def settings_env(root):
+def settings_env(root, names=("settings.json", "settings.local.json")):
     """`env` from the project's settings files; settings.local.json wins over settings.json."""
     merged = {}
-    for name in ("settings.json", "settings.local.json"):
+    for name in names:
         try:
             with open(os.path.join(root, ".claude", name), encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -205,8 +206,11 @@ class Repo:
         self.record_path = os.path.join(state, "red", self.slug + ".json")
         self.scratch = os.path.join(state, "scratch", self.slug)
         self.env = settings_env(self.top)
-        self.test_globs = globs("HARNESS_TEST_PATTERNS", self.env, TEST_PATTERNS)
-        self.exempt_globs = globs("HARNESS_SOURCE_EXEMPT", self.env, SOURCE_EXEMPT)
+        # What counts as a test is decided by the main checkout's tracked settings.json only, as in
+        # tests_first: the worktree's files and settings.local.json are agent-editable.
+        classify_env = settings_env(self.main, ("settings.json",))
+        self.test_globs = globs("HARNESS_TEST_PATTERNS", classify_env, TEST_PATTERNS)
+        self.exempt_globs = globs("HARNESS_SOURCE_EXEMPT", classify_env, SOURCE_EXEMPT)
 
     def classify(self, path):
         """'test', 'exempt' or 'source'."""
