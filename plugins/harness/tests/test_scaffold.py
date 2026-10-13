@@ -555,6 +555,202 @@ class Render(ScaffoldTest):
         self.assertIn("`scripts/verify.sh`", section)
 
 
+# =========================================================================== skeleton (ticket #28)
+# The skeleton of each stack, as written into an empty folder for --name demo-app.
+SKELETON_FILES = {"python": ["pyproject.toml", "src/demo_app/__init__.py", "tests/test_smoke.py"],
+                  "node": ["package.json", "tests/smoke.test.js"]}
+LAYOUT = re.compile(r"kept the project's own layout \(([^)]*)\)")
+STATUS_LINE = re.compile(r"^(?:would )?(create|created|keep|kept|update|updated) (\S+)$")
+NORMAL = {"create": "created", "keep": "kept", "update": "updated"}
+MAKEFILE_TARGETS = "py:\n\tpython3 -m unittest discover -s test\n\nlint:\n\techo lint\n"
+
+
+class Skeleton(ScaffoldTest):
+    """The skeleton (manifest, src/<pkg>, smoke test) is written only when the project has no manifest of
+    any stack, no Makefile with a test or check target and no tests directory or test file; otherwise both
+    --dry-run and the real run say `kept the project's own layout (<what was found>)`."""
+
+    # ------------------------------------------------------------ helpers
+    def fixture(self, label, files):
+        root = self.mk(label)
+        for rel, text in files.items():
+            self.write(os.path.join(root, rel), text)
+        return root
+
+    def snapshot(self, root):
+        """{relative path: content} of every file under root, .git left out."""
+        out = {}
+        for here, dirs, names in os.walk(root):
+            dirs[:] = [d for d in dirs if d != ".git"]
+            for name in names:
+                path = os.path.join(here, name)
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    out[os.path.relpath(path, root).replace(os.sep, "/")] = fh.read()
+        return out
+
+    def both(self, root, stack, *extra):
+        """--dry-run first (it must write nothing), then the real run, on the same folder."""
+        before = self.snapshot(root)
+        dry = self.ok("init", root, "--name", "demo-app", "--stack", stack, *extra, "--dry-run")
+        self.assertEqual(self.snapshot(root), before, "--dry-run wrote into the project")
+        real = self.ok("init", root, "--name", "demo-app", "--stack", stack, *extra)
+        return dry, real
+
+    def statuses(self, p):
+        """{path: created|kept|updated} for the scaffold's file lines, `would ...` normalised."""
+        out = {}
+        for line in self.lines(p):
+            m = STATUS_LINE.match(line)
+            if m and not m.group(2).startswith(".git/") and not m.group(2).startswith("core."):
+                out[m.group(2)] = NORMAL.get(m.group(1), m.group(1))
+        return out
+
+    def layout(self, p):
+        """The names inside `kept the project's own layout (...)`, or None when the line is absent."""
+        found = [LAYOUT.search(line) for line in self.lines(p)]
+        found = [m for m in found if m]
+        if not found:
+            return None
+        self.assertEqual(len(found), 1, p.stdout)
+        return {name.strip() for name in found[0].group(1).split(",") if name.strip()}
+
+    def assertSkipped(self, root, stack, before, dry, real, names):
+        """No skeleton file planned or written, the fixture untouched, the reason named in both runs."""
+        for rel in SKELETON_FILES[stack]:
+            if rel in before:
+                continue
+            self.assertFalse(os.path.exists(os.path.join(root, rel)), f"skeleton file written: {rel}")
+            self.assertNotIn(f"created {rel}", self.lines(real))
+            self.assertNotIn(f"would create {rel}", self.lines(dry))
+        if stack == "python" and not any(rel.startswith("src/") for rel in before):
+            self.assertFalse(os.path.exists(os.path.join(root, "src")), "src/<pkg> written")
+        after = self.snapshot(root)
+        for rel, text in before.items():
+            self.assertEqual(after.get(rel), text, f"the project's {rel} changed")
+        for p, which in ((dry, "--dry-run"), (real, "real run")):
+            got = self.layout(p)
+            self.assertIsNotNone(got, f"{which} does not say why the skeleton was skipped:\n{p.stdout}")
+            for name in names:
+                self.assertIn(name, got, f"{which} does not name {name}: {got}")
+        self.assertEqual(self.layout(dry), self.layout(real), "--dry-run and the real run name different things")
+        self.assertEqual(self.statuses(dry), self.statuses(real), "--dry-run and the real run disagree")
+
+    def assertWritten(self, root, stack, dry, real):
+        for rel in SKELETON_FILES[stack]:
+            self.assertTrue(os.path.isfile(os.path.join(root, rel)), f"skeleton file missing: {rel}")
+            self.assertIn(f"created {rel}", self.lines(real))
+            self.assertIn(f"would create {rel}", self.lines(dry))
+        for p in (dry, real):
+            self.assertIsNone(self.layout(p), p.stdout)
+        self.assertEqual(self.statuses(dry), self.statuses(real), "--dry-run and the real run disagree")
+
+    def where(self, root):
+        text = self.read(root, "CLAUDE.md")
+        return text.split("## Where things live", 1)[1].split("\n## ", 1)[0]
+
+    def names_dir(self, section, directory):
+        return re.search(r"`" + re.escape(directory) + r"/?`", section) is not None
+
+    # ------------------------------------------------------------ tests
+    def test_the_jotform_layout_keeps_its_own_layout(self):
+        # package.json, a Makefile with check/test/py targets and tests under test/ (2026-10-14)
+        files = {"package.json": '{"name": "jotform-glow-sync", "scripts": {"test": "make test"}}\n',
+                 "Makefile": "check: lint test\n\ntest:\n\tpython3 -m unittest discover -s test -p '*_test.py'\n\n"
+                             + MAKEFILE_TARGETS,
+                 "test/x_test.py": "import unittest\n",
+                 "sync.py": "print('sync')\n"}
+        root = self.fixture("jotform-glow-sync", files)
+        before = self.snapshot(root)
+        dry, real = self.both(root, "python")
+        self.assertSkipped(root, "python", before, dry, real, ["package.json", "test/"])
+        section = self.where(root)
+        self.assertTrue(self.names_dir(section, "test"), section)
+        self.assertFalse(self.names_dir(section, "tests"), section)
+
+    def test_no_skeleton_when_another_stacks_manifest_exists(self):
+        manifests = {"pyproject.toml": "[project]\nname = 'x'\n", "package.json": '{"name": "x"}\n',
+                     "setup.py": "from setuptools import setup\nsetup(name='x')\n",
+                     "setup.cfg": "[metadata]\nname = x\n", "requirements.txt": "requests==2.32.3\n",
+                     "Cargo.toml": "[package]\nname = \"x\"\nversion = \"0.1.0\"\n", "go.mod": "module example.com/x\n"}
+        cases = [("python", m) for m in manifests if m != "pyproject.toml"]
+        cases += [("node", m) for m in ("pyproject.toml", "setup.py", "requirements.txt", "Cargo.toml", "go.mod")]
+        cases += [("python", "pyproject.toml"), ("node", "package.json")]        # the stack's own, as today
+        for stack, manifest in cases:
+            with self.subTest(stack=stack, manifest=manifest):
+                root = self.fixture(f"man-{stack}-{manifest.replace('.', '-')}", {manifest: manifests[manifest]})
+                before = self.snapshot(root)
+                dry, real = self.both(root, stack)
+                self.assertSkipped(root, stack, before, dry, real, [manifest])
+                section = self.where(root)                     # no skeleton, so no tests/ to name
+                self.assertFalse(self.names_dir(section, "tests"), section)
+        with self.subTest(several=True):
+            root = self.fixture("man-several", {"go.mod": manifests["go.mod"],
+                                                "requirements.txt": manifests["requirements.txt"]})
+            before = self.snapshot(root)
+            dry, real = self.both(root, "node")
+            self.assertSkipped(root, "node", before, dry, real, ["go.mod", "requirements.txt"])
+        with self.subTest(force=True):                             # --force overwrites files, adds no skeleton
+            root = self.fixture("man-force", {"package.json": manifests["package.json"]})
+            before = self.snapshot(root)
+            dry, real = self.both(root, "python", "--force")
+            self.assertSkipped(root, "python", before, dry, real, ["package.json"])
+
+    def test_no_skeleton_when_a_tests_directory_or_makefile_test_target_exists(self):
+        blocking = [
+            ("tests-dir", {"tests/conftest.py": "import pytest\n"}, "tests/"),
+            ("test-dir", {"test/helper.js": "module.exports = {};\n"}, "test/"),
+            ("spec-dir", {"spec/spec_helper.rb": "require 'rspec'\n"}, "spec/"),
+            ("test-pattern-in-test", {"test/x_test.py": "import unittest\n"}, "test/"),
+            ("top-test-prefix", {"test_app.py": "def test_x():\n    pass\n"}, "test_app.py"),
+            ("top-test-suffix", {"app_test.py": "def test_x():\n    pass\n"}, "app_test.py"),
+            ("top-js-test", {"app.test.js": "require('node:test');\n"}, "app.test.js"),
+            ("make-test", {"Makefile": "test:\n\tpython3 -m unittest\n"}, "Makefile"),
+            ("make-check", {"Makefile": "build:\n\techo build\n\ncheck: build\n\techo ok\n"}, "Makefile"),
+        ]
+        for stack in ("python", "node"):
+            for label, files, name in blocking:
+                with self.subTest(stack=stack, blocker=label):
+                    root = self.fixture(f"block-{stack}-{label}", files)
+                    before = self.snapshot(root)
+                    dry, real = self.both(root, stack)
+                    self.assertSkipped(root, stack, before, dry, real, [name])
+                    if name != "tests/":
+                        section = self.where(root)
+                        self.assertFalse(self.names_dir(section, "tests"), section)
+                        self.assertFalse(os.path.exists(os.path.join(root, "tests")))
+        # none of these is a manifest, a tests directory, a test file or a test/check target
+        not_blocking = [
+            ("make-no-test-target", {"Makefile": MAKEFILE_TARGETS}),
+            ("make-lookalike-targets", {"Makefile": "pytest:\n\tpytest\n\nrecheck:\n\techo again\n\n"
+                                                    "testing:\n\techo t\n\nci:\n\t$(MAKE) py\n"}),
+            ("readme-and-docs", {"README.md": "# demo\n", "docs/notes.md": "test: notes\n"}),
+            ("non-test-sources", {"tool.py": "print(1)\n", "latest.py": "print(2)\n", "attest.js": "1;\n"}),
+        ]
+        for stack in ("python", "node"):
+            for label, files in not_blocking:
+                with self.subTest(stack=stack, not_blocking=label):
+                    root = self.fixture(f"free-{stack}-{label}", files)
+                    dry, real = self.both(root, stack)
+                    self.assertWritten(root, stack, dry, real)
+                    for rel, text in files.items():
+                        self.assertEqual(self.read(root, rel), text, rel)
+
+    def test_empty_folder_still_gets_the_skeleton(self):
+        for stack in ("python", "node"):
+            with self.subTest(stack=stack):
+                root = self.mk(f"empty-{stack}")
+                dry, real = self.both(root, stack)
+                self.assertWritten(root, stack, dry, real)
+                expected = set(COMMON_FILES + SKELETON_FILES[stack])
+                self.assertEqual(set(self.snapshot(root)), expected)        # exactly what is written today
+                self.assertEqual({p for p, s in self.statuses(real).items() if s == "created"}, expected)
+                self.assertTrue(self.names_dir(self.where(root), "tests"), self.where(root))
+        with self.subTest(stack="python", folder="missing"):              # a path that does not exist yet
+            root = os.path.join(self.tmp, "fresh-python")
+            self.ok("init", root, "--name", "demo-app", "--stack", "python")
+            self.assertEqual(set(self.snapshot(root)), set(COMMON_FILES + SKELETON_FILES["python"]))
+
+
 # =========================================================================== rules
 class Rules(ScaffoldTest):
     def test_existing_file_is_kept_without_force(self):
