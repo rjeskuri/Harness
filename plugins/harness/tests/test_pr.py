@@ -579,6 +579,109 @@ class Checks(PrTest):
         self.assertEqual(self.polls(), 6)
 
 
+# =========================================================================== the review gate
+# What `harness-pr ready` and `harness-pr land` read to find the latest harness review and whether a commit came after
+# it, all through the REST API (gh api, with any flags such as --paginate, but these exact endpoint paths):
+#   repos/o/r/pulls/34/reviews                  [{id, user, body, state, submitted_at, commit_id}]
+#   repos/o/r/pulls/34/reviews/<id>/comments    that review's inline comments [{path, line, body, ...}]
+#   repos/o/r/pulls/34/commits                  [{sha, commit: {author: {date}, committer: {date}}}]
+# A harness review is one whose body carries MARKER: `harness-pr review` posts "Harness review (<model>): N findings,
+# h high, m medium, l low." with the findings not on a changed line listed in the body ("- `path:line` [severity]
+# body") and the rest as inline comments ("[severity] body"), or, with no findings, "Harness review: no findings.
+# Checked: ...".
+PULL = "repos/o/r/pulls/34"
+
+
+def at(hour):
+    return f"2026-10-12T{hour:02d}:00:00Z"
+
+
+def harness_review(rid, when, inline=(), body_only=(), model="fable"):
+    """(the review, its inline comments) as `harness-pr review` posts them; a finding: (path, line, severity, body)."""
+    findings = list(inline) + list(body_only)
+    if not findings:
+        body = f"Harness review: no findings. Checked: the diff against the ticket's definition of done\n\n{MARKER}"
+    else:
+        counts = {s: sum(1 for f in findings if f[2] == s) for s in ("high", "medium", "low")}
+        parts = [f"Harness review ({model}): {len(findings)} finding{'s' if len(findings) != 1 else ''}, "
+                 f"{counts['high']} high, {counts['medium']} medium, {counts['low']} low."]
+        if body_only:
+            parts.append("\n".join(["Not on a changed line:"] + [f"- `{p}:{n}` [{s}] {b}" for p, n, s, b in body_only]))
+        parts.append(MARKER)
+        body = "\n\n".join(parts)
+    review = {"id": rid, "user": {"login": "rjeskuri"}, "body": body, "state": "COMMENTED", "submitted_at": when,
+              "commit_id": "c" * 40}
+    comments = [{"id": rid * 100 + i, "pull_request_review_id": rid, "user": {"login": "rjeskuri"}, "path": p,
+                 "line": n, "original_line": n, "side": "RIGHT", "body": f"[{s}] {b}\n\n{MARKER}", "created_at": when}
+                for i, (p, n, s, b) in enumerate(inline)]
+    return review, comments
+
+
+def owner_review(rid, when, body):
+    return {"id": rid, "user": {"login": "pal"}, "body": body, "state": "COMMENTED", "submitted_at": when,
+            "commit_id": "c" * 40}, []
+
+
+def pr_commit(char, when):
+    return {"sha": char * 40, "commit": {"message": f"Commit {char}", "author": {"name": "Test", "date": when},
+                                         "committer": {"name": "Test", "date": when}}}
+
+
+def gate_calls(reviews=(), commits=()):
+    """fakegh entries for the gate's reads: reviews is a list of (review, comments)."""
+    calls = [{"contains": ["api", f"{PULL}/reviews/{r['id']}/comments"], "stdout_json": c} for r, c in reviews]
+    calls.append({"contains": ["api", f"{PULL}/reviews"], "stdout_json": [r for r, _ in reviews]})
+    calls.append({"contains": ["api", f"{PULL}/commits"], "stdout_json": list(commits)})
+    return calls
+
+
+FROBS = ("widget.py", 2, "high", "Frobs only once on empty input.")
+NOTES = ("docs/notes.md", 3, "low", "Mention the flag in the notes.")
+OLD_NIT = ("widget.py", 9, "low", "Old nit about naming.")
+OFF_BY_ONE = ("lib/frob.py", 41, "medium", "Off by one in the loop bound.")
+README = ("README.md", 1, "high", "Document the new flag.")
+TOKEN = ("src/app.py", 5, "high", "Leaks the token into the log.")
+LIMIT = ("docs/x.md", 7, "medium", "Explain the limit.")
+# name: (reviews, commits, the findings a refusal names or None for proceed, findings it must not name)
+GATE_CASES = {
+    "findings and no commit since": (
+        [harness_review(101, at(10), inline=[FROBS], body_only=[NOTES])], [pr_commit("a", at(9))],
+        [FROBS, NOTES], []),
+    "a commit after the findings": (
+        [harness_review(101, at(10), inline=[FROBS], body_only=[NOTES])],
+        [pr_commit("a", at(9)), pr_commit("b", at(11))],
+        None, []),
+    "an older review with findings, the latest clean": (
+        [harness_review(101, at(10), inline=[OLD_NIT]), harness_review(102, at(12))], [pr_commit("a", at(9))],
+        None, []),
+    "an older clean review, the latest with findings (listed newest first)": (
+        [harness_review(102, at(12), inline=[OFF_BY_ONE]), harness_review(101, at(10))],
+        [pr_commit("a", at(9)), pr_commit("b", at(11))], [OFF_BY_ONE], []),
+    "no harness review, only the owner's": (
+        [owner_review(201, at(12), "Please rename the widget.")], [pr_commit("a", at(9))], None, []),
+    "no review at all": ([], [pr_commit("a", at(9))], None, []),
+    "the owner reviewed after the harness findings": (
+        [harness_review(101, at(10), inline=[TOKEN]), owner_review(201, at(12), "LGTM")], [pr_commit("a", at(9))],
+        [TOKEN], []),
+    "two reviews with findings, a commit between them": (
+        [harness_review(101, at(10), inline=[OLD_NIT]),
+         harness_review(102, at(12), inline=[OFF_BY_ONE], body_only=[README])],
+        [pr_commit("a", at(9)), pr_commit("b", at(11))], [OFF_BY_ONE, README], [OLD_NIT]),
+    "every finding in the review body": (
+        [harness_review(101, at(10), body_only=[LIMIT])], [pr_commit("a", at(9))], [LIMIT], []),
+}
+
+
+class GateAsserts:
+    def assertNamesFindings(self, p, named, not_named):
+        said = p.stdout + p.stderr
+        for path, line, severity, body in named:
+            self.assertIn(f"{path}:{line}", said)
+            self.assertTrue(severity in said or body[:20] in said, (severity, body, said))
+        for path, line, _s, _b in not_named:
+            self.assertNotIn(f"{path}:{line}", said)
+
+
 # =========================================================================== ready
 class Ready(PrTest):
     def view(self, closing):
@@ -587,12 +690,15 @@ class Ready(PrTest):
                                 "closingIssuesReferences": [{"number": n, "url": f"https://github.com/o/r/issues/{n}"}
                                                             for n in closing]}}
 
+    def scenario(self, calls, default=None):
+        super().scenario(calls + [REPO_VIEW] + gate_calls(commits=[pr_commit("a", at(9))]), default)
+
     def test_ready_marks_the_pr_and_the_closing_ticket_and_notifies(self):
         self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, self.view([12])])
         p = self.ok("ready", "34")
         self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
-        self.assertEqual(self.gh_argv(), [["pr", "ready", "34"],
-                                          ["pr", "view", "34", "--json", "url,title,closingIssuesReferences"]])
+        self.assertEqual([a for a in self.gh_argv() if a[0] not in ("api", "repo")],     # the gate's reads aside
+                         [["pr", "ready", "34"], ["pr", "view", "34", "--json", "url,title,closingIssuesReferences"]])
         self.assertEqual(self.stub_calls("harness-board"), [
             ["status", "12", "in-review", "--comment", f"PR #34 ready for review: {PR_URL}", "--repo", self.main]])
         sent = self.notifications()
@@ -611,6 +717,43 @@ class Ready(PrTest):
         p = self.pr("ready", "34")
         self.assertOneLineError(p, "PR #34 is ready, but", "gh issue edit failed")
         self.assertEqual(len(self.notifications()), 1)
+
+
+class ReadyGate(GateAsserts, PrTest):
+    """`harness-pr ready P` refuses a PR whose latest harness review has findings and no commit after it."""
+
+    def run_case(self, reviews, commits, *flags):
+        self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, Ready.view(self, [12]), REPO_VIEW]
+                      + gate_calls(reviews, commits))
+        if os.path.exists(self.notify_log):
+            os.unlink(self.notify_log)
+        return self.pr("ready", "34", *flags)
+
+    def assertRefused(self, p):
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse([a for a in self.gh_argv() if a[:2] == ["pr", "ready"]], self.gh_argv())   # not marked ready
+        self.assertEqual(self.stub_calls("harness-board"), [])                                      # no status change
+        self.assertEqual(self.notifications(), [])
+
+    def test_ready_follows_the_latest_harness_review_and_the_commits_after_it(self):
+        for name, (reviews, commits, named, not_named) in GATE_CASES.items():
+            with self.subTest(name):
+                p = self.run_case(reviews, commits)
+                if named is None:
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn(["pr", "ready", "34"], self.gh_argv())
+                    self.assertEqual([a[:3] for a in self.stub_calls("harness-board")], [["status", "12", "in-review"]])
+                else:
+                    self.assertRefused(p)
+                    self.assertNamesFindings(p, named, not_named)
+
+    def test_ready_has_no_override(self):
+        reviews, commits, named, _ = GATE_CASES["findings and no commit since"]
+        p = self.run_case(reviews, commits)
+        self.assertRefused(p)
+        self.assertNamesFindings(p, named, [])
+        self.assertRefused(self.run_case(reviews, commits, "--accept-findings"))
 
 
 # =========================================================================== comments
@@ -773,9 +916,11 @@ def land_view(**over):
 
 
 class Land(WorktreeTest):
-    def land_calls(self, views=None, issue_state="OPEN", comments=()):
+    def land_calls(self, views=None, issue_state="OPEN", comments=(), reviews=(), commits=None):
         views = views or [land_view()]
-        return [{"match": ["pr", "view", "34", "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": SHA}}},
+        commits = [pr_commit("a", at(9))] if commits is None else commits
+        return gate_calls(reviews, commits) + [
+                {"match": ["pr", "view", "34", "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": SHA}}},
                 {"match": ["pr", "view", "34", "--json", LAND_FIELDS],
                  "responses": [{"stdout_json": v} for v in views]},
                 REPO_VIEW, {"match": ["pr", "merge", "34"], "stdout": ""},
@@ -958,10 +1103,76 @@ class LandRefusals(PrTest):
                  ("closed unmerged", land_view(state="CLOSED"), "closed without being merged")]
         for name, view, needle in cases:
             with self.subTest(name):
-                self.scenario([{"match": ["pr", "view", "34"], "stdout_json": view}, REPO_VIEW,
-                               {"match": ["pr", "merge"], "stdout": ""}])
+                self.scenario(gate_calls(commits=[pr_commit("a", at(9))])
+                              + [{"match": ["pr", "view", "34"], "stdout_json": view}, REPO_VIEW,
+                                 {"match": ["pr", "merge"], "stdout": ""}])
                 self.assertOneLineError(self.pr("land", "34"), needle)
                 self.assertFalse(any(a[:2] == ["pr", "merge"] for a in self.gh_argv()))
+
+
+class LandGate(GateAsserts, WorktreeTest):
+    """`harness-pr land P` refuses a PR whose latest harness review has findings and no commit after it, unless
+    --accept-findings; it lands the PR when a commit is newer, the latest harness review is clean, or there is none."""
+
+    def setUp(self):
+        super().setUp()
+        self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}}})
+        write(self.state_path("tickets", "12.json"),
+              json.dumps({"number": 12, "parent": {"number": 3, "title": "Widgets", "goal": ""}}))
+
+    def land_case(self, name, *flags):
+        reviews, commits, named, not_named = GATE_CASES[name]
+        self.scenario(Land.land_calls(self, reviews=reviews, commits=commits))
+        return self.pr("land", "34", *flags, cwd=self.main), named, not_named
+
+    def branch_exists(self):
+        return Land.branch_exists(self)
+
+    def assertLanded(self, p):
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(["pr", "merge", "34", "-R", "o/r", "--squash", "--delete-branch"], self.gh_argv())
+        self.assertFalse(os.path.exists(self.wt))
+        self.assertIn(["close", "12", "--repo", self.main], self.stub_calls("harness-board"))
+
+    def test_land_refuses_unaddressed_findings_of_the_latest_harness_review(self):
+        refused = [name for name, case in GATE_CASES.items() if case[2] is not None]
+        self.assertGreaterEqual(len(refused), 5)
+        for name in refused:
+            with self.subTest(name):
+                p, named, not_named = self.land_case(name)
+                self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertFalse([a for a in self.gh_argv() if a[:2] == ["pr", "merge"]], self.gh_argv())
+                self.assertEqual(self.stub_calls("harness-board"), [])
+                self.assertFalse(any("worktree remove" in line or "branch -D" in line for line in self.order()))
+                self.assertTrue(os.path.isdir(self.wt))
+                self.assertTrue(self.branch_exists())
+                self.assertNamesFindings(p, named, not_named)
+
+    # Each proceed case first runs its refused twin (the same PR but for the one fact that decides), so the pair
+    # shows that fact is what lets the land through.
+    def assertTwins(self, refused, proceeds):
+        p, _, _ = self.land_case(refused)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse([a for a in self.gh_argv() if a[:2] == ["pr", "merge"]], self.gh_argv())
+        p, _, _ = self.land_case(proceeds)
+        self.assertLanded(p)
+
+    def test_land_proceeds_when_a_commit_is_newer_than_the_findings(self):
+        self.assertTwins("findings and no commit since", "a commit after the findings")
+
+    def test_land_proceeds_when_the_latest_harness_review_is_clean(self):
+        self.assertTwins("an older clean review, the latest with findings (listed newest first)",
+                         "an older review with findings, the latest clean")
+
+    def test_land_proceeds_without_a_harness_review(self):
+        self.assertTwins("the owner reviewed after the harness findings", "no harness review, only the owner's")
+
+    def test_accept_findings_overrides_the_refusal(self):
+        p, _, _ = self.land_case("two reviews with findings, a commit between them")
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)            # refused without the flag
+        p, _, _ = self.land_case("two reviews with findings, a commit between them", "--accept-findings")
+        self.assertLanded(p)
 
 
 if __name__ == "__main__":
