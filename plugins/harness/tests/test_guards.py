@@ -1165,10 +1165,19 @@ class TestsFirstTests(GuardTestCase):
         self.commit_test_under_src()
         self.cache()
         self.red()
+        # a directory that holds source stays refused to the author, as it is today
+        source_dirs = [c for c in BULK_GIT_FORMS if c.endswith(" src")]
+        self.assertEqual(len(source_dirs), 3)
         for agent in ("harness:test-author", "test-author"):
             for command in BULK_GIT_FORMS:
                 with self.subTest(command=command, agent=agent):
-                    self.assertIsNone(self.bash(command, agent))
+                    reason = self.bash(command, agent)
+                    if command in source_dirs:
+                        self.assertEqual(
+                            reason, f'Refused "{command}": {AUTHOR_ON_SOURCE}'
+                        )
+                    else:
+                        self.assertIsNone(reason)
 
     def test_bulk_git_forms_follow_the_directory(self):
         self.commit_test_under_src()
