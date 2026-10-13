@@ -7,11 +7,13 @@ canonicalised through the file system (the on-disk spelling). A repository reach
 spelling of its path on a case-insensitive file system (macOS) gets the same key, and state written under
 the old spelling-based key is moved once to the canonical key.
 
-Every test builds, with real git under a temporary folder, a bare `origin`, a main checkout at <tmp>/Proj
-pushed to it, and the branch t/12-fix-login in a linked worktree at <tmp>/Proj/.claude/worktrees/. Git
-reports the main tree in the spelling the worktree's `.git` file names, so rewriting that file with
-<tmp>/pROJ gives a worktree whose `git rev-parse --git-common-dir` is the non-canonical spelling: the way
-a second spelling reaches every tool and hook. HOME is temporary. `fakebin`, first on PATH and written
+Every test builds, with real git under a temporary folder, a bare `origin`, a main checkout at <tmp>/<name>
+pushed to it, and the branch t/12-fix-login in a linked worktree at <tmp>/<name>/.claude/worktrees/. The
+name is new each run and mixed case ("Rk" + 6 upper hex + "q"), or all lowercase in the *LowercaseOnDisk
+variants, so no fixed table of names can stand in for asking the file system. Git reports the main tree in
+the spelling the worktree's `.git` file names, so rewriting that file with every component below the system
+temp root case-swapped gives a worktree whose `git rev-parse --git-common-dir` is a non-canonical spelling:
+the way a second spelling reaches every tool and hook. HOME is temporary. `fakebin`, first on PATH and written
 once for the module, holds gh (fakegh.py), claude (answers ultrareview and `agents --json`), silent
 terminal-notifier and osascript, and python3.
 
@@ -32,6 +34,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from importlib.machinery import SourceFileLoader
 
 sys.dont_write_bytecode = True      # importing the bin scripts must not leave a __pycache__ in bin/
@@ -66,6 +69,26 @@ def spelled(path, depth=1):
         head, tail = os.path.split(head)
         parts.insert(0, swap(tail))
     return os.path.join(head, *parts)
+
+
+TEMP_ROOT = os.path.realpath(tempfile.gettempdir())
+
+
+def spelled_below(path, base=TEMP_ROOT):
+    """`path` with the case of every component below `base` swapped (the fixture's own folders included)."""
+    rel = os.path.relpath(path, base)
+    assert not rel.startswith(os.pardir), (path, base)
+    return os.path.join(base, *[swap(part) for part in rel.split(os.sep)])
+
+
+def mixed_name(prefix):
+    """A directory name new each run, in mixed case: prefix + 6 upper hex digits + "q"."""
+    return prefix + uuid.uuid4().hex[:6].upper() + "q"
+
+
+def lower_name(prefix):
+    """A directory name new each run, all lowercase on disk."""
+    return prefix.lower() + uuid.uuid4().hex[:6] + "q"
 
 
 def on_disk(path):
@@ -153,6 +176,9 @@ def tearDownModule():
 @unittest.skipUnless(GIT, "git is not installed")
 class KeyFixture(unittest.TestCase):
 
+    def main_name(self):
+        return mixed_name("Rk")
+
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="KeyTest-", dir=W["root"]))
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -172,7 +198,7 @@ class KeyFixture(unittest.TestCase):
         self.env = env
 
         origin = os.path.join(self.tmp, "origin.git")
-        self.main = os.path.join(self.tmp, "Proj")                # the on-disk spelling
+        self.main = os.path.join(self.tmp, self.main_name())      # the on-disk spelling
         self.git(self.tmp, "init", "--bare", "-q", origin)
         self.git(self.tmp, "clone", "-q", origin, self.main)
         self.git(self.main, "symbolic-ref", "HEAD", "refs/heads/main")
@@ -199,8 +225,9 @@ class KeyFixture(unittest.TestCase):
                                *args], env=self.env, capture_output=True, text=True, check=True).stdout.strip()
 
     def spell_worktree(self):
-        """Point the worktree's .git file at <tmp>/pROJ; return that spelling of the main tree."""
-        other = spelled(self.main)
+        """Point the worktree's .git file at the main tree with every component below the system temp root
+        case-swapped; return that spelling of the main tree."""
+        other = spelled_below(self.main)
         dotgit = os.path.join(self.wt, ".git")
         with open(dotgit, encoding="utf-8") as fh:
             text = fh.read()
@@ -318,7 +345,7 @@ class CanonicalSpellingKeepsItsKey(KeyFixture):
         self.assertIsNone(self.edit_decision(os.path.join(self.wt, "src", "app.py")))
 
     def test_two_checkouts_keep_two_keys(self):
-        other = os.path.join(self.tmp, "Other")
+        other = os.path.join(self.tmp, mixed_name("Ot"))
         self.git(self.tmp, "clone", "-q", os.path.join(self.tmp, "origin.git"), other)
         self.put_ticket(self.canon, attempts=[])
         self.put_ticket(os.path.join(self.repos, sha12(other)), attempts=[])
@@ -330,7 +357,8 @@ class CanonicalSpellingKeepsItsKey(KeyFixture):
 # ================================================================ another spelling, one key
 @needs_case_insensitive
 class OtherSpellingOneKey(KeyFixture):
-    """The worktree's git names the main tree as <tmp>/pROJ; every tool and hook still uses sha1(<tmp>/Proj)."""
+    """The worktree's git names the main tree in another spelling; every tool and hook still uses sha1 of the
+    on-disk spelling."""
 
     def setUp(self):
         super().setUp()
@@ -385,10 +413,10 @@ class OtherSpellingOneKey(KeyFixture):
 
 @needs_case_insensitive
 class MainCheckoutOtherSpelling(KeyFixture):
-    """The main checkout itself reached as <tmp>/pROJ (cwd, --repo, CLAUDE_PROJECT_DIR)."""
+    """The main checkout itself reached in another spelling (cwd, --repo, CLAUDE_PROJECT_DIR)."""
 
     def test_tools_and_brief_from_the_other_spelling_use_the_canonical_key(self):
-        other = spelled(self.main)
+        other = spelled_below(self.main)
         self.git(self.main, "switch", "-q", "-c", "t/13-main-ticket")
         self.put_ticket(self.canon, number=13, title="Main ticket")
         self.ok("harness-work", "attempt", "13", "code", "fail", cwd=other)
@@ -407,7 +435,10 @@ class Migration(KeyFixture):
     def setUp(self):
         super().setUp()
         self.spell_worktree()
-        self.unrelated = os.path.join(self.repos, sha12(os.path.join(self.tmp, "Elsewhere")))
+        # another repository on disk, its state under the key of another spelling: not ours to move
+        elsewhere = os.path.join(self.tmp, mixed_name("El"))
+        os.makedirs(elsewhere)
+        self.unrelated = os.path.join(self.repos, sha12(spelled_below(elsewhere)))
         self.put_ticket(self.unrelated, title="Not ours")
 
     def assertMoved(self):
@@ -500,6 +531,32 @@ class Migration(KeyFixture):
         self.assertEqual(read_json(os.path.join(self.old, "red", SLUG + ".json"))["kind"], "assertion")
 
 
+# ================================================================ the same, with a lowercase name on disk
+class CanonicalSpellingKeepsItsKeyLowercaseOnDisk(CanonicalSpellingKeepsItsKey):
+    """Runs on every file system: a checkout whose on-disk name is lowercase keeps sha1 of that spelling."""
+
+    def main_name(self):
+        return lower_name("rk")
+
+    def test_the_lowercase_name_is_what_git_and_the_parent_list(self):
+        self.assertTrue(on_disk(self.main))
+        self.assertEqual(self.git(self.wt, "rev-parse", "--git-common-dir"), os.path.join(self.main, ".git"))
+
+
+class OtherSpellingOneKeyLowercaseOnDisk(OtherSpellingOneKey):
+    """A lowercase checkout reached through an uppercase spelling still keys by the lowercase on-disk name."""
+
+    def main_name(self):
+        return lower_name("rk")
+
+
+class MigrationLowercaseOnDisk(Migration):
+    """Old state under the uppercase spelling's key moves to the lowercase on-disk name's key."""
+
+    def main_name(self):
+        return lower_name("rk")
+
+
 # ================================================================ harness-digest and harness-standup
 class RegisteredPathKey(unittest.TestCase):
     """repo_key(path) in harness-digest and harness-standup, which map run files to registered projects."""
@@ -511,10 +568,12 @@ class RegisteredPathKey(unittest.TestCase):
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="KeyFn-", dir=W["root"]))
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.proj = os.path.join(self.tmp, "Outer", "Proj")
-        self.other = os.path.join(self.tmp, "Outer", "Other")
-        os.makedirs(self.proj)
-        os.makedirs(self.other)
+        self.outer = os.path.join(self.tmp, mixed_name("Ou"))
+        self.proj = os.path.join(self.outer, mixed_name("Rk"))
+        self.other = os.path.join(self.outer, mixed_name("Ot"))
+        self.lower = os.path.join(self.tmp, lower_name("ou"), lower_name("rk"))     # lowercase on disk
+        for path in (self.proj, self.other, self.lower):
+            os.makedirs(path)
 
     def test_on_disk_spelling_symlink_and_missing_path_keep_sha1_of_the_real_path(self):
         link = os.path.join(self.tmp, "link")
@@ -522,7 +581,8 @@ class RegisteredPathKey(unittest.TestCase):
         missing = os.path.join(self.tmp, "Gone", "Away")
         for name, mod in self.tools.items():
             for given, expected in ((self.proj, self.proj), (self.other, self.other), (link, self.proj),
-                                    (missing, missing), (self.proj + os.sep, self.proj)):
+                                    (missing, missing), (self.proj + os.sep, self.proj),
+                                    (self.lower, self.lower), (self.lower + os.sep, self.lower)):
                 with self.subTest(tool=name, path=given):
                     self.assertEqual(mod.repo_key(given), sha12(expected))
 
@@ -530,12 +590,24 @@ class RegisteredPathKey(unittest.TestCase):
     def test_every_spelling_of_a_path_gives_its_canonical_key(self):
         link = os.path.join(self.tmp, "Link")
         os.symlink(self.proj, link)
+        outer, proj, other = (os.path.basename(p) for p in (self.outer, self.proj, self.other))
+        lower_outer, lower_proj = self.lower.split(os.sep)[-2:]
         cases = [(p, self.proj) for p in (spelled(self.proj), spelled(self.proj, 2),
-                                          os.path.join(self.tmp, "oUTER", "Proj"),
-                                          os.path.join(self.tmp, "OUTER", "PROJ"),
-                                          os.path.join(self.tmp, "outer", "proj"),
-                                          spelled(link))]
-        cases += [(p, self.other) for p in (spelled(self.other), os.path.join(self.tmp, "outer", "OTHER"))]
+                                          os.path.join(self.tmp, swap(outer), proj),
+                                          os.path.join(self.tmp, outer.upper(), proj.upper()),
+                                          os.path.join(self.tmp, outer.lower(), proj.lower()),
+                                          spelled(link), spelled_below(self.proj))]
+        cases += [(p, self.other) for p in (spelled(self.other), spelled_below(self.other),
+                                            os.path.join(self.tmp, outer.lower(), other.upper()))]
+        cases += [(p, self.lower) for p in (spelled(self.lower), spelled(self.lower, 2), spelled_below(self.lower),
+                                            os.path.join(self.tmp, lower_outer.upper(), lower_proj))]
+        # every component swapped, the system folders too, where this file system resolves that spelling
+        for path in (self.proj, self.lower):
+            everything = path.swapcase()
+            if os.path.exists(everything) and os.path.samefile(everything, path):
+                cases.append((everything, path))
+        for given, _ in cases:
+            self.assertFalse(on_disk(given), given)                  # each case really is another spelling
         for name, mod in self.tools.items():
             for given, canonical in cases:
                 with self.subTest(tool=name, path=given):
@@ -546,15 +618,15 @@ class RegisteredPathKey(unittest.TestCase):
 @needs_case_insensitive
 @unittest.skipUnless(GIT, "git is not installed")
 class RunsOfAProjectRegisteredInAnotherSpelling(unittest.TestCase):
-    """A run file named by the tools' (canonical) key belongs to the project registered as <tmp>/pROJ."""
+    """A run file named by the tools' (canonical) key belongs to the project registered in another spelling."""
 
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="KeyRuns-", dir=W["root"]))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home = os.path.join(self.tmp, "home")
         self.state = os.path.join(self.home, ".claude", "harness")
-        self.proj = os.path.join(self.tmp, "Proj")
-        self.other = os.path.join(self.tmp, "Other")
+        self.proj = os.path.join(self.tmp, mixed_name("Ws"))
+        self.other = os.path.join(self.tmp, lower_name("ot"))          # lowercase on disk, registered otherwise
         os.makedirs(self.other)
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("HARNESS_", "GIT_", "CLAUDE_", "FAKEGH_")) and k != "PYTHONPATH"}
@@ -573,8 +645,8 @@ class RunsOfAProjectRegisteredInAnotherSpelling(unittest.TestCase):
         subprocess.run([GIT, "-C", self.proj, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"],
                        env=env, check=True, capture_output=True)
         write(os.path.join(self.state, "projects.json"), json.dumps({"version": 1, "projects": [
-            {"path": spelled(self.proj), "name": "Widget Shop", "billable": False, "client": "", "notes": ""},
-            {"path": spelled(self.other), "name": "Other Shop", "billable": False, "client": "", "notes": ""}]}))
+            {"path": spelled_below(self.proj), "name": "Widget Shop", "billable": False, "client": "", "notes": ""},
+            {"path": spelled_below(self.other), "name": "Other Shop", "billable": False, "client": "", "notes": ""}]}))
         # what harness-work writes: id and file named by the key, repo the main tree as git reports it
         for path, ticket, extra in ((self.proj, 12, {"repo": self.proj}), (self.other, 5, {})):
             k = sha12(path)
