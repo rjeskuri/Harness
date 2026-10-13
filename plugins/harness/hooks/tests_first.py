@@ -22,11 +22,21 @@ that the role rules also apply in the test-breaker's scratch worktree
 Bash: branch_guard.py's walker splits the command and follows its directory (cd, pushd,
 subshells, git -C); every path a part writes (a redirection, tee, cp, mv, install, ln,
 rsync, dd, rm, touch, truncate, chmod, sed/perl/awk in place, ed, patch with a named
-file, git checkout or restore of paths, git rm, git mv) is judged as an Edit of that
-path, except that an untracked path git ignores (a cache, build output, a log) passes
-unless it is test configuration. For the test-author, the coder and the test-breaker on
-a ticket branch, an inline python or node program (-c, -e or a heredoc) that writes
-files is refused, since its paths cannot be seen.
+file or -o, read inside its -d directory, git checkout or restore of paths, git rm,
+git mv, git stash push and git clean of paths) is judged as an Edit of that path, except
+that an untracked path git ignores (a cache, build output, a log) passes unless it is
+test configuration. A git form that rewrites the working tree wholesale (checkout or
+restore of a directory, a glob or pathspec magic, reset --hard or --merge, stash push,
+pop, apply, drop and the others but list, show, create and store, and clean, unless
+stash push or clean name only files) touches every test file of its worktree: each of
+them (git ls-files, tracked or untracked and not ignored) and each piece of test
+configuration goes through the role rules, so the coder and the test-breaker are
+refused and the test-author is not; a worktree without either passes. For the
+test-author, the coder and the test-breaker on a ticket branch, writes whose paths
+cannot be seen are refused: an inline python or node program (-c, -e or a heredoc) that
+writes files, patch without a file argument or -o (the diff names the files), and find
+with -delete or an -exec, -execdir, -ok or -okdir command that writes files (as the
+walker judges a part), runs git on paths, or is a shell or an interpreter.
 
 <key> is the first 12 hex digits of the sha1 of the real path of the main working tree,
 so a linked worktree shares its main checkout's state. HARNESS_TEST_PATTERNS and
@@ -94,6 +104,14 @@ CODER_ON_CONFIG = (
     "tests. If it has to change, stop and ask the orchestrator."
 )
 CHANGED = "Tests changed since the red run; run harness-red check again."
+# git stash subcommands that leave the working tree alone.
+STASH_READS = {"list", "show", "create", "store"}
+# find's primaries that run a command for each file, and its options before the paths.
+FIND_EXEC = {"-exec", "-execdir", "-ok", "-okdir"}
+FIND_OPTIONS = {"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"}
+# Interpreters, besides the shells, python and node: run by find -exec, they count as
+# writers, since what their program writes cannot be seen.
+INTERPRETERS = {"perl", "ruby", "php", "awk", "gawk", "lua", "Rscript", "osascript"}
 INLINE = "Write files with Edit or Write so the tests-first rules can see the path."
 
 
@@ -387,6 +405,136 @@ def branch_guard():
     return guard
 
 
+def wide(guard, path: str, where: str | None) -> bool:
+    """True for a pathspec that reaches files it does not name: a directory (on disk,
+    relative to `where`), a glob or pathspec magic."""
+    if path.startswith(":") or any(c in path for c in "*?["):
+        return True
+    full = guard.absolute(path, where)
+    return full is not None and os.path.isdir(full)
+
+
+def bulk_form(guard, sub: str, rest: list[str], where: str | None) -> bool:
+    """True when git `sub` `rest` rewrites the working tree wholesale: checkout or
+    restore of a directory, reset --hard or --merge, stash (push, pop, apply, drop and
+    the rest that change files) and clean, unless they name only files."""
+    if sub == "reset":
+        return bool({"--hard", "--merge"} & set(rest))
+    if sub == "stash" and guard.stash_action(rest) != "push":
+        return guard.stash_action(rest) not in STASH_READS
+    if sub == "clean" and guard.dry_run(rest):
+        return False
+    paths = guard.git_paths(sub, rest, where)
+    if sub in ("stash", "clean") and not paths:
+        return True
+    return any(wide(guard, p, where) for p in paths)
+
+
+def bulk_refusal(directory: str | None, role: str, cache: dict) -> str | None:
+    """Why `role` may not rewrite every file of the worktree at `directory`: the role
+    rules for each of its test files (tracked, or untracked and not ignored) and its
+    test configuration. None off the guarded branches or without such files."""
+    if role not in ROLES or directory is None:
+        return None
+    facts = facts_at(directory, cache)
+    if guarded(facts) is None:
+        return None
+    top = str(facts["top"])
+    out = git(top, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    file_env = classification_env(facts["main"])
+    found = None
+    for rel in sorted(set(out.stdout.split("\0")) - {""}):
+        kind = role_kind(rel, classify(rel, file_env))
+        if kind not in ("test", "config"):
+            continue
+        why = role_refusal(role, kind, rel)
+        if why and kind == "test":
+            return why
+        found = found or why
+    return found
+
+
+def find_roots(args: list[str]) -> list[str]:
+    """The starting points `find args` searches: the words before the expression."""
+    roots, k = [], 0
+    while k < len(args) and (args[k] in FIND_OPTIONS or args[k].startswith(("-O", "-D"))):
+        k += 2 if args[k] == "-D" else 1  # -D takes a value, -O3 does not
+    for a in args[k:]:
+        if a.startswith("-") or a in ("(", "!"):
+            break
+        roots.append(a)
+    return roots or ["."]
+
+
+def exec_writes(guard, words: list[str], cwd: str | None) -> str | None:
+    """Why the command find runs for each file, `words`, writes files, or None: a shell,
+    an interpreter, or a command branch_guard sees writing."""
+    inner = guard.command_words(words)
+    if not inner:
+        return None
+    name, args = os.path.basename(inner[0]), inner[1:]
+    if (
+        name in guard.SHELLS
+        or name == "eval"
+        or guard.PYTHON.match(name)
+        or name in guard.NODES
+        or name in INTERPRETERS
+    ):
+        return f"{name}, which can write any file"
+    part = guard.Part()
+    part.words = words
+    if guard.writes(part, name, args, cwd):
+        return f"{name}, which writes files"
+    if name == "git":
+        where, sub, rest = guard.git_split(args, cwd)
+        if guard.git_paths(sub, rest, where) or bulk_form(guard, sub, rest, where):
+            return f"git {sub}, which writes files"
+    if name == "find":
+        return find_writes(guard, args, cwd)
+    return None
+
+
+def find_writes(guard, args: list[str], cwd: str | None) -> str | None:
+    """Why `find args` writes files whose paths cannot be seen: -delete, or an -exec,
+    -execdir, -ok or -okdir whose command (up to ; or a + after {}) writes files."""
+    k = 0
+    while k < len(args):
+        a = args[k]
+        k += 1
+        if a == "-delete":
+            return "find -delete removes the files it finds"
+        if a not in FIND_EXEC:
+            continue
+        words: list[str] = []
+        while k < len(args):
+            w = args[k]
+            k += 1
+            if w == ";" or (w == "+" and words[-1:] == ["{}"]):
+                break
+            words.append(w)
+        why = exec_writes(guard, words, cwd)
+        if why:
+            return f"find {a} runs {why}"
+    return None
+
+
+def unseen_writes(guard, part, name: str, args: list[str], here: str | None):
+    """(why, the directories it writes in) when `part` writes files whose paths cannot
+    be seen: an inline program, patch taking the files from its diff, find -exec;
+    (None, []) otherwise."""
+    if name == "patch":
+        found = guard.writes(part, name, args, here)
+        dirs = [p for _, p, _, exact in found if not exact and p is not None]
+        if dirs:
+            return [why for _, _, why, exact in found if not exact][0], dirs
+    if name == "find":
+        why = find_writes(guard, args, here)
+        if why:
+            roots = [guard.absolute(r, here) for r in find_roots(args)]
+            return why, [r for r in roots if r is not None]
+    return guard.code_writes(name, args, part), []
+
+
 def check_bash(command: str, cwd: str, role: str) -> None:
     guard = branch_guard()
     state = {"cwd": cwd, "repos": {}}
@@ -394,10 +542,12 @@ def check_bash(command: str, cwd: str, role: str) -> None:
     for part, name, args in guard.walk(state, command):
         here = state["cwd"]
         paths = [p for _, p, _, exact in guard.writes(part, name, args, here) if exact]
+        bulk, where = False, here
         if name == "git":
             where, sub, rest = guard.git_split(args, here)
             for p in guard.git_paths(sub, rest, where):
                 paths.append(guard.absolute(p, where))
+            bulk = bulk_form(guard, sub, rest, where)
         for path in paths:
             if path is None:
                 continue
@@ -405,9 +555,17 @@ def check_bash(command: str, cwd: str, role: str) -> None:
             if why:
                 deny(f'Refused "{guard.shown(part.text)}": {why}')
                 return
-        if role in ROLES and here is not None and os.path.isdir(here):
-            why = guard.code_writes(name, args, part)
-            if why and guarded(facts_at(here, cache)) is not None:
+        if bulk:
+            why = bulk_refusal(where, role, cache)
+            if why:
+                deny(f'Refused "{guard.shown(part.text)}": {why}')
+                return
+        if role in ROLES:
+            why, dirs = unseen_writes(guard, part, name, args, here)
+            places = [existing_dir(d) for d in dirs]
+            if here is not None and os.path.isdir(here):
+                places.append(here)
+            if why and any(guarded(facts_at(p, cache)) is not None for p in places):
                 deny(f'Refused "{guard.shown(part.text)}": {why}. {INLINE}')
                 return
 
