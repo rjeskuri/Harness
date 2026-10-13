@@ -954,7 +954,7 @@ def run_state(record, agents):
 def of_repo(record, repo):
     """By the repo field in any spelling of the main tree (runs before the canonical key), else by the id."""
     field = record.get("repo")
-    return (field == repo.main or (isinstance(field, str) and canonical_path(field) == repo.main)
+    return (field == repo.main or (isinstance(field, str) and field != "" and canonical_path(field) == repo.main)
             or str(record.get("id", "")).startswith(repo.key + "-"))
 
 
@@ -1041,9 +1041,11 @@ def ask_without_pr(repo, n, branch):
     return None if prs else issue
 
 
-def redispatch_candidates(repo, records, live):
+def redispatch_candidates(repo, records, live, *, capped_only=False):
     """In-progress tickets whose last run ended (within the window) without a pull request: dispatched again,
-    unless REDISPATCH_MAX runs of the ticket ended within the window. (candidates, skipped)."""
+    unless REDISPATCH_MAX runs of the ticket ended within the window. (candidates, skipped, the id of the record
+    each skipped ticket's cap rests on: its latest started). `capped_only` skips the gh check for tickets under
+    the cap, whose answer the caller would discard."""
     cutoff = now() - REDISPATCH_WINDOW
     latest, ended_runs = {}, {}
     for record in records:
@@ -1055,10 +1057,12 @@ def redispatch_candidates(repo, records, live):
         ended = parse_iso(record.get("ended_at"))
         if ended is not None and ended >= cutoff:
             ended_runs[n] = ended_runs.get(n, 0) + 1
-    out, skipped = [], []
+    out, skipped, capped_ids = [], [], {}
     for n, record in sorted(latest.items()):
         ended = parse_iso(record.get("ended_at"))
         if n in live or ended is None or ended < cutoff:
+            continue
+        if capped_only and ended_runs.get(n, 0) < REDISPATCH_MAX:
             continue
         try:
             issue = without_pr(repo, n, record.get("branch"))
@@ -1069,13 +1073,24 @@ def redispatch_candidates(repo, records, live):
             continue
         again = record.get("outcome") or "ended"
         if ended_runs.get(n, 0) >= REDISPATCH_MAX:
-            skipped.append({"number": n, "why": f"{ended_runs[n]} runs ended without a pull request in "
-                                                f"{REDISPATCH_WINDOW.days} days, the last {again}; run "
-                                                f"/harness:work {n} by hand, or harness-board status {n} ready "
-                                                "to dispatch it again"})
+            days = REDISPATCH_WINDOW.days
+            skipped.append({"number": n, "why": f"{ended_runs[n]} runs ended without a pull request in {days} days "
+                                                f"(last: {again} at {record.get('ended_at')}); run it in this "
+                                                f"session with /harness:work {n}, or wait for the window",
+                            "runs": ended_runs[n], "window_days": days, "advice": f"/harness:work {n}"})
+            capped_ids[n] = record.get("id")
             continue
         out.append({"number": n, "title": issue.get("title") or "", "tier": None, "again": again})
-    return out, skipped
+    return out, skipped, capped_ids
+
+
+def live_runs(records, agents):
+    """{ticket: its first live record} among `records`."""
+    live = {}
+    for record in records:
+        if isinstance(record.get("ticket"), int) and run_live(record, agents):
+            live.setdefault(record["ticket"], record)
+    return live
 
 
 # --------------------------------------------------------------- commands
@@ -1134,13 +1149,10 @@ def cmd_dispatch(repo, args):
     venue = args.venue or ("bg" if api_until else "headless")
     if args.venue == "headless" and api_until:
         warn(f"the api budget is exhausted until {iso(api_until)}; launching headless anyway (--venue headless)")
-    live = {}
-    for record in mine:
-        if isinstance(record.get("ticket"), int) and run_live(record, agents):
-            live.setdefault(record["ticket"], record)
+    live = live_runs(mine, agents)
     ready = board_json(repo, "ready", "--json")
     ready = [r for r in ready if isinstance(r, dict)] if isinstance(ready, list) else []
-    again, capped = redispatch_candidates(repo, mine, live)
+    again, capped, _ = redispatch_candidates(repo, mine, live)
     candidates, seen = [], set()
     for row in again + ready:
         n = row.get("number")
@@ -1218,11 +1230,20 @@ def cmd_runs(args):
     if args.sweep:
         sweep(records, agents)
     cutoff = now() - RECENT
+    try:                    # the tickets dispatch would skip for the cap, in the repository of the cwd
+        repo = open_repo(None)
+        mine = [r for r in records if of_repo(r, repo)]
+        capped = set(redispatch_candidates(repo, mine, live_runs(mine, agents), capped_only=True)[2].values())
+    except Problem:         # not in a repository: nothing to mark
+        capped = set()
     shown = []
     for record in records:
         ended = parse_iso(record.get("ended_at"))
         if args.all or not record.get("ended_at") or (ended is not None and ended >= cutoff):
-            shown.append(dict(record, state=run_state(record, agents)))
+            row = dict(record, state=run_state(record, agents))
+            if record.get("id") in capped:
+                row["capped"] = True
+            shown.append(row)
     shown.sort(key=lambda r: str(r.get("started_at")))
     if args.json:
         emit(args, shown, "")
@@ -1232,7 +1253,8 @@ def cmd_runs(args):
         rows = [("RUN", "TICKET", "VENUE", "STATE", "STARTED")]
         for r in shown:
             rows.append((str(r.get("id")), f"{os.path.basename(str(r.get('repo') or ''))} #{r.get('ticket')}",
-                         str(r.get("venue")), r["state"], str(r.get("started_at"))))
+                         str(r.get("venue")), r["state"] + (" capped" if r.get("capped") else ""),
+                         str(r.get("started_at"))))
         print(table(rows))
 
 
