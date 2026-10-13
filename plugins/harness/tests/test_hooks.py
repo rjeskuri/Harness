@@ -1202,7 +1202,12 @@ class VerifyOnStopTests(HookTestCase):
         self.assertEqual(list(result), ["systemMessage"])
         message = result["systemMessage"]
         self.assertTrue(message.startswith(f"verify_on_stop: could not start {cmd}: "))
-        self.assertTrue(message.endswith("harness-no-such-command: command not found"))
+        # The shell's own words: "sh: harness-no-such-command: command not found" from
+        # bash or zsh as sh (macOS), "sh: 1: harness-no-such-command: not found" from dash
+        # (Debian and Ubuntu).
+        last = message[len(f"verify_on_stop: could not start {cmd}: ") :]
+        self.assertIn("harness-no-such-command", last)
+        self.assertTrue(last.endswith("not found"), last)
         self.assertNotIn("\n", message)
         self.assertTrue(self.dirty.exists())
         # Remembered like a failure: the next unchanged turn does not try again.

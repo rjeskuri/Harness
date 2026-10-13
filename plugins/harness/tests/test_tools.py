@@ -26,8 +26,11 @@ from importlib.machinery import SourceFileLoader
 sys.dont_write_bytecode = True      # importing a bin script must not leave a __pycache__ in bin/
 
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")
+FAKEGH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakegh.py")
 GIT = shutil.which("git")
 UTC = dt.timezone.utc
+# What gh says on a GitHub Actions runner without a token (its first line), before it looks at the repo.
+GH_AUTH_ERROR = "gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable. Example:"
 
 
 def load_tool(name):
@@ -286,9 +289,11 @@ def fake_claude(folder, payload, exit_code=0, stderr=""):
 
 
 class Standup(ToolTest):
-    """Built once for the class: alpha, a billable git repo with a handoff, specs, a work log and sessions;
-    beta, not a git repo, with PROGRESS.md and a feature list; gamma, a registered path that is gone.
-    Tests that change the registry or ~/.local/bin use a HOME of their own."""
+    """Built once for the class: alpha, a billable git repo with a handoff, specs, a work log and sessions
+    (its origin a local bare repo); beta, not a git repo, with PROGRESS.md and a feature list; gamma, a
+    registered path that is gone. Tests that change the registry or ~/.local/bin use a HOME of their own.
+    gh is always fakegh.py through HARNESS_GH, failing as on a runner without a token, so the real gh is
+    never reached; the board itself is covered by test_standup_v2.py."""
 
     @classmethod
     def setUpClass(cls):
@@ -357,11 +362,27 @@ class Standup(ToolTest):
             {"pid": 13, "cwd": "/somewhere/else", "kind": "interactive", "name": "other-3", "status": "busy"},
             {"pid": 14, "cwd": a + "-sibling", "sessionId": "abcdef12-3456", "status": "idle"}]   # no name
         fake_claude(cls.world_bin, cls.payload)
+        cls.gh = write_file(os.path.join(cls.world_bin, "gh"), f'#!/bin/sh\nexec "{sys.executable}" "{FAKEGH}" "$@"\n')
+        os.chmod(cls.gh, 0o755)
+        cls.gh_scenario = write_file(os.path.join(root, "gh-scenario.json"), json.dumps(
+            {"default": {"stderr": GH_AUTH_ERROR + "\n  env:\n    GH_TOKEN: ${{ github.token }}\n", "exit": 4}}))
 
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="test-", dir=self.root))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home, self.fakebin, self.ceiling = self.world_home, self.world_bin, self.root
+        self.gh_log = os.path.join(self.tmp, "gh.log")
+
+    def env(self, **extra):
+        fake = dict(HARNESS_GH=self.gh, FAKEGH_SCENARIO=self.gh_scenario, FAKEGH_LOG=self.gh_log)
+        fake.update(extra)
+        return super().env(**fake)
+
+    def gh_calls(self):
+        if not os.path.exists(self.gh_log):
+            return []
+        with open(self.gh_log, encoding="utf-8") as fh:
+            return [json.loads(line)["argv"] for line in fh if line.strip()]
 
     def own_home(self, projects=None):
         """A HOME of this test's own, with a registry of `projects` (none: no registry)."""
@@ -480,6 +501,26 @@ class Standup(ToolTest):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertTrue(p.stdout.startswith("No projects registered"))
         self.assertIn("## Fleet", p.stdout)
+
+    def test_no_board_without_a_github_origin(self):
+        """Only an origin on github.com reads the board: an origin that is a local path or on another host never
+        runs gh, though gh would fail; the same failing gh on a github.com origin is said in the board line."""
+        elsewhere, hub = self.mk("elsewhere"), self.mk("hub")
+        self.git(elsewhere, "init")
+        self.git(elsewhere, "remote", "add", "origin", "https://gitlab.com/o/elsewhere.git")
+        self.git(hub, "init")
+        self.git(hub, "remote", "add", "origin", "https://github.com/o/hub.git")
+        projects = [{"path": path, "name": name, "billable": False, "client": "", "notes": ""}
+                    for name, path in (("alpha", self.alpha), ("elsewhere", elsewhere), ("hub", hub))]
+        p = self.run_tool("harness-standup", env=self.env(HOME=self.own_home(projects)))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        s = self.sections(p.stdout)
+        for name, path in (("alpha", self.alpha), ("elsewhere", elsewhere)):
+            self.assertEqual([line for line in s[f"## {name} `{path}`"] if "Board" in line], [])
+        self.assertIn(f"- Board: could not read it (gh issue list failed: {GH_AUTH_ERROR})", s[f"## hub `{hub}`"])
+        calls = self.gh_calls()
+        self.assertTrue(calls)
+        self.assertEqual([argv for argv in calls if argv[-2:] != ["-R", "o/hub"]], [])     # hub's calls only
 
     def test_next_step_sources(self):
         tool = load_tool("harness-standup")
