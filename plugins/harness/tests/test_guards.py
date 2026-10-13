@@ -832,6 +832,173 @@ class BranchGuardBashTests(GuardTestCase):
                 self.assertIsNone(self.bash(command))
 
 
+TEMP_ROOT = os.path.realpath(tempfile.gettempdir())
+
+
+def swapped_below(path: Path, base: str = TEMP_ROOT) -> Path:
+    """`path` with the case of every component below `base` swapped (the fixture's own folders too)."""
+    rel = os.path.relpath(str(path), base)
+    assert not rel.startswith(os.pardir), (path, base)
+    return Path(base, *[part.swapcase() for part in rel.split(os.sep)])
+
+
+def listed(path: Path) -> bool:
+    """True when every component of the absolute `path` is spelled as its parent lists it."""
+    parent = os.sep
+    for part in str(path).strip(os.sep).split(os.sep):
+        try:
+            if part not in os.listdir(parent):
+                return False
+        except OSError:
+            return False
+        parent = os.path.join(parent, part)
+    return True
+
+
+class BranchGuardOtherSpellingTests(GuardTestCase):
+    """The main checkout on main, reached through another spelling of its path on a case-insensitive file
+    system (macOS): branch_guard decides exactly as for the on-disk spelling. git reports the top-level and
+    the absolute git dir in the on-disk spelling but --git-common-dir relative to the spelled directory, so
+    a guard that compares the two by realpath misreads the main checkout as a linked worktree; one that
+    takes paths relative to the on-disk top-level by realpath finds a spelled path outside the repo."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = self.make_repo()
+        self.write(self.repo / ".gitignore", ".env\n")
+        self.git(self.repo, "add", ".gitignore")
+        self.git(self.repo, "commit", "-q", "-m", "Ignore .env")
+        self.outside = self.tmp / "outside"
+        self.outside.mkdir()
+        self.nested = self.repo / ".claude/worktrees/t-13-nested"
+        self.git(self.repo, "worktree", "add", "-q", "-b", "t/13-nested", str(self.nested))
+        spellings = [self.tmp / "PROJ", self.tmp / "Proj", swapped_below(self.repo)]
+        lowered = Path(str(self.repo).lower())  # the whole path lowercased, as in the live finding
+        if str(lowered) != str(self.repo) and lowered.exists() and os.path.samefile(lowered, self.repo):
+            spellings.append(lowered)  # only when the temp root really has upper case to lose
+        if not (spellings[0].exists() and os.path.samefile(spellings[0], self.repo)):
+            self.skipTest("two spellings of one path need a case-insensitive file system")
+        for spelled in spellings:
+            self.assertFalse(listed(spelled), spelled)  # each really is another spelling
+            self.assertTrue(os.path.samefile(spelled, self.repo), spelled)
+        self.spellings = spellings
+        self.expected = f"On main in proj. {ADVICE}"
+
+    def edit(self, path, cwd: Path, tool: str = "Edit") -> str | None:
+        key = "notebook_path" if tool == "NotebookEdit" else "file_path"
+        tool_input = {key: str(path)}
+        if tool == "Edit":
+            tool_input.update(old_string="a", new_string="b", replace_all=False)
+        elif tool == "Write":
+            tool_input["content"] = "x = 1\n"
+        payload = self.payload(tool, tool_input, cwd)
+        return self.decision(self.run_hook("branch_guard.py", payload))
+
+    def bash(self, command: str, cwd: Path) -> str | None:
+        payload = self.payload("Bash", {"command": command, "description": "Run it"}, cwd)
+        return self.decision(self.run_hook("branch_guard.py", payload))
+
+    def refused(self, part: str, why: str) -> str:
+        return f'On main in proj. Refused "{part}": {why}. {ADVICE}'
+
+    # ---- Edit, Write, NotebookEdit
+
+    def test_edits_in_the_main_checkout_are_denied_in_every_spelling(self):
+        self.assertEqual(self.edit(self.repo / "src/app.py", self.repo), self.expected)
+        for spelled in self.spellings:
+            for path, cwd, tool in (
+                (spelled / "src/app.py", spelled, "Edit"),
+                (spelled / "README.md", self.outside, "Edit"),
+                (spelled / "new/deep/mod.py", spelled, "Write"),
+                (spelled / "nb.ipynb", spelled, "NotebookEdit"),
+                ("src/app.py", spelled, "Edit"),  # relative to a spelled cwd
+                (f"../{spelled.name}/README.md", spelled.parent / "outside", "Write"),
+            ):
+                with self.subTest(spelling=str(spelled), path=str(path), tool=tool):
+                    self.assertEqual(self.edit(path, cwd, tool), self.expected)
+
+    def test_edits_under_a_subdirectory_spelled_differently_are_denied(self):
+        for top in [self.repo] + self.spellings:
+            for path, cwd, tool in (
+                (top / "SRC/app.py", top, "Edit"),
+                (top / "Src/app.py", top / "SRC", "Edit"),
+                (top / "TESTS/new_test.py", self.outside, "Write"),
+                (top / "Src/Deep/New.py", top, "Write"),
+            ):
+                with self.subTest(top=str(top), path=str(path)):
+                    self.assertEqual(self.edit(path, cwd, tool), self.expected)
+
+    def test_notes_ignored_files_and_worktrees_stay_allowed_in_every_spelling(self):
+        for spelled in self.spellings:
+            with self.subTest(spelling=str(spelled)):
+                # source is denied in this spelling, while the exceptions keep holding
+                self.assertEqual(self.edit(spelled / "src/app.py", spelled), self.expected)
+                self.assertIsNone(self.edit(spelled / "docs/agent/handoff.md", spelled, "Write"))
+                self.assertIsNone(self.edit(spelled / ".env", spelled, "Write"))
+                nested = spelled / ".claude/worktrees/t-13-nested"
+                self.assertIsNone(self.edit(nested / "src/app.py", nested))
+                self.assertEqual(self.edit(spelled / "docs/design.md", spelled, "Write"), self.expected)
+
+    # ---- Bash
+
+    def test_bash_writes_and_commits_from_a_spelled_cwd_are_refused(self):
+        commands = (
+            ("echo hi > notes.txt", "it writes to notes.txt through a redirection"),
+            ("touch src/new.py", "touch changes src/new.py inside the repo"),
+            ("sed -i '' 's/a/b/' README.md", "sed -i edits files in place"),
+            ("rm -rf src", "rm changes src inside the repo"),
+            ("git commit -m x", "git commit changes main"),
+        )
+        for command, why in commands:  # the on-disk spelling, as a baseline
+            self.assertEqual(self.bash(command, self.repo), self.refused(command, why))
+        for spelled in self.spellings:
+            for command, why in commands:
+                with self.subTest(spelling=str(spelled), command=command):
+                    self.assertEqual(self.bash(command, spelled), self.refused(command, why))
+            with self.subTest(spelling=str(spelled), cwd="SRC"):
+                self.assertEqual(
+                    self.bash("touch new.py", spelled / "SRC"),
+                    self.refused("touch new.py", "touch changes new.py inside the repo"),
+                )
+
+    def test_bash_writes_into_a_spelled_main_checkout_from_elsewhere_are_refused(self):
+        wt = self.worktree(self.repo)
+        for spelled in self.spellings:
+            for command, why, cwd in (
+                (
+                    f"echo hi > {spelled}/src/app.py",
+                    f"it writes to {spelled}/src/app.py through a redirection",
+                    self.outside,
+                ),
+                (f"sed -i '' 's/a/b/' {spelled}/README.md", "sed -i edits files in place", wt),
+                (f"touch {spelled}/Src/new.py", f"touch changes {spelled}/Src/new.py inside the repo", wt),
+                (f"git -C {spelled} commit -m x", "git commit changes main", self.outside),
+            ):
+                with self.subTest(spelling=str(spelled), command=command):
+                    self.assertEqual(self.bash(command, cwd), self.refused(command, why))
+            command = f"cd {spelled}/SRC && echo hi > notes.txt"
+            with self.subTest(spelling=str(spelled), command=command):
+                self.assertEqual(
+                    self.bash(command, self.outside),
+                    self.refused("echo hi > notes.txt", "it writes to notes.txt through a redirection"),
+                )
+
+    def test_bash_writes_into_ticket_worktrees_stay_allowed_in_every_spelling(self):
+        for spelled in self.spellings:
+            nested = spelled / ".claude/worktrees/t-13-nested"
+            with self.subTest(spelling=str(spelled)):
+                # the main checkout itself is refused in this spelling ...
+                self.assertEqual(
+                    self.bash("echo hi > README.md", spelled),
+                    self.refused("echo hi > README.md", "it writes to README.md through a redirection"),
+                )
+                # ... while its ticket worktrees, and places outside it, are judged on their own
+                self.assertIsNone(self.bash(f"echo hi > {nested}/src/app.py", self.outside))
+                self.assertIsNone(self.bash(f"sed -i '' 's/a/b/' {nested}/README.md", spelled))
+                self.assertIsNone(self.bash("echo hi > src/app.py", nested))
+                self.assertIsNone(self.bash(f"git diff > {self.outside}/x.patch", spelled))
+
+
 class ReadonlyPlannerTests(GuardTestCase):
     """readonly_bash.py now keeps the planner read-only too."""
 
