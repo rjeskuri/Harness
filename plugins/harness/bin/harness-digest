@@ -4,8 +4,8 @@ The daily digest: what is waiting on you across the registered projects. For eac
 ~/.claude/harness/projects.json with an `origin` remote: your open pull requests awaiting review,
 tickets labeled status:needs-input (with the first line of the question), tickets in progress for more
 than 3 days without a pull request, and ticket worktrees (.claude/worktrees/) with no commit for 7 days
-and no open pull request. Then exhausted budgets and the runs that failed (billing, auth, error) since
-the previous digest. Writes ~/.claude/harness/digest/<yyyy-mm-dd>.md, prints it, and sends one
+and no open pull request. Then exhausted budgets and the runs that failed (billing, auth, error) or ended
+early (no PR) since the previous digest. Writes ~/.claude/harness/digest/<yyyy-mm-dd>.md, prints it, and sends one
 notification `Harness digest: <p> PRs to review, <q> need input, <s> stale` (none when all three are 0).
 
 Usage:
@@ -39,7 +39,7 @@ IN_PROGRESS_DAYS = 3      # an in-progress ticket older than this without a PR i
 RUNS_WINDOW = 86400       # failed runs since the previous digest, or in this many seconds without one
 WIDTH = 160               # a longer title or question is cut
 NEEDS_INPUT = "**Needs your input**"
-FAILED = ("billing", "auth", "error")
+FAILED = ("billing", "auth", "error", "early")   # early: ended ok, the ticket still in progress with no PR
 LABEL = "com.ryaneskuri.harness-digest"
 DEFAULT_APP = "com.microsoft.VSCode"
 DEFAULT_SOUND = "Glass"
@@ -395,7 +395,7 @@ def run_project(record, filename, projects):
 
 
 def failed_runs(projects, since, now):
-    """Runs whose outcome is billing, auth or error and that ended at or after `since`, newest first."""
+    """Runs whose outcome is billing, auth, error or early and that ended at or after `since`, newest first."""
     out = []
     for name in sorted(glob.glob(os.path.join(glob.escape(harness_home("runs")), "*.json"))):
         record = read_json(name)
@@ -418,11 +418,13 @@ def failed_runs(projects, since, now):
     return [run for _, run in out]
 
 
-def previous_digest(folder):
-    """The newest mtime among the digest files, or None."""
+def previous_digest(folder, today):
+    """The newest mtime among the digest files other than today's (the file this run rewrites, so a second run on
+    the same day keeps the same window), or None."""
     stamps = []
     for name in glob.glob(os.path.join(glob.escape(folder), "*.md")):
-        if DIGEST_NAME.match(os.path.basename(name)):
+        base = os.path.basename(name)
+        if DIGEST_NAME.match(base) and base != f"{today}.md":
             try:
                 stamps.append(os.path.getmtime(name))
             except OSError:
@@ -529,11 +531,11 @@ def digest(now):
     projects = load_projects()
     gh = gh_binary()
     folder = harness_home("digest")
-    previous = previous_digest(folder)
+    date = dt.date.fromtimestamp(now).isoformat()
+    previous = previous_digest(folder, date)
     since = previous if previous is not None else now - RUNS_WINDOW
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(projects)))) as pool:
         read = list(pool.map(lambda p: project_digest(p, gh, now), projects))
-    date = dt.date.fromtimestamp(now).isoformat()
     data = {"date": date, "generated": iso(now), "since": iso(since), "file": os.path.join(folder, f"{date}.md"),
             "registered": bool(projects),
             "projects": [{k: v for k, v in p.items() if k != "skipped"} for p in read if not p["skipped"]],

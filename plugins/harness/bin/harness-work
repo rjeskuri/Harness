@@ -38,8 +38,8 @@ reaches a command line or the environment); bg, the default while the api budget
 
 runs --sweep: closes the records of runs that ended and classifies each (ok, error, billing, auth; a bg run by its
 `claude agents` state). A headless `ok` whose issue is OPEN and still status:in-progress with no pull request of
-its branch in any state ended early: outcome `early`, shown as `ended early (no PR)`. When gh cannot tell, it stays
-`ok` with a warning.
+its branch in any state ended early: outcome `early`, shown as `ended early (no PR)`. When gh cannot tell, or the
+record names no repository, it stays `ok` with a warning. One command asks gh once per ticket and branch.
 
 Siblings (harness-board) are found on PATH, else next to this script. gh is HARNESS_GH when set, else `gh`;
 claude is HARNESS_CLAUDE when set, else `claude`.
@@ -849,6 +849,9 @@ def ended_early(record, repos):
     if not isinstance(n, int):
         return False
     path = str(record.get("repo") or "")
+    if not path:                    # never the cwd's repository: its issue n may be another ticket
+        warn(f"#{n}: cannot check whether its run ended early: the run record names no repository")
+        return False
     try:
         if path not in repos:
             repos[path] = Repo(path)
@@ -930,9 +933,26 @@ def failed(record, why):
     raise Problem(why)
 
 
+WITHOUT_PR = {}     # (main checkout, ticket, branch): the issue, None or the Problem, asked once per command
+
+
 def without_pr(repo, n, branch):
     """The issue of ticket n when it is OPEN and status:in-progress and `branch` has no pull request in any state,
-    else None. A failing gh call raises Problem."""
+    else None. A failing gh call raises Problem. One command asks gh once per ticket and branch: dispatch's sweep
+    and its redispatch share the answer, a failure included."""
+    key = (repo.main, n, branch)
+    if key not in WITHOUT_PR:
+        try:
+            WITHOUT_PR[key] = ask_without_pr(repo, n, branch)
+        except Problem as err:
+            WITHOUT_PR[key] = err
+    found = WITHOUT_PR[key]
+    if isinstance(found, Problem):
+        raise found
+    return found
+
+
+def ask_without_pr(repo, n, branch):
     issue = gh_json(repo, ["issue", "view", str(n), "--json", "number,title,state,labels"])
     if not isinstance(issue, dict) or str(issue.get("state", "")).upper() != "OPEN":
         return None
