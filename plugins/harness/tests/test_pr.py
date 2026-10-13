@@ -17,6 +17,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -579,6 +580,125 @@ class Checks(PrTest):
         self.assertEqual(self.polls(), 6)
 
 
+# =========================================================================== the review gate
+# What `harness-pr ready` and `harness-pr land` read to find the latest harness review and whether a commit came after
+# it, all through the REST API (gh api, with any flags such as --paginate, but these exact endpoint paths):
+#   repos/o/r/pulls/34/reviews                  [{id, user, body, state, submitted_at, commit_id}]
+#   repos/o/r/pulls/34/reviews/<id>/comments    that review's inline comments [{path, line, body, ...}]
+#   repos/o/r/pulls/34/commits                  [{sha, commit: {author: {date}, committer: {date}}}]
+# A harness review is one whose body carries MARKER: `harness-pr review` posts "Harness review (<model>): N findings,
+# h high, m medium, l low." with the findings not on a changed line listed in the body ("- `path:line` [severity]
+# body") and the rest as inline comments ("[severity] body"), or, with no findings, "Harness review: no findings.
+# Checked: ...".
+PULL = "repos/o/r/pulls/34"
+
+
+def at(hour):
+    return f"2026-10-12T{hour:02d}:00:00Z"
+
+
+def harness_review(rid, when, inline=(), body_only=(), model="fable"):
+    """(the review, its inline comments) as `harness-pr review` posts them; a finding: (path, line, severity, body)."""
+    findings = list(inline) + list(body_only)
+    if not findings:
+        body = f"Harness review: no findings. Checked: the diff against the ticket's definition of done\n\n{MARKER}"
+    else:
+        counts = {s: sum(1 for f in findings if f[2] == s) for s in ("high", "medium", "low")}
+        parts = [f"Harness review ({model}): {len(findings)} finding{'s' if len(findings) != 1 else ''}, "
+                 f"{counts['high']} high, {counts['medium']} medium, {counts['low']} low."]
+        if body_only:
+            parts.append("\n".join(["Not on a changed line:"] + [f"- `{p}:{n}` [{s}] {b}" for p, n, s, b in body_only]))
+        parts.append(MARKER)
+        body = "\n\n".join(parts)
+    review = {"id": rid, "user": {"login": "rjeskuri"}, "body": body, "state": "COMMENTED", "submitted_at": when,
+              "commit_id": "c" * 40}
+    comments = [{"id": rid * 100 + i, "pull_request_review_id": rid, "user": {"login": "rjeskuri"}, "path": p,
+                 "line": n, "original_line": n, "side": "RIGHT", "body": f"[{s}] {b}\n\n{MARKER}", "created_at": when}
+                for i, (p, n, s, b) in enumerate(inline)]
+    return review, comments
+
+
+def owner_review(rid, when, body):
+    return {"id": rid, "user": {"login": "pal"}, "body": body, "state": "COMMENTED", "submitted_at": when,
+            "commit_id": "c" * 40}, []
+
+
+def pr_commit(char, when):
+    return {"sha": char * 40, "commit": {"message": f"Commit {char}", "author": {"name": "Test", "date": when},
+                                         "committer": {"name": "Test", "date": when}}}
+
+
+def gate_calls(reviews=(), commits=(), pull=PULL):
+    """fakegh entries for the gate's reads: reviews is a list of (review, comments); `pull` the PR's endpoint."""
+    calls = [{"contains": ["api", f"{pull}/reviews/{r['id']}/comments"], "stdout_json": c} for r, c in reviews]
+    calls.append({"contains": ["api", f"{pull}/reviews"], "stdout_json": [r for r, _ in reviews]})
+    calls.append({"contains": ["api", f"{pull}/commits"], "stdout_json": list(commits)})
+    return calls
+
+
+FROBS = ("widget.py", 2, "high", "Frobs only once on empty input.")
+NOTES = ("docs/notes.md", 3, "low", "Mention the flag in the notes.")
+OLD_NIT = ("widget.py", 9, "low", "Old nit about naming.")
+OFF_BY_ONE = ("lib/frob.py", 41, "medium", "Off by one in the loop bound.")
+README = ("README.md", 1, "high", "Document the new flag.")
+TOKEN = ("src/app.py", 5, "high", "Leaks the token into the log.")
+LIMIT = ("docs/x.md", 7, "medium", "Explain the limit.")
+# name: (reviews, commits, the findings a refusal names or None for proceed, findings it must not name)
+GATE_CASES = {
+    "findings and no commit since": (
+        [harness_review(101, at(10), inline=[FROBS], body_only=[NOTES])], [pr_commit("a", at(9))],
+        [FROBS, NOTES], []),
+    "a commit after the findings": (
+        [harness_review(101, at(10), inline=[FROBS], body_only=[NOTES])],
+        [pr_commit("a", at(9)), pr_commit("b", at(11))],
+        None, []),
+    "an older review with findings, the latest clean": (
+        [harness_review(101, at(10), inline=[OLD_NIT]), harness_review(102, at(12))], [pr_commit("a", at(9))],
+        None, []),
+    "an older clean review, the latest with findings (listed newest first)": (
+        [harness_review(102, at(12), inline=[OFF_BY_ONE]), harness_review(101, at(10))],
+        [pr_commit("a", at(9)), pr_commit("b", at(11))], [OFF_BY_ONE], []),
+    "no harness review, only the owner's": (
+        [owner_review(201, at(12), "Please rename the widget.")], [pr_commit("a", at(9))], None, []),
+    "no review at all": ([], [pr_commit("a", at(9))], None, []),
+    "the owner reviewed after the harness findings": (
+        [harness_review(101, at(10), inline=[TOKEN]), owner_review(201, at(12), "LGTM")], [pr_commit("a", at(9))],
+        [TOKEN], []),
+    "two reviews with findings, a commit between them": (
+        [harness_review(101, at(10), inline=[OLD_NIT]),
+         harness_review(102, at(12), inline=[OFF_BY_ONE], body_only=[README])],
+        [pr_commit("a", at(9)), pr_commit("b", at(11))], [OFF_BY_ONE, README], [OLD_NIT]),
+    "every finding in the review body": (
+        [harness_review(101, at(10), body_only=[LIMIT])], [pr_commit("a", at(9))], [LIMIT], []),
+}
+
+
+GATE_FAILURE_TEXT = "HTTP 502: Bad Gateway (fake)"
+
+
+def gate_failure(entry):
+    return dict(entry, stderr=GATE_FAILURE_TEXT + "\n", exit=1)
+
+
+# Each read the gate makes, failing; placed first in a scenario so it wins over the gate_calls answer.
+GATE_API_FAILURES = {
+    "reviews": gate_failure({"contains": ["api", f"{PULL}/reviews"]}),
+    "review comments": gate_failure({"contains": ["api", f"{PULL}/reviews/101/comments"]}),
+    "commits": gate_failure({"contains": ["api", f"{PULL}/commits"]}),
+}
+GATE_READ_FAILURES = dict(GATE_API_FAILURES, **{"repo view": gate_failure({"match": ["repo", "view"]})})
+
+
+class GateAsserts:
+    def assertNamesFindings(self, p, named, not_named):
+        said = p.stdout + p.stderr
+        for path, line, severity, body in named:
+            self.assertIn(f"{path}:{line}", said)
+            self.assertTrue(severity in said or body[:20] in said, (severity, body, said))
+        for path, line, _s, _b in not_named:
+            self.assertNotIn(f"{path}:{line}", said)
+
+
 # =========================================================================== ready
 class Ready(PrTest):
     def view(self, closing):
@@ -587,12 +707,15 @@ class Ready(PrTest):
                                 "closingIssuesReferences": [{"number": n, "url": f"https://github.com/o/r/issues/{n}"}
                                                             for n in closing]}}
 
+    def scenario(self, calls, default=None):
+        super().scenario(calls + [REPO_VIEW] + gate_calls(commits=[pr_commit("a", at(9))]), default)
+
     def test_ready_marks_the_pr_and_the_closing_ticket_and_notifies(self):
         self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, self.view([12])])
         p = self.ok("ready", "34")
         self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
-        self.assertEqual(self.gh_argv(), [["pr", "ready", "34"],
-                                          ["pr", "view", "34", "--json", "url,title,closingIssuesReferences"]])
+        self.assertEqual([a for a in self.gh_argv() if a[0] not in ("api", "repo")],     # the gate's reads aside
+                         [["pr", "ready", "34"], ["pr", "view", "34", "--json", "url,title,closingIssuesReferences"]])
         self.assertEqual(self.stub_calls("harness-board"), [
             ["status", "12", "in-review", "--comment", f"PR #34 ready for review: {PR_URL}", "--repo", self.main]])
         sent = self.notifications()
@@ -611,6 +734,58 @@ class Ready(PrTest):
         p = self.pr("ready", "34")
         self.assertOneLineError(p, "PR #34 is ready, but", "gh issue edit failed")
         self.assertEqual(len(self.notifications()), 1)
+
+
+class ReadyGate(GateAsserts, PrTest):
+    """`harness-pr ready P` refuses a PR whose latest harness review has findings and no commit after it."""
+
+    def run_case(self, reviews, commits, *flags):
+        self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, Ready.view(self, [12]), REPO_VIEW]
+                      + gate_calls(reviews, commits))
+        if os.path.exists(self.notify_log):
+            os.unlink(self.notify_log)
+        return self.pr("ready", "34", *flags)
+
+    def assertRefused(self, p):
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse([a for a in self.gh_argv() if a[:2] == ["pr", "ready"]], self.gh_argv())   # not marked ready
+        self.assertEqual(self.stub_calls("harness-board"), [])                                      # no status change
+        self.assertEqual(self.notifications(), [])
+
+    def test_ready_follows_the_latest_harness_review_and_the_commits_after_it(self):
+        for name, (reviews, commits, named, not_named) in GATE_CASES.items():
+            with self.subTest(name):
+                p = self.run_case(reviews, commits)
+                if named is None:
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn(["pr", "ready", "34"], self.gh_argv())
+                    self.assertEqual([a[:3] for a in self.stub_calls("harness-board")], [["status", "12", "in-review"]])
+                else:
+                    self.assertRefused(p)
+                    self.assertNamesFindings(p, named, not_named)
+
+    def test_ready_has_no_override(self):
+        reviews, commits, named, _ = GATE_CASES["findings and no commit since"]
+        p = self.run_case(reviews, commits)
+        self.assertRefused(p)
+        self.assertNamesFindings(p, named, [])
+        self.assertRefused(self.run_case(reviews, commits, "--accept-findings"))
+
+    def test_ready_fails_closed_when_a_gate_read_fails(self):
+        # The PR would pass the gate (a commit after the findings), so only the failed read can refuse it.
+        reviews, commits, named, _ = GATE_CASES["a commit after the findings"]
+        self.assertIsNone(named)
+        for what, failing in GATE_READ_FAILURES.items():
+            with self.subTest(what):
+                self.scenario([failing, {"match": ["pr", "ready", "34"], "stdout": ""}, Ready.view(self, [12]),
+                               REPO_VIEW] + gate_calls(reviews, commits))
+                if os.path.exists(self.notify_log):
+                    os.unlink(self.notify_log)
+                p = self.pr("ready", "34")
+                self.assertRefused(p)
+                self.assertIn(GATE_FAILURE_TEXT, p.stderr)
+                self.assertTrue(any(a[:1] == ["api"] or a[:2] == ["repo", "view"] for a in self.gh_argv()))
 
 
 # =========================================================================== comments
@@ -772,17 +947,152 @@ def land_view(**over):
     return view
 
 
+HARNESS_MARK = "<!-- harness -->"     # the last line of every comment harness-board posts
+RESOLUTION = "**Resolution**"
+
+
+def pr_body_text(fx, summary=True, red=True, verify=True):
+    """A PR body as `harness-pr open` renders it from templates/pr_body.md, for the fixture `fx`. A switch off
+    leaves that part out, as a body edited by hand may."""
+    parts = ["Closes #12", ""]
+    if summary:
+        parts += ["## Summary", fx["summary"], ""]
+    parts += ["## Definition of done", *fx["dod"], "",
+              "## Tests", f"- `{fx['test_file']}::test_main`: the main case", "",
+              f"Test files run: `{fx['test_file']}`", ""]
+    if red:
+        parts += [f"Red run before implementation ({fx['red_kind']}, exit {fx['red_exit']}):",
+                  "```", *fx["red_tail"], "```", ""]
+    if verify:
+        parts += ["Verify:", "```", *fx["verify"], "```", ""]
+    parts += ["## Review", fx["review"], "", "## Risks", "None noted."]
+    return "\n".join(parts)
+
+
+def pr_data(fx):
+    """Everything `gh pr view P --json ...` can say about the fixture's PR after the merge (a superset: the
+    fake answers any field list with it). A fixture with a `body` of its own (hand-written) keeps it."""
+    url = f"https://github.com/o/r/pull/{fx['pr']}"
+    body = fx.get("body") or pr_body_text(fx)
+    return {"number": fx["pr"], "title": "Add the widget (#12)", "url": url, "body": body,
+            "files": [{"path": p, "additions": 3 + i, "deletions": i} for i, p in enumerate(fx["files"])],
+            "mergeCommit": {"oid": fx["sha"]}, "headRefName": BRANCH, "baseRefName": "main",
+            "closingIssuesReferences": [{"number": 12}]}
+
+
+FILES_PAGE = 30          # GitHub's page size for GET repos/O/R/pulls/N/files when none is asked for
+
+
+def files_calls(pr, paths):
+    """`gh api repos/o/r/pulls/N/files`, which lists every changed file (`gh pr view --json files` stops at
+    100): GitHub's pages of 30 objects with a `filename`. With --paginate gh prints one JSON array per page,
+    back to back; with --paginate --slurp one array of the pages; without --paginate only the first page. The
+    endpoint is one argv token, `repos/o/r/pulls/N/files` with or without `?per_page=100`."""
+    objects = [{"sha": hashlib.sha1(path.encode()).hexdigest(), "filename": path, "status": "modified",
+                "additions": 3, "deletions": 1, "changes": 4,
+                "blob_url": f"https://github.com/o/r/blob/{SHA}/{path}", "patch": "@@ -1 +1 @@\n-old\n+new"}
+               for path in paths]
+    pages = [objects[i:i + FILES_PAGE] for i in range(0, len(objects), FILES_PAGE)] or [[]]
+    back_to_back = "".join(json.dumps(page, indent=2) for page in pages)
+    calls = []
+    for endpoint in (f"repos/o/r/pulls/{pr}/files", f"repos/o/r/pulls/{pr}/files?per_page=100"):
+        calls += [{"contains": [endpoint, "--paginate", "--slurp"], "stdout": json.dumps(pages)},
+                  {"contains": [endpoint, "--paginate"], "stdout": back_to_back},
+                  {"contains": [endpoint], "stdout": json.dumps(pages[0], indent=2)}]
+    return calls
+
+
+TICKET_12_BODY = ("## Request\nAdd a widget that frobs.\n\n## Definition of done\n- [ ] The widget frobs twice\n\n"
+                  "## Tests that must pass\n- `tests/test_widget.py::test_frob`: frobs twice\n")
+
+# Two landings that differ in every part the Resolution copies: PR, squash sha, summary, files, the checklist,
+# the red-run kind and the verify result. Nothing in one appears in the other.
+FIXTURE_A = {
+    "pr": 34, "sha": SHA,
+    "summary": "The widget frobs twice now, and empty input frobs once.",
+    "files": ["widget.py", "tests/test_widget.py", "docs/widget.md"],
+    "dod": ["- [x] The widget frobs twice", "- [x] The docs mention it"],
+    "red_kind": "assertion", "red_exit": 1,
+    "red_tail": ["E   frob() returned 1, wanted 2", "1 failed in 0.12s"],
+    "verify": ["verify step: lint clean", "Ran 41 tests in 2.315s", "", "OK (skipped=1)"],
+    "test_file": "tests/test_frob_spec.py",          # in the body's Tests section, not among the changed files
+    "review": "2 findings: 0 high, 1 medium, 1 low.",
+}
+FIXTURE_B = {
+    "pr": 57, "sha": "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432",
+    "summary": "Gizmo parsing moves into lib/gizmo with a strict tokenizer.",
+    "files": ["lib/gizmo/__init__.py", "lib/gizmo/tokenizer.py", "bin/gizmo-cli", "tests/test_tokenizer.py",
+              "CHANGELOG.md"],
+    "dod": ["- [x] Tokens round-trip through the parser", "- [ ] The CLI prints a usage line on bad input",
+            "- [x] Changelog entry"],
+    "red_kind": "import", "red_exit": 2,
+    "red_tail": ["ModuleNotFoundError: No module named 'gizmo'"],
+    "verify": ["collected 212 items", "212 passed in 9.80s", "VERIFY PASSED: 212 checks, 0 warnings"],
+    "test_file": "tests/test_gizmo_spec.py",
+    "review": "Harness review (fable): no findings beyond a naming nit.",
+}
+# A harness-pr body edited by hand before the land, as the PR template invites: a Summary of two paragraphs and
+# a bullet list, a checklist item wrapped onto a second line, and a follow-up checkbox under Risks that is not
+# part of the definition of done.
+FIXTURE_C = {
+    "pr": 61, "sha": "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d",
+    "summary": "Parsing moves into lib/gizmo/parser with a strict tokenizer; the CLI keeps its flags.",
+    "summary_lines": ["Parsing moves into lib/gizmo/parser with a strict tokenizer; the CLI keeps its flags.",
+                      "Bad input used to raise a traceback from deep inside the old parser.",
+                      "- `gizmo-cli` now prints a usage line and exits 2 on bad input.",
+                      "- Unterminated strings are rejected instead of read past the end."],
+    "files": ["lib/gizmo/parser.py", "lib/gizmo/errors.py", "bin/gizmo-cli", "tests/test_parser.py"],
+    "dod": ["- [x] Tokens round-trip through the parser", "- [x] The CLI prints a usage line on bad input,",
+            "- [ ] Changelog entry"],
+    "dod_wrapped": "and exits 2 instead of raising",          # the second item's continuation line
+    "red_kind": "import", "red_exit": 2,
+    "red_tail": ["ModuleNotFoundError: No module named 'gizmo.parser'"],
+    "verify": ["collected 230 items", "230 passed in 10.42s", "VERIFY PASSED: 230 checks, 0 warnings"],
+    "test_file": "tests/test_gizmo_spec.py",
+    "review": "Harness review (fable): one low finding, fixed.",
+    "risks": ["Legacy gizmo files parse differently; the nightly import job is the first to see it.",
+              "- [ ] Watch the nightly import after the first run on main"],
+}
+FIXTURE_C["body"] = "\n".join([
+    "Closes #12", "",
+    "## Summary", *FIXTURE_C["summary_lines"][:2], "", *FIXTURE_C["summary_lines"][2:], "",
+    "## Definition of done", FIXTURE_C["dod"][0], FIXTURE_C["dod"][1], "  " + FIXTURE_C["dod_wrapped"],
+    FIXTURE_C["dod"][2], "",
+    "## Tests", f"- `{FIXTURE_C['test_file']}::test_main`: the main case", "",
+    f"Red run before implementation ({FIXTURE_C['red_kind']}, exit {FIXTURE_C['red_exit']}):",
+    "```", *FIXTURE_C["red_tail"], "```", "",
+    "Verify:", "```", *FIXTURE_C["verify"], "```", "",
+    "## Review", FIXTURE_C["review"], "",
+    "## Risks", *FIXTURE_C["risks"], ""])
+# A PR wider than `gh pr view --json files` reaches: 130 changed files, of which the PR view holds the first 100.
+FIXTURE_WIDE = dict(FIXTURE_A, pr=72, sha=hashlib.sha1(b"fixture-wide").hexdigest(),
+                    summary="Every service module logs through the structured logger.",
+                    files=[f"services/svc_{i:03d}/logging.py" for i in range(1, 131)])
+
+
 class Land(WorktreeTest):
-    def land_calls(self, views=None, issue_state="OPEN", comments=()):
+    def land_calls(self, views=None, issue_state="OPEN", comments=(), reviews=(), commits=None):
+        """The land conversation: the review gate's reads first (no harness review by default, so the gate
+        passes), then the land; the last entries answer the PR's body and files, the ticket's other fields and a
+        comment posted straight through gh, so the land may read and post the Resolution either way."""
         views = views or [land_view()]
-        return [{"match": ["pr", "view", "34", "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": SHA}}},
+        commits = [pr_commit("a", at(9))] if commits is None else commits
+        issue = {"state": issue_state, "labels": [{"name": "task"}, {"name": "status:in-review"}],
+                 "comments": list(comments)}
+        return gate_calls(reviews, commits) + [
+                {"match": ["pr", "view", "34", "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": SHA}}},
                 {"match": ["pr", "view", "34", "--json", LAND_FIELDS],
                  "responses": [{"stdout_json": v} for v in views]},
                 REPO_VIEW, {"match": ["pr", "merge", "34"], "stdout": ""},
-                {"match": ["issue", "view", "12", "--json", "state,labels,comments"],
-                 "stdout_json": {"state": issue_state, "labels": [{"name": "task"}, {"name": "status:in-review"}],
-                                 "comments": list(comments)}},
-                {"match": ["issue", "edit", "12"], "stdout": ""}]
+                {"match": ["issue", "view", "12", "--json", "state,labels,comments"], "stdout_json": issue},
+                {"match": ["issue", "edit", "12"], "stdout": ""},
+                {"match": ["pr", "view", "34"], "stdout_json": pr_data(FIXTURE_A)},
+                *files_calls(34, FIXTURE_A["files"]),
+                {"match": ["issue", "view", "12"],
+                 "stdout_json": dict(issue, number=12, title="Add the widget", body=TICKET_12_BODY,
+                                     url="https://github.com/o/r/issues/12")},
+                {"match": ["issue", "comment", "12"], "stdout": "https://github.com/o/r/issues/12#issuecomment-1\n"},
+                {"contains": ["repos/o/r/issues/12/comments"], "stdout_json": []}]
 
     def setUp(self):
         super().setUp()
@@ -946,6 +1256,413 @@ class Land(WorktreeTest):
         self.assertFalse(self.branch_exists())
 
 
+class LandResolution(Land):
+    """`land` leaves one `**Resolution**` comment on the ticket, posted through `harness-board comment` before the
+    `Landed in` comment. These run the real harness-board (no stubs), so every comment reaches the fake gh's log."""
+
+    def resolution_calls(self, fx, state="OPEN", issue_state="OPEN", comments=(), view_files=None, after=None):
+        """The land conversation for the fixture's PR. `view_files`: the files `gh pr view --json` holds (all of
+        the fixture's by default; GitHub stops at 100), while the files endpoint always lists them all; `after`:
+        the answer to the PR read after the merge (`gh pr view P --json body,...`), in place of the PR's data."""
+        pr, sha = str(fx["pr"]), fx["sha"]
+        view = pr_data(dict(fx, files=fx["files"] if view_files is None else view_files))
+        url = f"https://github.com/o/r/pull/{pr}"
+        issue = {"number": 12, "title": "Add the widget", "url": "https://github.com/o/r/issues/12",
+                 "body": TICKET_12_BODY, "state": issue_state,
+                 "labels": [{"name": "task"}, {"name": "status:in-review"}], "comments": list(comments)}
+        rest = [{"body": c["body"], "user": {"login": c["author"]["login"]}, "created_at": c["createdAt"]}
+                for c in comments]
+        # the review gate's reads: no harness review, so the gate lets the land through
+        gate = gate_calls(commits=[pr_commit("a", at(9))], pull=f"repos/o/r/pulls/{pr}")
+        return gate + [
+                {"match": ["pr", "view", pr, "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": sha}}},
+                {"match": ["pr", "view", pr, "--json", LAND_FIELDS],
+                 "stdout_json": land_view(url=url, state=state)},
+                REPO_VIEW,
+                {"match": ["pr", "merge", pr], "stdout": ""},
+                {"match": ["pr", "view", pr], **(after or {"stdout_json": view})},
+                *files_calls(pr, fx["files"]),
+                {"match": ["issue", "view", "12"], "stdout_json": issue},
+                {"match": ["issue", "edit", "12"], "stdout": ""},
+                {"match": ["issue", "close", "12"], "stdout": ""},
+                {"match": ["issue", "comment", "12"], "stdout": "https://github.com/o/r/issues/12#issuecomment-9\n"},
+                {"contains": ["repos/o/r/issues/12/comments", "POST"], "stdout_json": {"id": 9}},
+                {"contains": ["repos/o/r/issues/12/comments"], "stdout_json": rest},
+                {"match": ["issue", "view", "3"],
+                 "stdout_json": {"state": "OPEN", "subIssuesSummary": {"total": 2, "completed": 1}}}]
+
+    def land(self, fx, **scenario):
+        self.scenario(self.resolution_calls(fx, **scenario))
+        return self.ok("land", str(fx["pr"]), "--yes", cwd=self.main, stubs=False)
+
+    def posted(self, number=None):
+        """(index in the gh log, issue number, body) of every comment posted: `gh issue comment N`, `gh issue close
+        N --comment` and `gh api repos/o/r/issues/N/comments` with a body."""
+        out = []
+        for i, call in enumerate(self.gh_calls()):
+            a, body, n = call["argv"], None, None
+            if a[:2] in (["issue", "comment"], ["issue", "close"]) and len(a) > 2:
+                n = a[2]
+                for flag in ("--body", "-b", "--comment", "-c"):
+                    if flag in a[:-1]:
+                        body = a[a.index(flag) + 1]
+                for flag in ("--body-file", "-F"):
+                    if flag in a[:-1]:
+                        path = a[a.index(flag) + 1]
+                        if path == "-":
+                            body = call["stdin"]
+                        elif os.path.exists(path):
+                            with open(path, encoding="utf-8") as fh:
+                                body = fh.read()
+            elif a[:1] == ["api"]:
+                target = next((t for t in a if "/issues/" in t and "/comments" in t), None)
+                if target:
+                    n = target.split("/issues/")[1].split("/")[0]
+                    if "--input" in a and call["stdin"].strip():
+                        body = json.loads(call["stdin"]).get("body")
+                    for j, tok in enumerate(a[:-1]):
+                        if tok in ("-f", "-F", "--field", "--raw-field") and a[j + 1].startswith("body="):
+                            body = a[j + 1][len("body="):]
+            if body is not None and (number is None or n == str(number)):
+                out.append((i, n, body))
+        return out
+
+    def resolutions(self, number=None):
+        return [(i, n, b) for i, n, b in self.posted(number) if b.lstrip().startswith(RESOLUTION)]
+
+    def landed(self, number=None):
+        return [(i, n, b) for i, n, b in self.posted(number) if b.lstrip().startswith("Landed in")]
+
+    def as_comments(self, bodies):
+        return [{"author": {"login": "rjeskuri"}, "body": b, "createdAt": f"2026-10-13T1{k}:00:00Z"}
+                for k, b in enumerate(bodies)]
+
+    def first(self, lines, pred, what):
+        for i, line in enumerate(lines):
+            if pred(line):
+                return i
+        self.fail(f"{what} missing from the Resolution:\n" + "\n".join(lines))
+
+    def assertFrame(self, body, fx):
+        """The heading, the harness marker last, the PR link and the full squash sha; the body's lines."""
+        self.assertTrue(body.lstrip().startswith(RESOLUTION), body)
+        lines = body.rstrip().splitlines()
+        self.assertEqual(lines[-1].strip(), HARNESS_MARK, body)
+        self.assertIn(f"https://github.com/o/r/pull/{fx['pr']}", body)
+        self.assertIn(fx["sha"], body, "the full squash sha missing from the Resolution")
+        return lines
+
+    def file_positions(self, lines, fx):
+        """The index of each changed file's list line: exactly one of its own per file."""
+        file_lines = {}
+        for i, line in enumerate(lines):
+            m = re.match(r"^\s*[-*+]\s+(.*)$", line)
+            if m:
+                text = m.group(1).replace("`", "").strip()
+                for path in fx["files"]:
+                    if text == path or text.startswith(path + " "):
+                        file_lines.setdefault(path, []).append(i)
+        for path in fx["files"]:
+            self.assertEqual(len(file_lines.get(path, [])), 1,
+                             f"changed file {path} wants exactly one list line of its own:\n" + "\n".join(lines))
+        return [i for found in file_lines.values() for i in found]
+
+    def assertRedKind(self, lines, fx):
+        """The red-run kind on exactly one line, and that line is about the red run."""
+        kind = re.compile(r"\b" + fx["red_kind"] + r"\b")
+        kind_lines = [line for line in lines if kind.search(line)]
+        self.assertEqual(len(kind_lines), 1, f"want one red-run kind line, got {kind_lines}")
+        self.assertRegex(kind_lines[0], r"(?i)\bred\b", "the kind belongs on a line about the red run")
+
+    def assertVerifyResult(self, lines, fx):
+        """The last line of the verify fence: once, outside any code fence; the earlier lines left out."""
+        verify = [line for line in fx["verify"] if line.strip()]
+        fenced, where = False, []
+        for line in lines:
+            if line.strip().startswith("```"):
+                fenced = not fenced
+            elif verify[-1] in line:
+                where.append(fenced)
+        self.assertEqual(where, [False],
+                         f"the verify result line {verify[-1]!r} wants one unfenced line:\n" + "\n".join(lines))
+        for text in verify[:-1]:
+            self.assertNotIn(text, "\n".join(lines), f"the Resolution copies the earlier verify line {text!r}")
+
+    def assertResolution(self, body, fx):
+        """The Resolution carries the PR's summary, every changed file, the checklist as landed, the red-run
+        kind and the verify result from the PR body, the PR link and the squash sha, and the harness marker."""
+        lines = self.assertFrame(body, fx)
+
+        # the summary, then the changed files (one list line each), then the checklist as landed
+        at_summary = self.first(lines, lambda line: fx["summary"] in line, "the PR summary")
+        at_files = self.file_positions(lines, fx)
+        at_dod = [self.first(lines, lambda line, item=item: item in line, f"checklist line {item!r}")
+                  for item in fx["dod"]]
+        self.assertLess(at_summary, min(at_files), "the summary comes before the files")
+        self.assertLess(max(at_files), min(at_dod), "the files come before the checklist")
+        self.assertEqual(at_dod, sorted(at_dod), "the checklist keeps its order")
+
+        self.assertRedKind(lines, fx)
+        self.assertVerifyResult(lines, fx)
+
+        # what the Resolution leaves out of the PR body: the red tail, the tests section, the review, the
+        # risks and the closing line
+        left_out = fx["red_tail"] + [
+            fx["test_file"], "::test_main", "Test files run", fx["review"], "## Review", "## Risks", "None noted.",
+            "Closes #12", "## Tests"]
+        for text in left_out:
+            self.assertNotIn(text, body, f"the Resolution copies {text!r} from the PR body")
+
+    # ------------------------------------------------------------------ fresh lands
+    def test_land_posts_one_resolution_after_the_merge(self):
+        self.land(FIXTURE_A)
+        found = self.resolutions()
+        self.assertEqual(len(found), 1, f"want one Resolution comment, got {len(found)}: {self.posted()}")
+        index, number, body = found[0]
+        self.assertEqual(number, "12")
+        self.assertResolution(body, FIXTURE_A)
+        for other in FIXTURE_B["files"] + [FIXTURE_B["summary"], FIXTURE_B["sha"][:12]]:
+            self.assertNotIn(other, body)
+        calls = self.gh_calls()
+        merge = next(i for i, c in enumerate(calls) if c["argv"][:2] == ["pr", "merge"])
+        self.assertGreater(index, merge, "the Resolution is posted after the merge")
+        self.assertEqual(calls[index]["argv"][:3], ["issue", "comment", "12"],
+                         "posted through harness-board comment")
+        # the Landed comment is unchanged: one, `Landed in <sha>`, as harness-board posts it, after the Resolution
+        landed = self.landed(12)
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed], [f"Landed in {SHA}"])
+        self.assertLess(index, landed[0][0], "the Resolution goes before Landed in, so a resume never misses it")
+
+    def test_land_resolution_follows_the_pr_it_lands(self):
+        """Another PR, another sha, more files, an unchecked box, an import red run; GitHub closed the ticket."""
+        self.land(FIXTURE_B, issue_state="CLOSED")
+        found = self.resolutions()
+        self.assertEqual(len(found), 1, f"want one Resolution comment, got {len(found)}: {self.posted()}")
+        _, number, body = found[0]
+        self.assertEqual(number, "12")
+        self.assertResolution(body, FIXTURE_B)
+        for other in FIXTURE_A["files"][2:] + [FIXTURE_A["summary"], FIXTURE_A["sha"][:12], "OK (skipped=1)"]:
+            self.assertNotIn(other, body)
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in self.landed(12)],
+                         [f"Landed in {FIXTURE_B['sha']}"])
+
+    # ------------------------------------------------------------------ resumed lands
+    def land_then_resume(self, fx, keep):
+        """Land once, then land again on the merged PR with the ticket showing the first run's comments that
+        `keep` selects. Returns (Resolutions of the first run, Resolutions and Landed of the second)."""
+        self.land(fx)
+        first = self.resolutions(12)
+        bodies = [b for _, _, b in self.posted(12) if keep(b)]
+        self.land(fx, state="MERGED", issue_state="CLOSED", comments=self.as_comments(bodies))
+        return first, self.resolutions(), self.landed()
+
+    def test_resumed_land_adds_no_second_resolution(self):
+        first, again, landed = self.land_then_resume(FIXTURE_A, keep=lambda b: True)
+        self.assertEqual(len(first), 1, "the first land posts the Resolution")
+        self.assertEqual(again, [], "a resumed land must not post a second Resolution")
+        self.assertEqual(landed, [], "nor a second Landed comment")
+
+    def test_resumed_land_with_only_the_resolution_posts_the_landed_comment(self):
+        first, again, landed = self.land_then_resume(FIXTURE_B, keep=lambda b: b.lstrip().startswith(RESOLUTION))
+        self.assertEqual(len(first), 1, "the first land posts the Resolution")
+        self.assertEqual(again, [], "the Resolution already there is not repeated")
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed],
+                         [f"Landed in {FIXTURE_B['sha']}"])
+
+    def test_resumed_land_after_the_landed_comment_posts_no_resolution(self):
+        first, again, landed = self.land_then_resume(FIXTURE_A, keep=lambda b: b.lstrip().startswith("Landed in"))
+        self.assertEqual(len(first), 1, "the first land posts the Resolution")
+        self.assertEqual(again, [], "once Landed in is on the ticket the land is recorded; no Resolution")
+        self.assertEqual(landed, [])
+
+    # ------------------------------------------------------------------ the PR body's shape
+    def one_resolution(self):
+        found = self.resolutions(12)
+        self.assertEqual(len(found), 1, f"want one Resolution comment, got {len(found)}: {self.posted()}")
+        return found[0]
+
+    def test_land_resolution_carries_every_line_of_a_longer_summary(self):
+        """A Summary of two paragraphs and a bullet list (FIXTURE_C, edited by hand): every line of it is copied,
+        in order, ahead of the files; the Risks section stays out."""
+        self.land(FIXTURE_C)
+        _, _, body = self.one_resolution()
+        self.assertResolution(body, FIXTURE_C)
+        lines = body.rstrip().splitlines()
+        at = []
+        for text in FIXTURE_C["summary_lines"]:
+            wanted = text[2:] if text.startswith("- ") else text
+            at.append(self.first(lines, lambda line, w=wanted: w in line, f"summary line {wanted!r}"))
+        self.assertEqual(at, sorted(at), "the summary keeps its order")
+        self.assertLess(max(at), min(self.file_positions(lines, FIXTURE_C)), "the whole summary precedes the files")
+        for text in FIXTURE_C["risks"] + [FIXTURE_A["summary"], FIXTURE_B["summary"]]:
+            self.assertNotIn(text, body)
+
+    def test_land_resolution_reads_the_checklist_from_the_definition_of_done_only(self):
+        """FIXTURE_C again: the `- [ ]` follow-up under Risks is not part of the checklist, while the wrapped
+        item's continuation line is, and stays with its item."""
+        self.land(FIXTURE_C)
+        _, _, body = self.one_resolution()
+        lines = self.assertFrame(body, FIXTURE_C)
+        for text in FIXTURE_C["risks"]:
+            self.assertNotIn(text, body, "a checkbox outside the Definition of done is not copied")
+        self.assertNotIn("nightly", body)
+        at_dod = [self.first(lines, lambda line, item=item: item in line, f"checklist line {item!r}")
+                  for item in FIXTURE_C["dod"]]
+        wrapped = [i for i, line in enumerate(lines) if FIXTURE_C["dod_wrapped"] in line]
+        self.assertEqual(len(wrapped), 1, f"the wrapped item's continuation line wants one line:\n{body}")
+        self.assertTrue(at_dod[1] <= wrapped[0] < at_dod[2],
+                        f"the continuation line belongs with its item, between {at_dod[1]} and {at_dod[2]}:\n{body}")
+
+    def test_land_resolution_finds_the_verify_result_whatever_the_fence_layout(self):
+        """The verify fence need not follow its label directly: a blank line between, a ```text fence, or the
+        `## Verify` heading of the PR template harness-scaffold installs as .github/pull_request_template.md. The
+        last line of the fence is the result either way."""
+        variants = [("a blank line before the fence", "Verify:\n\n```\n",
+                     ["Ran 7 tests in 0.512s", "", "OK (expected failures=1)"]),
+                    ("a text fence", "Verify:\n```text\n",
+                     ["lint: clean", "Ran 52 tests in 1.907s", "", "OK (skipped=3)"]),
+                    ("the PR template's heading", "## Verify\n```\n",
+                     ["python3 -m unittest: 61 tests, all green", "VERIFY OK"])]
+        for name, label, verify in variants:
+            with self.subTest(name):
+                fx = dict(FIXTURE_A, verify=verify)
+                rendered = pr_body_text(fx)
+                self.assertEqual(rendered.count("Verify:\n```\n"), 1)
+                fx["body"] = rendered.replace("Verify:\n```\n", label)
+                self.land(fx)
+                _, _, body = self.one_resolution()
+                self.assertResolution(body, fx)
+
+    def test_land_resolution_without_a_red_run_line_has_no_red_line(self):
+        """A body with no red-run paragraph at all (written by hand on a no-tests ticket): the land finishes,
+        the Resolution says nothing about a red run and invents no kind."""
+        fx = dict(FIXTURE_B, body=pr_body_text(FIXTURE_B, red=False))
+        self.assertNotIn("Red run", fx["body"])
+        self.land(fx)
+        index, _, body = self.one_resolution()
+        lines = self.assertFrame(body, fx)
+        self.file_positions(lines, fx)
+        self.assertVerifyResult(lines, fx)
+        self.assertEqual([line for line in lines if re.search(r"(?i)\bred\b", line)], [],
+                         f"no red run in the PR body, so no red line in the Resolution:\n{body}")
+        self.assertIsNone(re.search(r"\bimport\b", body), f"a red-run kind invented:\n{body}")
+        self.assertNotIn("ModuleNotFoundError", body)
+        landed = self.landed(12)
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed], [f"Landed in {fx['sha']}"])
+        self.assertLess(index, landed[0][0])
+
+    def test_land_without_summary_or_verify_still_posts_the_resolution_and_lands(self):
+        """A hand-written body missing its Summary and/or its Verify block: the land finishes, one Resolution
+        still names every file, the checklist, the PR and the sha, nothing is invented, and `Landed in` follows."""
+        cases = [("no Summary", FIXTURE_A, {"summary": False}),
+                 ("no Verify", FIXTURE_B, {"verify": False}),
+                 ("neither", FIXTURE_B, {"summary": False, "verify": False})]
+        for name, base, drop in cases:
+            with self.subTest(name):
+                fx = dict(base, body=pr_body_text(base, **drop))
+                self.land(fx)
+                index, number, body = self.one_resolution()
+                self.assertEqual(number, "12")
+                lines = self.assertFrame(body, fx)
+                self.file_positions(lines, fx)
+                for item in fx["dod"]:
+                    self.assertIn(item, body, f"checklist line {item!r} missing:\n{body}")
+                self.assertRedKind(lines, fx)
+                if drop.get("summary") is False:
+                    self.assertNotIn(fx["summary"], body, "no Summary in the PR body, none to copy")
+                else:
+                    self.assertIn(fx["summary"], body)
+                if drop.get("verify") is False:
+                    for text in fx["verify"]:
+                        if text.strip():
+                            self.assertNotIn(text, body, "no Verify in the PR body, none to copy")
+                else:
+                    self.assertVerifyResult(lines, fx)
+                for text in fx["red_tail"] + ["## Tests", "## Review", "## Risks", "Closes #12"]:
+                    self.assertNotIn(text, body)
+                landed = self.landed(12)
+                self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed],
+                                 [f"Landed in {fx['sha']}"])
+                self.assertLess(index, landed[0][0], "the Resolution goes before Landed in")
+
+    # ------------------------------------------------------------------ every changed file
+    def files_listed(self, body):
+        """(N of the one `Files changed (N):` line, the paths on the list lines that follow it)."""
+        lines = body.splitlines()
+        heads = [i for i, line in enumerate(lines) if line.strip().startswith("Files changed")]
+        self.assertEqual(len(heads), 1, f"want one `Files changed (N):` line:\n{body}")
+        m = re.match(r"^Files changed \((\d+)\):$", lines[heads[0]].strip())
+        self.assertIsNotNone(m, f"the files line reads `Files changed (N):`, got {lines[heads[0]]!r}")
+        paths = []
+        for line in lines[heads[0] + 1:]:
+            item = re.match(r"^\s*[-*+]\s+(.*)$", line)
+            if not item:
+                break
+            paths.append(item.group(1).replace("`", "").strip().split(" ")[0])
+        return int(m.group(1)), paths
+
+    def test_land_resolution_lists_every_changed_file_past_the_first_hundred(self):
+        """`gh pr view --json files` stops at 100 files. A PR touching 130 gets all 130 in its Resolution, from
+        the paginated files endpoint, and the count says 130; the rest of the Resolution and `Landed in` as
+        usual."""
+        fx = FIXTURE_WIDE
+        self.land(fx, view_files=fx["files"][:100])
+        index, number, body = self.one_resolution()
+        self.assertEqual(number, "12")
+        count, listed = self.files_listed(body)
+        for nth in (101, 130):
+            path = fx["files"][nth - 1]
+            self.assertTrue(path in listed, f"changed file no. {nth}, {path}, missing from the Resolution, which "
+                                            f"lists {len(listed)} files under `Files changed ({count}):`")
+        self.assertEqual(count, 130, "want `Files changed (130):`")
+        self.assertEqual(sorted(listed), sorted(fx["files"]), "every changed file, each listed once")
+        self.assertResolution(body, fx)
+        landed = self.landed(12)
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed], [f"Landed in {fx['sha']}"])
+        self.assertLess(index, landed[0][0], "the Resolution goes before Landed in")
+
+    def test_land_resolution_lists_a_short_prs_files_once(self):
+        """Three files, listed alike by the PR view and the files endpoint: `Files changed (3):` and each path
+        once, whichever the land reads."""
+        self.land(FIXTURE_A)
+        _, _, body = self.one_resolution()
+        count, listed = self.files_listed(body)
+        self.assertEqual(sorted(listed), sorted(FIXTURE_A["files"]), f"each changed file once:\n{body}")
+        self.assertEqual(count, 3, f"want `Files changed (3):`:\n{body}")
+        self.assertResolution(body, FIXTURE_A)
+
+    # ------------------------------------------------------------------ a failed read after the merge
+    def test_land_posts_nothing_when_the_pr_read_after_the_merge_fails_and_the_resume_posts_both(self):
+        """The merge goes through, then reading the PR for the Resolution (`gh pr view P --json body,...`) fails:
+        no comment at all on the ticket, since `Landed in` alone would keep a resume from adding the Resolution,
+        and land fails naming the step. A second land on the merged PR posts one Resolution, then `Landed in`."""
+        self.scenario(self.resolution_calls(FIXTURE_A, after={"stderr": "GraphQL: something\n", "exit": 1}))
+        p = self.pr("land", "34", "--yes", cwd=self.main, stubs=False)
+        self.assertOneLineError(p, "PR #34 is merged", "#12", "gh pr view 34", "GraphQL: something")
+        self.assertRegex(p.stderr, r"(?i)\bresolution\b", "the error names the step that failed: the Resolution")
+        argv = self.gh_argv()
+        self.assertTrue(any(a[:2] == ["pr", "merge"] for a in argv), "the merge went through")
+        self.assertTrue(any(a[:3] == ["pr", "view", "34"] and "--json" in a[:-1]
+                            and "body" in a[a.index("--json") + 1].split(",") for a in argv),
+                        "the land read the PR's body after the merge, and that read failed")
+        self.assertEqual([a for a in argv if a[:2] == ["issue", "comment"]], [], "no issue comment at all")
+        self.assertEqual(self.posted(), [], "no comment of any kind on the ticket")
+        ticket = [line for line in p.stdout.splitlines() if line.startswith("Ticket:")]
+        self.assertEqual(len(ticket), 1, p.stdout)
+        self.assertNotIn("commented", ticket[0])
+
+        bodies = [b for _, _, b in self.posted(12)]        # what the ticket shows the resume: nothing
+        self.land(FIXTURE_A, state="MERGED", issue_state="CLOSED", comments=self.as_comments(bodies))
+        self.assertFalse(any(a[:2] == ["pr", "merge"] for a in self.gh_argv()), "the resume does not merge again")
+        found = self.resolutions(12)
+        self.assertEqual(len(found), 1, f"the resume posts one Resolution, got {len(found)}: {self.posted()}")
+        index, _, body = found[0]
+        self.assertResolution(body, FIXTURE_A)
+        landed = self.landed(12)
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed], [f"Landed in {SHA}"])
+        self.assertLess(index, landed[0][0], "the Resolution goes before Landed in")
+
+
 class LandRefusals(PrTest):
     def test_land_refuses_before_merging(self):
         cases = [("draft", land_view(isDraft=True), "is a draft"),
@@ -958,10 +1675,108 @@ class LandRefusals(PrTest):
                  ("closed unmerged", land_view(state="CLOSED"), "closed without being merged")]
         for name, view, needle in cases:
             with self.subTest(name):
-                self.scenario([{"match": ["pr", "view", "34"], "stdout_json": view}, REPO_VIEW,
-                               {"match": ["pr", "merge"], "stdout": ""}])
+                self.scenario(gate_calls(commits=[pr_commit("a", at(9))])
+                              + [{"match": ["pr", "view", "34"], "stdout_json": view}, REPO_VIEW,
+                                 {"match": ["pr", "merge"], "stdout": ""}])
                 self.assertOneLineError(self.pr("land", "34"), needle)
                 self.assertFalse(any(a[:2] == ["pr", "merge"] for a in self.gh_argv()))
+
+
+class LandGate(GateAsserts, WorktreeTest):
+    """`harness-pr land P` refuses a PR whose latest harness review has findings and no commit after it, unless
+    --accept-findings; it lands the PR when a commit is newer, the latest harness review is clean, or there is none."""
+
+    def setUp(self):
+        super().setUp()
+        self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}}})
+        write(self.state_path("tickets", "12.json"),
+              json.dumps({"number": 12, "parent": {"number": 3, "title": "Widgets", "goal": ""}}))
+
+    def land_case(self, name, *flags):
+        reviews, commits, named, not_named = GATE_CASES[name]
+        self.scenario(Land.land_calls(self, reviews=reviews, commits=commits))
+        return self.pr("land", "34", *flags, cwd=self.main), named, not_named
+
+    def branch_exists(self):
+        return Land.branch_exists(self)
+
+    def assertLanded(self, p):
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(["pr", "merge", "34", "-R", "o/r", "--squash", "--delete-branch"], self.gh_argv())
+        self.assertFalse(os.path.exists(self.wt))
+        self.assertIn(["close", "12", "--repo", self.main], self.stub_calls("harness-board"))
+
+    def test_land_refuses_unaddressed_findings_of_the_latest_harness_review(self):
+        refused = [name for name, case in GATE_CASES.items() if case[2] is not None]
+        self.assertGreaterEqual(len(refused), 5)
+        for name in refused:
+            with self.subTest(name):
+                p, named, not_named = self.land_case(name)
+                self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertFalse([a for a in self.gh_argv() if a[:2] == ["pr", "merge"]], self.gh_argv())
+                self.assertEqual(self.stub_calls("harness-board"), [])
+                self.assertFalse(any("worktree remove" in line or "branch -D" in line for line in self.order()))
+                self.assertTrue(os.path.isdir(self.wt))
+                self.assertTrue(self.branch_exists())
+                self.assertNamesFindings(p, named, not_named)
+
+    # Each proceed case first runs its refused twin (the same PR but for the one fact that decides), so the pair
+    # shows that fact is what lets the land through.
+    def assertTwins(self, refused, proceeds):
+        p, _, _ = self.land_case(refused)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse([a for a in self.gh_argv() if a[:2] == ["pr", "merge"]], self.gh_argv())
+        p, _, _ = self.land_case(proceeds)
+        self.assertLanded(p)
+
+    def test_land_proceeds_when_a_commit_is_newer_than_the_findings(self):
+        self.assertTwins("findings and no commit since", "a commit after the findings")
+
+    def test_land_proceeds_when_the_latest_harness_review_is_clean(self):
+        self.assertTwins("an older clean review, the latest with findings (listed newest first)",
+                         "an older review with findings, the latest clean")
+
+    def test_land_proceeds_without_a_harness_review(self):
+        self.assertTwins("the owner reviewed after the harness findings", "no harness review, only the owner's")
+
+    def test_accept_findings_overrides_the_refusal(self):
+        p, _, _ = self.land_case("two reviews with findings, a commit between them")
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)            # refused without the flag
+        p, _, _ = self.land_case("two reviews with findings, a commit between them", "--accept-findings")
+        self.assertLanded(p)
+
+    def failing_land(self, failing, *flags):
+        # The PR would land (a commit after the findings), so only the failed read can refuse it.
+        reviews, commits, named, _ = GATE_CASES["a commit after the findings"]
+        self.assertIsNone(named)
+        self.scenario([failing] + Land.land_calls(self, reviews=reviews, commits=commits))
+        return self.pr("land", "34", *flags, cwd=self.main)
+
+    def test_land_fails_closed_when_a_gate_read_fails(self):
+        for what, failing in GATE_READ_FAILURES.items():
+            with self.subTest(what):
+                p = self.failing_land(failing)
+                self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertIn(GATE_FAILURE_TEXT, p.stderr)
+                self.assertFalse([a for a in self.gh_argv() if a[:2] == ["pr", "merge"]], self.gh_argv())
+                self.assertEqual(self.stub_calls("harness-board"), [])
+                self.assertFalse(any("worktree remove" in line or "branch -D" in line for line in self.order()))
+                self.assertTrue(os.path.isdir(self.wt))
+                self.assertTrue(self.branch_exists())
+
+    def test_accept_findings_lands_through_a_failed_gate_read_with_a_warning(self):
+        # gh repo view is left out: the merge itself needs the repository's name, so no flag can land without it.
+        for i, (what, failing) in enumerate(GATE_API_FAILURES.items()):
+            with self.subTest(what):
+                if i:
+                    self.setUp()                                  # a fresh repository and worktree for each case
+                self.assertNotEqual(self.failing_land(failing).returncode, 0)          # refused without the flag
+                self.assertTrue(os.path.isdir(self.wt))
+                p = self.failing_land(failing, "--accept-findings")
+                self.assertLanded(p)
+                self.assertIn(GATE_FAILURE_TEXT, p.stderr)                           # the warning names the failure
 
 
 if __name__ == "__main__":

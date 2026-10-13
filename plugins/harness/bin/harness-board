@@ -76,6 +76,7 @@ SECTIONS = [("Request", "request"), ("Outline", "outline"), ("Definition of done
 ISSUE_FIELDS = "number,title,url,body,labels,state,parent,blockedBy,comments"
 PRESERVED = (("branch", None), ("worktree", None), ("started_at", None), ("attempts", []))
 NEEDS_INPUT = "**Needs your input**"
+RESOLUTION = "**Resolution**"   # the comment `harness-pr land` posts on a ticket it lands
 MARKER = "<!-- harness -->"     # the last line of every comment posted here
 # the harness's own comments from before the marker, as their bodies start
 HARNESS_PREFIXES = (NEEDS_INPUT, "Started on ", "PR #", "Landed in ")
@@ -525,8 +526,60 @@ def save_record(repo, record):
         raise Problem(f"cannot write {repo.ticket_path(record['number'])}: {err.strerror or err}") from None
 
 
-def context_markdown(record):
-    """The ticket context: header, epic and blockers, the sections, then the newest comments that fit."""
+def newest_resolution(comments):
+    """(index, lines) of the newest `**Resolution**` comment, its heading, marker and outer blank lines dropped;
+    (None, []) when there is none."""
+    for i in range(len(comments) - 1, -1, -1):
+        body = (comments[i].get("body") or "").strip()
+        if body.startswith(RESOLUTION):
+            lines = [line.rstrip() for line in body[len(RESOLUTION):].splitlines() if line.strip() != MARKER]
+            while lines and not lines[0]:
+                lines.pop(0)
+            while lines and not lines[-1]:
+                lines.pop()
+            return i, lines
+    return None, []
+
+
+def task_resolutions(repo, tasks):
+    """{task number: its newest Resolution's lines} for the closed tasks; a task whose comments cannot be read,
+    or that has no Resolution, is left out."""
+    out = {}
+    for t in tasks:
+        if t["state"] != "CLOSED" or not t.get("number"):
+            continue
+        try:
+            data = gh_json(repo, ["issue", "view", str(t["number"]), "--json", "comments"])
+        except Problem:
+            continue
+        _, lines = newest_resolution(as_list(data.get("comments")) if isinstance(data, dict) else [])
+        if lines:
+            out[t["number"]] = lines
+    return out
+
+
+def fitted_resolutions(entries, room):
+    """The (number, heading and lines) Resolutions as context lines within `room`: each printed whole when it
+    fits, in order, and the rest named on one pointer line; never one cut part-way."""
+    blocks = [(number, [""] + block) for number, block in entries]
+    if sum(len(block) for _, block in blocks) > room:
+        room -= 2                                      # the pointer line and the blank before it
+    out, left = [], []
+    for number, block in blocks:
+        if len(block) <= room:
+            out += block
+            room -= len(block)
+        else:
+            left.append(number)
+    if left:
+        where = f"gh issue view {left[0]} --comments" if len(left) == 1 else "gh issue view N --comments"
+        out += ["", f"Not shown for lack of room: the Resolution of {', '.join(f'#{x}' for x in left)} ({where})"]
+    return out
+
+
+def context_markdown(record, resolutions=None):
+    """The ticket context: header, epic and blockers, the task list and the closed tasks' Resolutions
+    (`resolutions`), the sections, a closed ticket's own Resolution, then the newest comments that fit."""
     n = record["number"]
     raw = split_sections(record.get("body"))
     state = "closed" if record.get("status") == "closed" else "open"
@@ -552,11 +605,23 @@ def context_markdown(record):
             detail = "closed" if t["state"] == "CLOSED" else ", ".join(
                 [t["status"] or "no status", t["size"] or "-", t["risk"] or "-", f"tier {t['tier']}"])
             lines.append(f"- #{t['number']} {t['title']} ({detail})")
+    entries = [(t["number"], [f"### #{t['number']} {t['title']}: Resolution"] + (resolutions or {})[t["number"]])
+               for t in tasks or [] if t["state"] == "CLOSED" and (resolutions or {}).get(t["number"])]
+    at = len(lines)                                    # an epic's Resolutions go under its task list
     for heading, _ in SECTIONS:
         text = raw.get(heading.lower(), "").strip("\n")
         if text.strip():
             lines += ["", f"## {heading}"] + text.splitlines()
     comments = record["comments"]
+    if record.get("status") == "closed":
+        index, own = newest_resolution(comments)
+        if own:
+            comments = comments[:index] + comments[index + 1:]
+            if not entries:
+                at = len(lines)                        # a ticket's own Resolution goes after its sections
+            entries.append((n, ["## Resolution"] + own))
+    if entries:
+        lines[at:at] = fitted_resolutions(entries, CONTEXT_LINES - len(lines) - 2)
     blocks = []
     for c in comments[-COMMENTS_SHOWN:]:
         body = (c["body"] or "").strip("\n").splitlines()
@@ -727,7 +792,7 @@ def cmd_show(repo, args):
     record = fetch_record(repo, args.number)
     save_record(repo, record)
     if args.markdown:
-        print(context_markdown(record))
+        print(context_markdown(record, task_resolutions(repo, record.get("tasks") or [])))
     else:
         print(json.dumps(record, indent=2, ensure_ascii=False))
 

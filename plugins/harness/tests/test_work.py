@@ -1016,6 +1016,707 @@ class Runs(WorkTest):
         self.assertIn("ended error", text)
 
 
+# =========================================================================== runs: ended early
+# The result of the headless run of #7 (2026-10-13): the orchestrator launched the test-author in the background and
+# ended its turn; `claude -p` has no next turn, so the process exited `ok` with no red record and no PR.
+EARLY_RESULT = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 6, "duration_ms": 70214,
+                "result": "I've started ticket #7 and the test-author is writing the tests now in the background. "
+                          "Next comes the red check, then the breaker and the coder.",
+                "total_cost_usd": 0.41, "stop_reason": "end_turn"}
+IN_PROGRESS = ("task", "status:in-progress", "size:S", "risk:low")
+
+
+class EndedEarly(WorkTest):
+    def write_scenario(self, tickets, branches=None, states=None, failing=None):
+        """tickets: {n: (labels, open_prs, all_prs)}. `pr list --head <branch>` (t/<n>-x unless branches[n] says
+        otherwise) gives open_prs; with --state all it gives all_prs (merged and closed included), as real gh does.
+        Any other pr list gives []. states[n] is the issue's state when it is not OPEN. failing[n] names the gh call
+        that fails for ticket n ("issue": `issue view n`; "pr": every `pr list --head <its branch>`): exit 1 with a
+        message on stderr and nothing on stdout, as gh does when the network or the token is gone."""
+        branches, states, failing = branches or {}, states or {}, failing or {}
+        gone = {"stderr": "HTTP 502: Bad gateway (https://api.github.com/graphql)\n", "exit": 1}
+        calls = []
+        for n, (labels, open_prs, all_prs) in tickets.items():
+            if failing.get(n) == "issue":
+                calls.append(dict(gone, match=["issue", "view", str(n)]))
+            else:
+                calls.append({"match": ["issue", "view", str(n)],
+                              "stdout_json": issue(n, labels=labels, state=states.get(n, "OPEN"))})
+        for n, (labels, open_prs, all_prs) in tickets.items():
+            branch = branches.get(n, f"t/{n}-x")
+            if failing.get(n) == "pr":
+                calls.append(dict(gone, contains=["pr", "list", "--head", branch]))
+                continue
+            calls.append({"contains": ["pr", "list", "--head", branch, "--state", "all"], "stdout_json": all_prs})
+            calls.append({"contains": ["pr", "list", "--head", branch], "stdout_json": open_prs})
+        calls += [
+            {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}},
+            {"match": ["issue", "list"], "stdout_json": []},
+            {"match": ["pr", "list"], "stdout_json": []},
+            {"match": ["api", "user"], "stdout": "rjeskuri\n"},
+        ]
+        write(self.scenario_path, json.dumps({"calls": calls}))
+        state = self.scenario_path + ".state.json"
+        if os.path.exists(state):
+            os.unlink(state)
+
+    def ended_run(self, n, result, warning=True, **fields):
+        """A headless run of ticket n whose process is gone, with `result` (a dict, or raw text) as its log, after the
+        connectors warning unless warning=False."""
+        record = self.write_run(n, pid=self.dead_pid(), **fields)
+        text = json.dumps(result) if isinstance(result, dict) else result
+        write(record["log"], (CONNECTORS_WARNING + "\n" if warning else "") + text + "\n")
+        return record
+
+    def fresh(self):
+        """Forget every run record and gh call, for the next pass of a test."""
+        shutil.rmtree(self.runs_dir(), True)
+        if os.path.exists(self.gh_log):
+            os.unlink(self.gh_log)
+
+    def run_lines(self):
+        """{ticket: its line} of `harness-work runs` (no sweep)."""
+        return {int(m.group(1)): line for line in self.ok("runs").stdout.splitlines()
+                for m in [re.search(r"proj #(\d+)\b", line)] if m}
+
+    def sweep_pair(self, **scenario):
+        """Two ended runs with the same log, both tickets in progress with no PR; the scenario keywords make #8
+        differ. Returns {ticket: row} of the sweep after checking that both runs were ended."""
+        for n in (7, 8):
+            self.ended_run(n, EARLY_RESULT)
+        self.write_scenario({7: (IN_PROGRESS, [], []), 8: (IN_PROGRESS, [], [])}, **scenario)
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+        self.assertEqual(sorted(rows), [7, 8])
+        for n in (7, 8):
+            self.assertTrue(rows[n]["ended_at"], rows[n])
+            self.assertIsNone(rows[n]["exit"])
+        return rows
+
+    def assertEarlyAndOk(self, rows):
+        """#7 ended early, #8 ended ok: in the sweep's rows, the saved records and the runs listing."""
+        self.assertEqual({n: rows[n]["outcome"] for n in rows}, {7: "early", 8: "ok"})
+        self.assertEqual((rows[7]["state"], rows[8]["state"]), ("ended early (no PR)", "ended ok"))
+        self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()}, {7: "early", 8: "ok"})
+        lines = self.run_lines()
+        self.assertIn("ended early (no PR)", lines[7])
+        self.assertIn("ended ok", lines[8])
+        self.assertNotIn("early", lines[8])
+        self.assertIn("api: available", self.ok("budget", "status").stdout)
+
+    def test_a_closed_issue_still_labelled_in_progress_is_ok_not_early(self):
+        # Same labels, same log, no PR either way: only the issue's state differs. A closed ticket is never worked
+        # again (the redispatch skips issues that are not OPEN), so its run did not end early.
+        self.assertEarlyAndOk(self.sweep_pair(states={8: "CLOSED"}))
+
+    def test_a_failing_issue_view_leaves_the_run_ok(self):
+        # gh cannot say what the board holds for #8: the sweep still ends its run, as ok (not early: the facts that
+        # make early are missing), exits 0, and classifies #7 all the same. A warning on stderr is fine.
+        self.assertEarlyAndOk(self.sweep_pair(failing={8: "issue"}))
+
+    def test_a_failing_pr_list_leaves_the_run_ok(self):
+        # The board says in-progress, but gh cannot list the branch's PRs: the same, ok, exit 0, #7 still early.
+        self.assertEarlyAndOk(self.sweep_pair(failing={8: "pr"}))
+
+    def test_ok_run_on_an_in_progress_ticket_without_a_pr_is_ended_early(self):
+        record = self.ended_run(7, EARLY_RESULT)
+        self.write_scenario({7: (IN_PROGRESS, [], [])})
+
+        text = self.ok("runs", "--sweep").stdout
+        self.assertIn("proj #7", text)
+        self.assertIn("ended early (no PR)", text)
+        self.assertNotIn("ended ok", text)
+
+        [saved] = self.run_records()
+        self.assertEqual((saved["id"], saved["outcome"], saved["exit"]), (record["id"], "early", None))
+        self.assertTrue(saved["ended_at"])
+
+        [row] = self.ok_json("runs", "--json")             # no sweep: the saved outcome alone gives the state
+        self.assertEqual((row["outcome"], row["state"]), ("early", "ended early (no PR)"))
+        self.assertIn("ended early (no PR)", self.ok("runs").stdout)
+        self.assertIn("api: available", self.ok("budget", "status").stdout)   # not a budget failure
+
+        # The redispatch says why it runs the ticket again.
+        p = self.ok("dispatch", "--dry-run")
+        self.assertIn("would start #7 Add the board tool (again after early)", p.stdout)
+
+    def test_sweep_json_reports_early_on_the_sweep_itself(self):
+        self.ended_run(7, EARLY_RESULT)
+        self.write_scenario({7: (IN_PROGRESS, [], [])})
+        [row] = self.ok_json("runs", "--sweep", "--json")
+        self.assertEqual((row["ticket"], row["outcome"], row["state"]), (7, "early", "ended early (no PR)"))
+        self.assertTrue(row["ended_at"])
+
+    def test_sweep_labels_early_only_for_ok_runs_on_in_progress_tickets_without_any_pr(self):
+        own_words = {k: v for k, v in API_401.items() if k not in ("terminal_reason", "api_error_status")}
+        own_words["result"] = "I could not finish: the tests do not import."
+        pr_open = [{"number": 40, "state": "OPEN", "isDraft": True}]
+        pr_merged = [{"number": 41, "state": "MERGED", "isDraft": False}]
+        # n: (log result, labels, open PRs, PRs of any state, outcome)
+        cases = {
+            12: (EARLY_RESULT, IN_PROGRESS, [], [], "early"),
+            13: ({"type": "result", "is_error": False, "result": "PR #31 is ready for review."},
+                 IN_PROGRESS, [], [], "early"),                           # the text claims a PR; there is none
+            14: (EARLY_RESULT, IN_PROGRESS, pr_open, pr_open, "ok"),      # a PR exists: ok
+            15: (EARLY_RESULT, IN_PROGRESS, [], pr_merged, "ok"),          # a merged PR counts (--state all)
+            16: (EARLY_RESULT, ("task", "status:in-review", "size:S", "risk:low"), [], [], "ok"),
+            17: (EARLY_RESULT, ("task", "status:needs-input", "size:S", "risk:low"), [], [], "ok"),
+            18: (EARLY_RESULT, ("task", "status:ready", "size:S", "risk:low"), [], [], "ok"),
+            19: ("Traceback: something else broke", IN_PROGRESS, [], [], "error"),
+            20: (dict(API_401, api_error_status=402), IN_PROGRESS, [], [], "billing"),
+            21: (API_401, IN_PROGRESS, [], [], "auth"),
+            22: (own_words, IN_PROGRESS, [], [], "error"),
+            23: ({"type": "result", "is_error": False, "result": "Done."}, IN_PROGRESS, [], [], "early"),
+            24: (EARLY_RESULT, IN_PROGRESS, [], [{"number": 42, "state": "CLOSED", "isDraft": False}], "ok"),
+            25: (EARLY_RESULT, IN_PROGRESS, [], [], "ok"),                # the issue itself is CLOSED (below)
+        }
+        for n, (result, *_rest) in cases.items():
+            self.ended_run(n, result)
+        self.write_scenario({n: (labels, open_prs, all_prs) for n, (_r, labels, open_prs, all_prs, _o)
+                             in cases.items()}, states={25: "CLOSED"})
+
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+        expected = {n: c[-1] for n, c in cases.items()}
+        self.assertEqual({n: rows[n]["outcome"] for n in rows}, expected)
+        saved = {r["ticket"]: r["outcome"] for r in self.run_records()}
+        self.assertEqual(saved, expected)
+        for n, outcome in expected.items():
+            with self.subTest(ticket=n):
+                state = "ended early (no PR)" if outcome == "early" else f"ended {outcome}"
+                self.assertEqual(rows[n]["state"], state)
+
+        lines = self.run_lines()
+        for n, outcome in expected.items():
+            with self.subTest(ticket=n, text=True):
+                self.assertEqual("ended early (no PR)" in lines[n], outcome == "early", lines[n])
+
+    def test_only_the_board_and_the_pr_decide_early_never_the_ticket_number_or_the_log(self):
+        # Every ticket goes through every label, issue and PR state across the passes (a rotation), each run's log is
+        # one of three byte-identical texts whatever its state (with and without the connectors warning), and each
+        # branch has a slug the ticket number does not give. So no list of ticket numbers, no reading of the log and
+        # no branch built from the number can tell early from ok: only `issue view` (labels and state) and
+        # `pr list --head <branch> --state all`.
+        in_review = ("task", "status:in-review", "size:S", "risk:low")
+        states = [   # (labels, open PRs, PRs of any state, issue state, outcome)
+            (IN_PROGRESS, [], [], "OPEN", "early"),
+            (IN_PROGRESS, [{"number": 60, "state": "OPEN", "isDraft": True}],
+             [{"number": 60, "state": "OPEN", "isDraft": True}], "OPEN", "ok"),
+            (IN_PROGRESS, [{"number": 61, "state": "OPEN", "isDraft": False}],
+             [{"number": 61, "state": "OPEN", "isDraft": False}], "OPEN", "ok"),
+            (IN_PROGRESS, [], [{"number": 62, "state": "MERGED", "isDraft": False}], "OPEN", "ok"),
+            (IN_PROGRESS, [], [{"number": 63, "state": "CLOSED", "isDraft": False}], "OPEN", "ok"),  # closed unmerged
+            (IN_PROGRESS, [], [], "CLOSED", "ok"),                        # the issue is closed, label or not
+            (in_review, [], [], "OPEN", "ok"),
+            (("task", "status:needs-input", "size:S", "risk:low"), [], [], "OPEN", "ok"),
+            (("task", "status:ready", "size:S", "risk:low"), [], [], "OPEN", "ok"),
+        ]
+        logs = [(EARLY_RESULT, True), (EARLY_RESULT, False),
+                ({"type": "result", "is_error": False, "result": "PR #7 ready"}, False)]
+        tickets = [7, 12, 13, 23, 58, 104, 311, 9, 77]
+        branches = {n: f"t/{n}-sweep-{chr(97 + i)}{n * 7}" for i, n in enumerate(tickets)}
+        for k in range(len(states)):
+            self.fresh()
+            plan = {n: states[(j + k) % len(states)] for j, n in enumerate(tickets)}
+            for j, n in enumerate(tickets):
+                result, warning = logs[(j + 2 * k) % len(logs)]
+                self.ended_run(n, result, warning=warning, branch=branches[n],
+                               worktree=os.path.join(self.repo, ".claude", "worktrees", branches[n].replace("/", "-")))
+            self.write_scenario({n: s[:3] for n, s in plan.items()}, branches=branches,
+                                states={n: s[3] for n, s in plan.items() if s[3] != "OPEN"})
+
+            rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+            expected = {n: s[4] for n, s in plan.items()}
+            with self.subTest(rotation=k):
+                self.assertEqual({n: rows[n]["outcome"] for n in rows}, expected)
+                self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()}, expected)
+                for n, outcome in expected.items():
+                    self.assertEqual(rows[n]["state"], "ended early (no PR)" if outcome == "early" else "ended ok")
+                # Early needs both facts: the ticket's labels and every PR of its branch, merged and closed included.
+                calls = self.gh_calls()
+                for n in (n for n, o in expected.items() if o == "early"):
+                    self.assertTrue(any(a[:3] == ["issue", "view", str(n)] for a in calls), (n, calls))
+                    self.assertTrue(any(a[:2] == ["pr", "list"] and "--head" in a
+                                        and a[a.index("--head") + 1] == branches[n]
+                                        and "--state" in a and a[a.index("--state") + 1] == "all"
+                                        for a in calls), (n, calls))
+
+    def test_a_run_without_a_repo_stays_ok_and_asks_gh_nothing(self):
+        # A record with no repo (the key absent, empty or null) cannot say which repository's issue it ran: the sweep
+        # must not read issue N of whatever repository it runs in (here proj, where #7..#9 are in progress with no
+        # PR, so a guess would label them early). The control #10 has its repo and ends early as before. The ids
+        # carry a key no repository here has, so nothing can tie the records to proj.
+        for n, repo in ((7, "absent"), (8, ""), (9, None)):
+            record = self.ended_run(n, EARLY_RESULT, id=f"0123456789ab-{n}-20261013120000")
+            if repo == "absent":
+                record.pop("repo")
+            else:
+                record["repo"] = repo
+            write(os.path.join(self.runs_dir(), record["id"] + ".json"), json.dumps(record))
+        self.ended_run(10, EARLY_RESULT)
+        self.write_scenario({n: (IN_PROGRESS, [], []) for n in (7, 8, 9, 10)})
+
+        p = self.work("runs", "--sweep", "--json")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rows = {r["ticket"]: r for r in json.loads(p.stdout)}
+        self.assertEqual({n: rows[n]["outcome"] for n in rows}, {7: "ok", 8: "ok", 9: "ok", 10: "early"})
+        self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()},
+                         {7: "ok", 8: "ok", 9: "ok", 10: "early"})
+        for n in (7, 8, 9):
+            self.assertTrue(rows[n]["ended_at"], rows[n])
+            self.assertEqual(rows[n]["state"], "ended ok")
+        calls = self.gh_calls()
+        for n in (7, 8, 9):
+            with self.subTest(ticket=n):
+                self.assertFalse([a for a in calls if a[:3] == ["issue", "view", str(n)]], calls)
+                self.assertFalse([a for a in calls if a[:2] == ["pr", "list"] and f"t/{n}-x" in a], calls)
+        self.assertTrue([a for a in calls if a[:3] == ["issue", "view", "10"]], calls)
+
+    def test_dispatch_asks_gh_about_a_freshly_ended_run_once(self):
+        # Three headless runs ended ok since the last sweep: #7 in progress with no PR (early, dispatched again), #8 in
+        # progress with an open PR, #9 in review. One dispatch closes them (the sweep) and picks what to run again
+        # (the redispatch); both need `issue view` and `pr list --head` for the same ticket and branch, and the
+        # answer is the same, so each is asked at most once per ticket in one invocation.
+        pr_open = [{"number": 40, "state": "OPEN", "isDraft": True}]
+        for n in (7, 8, 9):
+            self.ended_run(n, EARLY_RESULT)
+        self.write_scenario({7: (IN_PROGRESS, [], []), 8: (IN_PROGRESS, pr_open, pr_open),
+                             9: (("task", "status:in-review", "size:S", "risk:low"), [], [])})
+
+        p = self.ok("dispatch", "--dry-run")
+        self.assertIn("would start #7 Add the board tool (again after early)", p.stdout)
+        self.assertNotIn("would start #8", p.stdout)
+        self.assertNotIn("would start #9", p.stdout)
+        self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()}, {7: "early", 8: "ok", 9: "ok"})
+        calls = self.gh_calls()
+        for n in (7, 8, 9):
+            with self.subTest(ticket=n):
+                views = [a for a in calls if a[:3] == ["issue", "view", str(n)]]
+                heads = [a for a in calls if a[:2] == ["pr", "list"] and "--head" in a
+                         and a[a.index("--head") + 1] == f"t/{n}-x"]
+                self.assertLessEqual(len(views), 1, calls)
+                self.assertLessEqual(len(heads), 1, calls)
+                if n == 7:                                  # early needs both facts: asked exactly once each
+                    self.assertEqual((len(views), len(heads)), (1, 1), calls)
+
+
+# =========================================================================== the work skill
+SKILL = os.path.join(os.path.dirname(HERE), "skills", "work", "SKILL.md")
+
+
+def skill_text():
+    with open(SKILL, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def skill_front():
+    text = skill_text()
+    return text.split("\n---", 1)[0] if text.startswith("---") else ""
+
+
+def skill_body():
+    text = skill_text()
+    if text.startswith("---"):
+        text = text.split("\n---", 1)[1].split("\n", 1)[1]           # drop the frontmatter
+    return text
+
+
+def blocks(text):
+    """Blank-line-separated blocks of non-empty lines."""
+    out, cur = [], []
+    for line in text.splitlines():
+        if line.strip():
+            cur.append(line)
+        elif cur:
+            out.append(cur)
+            cur = []
+    if cur:
+        out.append(cur)
+    return out
+
+
+def is_preamble(block):
+    """Headings, the Arguments line and the injected ready-tickets listing come before the instructions."""
+    lines = [ln for ln in block if not ln.lstrip().startswith("#")]
+    return not lines or all(ln.startswith(("Arguments:", "Ready tickets:", "!`")) for ln in lines)
+
+
+def first_paragraph():
+    """The first instruction paragraph of the skill, lower-cased, heading lines dropped."""
+    first = next(b for b in blocks(skill_body()) if not is_preamble(b))
+    return " ".join(ln for ln in first if not ln.lstrip().startswith("#")).lower()
+
+
+LIST_ITEM = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+")
+HEADING = re.compile(r"(?m)^(?=#{1,6} )")
+NEGATION = {"never", "not", "no", "none", "nothing", "nor", "neither", "without", "cannot", "don't", "doesn't",
+            "isn't", "aren't", "won't", "shouldn't", "mustn't", "can't"}
+CLAUSE_END = re.compile(r"[.;:!?,()]")
+WORD = re.compile(r"[a-z][a-z'_-]*")
+
+
+def negated(text, at, window=8):
+    """True when a negation word stands within `window` words before text[at], in the same clause."""
+    clause = CLAUSE_END.split(text[:at])[-1]
+    return any(w in NEGATION for w in WORD.findall(clause)[-window:])
+
+
+# Wording that turns a rule into an option: an inverted skill reads as a list of things the orchestrator may leave
+# out or do when it likes. A prohibition is not an option ("never skip a stage", "do not ignore a red check", "is not
+# optional"), and "may" bounded by "only" in its clause ("the turn may end only when ...") is a rule; "not only" is
+# always an opening ("may end ..., not only at X").
+OPTION = re.compile(r"\b(?:optional(?:ly)?|skip(?:s|ped|ping)?|ignor(?:e|es|ed|ing)|omit(?:s|ted|ting)?"
+                    r"|whenever you (?:like|want|wish|choose|prefer|see fit)|as you (?:like|see fit)"
+                    r"|if you (?:have time|like|want|prefer)|at your discretion|up to you)\b")
+NOT_ONLY = re.compile(r"\bnot only\b")
+MAY = re.compile(r"\bmay\b")
+
+
+def permissive_words(text):
+    """The words in lower-cased `text` that leave a rule to choice: [] for a text that only commands and forbids."""
+    found = [m.group(0) for m in NOT_ONLY.finditer(text)]
+    found += [m.group(0) for m in OPTION.finditer(text) if not negated(text, m.start())]
+    for m in MAY.finditer(text):
+        rest = CLAUSE_END.split(text[m.end():])[0]
+        if negated(text, m.start()) or re.match(r"\s+(?:not|never)\b", rest) or re.search(r"\bonly\b", rest):
+            continue
+        found.append("may" + rest[:40])
+    return found
+
+
+def first_paragraph_problems(para):
+    """What the one-turn paragraph (lower-cased) gets wrong; [] when it states the rule."""
+    problems = []
+    if not re.search(r"\b(?:one|single) turn\b", para):
+        problems.append("no one turn")
+    # Agents run in the foreground: said as a directive, not negated, and no "background" anywhere in the
+    # paragraph that is not negated ("never/not/no ... in the background").
+    if not directive_foreground(para):
+        problems.append("no directive to run agents in the foreground")
+    fore, back_negated, _ = foreground_stance(para)
+    if not fore:
+        problems.append("no foreground that is not negated")
+    if not back_negated:
+        problems.append("a background that is not negated")
+    # The orchestrator waits for each agent's result: a "wait" that is not "never wait".
+    if not any(not negated(para, m.start()) for m in re.finditer(r"\bwait", para)):
+        problems.append("no wait")
+    for needle in ("harness-pr ready", "needs-input", "harness-work attempt"):
+        if needle not in para:
+            problems.append(f"no {needle}")
+    if not re.search(r"\bfinal\b[^.;]*\bfailure\b", para):
+        problems.append("no final failure")
+    # "Only" (or "until") governs the end states: in the same sentence as the first of them.
+    if not re.search(r"\b(?:only|until)\b(?:(?!\.\s).)*?(?:harness-pr ready|needs-input|harness-work attempt)", para):
+        problems.append("the end states are not the only ones")
+    words = permissive_words(para)
+    if words:
+        problems.append(f"permissive: {words}")
+    return problems
+
+
+def sentences_of(text):
+    return [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+
+
+def findings_rule_problems(para):
+    """What the first paragraph (lower-cased) gets wrong about review findings; [] when it says that every finding
+    on the ticket's files is fixed before `harness-pr ready` whatever its severity, that only a finding outside them
+    becomes a new ticket, and that the PR body names it and says why."""
+    problems = []
+    sentences = sentences_of(para)
+
+    def fixes_all(s):
+        fixed = [m for m in re.finditer(r"\bfix(?:e[ds])?\b|\bfixing\b", s) if not negated(s, m.start())]
+        return (re.search(r"\bfindings?\b", s) and fixed
+                and re.search(r"\b(?:whatever|regardless of|of any|any|every|all)\b(?:\s+[a-z']+){0,2}\s+severit", s)
+                and re.search(r"\b(?:files?|touch\w*|chang\w*|diff)\b", s)
+                and re.search(r"\bbefore\b[^.!?]*harness-pr ready|harness-pr ready[^.!?]*\bafter\b", s))
+    if not any(fixes_all(s) for s in sentences):
+        problems.append("no sentence: every finding on the ticket's files is fixed before harness-pr ready, "
+                        "whatever its severity")
+    outside = [i for i, s in enumerate(sentences)
+               if re.search(r"\b(?:outside|out of scope|beyond|other files|not (?:on|in) the (?:ticket's )?files)\b", s)
+               and re.search(r"\b(?:new|follow-up|separate) (?:ticket|issue)\b", s)
+               and re.search(r"\b(?:only|except|exception)\b", s)]
+    if not outside:
+        problems.append("no sentence: only a finding outside the ticket's files becomes a new ticket")
+
+    def names_why(s):
+        return re.search(r"\b(?:pr|pull request) (?:body|description)\b", s) and re.search(r"\b(?:why|reasons?)\b", s)
+    if not any(names_why(s) for i in outside for s in sentences[i:i + 2]):
+        problems.append("no sentence: the PR body names the out-of-scope finding and says why")
+    return problems
+
+
+def foreground_stance(text):
+    """(a 'foreground' that is not negated, every 'background' negated, a 'background' at all) in lower-cased text.
+    `run_in_background: false` is one word and never counts as 'background'."""
+    fore = [not negated(text, m.start()) for m in re.finditer(r"\bforeground\b", text)]
+    back = [negated(text, m.start()) for m in re.finditer(r"\bbackground\b", text)]
+    return any(fore), all(back), bool(back)
+
+
+def directive_foreground(text):
+    """A sentence that names agents (itself, or the sentence before it: "run them in the foreground") and says, not
+    negated, that they are 'in the foreground' (or are 'foreground agents'): the rule as an instruction, not a
+    mention."""
+    sentences = re.split(r"(?<=[.!?])\s", text)
+    for i, sentence in enumerate(sentences):
+        if not any(re.search(r"\bagents?\b", s) for s in sentences[max(0, i - 1):i + 1]):
+            continue
+        for m in re.finditer(r"\b(?:in the foreground|foreground agents?)\b", sentence):
+            if not negated(sentence, m.start()):
+                return True
+    return False
+
+
+def closing_lines():
+    """The lines of the last section of the skill: its heading and everything after it."""
+    return HEADING.split(skill_body())[-1].splitlines()
+
+
+def closing_parts(lines):
+    """(heading and lead-in text, the list items) of a closing section's lines, lower-cased."""
+    items, item, prose = [], None, []
+    for ln in lines:
+        if LIST_ITEM.match(ln):
+            item = [LIST_ITEM.sub("", ln, count=1)]
+            items.append(item)
+        elif item is not None and ln.startswith((" ", "\t")) and ln.strip():
+            item.append(ln.strip())                                 # a wrapped item continues
+        else:
+            item = None
+            prose.append(ln)
+    return " ".join(prose).lower(), [" ".join(i).lower() for i in items]
+
+
+def closing_problems(lines):
+    """What a closing section gets wrong about being a checklist with nothing left to choice; [] when right."""
+    problems = []
+    if "checklist" not in lines[0].lower():
+        problems.append(f"the heading is not a checklist: {lines[0]}")
+    prose, items = closing_parts(lines)
+    for where, text in [("closing prose", prose)] + [(f"item {i + 1}", t) for i, t in enumerate(items)]:
+        words = permissive_words(text)
+        if words:
+            problems.append(f"{where} is permissive: {words}")
+    return problems
+
+
+class WorkSkill(unittest.TestCase):
+    def closing_lines(self):
+        return closing_lines()
+
+    def closing_heading(self):
+        return self.closing_lines()[0].lower()
+
+    def closing_section(self):
+        return closing_parts(self.closing_lines())
+
+    def revise_step(self):
+        """The revise step: from the numbered step that runs `harness-pr comments ... --unresolved` up to the next
+        top-level numbered step, heading, or unindented paragraph after a blank line (indented sub-items and
+        continuation lines included)."""
+        lines = skill_body().splitlines()
+        start = next((i for i, ln in enumerate(lines) if re.match(r"^\d+[.)]\s", ln)
+                      and "harness-pr comments" in ln and "--unresolved" in ln), None)
+        self.assertIsNotNone(start, "no numbered step runs `harness-pr comments <P> --unresolved`")
+        end = next((j for j in range(start + 1, len(lines))
+                    if re.match(r"^\d+[.)]\s", lines[j]) or lines[j].startswith("#")
+                    or (lines[j].strip() and not lines[j][0].isspace() and not lines[j - 1].strip())), len(lines))
+        return "\n".join(lines[start:end])
+
+    def test_the_revise_step_runs_the_red_check_against_the_branch_tip_for_new_tests(self):
+        # The branch already carries source changes when the owner's comments need new tests, so the default base
+        # refuses ("Source already changed before the red run"); the revise step says to check with --base HEAD.
+        step = self.revise_step()
+        self.assertIn("harness-red check", step, step)
+        self.assertIn("--base HEAD", step, step)
+        self.assertGreater(step.index("--base HEAD"), step.index("harness-red check"), step)
+        self.assertRegex(step.lower(), r"\btests?\b|test-author", step)
+
+    def test_the_first_paragraph_says_one_turn_foreground_agents_and_when_the_turn_ends(self):
+        para = first_paragraph()
+        self.assertEqual(first_paragraph_problems(para), [], para)
+
+    def test_the_skill_ends_with_the_closing_checklist(self):
+        body = skill_body()
+        last = blocks(body)[-1]
+        items = [ln for ln in last if LIST_ITEM.match(ln)]
+        self.assertGreaterEqual(len(items), 3, last)
+        self.assertTrue(LIST_ITEM.match(last[-1]), last[-1])          # the file ends on a checklist item
+        prose, checklist = self.closing_section()
+        self.assertGreaterEqual(len(checklist), 4, checklist)          # foreground agents and the three end states
+        joined = " ".join(checklist)
+        self.assertIn("harness-pr ready", joined)
+        self.assertIn("harness-board needs-input", joined)
+        self.assertIn("harness-work attempt", joined)
+        self.assertRegex(joined, r"\b(?:foreground|background)\b", joined)
+
+    def test_the_closing_checklist_is_named_as_one_and_tied_to_the_last_message(self):
+        prose, checklist = self.closing_section()
+        # The heading calls it a checklist; the heading or its lead-in says it holds before the final message.
+        self.assertIn("checklist", self.closing_heading())
+        self.assertRegex(prose, r"\bbefore\b.*\b(?:(?:last|final|closing)\b.*\b(?:message|reply|response|report)"
+                                r"|end(?:ing|s)?\b.*\bturn)", prose)
+
+    def test_the_one_turn_rule_and_the_checklist_are_unconditional(self):
+        # Neither the first paragraph nor the closing section (heading, lead-in, every item) leaves anything to
+        # choice: no may, optional, skip, ignore, whenever, "not only" or "if you have time".
+        self.assertEqual(permissive_words(first_paragraph()), [], first_paragraph())
+        self.assertEqual(closing_problems(self.closing_lines()), [], self.closing_lines())
+
+    def test_each_end_state_and_the_foreground_rule_is_its_own_checklist_item_naming_its_command(self):
+        prose, checklist = self.closing_section()
+
+        def holding(pattern):
+            return [i for i, item in enumerate(checklist) if re.search(pattern, item)]
+
+        found = {
+            "ready": holding(r"harness-pr ready"),
+            "needs-input": holding(r"harness-board needs-input"),
+            "final failure": holding(r"harness-work attempt"),
+            "foreground agents": holding(r"\bagents?\b.*\b(?:foreground|background)\b"
+                                         r"|\b(?:foreground|background)\b.*\bagents?\b"),
+        }
+        for what, where in found.items():
+            with self.subTest(item=what):
+                self.assertTrue(where, (what, checklist))
+        # One item per end state: the three commands sit in three different items.
+        end_states = [found["ready"], found["needs-input"], found["final failure"]]
+        self.assertTrue(any(len({a, b, c}) == 3 for a in end_states[0] for b in end_states[1] for c in end_states[2]),
+                        checklist)
+        # The foreground item takes the right side: a foreground that is not negated, or a background that is, and
+        # no background that is not ("agents ran in the background" is the inverse of the rule).
+        stances = {i: foreground_stance(checklist[i]) for i in found["foreground agents"]}
+        self.assertTrue(any(back_ok and (fore or back) for fore, back_ok, back in stances.values()),
+                        (stances, checklist))
+        # An item is a sentence the orchestrator can check, not a bare command or keyword.
+        for item in checklist:
+            with self.subTest(item=item):
+                self.assertGreaterEqual(len(re.findall(r"[a-z][a-z'-]*", item)), 5, item)
+
+    def test_the_one_turn_rule_leads_and_dispatch_the_loop_and_the_checklist_follow_it(self):
+        # The rule is the first paragraph, before the dispatch section; the dispatch section, the loop with its
+        # agents and tools, and the report guidance all survive; the checklist is the last section.
+        body = skill_body()
+        self.assertIn("foreground", first_paragraph())
+        first = next(b for b in blocks(body) if not is_preamble(b))
+        first_at = body.index(next(ln for ln in first if not ln.lstrip().startswith("#")))
+        headings = [m.start() for m in re.finditer(r"(?m)^#{1,6} ", body)]
+        dispatch = [m.start() for m in re.finditer(r"(?im)^#{1,6} .*\bdispatch\b.*$", body)]
+        loop = [m.start() for m in re.finditer(r"(?im)^#{1,6} .*\bloop\b.*$", body)]
+        self.assertTrue(dispatch, body)
+        self.assertTrue(loop, body)
+        self.assertLess(first_at, dispatch[0], "the one-turn rule comes before the dispatch section")
+        self.assertLess(dispatch[0], loop[0], "dispatch comes before the loop")
+        self.assertLess(loop[0], headings[-1], "the loop comes before the closing checklist")
+        self.assertIn("checklist", body[headings[-1]:].splitlines()[0].lower())
+        for needle in ("harness-work dispatch", "harness-work start", "harness-red check", "harness-pr open",
+                       "harness-pr ready", "harness:test-author", "harness:test-breaker", "harness:coder",
+                       "harness:reviewer"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, body)
+        self.assertGreaterEqual(len(re.findall(r"(?m)^\s*\d+[.)]\s", body)), 6)     # the loop's numbered stages
+        self.assertRegex(body[loop[0]:], r"(?i)\breport\b")                          # the report guidance
+        front = skill_front()
+        self.assertRegex(front, r"(?m)^name: work\s*$")
+        self.assertRegex(front, r"(?m)^description: .*\bticket\b.*\bdispatch\b")
+        self.assertIn("/harness:work", front)
+
+    def test_the_first_paragraph_says_every_finding_on_the_tickets_files_is_fixed_before_ready(self):
+        # The owner's scope addition (11:59): in the same first paragraph, every review finding on the files the
+        # ticket touched is fixed before `harness-pr ready`, whatever its severity; only a finding outside the
+        # ticket's files becomes a new ticket, and the PR body names it and says why.
+        para = first_paragraph()
+        self.assertEqual(findings_rule_problems(para), [], para)
+        self.assertEqual(first_paragraph_problems(para), [], para)          # and the one-turn rule still holds
+
+
+# The breaker's inverted skill: agents in the background, no waiting, the turn ends when it likes, the checks optional.
+INVERTED_FIRST = ("every run of this skill is one turn. launch agents in the background with `run_in_background: "
+                  "true`, never wait for their results, and keep going. the turn may end whenever you like, not only "
+                  "at `harness-pr ready`, `harness-board needs-input` or the final failure that `harness-work "
+                  "attempt` records.")
+INVERTED_CLOSING = ["## Optional checks", "Run these if you have time.", "",
+                    "- You may skip `harness-pr ready` when CI is slow.",
+                    "- Ignore `harness-work attempt` and keep going after a failure.",
+                    "- `harness-board needs-input` is optional when the question seems small."]
+# Rules in the ticket outline's own words and plain prohibitions: none of them is an option.
+RULE_SENTENCES = ["With a ticket number the turn may end only when `harness-pr ready` has run.",
+                  "Never skip a stage, and do not ignore a red check.",
+                  "The turn may not end before one of the end states holds; the checklist is not optional.",
+                  "Don't skip `harness-red check` and never omit the evidence file."]
+OPTION_SENTENCES = ["You may skip `harness-pr ready`.",
+                    "Ignore `harness-work attempt`.",
+                    "The turn may end whenever you like, not only at these points.",
+                    "The review is optional.",
+                    "Run the breaker if you have time.",
+                    "You may end the turn after the coder."]
+
+
+class SkillWording(unittest.TestCase):
+    """The wording checks themselves, on text swapped in at test time: a rule in the outline's words or a plain
+    prohibition passes, the breaker's inverted skill and each option sentence fails."""
+
+    def test_rules_in_the_outlines_words_and_plain_prohibitions_pass(self):
+        para = first_paragraph()
+        for sentence in RULE_SENTENCES:
+            with self.subTest(sentence=sentence):
+                self.assertEqual(permissive_words(sentence.lower()), [])
+                self.assertEqual(first_paragraph_problems((para + " " + sentence).lower()), [])
+                lines = closing_lines()
+                self.assertEqual(closing_problems(lines + ["- " + sentence]), [])        # as one more item
+                self.assertEqual(closing_problems(lines[:1] + [sentence] + lines[1:]), [])   # in the lead-in
+
+    def test_the_inverted_skill_and_every_option_sentence_fail(self):
+        problems = first_paragraph_problems(INVERTED_FIRST)
+        self.assertTrue(any(p.startswith("permissive") for p in problems), problems)
+        self.assertIn("a background that is not negated", problems)
+        self.assertIn("no directive to run agents in the foreground", problems)
+        problems = closing_problems(INVERTED_CLOSING)
+        self.assertTrue(any(p.startswith("the heading is not a checklist") for p in problems), problems)
+        for where in ("closing prose", "item 1", "item 2", "item 3"):
+            with self.subTest(where=where):
+                self.assertTrue(any(p.startswith(where + " is permissive") for p in problems), problems)
+        para, lines = first_paragraph(), closing_lines()
+        for sentence in OPTION_SENTENCES:
+            with self.subTest(sentence=sentence):
+                self.assertNotEqual(permissive_words(sentence.lower()), [])
+                self.assertNotEqual(first_paragraph_problems((para + " " + sentence).lower()), [])
+                self.assertNotEqual(closing_problems(lines + ["- " + sentence]), [])
+
+    def test_the_findings_rule_check_takes_any_wording_of_the_rule_and_rejects_a_weaker_one(self):
+        rules = [
+            "Every review finding on the files the ticket touched is fixed before `harness-pr ready`, whatever its "
+            "severity; only a finding outside the ticket's files becomes a new ticket, and the PR body names it and "
+            "says why.",
+            "Fix all review findings in the files this ticket changed before `harness-pr ready`, whatever their "
+            "severity. Only findings outside those files go to a new ticket. The PR body lists each one and the "
+            "reason.",
+            "`harness-pr ready` runs only after every finding on the touched files is fixed, regardless of severity. "
+            "A finding out of scope is the one exception: it becomes a new issue, and the pull request body names it "
+            "and says why it was left.",
+        ]
+        for text in rules:
+            with self.subTest(rule=text):
+                self.assertEqual(findings_rule_problems(text.lower()), [])
+        weaker = [
+            "Fix the high and medium review findings on the ticket's files before `harness-pr ready`; only a finding "
+            "outside the ticket's files becomes a new ticket, and the PR body names it and says why.",
+            "Fix all high-severity findings on the touched files before `harness-pr ready`. Only a finding outside "
+            "the ticket's files becomes a new ticket, and the PR body names it and says why.",
+            "Findings on the ticket's files need not be fixed before `harness-pr ready`, whatever their severity; "
+            "only a finding outside the ticket's files becomes a new ticket, and the PR body names it and says why.",
+            "Every review finding on the files the ticket touched is fixed before `harness-pr ready`, whatever its "
+            "severity, and any finding you would rather not fix becomes a new ticket.",
+            "Every review finding on the files the ticket touched is fixed before `harness-pr ready`, whatever its "
+            "severity; only a finding outside the ticket's files becomes a new ticket.",
+        ]
+        for text in weaker:
+            with self.subTest(weaker=text):
+                self.assertNotEqual(findings_rule_problems(text.lower()), [])
+
+
 # =========================================================================== budget
 class Budget(WorkTest):
     def test_status_exhaust_and_reset(self):
