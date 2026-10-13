@@ -329,7 +329,7 @@ Across the registry: PRs awaiting review (`harness-pr awaiting --all-projects`),
 
 ### harness-standup, harness-projects, harness-worklog
 
-`harness-standup` adds, per project and inside the existing time budget (gh calls run in threads, 6 s): `Board: r ready, p in progress, v in review, q needs input` (only for a project whose `origin` is on github.com); `PRs awaiting you:` lines; `Needs input:` lines (title, first line of the question); `Stale worktrees:` lines; and after the fleet section a `## Budgets` line when any budget is exhausted and a `## Runs` section for headless runs alive or failed in the last day. `harness-projects` and `harness-worklog` are unchanged.
+`harness-standup` adds, per project and inside the existing time budget (gh calls run in threads, 6 s): `Board: r ready, p in progress, v in review, q needs input` (only for a project whose `origin` is on github.com); `PRs awaiting you:` lines; `Needs input:` lines (title, first line of the question); `Stale worktrees:` lines; and after the fleet section a `## Budgets` line when any budget is exhausted and a `## Runs` section for headless runs alive or failed in the last day. `harness-projects` is unchanged. `harness-worklog` counts as the user's own message any non-empty user text that does not start with a tag or whose leading tag, by exact name, is `pasted_content`, `bash-input` or `command-name` (or `command-message` with a `<command-name>` later in the text), so pastes, `!` commands and slash commands bill their block while task notifications, system reminders, local command output, `isMeta` and compaction summaries do not.
 
 ## Templates
 

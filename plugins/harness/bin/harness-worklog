@@ -265,16 +265,37 @@ def mac_zone_problem(zones, sys_tz, sys_name, now, evts, changed=None, gap_minut
 
 
 # ------------------------------------------------------------ transcripts
+LEADING_TAG = re.compile(r"<([A-Za-z][\w:.-]*)")
+# Claude Code stores three kinds of typed input under a leading tag: a paste-only message
+# (<pasted_content>), a `!` command (<bash-input>) and a slash command (<command-name>, or more often
+# <command-message> then <command-name>). Every other leading tag - <task-notification>,
+# <system-reminder>, <local-command-stdout>, <local-command-caveat>, <bash-stdout>, ... - is Claude
+# Code talking, so the rule is an allow-list on the exact tag name.
+HUMAN_TAGS = ("pasted_content", "bash-input", "command-name")
+
+
+def is_human_text(text):
+    text = text.strip()
+    if not text:
+        return False
+    m = LEADING_TAG.match(text)
+    if not m:
+        return True             # plain text, including a '<' that opens no tag ("<3 thanks")
+    if m.group(1) in HUMAN_TAGS:
+        return True
+    return m.group(1) == "command-message" and re.search(r"<command-name[\s>]", text) is not None
+
+
 def is_human_message(entry):
     """A message the user typed: not a tool result, a task notification, a skill load or a summary."""
     if entry.get("type") != "user" or entry.get("isMeta") or entry.get("isCompactSummary"):
         return False
     content = (entry.get("message") or {}).get("content")
     if isinstance(content, str):
-        return bool(content.strip()) and not content.lstrip().startswith("<")
+        return is_human_text(content)
     if isinstance(content, list):
         texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
-        return any(t.strip() and not t.lstrip().startswith("<") for t in texts)
+        return any(is_human_text(t) for t in texts if isinstance(t, str))
     return False
 
 
