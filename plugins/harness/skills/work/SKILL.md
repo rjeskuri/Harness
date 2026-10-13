@@ -11,11 +11,13 @@ Arguments: $ARGUMENTS
 Ready tickets:
 !`harness-board ready 2>/dev/null | head -20`
 
+Every run of this skill is one turn, and a dispatched run (`claude -p`) has no next turn: whatever is unfinished when the turn ends stays unfinished. Run every agent in the foreground, with `run_in_background: false` on each Agent call, and wait for its result before the next step; never launch an agent in the background. With no ticket number the turn ends once `harness-work dispatch` has launched the runs and you have reported them. With a ticket number the turn ends only when `harness-pr ready` has run, `harness-board needs-input` has posted the question (or start found the ticket still waiting for an answer), or `harness-work attempt` has recorded the final failure and its question is posted.
+
 ## No ticket number: dispatch
 Run `harness-work dispatch $ARGUMENTS`. With more than three ready tickets, run it with `--dry-run` first and show the plan. It starts a worktree per ready ticket and launches a headless run billed to the API key, or a background session on the subscription when the API budget is exhausted. Report what was launched, and that notifications arrive when a PR is ready or a ticket needs input. Do not work tickets in this session when dispatching.
 
 ## One ticket: the loop
-You orchestrate; agents do the work; the tools keep the record. Work only in the worktree path that `harness-work start` prints, never in the main checkout. Pass `model: <tier>` on every Agent call: the tier from `harness-board tier N`, or one tier up on escalation (sonnet, opus, fable). When escalating or reviewing on Fable, pass `model: fable` and `effort: xhigh` on the Agent call. The agents commit on the ticket branch and never push; you push (`harness-pr open` on the first pass, `git push` in the worktree after that). After every stage run `harness-work attempt N <stage> pass|fail` and do what it says: `retry` (same tier), `escalate <tier>`, or `needs-input` (go to the last paragraph).
+You orchestrate; agents do the work; the tools keep the record. Work only in the worktree path that `harness-work start` prints, never in the main checkout. Pass `model: <tier>` on every Agent call: the tier from `harness-board tier N`, or one tier up on escalation (sonnet, opus, fable). When escalating or reviewing on Fable, pass `model: fable` and `effort: xhigh` on the Agent call. The agents commit on the ticket branch and never push; you push (`harness-pr open` on the first pass, `git push` in the worktree after that). After every stage run `harness-work attempt N <stage> pass|fail` and do what it says: `retry` (same tier), `escalate <tier>`, or `needs-input` (go to the paragraph after the steps).
 
 1. **Start**: `harness-work start N --json`, then read the ticket context it prints (request, outline, definition of done, tests, context, the epic's goal, blockers, recent comments). Branch on its `previous_status` (the status before start ran): `needs-input` with `answers` (all of the owner's replies since the newest needs-input question, oldest first): together they answer that question; continue with them (start moved the ticket to in-progress). `needs-input` with `waiting: true`: no answer yet and the ticket stays in needs-input; report that and stop. `in-review` (start leaves that label alone) with a PR: go to step 10.
 2. **Tests** (`harness:test-author`, stage `tests`): the context, the worktree, the test command (`HARNESS_TEST_CMD` from `.claude/settings.json`, or the detected default), and the ask for broad behavior tests first. Then `harness-red check --worktree <path>`. Red: continue. Green or no tests: the stage failed; send the author the tool's output.
@@ -32,3 +34,12 @@ When a stage reaches `needs-input`, or an agent reports a question the ticket, t
 
 ## Report
 Ticket and branch, PR URL and state, each stage with tier and attempts, review findings fixed and left, CI state, and anything the user must decide. Short.
+
+## Closing checklist
+Before your last message, every item for your path holds: the first always; with no ticket number, the second; with a ticket number, one of the three end states after it. Otherwise the turn is not over: go back to the unfinished stage.
+
+- Every agent ran in the foreground and you waited for its result; none was launched in the background.
+- No ticket number: `harness-work dispatch` launched the runs and you reported them.
+- Ready: `harness-pr ready <P>` has run and the ticket is `status:in-review`.
+- Needs input: `harness-board needs-input N` has posted the question with its evidence, or start found the ticket still waiting for an answer.
+- Final failure: `harness-work attempt` answered `needs-input` after the stage's last failure, and that question is posted.
