@@ -12,7 +12,7 @@ Usage:
     harness-scaffold labels [PATH]          # harness-board labels ensure, for an existing repo
 
 Templates live in ../templates next to this script and are rendered by plain substitution of
-{{name}}, {{pkg}}, {{stack}}, {{verify_cmd}}, {{test_cmd}}, {{python_version}} and {{year}}:
+{{name}}, {{pkg}}, {{stack}}, {{verify_cmd}}, {{test_cmd}}, {{tests_dirs}}, {{python_version}}, {{year}}:
 - Only those known keys are replaced, and never right after a `$`, so GitHub Actions expressions
   such as ${{ github.ref }} and unknown tokens such as {{number}} pass through untouched.
 - In a text template, a line that holds a placeholder whose value is empty is left out (the none
@@ -23,6 +23,11 @@ Templates live in ../templates next to this script and are rendered by plain sub
   ci-node.yml, pre-commit-python. The plain file (verify.sh, ci.yml, pre-commit) serves the rest.
 - {{pkg}} is the package name in the stack's own convention: the import name for python
   (demo-app -> demo_app), the lower-cased name for node.
+- --verify CMD replaces the stack's checks in scripts/verify.sh and is written as is (no substitution
+  in CMD). Stack none then points CLAUDE_VERIFY_CMD at scripts/verify.sh; python and node keep CMD.
+- {{tests_dirs}} (CLAUDE.md) is the -s directory of a `unittest discover` in --verify, else the tests/,
+  test/ and plugins/*/tests directories on disk, else the stack skeleton's tests/, else empty (the
+  line is dropped).
 
 Rules: an existing file is never overwritten without --force, and each path is reported as
 created, kept or updated. The stack skeleton (pyproject.toml, src/<pkg>/__init__.py,
@@ -203,6 +208,77 @@ def package_name(name, stack):
     return "_" + pkg if pkg[0].isdigit() else pkg
 
 
+def shell_commands(line):
+    """The simple commands of a shell line, each a list of its unquoted words. Splits at ;, &&, ||, |
+    and newlines outside quotes only."""
+    commands, words, word, in_word, quote, i = [], [], "", False, "", 0
+
+    def end_word():
+        nonlocal word, in_word
+        if in_word:
+            words.append(word)
+        word, in_word = "", False
+
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == quote:
+                quote = ""
+            elif c == "\\" and quote == '"' and line[i + 1:i + 2] in ('"', "\\", "$", "`"):
+                i += 1
+                word += line[i]
+            else:
+                word += c
+        elif c in "'\"":
+            quote, in_word = c, True
+        elif c == "\\" and i + 1 < len(line):
+            i += 1
+            word, in_word = word + line[i], True
+        elif c in " \t":
+            end_word()
+        elif c in ";\n|" or line.startswith("&&", i):
+            end_word()
+            commands.append(words)
+            words = []
+            i += 1 if line.startswith(("&&", "||"), i) else 0
+        else:
+            word, in_word = word + c, True
+        i += 1
+    end_word()
+    commands.append(words)
+    return [c for c in commands if c]
+
+
+def discover_start_dir(command):
+    """The -s/--start-directory value (any argparse spelling) of a `unittest discover` in a shell
+    command, or None. A -s on another command is not a tests directory."""
+    found = None
+    for words in shell_commands(command):
+        for at in range(len(words) - 1):
+            if words[at:at + 2] != ["unittest", "discover"]:
+                continue
+            rest = words[at + 2:]
+            for n, word in enumerate(rest):
+                if word in ("-s", "--start-directory"):
+                    found = rest[n + 1] if n + 1 < len(rest) else found
+                elif word.startswith("--start-directory="):
+                    found = word.split("=", 1)[1]
+                elif word.startswith("-s") and not word.startswith("--"):
+                    found = word[2:].lstrip("=")
+    return found or None
+
+
+def tests_dirs(root, stack, verify):
+    """The tests directories CLAUDE.md names: the verify command's discover start directory, else those
+    on disk (tests/, test/, plugins/*/tests), else the stack skeleton's tests/, else none."""
+    start = discover_start_dir(verify) if verify else None
+    if start:
+        return [start.rstrip("/") or start]
+    found = [d for d in ("tests", "test") if (root / d).is_dir()]
+    found += sorted(p.relative_to(root).as_posix() for p in root.glob("plugins/*/tests") if p.is_dir())
+    return found or (["tests"] if stack in MANIFEST else [])
+
+
 def default_test_cmd(root, stack):
     """uv when the project is (or is about to be) a uv project, else the stack's plain runner."""
     if stack == "python":
@@ -254,12 +330,25 @@ def read_template(name, stack):
     return template_path(name, stack).read_text(encoding="utf-8")
 
 
-def settings_json(values, stack):
+def settings_json(values, stack, verify):
+    if verify is not None and stack == "none":     # verify.sh runs the command; this stack has no default
+        values = dict(values, verify_cmd="scripts/verify.sh")
     data = render_json(read_template("settings.json", stack), values)
     data["env"] = {k: v for k, v in data.get("env", {}).items() if v != ""}
     allow = data.setdefault("permissions", {}).setdefault("allow", [])
     allow.extend(rule for rule in STACK_ALLOW[stack] if rule not in allow)
     return json.dumps(data, indent=2) + "\n"
+
+
+def verify_script(values, stack, verify):
+    """scripts/verify.sh: the stack's checks, or only --verify (written as is) when it is given."""
+    text = render_text(read_template("verify.sh", stack), values)
+    if verify is None:
+        return text
+    lines = text.splitlines(keepends=True)
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("cd ")) + 1
+    end = next(i for i, ln in enumerate(lines) if ln.startswith("echo VERIFY OK"))
+    return "".join(lines[:start] + ["\n", verify + "\n", "\n"] + lines[end:])
 
 
 def issue_template(name, stack, dest, values):
@@ -269,12 +358,12 @@ def issue_template(name, stack, dest, values):
     return front + render_text(read_template(name, stack), values)
 
 
-def plan(root, stack, values, ci):
+def plan(root, stack, values, ci, verify=None):
     """[(destination, content, mode)] for every file the scaffold writes into `root`."""
     files = [
         ("CLAUDE.md", render_text(read_template("CLAUDE.md", stack), values), 0o644),
-        (".claude/settings.json", settings_json(values, stack), 0o644),
-        ("scripts/verify.sh", render_text(read_template("verify.sh", stack), values), 0o755),
+        (".claude/settings.json", settings_json(values, stack, verify), 0o644),
+        ("scripts/verify.sh", verify_script(values, stack, verify), 0o755),
     ]
     if ci:
         files += [(".github/workflows/ci.yml", render_text(read_template("ci.yml", stack), values), 0o644),
@@ -623,10 +712,11 @@ def cmd_init(args):
         "stack": stack,
         "verify_cmd": args.verify if args.verify is not None else "scripts/verify.sh",
         "test_cmd": args.test_cmd if args.test_cmd is not None else default_test_cmd(root, stack),
+        "tests_dirs": ", ".join(f"`{d}/`" for d in tests_dirs(root, stack, args.verify)),
         "python_version": PYTHON_VERSION,
         "year": str(dt.date.today().year),
     }
-    files = plan(root, stack, values, ci=not args.no_ci)
+    files = plan(root, stack, values, ci=not args.no_ci, verify=args.verify)
 
     if not committed:
         written = write_files(root, files, args.force, dry)
@@ -676,7 +766,7 @@ def parser():
     init.add_argument("path", nargs="?", help="the project folder (default: the current one)")
     init.add_argument("--name", required=True, help="the project and GitHub repository name")
     init.add_argument("--stack", choices=STACKS, help="default: detected (pyproject.toml or *.py, package.json)")
-    init.add_argument("--verify", metavar="CMD", help="CLAUDE_VERIFY_CMD (default: scripts/verify.sh)")
+    init.add_argument("--verify", metavar="CMD", help="the verify command, written into scripts/verify.sh (default: the stack's checks)")
     init.add_argument("--test-cmd", metavar="CMD", help="HARNESS_TEST_CMD, with {files} (default: per stack)")
     init.add_argument("--github", action="store_true", help="create the private GitHub repository and push main")
     init.add_argument("--register", action="store_true", help="add the project to the harness-projects registry")
