@@ -67,7 +67,7 @@ Verified 2026-10-13 from the Claude Code docs, the gh source at v2.99.0 and the 
 }
 ```
 
-Per project, in `.claude/settings.json` under `env` (read by hooks and tools the way `CLAUDE_VERIFY_CMD` is today: the process environment first, then `.claude/settings.local.json`, then `.claude/settings.json`, so a local file overrides the project file; read from the worktree's own `.claude/`, except the two classification keys tests_first reads from the main checkout's tracked settings, see Hooks):
+Per project, in `.claude/settings.json` under `env` (read by hooks and tools the way `CLAUDE_VERIFY_CMD` is today: the process environment first, then `.claude/settings.local.json`, then `.claude/settings.json`, so a local file overrides the project file; read from the worktree's own `.claude/`, except the two classification keys tests_first and harness-red read from the main checkout's tracked settings, see Hooks):
 
 | Variable | Meaning | Default |
 |---|---|---|

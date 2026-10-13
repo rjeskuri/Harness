@@ -101,7 +101,7 @@ Hooks run outside the sandbox with your permissions. Point `CLAUDE_VERIFY_CMD` a
 
 ## Per-project settings
 
-Under `env` in the project's `.claude/settings.json`; `.claude/settings.local.json` overrides it, and the process environment overrides both.
+Under `env` in the project's `.claude/settings.json`; `.claude/settings.local.json` overrides it, and the process environment overrides both. The exception is `HARNESS_TEST_PATTERNS` and `HARNESS_SOURCE_EXEMPT`: they are read from the environment, then the main checkout's tracked `.claude/settings.json` only, never from a worktree or a `settings.local.json`.
 
 | Variable | Meaning | Default |
 |---|---|---|
