@@ -1,208 +1,372 @@
-# Harness design
+# Harness design, v2
 
-Ryan's personal Claude Code harness. One repository, two plugins, installed once at user scope, applied to every project. Written 2026-10-06 against Claude Code 2.1.285 (CLI) and 2.1.289 (VS Code extension).
+Ryan's personal Claude Code harness. One repository, one plugin, installed once at user scope, applied to every project. v2 written 2026-10-13 against Claude Code 2.1.296 (installed from the latest channel that day; the per-call Agent `effort` parameter arrived in 2.1.292), gh 2.99.0, git 2.39. v1 (2026-10-06) is in git history; what changed and why is in `docs/research/` and in the interview notes at the end of this file.
 
 ## Principles
 
-1. **Additive, never invasive.** The harness never replaces a project's own `CLAUDE.md`, hooks, rules or skills. jotform-glow-sync and HKTrack keep their bespoke guardrails untouched; the harness adds a shared layer beside them.
-2. **Model routing is the main efficiency lever.** Ryan is on a subscription with five-hour and seven-day windows. Fable (the main session) designs, orchestrates and reviews; Opus implements; Sonnet does trivial mechanical work. Effort defaults to xhigh everywhere and is adjustable per agent.
-3. **Deterministic where it must be, advisory where it can be.** Hooks enforce (secret scan, verify before stopping); CLAUDE.md and skills advise.
-4. **Fail open.** A hook that crashes never traps a session: every hook exits 0 on its own errors.
-5. **Hooks run outside the sandbox.** Whatever a hook executes runs with the user's full permissions and without a prompt, so the verify command must be a test command the user trusts, and hook scripts never run code from the edited files.
-6. **Standard library only.** Hooks and tools run on the `python3` from Xcode's command line tools (3.9) or newer; nothing to install.
+1. **The board is the context.** Every unit of work is a GitHub issue: an epic with sub-issue tasks, each carrying the request, an outline, a definition of done and the tests that must pass. Agents read the ticket and its epic before working and write status back. The user's job is to answer questions on tickets and review pull requests.
+2. **Tests before code, proven.** A test-author writes tests from the ticket; a tool proves they fail against the unchanged code; an adversary tries to pass them with a trivial implementation; only then does a coder touch source. A hook denies source edits until the proof exists.
+3. **Never on main.** Each ticket gets its own branch and worktree. A hook denies edits, commits and pushes on main in every repository. GitHub Free does not protect branches on private repos, so the hook is the only block; landing goes through a pull request the user merges.
+4. **Route by labels, escalate by failure.** Opus 5.5 at high effort is the default everywhere. The planner labels each task with size and risk; the labels pick the tier (Sonnet, Opus, Fable). A second failure re-runs one tier up; a third stops and asks on the ticket.
+5. **Spend credits before the subscription.** Interactive sessions use the Max subscription. Dispatched ticket work runs headless and bills the API key; high-risk pull requests get ultrareview, which bills claude.ai usage credits. When a budget is exhausted the dispatcher falls back one step and remembers for a day.
+6. **Additive, never invasive.** Projects keep their own `CLAUDE.md`, hooks, rules and skills. The harness adds the board, the guards and the loop beside them, in every project including jotform-glow-sync.
+7. **Deterministic where it must be, advisory where it can be.** Hooks and tools enforce; prompts advise.
+8. **Fail open, except where a guard is sure.** A hook that hits its own error exits 0 and says so on stderr. The guards deny only when they have established the branch and the path.
+9. **Standard library only.** `python3` 3.9 or newer, `git`, `gh`. Nothing to install.
+10. **Hooks run outside the sandbox**, with the user's permissions and no prompt. The verify and test commands must be commands the user trusts.
 
 ## Layout
 
 ```
 Harness/
-  .claude-plugin/marketplace.json      marketplace "ryan": plugins harness and companion
-  plugins/harness/                      plugin "harness"
+  .claude-plugin/marketplace.json      marketplace "ryan": plugin harness
+  plugins/harness/
     .claude-plugin/plugin.json
-    agents/   coder.md quick.md reviewer.md researcher.md
-    skills/   spec build ship handoff learn standup worklog   (one SKILL.md each)
-    hooks/    hooks.json notify.py session_brief.py after_edit.py verify_on_stop.py readonly_bash.py
-    bin/      harness-standup harness-worklog harness-projects   (executable python3 scripts, on the Bash PATH while enabled)
-    tests/    test_*.py   (python3 -m unittest discover -s plugins/harness/tests)
-  plugins/companion/                    plugin "companion" (a mod)
-    .claude-plugin/plugin.json          names types/index.d.ts
-    hooks/hooks.json                    { "modules": ["./register.tsx"] }
-    hooks/register.tsx
-    types/index.d.ts
-    tests/companion.test.ts             run with: claude plugin test plugins/companion
+    agents/    planner.md test-author.md test-breaker.md coder.md reviewer.md researcher.md quick.md
+    skills/    plan work land new-project handoff learn standup worklog     (one SKILL.md each)
+    hooks/     hooks.json notify.py session_brief.py after_edit.py verify_on_stop.py readonly_bash.py
+               branch_guard.py tests_first.py
+    bin/       harness-board harness-work harness-red harness-pr harness-scaffold harness-digest
+               harness-projects harness-standup harness-worklog        (python3, mode 755, on the Bash PATH)
+    templates/ scaffold templates (see harness-scaffold)
+    tests/     test_*.py, fakegh.py       python3 -m unittest discover -s plugins/harness/tests
   user/CLAUDE.md                        copied to ~/.claude/CLAUDE.md
-  user/settings.snippet.json            merged into ~/.claude/settings.json
-  docs/design.md                        this file
-  docs/verification.md                  claim-by-claim check of the starter kit
-  claude-code-starter-macos/            the starter kit the harness was built from, kept for reference
+  user/settings.snippet.json            merged into ~/.claude/settings.json by scripts/install.sh
+  scripts/install.sh
+  docs/design.md docs/guide.md docs/verification.md docs/research/
 ```
 
-Install (once):
+Every bin script is standalone (no imports between scripts): argparse, standard library, finds nothing through `CLAUDE_PLUGIN_ROOT` (that variable is not set for Bash). Scripts compose by calling each other on PATH and exchanging JSON (`--json`). A script that must call another finds it next to itself (`Path(__file__).resolve().parent`) when it is not on PATH. Each prints one line and exits 1 on a bad invocation or a failed precondition, never a traceback. `gh` is resolved as `os.environ.get("HARNESS_GH", "gh")` so tests can substitute a fake.
 
-```sh
-claude plugin marketplace add /Users/ryaneskuri/portfolio_projects/Harness
-claude plugin install harness@ryan
-claude plugin install companion@ryan
-cp user/CLAUDE.md ~/.claude/CLAUDE.md
-```
+Install (once): `sh scripts/install.sh`. A marketplace added from a local path loads the plugin in place, so edits take effect at the next session start or `/reload-plugins`.
 
-A marketplace added from a local path loads its plugins in place, so edits in this repo take effect at the next session start or `/reload-plugins`.
+## Platform facts this design relies on
 
-## Model routing
+Verified 2026-10-13 from the Claude Code docs, the gh source at v2.99.0 and the GitHub docs; details in `docs/research/`.
 
-| Role | Agent | Model | Effort | Tools |
-|---|---|---|---|---|
-| Design, orchestration, final review | the main session | Fable (settings `model`) | xhigh | all |
-| Implementation | `harness:coder` | opus | xhigh | all |
-| Trivial mechanical tasks | `harness:quick` | sonnet | xhigh | all |
-| Fresh-context review | `harness:reviewer` | fable | xhigh | read-only |
-| Fact-checking, research | `harness:researcher` | opus | xhigh | read-only + web |
+- Plugin agents support `model` (alias, full id or `inherit`) and `effort`; they ignore `hooks` and `permissionMode`. The Agent tool takes `model` per call and, since 2.1.292, `effort`. An agent that omits `effort` runs at the session's level.
+- `"model": "opus"` in settings resolves to Opus 5.5. `modelSettings` is keyed by canonical ids (`claude-opus-5-5`, `claude-fable-5-1`, `claude-sonnet-5-5`); a top-level `effortLevel` does not apply to Opus 5.5.
+- PreToolUse receives `cwd`, `session_id`, `agent_type` (`harness:coder` for plugin agents), `tool_name`, `tool_input` (`file_path` absolute for Edit and Write, `notebook_path` for NotebookEdit, `command` for Bash). It denies with `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "..."}}`; deny wins over every other hook. SessionStart carries no branch; its `cwd` is the worktree root when the session runs in one.
+- `claude -w <name>` creates `.claude/worktrees/<name>` on branch `worktree-<name>` and cannot pick a branch name; `git worktree add` is the way to control the branch. `claude --bg -n <name> "<prompt>"` starts a background session in the cwd with the supervisor's stored login; trust is inherited from the main checkout; a session already in a linked worktree does not self-isolate. `claude rm` leaves a user-created worktree in place.
+- Billing: `ANTHROPIC_API_KEY` and `apiKeyHelper` outrank the subscription login; in `-p` mode the key is used without a prompt. Background sessions cannot be billed separately. Cloud sessions and routines bill the subscription, need a TTY to start, and do not load plugins. `claude ultrareview <PR> --post --json` runs in the cloud, bills usage credits (about 5 to 25 dollars a run), and prints findings.
+- gh: `gh issue create --parent` links a sub-issue (not idempotent on retry); `gh api repos/O/R/issues/N/sub_issues` lists sub-issues with labels; `--blocked-by`, `--add-blocked-by` and `--json blockedBy` are native; a parent never auto-closes. `gh label create --force` updates. `gh pr checks --watch` exits 0, 1 (failure) or 8 (pending) and counts cancelled runs as not failed. The PR author can post a `COMMENT` review with inline comments through `POST /repos/O/R/pulls/N/reviews`; `APPROVE` is refused. `gh pr merge -R O/R --squash --delete-branch` deletes only the remote branch; local cleanup is ours. Branch protection and rulesets return 403 on this account's private repos. Issue types are organization-only; labels it is.
 
-The rule itself lives in `user/CLAUDE.md` so the orchestrator applies it in every project. Workflow scripts follow the same tiers: Opus workers, Fable judges.
+## Settings
 
-Facts that shape the routing (verified 2026-10-06, see docs/research/model-routing.md):
-- Delegation is Claude's judgment, steered by each agent's `description` and by naming the agent in CLAUDE.md or a skill; an `@`-mention of the agent in a prompt guarantees it. Ryan is on Claude Max 20x, so the Pro-plan instruction that holds subagents back does not apply.
-- Plugin subagents ignore the `hooks`, `mcpServers` and `permissionMode` frontmatter fields. The reviewer's and researcher's read-only guard is therefore a plugin-level PreToolUse hook on `Bash` (`hooks/readonly_bash.py`) that acts only when the hook's stdin names `agent_type` as one of those agents and exits 0 for everything else.
-- The Agent tool's per-call `model` is an alias (sonnet, opus, haiku, fable); full IDs go in agent frontmatter. `max` effort cannot be saved in settings; `xhigh` can. A top-level `effortLevel` is ignored by Opus 5.5 and Sonnet 5.5, so the per-model `modelSettings` entries carry the defaults.
-- `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` would force one model on every subagent and defeat the tiers; it is not used.
+`user/settings.snippet.json` (merged into `~/.claude/settings.json` by the installer: `model` and `effortLevel` replace, `modelSettings` is merged per model id (the snippet's entries set or override theirs, entries for other model ids stay), nothing else is touched):
 
-## Harness plugin
-
-### Hooks
-
-All hooks: read JSON from stdin, never raise, exit 0 on their own errors (the one deliberate non-zero exit is the secret scan's exit 2). State lives outside the repo under `$TMPDIR/claude-harness/<sha1 of repo path, 12 hex>/`.
-
-**notify.py** (Notification: `permission_prompt|idle_prompt|agent_needs_input|agent_completed`). A macOS notification naming the repo (basename of `cwd`) and the message. Order: `terminal-notifier` if on PATH (`-title`, `-subtitle <repo>`, `-message`, `-group claude-code-<session_id>`, `-activate $HARNESS_NOTIFY_APP` default `com.microsoft.VSCode`, `-sound $HARNESS_NOTIFY_SOUND` default `Glass`, empty disables); else `osascript display notification`; else print `{"terminalSequence": "\u0007"}`. `title` from stdin or "Claude Code". Always exit 0.
-
-**session_brief.py** (SessionStart: `startup|resume|compact`). Prints JSON `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "<brief>", "sessionTitle": "<repo name>"}}` (omit `sessionTitle` unless `source` is `startup`). The brief, at most 40 lines:
-- `## Session brief: <repo> on <branch>, <n> uncommitted, last commit <relative age>: <subject>`
-- If `docs/agent/handoff.md` exists: its **Next steps** section (first 12 lines of it), else the file's first 20 lines.
-- Else if `docs/PROGRESS.md` exists: the last `## ` block's lines that start with `Next` (max 6 lines).
-- If `docs/agent/specs/` has files: `Latest spec: <path>`.
-- If `docs/plans/feature_list.json` exists and is a list with `passes` fields: the first three `passes: false` items.
-- If `worklog/worklog.csv` exists: `Hours this month: <sum of this month's rows>`.
-Skip entirely (print nothing) when the project's `.claude/settings.json` declares its own `SessionStart` hook, so a project with a bespoke brief is not briefed twice. Not a git repo: the heading carries no git facts, and the sections are still read from the directory. The PROGRESS.md scan ignores lines inside code fences, as the handoff parser does.
-
-**after_edit.py** (PostToolUse: `Edit|Write|NotebookEdit|Bash`). Hook matchers never see files changed through the shell, so for a `Bash` call the hook takes the files `git status` lists (modified or untracked, regular, under 2 MB, newer than the session's last Bash scan or the last 10 minutes, at most 100) and gives them the same two jobs as an edited file; outside a git repo a Bash call does nothing. Two jobs:
-1. Append the edited file's absolute path (`tool_input.file_path` or `notebook_path`) to `<state>/dirty-<session_id>` so the Stop hook knows a verify run is due.
-2. Secret scan of that file when it exists, is under 2 MB and decodes as UTF-8. High-confidence patterns only: AWS access key id `AKIA[0-9A-Z]{16}`; GitHub tokens `gh[pousr]_[A-Za-z0-9]{36,}` and `github_pat_[A-Za-z0-9_]{22,}`; Slack `xox[baprs]-[A-Za-z0-9-]{10,}`; Google `AIza[0-9A-Za-z_-]{35}`; OpenAI `sk-(proj-)?[A-Za-z0-9_-]{20,}`; Anthropic `sk-ant-[A-Za-z0-9_-]{20,}`; Stripe `sk_live_[A-Za-z0-9]{16,}`; private key blocks `-----BEGIN [A-Z ]*PRIVATE KEY-----`; a Jotform-style `apiKey=[0-9a-f]{32}`; and a generic `(api[_-]?key|secret|token|password)\s*[:=]\s*["'][A-Za-z0-9_\-]{24,}["']`. The Anthropic, OpenAI and Stripe patterns carry a `(?<![A-Za-z0-9_-])` lookbehind so kebab-case words ending in `sk` (`task-`, `risk-`) are not keys; the generic assignment pattern is compiled case-insensitively so `API_KEY = "..."` and `apiKey: "..."` are caught, while the provider patterns stay case-sensitive. Skip a line that contains `example`, `placeholder`, `dummy`, `xxxx`, `<`, `${`, `your_` or `REDACTED` (any case), and skip entirely when `HARNESS_SECRET_SCAN=0` or the file contains `harness: allow-secrets`. On a hit: stderr `SECRET pattern in <path>:<line> (<pattern name>): <first 4 chars>… - remove it before continuing; read secrets from the environment or a file that is gitignored.` and exit 2. Otherwise exit 0 silently.
-
-**verify_on_stop.py** (Stop). Opt-in per project through `CLAUDE_VERIFY_CMD`, read from the environment first and then from `env` in the project's `.claude/settings.json` and `.claude/settings.local.json` (so it works whether or not settings `env` is exported to hooks). Behavior:
-- Exit 0 silently when there is no verify command, `background_tasks` is non-empty, or the project's `.claude/settings.json` declares a `Stop` hook of its own (a project with its own verify-on-stop, such as FantasyHockey with the starter kit, is not checked twice). Without a `dirty-<session_id>` file it still watches the working tree: a hash of `git status --porcelain` is stored at every stop; the first stop of a session only stores it, a changed tree counts as dirty and its files join the dirty list, an unchanged tree exits 0.
-- Reset the consecutive-block counter when `stop_hook_active` is false.
-- Fingerprint = sha256 of `git rev-parse HEAD` plus the contents of the dirty files and of every file `git status` lists; if it equals the last green fingerprint, exit 0. The last red or timed-out fingerprint is remembered too, together with the command that produced it: a fresh stop (not a continuation) whose fingerprint and command both match skips the run and says so in one `systemMessage` line, so a Q&A turn after a failure does not re-run the suite, while a corrected `CLAUDE_VERIFY_CMD` runs at once; the two in-turn retries still happen.
-- The command inherits the hook's environment plus `PYTHONDONTWRITEBYTECODE=1` (no stale `.pyc` after a same-second edit). A verify command that leaves a background child holding its stdout is reported as a timeout; such children must redirect their output.
-- Run the command through the shell from the repo root with `CLAUDE_VERIFY_TIMEOUT` seconds (default 300). On timeout or a command that cannot start: `{"systemMessage": "verify_on_stop: ..."}` and exit 0.
-- Pass: record the fingerprint, delete the dirty file, print `{"systemMessage": "verify_on_stop: <command> passed."}`.
-- Fail: at most 2 consecutive blocks: `{"decision": "block", "reason": "<the command> failed:\n<last 60 non-empty lines>\n\nFix the root cause and re-run. Don't delete, skip or loosen tests. If a failure predates your change or is out of scope, say so explicitly."}`. After 2 blocks in a row: `{"systemMessage": "verify_on_stop: still failing after 2 automatic retries; review before trusting this turn."}` and exit 0.
-
-**readonly_bash.py** (PreToolUse: `Bash`). Acts only when the hook's stdin names `agent_type` as `harness:reviewer`, `reviewer`, `harness:researcher` or `researcher`; everyone else gets an immediate exit 0. For those agents it splits the command on shell separators and refuses, with `permissionDecision: deny` and the offending part named, anything that writes files or changes git, package or process state: redirections, `sed -i`, `rm`, `mv`, `cp`, `tee`, `touch`, `chmod`, git subcommands outside the read-only set, installs, Python write calls, `kill`. It is not a sandbox: a test or a script can still write; it closes the routine paths. Plugin subagents ignore frontmatter hooks, which is why the guard lives here.
-
-### bin tools
-
-Executable `python3` scripts (shebang `#!/usr/bin/env python3`, mode 755), `argparse`, standard library. Each prints a one-line error and exits 1 on a bad invocation, never a traceback.
-
-**harness-projects**: the registry at `~/.claude/harness/projects.json`, schema `{"version": 1, "projects": [{"path": "/abs/path", "name": "HKTrack", "billable": false, "client": "", "notes": ""}]}`.
-- `list` (default): a table of name, path, billable, client.
-- `add <path> [--name N] [--billable] [--client C] [--notes T]`: path resolved to absolute; name defaults to the basename; refuses a duplicate path.
-- `set <name|path> [--billable|--no-billable] [--client C] [--notes T] [--name N]`.
-- `remove <name|path>`.
-- `discover`: candidates from the directory names under `~/.claude/projects/` (Claude Code encodes a path by replacing every non-alphanumeric character with `-`; recover the path by trying every split of the hyphens into `/` and `-` and keeping the one that exists as a directory; skip names containing `-claude-worktrees-`). Print the candidates that exist, are not registered, and have a `.git` or a `CLAUDE.md`, with their last session time.
-- `--json` on every subcommand.
-
-**harness-standup**: the cross-project brief. For each registered project (in registry order; `harness-standup <name>` limits to one):
-- heading `## <name>` with the path;
-- git: branch, uncommitted count, ahead/behind the upstream if any, last commit age and subject; "not a git repo" otherwise;
-- last session: the newest mtime among `~/.claude/projects/<encoded path>/*.jsonl`, as a relative age;
-- next: the same sources and order as the session brief (handoff Next steps, PROGRESS.md Next lines, feature_list.json pending items), at most 5 lines;
-- latest spec path when `docs/agent/specs/` exists;
-- hours this month from `worklog/worklog.csv` when the project is billable;
-- sessions: entries of `claude agents --json` whose `cwd` is this path (or under it), as `<name> <status> (<waitingFor>)`; the `claude` binary is looked up on PATH, then `~/.local/bin/claude`; if it cannot run, say so once.
-Then `## Fleet`: every session from `claude agents --json`, waiting ones first, with its cwd basename. Output is Markdown; `--json` prints the raw structure. The fleet call and the projects' git calls each get a 4-second budget, so the whole run stays under 5 seconds; a project that cannot be read gets one line saying so and never stops the others.
-
-**harness-worklog**: a generalized copy of `~/jotform-glow-sync/tools/worklog.py` (read it; keep its algorithm, messages and file formats exactly: 30-minute gap blocks, only blocks containing a human message count, day assignment on the Mac's clock at the time, quarter-hour rounding, the time-zone timeline in `worklog/timezones.csv`, descriptions kept once written, manual rows never touched, the window and expiry rules). Changes:
-- The repo is `--repo PATH`, else `CLAUDE_PROJECT_DIR`, else `git rev-parse --show-toplevel` from the cwd, else the cwd. The log is `<repo>/worklog/worklog.csv`, the timeline `<repo>/worklog/timezones.csv`. Messages that mention `tools/worklog.py` say `harness-worklog` instead; "Ryan" becomes "the user" in docstrings (`is_ryans_message` becomes `is_human_message`).
-- New `init [--since YYYY-MM-DD]`: creates `worklog/timezones.csv` with one row, the Mac's current zone from `--since` (default: the first day of the previous month) with evidence `recorded <today> by harness-worklog init`; refuses to overwrite an existing timeline. `update` without a timeline points at `init` instead of at a RUNBOOK.
-- New `describe --date YYYY-MM-DD --text "..."`: sets the description of that day's auto row (creates the row with 0.25 h only if the day has blocks computed; otherwise refuses and suggests `add`).
-- `export` unchanged; `add` unchanged; `zone` unchanged, except one inherited bug fixed in the copy: `append_zone`'s end-of-file newline check always said a newline was needed, so every appended zone row was preceded by a blank line (the original reads `fh.seek(-1, os.SEEK_END) or fh.read(1)`; the copy seeks, then reads). Tests use a neutral client name, never a real one.
-
-### Tests (plugins/harness/tests)
-
-`python3 -m unittest discover -s plugins/harness/tests -v` passes, offline, under 30 seconds. Cover at least: the secret scan (a hit, a skipped placeholder line, a clean file), the Bash-edit scan and the stop-time tree check, the read-only guard (deny and allow cases, and that only the two agents are guarded), the dirty-file bookkeeping, verify_on_stop's decisions with a fake command (pass, fail, block limit, no command), session_brief's output shape and the skip rule, the registry round trip and `discover`'s path recovery, standup's rendering with a fake registry and a fake `claude agents --json` payload, and worklog's `init` and `describe` plus one block/hours computation on a synthetic transcript. Tests run the scripts as subprocesses or import them by path; they must not touch `~/.claude` (use a temporary HOME and temporary repos).
-
-## Companion plugin (the mod)
-
-A Game Boy style robot that lives in the band above the prompt and reacts to the session. Surfaces: the band is raised in the terminal (a `Raster`) and in the desktop app (an `Svg`). The VS Code chat panel does not raise the band, so in VS Code the robot appears only when `claude` runs in the integrated terminal; the `Svg` branch also serves the test kit's vscode and mobile mounts. Hidden with the `/companion` command (toggle) or its Hide button; the choice persists for the session in `$.state`.
-
-### State (types/index.d.ts)
-
-```ts
-export type Mood = 'idle' | 'thinking' | 'working' | 'waiting' | 'happy' | 'sad'
-declare module 'claude-code' {
-  interface PluginState {
-    companion: { mood: Mood; note: string; frame: number; isHidden: boolean }
+```json
+{
+  "model": "opus",
+  "effortLevel": "high",
+  "modelSettings": {
+    "claude-opus-5-5": { "effortLevel": "high" },
+    "claude-fable-5-1": { "effortLevel": "xhigh" },
+    "claude-sonnet-5-5": { "effortLevel": "high" }
   }
 }
 ```
 
-### Events
+Per project, in `.claude/settings.json` under `env` (read by hooks and tools the way `CLAUDE_VERIFY_CMD` is today: the process environment first, then `.claude/settings.local.json`, then `.claude/settings.json`, so a local file overrides the project file; read from the worktree's own `.claude/`, except the two classification keys tests_first reads from the main checkout's tracked settings, see Hooks):
 
-- `session.start`: register the command `companion` ("Show or hide the companion sprite"); set mood `idle`, note `""`; start a ticker with `$.clock.every(500, ...)` that increments `frame` while the sprite is visible (skip the write while hidden).
-- `prompt.submit`: mood `thinking`, note `""`; `next(e)`.
-- `tool.call`: mood `working`, note from the tool: Bash "running a command"; Edit, Write, NotebookEdit "editing <basename of file_path>"; Read "reading <basename>"; Grep, Glob "searching"; Agent "delegating"; Workflow "orchestrating"; WebFetch, WebSearch "browsing"; otherwise the tool name. Then `const r = await next(e)`; if `r` has `isError` true: mood `sad`, note "that failed", and `$.clock.after(2500, ...)` back to `working` if still sad. Otherwise, on the next tick, a `waiting` look left by this call's permission prompt reverts to `working` (the prompt has been answered by then). Return `r` unchanged.
-- `tool.check`: `const r = await next(e)`; if `r.decision === 'ask'`: mood `waiting`, note "needs you: <tool>". Return `r` unchanged.
-- `turn.complete`: reason `answer`: mood `happy`, note "done", and after 6 s back to `idle` if still happy; `error` or `refusal`: mood `sad`, note "error"; `aborted`: `idle`. `next(e)`.
-- `command.run` `{ command: 'companion' }`: toggle `isHidden`, then set the look to idle (a local command starts no turn, so nothing else would clear a `thinking` left by its `prompt.submit`); return `{ text: 'Companion hidden; /companion shows it again.' }` or `{ text: 'Companion shown.' }`.
-- `ui.render` `{ component: 'AbovePrompt' }`: if `e.props.hasSurvey` or hidden, `next(e)`. Otherwise a `Box` row: the sprite, then a column with `Text bold` "ROBO · <mood>" and `Text dimColor` note, then a `Button key="hide" label="Hide"` whose press sets `isHidden`. When `e.props.bodyColumns < 36`, draw the sprite alone. Read state with `read($, atom)` so the drawing re-runs on writes; write only from handlers and other events with `update($, atom, fn)`.
+| Variable | Meaning | Default |
+|---|---|---|
+| `CLAUDE_VERIFY_CMD` | the whole suite plus lint; verify-on-stop and the coder run it | none (verify-on-stop off) |
+| `HARNESS_TEST_CMD` | runs named test files; `{files}` is replaced by space-separated repo-relative paths | detected: `uv run pytest -q {files}` when `uv.lock` exists, `python3 -m pytest -q {files}` when `pyproject.toml` or `pytest.ini` names pytest, `python3 -m unittest {files}` for other `test_*.py` or `*_test.py`, `npm test -- {files}` when `package.json` has a `test` script, `node --test {files}` for `*.test.js` |
+| `HARNESS_TEST_PATTERNS` | comma-separated globs that mark a path as a test file | `tests/**,test/**,**/test_*.py,**/*_test.py,**/conftest.py,**/*_test.js,**/*.test.js,**/*.test.ts,**/*_test.ts,spec/**` |
+| `HARNESS_SOURCE_EXEMPT` | globs never gated by tests-first | `docs/**,**/*.md,.claude/**,.github/**,.githooks/**,**/*.toml,**/*.cfg,**/*.ini,**/*.json,**/*.yaml,**/*.yml,**/*.txt,**/*.lock,.gitignore,.worktreeinclude,LICENSE*` |
+| `HARNESS_WORKTREE_SETUP` | command run in a fresh worktree | detected: `uv sync` when `uv.lock`, `npm ci` when `package-lock.json`; always followed by copying gitignored files that match `.worktreeinclude` |
+| `HARNESS_ALLOW_MAIN` | `1` disables the branch guard for this project | unset |
+| `HARNESS_TEST_TIMEOUT` | seconds for a red run | 300 |
 
-### Sprite
+Machine-wide, under `env` in `~/.claude/settings.json`: `HARNESS_API_KEY_CMD` (default `security find-generic-password -s harness-anthropic -w`), `HARNESS_NOTIFY_APP`, `HARNESS_NOTIFY_SOUND`, `HARNESS_SECRET_SCAN`, `CLAUDE_VERIFY_TIMEOUT` as before.
 
-14 pixels wide, 12 tall. Palette (Game Boy): `.` transparent (terminal default background; no rect in SVG), `1` `#9bbc0f`, `2` `#8bac0f`, `3` `#306230`, `4` `#0f380f`. Every row below is exactly 14 characters.
+Globs match against the repo-relative path with `/` separators; `**` matches any number of segments including none; a pattern without `/` matches the basename. One matcher function, specified here so every script agrees: split the pattern on `/`, walk segments, `**` consumes zero or more, other segments use `fnmatch`.
 
-Base frame:
+## State
+
+- `~/.claude/harness/projects.json`: the registry (unchanged, v1 schema).
+- `~/.claude/harness/budgets.json`: `{"api": {"exhausted_until": ISO-8601 or null, "reason": ""}, "cloud": {...}}`.
+- `~/.claude/harness/runs/<repo-key>-<issue>-<yyyymmddHHMMSS>.json`: one headless or background run (schema under harness-work).
+- `~/.claude/harness/digest/<yyyy-mm-dd>.md`: the daily digest.
+- `~/.claude/harness/repos/<repo-key>/`: durable per-repository state: `tickets/<issue>.json` (ticket cache), `red/<branch-slug>.json` (red proofs), `scratch/<branch-slug>/` (the adversary's working copy), `ultra/<pr>.json`.
+- `$TMPDIR/claude-harness/<repo-key>/`: the v1 ephemeral state (dirty lists, fingerprints), unchanged.
+
+`repo-key` is the first 12 hex digits of the sha1 of the real path of the **main** working tree, found as the parent of `git rev-parse --git-common-dir` resolved to an absolute path. A linked worktree and its main checkout therefore share one state directory. `branch-slug` is the branch name with `/` replaced by `-`.
+
+Ticket cache `tickets/<N>.json`:
+
+```json
+{"number": 12, "title": "...", "url": "...", "type": "task|bug|chore|refactor|epic",
+ "status": "ready|in-progress|in-review|blocked|needs-input|closed", "size": "S|M|L|null", "risk": "low|high|null",
+ "flags": ["no-tests", "needs-local", "priority:high"], "labels": ["..."], "tier": "sonnet|opus|fable",
+ "parent": {"number": 3, "title": "...", "goal": "first paragraph of the epic's Goal section"} | null,
+ "blocked_by": [{"number": 9, "state": "OPEN|CLOSED"}],
+ "body": "...", "sections": {"request": "...", "outline": "...", "definition_of_done": ["..."], "tests": ["..."], "context": "..."},
+ "comments": [{"author": "rjeskuri", "created_at": "...", "body": "..."}],
+ "fetched_at": "...", "branch": "t/12-slug" | null, "worktree": "/abs/path" | null, "started_at": "..." | null,
+ "attempts": [{"stage": "tests|breaker|code|review|ci", "tier": "opus", "result": "pass|fail", "at": "..."}]}
+```
+
+Red record `red/<branch-slug>.json`:
+
+```json
+{"branch": "t/12-slug", "base_sha": "<merge base>", "test_files": ["tests/test_x.py", "tests/conftest.py", "tests/fixtures/a.json"],
+ "run_files": ["tests/test_x.py"], "test_hash": "sha256 over path + newline + bytes of every test file, sorted",
+ "cmd": "...", "exit": 1, "kind": "assertion|import|error|green", "tail": "last 40 lines", "at": "..."}
+```
+
+`test_files` is every changed path matching `HARNESS_TEST_PATTERNS` (fixtures and `conftest.py` included) and all of them are hashed; `run_files` is the subset passed to the test command, those whose basename matches `test_*.py`, `*_test.py`, `*.test.js`, `*_test.js`, `*.test.ts`, `*_test.ts`, `*.test.mjs`, `*.spec.js` or `*.spec.ts`. A change with no runnable file is refused.
+
+## The board
+
+GitHub Issues in each project's private repository. An **epic** is an issue labeled `epic`; its **tasks** are sub-issues. Dependencies use GitHub's native blocked-by. Status, type, size, risk and flags are labels. Done is closed.
+
+Labels (name, color, meaning), created idempotently by `harness-board labels ensure`:
+
+| Group | Labels |
+|---|---|
+| type | `epic` 5319E7, `task` 0E8A16, `bug` D73A4A, `chore` BFD4F2, `refactor` C2E0C6 |
+| status | `status:ready` 0052CC, `status:in-progress` FBCA04, `status:in-review` D4C5F9, `status:blocked` B60205, `status:needs-input` E99695 |
+| size | `size:S` C5DEF5 (one sitting, one or two files), `size:M` BFDADC, `size:L` F9D0C4 (the cap: about 5 files or 300 lines; anything bigger is split) |
+| risk | `risk:low` E6E6E6, `risk:high` B60205 (data loss, money, live systems, security, minors' data) |
+| flags | `no-tests` EDEDED (docs or config only; exempt from tests-first), `needs-local` FEF2C0 (needs this Mac's files or credentials), `priority:high` FF7F0E |
+
+Tier rubric, implemented once in `harness-board tier`: `size:S` and `risk:low` and type not `bug` gives `sonnet`; `size:L` or `risk:high` gives `fable`; everything else gives `opus`. Escalation order is sonnet, opus, fable.
+
+Task body template (`templates/ticket_task.md`; the planner fills it, the scaffold installs it as a GitHub issue template too):
+
+```markdown
+## Request
+<what was asked, in the requester's words, one paragraph>
+
+## Outline
+1. <step>
+
+## Definition of done
+- [ ] <observable, testable statement>
+
+## Tests that must pass
+Broad behavior first, specific cases after. One line each: where, and what it proves.
+- `tests/test_<area>.py::test_<behavior>`: <the contract it pins down>
+The existing suite (`<verify command>`) stays green.
+
+## Context
+- `<path>`: <why it matters>
+- Must not change: <...>
+```
+
+Epic body template (`templates/ticket_epic.md`): `## Goal`, `## Why`, `## Scope` and `## Out of scope`, `## Definition of done`, `## Verification` (the end-to-end commands), `## Decisions and open questions`. Tasks are the sub-issues; no task list in the body.
+
+## Agents
+
+| Agent | Model, effort | Tools | Job |
+|---|---|---|---|
+| `planner` | opus, xhigh | Read, Grep, Glob, Bash (read-only guard) | Turns an interviewed request into an epic and tasks in the templates, with sizes, risks, flags and blocked-by, under the size cap. Returns a proposal; creates nothing. |
+| `test-author` | opus (tier override per call), effort inherited | all | Writes the tests the ticket names, broad behavior first, against the public interface, and runs them to show them red. The tests-first hook denies it any source edit. |
+| `test-breaker` | opus (tier override), inherited | all | In the scratch copy, writes the cheapest implementation that could pass the new tests (constants, special-casing the fixtures) and runs them. If it passes, the tests are too narrow. Denied test edits by the hook. |
+| `coder` | opus (tier override), inherited | all | Makes the tests and the verify command green with the smallest coherent change, commits on the ticket branch, reports evidence. Denied test edits by the hook; stops and reports when the change outgrows the size cap. |
+| `reviewer` | fable, xhigh | Read, Grep, Glob, Bash (read-only guard) | Reviews the branch against the ticket's definition of done; returns findings as JSON lines for the PR. |
+| `researcher` | opus, inherited | WebFetch, WebSearch, Read, Grep, Glob, Bash (read-only guard) | Primary-source fact checking, as in v1. |
+| `quick` | sonnet, inherited | all | Trivial mechanical tasks outside the ticket loop, as in v1. |
+
+The orchestrator passes `model` on the Agent call from `harness-board tier` (and `effort` too once the Agent tool offers it: `high` by default, `xhigh` when escalating to Fable). The read-only guard (`readonly_bash.py`) now covers `planner`, `reviewer` and `researcher`.
+
+## Skills
+
+| Skill | Replaces | What it does |
+|---|---|---|
+| `plan [request]` | `spec` | Reads the code, interviews the user with AskUserQuestion, hands the answers to `planner`, shows the proposal (epic, tasks, sizes, risks, dependencies, tests) as a compact table, and on approval creates the issues with `harness-board`. |
+| `work [issue#]` | `build` | With a number: runs that ticket to a ready pull request in this session (the loop below). Without: `harness-work dispatch`, one headless or background session per ready ticket. |
+| `land [PR#]` | new | Without a number: the PRs awaiting the user. With one: summary (ticket, definition of done, review findings, checks), one confirmation, then `harness-pr land`. |
+| `new-project [path]` | new | Short interview (name, stack, verify command, GitHub yes or no, billable), then `harness-scaffold`, confirmation before the repository is created and pushed, then suggests `/harness:plan`. |
+| `learn` | changed | Same analysis as v1; every proposal becomes a `chore` ticket (body: the proposed diff and the reasoning) via `harness-board task create`, no edits on the spot. |
+| `standup` | changed | Adds per project: board counts, PRs awaiting review, needs-input tickets, stale worktrees, failed runs; and the budget line. |
+| `handoff`, `worklog` | unchanged | |
+
+### The work loop (one ticket, in-session)
 
 ```
-......4.......
-......4.......
-...44444444...
-..4111111114..
-..4144114414..
-..4144114414..
-..4111111114..
-...44444444...
-.442232232244.
-44.22222222.44
-...42222224...
-...44....44...
+harness-work start N            ticket context, branch t/N-slug, worktree, status in-progress, tier
+test-author (tier)              tests only; must show them red
+harness-red check               proof: tests fail, source untouched; record written
+test-breaker (tier)             scratch copy; cheat attempt; pass means tests go back to the author (max 2 rounds)
+coder (tier)                    source only; new tests and CLAUDE_VERIFY_CMD green; commits
+reviewer (fable)                findings JSON; high and medium go back to the coder (max 2 rounds)
+harness-pr open N               push, draft PR from the template (Closes #N, DoD, red proof, verify tail)
+harness-pr review P --findings  inline review comments from the reviewer's JSON
+harness-pr checks P --wait      CI; failures go back to the coder (max 2 rounds)
+[harness-pr ultra P]            when risk:high: ultrareview, posted to the PR
+harness-pr ready P              ready for review, status in-review, notification
 ```
 
-Frames per mood, each a 12-row array of 14-character strings. "Base with row N = X" means the base frame with that one row replaced.
+Failure policy, enforced by `harness-work attempt`: the first failure of a stage retries at the same tier; the second re-runs one tier up; the third calls `harness-board needs-input` with the evidence and stops. A stage is `tests` (red cannot be reached), `breaker` (tests still cheatable after two rounds: proceed, but say so in the PR), `code` (verify not green), `review` (findings not fixed), `ci` (checks red). Any question the agents cannot answer from the ticket, the epic or the code also ends in `needs-input`. A revisit of a ticket with `status:needs-input` and a newer comment by the repository owner passes that comment to the agents as the answer. A revisit of a ticket in `status:in-review` with unresolved review threads from the owner runs the coder on those comments only, then checks and ready again.
 
-- idle: A = base. B (blink) = base with row 4 = `..4111111114..`. Show B on one tick in eight, A otherwise.
-- thinking: A = base. B = base with row 0 = `......2.......` and row 1 = `......3.......` (the antenna glows). Alternate every tick.
-- working: A = base. B = base with row 8 = `44422322322444` and row 9 = `...22222222...` (arms pumped up), and with the chest lights swapped: in B the `3` pixels of row 8 become `2` and the `2` pixels directly beside them become `3`. Alternate every tick.
-- waiting: A = base with row 4 = `..4141114114..` (pupils left). B = base with row 4 = `..4114111414..` (pupils right). Row 5 stays as in the base. Alternate every tick.
-- happy: A = base with row 4 = `..4141111414..` and row 5 = `..4114114114..` (smiling arcs). B = A shifted up one row (drop row 0, append a blank row of 14 dots), a bounce. Alternate every tick.
-- sad: one frame: base with row 0 = `..............`, row 1 = `......44......` (the antenna droops), row 4 = `..4111111114..` (eyes low, pupils only on row 5).
+## Hooks
 
-Terminal encoding: one `Raster` with `key: "sprite"`, `columns: 14`, `rows: 6`. Cell (column c, row r) covers pixels (c, 2r) top and (c, 2r+1) bottom. Both opaque: glyph `▀` (upper half block), foreground = top color, background = bottom color. Top only: `▀` with background `0x01000000` (the terminal default). Bottom only: `▄` (lower half block), foreground = bottom color, background default. Neither: a space with both default. Colors are `0x00RRGGBB`. `cells` is standard padded base64 of little-endian u32 triplets `[codePoint, fg, bg]`, row-major, built with a `Uint32Array` and `new Uint8Array(words.buffer).toBase64()`.
+`hooks.json` wires: Notification to `notify.py`; SessionStart to `session_brief.py`; PreToolUse `Bash` to `readonly_bash.py`, `branch_guard.py` and `tests_first.py`; PreToolUse `Edit|Write|NotebookEdit` to `branch_guard.py` and `tests_first.py`; PostToolUse `Edit|Write|NotebookEdit|Bash` to `after_edit.py`; Stop to `verify_on_stop.py`. Timeouts 10 s for the guards.
 
-SVG encoding (desktop, vscode, mobile): `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 14 12" width="56" height="48" shape-rendering="crispEdges">` with one `<rect x y width="1" height="1" fill>` per opaque pixel; `alt` = "ROBO, <mood>". Pass `width={56}` and `height={48}`.
+**branch_guard.py** (PreToolUse `Edit|Write|NotebookEdit|Bash`). Fail open. Exempt when `HARNESS_ALLOW_MAIN` is `1` (environment or project settings).
+- Edit, Write, NotebookEdit: take `file_path` or `notebook_path`; walk up to an existing directory; `git -C <dir> symbolic-ref --short HEAD`; if the branch is `main` or `master` and `git rev-parse --verify HEAD` succeeds (the repo has a commit), deny, except for a path under `docs/agent/` (the handoff note and specs, which the session brief reads) and for an untracked path that `git check-ignore` reports as ignored (local settings, `.env`, scratch files): `On main in <repo basename>. Work happens on a ticket branch: harness-work start <issue#> for a ticket, or git switch -c t/<n>-<slug> for untracked work.` Outside a repo, on a detached HEAD, or on an empty repo: allow.
+- Bash: split the command on `;`, `&&`, `||`, `|`, `&` and newlines (and inside `(...)`, `$(...)`, `sh -c`, `eval`, a heredoc a shell reads and a `-c alias.x='!...'` git alias) and judge each part in the directory it runs in: `cwd`, moved by `cd`/`pushd` (an empty target, or one that is not a directory, leaves it unchanged unless `&&` follows, since a failed `cd` stops the chain; an unresolvable target such as `$VAR` makes it unknown and the repo rules allow), restored after a subshell, substitution or child shell; git's directory also follows `-C`, `--git-dir` and `--work-tree`, and `-c alias.<x>=` aliases are expanded. Deny when (a) a part writes a path whose repo (that of the nearest existing directory; `.git/...` belongs to the repo around it) is a main working tree on `main` or `master` with a commit, from any cwd: a redirection or `tee` to it, `cp`, `mv`, `install`, `ln`, `rsync` or `dd of=` into it, `mv`, `rm`, `touch`, `truncate` or `chmod` of it, `sed`/`gsed -i`, `perl -i`, `awk -i inplace`, `ed` or `patch` on it (`xargs` with one of these counts as writing the current directory); a path under `<top>/.claude/worktrees/`, in a linked worktree or outside any repo is never refused, nor is `mkdir`; (b) git runs in such a repo and the part is `git commit`, `merge` (unless `--ff-only`), `rebase`, `cherry-pick`, `revert`, `am`, `apply` (except `--check`/`--stat`/`--numstat`/`--summary`), `reset`, `rm` (except `--cached` or `-n`), `mv`, `clean` (except `-n`), `restore` (except `--staged` alone), `stash pop|apply`, `checkout` of paths or `-B main`, `switch -C main`, `branch -f|-m|-C` onto main or `-D|-d main|master`, `update-ref` or `symbolic-ref` writing `HEAD` or main, or `git push` with no refspec, of `HEAD`, or with `--delete`/`:` of any branch; (c) the part runs in such a repo and is `python -c`, `node -e`, or a python or node program read from a heredoc, that opens a file for writing or writes, moves or deletes files; (d) on any branch, in any repo state, including linked worktrees and outside a repo: any `git push` with `--force`, `-f`, `--force-with-lease`, a `+refspec` or a short-flag cluster containing `f`, or whose destination names `main` or `master` (`main`, `HEAD:main`, `x:refs/heads/main`, `:main`, `--delete main`), or with `--mirror`, `--all`, a matching `:` or a wildcard reaching main (`HARNESS_ALLOW_MAIN=1` turns off the whole guard, this included). Reason text names the part. Allowed on main: everything that reads, `git fetch`, `git pull`, `git switch`, `git checkout <branch>`, `git worktree ...`, `gh ...`, `harness-* ...`, the verify command.
+- Never deny inside a linked worktree (its branch is never main), never deny for a different repo than the one on main. A command that is exactly the project's `CLAUDE_VERIFY_CMD` is always allowed. `mv` is refused when either path is in a protected repo; `cp`, `install`, `ln` and `rsync` only by destination.
 
-### Tests (tests/companion.test.ts)
+**tests_first.py** (PreToolUse `Edit|Write|NotebookEdit|Bash`). Fail open. For Bash it uses branch_guard's walker: each path a part writes (redirections, `tee`, `cp`/`mv`/`install`/`ln`/`rsync`/`dd` destinations, `rm`, `touch`, `truncate`, `chmod`, in-place `sed`/`perl`/`awk`, `ed`, `patch` with a named file, `git checkout`/`restore` of paths, `git rm`, `git mv`), resolved against the part's directory, goes through steps 1 to 5 as an edit would, except that an untracked path git ignores passes unless it is test configuration; and for `test-author`, `coder` and `test-breaker` on a ticket branch, a `python -c`, `node -e` or heredoc program that writes files is denied: `Write files with Edit or Write so the tests-first rules can see the path.`
+1. Resolve the file's repo and branch as above. Not a repo, or branch not matching `^t/(\d+)-` → allow. Detached HEAD → allow, except in the test-breaker's scratch copy (a worktree under `~/.claude/harness/repos/<key>/scratch/`), where the role rules of step 3 still apply and the red-run check does not.
+2. Classify the repo-relative path: test (`HARNESS_TEST_PATTERNS`), exempt (`HARNESS_SOURCE_EXEMPT`), else source; these two keys come from the environment, then the main checkout's tracked `.claude/settings.json` (the parent of `git rev-parse --git-common-dir`), never the worktree's files and never `.claude/settings.local.json` (a gitignored file any agent can edit must not decide what counts as a test). For the role rules, `.claude/settings.json`, `.claude/settings.local.json`, `pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini`, `conftest.py`, `jest.config.*`, `vitest.config.*` and `package.json` are test configuration.
+3. Role rules from `agent_type` (compare the part after the last `:`): `test-author` editing source → deny `You write tests only on this ticket. Report the source change the implementation needs; the coder makes it.`; `coder` editing a test → deny `Tests are fixed for this ticket. If a test is wrong, stop and report it; the orchestrator sends it back to the test-author.`; `coder` editing test configuration → deny `<path> decides which tests run and how, so it is fixed for this ticket like the tests. If it has to change, stop and ask the orchestrator.`; `test-breaker` editing a test or test configuration → deny.
+4. Source edit by anyone: read `tickets/<N>.json`. `no-tests` in flags or labels → allow. A green record on a non-refactor ticket → deny (the tests do not test the change). A file listed in the record that no longer exists counts as changed. A corrupt cache or record counts as missing. Load `red/<branch-slug>.json`; missing → deny `Tests first on t/N: write the tests, then run harness-red check. (No red run recorded.)`; type `refactor` → allow when a record exists (green is fine); otherwise require `kind` to be `assertion`, `import` or `error` (missing or other → deny `The red record for t/N does not say how the tests failed; run harness-red check again.`) and `test_hash` equal to the sha256 of the record's test files as they are on disk now → allow; mismatch → deny `Tests changed since the red run; run harness-red check again.` No ticket cache → treat as a task without flags (deny until red) and say `harness-work start N` writes the cache.
+5. Test and exempt edits → allow silently.
 
-With `claude-code/testing`: mount `AbovePrompt` on `terminal` and assert the tree holds a `Raster` with key `sprite`; mount on `vscode` and assert an `Svg`; press `hide` and assert the next mount yields nothing of the plugin's; mount with `props.hasSurvey: true` and assert the plugin yields. Run with `claude plugin test plugins/companion`; `claude plugin validate plugins/companion` must pass.
+**readonly_bash.py**: GUARDED gains `harness:planner` and `planner`. Otherwise unchanged.
+
+**session_brief.py**: after the heading, when the branch matches `^t/(\d+)-`: `Ticket #N: <title> (<status>, tier <tier>)`, up to six definition-of-done lines, `Red run: <kind> at <time>` or `Red run: none`, from the cache files only (no network). Otherwise, when the repo has an `origin` remote and `gh` answers within 3 s: `Board: <r> ready, <p> in progress, <v> awaiting your review, <q> needs input`. When `budgets.json` marks a budget exhausted: `Budget: api exhausted until <time> (<reason>)`. Still at most 40 lines; the rest as in v1.
+
+`notify.py`, `after_edit.py`, `verify_on_stop.py`: unchanged.
+
+## bin tools
+
+### harness-board
+
+`harness-board <sub> [--repo PATH] [--json]`. Repo: `--repo`, else `CLAUDE_PROJECT_DIR`, else the toplevel of the cwd. `OWNER/REPO` from `gh repo view --json nameWithOwner`; no remote or no `gh` login → one line, exit 1.
+
+- `labels ensure`: the label table above, `gh label create <name> --color <hex> --description <text> --force`. Prints how many were created or updated.
+- `epic create --title T --body-file F [--size S] [--risk R]`: labels `epic`, `status:ready`, size and risk when given. Prints `#N <url>`.
+- `task create --title T --body-file F [--parent N] [--type task|bug|chore|refactor] [--size S|M|L] [--risk low|high] [--blocked-by N[,N]] [--no-tests] [--needs-local] [--priority]`: checks the remote and login first (`gh repo view`), creates the issue without `--parent`, then links it with `gh api -X POST repos/O/R/issues/<parent>/sub_issues -F sub_issue_id=<numeric id from gh issue view --json id? no: REST .id>` (the numeric database id, from `gh api repos/O/R/issues/N --jq .id`); a failed link is retried once and then reported with the issue number so no duplicate is ever created. Then `gh issue edit N --add-blocked-by`. Labels: type (default `task`), `status:ready`, size, risk, flags.
+- `show N [--markdown]`: `gh issue view N --json number,title,url,body,labels,state,parent,blockedBy,comments`; when the issue is an epic, `gh api repos/O/R/issues/N/sub_issues` for the tasks with labels and state; parses the body sections (headings `## Request`, `## Outline`, `## Definition of done` as checkbox lines, `## Tests that must pass`, `## Context`); writes the cache (preserving `branch`, `worktree`, `started_at`, `attempts` from an existing cache); prints JSON, or with `--markdown` the ticket context, at most 120 lines: title and labels, the sections, the epic's goal paragraph, blocked-by numbers with state, the last 10 comments (author, date, first 20 lines each).
+- `ready`: open issues with `status:ready` and not `epic`, whose `blockedBy` are all closed, `priority:high` first, then lowest number first. Table or JSON (number, title, type, size, risk, tier, flags).
+- `status N <ready|in-progress|in-review|blocked|needs-input> [--comment TEXT]`: removes every `status:*` label, adds the new one, comments when asked.
+- `comment N (--body TEXT | --body-file F)`.
+- `needs-input N --question TEXT [--evidence-file F]`: `status needs-input`, a comment `**Needs your input**` with the question, the evidence (fenced, at most 60 lines) and the line `Reply in a comment; /harness:work N picks it up.`, then a macOS notification `<repo> #N needs input` (terminal-notifier, else osascript; same lookup as notify.py). Prints the URL.
+- `answers N [--since ISO]`: comments by the authenticated user (`gh api user --jq .login`) newer than `--since` (default: the newest `**Needs your input**` comment, else the cache's `fetched_at`, else no bound), skipping the harness's own comments (posted under the same account): every comment harness-board posts (`comment`, `status --comment`, `needs-input`, `close --comment`, `epic-check`) ends with the line `<!-- harness -->`, and older ones are recognised by a body starting `**Needs your input**`, `Started on `, `PR #` or `Landed in `. JSON. `status`, `close` and `epic-check` also refresh an existing cache so the session brief never shows a stale status.
+- `close N [--comment TEXT]`; `epic-check N`: when `subIssuesSummary.completed == total` and total > 0, comment `All tasks landed.` and close the epic.
+- `board`: markdown by status, counts in the headings, `#N title (type, size, risk)` lines; `--json` the same structure.
+- `tier N`: `sonnet`, `opus` or `fable` per the rubric; from the cache when present, else fetched.
+
+### harness-work
+
+- `start N [--repo PATH]`: `harness-board show N` (cache); refuse an epic, a closed issue, a blocked ticket (open blockers listed) or `status:blocked`; `git fetch origin`; branch `t/N-<slug>` (slug: title lower-cased, non `[a-z0-9]` runs to `-`, trimmed, at most 30 chars); if `origin/t/N-*` exists reuse that branch, else `git worktree add <main>/.claude/worktrees/t-N-<slug> -b t/N-<slug> origin/main` (when the worktree already exists, reuse it); ensure `.git/info/exclude` lists `.claude/worktrees/`; run `HARNESS_WORKTREE_SETUP` or the detected setup in the worktree, then copy gitignored files matching `.worktreeinclude` from the main checkout; `harness-board status N in-progress --comment "Started on t/N-<slug> (<hostname>, <venue>)"` unless already in progress; record `branch`, `worktree`, `started_at` in the cache. Prints JSON `{"number", "branch", "worktree", "tier", "context": "<markdown>"}`; without `--json` prints the worktree path and then the markdown context.
+- `attempt N <stage> <pass|fail> [--tier T]`: appends to the cache and prints the next action for that stage on failure: `retry` (one failure so far), `escalate <tier>` (two failures; the tier above the last used, Fable stays Fable), `needs-input` (three). Prints `done` on pass.
+- `dispatch [--max 3] [--venue headless|bg] [--dry-run]`: first `runs --sweep` (below); then `harness-board ready`; skip tickets that have a live run; for each remaining up to `--max` minus live runs: `start N`, then launch:
+  - venue `headless` (default when `budgets.json` shows `api` not exhausted): in the worktree, `claude -p "/harness:work N" --permission-mode auto --output-format json --settings <json>` where the settings JSON is `{"apiKeyHelper": "<HARNESS_API_KEY_CMD>"}` (the key itself never appears on a command line or in the environment), detached with `nohup`/`setsid`-equivalent (`subprocess.Popen(start_new_session=True)`), stdout and stderr to `~/.claude/harness/runs/<id>.log`;
+  - venue `bg` (fallback): in the worktree, `claude --bg -n "<repo> #N <title>" "/harness:work N"`; parse the id from `backgrounded · <id>`.
+  - Write the run record `{"id", "ticket", "repo", "worktree", "branch", "venue", "pid" | "bg_id", "log", "started_at", "ended_at": null, "exit": null, "outcome": null}`.
+  - `--dry-run` prints the plan and launches nothing.
+- `runs [--sweep] [--all]`: lists run records with state (alive, exited N, done). `--sweep` updates records whose process has exited: reads the log tail and sets `outcome` (`ok`, `billing`, `auth`, `error`); `exit` is set only for `--bg` runs when the `claude agents` listing provides it, otherwise it stays null (a reparented headless child leaves no exit code). With a JSON result (`claude -p --output-format json`; its `subtype` says `success` even on an API error): `is_error` not true → `ok`; an API failure (`terminal_reason: "api_error"` or an `api_error_status`) → `auth` on 401 and 403, `billing` on 402, otherwise by the start of the `result` text, which then holds claude's own message (`^(Credit balance is too low|Your credit balance|insufficient credits|billing)` → `billing`, `^(Invalid API key|Not logged in|authentication)` → `auth`), else `error`; any other `is_error` → `error`, and the result text, the model's own words then, is never read. Without a JSON result (a crash before one), the tail's API-error lines decide: `credit balance|insufficient.*credit|billing_error|payment required|402` → `billing`, `invalid.*api.key|authentication_error|401` → `auth`. A `billing` or `auth` outcome on a headless run marks `api` exhausted for 24 h with the status and message (or the matching line) as reason, and the next `dispatch` uses `bg`. A ticket whose run ended without a PR and is still `status:in-progress` is re-dispatched by the next `dispatch`, until 3 of its runs ended within 7 days.
+- `budget [status | exhaust <api|cloud> --reason TEXT [--hours 24] | reset <api|cloud>]`.
+- `worktrees [--stale DAYS]`: every `.claude/worktrees/*` of the repo with branch, last commit age, PR number and state (from `gh pr list --head`), flagged stale when older than `--stale` (default 7) and without an open PR. `worktree remove <branch> [--discard]`: `git worktree remove` (refuses a dirty tree unless `--discard`) then `git branch -D`.
+
+Cloud dispatch is out of scope for v2: cloud sessions bill the subscription, need a TTY and do not load plugins. `needs-local` is kept on tickets so a future cloud venue can respect it.
+
+### harness-red
+
+Runs in a ticket worktree (cwd, or `--worktree PATH`).
+
+- `check [--base origin/main]`:
+  1. `merge-base HEAD <base>`; changed paths = `git diff --name-only <merge-base>` plus `git status --porcelain` untracked and modified. Test files = those matching `HARNESS_TEST_PATTERNS`; none → `No test changes on this branch; write the tests first.` exit 1.
+  2. Source files changed (not test, not exempt) → `Source already changed before the red run: <list>. Revert them or move them to the coder step.` exit 1.
+  3. Run `HARNESS_TEST_CMD` with `{files}` = the test files, `cwd` = worktree, timeout `HARNESS_TEST_TIMEOUT`, `PYTHONDONTWRITEBYTECODE=1`.
+  4. kind: `green` when exit 0; else `import` when the output matches `ModuleNotFoundError|ImportError|No module named|Cannot find module|ERR_MODULE_NOT_FOUND`; `assertion` when it matches `AssertionError|assert |FAILED|failed|✗|not ok`; else `error`. Before that, a run that proves nothing is refused with no record and exit 1 (`no red run recorded: no tests ran` / `...: tests failed to load`): exit 5 or `no tests ran|NO TESTS RAN` → no tests ran; a `SyntaxError`/`IndentationError` line → failed to load; a missing module (`ModuleNotFoundError|ImportError: cannot import name|No module named|Cannot find module|ERR_MODULE_NOT_FOUND`) stays red even inside a pytest collection error; otherwise `error during collection|ERROR collecting` → failed to load, `collected 0 items` → no tests ran.
+  5. Write the record; print `red (<kind>): <n> test files, exit <code>` and the tail; exit 0 when red. On `green`: `Tests pass before the implementation; they do not test this change.` exit 1 (the record is still written so a refactor ticket can proceed).
+- `status`: the record for the current branch, and `current: yes|no` (test_hash against the files now).
+- `scratch create`: a detached worktree of `HEAD` at `~/.claude/harness/repos/<key>/scratch/<branch-slug>` (plus uncommitted test files copied in), prints the path; `scratch run`: `HARNESS_TEST_CMD` on the record's test files in the scratch, prints `cheat passed` (exit 0) or `cheat failed` (exit 1) and the tail; `scratch remove`.
+
+### harness-pr
+
+- `open N [--worktree PATH] [--verify-log F] [--review F]`: in the ticket's worktree: refuse with the list when the tree is dirty; `git push -u origin <branch>`; body from `templates/pr_body.md` with the title, `Closes #N`, the definition-of-done checkboxes copied from the ticket, the tests list, the red proof (kind, exit, 15 lines of tail), the verify tail (20 lines of `--verify-log`), the review summary (counts by severity and the high findings from `--review`), a risks line for `risk:high`; `gh pr create --draft --base main --head <branch> --title "<title> (#N)" --body-file`; if a PR for the branch exists, `gh pr edit --body-file` instead; `harness-board comment N` with the PR URL; prints `{"number", "url"}`.
+- `review P --findings F`: findings JSON list `[{"path", "line", "severity": "high|medium|low", "body"}]`; `gh pr diff P` is parsed to the set of (path, right-side line) in the diff; findings on those lines become inline comments (`path`, `line`, `side: RIGHT`), the rest are listed in the review body; `gh api repos/O/R/pulls/P/reviews --input` with `event: COMMENT` and body `Harness review (<model>): <n> findings, <h> high, <m> medium, <l> low.` followed by the off-diff list and the marker `<!-- harness-review -->`. Zero findings: `gh pr review P --comment -b "Harness review: no findings. Checked: <text from --checked>"`.
+- `checks P [--wait] [--timeout 1200]`: poll `gh pr view P --json statusCheckRollup` every 20 s: no checks after 120 s → `no checks registered` exit 0 with a warning; any `PENDING|QUEUED|IN_PROGRESS` → keep waiting; any `FAILURE|CANCELLED|TIMED_OUT|ERROR|ACTION_REQUIRED|STARTUP_FAILURE` → exit 1 with the names and, for GitHub Actions runs (details URL `/actions/runs/<id>`), the last 60 lines of `gh run view <id> --log-failed`; all `SUCCESS|SKIPPED|NEUTRAL` → exit 0. Without `--wait` one poll.
+- `ready P`: `gh pr ready P`; ticket number from `closingIssuesReferences` (or `--ticket N`); `harness-board status N in-review --comment "PR #P ready for review: <url>"`; notification `<repo> PR #P ready for review: <title>`.
+- `comments P [--since ISO] [--unresolved]`: review threads (GraphQL `reviewThreads` with `isResolved`, comments with author, path, line, body, createdAt), reviews and issue comments on the PR, excluding bodies containing `<!-- harness-review -->`; `--unresolved` keeps unresolved threads only. JSON or markdown.
+- `awaiting [--all-projects]`: open, non-draft PRs by the authenticated user: number, title, ticket, age, checks state (one poll), unresolved thread count. `--all-projects` walks the registry.
+- `ultra P [--post]`: `claude ultrareview P --post --json --timeout 30` (post only with `--post`); saves stdout to `ultra/<P>.json`; a non-zero exit whose output mentions credits, billing or balance marks `cloud` exhausted for 24 h; prints the finding count and the highest severities.
+- `land P [--yes] [--discard]`: preconditions: not a draft, `mergeable` not `CONFLICTING` (retry twice on `UNKNOWN`), checks green by one poll (cancelled counts as red), `closingIssuesReferences` non-empty (warn and continue when empty). Then `gh pr merge P -R O/R --squash --delete-branch`; locate the worktree for the head branch in `git worktree list --porcelain`; `git worktree remove` (`--force` only with `--discard`; a dirty worktree otherwise stops after the merge with instructions); `git branch -D <branch>`; in the main checkout `git fetch --prune` and, when it is on main, `git pull --ff-only`; confirm the ticket closed (else `gh issue close`), remove its `status:*` labels, comment `Landed in <merge sha>`; `harness-board epic-check <parent>` when there is a parent. Prints a four-line summary.
+
+### harness-scaffold
+
+Templates in `plugins/harness/templates/`, rendered by plain `{{name}}` substitution (`name`, `pkg`, `stack`, `verify_cmd`, `test_cmd`, `python_version`, `year`). Never overwrites an existing file unless `--force`; reports each path as created, kept or updated.
+
+- `init [PATH] --name NAME [--stack python|node|none] [--verify CMD] [--test-cmd CMD] [--github] [--register [--billable --client C]] [--no-ci] [--dry-run]`:
+  1. `mkdir -p`, `git init -b main` when not a repo.
+  2. Files (the stack skeleton, that is the manifest, `src/<pkg>`, the smoke test, only when no `pyproject.toml` or `package.json` exists yet; when this run creates the manifest and `uv` or `npm` is on PATH, the lock file is generated and committed too, since CI installs with `--locked`/`npm ci`): `CLAUDE.md` (lean: commands, where things live, done means, board and branch rules), `.claude/settings.json` (`env`: `CLAUDE_VERIFY_CMD`, `HARNESS_TEST_CMD`; `permissions.allow`: `Bash(scripts/verify.sh)`, `Bash(git status:*)`, `Bash(git diff:*)`, `Bash(git log:*)`, `Bash(git add:*)`, `Bash(git commit:*)`, `Bash(git push:*)`, `Bash(git fetch:*)`, `Bash(git worktree:*)`, `Bash(gh issue:*)`, `Bash(gh pr:*)`, `Bash(gh api:*)`, `Bash(harness-*:*)`, stack test runners), `scripts/verify.sh` (python: `uv run ruff check . && uv run ruff format --check . && uv run pytest -q`, ending with `echo VERIFY OK`; node: `npm test`; none: a comment and `true`), `.github/workflows/ci.yml` (`push` on main, `pull_request`, `workflow_dispatch`; concurrency per ref; `actions/checkout@v7`; python: `astral-sh/setup-uv@v10.3.0` with cache and `uv sync --locked --all-extras --dev`; node: `actions/setup-node@v7`, `node-version: 24`, `cache: npm`, `npm ci`; then `scripts/verify.sh`), `.github/workflows/deploy.yml` (`push` on main and `workflow_dispatch`; runs `scripts/deploy.sh` when it exists, else prints `no deploy script`), `.github/pull_request_template.md`, `.github/ISSUE_TEMPLATE/task.md` and `epic.md` (the ticket templates), `.githooks/pre-commit` (python: `ruff format --check` and `ruff check` on staged `.py`; node: `npm run lint --if-present`; exits non-zero with the file list) plus `git config core.hooksPath .githooks`, `.gitignore`, `.worktreeinclude` (`.env`, `.env.*`, `credentials/`), `.git/info/exclude` with `.claude/worktrees/`. Python also: `pyproject.toml` (project, `requires-python >= 3.10`, dev dependencies `pytest` and `ruff`, `[tool.ruff]`, `[tool.pytest.ini_options]`), `src/<pkg>/__init__.py`, `tests/test_smoke.py`. Node also: `package.json` with `"test": "node --test"`, `tests/smoke.test.js`. `--no-ci` skips both workflows (a project with its own CI, such as jotform-glow-sync).
+  3. A repo with no commits: commit everything on main as `Scaffold <name> with the harness`. A repo that already has commits: create the chore issue `Adopt the harness scaffold` (`no-tests`, `size:S`, `risk:low`), `harness-work start N`, write the files in that worktree, commit, `harness-pr open N`, `harness-pr ready P`; this needs a GitHub remote, so `--github` runs first when there is none.
+  4. `--github`: `gh repo create <name> --private --source . --remote origin` (no push), `git push -u origin main`, `harness-board labels ensure`, `gh repo edit --delete-branch-on-merge`, then a ruleset attempt (`POST repos/O/R/rulesets`: target `main`, rules `pull_request`, `non_fast_forward`, `deletion`); a 403 prints `Branch protection is unavailable on this plan for a private repo; the local branch guard is the only block.` and continues.
+  5. `--register`: `harness-projects add`.
+- `labels`: `harness-board labels ensure` for an existing repo (alias).
+
+### harness-digest
+
+Across the registry: PRs awaiting review (`harness-pr awaiting --all-projects`), `status:needs-input` tickets with the first line of the question, `status:in-progress` tickets older than 3 days without a PR, stale worktrees, runs with outcome `billing|auth|error` since the last digest, budgets. Writes `~/.claude/harness/digest/<date>.md`, prints it, and sends one notification `Harness digest: <p> PRs to review, <q> need input, <s> stale` (nothing when all zero). `--install-launchd` writes `~/Library/LaunchAgents/com.ryaneskuri.harness-digest.plist` (daily at 08:30, `python3 <absolute path of this script>`, `PATH` including `/opt/homebrew/bin` and `~/.local/bin`, stdout and stderr to `~/.claude/harness/digest/launchd.log`) and loads it with `launchctl bootstrap gui/<uid>`; `--uninstall-launchd` reverses it. Each project's calls get a 6 s budget; a project that cannot be read gets one line.
+
+### harness-standup, harness-projects, harness-worklog
+
+`harness-standup` adds, per project and inside the existing time budget (gh calls run in threads, 6 s): `Board: r ready, p in progress, v in review, q needs input`; `PRs awaiting you:` lines; `Needs input:` lines (title, first line of the question); `Stale worktrees:` lines; and after the fleet section a `## Budgets` line when any budget is exhausted and a `## Runs` section for headless runs alive or failed in the last day. `harness-projects` and `harness-worklog` are unchanged.
+
+## Templates
+
+`templates/`: `ticket_task.md`, `ticket_epic.md`, `pr_body.md`, `CLAUDE.md`, `settings.json`, `verify.sh`, `ci.yml`, `deploy.yml`, `pull_request_template.md`, `pre-commit`, `gitignore`, `worktreeinclude`, `pyproject.toml`, `package.json`, `test_smoke.py`, `smoke.test.js`.
+
+`pr_body.md`:
+
+```markdown
+Closes #{{number}}
+
+## Summary
+{{summary}}
+
+## Definition of done
+{{dod_checklist}}
+
+## Tests
+{{tests_list}}
+
+Red run before implementation ({{red_kind}}, exit {{red_exit}}):
+```
+{{red_tail}}
+```
+
+Verify:
+```
+{{verify_tail}}
+```
+
+## Review
+{{review_summary}}
+
+## Risks
+{{risks}}
+```
+
+## user/CLAUDE.md
+
+Rewritten around the loop. Sections: how I work (unchanged lines), **Routing** (Opus high default; `harness-board tier` picks the agent model from the ticket labels; pass `model`, and `effort` when the Agent tool offers it; escalate once on a second failure, needs-input on a third; Fable only for review, L and high-risk), **The board is the context** (read the ticket and epic before any work; status changes go through `harness-board`; questions become `needs-input`, never guesses), **Never on main** (ticket branch and worktree via `harness-work start`; agents push `t/*` branches and open PRs without asking; never merge, never push main, never force-push, never delete a branch: the user lands with `/harness:land`), **Tests first** (test-author, red proof, breaker, then coder; never loosen a test), **Budgets** (dispatch runs headless on the API key, falls back to the subscription; ultrareview on risk:high), **Across projects** (as v1, with `/harness:plan` and `/harness:work`), **Compact instructions** (add the ticket number and branch).
+
+## Install
+
+`scripts/install.sh`: marketplace add, plugin install (harness only), `~/.claude/CLAUDE.md` with a dated backup, settings merge (python3: load `~/.claude/settings.json`, set `model` and `effortLevel` and merge `modelSettings` per model id from the snippet, drop `enabledPlugins["companion@ryan"]`, write back with a dated backup; a settings file it cannot read is left unchanged, the remaining steps run, and the installer exits non-zero), `harness-digest --install-launchd`, and a reminder to store the API key once: `security add-generic-password -a "$USER" -s harness-anthropic -w` (interactive prompt; the key never touches a command line), and to run `harness-projects discover`.
+
+## Tests (plugins/harness/tests)
+
+`python3 -m unittest discover -s plugins/harness/tests -v`, offline, under three minutes (each hook check is a subprocess, and macOS validates every new executable on first run; tests write their fake executables once per module). `fakegh.py` is an executable stand-in for `gh`: it reads a scenario JSON (path in `FAKEGH_SCENARIO`) mapping argv prefixes to stdout, exit code and optional stdin capture, appends every call to `FAKEGH_LOG`, and exits 1 with `fakegh: no match` otherwise. Tests put it on PATH as `gh` or set `HARNESS_GH`. Tests never touch `~/.claude` (temporary HOME) and use temporary repos with real `git`.
+
+Cover at least: the glob matcher; branch_guard (deny edit on main with a commit; allow on a `t/` branch, in a linked worktree, on an empty repo, outside a repo, with `HARNESS_ALLOW_MAIN`; Bash denies for commit, push without refspec, push to main, force push, `sed -i`, redirect into the repo; allows for fetch, pull, status, a push on a ticket branch); tests_first (role rules for each agent type; deny source without a red record; allow after a current red record; deny after test files changed; `no-tests` exemption; `refactor` with a green record; test and exempt paths pass); session_brief's ticket lines and board line with a fake `gh`; harness-board (labels ensure calls, task create with link retry and no duplicate, show's section parsing and cache merge, ready's blocked-by filtering and ordering, status label swap, needs-input comment text, tier rubric for each combination); harness-work (start creates the branch and worktree from a temporary origin, reuses an existing remote branch, writes the exclude line, refuses an epic and a blocked ticket; attempt's retry, escalate and needs-input sequence; dispatch dry-run plan; runs sweep classifies billing output and marks the budget; budget status, exhaust, reset); harness-red (red by assertion, red by import, green refused, source-changed refused, no tests refused, scratch create and run); harness-pr (open's body rendering and idempotent edit, review's diff-line routing to inline vs body, checks' decisions over success, pending, failure and cancelled rollups, land's merge then cleanup sequence with a dirty worktree refusal); harness-scaffold (python and node renders in a temporary dir, kept files, `--no-ci`, the first-commit path, the adopt path's calls in order with a fake gh); harness-digest (rendering with a fake registry and fake gh, launchd plist contents); harness-standup's new sections. Keep the v1 tests passing.
 
 ## Daily use
 
-- **Console**: `claude agents` in a terminal lists every session across repos, lets you dispatch new background sessions (`claude --bg` in a repo), peek, attach, rename and stop them. `claude --bg -n "<name>" "<task>"` starts one.
-- **Morning**: open any session, run `/harness:standup`.
-- **A change**: `/harness:spec` (interview, spec file) then `/harness:build <spec>` (Opus implements, Fable reviews) then `/harness:ship [pr]`.
-- **Context hygiene**: `/harness:handoff` before `/clear`; the session brief restores the thread on the next start.
-- **Hours**: `/harness:worklog` at the end of a session on a billable project.
-- **Learning**: `/harness:learn` when a session needed corrections.
-- **Companion**: `/companion` toggles the sprite.
+- **New project**: `/harness:new-project ~/Projects/<name>`.
+- **Plan**: `/harness:plan <request>` interviews you and writes the epic and tasks on the board.
+- **Work**: `/harness:work` dispatches every ready ticket; `/harness:work 12` runs one here. Notifications tell you when a PR is ready or a ticket needs you.
+- **Answer**: reply on the ticket; the next `/harness:work 12` reads it.
+- **Land**: `/harness:land` lists PRs waiting; `/harness:land 7` merges one and cleans up.
+- **Morning**: `/harness:standup`; the digest arrives at 08:30 on its own.
+- **Lessons**: `/harness:learn` files chore tickets. **Context**: `/harness:handoff` before `/clear`. **Hours**: `/harness:worklog`.
 
-## Open items
+## Implementation notes
 
-- `docs/verification.md`: the claim-by-claim check of the starter kit, written when the verification workflow finishes.
-- A per-project `verify` convention: FantasyHockey sets `CLAUDE_VERIFY_CMD`; HKTrack could set `scripts/verify.sh --fast`; jotform-glow-sync stays as is (its `check` skill and `verifier` agent run `make check` on demand).
+Deviations accepted during the build on 2026-10-13, all recorded above where they apply: settings precedence (local overrides project, read from the worktree); `run_files` next to `test_files` in the red record; branch-guard exemptions for `docs/agent/` and gitignored files, `cd` handling, force-push refused everywhere; role rules in the breaker's scratch copy; the board's answers filter and cache refresh; the scaffold's uv-based test command for new Python projects, lock-file step and skeleton-only-when-missing rule; the suite time target.
+
+Review round on 2026-10-13 (three fresh-context Fable reviews, fixes recorded above where they apply): pushes naming main denied on every branch; writes judged by the repo that holds the path, so ticket worktrees under `.claude/worktrees/` are writable from any cwd; tests_first on Bash and on test configuration, settings for classification from the main checkout only; `start` keeps `in-review`, reads needs-input answers before changing anything and reports `previous_status`; `answers` anchored on the newest question and every harness comment marked `<!-- harness -->`; `harness-red check` refuses runs that prove nothing; budget exhaustion from the result's `api_error_status`, never from the model's text; `land` prunes worktrees first; a redispatch cap of three; installer merges `modelSettings` per model id and exits non-zero on a malformed settings file. Known follow-ups for chore tickets: harness-red still reads `HARNESS_TEST_PATTERNS` from the worktree; tests_first on Bash cannot see paths inside `git checkout -- .`, `git reset --hard`, `patch` without a file or `find -exec`.
+
+## Interview decisions, 2026-10-13
+
+Companion removed (tokens). Board on GitHub Issues with sub-issues, no Projects board, no local files. Main session on Opus 5.5 high; planner Opus xhigh; Fable only for review. Tiers from size and risk labels, escalation once, then needs-input. Tests-first with a hook gate and a red proof, plus the adversarial test review. Worktree per ticket. Agents push ticket branches and open PRs freely; the user merges from the CLI with `land`. CI on PRs and main plus a deploy stub; branch protection when the plan allows (it does not, today). Manual kick-off, background sessions for parallel tickets. Every project adopts the flow, including jotform-glow-sync. Extras: reviewer findings on the PR, CI wait-and-fix, needs-input loop, lessons as tickets, size cap, pre-commit and PR template, daily digest. Budgets: credits first (API for dispatch, usage credits for ultrareview), subscription as the fallback once a budget is exhausted. Harness, Kalshi and PilatesAttendance get private GitHub repos during the v2 rollout, with confirmation before each push.

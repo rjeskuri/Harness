@@ -1,0 +1,1389 @@
+#!/usr/bin/env python3
+"""
+Pull requests for tickets: open a draft PR from a ticket worktree, post the reviewer's findings inline, wait on
+the checks, mark it ready, read the comments, list the PRs awaiting the user, run ultrareview, and land it
+(squash merge, then the worktree, the branch, the main checkout and the ticket).
+
+Usage:
+    harness-pr open N [--worktree PATH] [--verify-log F] [--review F] [--json]
+    harness-pr review P --findings F [--checked TEXT] [--model NAME]
+    harness-pr checks P [--wait] [--timeout 1200] [--json]
+    harness-pr ready P [--ticket N]
+    harness-pr comments P [--since ISO] [--unresolved] [--json]
+    harness-pr awaiting [--all-projects] [--json]
+    harness-pr ultra P [--post]
+    harness-pr land P [--yes] [--discard]
+
+The repository is the cwd's (open: --worktree, else the cwd), else CLAUDE_PROJECT_DIR. gh is HARNESS_GH when
+set, else `gh`; claude is HARNESS_CLAUDE, else `claude`; harness-board and harness-red are found on PATH, else
+next to this script. HARNESS_POLL_SECONDS replaces the 20 s poll interval (tests).
+
+Exit status: 0 done; 1 a bad invocation, a failed precondition or call (one line on stderr), failed checks, or
+a land whose cleanup stopped; 8 checks still pending (as gh pr checks).
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
+TICKET_BRANCH = re.compile(r"^t/(\d+)-")
+MARKER = "<!-- harness-review -->"
+LANDED = "Landed in"
+HIGH_RISK = "High risk: review the data and live-system paths before merging."
+NO_RISK = "None noted."
+SEVERITIES = ("high", "medium", "low")
+SEVERITY_ALIASES = {"critical": "high", "blocker": "high", "major": "medium", "minor": "low", "nit": "low",
+                    "info": "low"}
+SEVERITY_RANK = ("critical", "high", "medium", "low", "info")
+FAILED = ("FAILURE", "CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED", "STARTUP_FAILURE")
+PASSED = ("SUCCESS", "SKIPPED", "NEUTRAL")
+BILLING = re.compile(r"credit|billing|balance", re.I)
+RUN_URL = re.compile(r"/actions/runs/(\d+)")
+PR_URL = re.compile(r"https?://\S+/pull/(\d+)")
+HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
+RED_TAIL_LINES = 15
+VERIFY_TAIL_LINES = 20
+RUN_LOG_LINES = 60
+DIRTY_SHOWN = 20             # files named in a dirty-tree refusal
+POLL_SECONDS = 20.0          # checks --wait
+NO_CHECKS_POLLS = 6          # 120 s at 20 s: no checks registered by then means none will be
+MERGEABLE_RETRIES = 2
+MERGEABLE_SLEEP = 3.0        # seconds, at most the poll interval
+GH_TIMEOUT = 60
+PUSH_TIMEOUT = 180
+TOOL_TIMEOUT = 180
+ULTRA_MINUTES = 30
+EXHAUSTED_HOURS = 24
+DEFAULT_CHECKED = "the diff against the ticket's definition of done"
+DEFAULT_APP = "com.microsoft.VSCode"
+DEFAULT_SOUND = "Glass"
+LAND_FIELDS = "isDraft,mergeable,headRefName,closingIssuesReferences,statusCheckRollup,title,url,state"
+AWAIT_FIELDS = "number,title,isDraft,createdAt,url,headRefName,closingIssuesReferences,statusCheckRollup"
+CONVERSATION = """query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) { nodes { isResolved
+        comments(first: 50) { nodes { author { login } body path line createdAt url } } } }
+      reviews(first: 50) { nodes { author { login } body state createdAt url } }
+      comments(first: 100) { nodes { author { login } body createdAt url } }
+    }
+  }
+}"""
+
+
+class Problem(Exception):
+    """A bad invocation, a failed precondition or a failed call: printed as one line, exit 1."""
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse that reports a bad invocation in one line and exits 1."""
+
+    def error(self, message):
+        sys.exit(f"{self.prog}: error: {message}")
+
+
+def one_line(text):
+    return " ".join(str(text).split())
+
+
+def first_line(text):
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def last_line(text):
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def warn(message):
+    sys.stderr.write(f"harness-pr: warning: {one_line(message)}\n")
+
+
+def home(*parts):
+    return os.path.join(os.path.expanduser("~"), *parts)
+
+
+def plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def parse_iso(text):
+    """A timezone-aware datetime from ISO-8601 (a trailing Z and a naive time both mean UTC), or None."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    text = text.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        when = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)
+
+
+def as_list(value):
+    """gh lists come as a JSON list or as {"nodes": [...]}; anything else is empty."""
+    if isinstance(value, dict):
+        value = value.get("nodes")
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
+def tail(text, n):
+    """The last n lines, trailing spaces and the blank lines around them dropped."""
+    lines = [line.rstrip() for line in (text or "").splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    lines = lines[-n:]
+    while lines and not lines[0]:
+        lines.pop(0)
+    return "\n".join(lines)
+
+
+def fence_safe(text):
+    """Text that cannot close the ``` fence it is shown in."""
+    return text.replace("```", "'''")
+
+
+def read_text(path, what):
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError as err:
+        raise Problem(f"cannot read {what} {path}: {err.strerror or err}") from None
+
+
+def write_file(path, text):
+    """Write through a temporary file in the same folder, renamed over the old one."""
+    folder = os.path.dirname(path)
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".harness-pr-", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def short_home(path):
+    """~/... for a path under HOME, for messages."""
+    root = os.path.expanduser("~")
+    return "~" + path[len(root):] if path.startswith(root + os.sep) else path
+
+
+def poll_interval():
+    raw = os.environ.get("HARNESS_POLL_SECONDS", "").strip()
+    try:
+        value = float(raw) if raw else POLL_SECONDS
+    except ValueError:
+        return POLL_SECONDS
+    return value if value >= 0 else POLL_SECONDS       # also catches nan
+
+
+# --------------------------------------------------------------- git and the repository
+def git(path, *args, timeout=60):
+    try:
+        return subprocess.run(["git", "-C", str(path)] + list(args), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=timeout)
+    except FileNotFoundError:
+        raise Problem("git not found on PATH") from None
+    except subprocess.TimeoutExpired:
+        raise Problem(f"git {args[0]} timed out in {path}") from None
+
+
+def git_ok(path, *args, timeout=60):
+    done = git(path, *args, timeout=timeout)
+    if done.returncode != 0:
+        raise Problem(f"git {' '.join(args[:2])} failed in {path}: "
+                      f"{last_line(done.stderr) or f'exit {done.returncode}'}")
+    return done.stdout
+
+
+def current_branch(path):
+    return git(path, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip() or None
+
+
+def dirty_files(path):
+    """Paths git status lists (modified, staged or untracked) in the working tree at `path`."""
+    out = git_ok(path, "status", "--porcelain=v1", "--untracked-files=all")
+    return [line[3:] for line in out.splitlines() if len(line) > 3]
+
+
+def listing(paths):
+    shown = ", ".join(paths[:DIRTY_SHOWN])
+    return shown + (f" and {len(paths) - DIRTY_SHOWN} more" if len(paths) > DIRTY_SHOWN else "")
+
+
+class Repo:
+    """The repository: its toplevel (`root`, maybe a linked worktree), its main working tree, the state key
+    shared by both, and (on demand) OWNER/REPO."""
+
+    def __init__(self, path):
+        path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isdir(path):
+            raise Problem(f"not a directory: {path}")
+        top = git(path, "rev-parse", "--show-toplevel")
+        if top.returncode != 0 or not top.stdout.strip():
+            raise Problem(f"not a git repository: {path}")
+        self.root = top.stdout.strip()
+        common = git(self.root, "rev-parse", "--git-common-dir")
+        if common.returncode != 0 or not common.stdout.strip():
+            raise Problem(f"git rev-parse --git-common-dir failed in {self.root}: {first_line(common.stderr)}")
+        common_dir = os.path.normpath(os.path.join(self.root, common.stdout.strip()))
+        self.main = os.path.realpath(os.path.dirname(common_dir))
+        self.key = hashlib.sha1(self.main.encode("utf-8")).hexdigest()[:12]
+        self.name = os.path.basename(self.main)
+        self._slug = None
+
+    def slug(self):
+        """OWNER/REPO, from gh repo view (once)."""
+        if self._slug is None:
+            data = gh_json(["repo", "view", "--json", "nameWithOwner"], self.main)
+            slug = data.get("nameWithOwner") if isinstance(data, dict) else None
+            if not isinstance(slug, str) or "/" not in slug:
+                raise Problem("gh repo view did not name the repository (nameWithOwner missing)")
+            self._slug = slug
+        return self._slug
+
+    def state(self, *parts):
+        return home(".claude", "harness", "repos", self.key, *parts)
+
+
+def open_repo(path=None):
+    """--worktree when given; else the cwd's repository; else CLAUDE_PROJECT_DIR's."""
+    if path:
+        return Repo(path)
+    try:
+        return Repo(os.getcwd())
+    except (Problem, OSError):
+        project = os.environ.get("CLAUDE_PROJECT_DIR")
+        if project:
+            return Repo(project)
+        raise Problem("not in a git repository (run it from the project or its ticket worktree)") from None
+
+
+# --------------------------------------------------------------- gh, claude and the sibling tools
+def describe(args):
+    """`gh pr view 12`, `gh api repos/o/r/pulls/3/reviews`: the call, for an error line."""
+    if args and args[0] == "api":
+        return "gh api " + next((a for a in args[1:] if "/" in a or a == "graphql"), "")
+    words = []
+    for arg in args:
+        if arg.startswith("-") or len(words) == 3:
+            break
+        words.append(arg)
+    return "gh " + " ".join(words)
+
+
+def gh_run(args, cwd, stdin=None, timeout=GH_TIMEOUT):
+    exe = os.environ.get("HARNESS_GH", "gh")
+    io = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
+    try:
+        return subprocess.run([exe] + list(args), cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout, env=dict(os.environ, GH_PROMPT_DISABLED="1"), **io)
+    except FileNotFoundError:
+        raise Problem(f"gh not found ({exe}); install it with `brew install gh`, then `gh auth login`") from None
+    except OSError as err:
+        raise Problem(f"cannot run gh ({exe}): {err.strerror or err}") from None
+    except subprocess.TimeoutExpired:
+        raise Problem(f"{describe(args)} timed out after {timeout} s") from None
+
+
+def gh(args, cwd, stdin=None, timeout=GH_TIMEOUT):
+    """gh's stdout, or Problem naming the call and gh's first stderr line."""
+    done = gh_run(args, cwd, stdin, timeout)
+    if done.returncode != 0:
+        raise Problem(f"{describe(args)} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
+    return done.stdout
+
+
+def gh_json(args, cwd):
+    out = gh(args, cwd)
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise Problem(f"{describe(args)} printed something other than JSON: {first_line(out)[:80]}") from None
+
+
+def sibling(name):
+    """A sibling bin tool: on PATH, else next to this script."""
+    found = shutil.which(name)
+    if found:
+        return found
+    here = HERE / name
+    if here.is_file() and os.access(here, os.X_OK):
+        return str(here)
+    raise Problem(f"{name} not found on PATH or in {HERE}")
+
+
+def tool(name, args, cwd, check=True):
+    try:
+        done = subprocess.run([sibling(name)] + list(args), cwd=cwd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=TOOL_TIMEOUT)
+    except OSError as err:
+        raise Problem(f"cannot run {name}: {err.strerror or err}") from None
+    except subprocess.TimeoutExpired:
+        raise Problem(f"{name} {args[0]} timed out after {TOOL_TIMEOUT} s") from None
+    if check and done.returncode != 0:
+        why = one_line(done.stderr) or one_line(done.stdout) or f"exit {done.returncode}"
+        raise Problem(f"{name} {' '.join(args[:2])} failed: {why}")
+    return done
+
+
+def board(repo, *args):
+    """harness-board on this repository; its stdout."""
+    return tool("harness-board", list(args) + ["--repo", repo.main], repo.main).stdout
+
+
+def pr_view(repo, number, fields, cwd=None):
+    data = gh_json(["pr", "view", str(number), "--json", fields], cwd or repo.root)
+    if not isinstance(data, dict):
+        raise Problem(f"gh pr view {number} printed no pull request")
+    return data
+
+
+def closing_numbers(view):
+    out = []
+    for ref in as_list(view.get("closingIssuesReferences")):
+        n = ref.get("number")
+        if isinstance(n, int) and n not in out:
+            out.append(n)
+    return out
+
+
+# --------------------------------------------------------------- notifications (as hooks/notify.py)
+def env_setting(name, default):
+    value = os.environ.get(name)
+    return default if value is None else value.strip()
+
+
+def succeeded(cmd):
+    return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=10).returncode == 0
+
+
+def applescript_string(text):
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def notify(message, group):
+    """A macOS notification: terminal-notifier when on PATH, else osascript. Never fails."""
+    title = "Harness"
+    app = env_setting("HARNESS_NOTIFY_APP", DEFAULT_APP)
+    sound = env_setting("HARNESS_NOTIFY_SOUND", DEFAULT_SOUND)
+    try:
+        exe = shutil.which("terminal-notifier")
+        if exe:
+            cmd = [exe, "-title", title, "-message", message, "-group", group]
+            cmd += ["-activate", app] if app else []
+            cmd += ["-sound", sound] if sound else []
+            if succeeded(cmd):
+                return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        exe = shutil.which("osascript")
+        if exe:
+            script = f"display notification {applescript_string(message)} with title {applescript_string(title)}"
+            if sound:
+                script += f" sound name {applescript_string(sound)}"
+            return succeeded([exe, "-e", script])
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return False
+
+
+# --------------------------------------------------------------- findings
+def normal_severity(value):
+    sev = str(value or "").strip().lower()
+    sev = SEVERITY_ALIASES.get(sev, sev)
+    return sev if sev in SEVERITIES else "low"
+
+
+def load_findings(path):
+    """The reviewer's findings: a JSON list (or {"findings": [...]}, or one object per line), normalized to
+    {"path", "line", "severity", "body"}."""
+    text = read_text(path, "findings file")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+        start = text.find("[")
+        if start >= 0:                         # the array, with the reviewer's verdict after it
+            try:
+                data, _ = json.JSONDecoder().raw_decode(text[start:])
+            except ValueError:
+                data = None
+        if data is None:
+            data = []
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    data.append(json.loads(line))
+                except ValueError:
+                    raise Problem(f"{path}: not JSON (a list of findings, or one finding per line)") from None
+    if isinstance(data, dict):
+        data = data.get("findings") if isinstance(data.get("findings"), list) else [data]
+    if not isinstance(data, list):
+        raise Problem(f"{path}: expected a JSON list of findings")
+    findings = []
+    for i, item in enumerate(data, 1):
+        if not isinstance(item, dict):
+            raise Problem(f"{path}: finding {i} is not an object")
+        line = item.get("line")
+        try:
+            line = int(line) if line is not None and not isinstance(line, bool) and str(line).strip() else None
+        except (TypeError, ValueError):
+            line = None
+        path_text = str(item.get("path") or "").strip()
+        findings.append({"path": path_text[2:] if path_text.startswith("./") else path_text,
+                         "line": line if line and line > 0 else None,
+                         "severity": normal_severity(item.get("severity")),
+                         "body": str(item.get("body") or "").strip()})
+    return findings
+
+
+def severity_counts(findings):
+    counts = {s: 0 for s in SEVERITIES}
+    for f in findings:
+        counts[f["severity"]] += 1
+    return counts
+
+
+def where(f):
+    if f["path"] and f["line"]:
+        return f"`{f['path']}:{f['line']}`"
+    return f"`{f['path']}`" if f["path"] else "(no path)"
+
+
+def indented(body):
+    return "\n  ".join(body.splitlines()) if body else ""
+
+
+# --------------------------------------------------------------- open
+def show_ticket(repo, number):
+    out = board(repo, "show", str(number), "--json")
+    try:
+        data = json.loads(out)
+    except ValueError:
+        raise Problem(f"harness-board show {number} printed something other than JSON") from None
+    if not isinstance(data, dict):
+        raise Problem(f"harness-board show {number} printed no ticket")
+    return data
+
+
+def red_record(repo):
+    """The branch's red record from harness-red status, or None when there is none."""
+    done = tool("harness-red", ["status", "--json", "--worktree", repo.root], repo.root, check=False)
+    if done.returncode != 0:
+        return None
+    try:
+        data = json.loads(done.stdout)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def first_paragraph(text):
+    lines = []
+    for line in (text or "").strip().splitlines():
+        if not line.strip():
+            break
+        lines.append(line.strip())
+    return " ".join(lines)
+
+
+def tests_block(items, red):
+    lines = [f"- {item}" for item in items] or ["None listed on the ticket."]
+    files = (red or {}).get("run_files") or (red or {}).get("test_files") or []
+    files = [f for f in files if isinstance(f, str) and f]
+    if files:
+        lines += ["", "Test files run: " + ", ".join(f"`{f}`" for f in files)]
+    return "\n".join(lines)
+
+
+def review_summary(findings):
+    if findings is None:
+        return "No review attached."
+    if not findings:
+        return "No findings."
+    c = severity_counts(findings)
+    lines = [f"{plural(len(findings), 'finding')}: {c['high']} high, {c['medium']} medium, {c['low']} low."]
+    highs = [f for f in findings if f["severity"] == "high"]
+    if highs:
+        lines += ["", "High:"] + [f"- {where(f)}: {indented(f['body'])}" for f in highs]
+    return "\n".join(lines)
+
+
+def render(template, values):
+    """One pass of {{name}} substitution, so a value that contains braces is left alone."""
+    return PLACEHOLDER.sub(lambda m: values.get(m.group(1), m.group(0)), template)
+
+
+def pr_body(number, ticket, red, verify_text, findings):
+    sections = ticket.get("sections") if isinstance(ticket.get("sections"), dict) else {}
+    dod = [str(x).strip() for x in sections.get("definition_of_done") or [] if str(x).strip()]
+    tests = [str(x).strip() for x in sections.get("tests") or [] if str(x).strip()]
+    risky = ticket.get("risk") == "high" or "risk:high" in (ticket.get("labels") or [])
+    values = {
+        "number": str(number),
+        "summary": first_paragraph(sections.get("request")) or ticket.get("title") or f"Ticket #{number}.",
+        "dod_checklist": "\n".join(dod) or "None listed on the ticket.",
+        "tests_list": tests_block(tests, red),
+        "red_kind": str(red.get("kind") or "unknown") if red else "none",
+        "red_exit": str(red.get("exit")) if red else "-",
+        "red_tail": fence_safe(tail(red.get("tail"), RED_TAIL_LINES)) if red else "No red run recorded on this branch.",
+        "verify_tail": fence_safe(tail(verify_text, VERIFY_TAIL_LINES)) if verify_text is not None
+        else "No verify log attached.",
+        "review_summary": review_summary(findings),
+        "risks": HIGH_RISK if risky else NO_RISK,
+    }
+    path = TEMPLATES / "pr_body.md"
+    return render(read_text(str(path), "template"), values)
+
+
+def created_pr(out):
+    found = PR_URL.findall(out)
+    if not found:
+        raise Problem(f"gh pr create printed no pull request URL: {first_line(out)[:80]}")
+    url = [m.group(0) for m in PR_URL.finditer(out)][-1]
+    return int(found[-1]), url
+
+
+def cmd_open(args):
+    repo = open_repo(args.worktree)
+    number = args.number
+    branch = current_branch(repo.root)
+    m = TICKET_BRANCH.match(branch or "")
+    if not m:
+        raise Problem(f"{repo.root} is on {branch or 'a detached HEAD'}, not a ticket branch (t/<N>-<slug>)")
+    if int(m.group(1)) != number:
+        raise Problem(f"{repo.root} is on {branch}, the branch of ticket #{m.group(1)}, not #{number}")
+    dirty = dirty_files(repo.root)
+    if dirty:
+        raise Problem(f"uncommitted changes in {repo.root}: {listing(dirty)}; commit or remove them first")
+    verify_text = read_text(args.verify_log, "verify log") if args.verify_log else None
+    findings = load_findings(args.review) if args.review else None
+    ticket = show_ticket(repo, number)
+    body = pr_body(number, ticket, red_record(repo), verify_text, findings)
+    title = f"{ticket.get('title') or f'Ticket {number}'} (#{number})"
+
+    push = git(repo.root, "push", "-u", "origin", branch, timeout=PUSH_TIMEOUT)
+    if push.returncode != 0:
+        raise Problem(f"git push -u origin {branch} failed: {last_line(push.stderr) or f'exit {push.returncode}'}")
+    existing = gh_json(["pr", "list", "--head", branch, "--state", "open", "--json", "number,url"], repo.root)
+    existing = [p for p in existing if isinstance(p, dict) and p.get("number")] if isinstance(existing, list) else []
+    if existing:
+        pr, url = int(existing[0]["number"]), existing[0].get("url") or ""
+        gh(["pr", "edit", str(pr), "--body-file", "-"], repo.root, stdin=body)
+    else:
+        out = gh(["pr", "create", "--draft", "--base", "main", "--head", branch, "--title", title, "--body-file", "-"],
+                 repo.root, stdin=body)
+        pr, url = created_pr(out)
+        try:
+            board(repo, "comment", str(number), "--body", f"Pull request: {url}")
+        except Problem as err:
+            warn(f"PR #{pr} is open, but the ticket comment failed: {err}")
+    if args.json:
+        print(json.dumps({"number": pr, "url": url}))
+    else:
+        print(f"#{pr} {url}")
+    return 0
+
+
+# --------------------------------------------------------------- review
+def diff_path(text):
+    text = text.rstrip("\n")
+    if text.startswith('"') and text.endswith('"') and len(text) >= 2:
+        text = text[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    if text == "/dev/null":
+        return None
+    return text[2:] if text.startswith("b/") else text
+
+
+def diff_lines(text):
+    """{(path, new-side line)} for every added or context line in a unified diff."""
+    found = set()
+    path, line_no, old_left, new_left = None, 0, 0, 0
+    for raw in text.splitlines():
+        if old_left > 0 or new_left > 0:
+            if raw.startswith("\\"):                  # \ No newline at end of file
+                continue
+            tag = raw[:1]
+            if tag == "-":
+                old_left -= 1
+                continue
+            if path:
+                found.add((path, line_no))
+            line_no += 1
+            new_left -= 1
+            if tag != "+":                             # a context line (or an empty one with its space stripped)
+                old_left -= 1
+            continue
+        if raw.startswith("diff --git "):
+            path = None
+        elif raw.startswith("+++ "):
+            path = diff_path(raw[4:])
+        else:
+            m = HUNK.match(raw)
+            if m:
+                old_left = int(m.group(1)) if m.group(1) is not None else 1
+                line_no = int(m.group(2))
+                new_left = int(m.group(3)) if m.group(3) is not None else 1
+    return found
+
+
+def review_body(model, findings, outside):
+    c = severity_counts(findings)
+    parts = [f"Harness review ({model}): {plural(len(findings), 'finding')}, {c['high']} high, "
+             f"{c['medium']} medium, {c['low']} low."]
+    if outside:
+        parts.append("\n".join(["Not on a changed line:"] + [f"- {where(f)} [{f['severity']}] {indented(f['body'])}"
+                                                            for f in outside]))
+    parts.append(MARKER)
+    return "\n\n".join(parts)
+
+
+def cmd_review(args):
+    repo = open_repo()
+    number = args.number
+    findings = load_findings(args.findings)
+    if not findings:
+        gh(["pr", "review", str(number), "--comment", "-b",
+            f"Harness review: no findings. Checked: {args.checked}\n\n{MARKER}"], repo.root)
+        print(f"PR #{number}: review posted, no findings")
+        return 0
+    slug = repo.slug()
+    diff = gh_run(["pr", "diff", str(number)], repo.root)
+    if diff.returncode != 0:
+        warn(f"gh pr diff {number} failed ({first_line(diff.stderr) or f'exit {diff.returncode}'}); "
+             "every finding goes in the review body")
+        lines = set()
+    else:
+        lines = diff_lines(diff.stdout)
+    inline, outside = [], []
+    for f in findings:
+        (inline if f["path"] and f["line"] and (f["path"], f["line"]) in lines else outside).append(f)
+    comments = [{"path": f["path"], "line": f["line"], "side": "RIGHT",
+                 "body": f"[{f['severity']}] {f['body']}\n\n{MARKER}"} for f in inline]
+    call = ["api", "-X", "POST", f"repos/{slug}/pulls/{number}/reviews", "--input", "-"]
+    payload = {"event": "COMMENT", "body": review_body(args.model, findings, outside), "comments": comments}
+    done = gh_run(call, repo.root, stdin=json.dumps(payload))
+    if done.returncode != 0 and comments:
+        warn(f"GitHub refused the inline comments ({first_line(done.stderr) or f'exit {done.returncode}'}); "
+             "posting every finding in the review body")
+        inline, outside = [], findings
+        payload = {"event": "COMMENT", "body": review_body(args.model, findings, outside), "comments": []}
+        done = gh_run(call, repo.root, stdin=json.dumps(payload))
+    if done.returncode != 0:
+        raise Problem(f"{describe(call)} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
+    print(f"PR #{number}: review posted, {plural(len(findings), 'finding')} "
+          f"({len(inline)} inline, {len(outside)} in the body)")
+    return 0
+
+
+# --------------------------------------------------------------- checks
+def check_entries(rollup):
+    """[{"name", "state", "bucket": pass|fail|pending, "url"}] from a statusCheckRollup (CheckRun or StatusContext)."""
+    out = []
+    for e in as_list(rollup):
+        kind = e.get("__typename")
+        if kind == "StatusContext" or (kind != "CheckRun" and "state" in e and "status" not in e):
+            state = str(e.get("state") or "").upper()
+            bucket = ("pending" if state in ("PENDING", "EXPECTED") else "fail" if state in FAILED
+                      else "pass" if state in PASSED else "pending")
+            name, url = e.get("context") or e.get("name") or "status", e.get("targetUrl") or e.get("detailsUrl") or ""
+        else:
+            status = str(e.get("status") or "").upper()
+            conclusion = str(e.get("conclusion") or "").upper()
+            if status != "COMPLETED":
+                state, bucket = status or "PENDING", "pending"
+            else:
+                state = conclusion
+                bucket = "fail" if conclusion in FAILED else "pass" if conclusion in PASSED else "pending"
+            name, url = e.get("name") or e.get("context") or "check", e.get("detailsUrl") or e.get("targetUrl") or ""
+        out.append({"name": str(name), "state": state, "bucket": bucket, "url": str(url)})
+    return out
+
+
+def overall(entries):
+    """none, failure, pending or success: a failure wins over pending (gh pr checks does the same)."""
+    if not entries:
+        return "none"
+    if any(e["bucket"] == "fail" for e in entries):
+        return "failure"
+    if any(e["bucket"] == "pending" for e in entries):
+        return "pending"
+    return "success"
+
+
+def failed_logs(repo, failed):
+    """[{"run", "name", "tail"}] for the failed checks that are GitHub Actions runs."""
+    logs, seen = [], set()
+    for e in failed:
+        m = RUN_URL.search(e["url"])
+        if not m or m.group(1) in seen:
+            continue
+        seen.add(m.group(1))
+        done = gh_run(["run", "view", m.group(1), "--log-failed"], repo.root, timeout=120)
+        text = tail(done.stdout, RUN_LOG_LINES) if done.returncode == 0 else \
+            f"(gh run view {m.group(1)} --log-failed failed: {first_line(done.stderr) or f'exit {done.returncode}'})"
+        logs.append({"run": m.group(1), "name": e["name"], "tail": text})
+    return logs
+
+
+def cmd_checks(args):
+    repo = open_repo()
+    number = args.number
+    interval = poll_interval()
+    deadline = time.monotonic() + args.timeout
+    started = time.monotonic()
+    empty_polls = 0
+    while True:
+        entries = check_entries(pr_view(repo, number, "statusCheckRollup").get("statusCheckRollup"))
+        state = overall(entries)
+        empty_polls = empty_polls + 1 if state == "none" else 0
+        if not args.wait or state in ("success", "failure"):
+            break
+        if state == "none" and empty_polls >= NO_CHECKS_POLLS:
+            break
+        if time.monotonic() + interval > deadline:
+            break
+        time.sleep(interval)
+    failed = [e for e in entries if e["bucket"] == "fail"]
+    pending = [e for e in entries if e["bucket"] == "pending"]
+    logs = failed_logs(repo, failed) if failed else []
+    if args.json:
+        print(json.dumps({"number": number, "state": state, "checks": entries,
+                          "failed": [e["name"] for e in failed], "pending": [e["name"] for e in pending],
+                          "logs": logs}, indent=2, ensure_ascii=False))
+    if state == "none":
+        warn(f"no checks registered on PR #{number}")
+        return 0
+    if state == "success":
+        if not args.json:
+            print(f"PR #{number}: checks green ({', '.join(e['name'] for e in entries)})")
+        return 0
+    if state == "pending":
+        waited = f" after {round(time.monotonic() - started)} s" if args.wait else ""
+        if not args.json:
+            print(f"PR #{number}: checks pending{waited}: {', '.join(e['name'] for e in pending)}")
+        return 8
+    if not args.json:
+        print(f"PR #{number}: checks failed: " + ", ".join(f"{e['name']} ({e['state'].lower()})" for e in failed))
+        for log in logs:
+            print(f"\n--- {log['name']}: gh run view {log['run']} --log-failed (last {RUN_LOG_LINES} lines) ---")
+            print(log["tail"])
+    sys.stdout.flush()
+    sys.stderr.write(f"harness-pr: checks failed on PR #{number}: {', '.join(e['name'] for e in failed)}\n")
+    return 1
+
+
+# --------------------------------------------------------------- ready
+def cmd_ready(args):
+    repo = open_repo()
+    number = args.number
+    gh(["pr", "ready", str(number)], repo.root)
+    view = pr_view(repo, number, "url,title,closingIssuesReferences")
+    url, title = view.get("url") or "", view.get("title") or ""
+    tickets = [args.ticket] if args.ticket else closing_numbers(view)
+    error = None
+    for n in tickets:
+        try:
+            board(repo, "status", str(n), "in-review", "--comment", f"PR #{number} ready for review: {url}")
+        except Problem as err:
+            error = error or err
+    notify(f"{repo.name} PR #{number} ready for review: {title}", f"harness-{repo.key}-pr-{number}")
+    print(f"PR #{number} ready for review: {url}")
+    if not tickets:
+        warn(f"PR #{number} names no ticket (no Closes #N, no --ticket); no status changed")
+    if error:
+        raise Problem(f"PR #{number} is ready, but {error}")
+    return 0
+
+
+# --------------------------------------------------------------- comments
+def conversation_of(repo, number):
+    owner, name = repo.slug().split("/", 1)
+    data = gh_json(["api", "graphql", "-f", f"query={CONVERSATION}", "-f", f"owner={owner}", "-f", f"repo={name}",
+                    "-F", f"number={number}"], repo.root)
+    pr = ((data.get("data") or {}).get("repository") or {}).get("pullRequest") if isinstance(data, dict) else None
+    if not isinstance(pr, dict):
+        raise Problem(f"PR #{number} not found in {repo.slug()}")
+    return pr
+
+
+def entry(node):
+    author = node.get("author") if isinstance(node.get("author"), dict) else {}
+    return {"author": author.get("login") or "ghost", "body": node.get("body") or "",
+            "created_at": node.get("createdAt") or "", "url": node.get("url") or ""}
+
+
+def newer(node, since):
+    when = parse_iso(node.get("createdAt") or node.get("created_at"))
+    return since is None or (when is not None and when > since)
+
+
+def conversation(pr, since=None, unresolved=False):
+    """Threads, reviews and comments without the harness's own (the marker) and, with `since`, only the newer
+    ones (a thread is kept whole when any comment in it is newer)."""
+    threads = []
+    for t in as_list(pr.get("reviewThreads")):
+        nodes = [c for c in as_list(t.get("comments")) if MARKER not in (c.get("body") or "")]
+        if not nodes or (unresolved and t.get("isResolved")) or not any(newer(c, since) for c in nodes):
+            continue
+        anchor = next((c for c in nodes if c.get("path")), nodes[0])
+        threads.append({"resolved": bool(t.get("isResolved")), "path": anchor.get("path") or "",
+                        "line": anchor.get("line"), "comments": [entry(c) for c in nodes]})
+    if unresolved:
+        return {"threads": threads, "reviews": [], "comments": []}
+    reviews = [dict(entry(r), state=r.get("state") or "") for r in as_list(pr.get("reviews"))
+               if (r.get("body") or "").strip() and MARKER not in r.get("body") and newer(r, since)]
+    comments = [entry(c) for c in as_list(pr.get("comments"))
+                if MARKER not in (c.get("body") or "") and newer(c, since)]
+    return {"threads": threads, "reviews": reviews, "comments": comments}
+
+
+def quoted_body(body):
+    lines = (body or "").strip().splitlines() or [""]
+    return "\n".join([lines[0]] + ["    " + line for line in lines[1:]])
+
+
+def cmd_comments(args):
+    repo = open_repo()
+    number = args.number
+    since = None
+    if args.since is not None:
+        since = parse_iso(args.since)
+        if since is None:
+            raise Problem(f"--since: not an ISO-8601 time: {args.since!r}")
+    found = conversation(conversation_of(repo, number), since, args.unresolved)
+    if args.json:
+        print(json.dumps(dict({"number": number}, **found), indent=2, ensure_ascii=False))
+        return 0
+    if not any(found.values()):
+        print(f"No {'unresolved threads' if args.unresolved else 'comments'} on PR #{number}.")
+        return 0
+    blocks = []
+    for resolved in (False, True):
+        group = [t for t in found["threads"] if t["resolved"] == resolved]
+        if not group:
+            continue
+        lines = [f"## {'Resolved' if resolved else 'Unresolved'} threads ({len(group)})"]
+        for t in group:
+            spot = f"`{t['path']}:{t['line']}`" if t["line"] else f"`{t['path']}`" if t["path"] else "(general)"
+            lines.append(f"- {spot} {t['comments'][0]['url']}".rstrip())
+            lines += [f"  - **{c['author']}** ({c['created_at'][:10]}): {quoted_body(c['body'])}"
+                      for c in t["comments"]]
+        blocks.append("\n".join(lines))
+    if found["reviews"]:
+        blocks.append("\n".join([f"## Reviews ({len(found['reviews'])})"] + [
+            f"- **{r['author']}** {r['state']} ({r['created_at'][:10]}): {quoted_body(r['body'])}"
+            for r in found["reviews"]]))
+    if found["comments"]:
+        blocks.append("\n".join([f"## Comments ({len(found['comments'])})"] + [
+            f"- **{c['author']}** ({c['created_at'][:10]}): {quoted_body(c['body'])}" for c in found["comments"]]))
+    print("\n\n".join(blocks))
+    return 0
+
+
+# --------------------------------------------------------------- awaiting
+CHECK_WORDS = {"success": "green", "failure": "red", "pending": "pending", "none": "none"}
+
+
+def age(created):
+    when = parse_iso(created)
+    if when is None:
+        return "?"
+    minutes = max(0, int((dt.datetime.now(dt.timezone.utc) - when).total_seconds() // 60))
+    if minutes < 60:
+        return f"{minutes}m"
+    if minutes < 24 * 60:
+        return f"{minutes // 60}h"
+    return f"{minutes // (24 * 60)}d"
+
+
+def awaiting_in(repo, project=None):
+    prs = gh_json(["pr", "list", "--author", "@me", "--state", "open", "--json", AWAIT_FIELDS], repo.root)
+    rows = []
+    for pr in prs if isinstance(prs, list) else []:
+        if not isinstance(pr, dict) or pr.get("isDraft") or not pr.get("number"):
+            continue
+        number = int(pr["number"])
+        threads = conversation(conversation_of(repo, number), unresolved=True)["threads"]
+        tickets = closing_numbers(pr)
+        m = TICKET_BRANCH.match(pr.get("headRefName") or "")
+        ticket = tickets[0] if tickets else int(m.group(1)) if m else None
+        row = {"number": number, "title": pr.get("title") or "", "ticket": ticket, "url": pr.get("url") or "",
+               "created_at": pr.get("createdAt") or "", "age": age(pr.get("createdAt")),
+               "checks": CHECK_WORDS[overall(check_entries(pr.get("statusCheckRollup")))],
+               "unresolved": len(threads)}
+        rows.append(dict({"project": project}, **row) if project else row)
+    return rows
+
+
+def registry_projects():
+    path = home(".claude", "harness", "projects.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as err:
+        raise Problem(f"cannot read {path}: {err}") from None
+    projects = data.get("projects") if isinstance(data, dict) else None
+    out = []
+    for p in projects if isinstance(projects, list) else []:
+        if isinstance(p, dict) and isinstance(p.get("path"), str):
+            out.append((p.get("name") or os.path.basename(p["path"].rstrip("/")), os.path.expanduser(p["path"])))
+    return out
+
+
+def table(rows):
+    """Left-aligned columns, two spaces apart."""
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
+    return "\n".join("  ".join([c.ljust(w) for c, w in zip(r, widths)] + [r[-1]]).rstrip() for r in rows)
+
+
+def cmd_awaiting(args):
+    rows, errors = [], []
+    if args.all_projects:
+        for name, path in registry_projects():
+            if not os.path.isdir(path) or git(path, "remote", "get-url", "origin").returncode != 0:
+                continue
+            try:
+                rows += awaiting_in(Repo(path), name)
+            except Problem as err:
+                errors.append(f"{name}: {err}")
+    else:
+        rows = awaiting_in(open_repo())
+    if args.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+    elif not rows:
+        print("No pull requests awaiting you.")
+    else:
+        head = (["PROJECT"] if args.all_projects else []) + ["PR", "TITLE", "TICKET", "AGE", "CHECKS", "UNRESOLVED",
+                                                             "URL"]
+        body = [([r["project"]] if args.all_projects else []) +
+                [f"#{r['number']}", r["title"], f"#{r['ticket']}" if r["ticket"] else "-", r["age"], r["checks"],
+                 str(r["unresolved"]), r["url"]] for r in rows]
+        print(table([head] + body))
+    for line in errors:
+        warn(line)
+    return 0
+
+
+# --------------------------------------------------------------- ultra
+def find_findings(data):
+    """The findings in ultrareview's JSON, whatever its shape: a top-level list, a `findings` list (at any
+    depth), else every object that has a `severity`."""
+    if isinstance(data, list):
+        return [d for d in data if isinstance(d, dict)]
+    stack = [data]
+    while stack:
+        node = stack.pop(0)
+        if isinstance(node, dict):
+            if isinstance(node.get("findings"), list):
+                return [d for d in node["findings"] if isinstance(d, dict)]
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    found, stack = [], [data]
+    while stack:
+        node = stack.pop(0)
+        if isinstance(node, dict):
+            if "severity" in node:
+                found.append(node)
+            else:
+                stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return found
+
+
+def severity_line(findings):
+    counts = {}
+    for f in findings:
+        sev = str(f.get("severity") or "unrated").strip().lower() or "unrated"
+        counts[sev] = counts.get(sev, 0) + 1
+    rank = {s: i for i, s in enumerate(SEVERITY_RANK)}
+    order = sorted(counts, key=lambda s: (rank.get(s, len(rank)), s))
+    return ", ".join(f"{counts[s]} {s}" for s in order)
+
+
+def mark_cloud_exhausted(reason):
+    path = home(".claude", "harness", "budgets.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = {}
+    data = data if isinstance(data, dict) else {}
+    until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=EXHAUSTED_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data["cloud"] = {"exhausted_until": until, "reason": reason}
+    write_file(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return until
+
+
+def cmd_ultra(args):
+    repo = open_repo()
+    number = args.number
+    exe = os.environ.get("HARNESS_CLAUDE", "claude")
+    cmd = [exe, "ultrareview", str(number), "--json", "--timeout", str(ULTRA_MINUTES)]
+    cmd += ["--post"] if args.post else []
+    try:
+        done = subprocess.run(cmd, cwd=repo.root, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              stdin=subprocess.DEVNULL, timeout=(ULTRA_MINUTES + 10) * 60)
+    except FileNotFoundError:
+        raise Problem(f"claude not found ({exe})") from None
+    except OSError as err:
+        raise Problem(f"cannot run claude ({exe}): {err.strerror or err}") from None
+    except subprocess.TimeoutExpired:
+        raise Problem(f"claude ultrareview {number} did not finish in {ULTRA_MINUTES + 10} minutes") from None
+    path = repo.state("ultra", f"{number}.json")
+    if done.stdout.strip():
+        write_file(path, done.stdout)
+    if done.returncode != 0:
+        output = (done.stdout or "") + "\n" + (done.stderr or "")
+        hit = next((line for line in output.splitlines() if BILLING.search(line)), None)
+        if hit:
+            reason = one_line(hit)[:200]
+            until = mark_cloud_exhausted(reason)
+            raise Problem(f"ultrareview PR #{number} failed (exit {done.returncode}): {reason}; "
+                          f"the cloud budget is marked exhausted until {until}")
+        why = last_line(done.stderr) or last_line(done.stdout) or "no output"
+        raise Problem(f"ultrareview PR #{number} failed (exit {done.returncode}): {why}")
+    saved = f"saved {short_home(path)}" if done.stdout.strip() else "no output to save"
+    try:
+        data = json.loads(done.stdout)
+    except ValueError:
+        print(f"ultrareview PR #{number}: done, the output is not JSON so findings were not counted; {saved}")
+        return 0
+    findings = find_findings(data)
+    posted = "; posted to the PR" if args.post else ""
+    if findings:
+        print(f"ultrareview PR #{number}: {plural(len(findings), 'finding')} ({severity_line(findings)}){posted}; "
+              f"{saved}")
+    else:
+        print(f"ultrareview PR #{number}: no findings{posted}; {saved}")
+    return 0
+
+
+# --------------------------------------------------------------- land
+def worktree_for(main, branch):
+    """The path of the worktree that has `branch` checked out, or None."""
+    out = git_ok(main, "worktree", "list", "--porcelain")
+    for block in out.split("\n\n"):
+        path, ref = None, None
+        for line in block.splitlines():
+            if line.startswith("worktree "):
+                path = line[len("worktree "):]
+            elif line.startswith("branch "):
+                ref = line[len("branch "):]
+        if path and ref == f"refs/heads/{branch}":
+            return path
+    return None
+
+
+def ticket_parent(repo, number):
+    """The ticket's epic: `parent` in the ticket cache, else GitHub's sub-issue parent (404: none)."""
+    try:
+        with open(repo.state("tickets", f"{number}.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = None
+    parent = data.get("parent") if isinstance(data, dict) else None
+    n = parent.get("number") if isinstance(parent, dict) else None
+    if isinstance(n, int) and n > 0:
+        return n
+    call = ["api", f"repos/{repo.slug()}/issues/{number}/parent"]
+    done = gh_run(call, repo.main)
+    if done.returncode != 0:
+        if re.search(r"\b404\b|Not Found", (done.stderr or "") + (done.stdout or "")):
+            return None
+        raise Problem(f"{describe(call)} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
+    try:
+        found = json.loads(done.stdout or "null")
+    except ValueError:
+        raise Problem(f"{describe(call)} printed something other than JSON") from None
+    n = found.get("number") if isinstance(found, dict) else None
+    return n if isinstance(n, int) and n > 0 else None
+
+
+def land_ticket(repo, number, sha, pr):
+    """Close the ticket when GitHub has not, drop its status labels, comment `Landed in <sha>` unless a comment
+    already says it (a resumed land), check its epic. (summary, error)."""
+    done = []
+    try:
+        info = gh_json(["issue", "view", str(number), "--json", "state,labels,comments"], repo.main)
+        info = info if isinstance(info, dict) else {}
+        if str(info.get("state", "")).upper() != "CLOSED":
+            board(repo, "close", str(number))
+            done.append("closed")
+        else:
+            done.append("closed by GitHub")
+        statuses = [label.get("name") for label in as_list(info.get("labels"))
+                    if str(label.get("name") or "").startswith("status:")]
+        if statuses:
+            cmd = ["issue", "edit", str(number)]
+            for name in statuses:
+                cmd += ["--remove-label", name]
+            gh(cmd, repo.main)
+            done.append("status labels removed")
+        if any(LANDED in (c.get("body") or "") for c in as_list(info.get("comments"))):
+            done.append("landed comment already there")
+        else:
+            board(repo, "comment", str(number), "--body", f"{LANDED} {sha}" if sha else f"{LANDED} PR #{pr}")
+            done.append("commented")
+        parent = ticket_parent(repo, number)
+        if parent:
+            said = first_line(board(repo, "epic-check", str(parent)))
+            done.append(f"epic check: {said or f'#{parent} checked'}")
+    except Problem as err:
+        return f"#{number} {', '.join(done) or 'unchanged'}", str(err)
+    return f"#{number} {', '.join(done)}", None
+
+
+def merge_preconditions(repo, number, view):
+    """Refuse a draft, a conflict or checks that are not green; the view, fetched again while GitHub has not
+    worked out mergeability."""
+    main = repo.main
+    if view.get("isDraft"):
+        raise Problem(f"PR #{number} is a draft; harness-pr ready {number} first")
+    interval = poll_interval()
+    for _ in range(MERGEABLE_RETRIES):
+        if str(view.get("mergeable") or "").upper() != "UNKNOWN":
+            break
+        time.sleep(min(MERGEABLE_SLEEP, interval))
+        view = pr_view(repo, number, LAND_FIELDS, main)
+    mergeable = str(view.get("mergeable") or "").upper()
+    if mergeable == "CONFLICTING":
+        raise Problem(f"PR #{number} conflicts with main; update the branch, then land again")
+    if mergeable == "UNKNOWN":
+        warn(f"GitHub has not worked out whether PR #{number} merges cleanly; trying the merge")
+    entries = check_entries(view.get("statusCheckRollup"))
+    checks = overall(entries)
+    if checks == "failure":
+        raise Problem(f"checks are red on PR #{number}: " + ", ".join(
+            f"{e['name']} ({e['state'].lower()})" for e in entries if e["bucket"] == "fail"))
+    if checks == "pending":
+        raise Problem(f"checks are still running on PR #{number}: " + ", ".join(
+            e["name"] for e in entries if e["bucket"] == "pending") + f"; harness-pr checks {number} --wait")
+    if checks == "none":
+        warn(f"no checks registered on PR #{number}")
+    return view
+
+
+def cmd_land(args):
+    """Merge and clean up; on a PR that is already merged (an earlier land stopped at a dirty worktree, or it
+    was merged on GitHub), skip the preconditions and the merge and finish the cleanup."""
+    repo = open_repo()
+    main = repo.main
+    number = args.number
+    view = pr_view(repo, number, LAND_FIELDS, main)
+    state = str(view.get("state") or "OPEN").upper()
+    resume = state == "MERGED"
+    if resume:
+        print("already merged, finishing cleanup")
+        sys.stdout.flush()
+    elif state == "CLOSED":
+        raise Problem(f"PR #{number} was closed without being merged; nothing to land")
+    elif state != "OPEN":
+        raise Problem(f"PR #{number} is {state.lower()}, not open")
+    else:
+        view = merge_preconditions(repo, number, view)
+    tickets = closing_numbers(view)
+    if not tickets:
+        warn(f"PR #{number} closes no issue (no Closes #N in its body); no ticket to close")
+    branch = view.get("headRefName") or ""
+    title = view.get("title") or ""
+
+    if not resume:
+        gh(["pr", "merge", str(number), "-R", repo.slug(), "--squash", "--delete-branch"], main, timeout=120)
+    sha = ""
+    try:
+        merged = pr_view(repo, number, "mergeCommit", main).get("mergeCommit")
+        sha = str(merged.get("oid") or "") if isinstance(merged, dict) else ""
+    except Problem as err:
+        warn(f"could not read the merge commit: {err}")
+    merged_as = f" as {sha[:12]}." if sha else "."
+    summary = [(f'PR #{number} "{title}" was already merged into main' if resume
+                else f'Merged PR #{number} "{title}" into main') + merged_as]
+    problems = []
+
+    git(main, "worktree", "prune")            # forget worktrees whose folder was removed by hand
+    wt = worktree_for(main, branch) if branch else None
+    vanished = None
+    if wt and not os.path.isdir(wt):          # still listed (locked) but gone from disk: nothing to remove
+        vanished, wt = wt, None
+    if wt and os.path.realpath(wt) == main:
+        problems.append(f"the main checkout is on {branch}; switch it to main, then git branch -D {branch}")
+        summary.append(f"Worktree: the main checkout is on {branch}; nothing removed.")
+    else:
+        if wt:
+            dirty = dirty_files(wt)
+            if dirty and not args.discard:
+                print(summary[0])
+                print(f"The worktree {wt} has uncommitted changes: {listing(dirty)}")
+                print(f"To finish: harness-pr land {number} --discard (drops them and completes the cleanup),"
+                      " or by hand:")
+                print(f"  git -C {main} worktree remove --force {wt}")
+                print(f"  git -C {main} branch -D {branch}")
+                sys.stdout.flush()
+                raise Problem(f"PR #{number} is merged, but the worktree {wt} is dirty; cleanup stopped "
+                              f"(harness-pr land {number} --discard finishes it)")
+            removed = git(main, "worktree", "remove", *(["--force"] if args.discard else []), wt)
+            if removed.returncode != 0:
+                problems.append(f"git worktree remove {wt} failed: {last_line(removed.stderr)}")
+        exists = branch and git(main, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0
+        deleted = False
+        if exists and not problems:
+            gone = git(main, "branch", "-D", branch)
+            deleted = gone.returncode == 0
+            if not deleted:
+                problems.append(f"git branch -D {branch} failed: {last_line(gone.stderr)}")
+        where_line = (f"removed {wt}" if wt and not problems else f"kept {wt}" if wt
+                      else f"{vanished} was already gone" if vanished else f"no worktree for {branch}")
+        branch_line = (f"branch {branch} deleted" if deleted else f"branch {branch} kept" if exists
+                       else f"no local branch {branch}")
+        summary.append(f"Worktree: {where_line}; {branch_line}.")
+
+    fetched = git(main, "fetch", "--prune", timeout=PUSH_TIMEOUT)
+    if fetched.returncode != 0:
+        problems.append(f"git fetch --prune failed: {last_line(fetched.stderr)}")
+    on = current_branch(main)
+    if on == "main":
+        pulled = git(main, "pull", "--ff-only", timeout=PUSH_TIMEOUT)
+        if pulled.returncode != 0:
+            problems.append(f"git pull --ff-only failed: {last_line(pulled.stderr)}")
+        main_line = "fetched and fast-forwarded main" if pulled.returncode == 0 else "fetched; main not pulled"
+    else:
+        main_line = f"fetched; on {on or 'a detached HEAD'}, so main was not pulled"
+    summary.append(f"Main checkout: {main_line if fetched.returncode == 0 else 'fetch failed'}.")
+
+    ticket_lines = []
+    for n in tickets:
+        line, error = land_ticket(repo, n, sha, number)
+        ticket_lines.append(line)
+        if error:
+            problems.append(f"ticket #{n}: {error}")
+    summary.append("Ticket: " + ("; ".join(ticket_lines) if ticket_lines else "none linked") + ".")
+    print("\n".join(summary))
+    if problems:
+        sys.stdout.flush()
+        raise Problem(f"PR #{number} is merged, but: " + "; ".join(problems))
+    return 0
+
+
+# --------------------------------------------------------------- arguments
+def number_arg(text):
+    digits = text.lstrip("#")
+    if not digits.isdigit() or int(digits) <= 0:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}")
+    return int(digits)
+
+
+def seconds_arg(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
+    if not value > 0:
+        raise argparse.ArgumentTypeError(f"not a positive number of seconds: {text!r}")
+    return value
+
+
+def parser():
+    ap = Parser(prog="harness-pr", description="Pull requests for tickets: open, review, checks, ready, comments, "
+                                               "awaiting, ultra, land.")
+    sub = ap.add_subparsers(dest="cmd", metavar="{open,review,checks,ready,comments,awaiting,ultra,land}")
+    sub.required = True
+
+    op = sub.add_parser("open", help="push the ticket branch and open (or update) its draft PR")
+    op.add_argument("number", type=number_arg, metavar="N", help="the ticket")
+    op.add_argument("--worktree", metavar="PATH", help="the ticket worktree (default: the cwd)")
+    op.add_argument("--verify-log", metavar="F", help=f"the verify output; its last {VERIFY_TAIL_LINES} lines go in")
+    op.add_argument("--review", metavar="F", help="the reviewer's findings JSON")
+    op.add_argument("--json", action="store_true", help='print {"number", "url"}')
+
+    rv = sub.add_parser("review", help="post the reviewer's findings as a COMMENT review, inline where possible")
+    rv.add_argument("number", type=number_arg, metavar="P", help="the pull request")
+    rv.add_argument("--findings", required=True, metavar="F", help='[{"path", "line", "severity", "body"}]')
+    rv.add_argument("--checked", metavar="TEXT", default=DEFAULT_CHECKED, help="what was checked (no findings)")
+    rv.add_argument("--model", metavar="NAME", default="fable", help="the reviewer's model, named in the review")
+
+    ck = sub.add_parser("checks", help="the PR's checks: 0 green, 1 failed, 8 pending")
+    ck.add_argument("number", type=number_arg, metavar="P")
+    ck.add_argument("--wait", action="store_true", help="poll until the checks finish")
+    ck.add_argument("--timeout", type=seconds_arg, default=1200.0, metavar="SECONDS", help="with --wait (1200)")
+    ck.add_argument("--json", action="store_true")
+
+    rd = sub.add_parser("ready", help="mark the PR ready, the ticket in-review, and notify")
+    rd.add_argument("number", type=number_arg, metavar="P")
+    rd.add_argument("--ticket", type=number_arg, metavar="N", help="default: the issue the PR closes")
+
+    cm = sub.add_parser("comments", help="review threads, reviews and comments, without the harness's own")
+    cm.add_argument("number", type=number_arg, metavar="P")
+    cm.add_argument("--since", metavar="ISO", help="only what is newer")
+    cm.add_argument("--unresolved", action="store_true", help="unresolved review threads only")
+    cm.add_argument("--json", action="store_true")
+
+    aw = sub.add_parser("awaiting", help="your open, non-draft PRs")
+    aw.add_argument("--all-projects", action="store_true", help="every registered project with an origin remote")
+    aw.add_argument("--json", action="store_true")
+
+    ul = sub.add_parser("ultra", help="claude ultrareview (bills usage credits)")
+    ul.add_argument("number", type=number_arg, metavar="P")
+    ul.add_argument("--post", action="store_true", help="post the findings to the PR")
+
+    ld = sub.add_parser("land", help="squash-merge, remove the worktree and branch, update main, close the ticket")
+    ld.add_argument("number", type=number_arg, metavar="P")
+    ld.add_argument("--yes", action="store_true", help="accepted and ignored (the land skill confirms)")
+    ld.add_argument("--discard", action="store_true", help="remove the worktree even with uncommitted changes")
+    return ap
+
+
+COMMANDS = {"open": cmd_open, "review": cmd_review, "checks": cmd_checks, "ready": cmd_ready,
+            "comments": cmd_comments, "awaiting": cmd_awaiting, "ultra": cmd_ultra, "land": cmd_land}
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        code = COMMANDS[args.cmd](args)
+    except Problem as err:
+        sys.stdout.flush()
+        sys.exit(f"harness-pr: {one_line(err)}")
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:                      # the reader went away (| head): stop quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
+    except Exception as err:                     # never a traceback: one line, exit 1
+        sys.exit(f"harness-pr: {type(err).__name__}: {one_line(err)}")

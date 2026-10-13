@@ -1,0 +1,4 @@
+#!/bin/sh
+# Checks before each commit (git config core.hooksPath .githooks). None yet: add them here, and
+# exit non-zero listing the files that fail. Skip once with: git commit --no-verify
+exit 0

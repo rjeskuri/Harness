@@ -4,24 +4,41 @@
 - Keep replies short. For code changes I will review inline, show before/after snippets of the changed lines rather than whole files.
 - I am on macOS with zsh, Homebrew and VS Code. macOS ships BSD `sed`, `grep` and `date`: no `grep -P`, `sed -i` needs `''`, and `date -d` does not exist. There is no bare `python`, only `python3` or the project's own interpreter.
 - When you finish a task, show the evidence (the command you ran and its result) and say plainly what you could not verify.
-- Ask before adding dependencies, pushing, or anything else that is hard to undo. Never put a secret on a command line; read it from the environment or a file.
+- Ask before adding dependencies or doing anything else hard to undo, except what the loop below allows. Never put a secret on a command line; read it from the environment, a file or the keychain.
+
+## The board is the context
+
+- Every piece of work is a GitHub issue on the project's board: an epic with task sub-issues, each with a request, an outline, a definition of done and the tests that must pass. Read the ticket (`harness-board show N --markdown`) and its epic before working. Status changes go through `harness-board`; `harness-board board` shows the whole board.
+- A question the ticket, the epic and the code cannot answer becomes `harness-board needs-input N --question ...`, never a guess. I answer on the ticket; the next `/harness:work N` reads the answer.
+- New work: `/harness:plan <request>`. Tickets to pull requests: `/harness:work [N]`. Merging: `/harness:land [PR#]`. A new or existing repository joins the board with `/harness:new-project`.
+
+## Never on main
+
+- Work happens on a ticket branch `t/<issue>-<slug>` in its own worktree, created by `harness-work start N`. A hook denies edits, commits and pushes on main; do not look for a way around it.
+- Agents may push `t/*` branches and open or update pull requests without asking. Only I merge, push main, force-push or delete a branch: I land pull requests with `/harness:land`.
+
+## Tests first
+
+- On a ticket, tests are written before code by `harness:test-author`, proven red by `harness-red check`, challenged by `harness:test-breaker`, and only then implemented by `harness:coder`. A hook enforces the roles: authors edit tests only, coders never edit tests. Broad behavior tests through the public interface come first; specific cases after.
+- Never delete, skip or loosen a test to get green. A wrong test goes back to the test-author with the reason.
 
 ## Model routing
 
-- You, the main session, run on Fable: you own design decisions, orchestration and the final review.
-- Delegate implementation to the `harness:coder` subagent (Opus): anything beyond a trivial edit, including new code, tests, refactors and bug fixes that need investigation. Give it the task, the files, the conventions and the verify command.
-- Use `harness:quick` (Sonnet) only for small tasks you judge simple: a rename, a one-line fix, a lookup, a doc tweak, formatting.
-- Before calling work done, have `harness:reviewer` (Fable, fresh context) review the diff against the spec or task, and fix correctness findings.
-- Send fact-checking and "how does X behave" questions to `harness:researcher` (Opus), which answers from primary sources.
-- Large or parallel work is your call: launch a Workflow when it pays off, with Fable workers for judgment-heavy review or design stages, Opus workers for coding, and Sonnet workers only for mechanical fan-out. Say what you launched and why.
-- Effort defaults to xhigh for every tier; lower a subagent's effort only when its task is mechanical.
+- Default: Opus 5.5 at high effort, for the main session and every agent. `harness-board tier N` maps a ticket's labels to a tier: size:S and risk:low on a non-bug gives `sonnet`; size:L or risk:high gives `fable`; otherwise `opus`. Pass that as `model` on the Agent call. When escalating or reviewing on Fable, pass `model: fable` and `effort: xhigh` on the Agent call.
+- Escalation is by failure, recorded with `harness-work attempt`: a stage's first failure retries at the same tier, the second re-runs one tier up, the third stops with needs-input.
+- Fable is for `harness:reviewer` (always) and for escalations. `harness:planner` is Opus at xhigh. `harness:researcher` answers from primary sources. `harness:quick` (Sonnet) does trivial mechanical tasks outside tickets.
+- Parallel work: `/harness:work` with no number dispatches a session per ready ticket. A Workflow is yours to launch when it pays off, Opus workers for coding, Fable for judgment stages. Say what you launched and why.
+
+## Budgets
+
+- Interactive sessions run on the subscription. Dispatched tickets run headless on the API key (`harness-work dispatch`) and fall back to a background session on the subscription when the API budget is exhausted. `risk:high` pull requests get `claude ultrareview` on usage credits. `harness-work budget status` shows what is exhausted; report it, do not fight it.
 
 ## Across projects
 
-- Each project gets its own session; `/harness:standup` is the cross-project view, and `claude agents` in a terminal is the console for background sessions.
+- Each project gets its own session; `/harness:standup` is the cross-project view, the digest arrives daily, and `claude agents` in a terminal is the console for background sessions.
 - Write `docs/agent/handoff.md` with `/harness:handoff` before clearing context mid-task; the session brief reads it on the next start.
 - On a billable project, run `/harness:worklog` at the end of a working session.
 
 ## Compact Instructions
 
-When compacting, keep the list of files changed this session, the path of the current spec or handoff note, the latest test or verify result, and any decision I made in the conversation.
+When compacting, keep the ticket number and branch, the worktree path, the list of files changed this session, the latest test, red-run or verify result, and any decision I made in the conversation.

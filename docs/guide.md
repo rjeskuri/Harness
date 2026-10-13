@@ -1,129 +1,157 @@
 # Your Claude Code harness: first-run guide
 
-Written 2026-10-06. The living copy, with the drawing of the daily loop, is the Claude doc at https://claude.ai/code/artifact/2950d172-2435-48a1-9dde-9670fa499c0e
+Written 2026-10-13 for harness v2, Claude Code 2.1.296 and gh 2.99.0. The design and every contract live in [design.md](design.md).
 
 ## What you have now
 
-The harness is a set of files that shape every Claude Code session, so you stop repeating yourself and Claude stops guessing your rules. Five pieces, each with one job.
+The harness turns each project's GitHub issues into the context for every session. You describe work once, it becomes tickets, agents carry tickets to pull requests, and you merge. Each piece has one job.
 
 | Piece | What it is | What it does for you |
 | --- | --- | --- |
-| Personal instructions, `~/.claude/CLAUDE.md` | A short text file Claude reads at the start of every session, in every repo | Carries your preferences and the routing rule: Fable designs and reviews, Opus writes the code, Sonnet does trivial jobs |
-| The `harness` plugin | Four agents, seven slash commands and four hooks, installed once for your user | Agents are specialists Claude delegates to. Slash commands are procedures you start by typing `/harness:<name>`. Hooks are small scripts Claude Code itself runs at fixed moments, whatever the model thinks |
-| The `companion` plugin | A mod that draws the Game Boy robot above the prompt | Shows at a glance whether Claude is idle, thinking, working, waiting on you, done or stuck |
-| The `claude` command | The native command-line program, now on your PATH | Runs sessions in a terminal and opens the console that lists every session across your repos |
+| Personal instructions, `~/.claude/CLAUDE.md` | A short file Claude reads at the start of every session | Carries your preferences and the loop's rules: read the ticket first, never work on main, tests first, route by tier |
+| The board | GitHub Issues in each project's private repo: epics, task sub-issues, labels for status, size and risk | The single record of what is asked, what is in progress and what needs you. Agents read it before working and write status back |
+| The `harness` plugin | Seven agents, eight skills and seven hooks, installed once for your user | Agents do the work, skills are the procedures you start with `/harness:<name>`, hooks enforce the rules whatever the model thinks |
+| The `harness-*` tools | Nine command-line tools, on the Bash PATH in every session | The deterministic parts: board edits, worktrees, the red proof, PRs, budgets. Outside a session they live in `~/portfolio_projects/Harness/plugins/harness/bin/` |
+| The digest | A launchd job that runs `harness-digest` daily at 08:30 | One notification with PRs to review, tickets that need input and stale work, across every project |
 | The Harness repo, `~/portfolio_projects/Harness` | The source of all of the above, under git | Edit a skill, an agent or a hook there, run `/reload-plugins`, and every project picks it up |
 
-Each project keeps its own `CLAUDE.md`, hooks, rules and skills. The harness adds to them and never replaces them: jotform-glow-sync's live gate and HKTrack's rules stay exactly as they are.
+Each project keeps its own `CLAUDE.md`, hooks, rules and skills. The harness adds the board, the guards and the loop beside them, in every project including jotform-glow-sync.
 
-## Day one: finish the install and open your first session
+## Day one
 
-Eight steps, about twenty minutes, all in a terminal.
+In a terminal, in this order.
 
-1. **Wait for the build to land.** The Harness session will report that the hook scripts, the tools and the robot passed their tests and that both plugins are installed. To redo the install at any later time, run `sh ~/portfolio_projects/Harness/scripts/install.sh`.
-2. **Open a new terminal window.** The PATH change applies only to terminals started after today. `claude --version` prints 2.1.285.
-3. **Start a session in one repo.** `cd ~/Projects/HKTrack`, or any project, then `claude`. The first time in a folder Claude Code asks whether you trust it; answer yes for your own repos, because project hooks run only in trusted folders.
-4. **Look around.** Type `/hooks` and expect Notification, SessionStart, PostToolUse and Stop entries from the harness plugin. Type `/plugin`, open the Installed tab, and see harness and companion. Type `/` and scroll to the `/harness:` commands. The robot sits above the prompt; `/companion` hides it, and again shows it.
-5. **Register your projects.** In that session, ask Claude to run `harness-projects discover`, then `harness-projects add <path>` for each repo it found. Mark the client work billable: `harness-projects add ~/jotform-glow-sync --billable --client "Global G.L.O.W."`. Outside a session the tool lives at `~/portfolio_projects/Harness/plugins/harness/bin/harness-projects`.
-6. **Run the first brief.** `/harness:standup` lists each project's state, its next steps and the sessions that are open.
-7. **VS Code: the robot lives in its terminal.** The extension reads the same settings files, so the agents, commands and hooks work in its chat panel too, but the band above the prompt exists only in a terminal and in the desktop app. In VS Code, open the integrated terminal and run `claude` there to see the robot.
-8. **Tidy FantasyHockey when convenient.** Its repo has the kit installed but no commits yet. A session there can commit it, and its verify-on-stop is already configured through `CLAUDE_VERIFY_CMD`.
-
-## The console: several projects at once
-
-`claude agents`, run in a terminal, is the console. It lists every Claude session on this Mac, whether started in a terminal or in VS Code, with its repo and its status: running, idle, or waiting on a permission answer. From there you peek at a session's output, attach to it, rename it, stop it, or dispatch a new one into a repo.
-
-| You want to | Run |
-| --- | --- |
-| See every session | `claude agents` (`--json` for scripts, `--cwd <path>` to filter by repo) |
-| Start a session that works while you do something else | `cd <repo>` then `claude --bg -n "<name>" "<task>"`; it prints a short id |
-| Read a background session's recent output | `claude logs <id>` |
-| Take over a background session in this terminal | `claude attach <id>` |
-| Stop one but keep its conversation | `claude stop <id>`; later `claude attach <id>` or `claude --resume` |
-| Delete one, and its worktree when safe | `claude rm <id>` |
-| Let two sessions work on one repo without colliding | `claude --worktree` (or `-w <name>`) starts in a fresh git worktree |
-
-Notifications arrive on their own: a macOS banner names the repo when a session needs a permission answer, has gone idle waiting for you, or a background session needs input or has finished. Clicking it brings VS Code forward. To bring a terminal forward instead, set `HARNESS_NOTIFY_APP` to that app's bundle id under `env` in `~/.claude/settings.json`.
-
-Rule of thumb: one session per project, and two sessions never edit the same checkout at the same time unless one of them runs in a worktree.
+1. **Install.** `sh ~/portfolio_projects/Harness/scripts/install.sh`. It installs the plugin, your `CLAUDE.md`, the model settings and the daily digest, and backs up what it replaces. `claude --version` should print 2.1.296 or newer.
+2. **Store the API key.** `security add-generic-password -a "$USER" -s harness-anthropic -w` prompts for the key and keeps it in the keychain. Dispatched runs read it from there, so it never appears on a command line or in the environment.
+3. **Check GitHub.** `gh auth status` should show your account. The board needs it.
+4. **Register your projects.** `harness-projects discover` lists repos with Claude Code sessions. Add each with `harness-projects add <path>`. Mark client work billable: `harness-projects add ~/jotform-glow-sync --billable --client "Global G.L.O.W."`.
+5. **Put the first repo on the board.** `cd` into it, start `claude`, and trust the folder when asked. Run `/harness:new-project`. It interviews you, shows the scaffold plan, and asks before it creates the private GitHub repository and pushes. A repo that already has commits gets the scaffold through a chore ticket and a PR: your first PR to land.
+6. **Plan once.** `/harness:plan <a small, real request>`. Answer the interview, read the proposed table of tasks, approve it. The epic and tasks appear on GitHub.
+7. **Work one ticket here.** `/harness:work <n>` runs the whole loop in this session, so you see each stage. Later, `/harness:work` with no number dispatches every ready ticket in the background.
+8. **Answer a ticket.** When a notification says `<repo> #N needs input`, open the issue, reply in a comment, then run `/harness:work N`.
+9. **Land.** When a notification says a PR is ready, read it on GitHub, then `/harness:land` to list what is waiting and `/harness:land <P>` to merge one.
 
 ## A working day
 
-1. **Standup**: `/harness:standup`, where things stand, pick one project.
-2. **Open the project**: `cd` into the repo, then `claude`; one session per repo; the brief loads itself.
-3. **Spec the change**: `/harness:spec`, an interview then a spec file; skip for small fixes.
-4. **Build**: `/harness:build`, Opus implements, Fable reviews, repeated until the reviewer passes it.
-5. **Ship** when tests are green: `/harness:ship [pr]`, verify, review, commit, optional pull request.
-6. **Hand off** when stopping mid-task: `/harness:handoff`, then `/clear`.
-7. **Log hours** on billable projects: `/harness:worklog`, hours and a client note.
-8. **Next project**: back to the brief, or done for today.
+| Step | Command | What you get |
+| --- | --- | --- |
+| Digest | arrives at 08:30; `harness-digest` runs it now | PRs to review, tickets that need input, stale work, failed runs, budgets |
+| Standup | `/harness:standup` | Per project: git state, board counts, PRs awaiting you, needs-input tickets, stale worktrees, next steps, hours. Then a proposed order for the day |
+| Plan | `/harness:plan <request>` | New work on the board as an epic and tasks |
+| Work | `/harness:work` or `/harness:work <n>` | Ready tickets dispatched, or one run here |
+| Land | `/harness:land`, then `/harness:land <P>` | Reviewed PRs merged, worktrees and branches cleaned up, tickets closed |
+| Handoff | `/harness:handoff`, then `/clear` | `docs/agent/handoff.md`, which the next session's brief reads |
+| Worklog | `/harness:worklog` | The day's hours and a client note on billable projects |
 
-Build repeats until the reviewer passes the change; a small fix skips the spec and goes straight to build or to a plain request. Each box is one slash command, so a day is the loop run once per project you touch.
+One session per project. `claude agents` in a terminal lists every session, including the background ones dispatch starts.
 
-## The routing rule and the robot, in practice
+## How a ticket flows
 
-For anything beyond a small edit, the main session should say it is handing the work to `harness:coder`, a subagent line appears, and the result comes back as a short report with the commands it ran. Before saying done, it should call `harness:reviewer`. The rule is advice in your CLAUDE.md, not enforcement: if a session starts writing a large change itself, say "use the harness:coder agent", or type @ and pick the agent from the list, which guarantees it runs; then run `/harness:learn` at the end so the lesson gets recorded.
+| Stage | Who | What happens |
+| --- | --- | --- |
+| Start | `harness-work start N` | Branch `t/N-<slug>`, a worktree under `.claude/worktrees/`, label `status:in-progress`, a comment on the ticket |
+| Tests | `test-author` at the ticket's tier | Writes the tests the ticket names, broad behavior first, and runs them |
+| Red proof | `harness-red check` | Runs the new tests against unchanged source. They must fail; the record is written |
+| Break | `test-breaker` | In a scratch copy, tries to pass the tests with a cheat. If it can, the tests go back to the author, at most twice |
+| Code | `coder` at the tier | Changes source only, until the new tests and `CLAUDE_VERIFY_CMD` pass, and commits |
+| Review | `reviewer`, Fable | Checks the branch against the definition of done. High and medium findings go back to the coder, at most twice |
+| PR | `harness-pr open`, `harness-pr review` | Pushes the branch, opens a draft PR, posts the findings as a review |
+| CI | `harness-pr checks <P> --wait` | Waits for checks. Failures go back to the coder, at most twice |
+| Ultrareview | `harness-pr ultra <P> --post` | Only on `risk:high`; posts a cloud review to the PR |
+| Ready | `harness-pr ready <P>` | Marks the PR ready, sets `status:in-review`, notifies you |
 
-The robot tells you the session's state without reading the transcript.
+Every stage reports pass or fail to `harness-work attempt`. A first failure retries at the same tier, a second re-runs one tier up, a third posts a needs-input question on the ticket and stops.
 
-| Robot | Meaning |
+The hooks refuse three kinds of action, so the rules hold even when a prompt is ignored:
+
+| Hook | Refuses | Why |
+| --- | --- | --- |
+| Branch guard | Edits, commits, merges, resets and pushes to main in a repo on main or master. Force pushes on any branch | GitHub Free does not protect branches on private repos, so this is the only block. `docs/agent/` and gitignored files stay editable on main |
+| Tests first | On a `t/N-` branch: any source edit before a current red run; the test-author editing source; the coder or breaker editing tests | The tests are the contract, written and proven before the code. A `no-tests` ticket is exempt; a `refactor` ticket accepts a green record |
+| Read-only guard | Writes from the planner, reviewer and researcher | They advise; they never change files |
+
+On GitHub you see the work in two places. The ticket gets comments as it moves: started on its branch, the PR link, ready for review, landed with the merge commit. The PR body carries the red proof, and the reviewer's findings arrive as a review titled `Harness review (<model>): <n> findings`, inline on the changed lines, with any finding outside the diff listed in the review body.
+
+## Your two jobs
+
+**Answer needs-input tickets.** When the agents cannot answer a question from the ticket, the epic or the code, they stop and ask. The ticket gets `status:needs-input` and a comment headed **Needs your input** with the question and the evidence, and you get a notification. Reply in a comment on the issue. `/harness:work N` reads your newest comment as the answer and carries on.
+
+**Review pull requests.** Agents open PRs under your GitHub account, so GitHub will not let you approve them; landing is the approval. Read the PR, leave review comments where something should change, and run `/harness:work N` again: it gives the coder your unresolved threads, pushes, waits for checks and answers each thread with what changed. When it is right, `/harness:land <P>`.
+
+The PR body is laid out the same way every time:
+
+| Section | What it holds |
 | --- | --- |
-| Blinks now and then | Idle, nothing running |
-| Antenna glows | Thinking: your prompt is being worked on, no tool yet |
-| Arms pump, the note names the tool | Working: running a command, editing a file, searching |
-| Eyes look left and right, the note says "needs you" | A permission prompt is waiting for your answer |
-| Bounces with smiling eyes | The turn finished |
-| Antenna droops | A tool call failed or the turn ended in an error |
+| `Closes #N` | The ticket, so merging closes it |
+| Summary | What changed |
+| Definition of done | The ticket's checklist |
+| Tests | The tests added, then the red run: its kind, exit code and the tail of the failing output |
+| Verify | The tail of `CLAUDE_VERIFY_CMD` on the finished branch |
+| Review | Finding counts by severity and the high findings |
+| Risks | Filled for `risk:high` tickets |
 
-The band above the prompt exists in a terminal and in the desktop app, not in the VS Code chat panel. The desktop app draws the robot as an SVG; a terminal draws colored cells: VS Code's integrated terminal, iTerm2 and Ghostty show its four greens exactly, Terminal.app the nearest of 256 colors.
+## Budgets and quota
 
-Quota is the thing to watch on a subscription. You are on Claude Max 20x, and Fable draws on its limits faster than the other models, so the routing rule earns its keep. `/usage` shows the five-hour and seven-day windows, `/cost` what this session has used, `/context` what fills the window. Fable is the most expensive tier, so the routing rule keeps most tokens on Opus. For a simple session you can run the orchestrator itself on Opus with `/model opus`, and `/effort` changes the reasoning effort for the session. The defaults live under `modelSettings` in `~/.claude/settings.json`.
+| Work | Bills to | When it runs out |
+| --- | --- | --- |
+| Your interactive sessions, including `/harness:work N` | The Max subscription | Wait for the window; `/usage` shows the five-hour and seven-day limits |
+| `/harness:work` dispatch | The API key in the keychain | A billing or auth failure marks the `api` budget exhausted for 24 hours. Dispatch then starts background sessions on the subscription |
+| Ultrareview on `risk:high` PRs | claude.ai usage credits, about 5 to 25 dollars a run | A credits failure marks the `cloud` budget exhausted for 24 hours |
+
+`harness-work budget status` shows both budgets. After a top-up, `harness-work budget reset api` clears the mark. `harness-work budget exhaust api --reason <text>` forces the fallback by hand. The session brief and the standup name an exhausted budget.
 
 ## When something looks wrong
 
-Most problems have a one-command check.
-
 | Symptom | Check |
 | --- | --- |
-| `/hooks` lists nothing from the harness | Trust the folder (start `claude` there and accept), then `/reload-plugins`. `claude --debug hooks` logs every hook run with its exit code to `~/.claude/debug/<session-id>.txt`; it prints nothing in the terminal |
-| A plugin shows an error | `/plugin`, Errors tab. In a terminal, `claude plugin list` and `claude plugin validate ~/portfolio_projects/Harness` |
-| No robot above the prompt | `/companion` toggles it. The band exists only in a terminal or the desktop app, never in the VS Code chat panel. A survey can hold it for a while, and a window under 36 columns shows the sprite alone. `claude --debug` writes a line starting `ui.render (AbovePrompt)` when a drawing was refused |
-| Claude keeps working after you expected it to stop | Verify-on-stop ran the project's `CLAUDE_VERIFY_CMD` and it failed; the reason is in the transcript. It gives up after two tries. Raise `CLAUDE_VERIFY_TIMEOUT`, or remove the `env` entry to turn it off |
-| An edit was blocked for a secret | Move the value to the environment or a gitignored file. A fixtures file with fake tokens can carry the line `harness: allow-secrets` |
-| No notifications | `brew list terminal-notifier`; allow terminal-notifier under System Settings, Notifications; check that a Focus mode is not hiding banners |
+| A guard refused an edit: `On main in <repo>` | You are in the main checkout on main. `harness-work start N` for a ticket, or `git switch -c t/<n>-<slug>` for untracked work. `HARNESS_ALLOW_MAIN=1` under `env` in the project's `.claude/settings.local.json` turns the guard off there |
+| Tests first refused: `No red run recorded` | Write the tests, then `harness-red check`. `harness-red status` shows the record and whether it is current. `Tests changed since the red run` means run `harness-red check` again. A docs or config ticket needs the `no-tests` label |
+| `harness-red check` says the tests pass | They do not test the change. Back to the test-author; only a `refactor` ticket proceeds on green |
+| `no checks registered` from `harness-pr checks` | The repo has no CI on pull requests. The scaffold's `.github/workflows/ci.yml` is missing, or `--no-ci` skipped it and the project's own CI does not run on PRs |
+| A headless run died | `harness-work runs --sweep` shows each run's exit and outcome: `ok`, `billing`, `auth` or `error`. The log is in `~/.claude/harness/runs/`. The next `/harness:work` re-dispatches a ticket still in progress without a PR |
+| Budget exhausted | `harness-work budget status`. Top up, then `harness-work budget reset api`. Until then dispatch uses the subscription |
+| Old worktrees pile up | `harness-work worktrees` lists them and flags stale ones; `harness-work worktree remove <branch>` removes one |
 | Standup says the fleet could not be read | The `claude` binary was not found. The tool looks on PATH, then in `~/.local/bin` |
-| Everything misbehaves | `claude --safe-mode` starts with every customization off, to narrow it down. `"disableAllHooks": true` in a project's `.claude/settings.local.json` pauses hooks there. `claude doctor` checks the install |
+| `/hooks` lists nothing from the harness | Trust the folder, then `/reload-plugins`. `claude plugin validate ~/portfolio_projects/Harness` checks the plugin. `claude --debug` logs every hook run with its exit code to `~/.claude/debug/<session-id>.txt` |
+| An edit was flagged for a secret | Move the value to the environment, the keychain or a gitignored file. A fixtures file with fake tokens can carry the line `harness: allow-secrets` |
+| No notifications | `brew list terminal-notifier`; allow it under System Settings, Notifications; check that a Focus mode is not hiding banners |
+| Everything misbehaves | `"disableAllHooks": true` in the project's `.claude/settings.local.json` pauses its hooks. `claude doctor` checks the install |
 
-## Habits that keep it efficient
+## Habits
 
-- One session per project. `/clear` between unrelated tasks, and `/harness:handoff` first when you stop mid-task. `/resume` reopens an earlier conversation.
-- Let the harness delegate. Ask for `harness:coder` when a session starts coding a big change itself, and for `harness:reviewer` before you accept "done".
-- Spec anything that will take more than an hour with `/harness:spec`. Small fixes go straight to a request.
-- Keep each project's CLAUDE.md under about 60 lines. File-specific rules go in `.claude/rules/`. After a session with corrections, `/harness:learn` proposes the diffs; apply only the ones you agree with.
-- Watch `/context`. Compaction summarizes the conversation on its own near the limit; `/compact <what to keep>` does it early when the window is full of noise. Esc interrupts a turn that is heading the wrong way.
-- Long tasks run in the background with `claude --bg`, and the notifications call you back.
-- Check `/usage` once a day. If the five-hour window runs short, lower Opus or Sonnet effort under `modelSettings`, or run a simple session on `/model opus`.
-- Keep secrets out of commands. The scan blocks them in files, but a key typed on a command line still lands in transcripts and allow rules.
-- End every billable session with `/harness:worklog`, and run it at least every two weeks: Claude Code deletes a session's transcript about 30 days after its last activity, and the hours come from those transcripts.
+- Put work on the board before it starts. Anything bigger than a quick fix goes through `/harness:plan`.
+- Run unfamiliar or risky tickets with `/harness:work <n>` in a session you watch. Dispatch the rest.
+- Answer needs-input tickets and land PRs the same day. Each waiting ticket holds a worktree.
+- One session per project. `/clear` between unrelated tasks, with `/harness:handoff` first when you stop mid-task.
+- Keep each project's `CLAUDE.md` under about 60 lines. `/harness:learn` turns a session's corrections into chore tickets; land the ones you agree with.
+- Never loosen a test to get a PR through. A wrong test goes back to the test-author with the reason.
+- Keep secrets out of commands. The API key lives in the keychain for that reason.
+- End every billable session with `/harness:worklog`, and run it at least every two weeks: Claude Code deletes a transcript about 30 days after its last activity, and the hours come from transcripts.
 
 ## Glossary
 
 | Term | Meaning here |
 | --- | --- |
+| Ticket | A GitHub issue on the board: request, outline, definition of done, tests that must pass, context |
+| Epic | An issue labeled `epic` whose tasks are its sub-issues. It closes when the last task lands |
+| Board | A project's GitHub issues and their labels. `harness-board board` prints it |
+| Tier | The model a ticket's agents run on: Sonnet, Opus or Fable, from its size and risk labels |
+| Red run | `harness-red check` proving the new tests fail before any source changes. Its record unlocks source edits |
+| Breaker | The `test-breaker` agent, which tries to cheat the tests to show they are too narrow |
+| Worktree | A second checkout of the repo in another folder. Each ticket gets one under `.claude/worktrees/` |
+| Land | Squash-merge a PR, remove its worktree and branch, close the ticket: `/harness:land <P>` |
+| Headless run | A `claude -p` session that dispatch starts per ticket, billed to the API key, logged under `~/.claude/harness/runs/` |
+| Budget | The API key or the usage credits. An exhausted one is skipped for 24 hours |
+| Digest | The daily summary across projects, written to `~/.claude/harness/digest/` |
 | Session | One conversation with Claude Code in one folder, with its own context window |
-| Context window | What the model can see right now: your messages, files it read, tool output. It fills up, which is why compaction and handoffs exist |
-| Compaction | Claude Code summarizing the conversation to free space. Automatic near the limit, manual with `/compact` |
-| CLAUDE.md | Instructions loaded at session start. `~/.claude/CLAUDE.md` applies in every repo; a project's own file adds to it |
+| Context window | What the model can see right now. It fills up, which is why compaction and handoffs exist |
+| Compaction | Claude Code summarizing the conversation to free space; manual with `/compact` |
+| CLAUDE.md | Instructions loaded at session start. `~/.claude/CLAUDE.md` applies everywhere; a project's own file adds to it |
 | Rule | A markdown file under `.claude/rules/` that loads only when matching files are touched |
-| Hook | A script Claude Code runs at an event, such as before a tool call, after an edit or when Claude tries to stop. Deterministic, unlike instructions |
-| Skill, slash command | A procedure written in a SKILL.md and started by typing `/name`. The harness ones are `/harness:<name>` |
-| Subagent | A separate Claude with its own context, model and tools, given one task, returning a report. `harness:coder` and `harness:reviewer` are subagents |
-| Plugin | A package of agents, skills, hooks and mods installed as one unit. A marketplace is a catalog of plugins; `ryan` is yours |
-| Mod | A plugin module that draws in the interface. The robot is one |
-| Worktree | A second checkout of a git repo in another folder, so two sessions can edit without colliding |
-| Permission mode | How Claude Code decides what runs without asking: allow, ask and deny rules, plan mode, auto mode |
-| Effort | How much reasoning the model spends per turn, from low to max. Set per model or per agent |
-| Fleet, console | `claude agents`: the list of every session on the machine |
+| Hook | A script Claude Code runs at an event, such as before a tool call. Deterministic, unlike instructions |
+| Skill | A procedure in a SKILL.md, started with `/name`. The harness ones are `/harness:<name>` |
+| Subagent | A separate Claude with its own context, model and tools, given one task |
+| Plugin | A package of agents, skills and hooks installed as one unit. `ryan` is your marketplace |
+| Effort | How much reasoning a model spends per turn. Set per model under `modelSettings` |
+| Fleet, console | `claude agents`: every session on the machine |
 | Handoff | `docs/agent/handoff.md`, the note a session writes so the next one can continue |
-| Spec | `docs/agent/specs/<date>-<slug>.md`, the contract for a change before it is built |
-| Workflow | A script that runs many subagents with fixed control flow. The orchestrator may launch one for large or parallel work |

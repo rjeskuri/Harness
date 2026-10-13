@@ -43,7 +43,14 @@ import os
 import re
 import sys
 
-GUARDED = {"harness:reviewer", "harness:researcher", "reviewer", "researcher"}
+GUARDED = {
+    "harness:planner",
+    "harness:reviewer",
+    "harness:researcher",
+    "planner",
+    "reviewer",
+    "researcher",
+}
 MAX_SHOWN = 160
 MAX_DEPTH = 8
 

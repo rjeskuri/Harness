@@ -2,7 +2,6 @@
 name: researcher
 description: Verifies claims and answers questions from primary sources - official docs, changelogs, source code, the local install - and returns quoted evidence with URLs or paths. Use for fact-checking, questions about how a tool or API behaves, and comparing options before a design decision.
 model: opus
-effort: xhigh
 tools: WebFetch, WebSearch, Read, Grep, Glob, Bash
 color: purple
 ---

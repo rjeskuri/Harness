@@ -1,10 +1,10 @@
 {
-  "_comment": "Merged into ~/.claude/settings.json by the install step. Effort is xhigh for every tier (Ryan's choice); change a tier here or per agent with the effort frontmatter field.",
-  "model": "claude-fable-5-1",
-  "effortLevel": "xhigh",
+  "_comment": "Merged into ~/.claude/settings.json by scripts/install.sh: model and effortLevel replace, modelSettings merges per model id, nothing else is touched. Opus 5.5 at high is the default everywhere; Fable (review, escalations) runs at xhigh; Sonnet (size:S risk:low tickets) at high.",
+  "model": "opus",
+  "effortLevel": "high",
   "modelSettings": {
+    "claude-opus-5-5": { "effortLevel": "high" },
     "claude-fable-5-1": { "effortLevel": "xhigh" },
-    "claude-opus-5-5": { "effortLevel": "xhigh" },
-    "claude-sonnet-5-5": { "effortLevel": "xhigh" }
+    "claude-sonnet-5-5": { "effortLevel": "high" }
   }
 }

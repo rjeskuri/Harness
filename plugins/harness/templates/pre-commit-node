@@ -1,0 +1,21 @@
+#!/bin/sh
+# Lint before each commit (git config core.hooksPath .githooks): `npm run lint` when package.json
+# has that script. Skip once with: git commit --no-verify
+set -f
+IFS='
+'
+files=$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACM -- \
+    '*.js' '*.jsx' '*.mjs' '*.cjs' '*.ts' '*.tsx' '*.mts' '*.cts')
+[ -n "$files" ] || exit 0
+
+if ! command -v npm >/dev/null 2>&1; then
+    echo "pre-commit: npm not found; lint skipped." >&2
+    exit 0
+fi
+if ! npm run lint --if-present; then
+    echo "pre-commit: npm run lint failed with these files staged:" >&2
+    for f in $files; do echo "  $f" >&2; done
+    echo "Fix them, git add them, and commit again." >&2
+    exit 1
+fi
+exit 0
