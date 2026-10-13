@@ -526,19 +526,26 @@ def save_record(repo, record):
         raise Problem(f"cannot write {repo.ticket_path(record['number'])}: {err.strerror or err}") from None
 
 
-def newest_resolution(comments):
-    """(index, lines) of the newest `**Resolution**` comment, its heading, marker and outer blank lines dropped;
-    (None, []) when there is none."""
-    for i in range(len(comments) - 1, -1, -1):
-        body = (comments[i].get("body") or "").strip()
+def all_resolutions(comments):
+    """[(index, lines)] of every `**Resolution**` comment, oldest first, each with its heading, marker and outer
+    blank lines dropped; a ticket reopened and landed again carries one per landing."""
+    out = []
+    for i, c in enumerate(comments):
+        body = (c.get("body") or "").strip()
         if body.startswith(RESOLUTION):
             lines = [line.rstrip() for line in body[len(RESOLUTION):].splitlines() if line.strip() != MARKER]
             while lines and not lines[0]:
                 lines.pop(0)
             while lines and not lines[-1]:
                 lines.pop()
-            return i, lines
-    return None, []
+            out.append((i, lines))
+    return out
+
+
+def newest_resolution(comments):
+    """(index, lines) of the newest `**Resolution**` comment, as in `all_resolutions`; (None, []) when none."""
+    found = all_resolutions(comments)
+    return found[-1] if found else (None, [])
 
 
 def task_resolutions(repo, tasks):
@@ -558,18 +565,24 @@ def task_resolutions(repo, tasks):
     return out
 
 
-def fitted_resolutions(entries, room):
+def fitted_resolutions(entries, room, newest=0):
     """The (number, heading and lines) Resolutions as context lines within `room`: each printed whole when it
-    fits, in order, and the rest named on one pointer line; never one cut part-way."""
+    fits, in order, and the rest named on one pointer line; never one cut part-way. The last `newest` entries
+    (a ticket's own, one per landing) are fitted newest first, so the oldest landing is the one dropped."""
     blocks = [(number, [""] + block) for number, block in entries]
     if sum(len(block) for _, block in blocks) > room:
         room -= 2                                      # the pointer line and the blank before it
+    split = len(blocks) - newest
+    shown = set()
+    for i in list(range(split)) + list(range(len(blocks) - 1, split - 1, -1)):
+        if len(blocks[i][1]) <= room:
+            shown.add(i)
+            room -= len(blocks[i][1])
     out, left = [], []
-    for number, block in blocks:
-        if len(block) <= room:
+    for i, (number, block) in enumerate(blocks):
+        if i in shown:
             out += block
-            room -= len(block)
-        else:
+        elif number not in left:
             left.append(number)
     if left:
         where = f"gh issue view {left[0]} --comments" if len(left) == 1 else "gh issue view N --comments"
@@ -579,7 +592,7 @@ def fitted_resolutions(entries, room):
 
 def context_markdown(record, resolutions=None):
     """The ticket context: header, epic and blockers, the task list and the closed tasks' Resolutions
-    (`resolutions`), the sections, a closed ticket's own Resolution, then the newest comments that fit."""
+    (`resolutions`), the sections, a closed ticket's own Resolutions, then the newest comments that fit."""
     n = record["number"]
     raw = split_sections(record.get("body"))
     state = "closed" if record.get("status") == "closed" else "open"
@@ -613,15 +626,19 @@ def context_markdown(record, resolutions=None):
         if text.strip():
             lines += ["", f"## {heading}"] + text.splitlines()
     comments = record["comments"]
+    own = []
     if record.get("status") == "closed":
-        index, own = newest_resolution(comments)
+        own = [(index, body) for index, body in all_resolutions(comments) if body]
         if own:
-            comments = comments[:index] + comments[index + 1:]
+            taken = {index for index, _ in own}
+            comments = [c for i, c in enumerate(comments) if i not in taken]
             if not entries:
-                at = len(lines)                        # a ticket's own Resolution goes after its sections
-            entries.append((n, ["## Resolution"] + own))
+                at = len(lines)                        # a ticket's own Resolutions go after its sections
+            for k, (_, body) in enumerate(own, 1):     # one per landing, oldest first
+                heading = "## Resolution" if len(own) == 1 else f"## Resolution (landing {k} of {len(own)})"
+                entries.append((n, [heading] + body))
     if entries:
-        lines[at:at] = fitted_resolutions(entries, CONTEXT_LINES - len(lines) - 2)
+        lines[at:at] = fitted_resolutions(entries, CONTEXT_LINES - len(lines) - 2, newest=len(own))
     blocks = []
     for c in comments[-COMMENTS_SHOWN:]:
         body = (c["body"] or "").strip("\n").splitlines()
