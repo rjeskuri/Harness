@@ -90,6 +90,11 @@ BILLING_STATUSES = (402,)
 BILLING_RESULT_RE = re.compile(r"^\s*(?:Credit balance is too low|Your credit balance|insufficient credits|billing)",
                                re.I)
 AUTH_RESULT_RE = re.compile(r"^\s*(?:Invalid API key|Not logged in|authentication)", re.I)
+# A credential that can never work, seen on 2026-10-13 under statuses that are no auth status (400 "This API key is
+# not scoped to a workspace ... anthropic-workspace-id header", 401 "Your apiKeyHelper script is failing"): a 4xx
+# naming the API key, the apiKeyHelper failing, or the workspace header. "key" or "workspace" alone decide nothing.
+CREDENTIAL_RESULT_RE = re.compile(r"^\s*API Error: 4(?!29)\d\d .*\bAPI key\b|apiKeyHelper script is failing|"
+                                  r"anthropic-workspace-id", re.I)
 BG_ID_RE = re.compile(r"backgrounded\s+(?:·|-)\s+(\S+)")
 # `claude agents --json` states of a session still running; any other non-empty state means it ended. Seen on
 # 2026-10-13: `blocked` for a background session; interactive sessions carry no `state` (a `status` instead).
@@ -756,8 +761,9 @@ def classify(lines):
     """(outcome, reason) of a finished headless run from its log tail.
 
     With a JSON result: is_error not true is `ok` whatever its text says; an API failure (terminal_reason
-    api_error or an api_error_status) is `auth` on 401 and 403, `billing` on 402, else told by the start of the
-    result text (claude's own message there), else `error`; any other is_error is `error` and its result text (the
+    api_error or an api_error_status) is `auth` on 401 and 403, `billing` on 402, `error` on 429 and 5xx, else told
+    by the result text (claude's own message there: its start, or a 4xx naming the API key, the apiKeyHelper failing
+    or the workspace header for `auth`), else `error`; any other is_error is `error` and its result text (the
     model's own words) is never read. Without a JSON result, the API-error lines of the tail are searched for
     billing and auth wording. Only `billing` and `auth` come with a reason."""
     result = last_result(lines)
@@ -783,9 +789,11 @@ def classify(lines):
         return "auth", reason
     if status in BILLING_STATUSES:
         return "billing", reason
+    if status == 429 or (status is not None and 500 <= status <= 599):    # transient whatever the text says
+        return "error", None
     if BILLING_RESULT_RE.match(text):
         return "billing", reason
-    if AUTH_RESULT_RE.match(text):
+    if AUTH_RESULT_RE.match(text) or CREDENTIAL_RESULT_RE.search(text):
         return "auth", reason
     return "error", None
 

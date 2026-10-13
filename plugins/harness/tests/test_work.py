@@ -49,6 +49,14 @@ API_401 = {"type": "result", "subtype": "success", "is_error": True, "terminal_r
            "api_error_status": 401, "result": "Invalid API key \u00b7 Fix external API key", "num_turns": 1,
            "total_cost_usd": 0, "duration_api_ms": 0, "stop_reason": "stop_sequence",
            "usage": {"fallback_credit": None}}
+# The results of two live headless probes on 2026-10-13: a stored key not scoped to a workspace (400), and an
+# apiKeyHelper that could not produce a key (401). Neither credential can ever work, so both are `auth`.
+API_400_WORKSPACE = dict(API_401, api_error_status=400, result=(
+    "API Error: 400 This API key is not scoped to a workspace, so this request must include the "
+    "anthropic-workspace-id header to identify the workspace it is for."))
+API_401_HELPER = dict(API_401, api_error_status=401, result=(
+    "API Error: 401 Your apiKeyHelper script is failing: command exited with status 1 · Fix the "
+    "apiKeyHelper setting"))
 CONNECTORS_WARNING = "Warning: some connectors could not be loaded"
 BODY = """## Request
 Add the board tool.
@@ -690,6 +698,156 @@ class Runs(WorkTest):
         self.ok("budget", "reset", "api")
         self.assertEqual(self.sweep_one(15, dict(API_401, api_error_status=402))["outcome"], "billing")
         self.assertTrue(self.read_json(self.budgets_path())["api"]["reason"].startswith("billing: API error 402"))
+
+    def test_sweep_classifies_an_unscoped_api_key_as_auth_and_falls_back_to_bg(self):
+        # The real 400 of 2026-10-13: a 400 is no auth status, the result text names the key.
+        swept = self.sweep_one(12, API_400_WORKSPACE)
+        self.assertEqual(swept["outcome"], "auth")
+        self.assertEqual(self.run_records()[0]["outcome"], "auth")
+        api = self.read_json(self.budgets_path())["api"]
+        self.iso_close_to(api["exhausted_until"], dt.timedelta(hours=24))
+        self.assertTrue(api["reason"].startswith("auth: API error 400: API Error: 400 This API key is not scoped"),
+                        api["reason"])
+        self.assertIn("anthropic-workspace-id", api["reason"])
+        self.assertIn("api: exhausted until", self.ok("budget", "status").stdout)
+
+        # The next dispatch falls back to a background session instead of retrying the key headless.
+        self.scenario(issues=[issue()], ready=[ready_row(13, "Next")])
+        p = self.ok("dispatch", "--dry-run")
+        self.assertIn("would start #13 Next (tier sonnet) and launch bg", p.stdout)
+
+    def test_sweep_classifies_key_and_helper_failures_as_auth_whatever_the_4xx(self):
+        # (result, the status the reason must name, a fragment of the result the reason must carry)
+        cases = [
+            (API_400_WORKSPACE, "400", "not scoped to a workspace"),
+            (API_401_HELPER, "401", "apiKeyHelper script is failing"),
+            # The helper text under a status that is not an auth status: the text decides.
+            (dict(API_401_HELPER, api_error_status=400,
+                  result="API Error: 400 Your apiKeyHelper script is failing: timed out after 10s"),
+             "400", "timed out after 10s"),
+            (dict(API_401_HELPER, api_error_status=400,
+                  result="Your apiKeyHelper script is failing: security: item not found"),
+             "400", "security: item not found"),
+            # Any other 4xx naming the API key.
+            (dict(API_401, api_error_status=404,
+                  result="API Error: 404 This API key does not have access to model claude-opus-5-5"),
+             "404", "does not have access to model"),
+            (dict(API_401, api_error_status=400,
+                  result="API Error: 400 Your API key belongs to an archived workspace"),
+             "400", "archived workspace"),
+            # The workspace header named without the words "API key".
+            (dict(API_401, api_error_status=400,
+                  result="API Error: 400 Missing anthropic-workspace-id header for an organization credential"),
+             "400", "organization credential"),
+        ]
+        for n, (result, status, fragment) in enumerate(cases, start=12):
+            with self.subTest(result=result["result"]):
+                self.ok("budget", "reset", "api")
+                swept = self.sweep_one(n, result)
+                self.assertEqual(swept["outcome"], "auth")
+                api = self.read_json(self.budgets_path())["api"]
+                self.iso_close_to(api["exhausted_until"], dt.timedelta(hours=24))
+                self.assertTrue(api["reason"].startswith(f"auth: API error {status}: "), api["reason"])
+                self.assertIn(fragment, api["reason"])
+
+        # terminal_reason api_error without a status: the text still decides, and the reason names no status.
+        self.ok("budget", "reset", "api")
+        no_status = {k: v for k, v in API_400_WORKSPACE.items() if k != "api_error_status"}
+        self.assertEqual(self.sweep_one(40, no_status)["outcome"], "auth")
+        reason = self.read_json(self.budgets_path())["api"]["reason"]
+        self.assertTrue(reason.startswith("auth: API error: API Error: 400 This API key"), reason)
+
+    def test_sweep_keeps_rate_limits_overloads_and_other_errors_as_error(self):
+        # Guard against over-matching: transient statuses and the model's own words never exhaust a budget,
+        # even when their text names an API key, the workspace header or the helper.
+        own_words = {k: v for k, v in API_400_WORKSPACE.items() if k not in ("terminal_reason", "api_error_status")}
+        cases = [
+            dict(API_401, api_error_status=529, result="Overloaded"),
+            dict(API_401, api_error_status=529, result="API Error: 529 Overloaded"),
+            dict(API_401, api_error_status=429, result=(
+                "API Error: 429 Number of request tokens has exceeded your per-minute rate limit for this API key")),
+            dict(API_401, api_error_status=500,
+                 result="API Error: 500 Internal server error while validating the API key"),
+            dict(API_401, api_error_status=503,
+                 result="API Error: 503 Service unavailable; API key checks are degraded"),
+            # An explicit 429 or 5xx stays transient even when the text names the helper or the workspace header.
+            dict(API_401, api_error_status=503, result=API_401_HELPER["result"].replace("401", "503", 1)),
+            dict(API_401, api_error_status=429, result=API_400_WORKSPACE["result"].replace("400", "429", 1)),
+            # Other 4xx: only the text tells auth from error, and these name neither key, helper nor header.
+            dict(API_401, api_error_status=400,
+                 result="API Error: 400 prompt is too long: 212000 tokens > 200000 maximum"),
+            dict(API_401, api_error_status=400,
+                 result="API Error: 400 messages.0.content: Input should be a valid list"),
+            dict(API_401, api_error_status=404, result="API Error: 404 model: claude-foo not found"),
+            dict(API_401, api_error_status=413, result="API Error: 413 Request too large"),
+            dict(API_401, api_error_status=400,
+                 result="API Error: 400 invalid_request_error: tool_use ids must be unique"),
+            dict(API_401, api_error_status=408, result="API Error: 408 Request timeout"),
+            dict(API_401, api_error_status=409, result="API Error: 409 Conflict"),
+            # terminal_reason api_error without a status, and nothing about a key in the text.
+            {k: v for k, v in dict(API_401, result="API Error: Connection error.").items()
+             if k != "api_error_status"},
+            {k: v for k, v in dict(API_401, result="API Error: Request timed out.").items()
+             if k != "api_error_status"},
+            own_words,
+            dict(own_words, result="Your apiKeyHelper script is failing, so I added a retry to it."),
+        ]
+        for n, result in enumerate(cases, start=12):
+            with self.subTest(result=result["result"]):
+                swept = self.sweep_one(n, result)
+                self.assertEqual(swept["outcome"], "error")
+                self.assertFalse(os.path.exists(self.budgets_path()))
+
+        # A run that succeeded is ok whatever its text says.
+        ok = {"type": "result", "is_error": False, "result": API_400_WORKSPACE["result"]}
+        self.assertEqual(self.sweep_one(50, ok)["outcome"], "ok")
+        self.assertFalse(os.path.exists(self.budgets_path()))
+
+    def test_sweep_reads_key_and_workspace_in_their_credential_sense_only(self):
+        # The words "key" and "workspace" on their own decide nothing. A 4xx about an unexpected key in the request
+        # schema, a missing workspace file or a keychain read is `error`; the API key named as the credential, the
+        # apiKeyHelper or the anthropic-workspace-id header is `auth`. Interleaved and worded unlike the real probes, so
+        # neither a substring match on either word nor a list of the probes' phrases passes.
+        no_status = {k: v for k, v in API_401.items() if k != "api_error_status"}   # terminal_reason api_error only
+        cases = [
+            # (result, outcome, the start of the api budget's reason when auth, a fragment of the text it must carry)
+            (dict(API_401, api_error_status=400, result="API Error: 400 tools.0.input_schema: unexpected key 'foo'"),
+             "error", None, None),
+            (dict(API_401, api_error_status=400, result="API Error: 400 The provided API key has been disabled"),
+             "auth", "auth: API error 400: ", "has been disabled"),
+            (dict(API_401, api_error_status=400, result="API Error: 400 metadata: key user_id must be a string"),
+             "error", None, None),
+            (dict(API_401, api_error_status=404, result="API Error: 404 workspace file not found: /tmp/x"),
+             "error", None, None),
+            (dict(API_401, api_error_status=404, result="API Error: 404 No API key found for this organization"),
+             "auth", "auth: API error 404: ", "No API key found"),
+            (dict(API_401, api_error_status=422,
+                  result="API Error: 422 The anthropic-workspace-id header names a deleted workspace"),
+             "auth", "auth: API error 422: ", "names a deleted workspace"),
+            (dict(API_401, api_error_status=400, result="API Error: 400 cache_control: unexpected key 'ttl'"),
+             "error", None, None),
+            # terminal_reason api_error without a status: the same words, the same split.
+            (dict(no_status, result="API Error: Connection error while reading keychain"), "error", None, None),
+            (dict(no_status, result="API Error: 400 Unexpected key 'workspace' in request body"), "error", None, None),
+            (dict(no_status, result="apiKeyHelper script is failing: produced no output · Fix the apiKeyHelper "
+                                    "setting"),
+             "auth", "auth: API error: apiKeyHelper script is failing", "produced no output"),
+        ]
+        for n, (result, outcome, prefix, fragment) in enumerate(cases, start=12):
+            with self.subTest(result=result["result"]):
+                self.ok("budget", "reset", "api")
+                swept = self.sweep_one(n, result)
+                self.assertEqual(swept["outcome"], outcome)
+                self.assertEqual(next(r for r in self.run_records() if r["ticket"] == n)["outcome"], outcome)
+                status = self.ok("budget", "status").stdout
+                if outcome == "error":
+                    self.assertIn("api: available", status)
+                    continue
+                self.assertIn("api: exhausted until", status)
+                api = self.read_json(self.budgets_path())["api"]
+                self.iso_close_to(api["exhausted_until"], dt.timedelta(hours=24))
+                self.assertTrue(api["reason"].startswith(prefix), api["reason"])
+                self.assertIn(fragment, api["reason"])
 
     def test_sweep_closes_a_bg_run_on_any_state_that_is_not_live(self):
         for n, bg_id in ((12, "s-blocked"), (13, "s-idle"), (14, "s-done"), (15, "s-archived"), (16, "s-gone"),
