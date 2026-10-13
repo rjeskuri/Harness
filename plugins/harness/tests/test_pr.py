@@ -1448,6 +1448,16 @@ class LandDirtyMain(WorktreeTest):
     def test_a_missing_final_newline_refuses(self):
         self.refused_case(WORKLOG_LANDED.rstrip("\n"))
 
+    def test_a_staged_third_version_under_identical_tree_bytes_refuses(self):
+        # The index holds a version that is neither HEAD's nor the landed one; the tree matches the landed bytes.
+        # Restoring the path would drop the staged version, and plain git refuses this state, so the land must too.
+        staged = WORKLOG_BEFORE + "2026-10-13,harness,4.0,staged only\n"
+        self.assertNotIn(staged, (WORKLOG_BEFORE, WORKLOG_LANDED))
+        self.assertEqual(self.refused_case(WORKLOG_LANDED, staged=staged), "MM")
+        index = subprocess.run([GIT, "-C", self.main, "show", f":{WORKLOG}"], env=self.env(),
+                               capture_output=True, check=True).stdout.decode("utf-8")
+        self.assertEqual(index, staged, "the staged version was dropped from the index")
+
     def test_staged_landed_content_with_other_bytes_in_the_tree_keeps_the_edit_and_fast_forwards(self):
         # The index already holds the landed bytes, so git fast-forwards today and keeps the tree's edit; the land
         # must not get stricter than that, nor restore (and so drop) the unstaged row.

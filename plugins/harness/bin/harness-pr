@@ -263,7 +263,8 @@ def tree_entries(path, rev, paths):
 
 def fast_forward_blockers(path, target):
     """Before `git pull --ff-only` moves the checkout at `path` to `target`: (identical, blocking). `identical`
-    are the dirty paths the fast-forward changes whose working-tree bytes equal `target`'s; `blocking` the
+    are the dirty paths the fast-forward changes whose working-tree bytes equal `target`'s and whose index holds
+    HEAD's or `target`'s version (an untracked path: absent from both index and HEAD); `blocking` the
     paths git would refuse to overwrite that are not identical: a tracked path whose index matches neither the
     landed version nor (with working-tree edits) HEAD, an untracked file in the way. A path whose index already
     holds the landed version is git's to keep, so it blocks nothing."""
@@ -290,7 +291,8 @@ def fast_forward_blockers(path, target):
     hashed = dict(zip(files, git_ok(path, "hash-object", "--no-filters", "--", *files).split())) if files else {}
     identical, blocking = [], []
     for name in relevant:
-        if name in landed and landed[name][0].startswith("100") and hashed.get(name) == landed[name][1]:
+        if (name in landed and landed[name][0].startswith("100") and hashed.get(name) == landed[name][1]
+                and index.get(name) in (head.get(name), landed[name])):    # never drop a staged third version
             identical.append(name)
         elif name in untracked:
             blocking.append(name)
