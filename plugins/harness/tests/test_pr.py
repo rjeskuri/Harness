@@ -2128,6 +2128,24 @@ class OpenNotes(WorktreeTest):
         body = self.open_body("Second pass: fixed the loop.\n\n### Follow-ups\nTicket the cleanup.\n")
         self.assertIn("### Follow-ups", body)
 
+    def test_a_notes_file_with_a_bare_second_level_heading_is_refused(self):
+        """`## ` with nothing after it is still a heading to the section parser (it ends the Notes section), so it
+        is refused like any other; there is no heading text to name, so the error names the file."""
+        cases = {"bare, one space": "Second pass.\n\n## \nLeft alone.\n",
+                 "bare, trailing spaces": "## \t  \nOut of scope: the legacy parser.\n",
+                 "bare, after a fence": "Text.\n```\n## in a fence\n```\n##   \nmore\n"}
+        for what, text in cases.items():
+            with self.subTest(what):
+                self.scenario([])
+                path = write(os.path.join(self.tmp, "bare-heading-notes.md"), text)
+                p = self.pr("open", "12", "--verify-log", self.verify_log, "--notes", path, cwd=self.wt)
+                self.assertOneLineError(p, "bare-heading-notes.md")
+                self.assertNotIn("unrecognized", p.stderr)
+                self.assertEqual(self.gh_calls(), [])
+                self.assertEqual(self.stub_calls("harness-board"), [])
+                self.assertFalse(any(line.startswith("git") and " push " in line for line in self.order()),
+                                 self.order())
+
     # ------------------------------------------------------------------ land
     resolution_calls = LandResolution.resolution_calls
     posted = LandResolution.posted
