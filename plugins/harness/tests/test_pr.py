@@ -777,24 +777,30 @@ HARNESS_MARK = "<!-- harness -->"     # the last line of every comment harness-b
 RESOLUTION = "**Resolution**"
 
 
-def pr_body_text(fx):
-    """A PR body as `harness-pr open` renders it from templates/pr_body.md, for the fixture `fx`."""
-    return "\n".join([
-        "Closes #12", "", "## Summary", fx["summary"], "",
-        "## Definition of done", *fx["dod"], "",
-        "## Tests", f"- `{fx['test_file']}::test_main`: the main case", "",
-        f"Test files run: `{fx['test_file']}`",
-        "", f"Red run before implementation ({fx['red_kind']}, exit {fx['red_exit']}):",
-        "```", *fx["red_tail"], "```", "",
-        "Verify:", "```", *fx["verify"], "```", "",
-        "## Review", fx["review"], "", "## Risks", "None noted."])
+def pr_body_text(fx, summary=True, red=True, verify=True):
+    """A PR body as `harness-pr open` renders it from templates/pr_body.md, for the fixture `fx`. A switch off
+    leaves that part out, as a body edited by hand may."""
+    parts = ["Closes #12", ""]
+    if summary:
+        parts += ["## Summary", fx["summary"], ""]
+    parts += ["## Definition of done", *fx["dod"], "",
+              "## Tests", f"- `{fx['test_file']}::test_main`: the main case", "",
+              f"Test files run: `{fx['test_file']}`", ""]
+    if red:
+        parts += [f"Red run before implementation ({fx['red_kind']}, exit {fx['red_exit']}):",
+                  "```", *fx["red_tail"], "```", ""]
+    if verify:
+        parts += ["Verify:", "```", *fx["verify"], "```", ""]
+    parts += ["## Review", fx["review"], "", "## Risks", "None noted."]
+    return "\n".join(parts)
 
 
 def pr_data(fx):
     """Everything `gh pr view P --json ...` can say about the fixture's PR after the merge (a superset: the
-    fake answers any field list with it)."""
+    fake answers any field list with it). A fixture with a `body` of its own (hand-written) keeps it."""
     url = f"https://github.com/o/r/pull/{fx['pr']}"
-    return {"number": fx["pr"], "title": "Add the widget (#12)", "url": url, "body": pr_body_text(fx),
+    body = fx.get("body") or pr_body_text(fx)
+    return {"number": fx["pr"], "title": "Add the widget (#12)", "url": url, "body": body,
             "files": [{"path": p, "additions": 3 + i, "deletions": i} for i, p in enumerate(fx["files"])],
             "mergeCommit": {"oid": fx["sha"]}, "headRefName": BRANCH, "baseRefName": "main",
             "closingIssuesReferences": [{"number": 12}]}
@@ -829,6 +835,39 @@ FIXTURE_B = {
     "test_file": "tests/test_gizmo_spec.py",
     "review": "Harness review (fable): no findings beyond a naming nit.",
 }
+# A harness-pr body edited by hand before the land, as the PR template invites: a Summary of two paragraphs and
+# a bullet list, a checklist item wrapped onto a second line, and a follow-up checkbox under Risks that is not
+# part of the definition of done.
+FIXTURE_C = {
+    "pr": 61, "sha": "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d",
+    "summary": "Parsing moves into lib/gizmo/parser with a strict tokenizer; the CLI keeps its flags.",
+    "summary_lines": ["Parsing moves into lib/gizmo/parser with a strict tokenizer; the CLI keeps its flags.",
+                      "Bad input used to raise a traceback from deep inside the old parser.",
+                      "- `gizmo-cli` now prints a usage line and exits 2 on bad input.",
+                      "- Unterminated strings are rejected instead of read past the end."],
+    "files": ["lib/gizmo/parser.py", "lib/gizmo/errors.py", "bin/gizmo-cli", "tests/test_parser.py"],
+    "dod": ["- [x] Tokens round-trip through the parser", "- [x] The CLI prints a usage line on bad input,",
+            "- [ ] Changelog entry"],
+    "dod_wrapped": "and exits 2 instead of raising",          # the second item's continuation line
+    "red_kind": "import", "red_exit": 2,
+    "red_tail": ["ModuleNotFoundError: No module named 'gizmo.parser'"],
+    "verify": ["collected 230 items", "230 passed in 10.42s", "VERIFY PASSED: 230 checks, 0 warnings"],
+    "test_file": "tests/test_gizmo_spec.py",
+    "review": "Harness review (fable): one low finding, fixed.",
+    "risks": ["Legacy gizmo files parse differently; the nightly import job is the first to see it.",
+              "- [ ] Watch the nightly import after the first run on main"],
+}
+FIXTURE_C["body"] = "\n".join([
+    "Closes #12", "",
+    "## Summary", *FIXTURE_C["summary_lines"][:2], "", *FIXTURE_C["summary_lines"][2:], "",
+    "## Definition of done", FIXTURE_C["dod"][0], FIXTURE_C["dod"][1], "  " + FIXTURE_C["dod_wrapped"],
+    FIXTURE_C["dod"][2], "",
+    "## Tests", f"- `{FIXTURE_C['test_file']}::test_main`: the main case", "",
+    f"Red run before implementation ({FIXTURE_C['red_kind']}, exit {FIXTURE_C['red_exit']}):",
+    "```", *FIXTURE_C["red_tail"], "```", "",
+    "Verify:", "```", *FIXTURE_C["verify"], "```", "",
+    "## Review", FIXTURE_C["review"], "",
+    "## Risks", *FIXTURE_C["risks"], ""])
 
 
 class Land(WorktreeTest):
@@ -1086,21 +1125,23 @@ class LandResolution(Land):
         return [{"author": {"login": "rjeskuri"}, "body": b, "createdAt": f"2026-10-13T1{k}:00:00Z"}
                 for k, b in enumerate(bodies)]
 
-    def assertResolution(self, body, fx):
-        """The Resolution carries the PR's summary, every changed file, the checklist as landed, the red-run
-        kind and the verify result from the PR body, the PR link and the squash sha, and the harness marker."""
+    def first(self, lines, pred, what):
+        for i, line in enumerate(lines):
+            if pred(line):
+                return i
+        self.fail(f"{what} missing from the Resolution:\n" + "\n".join(lines))
+
+    def assertFrame(self, body, fx):
+        """The heading, the harness marker last, the PR link and the full squash sha; the body's lines."""
         self.assertTrue(body.lstrip().startswith(RESOLUTION), body)
         lines = body.rstrip().splitlines()
         self.assertEqual(lines[-1].strip(), HARNESS_MARK, body)
+        self.assertIn(f"https://github.com/o/r/pull/{fx['pr']}", body)
+        self.assertIn(fx["sha"], body, "the full squash sha missing from the Resolution")
+        return lines
 
-        def first(pred, what):
-            for i, line in enumerate(lines):
-                if pred(line):
-                    return i
-            self.fail(f"{what} missing from the Resolution:\n{body}")
-
-        # the summary, then the changed files (one list line each), then the checklist as landed
-        at_summary = first(lambda line: fx["summary"] in line, "the PR summary")
+    def file_positions(self, lines, fx):
+        """The index of each changed file's list line: exactly one of its own per file."""
         file_lines = {}
         for i, line in enumerate(lines):
             m = re.match(r"^\s*[-*+]\s+(.*)$", line)
@@ -1111,36 +1152,50 @@ class LandResolution(Land):
                         file_lines.setdefault(path, []).append(i)
         for path in fx["files"]:
             self.assertEqual(len(file_lines.get(path, [])), 1,
-                             f"changed file {path} wants exactly one list line of its own:\n{body}")
-        at_files = min(i for found in file_lines.values() for i in found)
-        at_dod = [first(lambda line, item=item: item in line, f"checklist line {item!r}") for item in fx["dod"]]
-        self.assertLess(at_summary, at_files, "the summary comes before the files")
-        self.assertLess(max(i for found in file_lines.values() for i in found), min(at_dod),
-                        "the files come before the checklist")
-        self.assertEqual(at_dod, sorted(at_dod), "the checklist keeps its order")
+                             f"changed file {path} wants exactly one list line of its own:\n" + "\n".join(lines))
+        return [i for found in file_lines.values() for i in found]
 
-        # the red-run kind on exactly one line about the red run
+    def assertRedKind(self, lines, fx):
+        """The red-run kind on exactly one line, and that line is about the red run."""
         kind = re.compile(r"\b" + fx["red_kind"] + r"\b")
         kind_lines = [line for line in lines if kind.search(line)]
         self.assertEqual(len(kind_lines), 1, f"want one red-run kind line, got {kind_lines}")
         self.assertRegex(kind_lines[0], r"(?i)\bred\b", "the kind belongs on a line about the red run")
 
-        # the verify result: once, outside any code fence
-        last_verify = [line for line in fx["verify"] if line.strip()][-1]
+    def assertVerifyResult(self, lines, fx):
+        """The last line of the verify fence: once, outside any code fence; the earlier lines left out."""
+        verify = [line for line in fx["verify"] if line.strip()]
         fenced, where = False, []
         for line in lines:
             if line.strip().startswith("```"):
                 fenced = not fenced
-            elif last_verify in line:
+            elif verify[-1] in line:
                 where.append(fenced)
-        self.assertEqual(where, [False], f"the verify result line {last_verify!r} wants one unfenced line:\n{body}")
+        self.assertEqual(where, [False],
+                         f"the verify result line {verify[-1]!r} wants one unfenced line:\n" + "\n".join(lines))
+        for text in verify[:-1]:
+            self.assertNotIn(text, "\n".join(lines), f"the Resolution copies the earlier verify line {text!r}")
 
-        self.assertIn(f"https://github.com/o/r/pull/{fx['pr']}", body)
-        self.assertIn(fx["sha"], body, "the full squash sha missing from the Resolution")
+    def assertResolution(self, body, fx):
+        """The Resolution carries the PR's summary, every changed file, the checklist as landed, the red-run
+        kind and the verify result from the PR body, the PR link and the squash sha, and the harness marker."""
+        lines = self.assertFrame(body, fx)
 
-        # what the Resolution leaves out of the PR body: the red tail, the earlier verify lines, the tests
-        # section, the review, the risks and the closing line
-        left_out = fx["red_tail"] + [line for line in fx["verify"] if line.strip()][:-1] + [
+        # the summary, then the changed files (one list line each), then the checklist as landed
+        at_summary = self.first(lines, lambda line: fx["summary"] in line, "the PR summary")
+        at_files = self.file_positions(lines, fx)
+        at_dod = [self.first(lines, lambda line, item=item: item in line, f"checklist line {item!r}")
+                  for item in fx["dod"]]
+        self.assertLess(at_summary, min(at_files), "the summary comes before the files")
+        self.assertLess(max(at_files), min(at_dod), "the files come before the checklist")
+        self.assertEqual(at_dod, sorted(at_dod), "the checklist keeps its order")
+
+        self.assertRedKind(lines, fx)
+        self.assertVerifyResult(lines, fx)
+
+        # what the Resolution leaves out of the PR body: the red tail, the tests section, the review, the
+        # risks and the closing line
+        left_out = fx["red_tail"] + [
             fx["test_file"], "::test_main", "Test files run", fx["review"], "## Review", "## Risks", "None noted.",
             "Closes #12", "## Tests"]
         for text in left_out:
@@ -1207,6 +1262,116 @@ class LandResolution(Land):
         self.assertEqual(len(first), 1, "the first land posts the Resolution")
         self.assertEqual(again, [], "once Landed in is on the ticket the land is recorded; no Resolution")
         self.assertEqual(landed, [])
+
+    # ------------------------------------------------------------------ the PR body's shape
+    def one_resolution(self):
+        found = self.resolutions(12)
+        self.assertEqual(len(found), 1, f"want one Resolution comment, got {len(found)}: {self.posted()}")
+        return found[0]
+
+    def test_land_resolution_carries_every_line_of_a_longer_summary(self):
+        """A Summary of two paragraphs and a bullet list (FIXTURE_C, edited by hand): every line of it is copied,
+        in order, ahead of the files; the Risks section stays out."""
+        self.land(FIXTURE_C)
+        _, _, body = self.one_resolution()
+        self.assertResolution(body, FIXTURE_C)
+        lines = body.rstrip().splitlines()
+        at = []
+        for text in FIXTURE_C["summary_lines"]:
+            wanted = text[2:] if text.startswith("- ") else text
+            at.append(self.first(lines, lambda line, w=wanted: w in line, f"summary line {wanted!r}"))
+        self.assertEqual(at, sorted(at), "the summary keeps its order")
+        self.assertLess(max(at), min(self.file_positions(lines, FIXTURE_C)), "the whole summary precedes the files")
+        for text in FIXTURE_C["risks"] + [FIXTURE_A["summary"], FIXTURE_B["summary"]]:
+            self.assertNotIn(text, body)
+
+    def test_land_resolution_reads_the_checklist_from_the_definition_of_done_only(self):
+        """FIXTURE_C again: the `- [ ]` follow-up under Risks is not part of the checklist, while the wrapped
+        item's continuation line is, and stays with its item."""
+        self.land(FIXTURE_C)
+        _, _, body = self.one_resolution()
+        lines = self.assertFrame(body, FIXTURE_C)
+        for text in FIXTURE_C["risks"]:
+            self.assertNotIn(text, body, "a checkbox outside the Definition of done is not copied")
+        self.assertNotIn("nightly", body)
+        at_dod = [self.first(lines, lambda line, item=item: item in line, f"checklist line {item!r}")
+                  for item in FIXTURE_C["dod"]]
+        wrapped = [i for i, line in enumerate(lines) if FIXTURE_C["dod_wrapped"] in line]
+        self.assertEqual(len(wrapped), 1, f"the wrapped item's continuation line wants one line:\n{body}")
+        self.assertTrue(at_dod[1] <= wrapped[0] < at_dod[2],
+                        f"the continuation line belongs with its item, between {at_dod[1]} and {at_dod[2]}:\n{body}")
+
+    def test_land_resolution_finds_the_verify_result_whatever_the_fence_layout(self):
+        """The verify fence need not follow its label directly: a blank line between, a ```text fence, or the
+        `## Verify` heading of the PR template harness-scaffold installs as .github/pull_request_template.md. The
+        last line of the fence is the result either way."""
+        variants = [("a blank line before the fence", "Verify:\n\n```\n",
+                     ["Ran 7 tests in 0.512s", "", "OK (expected failures=1)"]),
+                    ("a text fence", "Verify:\n```text\n",
+                     ["lint: clean", "Ran 52 tests in 1.907s", "", "OK (skipped=3)"]),
+                    ("the PR template's heading", "## Verify\n```\n",
+                     ["python3 -m unittest: 61 tests, all green", "VERIFY OK"])]
+        for name, label, verify in variants:
+            with self.subTest(name):
+                fx = dict(FIXTURE_A, verify=verify)
+                rendered = pr_body_text(fx)
+                self.assertEqual(rendered.count("Verify:\n```\n"), 1)
+                fx["body"] = rendered.replace("Verify:\n```\n", label)
+                self.land(fx)
+                _, _, body = self.one_resolution()
+                self.assertResolution(body, fx)
+
+    def test_land_resolution_without_a_red_run_line_has_no_red_line(self):
+        """A body with no red-run paragraph at all (written by hand on a no-tests ticket): the land finishes,
+        the Resolution says nothing about a red run and invents no kind."""
+        fx = dict(FIXTURE_B, body=pr_body_text(FIXTURE_B, red=False))
+        self.assertNotIn("Red run", fx["body"])
+        self.land(fx)
+        index, _, body = self.one_resolution()
+        lines = self.assertFrame(body, fx)
+        self.file_positions(lines, fx)
+        self.assertVerifyResult(lines, fx)
+        self.assertEqual([line for line in lines if re.search(r"(?i)\bred\b", line)], [],
+                         f"no red run in the PR body, so no red line in the Resolution:\n{body}")
+        self.assertIsNone(re.search(r"\bimport\b", body), f"a red-run kind invented:\n{body}")
+        self.assertNotIn("ModuleNotFoundError", body)
+        landed = self.landed(12)
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed], [f"Landed in {fx['sha']}"])
+        self.assertLess(index, landed[0][0])
+
+    def test_land_without_summary_or_verify_still_posts_the_resolution_and_lands(self):
+        """A hand-written body missing its Summary and/or its Verify block: the land finishes, one Resolution
+        still names every file, the checklist, the PR and the sha, nothing is invented, and `Landed in` follows."""
+        cases = [("no Summary", FIXTURE_A, {"summary": False}),
+                 ("no Verify", FIXTURE_B, {"verify": False}),
+                 ("neither", FIXTURE_B, {"summary": False, "verify": False})]
+        for name, base, drop in cases:
+            with self.subTest(name):
+                fx = dict(base, body=pr_body_text(base, **drop))
+                self.land(fx)
+                index, number, body = self.one_resolution()
+                self.assertEqual(number, "12")
+                lines = self.assertFrame(body, fx)
+                self.file_positions(lines, fx)
+                for item in fx["dod"]:
+                    self.assertIn(item, body, f"checklist line {item!r} missing:\n{body}")
+                self.assertRedKind(lines, fx)
+                if drop.get("summary") is False:
+                    self.assertNotIn(fx["summary"], body, "no Summary in the PR body, none to copy")
+                else:
+                    self.assertIn(fx["summary"], body)
+                if drop.get("verify") is False:
+                    for text in fx["verify"]:
+                        if text.strip():
+                            self.assertNotIn(text, body, "no Verify in the PR body, none to copy")
+                else:
+                    self.assertVerifyResult(lines, fx)
+                for text in fx["red_tail"] + ["## Tests", "## Review", "## Risks", "Closes #12"]:
+                    self.assertNotIn(text, body)
+                landed = self.landed(12)
+                self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed],
+                                 [f"Landed in {fx['sha']}"])
+                self.assertLess(index, landed[0][0], "the Resolution goes before Landed in")
 
 
 class LandRefusals(PrTest):

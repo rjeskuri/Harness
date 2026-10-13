@@ -469,6 +469,37 @@ RES_13_STALE = resolution(38, "0a0b0c0d0e0f1a1b1c1d1e1f2a2b2c2d2e2f3a3b",
                           "STALE VERIFY LINE")
 
 
+def wide_resolution(number, pr, sha, summary, nfiles, verify):
+    """A Resolution for task #number that touched `nfiles` files of its own package: about nfiles + 14 lines
+    when printed with a heading, so a handful of them outgrow the 120-line context."""
+    files = [f"lib/part{number}/{name}.py" for name in
+             ["__init__", "model", "schema", "loader", "writer", "errors", "cli", "config", "cache", "hooks",
+              "render", "report", "stats", "sync", "queue", "index", "merge", "diff", "notify", "export"][:nfiles]]
+    return resolution(pr, sha, summary, files, [f"- [x] Part {number} lands", f"- [x] Part {number} is documented"],
+                      "assertion", verify)
+
+
+EPIC_BODY_LONG = """## Goal
+Ship the board so agents read tickets
+before they work.
+
+Second paragraph, not the goal.
+
+## Why
+Because.
+
+## Scope
+- The board tool and its tests.
+
+## Definition of done
+- [ ] Every task has landed and the digest says so
+- [x] The labels exist on the repository
+
+## Verification
+- `harness-board board`: every column.
+"""
+
+
 class ShowResolution(BoardTest):
     def closed_task(self, number, res, chatter=0, title=None):
         """A closed task: harness comments, the Resolution, `Landed in`, then `chatter` short comments after."""
@@ -622,6 +653,64 @@ class ShowResolution(BoardTest):
         self.epic_with([dict(failing, match=["issue", "view", "13"]),
                         dict(failing, contains=["repos/o/r/issues/13/comments"]),
                         dict(failing, contains=["repos/o/r/issues/13/comments?per_page=100"])])
+
+    def test_epic_keeps_whole_resolutions_or_pointers_within_the_line_budget(self):
+        """Five closed tasks whose Resolutions together outgrow the 120-line context: the output stays within
+        it, the epic's own lines (goal, task list, definition of done) survive, and each Resolution is either
+        printed whole under its task's heading or stands in as a short pointer line naming the task below the
+        task list (as whole comments do today), never cut part-way."""
+        tasks = {
+            12: RES_12,
+            14: RES_14,
+            15: wide_resolution(15, 44, "7a7b7c7d7e7f8a8b8c8d8e8f9a9b9c9d9e9f0a0b",
+                                "The loader streams records instead of reading the file whole.", 18,
+                                "Ran 96 tests in 4.011s OK"),
+            16: wide_resolution(16, 47, "b1b2b3b4b5b6b7b8b9c0c1c2c3c4c5c6c7c8c9d0",
+                                "Reports render from the cache, so the board is offline-safe.", 16,
+                                "VERIFY PASSED 151 checks"),
+            17: wide_resolution(17, 52, "d1d2d3d4d5d6d7d8d9e0e1e2e3e4e5e6e7e8e9f0",
+                                "Sync pushes label changes back to GitHub in one call.", 18,
+                                "Ran 104 tests in 4.420s OK"),
+        }
+        epic = issue(number=3, title="Board v2", labels=("epic", "status:ready"), body=EPIC_BODY_LONG)
+        subs = [{"number": n, "title": f"Task {n}", "state": "closed", "labels": [{"name": "task"}]} for n in tasks]
+        calls = [REPO_VIEW, {"match": ["issue", "view", "3"], "stdout_json": epic},
+                 {"match": ["api", "repos/o/r/issues/3/sub_issues?per_page=100"], "stdout_json": subs}]
+        for n, res in tasks.items():
+            calls += self.comment_calls(n, self.closed_task(n, res))
+        self.scenario(calls)
+        total = sum(len(res.splitlines()) for res in tasks.values())
+        self.assertGreater(total, 120, "the fixture must not fit: the Resolutions alone pass the cap")
+
+        p = self.ok("show", "3", "--markdown")
+        self.assertNotIn("Traceback", p.stderr)
+        lines = p.stdout.splitlines()
+        self.assertLessEqual(len(lines), 120, p.stdout)
+        self.assertIn("Goal: Ship the board so agents read tickets before they work.", lines)
+        self.assertIn("## Definition of done", lines)
+        self.assertIn("- [ ] Every task has landed and the digest says so", lines)
+        self.assertIn("- [x] The labels exist on the repository", lines)
+        self.assertIn("## Tasks (5 of 5 closed)", lines)
+        tasks_at = lines.index("## Tasks (5 of 5 closed)")
+        for n in tasks:
+            self.assertIn(f"- #{n} Task {n} (closed)", lines)
+
+        whole, pointed = [], []
+        for n, res in tasks.items():
+            others = [line for m, other in tasks.items() if m != n for line in content_lines(other)]
+            own = [line for line in content_lines(res) if line not in others]
+            found = [line for line in own if any(line in text for text in lines)]
+            if found == own:
+                self.assertUnderTaskHeading(lines, res, n, tasks_at)
+                whole.append(n)
+            else:
+                self.assertEqual(found, [], f"#{n}'s Resolution is cut part-way:\n{p.stdout}")
+                pointers = [text for i, text in enumerate(lines)
+                            if i > tasks_at and re.search(rf"#{n}\b", text) and text != f"- #{n} Task {n} (closed)"]
+                self.assertTrue(pointers, f"#{n}'s Resolution is left out without a line pointing at it:\n{p.stdout}")
+                pointed.append(n)
+        self.assertTrue(whole, f"the smallest Resolution fits, so at least one is printed whole:\n{p.stdout}")
+        self.assertTrue(pointed, f"they cannot all fit in 120 lines, so at least one is a pointer:\n{p.stdout}")
 
 
 # ======================================================================= ready
