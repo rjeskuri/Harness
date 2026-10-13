@@ -2,8 +2,11 @@
 """
 The cross-project standup. For each project in ~/.claude/harness/projects.json (registry order):
 git state, last Claude Code session, next steps (as the session brief reads them), latest spec,
-hours this month on a billable project, and the sessions running in it; then the fleet of every
-running Claude Code session, waiting ones first. Markdown, or --json for the structure behind it.
+hours this month on a billable project, and the sessions running in it; for a project with an `origin`
+remote, when gh is found (HARNESS_GH, else gh on PATH): the board counts, your pull requests awaiting
+review, the tickets that need your input and the stale ticket worktrees. Then the fleet of every
+running Claude Code session, waiting ones first; the exhausted budgets; and the headless and background
+runs alive or ended in the last 24 hours. Markdown, or --json for the structure behind it.
 
 Usage:
     harness-standup                  # every registered project
@@ -17,10 +20,12 @@ import concurrent.futures
 import csv
 import datetime as dt
 import glob
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -30,13 +35,17 @@ BUDGET = 4            # seconds for the projects' git calls (they run side by si
 FLEET_TIMEOUT = 4     # seconds for `claude agents --json`, started before the projects and read after
 NEXT_LINES = 5        # next steps per project
 WIDTH = 160           # a longer next-step line is cut
+GH_BUDGET = 6         # seconds for one project's gh calls (side by side, beside the git calls) and worktree reads
+STALE_DAYS = 7        # a ticket worktree with no commit for this long and no open PR is stale
+RUNS_WINDOW = 86400   # runs that ended this many seconds ago or less are listed
+NEEDS_INPUT = "**Needs your input**"
 HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
 NEXT_STEPS = re.compile(r"^(\s*)(#{1,6}\s+|[-*+]\s+)?(\*\*|__)?\s*next steps?\b\s*:?\s*(?:\*\*|__)?\s*:?\s*(.*)$", re.I)
 BOLD_LABEL = re.compile(r"^(\s*)([-*+]\s+)?(\*\*|__)\S")
 
 
 class Problem(Exception):
-    """A bad invocation or an unreadable registry: printed as one line, exit 1."""
+    """A bad invocation or an unreadable registry (one line, exit 1), or a failed gh call (one board line)."""
 
 
 class Parser(argparse.ArgumentParser):
@@ -358,7 +367,344 @@ def fleet_text(e):
     return f"{session_text(e)} in {where}" + (" [background]" if e.get("kind") == "background" else "")
 
 
+# --------------------------------------------------------------- board (gh)
+def first_line(text):
+    return next((line.strip() for line in (text or "").splitlines() if line.strip()), "")
+
+
+def parse_iso(text):
+    """Seconds since the epoch for an ISO-8601 time (Z allowed; naive means local), or None."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        when = dt.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (when if when.tzinfo else when.astimezone()).timestamp()
+
+
+def gh_binary():
+    """The gh to run (HARNESS_GH, else gh on PATH), or None when it cannot be found."""
+    gh = os.environ.get("HARNESS_GH", "gh")
+    if os.sep in gh:
+        return gh if os.path.isfile(gh) and os.access(gh, os.X_OK) else None
+    return shutil.which(gh)
+
+
+def repo_slug(url):
+    """OWNER/REPO (HOST/OWNER/REPO off github.com) for gh -R, from an origin URL; None for a local path."""
+    url = url.strip()
+    m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]*@)?([^/:]+)(?::\d*)?/(.+)$", url)
+    if not m or url.lower().startswith("file:"):
+        m = re.match(r"^(?:[^@/:]+@)?([^/:]+):(?!/)(.+)$", url)         # scp-like: git@host:owner/repo
+    if not m:
+        return None
+    host, parts = m.group(1), [p for p in m.group(2).split("/") if p]
+    if len(parts) != 2:
+        return None
+    owner, name = parts[0], parts[1][:-4] if parts[1].endswith(".git") else parts[1]
+    if not owner or not name:
+        return None
+    return f"{owner}/{name}" if host.lower() in ("github.com", "www.github.com") else f"{host}/{owner}/{name}"
+
+
+def describe(args):
+    """`gh pr list`, `gh issue list --label status:needs-input`: the call, for an error line."""
+    words = "gh " + " ".join(args[:2])
+    if "--label" in args[:-1]:
+        words += " --label " + args[args.index("--label") + 1]
+    return words
+
+
+class GhBatch:
+    """gh calls started side by side; results() waits for each until the shared deadline."""
+
+    def __init__(self, gh, calls, cwd, deadline):
+        self.calls, self.deadline, self.procs = calls, deadline, []
+        env = dict(os.environ, GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", NO_COLOR="1")
+        try:
+            for args in calls:
+                self.procs.append(subprocess.Popen([gh] + args, cwd=cwd, stdin=subprocess.DEVNULL,
+                                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                                                   start_new_session=True))
+        except OSError as err:
+            self.close()
+            raise Problem(f"cannot run gh ({gh}): {err.strerror or err}") from None
+
+    def results(self):
+        """One list of objects per call, in order; Problem naming the first call that failed."""
+        out = []
+        for args, proc in zip(self.calls, self.procs):
+            try:
+                stdout, stderr = proc.communicate(timeout=max(0.1, self.deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                raise Problem(f"{describe(args)} timed out after {GH_BUDGET} s") from None
+            text = stdout.decode("utf-8", "replace")
+            if proc.returncode != 0:
+                why = first_line(stderr.decode("utf-8", "replace")) or f"exit {proc.returncode}"
+                raise Problem(f"{describe(args)} failed: {why}")
+            try:
+                data = json.loads(text)
+            except ValueError:
+                raise Problem(f"{describe(args)} printed something other than JSON: {first_line(text)[:80]}") from None
+            if not isinstance(data, list):
+                raise Problem(f"{describe(args)} did not print a JSON list")
+            out.append([x for x in data if isinstance(x, dict)])
+        return out
+
+    def close(self):
+        """Stop every call still running and release the pipes."""
+        for proc in self.procs:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    if pipe:
+                        pipe.close()
+                except OSError:
+                    pass
+            try:
+                proc.wait(timeout=1)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+
+def question(comments):
+    """The first line after **Needs your input** in the newest comment that asks, or None."""
+    asking = [c for c in comments if isinstance(c, dict) and NEEDS_INPUT in str(c.get("body") or "")]
+    if not asking:
+        return None
+    newest = max(enumerate(asking), key=lambda ic: (str(ic[1].get("createdAt") or ""), ic[0]))[1]
+    body = str(newest["body"])
+    rest = body[body.index(NEEDS_INPUT) + len(NEEDS_INPUT):]
+    return next((clip(line.strip()) for line in rest.splitlines() if line.strip()), None)
+
+
+def worktrees(path, deadline):
+    """[{"path", "branch", "head"}] from `git worktree list --porcelain`; the main working tree first."""
+    out = git(path, ["worktree", "list", "--porcelain"], deadline)
+    if out.returncode != 0:
+        raise Problem(f"git worktree list failed: {first_line(out.stderr) or f'exit {out.returncode}'}")
+    found, current = [], None
+    for line in out.stdout.splitlines():
+        if line.startswith("worktree "):
+            current = {"path": line[len("worktree "):], "branch": None, "head": None}
+            found.append(current)
+        elif current is not None and line.startswith("HEAD "):
+            current["head"] = line[len("HEAD "):].strip()
+        elif current is not None and line.startswith("branch "):
+            ref = line[len("branch "):].strip()
+            current["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+    return found
+
+
+def old_worktrees(path, now, deadline):
+    """Worktrees under .claude/worktrees/ whose last commit is older than STALE_DAYS (open PRs not checked)."""
+    found = worktrees(path, deadline)
+    out = []
+    for w in found[1:]:
+        if "/.claude/worktrees/" not in w["path"].replace(os.sep, "/"):
+            continue
+        ref = w["head"] or w["branch"]
+        if not ref:
+            continue
+        log = git(path, ["log", "-1", "--format=%ct", ref], deadline)
+        when = log.stdout.strip()
+        if log.returncode != 0 or not when.isdigit():
+            continue
+        if now - int(when) > STALE_DAYS * 86400:
+            out.append({"path": w["path"], "relative": os.path.relpath(w["path"], found[0]["path"]),
+                        "branch": w["branch"], "last_commit": stamp(int(when), now)})
+    return out
+
+
+def label_names(issue):
+    labels = issue.get("labels") if isinstance(issue.get("labels"), list) else []
+    return {str(lb.get("name")) if isinstance(lb, dict) else str(lb) for lb in labels}
+
+
+def board_report(project, now):
+    """The project's board: counts by status, your open non-draft PRs, the needs-input tickets with their
+    question and the stale ticket worktrees. Every field None when the path is gone, there is no origin
+    remote or gh is not found; board_error (and the rest None) when the calls fail or run out of time."""
+    out = {"board": None, "prs_awaiting": None, "needs_input": None, "stale_worktrees": None, "board_error": None}
+    deadline = time.monotonic() + GH_BUDGET
+    try:
+        path, gh = project["path"], gh_binary()
+        if gh is None or not os.path.isdir(path):
+            return out
+        remote = git(path, ["remote", "get-url", "origin"], deadline)
+        if remote.returncode != 0 or not remote.stdout.strip():
+            return out
+        slug = repo_slug(remote.stdout)
+        flag = ["-R", slug] if slug else []
+        batch = GhBatch(gh, [["issue", "list", "--state", "open", "--json", "labels", "--limit", "200"] + flag,
+                             ["pr", "list", "--author", "@me", "--state", "open", "--json",
+                              "number,title,isDraft,createdAt,url,headRefName", "--limit", "100"] + flag,
+                             ["issue", "list", "--state", "open", "--label", "status:needs-input", "--json",
+                              "number,title,url,comments", "--limit", "100"] + flag,
+                             ["pr", "list", "--state", "open", "--json", "headRefName", "--limit", "200"] + flag],
+                        path, deadline)
+        try:
+            old = old_worktrees(path, now, deadline)
+            issues, mine, asking, open_prs = batch.results()
+        finally:
+            batch.close()
+        board = {"ready": 0, "in_progress": 0, "in_review": 0, "needs_input": 0}
+        for issue in issues:
+            names = label_names(issue)
+            if "epic" in names:
+                continue
+            for key in board:
+                board[key] += int(f"status:{key.replace('_', '-')}" in names)
+        prs = []
+        for pr in mine:
+            if pr.get("isDraft") is False:
+                created = parse_iso(pr.get("createdAt"))
+                prs.append({"number": pr.get("number"), "title": clip(pr.get("title") or ""), "url": pr.get("url"),
+                            "branch": pr.get("headRefName"), "created_at": pr.get("createdAt"),
+                            "age": age(created, now) if created is not None else None})
+        needs = [{"number": i.get("number"), "title": clip(i.get("title") or ""), "url": i.get("url"),
+                  "question": question(i.get("comments") if isinstance(i.get("comments"), list) else [])}
+                 for i in asking]
+        heads = {str(p.get("headRefName") or "") for p in open_prs + mine}
+        out.update(board=board, prs_awaiting=prs, needs_input=needs,
+                   stale_worktrees=[w for w in old if not (w["branch"] and w["branch"] in heads)])
+    except Problem as err:
+        out["board_error"] = str(err)
+    except Exception as err:      # one project never stops the others
+        out["board_error"] = f"{type(err).__name__}: {' '.join(str(err).split())}"
+    return out
+
+
+# --------------------------------------------------------------- budgets and runs
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def exhausted_budgets(now):
+    """[{"name", "until", "reason"}] for each budget budgets.json marks exhausted until a time ahead."""
+    data = read_json(home(".claude", "harness", "budgets.json"))
+    out = []
+    for name, entry in (data.items() if isinstance(data, dict) else []):
+        until = entry.get("exhausted_until") if isinstance(entry, dict) else None
+        when = parse_iso(until)
+        if when is not None and when > now:
+            out.append({"name": name, "until": until.strip(), "reason": " ".join(str(entry.get("reason") or "").split())})
+    return out
+
+
+def repo_key(path):
+    """The state key of a main working tree: the first 12 hex digits of the sha1 of its real path."""
+    return hashlib.sha1(os.path.realpath(path).encode("utf-8", "surrogateescape")).hexdigest()[:12]
+
+
+def run_project(record, filename, projects):
+    """The registered project a run belongs to (by its repo field, else its file's key), else a short name."""
+    repo = record.get("repo") if isinstance(record.get("repo"), str) else ""
+    for p in projects:
+        if repo and (p["name"] == repo or same_path(p["path"], repo)):
+            return p["name"]
+    key = os.path.basename(filename)[:12]
+    for p in projects:
+        if repo_key(p["path"]) == key:
+            return p["name"]
+    return (os.path.basename(repo.rstrip("/")) or repo) if repo else key
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError, ValueError):
+        return False
+    return True
+
+
+def recent_runs(projects, now):
+    """Headless and background runs that are alive or ended in the last RUNS_WINDOW seconds: running ones
+    first, then the newest ended. A run with no end recorded whose process is gone is `exited` (not swept)."""
+    out = []
+    for name in sorted(glob.glob(os.path.join(glob.escape(home(".claude", "harness", "runs")), "*.json"))):
+        record = read_json(name)
+        if not isinstance(record, dict):
+            continue
+        started, ended, pid = parse_iso(record.get("started_at")), parse_iso(record.get("ended_at")), record.get("pid")
+        if ended is None and not record.get("outcome"):
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and not pid_alive(pid):
+                state = "exited"                       # gone, not swept yet: when its log last changed
+                try:
+                    ended = os.path.getmtime(record["log"]) if isinstance(record.get("log"), str) else os.path.getmtime(name)
+                except OSError:
+                    ended = started
+            else:
+                state = "running"
+        else:
+            state = str(record.get("outcome") or "ended")
+            if ended is None:
+                try:
+                    ended = os.path.getmtime(name)
+                except OSError:
+                    continue
+        if state != "running" and (ended is None or now - ended > RUNS_WINDOW):
+            continue
+        when = started if state == "running" else ended          # running: since it started; else: since it ended
+        out.append(((state != "running", -(when or 0)),
+                    {"id": record.get("id") or os.path.basename(name)[:-5], "project": run_project(record, name, projects),
+                     "ticket": record.get("ticket"), "venue": record.get("venue"), "state": state,
+                     "exit": record.get("exit"), "started_at": record.get("started_at"),
+                     "ended_at": record.get("ended_at"), "log": record.get("log"),
+                     "age": age(when, now) if when is not None else None}))
+    out.sort(key=lambda pair: pair[0])
+    return [run for _, run in out]
+
+
 # --------------------------------------------------------------- output
+def board_lines(r):
+    """The board lines of one project (none when it was not read)."""
+    if r.get("board_error"):
+        return [f"- Board: could not read it ({r['board_error']})"]
+    b = r.get("board")
+    if b is None:
+        return []
+    out = [f"- Board: {b['ready']} ready, {b['in_progress']} in progress, {b['in_review']} in review, "
+           f"{b['needs_input']} needs input"]
+    if r["prs_awaiting"]:
+        out += ["- PRs awaiting you:"] + [f"  - #{x['number']} {x['title']}" + (f" (opened {x['age']})" if x["age"] else "")
+                                         for x in r["prs_awaiting"]]
+    if r["needs_input"]:
+        out += ["- Needs input:"] + [f"  - #{x['number']} {x['title']}" + (f": {x['question']}" if x["question"] else "")
+                                    for x in r["needs_input"]]
+    if r["stale_worktrees"]:
+        out += ["- Stale worktrees:"] + [f"  - {w['branch'] or 'detached'} at {w['relative']}, "
+                                        f"last commit {w['last_commit']['age']}" for w in r["stale_worktrees"]]
+    return out
+
+
+def run_text(r):
+    ticket = f" #{r['ticket']}" if r.get("ticket") is not None else ""
+    head = f"- {r['project']}{ticket} {r.get('venue') or 'run'}: "
+    if r["state"] == "running":
+        return head + "running" + (f", started {r['age']}" if r["age"] else "")
+    exit_code = f" (exit {r['exit']})" if r.get("exit") is not None else ""
+    text = head + r["state"] + exit_code + (f", ended {r['age']}" if r["age"] else "")
+    if r["state"] == "exited":
+        text += ", not swept yet"
+    if r["state"] not in ("ok", "running") and r.get("log"):
+        text += f"; log {r['log']}"
+    return text
+
+
 def git_text(g):
     if not g.get("repo"):
         return "not a git repo"
@@ -377,7 +723,7 @@ def git_text(g):
     return ", ".join(parts)
 
 
-def markdown(reports, fleet, fleet_error, registered):
+def markdown(reports, fleet, fleet_error, registered, budgets=(), runs=()):
     out = []
     if not registered:
         out += ["No projects registered: `harness-projects discover` lists candidates, "
@@ -398,6 +744,7 @@ def markdown(reports, fleet, fleet_error, registered):
         if r["billable"]:
             h = r["hours_this_month"]
             out.append(f"- hours this month: {h:.2f}" if h is not None else "- hours this month: no worklog/worklog.csv")
+        out += board_lines(r)
         if r["sessions"] is not None:
             out.append("- sessions: " + (", ".join(session_text(e) for e in r["sessions"]) or "none"))
         out.append("")
@@ -408,6 +755,11 @@ def markdown(reports, fleet, fleet_error, registered):
         out.append("- no sessions running")
     else:
         out += [f"- {fleet_text(e)}" for e in sorted(fleet, key=lambda e: e.get("status") != "waiting")]
+    if budgets:
+        out += ["", "## Budgets"] + [f"- {b['name']} exhausted until {b['until']}" + (f" ({b['reason']})" if b["reason"] else "")
+                                     for b in budgets]
+    if runs:
+        out += ["", "## Runs"] + [run_text(r) for r in runs]
     return "\n".join(out)
 
 
@@ -427,8 +779,16 @@ def main():
     box = {}
     reader = threading.Thread(target=read_fleet_into, args=(box,), daemon=True)
     reader.start()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(projects)))) as pool:
-        reports = list(pool.map(lambda p: report(p, deadline, now), projects))
+    workers = max(1, min(8, len(projects)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as gh_pool:
+        boards = [gh_pool.submit(board_report, p, now) for p in projects]       # gh side by side with git
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            reports = list(pool.map(lambda p: report(p, deadline, now), projects))
+        for r, board in zip(reports, boards):
+            r.update(board.result())
+            if r["error"]:
+                r.update(board=None, prs_awaiting=None, needs_input=None, stale_worktrees=None, board_error=None)
+    budgets, runs = exhausted_budgets(now), recent_runs(registered, now)
     reader.join(FLEET_TIMEOUT + 1)
     fleet, fleet_error = box.get("fleet", (None, f"`claude agents --json` timed out after {FLEET_TIMEOUT} s"))
     if fleet is not None:
@@ -437,10 +797,10 @@ def main():
                 r["sessions"] = [e for e in fleet if under(e.get("cwd"), r["path"])]
     if args.json:
         print(json.dumps({"generated": dt.datetime.fromtimestamp(now).astimezone().isoformat(timespec="seconds"),
-                          "projects": reports, "fleet": fleet, "fleet_error": fleet_error}, indent=2,
-                         ensure_ascii=False))
+                          "projects": reports, "fleet": fleet, "fleet_error": fleet_error, "budgets": budgets,
+                          "runs": runs}, indent=2, ensure_ascii=False))
     else:
-        print(markdown(reports, fleet, fleet_error, bool(registered)))
+        print(markdown(reports, fleet, fleet_error, bool(registered), budgets, runs))
 
 
 if __name__ == "__main__":

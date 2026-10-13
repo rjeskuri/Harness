@@ -1,0 +1,1201 @@
+#!/usr/bin/env python3
+"""
+Ticket work: a branch and worktree per ticket, the failure policy (retry, escalate, needs-input), dispatch
+of a headless or background session per ready ticket, the run records, the budgets and the worktree list.
+
+Usage:
+    harness-work start N [--venue interactive|headless|bg]
+    harness-work attempt N tests|breaker|code|review|ci pass|fail [--tier sonnet|opus|fable]
+    harness-work dispatch [--max 3] [--venue headless|bg] [--dry-run]
+    harness-work runs [--sweep] [--all]
+    harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
+    harness-work worktrees [--stale DAYS]
+    harness-work worktree remove BRANCH [--discard]
+    start, attempt, dispatch, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR, else the
+    cwd's repository); every subcommand except worktree remove takes --json.
+
+State, under ~/.claude/harness: repos/<repo-key>/tickets/<N>.json (the ticket cache that `harness-board show`
+writes; start adds branch, worktree and started_at, attempt adds to attempts), runs/<repo-key>-<N>-<stamp>.json
+and .log (one dispatched run), budgets.json ({"api"|"cloud": {"exhausted_until", "reason"}}).
+
+start: refuses an epic, a closed issue, status:blocked and open blockers; fetches origin; reuses a worktree
+already on t/N-*, else a branch origin/t/N-*, else a local t/N-*, else creates t/N-<slug> from origin/main
+(main without an origin) in <main>/.claude/worktrees/t-N-<slug>; a new worktree gets HARNESS_WORKTREE_SETUP
+(environment, then the project's .claude/settings.local.json, then .claude/settings.json) or the detected
+setup (uv sync, npm ci); gitignored files of the main checkout matching .worktreeinclude are copied when
+missing; the ticket goes to status:in-progress unless it is there already.
+
+dispatch: sweeps the runs, then starts and launches each ready ticket (and each in-progress ticket whose last
+run ended without a pull request) that has no live run, up to --max minus the live runs. headless:
+`claude -p "/harness:work N"` billed through {"apiKeyHelper": HARNESS_API_KEY_CMD} (the key itself never
+reaches a command line or the environment); bg, the default while the api budget is exhausted:
+`claude --bg -n "<repo> #N <title>" "/harness:work N"`.
+
+Siblings (harness-board) are found on PATH, else next to this script. gh is HARNESS_GH when set, else `gh`;
+claude is HARNESS_CLAUDE when set, else `claude`.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+STAGES = ("tests", "breaker", "code", "review", "ci")
+TIERS = ("sonnet", "opus", "fable")
+NEXT_TIER = {"sonnet": "opus", "opus": "fable", "fable": "fable"}
+DEFAULT_TIER = "opus"
+VENUES = ("headless", "bg")
+BUDGETS = ("api", "cloud")
+DEFAULT_KEY_CMD = "security find-generic-password -s harness-anthropic -w"
+EXCLUDE_LINE = ".claude/worktrees/"
+SLUG_MAX = 30
+LOG_TAIL = 60                 # lines of a run's log read by the sweep
+TAIL_BYTES = 256 * 1024
+RECENT = dt.timedelta(hours=24)
+REDISPATCH_WINDOW = dt.timedelta(days=7)   # an ended run older than this is not picked up again
+EXHAUST_HOURS = 24.0
+REASON_MAX = 200
+DIRTY_SHOWN = 10
+GIT_TIMEOUT = 120
+TOOL_TIMEOUT = 300            # a harness-board call
+SETUP_TIMEOUT = 1500          # uv sync, npm ci
+LAUNCH_TIMEOUT = 120          # claude --bg returns once the session is handed to the supervisor
+AGENTS_TIMEOUT = 30
+GH_TIMEOUT = 60
+BILLING_RE = re.compile(r"credit balance|insufficient.*credit|billing|payment required|\b402\b", re.I)
+AUTH_RE = re.compile(r"invalid.*api.key|authentication_error|\b401\b", re.I)
+BG_ID_RE = re.compile(r"backgrounded\s+(?:·|-)\s+(\S+)")
+LIVE_STATES = ("working", "blocked")
+ENDED_STATES = {"done": "ok", "failed": "error", "stopped": "stopped"}
+PID_SLACK = 120               # seconds: a process younger than its run record by more is a recycled pid
+# The dispatching session's own identity, which a detached run must not inherit.
+SESSION_ENV = ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION",
+               "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET",
+               "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_EXECPATH", "CLAUDE_PID", "CLAUDE_EFFORT")
+
+
+class Problem(Exception):
+    """A bad invocation, a failed precondition or a failed call: printed as one line, exit 1."""
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse that reports a bad invocation in one line and exits 1."""
+
+    def error(self, message):
+        sys.exit(f"{self.prog}: error: {message}")
+
+
+def one_line(text):
+    return " ".join(str(text).split())
+
+
+def last_line(text):
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
+def warn(text):
+    print(f"harness-work: {one_line(text)}", file=sys.stderr, flush=True)
+
+
+def home(*parts):
+    return os.path.join(os.path.expanduser("~"), ".claude", "harness", *parts)
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def iso(when):
+    return when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(text):
+    """A timezone-aware datetime from ISO-8601 (a trailing Z and a naive time both mean UTC), or None."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    text = text.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        when = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)
+
+
+def age_text(seconds):
+    seconds = max(0, int(seconds))
+    if seconds >= 86400:
+        return f"{seconds // 86400}d"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 60}m"
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, data):
+    """Write JSON through a temporary file in the same folder, renamed over the old one."""
+    folder = os.path.dirname(path)
+    try:
+        os.makedirs(folder, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".harness-work-", suffix=".json", dir=folder)
+    except OSError as err:
+        raise Problem(f"cannot write {path}: {err.strerror or err}") from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except OSError as err:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise Problem(f"cannot write {path}: {err.strerror or err}") from None
+
+
+def emit(args, data, text):
+    print(json.dumps(data, indent=2, ensure_ascii=False) if getattr(args, "json", False) else text)
+
+
+def table(rows):
+    """Left-aligned columns, two spaces apart."""
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
+    return "\n".join("  ".join([c.ljust(w) for c, w in zip(r, widths)] + [r[-1]]).rstrip() for r in rows)
+
+
+# --------------------------------------------------------------- processes
+def run(cmd, cwd=None, input=None, env=None, timeout=GIT_TIMEOUT):
+    """Run a command and capture its output; a missing program or a timeout becomes a Problem."""
+    io = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
+    try:
+        return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8",
+                              errors="surrogateescape", timeout=timeout, **io)
+    except FileNotFoundError:
+        raise Problem(f"{cmd[0]} not found") from None
+    except OSError as err:
+        raise Problem(f"cannot run {cmd[0]}: {err.strerror or err}") from None
+    except subprocess.TimeoutExpired:
+        raise Problem(f"{' '.join(cmd[:3])} timed out after {timeout} s") from None
+
+
+def git(path, *args, input=None, timeout=GIT_TIMEOUT):
+    return run(["git", "-C", path] + list(args), input=input, timeout=timeout,
+               env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+
+
+def git_ok(path, *args, input=None, timeout=GIT_TIMEOUT):
+    done = git(path, *args, input=input, timeout=timeout)
+    if done.returncode != 0:
+        raise Problem(f"git {' '.join(args[:2])} failed: {last_line(done.stderr) or f'exit {done.returncode}'}")
+    return done.stdout
+
+
+def sibling(name):
+    """A sibling bin tool: on PATH, else next to this script."""
+    found = shutil.which(name)
+    if found:
+        return found
+    here = os.path.join(HERE, name)
+    if os.path.isfile(here) and os.access(here, os.X_OK):
+        return here
+    raise Problem(f"{name} not found on PATH or in {HERE}")
+
+
+def claude_exe():
+    return os.environ.get("HARNESS_CLAUDE", "claude")
+
+
+def child_env():
+    """The environment for a launched session: ours, without the dispatching session's identity."""
+    return {k: v for k, v in os.environ.items() if k not in SESSION_ENV}
+
+
+# --------------------------------------------------------------- the repository
+class Repo:
+    """The project: its toplevel, its main working tree and its state key."""
+
+    def __init__(self, path):
+        path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isdir(path):
+            raise Problem(f"not a directory: {path}")
+        top = git(path, "rev-parse", "--show-toplevel")
+        if top.returncode != 0 or not top.stdout.strip():
+            raise Problem(f"not a git repository: {path}")
+        self.root = top.stdout.strip()
+        common = git(self.root, "rev-parse", "--git-common-dir")
+        if common.returncode != 0 or not common.stdout.strip():
+            raise Problem(f"git rev-parse --git-common-dir failed in {self.root}: {last_line(common.stderr)}")
+        self.common_dir = os.path.normpath(os.path.join(self.root, common.stdout.strip()))
+        self.main = os.path.realpath(os.path.dirname(self.common_dir))
+        self.key = hashlib.sha1(self.main.encode("utf-8")).hexdigest()[:12]
+        self.name = os.path.basename(self.main)
+        self.worktrees_dir = os.path.join(self.main, ".claude", "worktrees")
+
+    def ticket_path(self, number):
+        return home("repos", self.key, "tickets", f"{number}.json")
+
+
+def open_repo(path):
+    return Repo(path or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+
+
+def board(repo, *args):
+    """harness-board in the project; its stdout, or a Problem with its error line."""
+    env = dict(os.environ, CLAUDE_PROJECT_DIR=repo.main)
+    done = run([sibling("harness-board")] + [str(a) for a in args], cwd=repo.main, env=env, timeout=TOOL_TIMEOUT)
+    if done.returncode != 0:
+        why = last_line(done.stderr) or last_line(done.stdout) or f"exit {done.returncode}"
+        if why.startswith("harness-board: "):
+            why = why[len("harness-board: "):]
+        raise Problem(f"harness-board {' '.join(str(a) for a in args[:2])}: {why}")
+    return done.stdout
+
+
+def board_json(repo, *args):
+    out = board(repo, *args)
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise Problem(f"harness-board {' '.join(str(a) for a in args[:2])} printed no JSON") from None
+
+
+def gh_json(repo, args):
+    exe = os.environ.get("HARNESS_GH", "gh")
+    done = run([exe] + args, cwd=repo.main, env=dict(os.environ, GH_PROMPT_DISABLED="1"), timeout=GH_TIMEOUT)
+    if done.returncode != 0:
+        raise Problem(f"gh {' '.join(args[:2])} failed: {last_line(done.stderr) or f'exit {done.returncode}'}")
+    try:
+        return json.loads(done.stdout or "null")
+    except ValueError:
+        raise Problem(f"gh {' '.join(args[:2])} printed something other than JSON") from None
+
+
+def settings_env(root):
+    """`env` from the project's settings files; settings.local.json wins over settings.json."""
+    merged = {}
+    for name in ("settings.json", "settings.local.json"):
+        data = read_json(os.path.join(root, ".claude", name))
+        env = data.get("env") if isinstance(data, dict) else None
+        if isinstance(env, dict):
+            merged.update(env)
+    return merged
+
+
+def setting(name, file_env):
+    value = os.environ.get(name)
+    if value is not None and value.strip():
+        return value.strip()
+    value = file_env.get(name)
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        return str(value).strip() or None
+    return None
+
+
+def api_key_cmd():
+    """HARNESS_API_KEY_CMD from the environment, else `env` in ~/.claude/settings.json, else the keychain."""
+    data = read_json(os.path.join(os.path.expanduser("~"), ".claude", "settings.json"))
+    file_env = data.get("env") if isinstance(data, dict) and isinstance(data.get("env"), dict) else {}
+    return setting("HARNESS_API_KEY_CMD", file_env) or DEFAULT_KEY_CMD
+
+
+# --------------------------------------------------------------- tickets
+def read_cache(repo, number):
+    data = read_json(repo.ticket_path(number))
+    return data if isinstance(data, dict) else None
+
+
+def slugify(title):
+    slug = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    return slug[:SLUG_MAX].strip("-") or "work"
+
+
+def refusal(record):
+    """Why a ticket cannot be started, or None."""
+    n = record.get("number")
+    if record.get("type") == "epic":
+        tasks = [f"#{t['number']}" for t in record.get("tasks") or []
+                 if isinstance(t, dict) and t.get("state") != "CLOSED" and t.get("number")]
+        return f"#{n} is an epic; start one of its tasks" + (f": {', '.join(tasks)}" if tasks else "")
+    if record.get("status") == "closed":
+        return f"#{n} is closed"
+    if record.get("status") == "blocked":
+        return f"#{n} is status:blocked; read its comments, then harness-board status {n} ready"
+    blockers = [f"#{b.get('number')}" for b in record.get("blocked_by") or []
+                if isinstance(b, dict) and str(b.get("state", "")).upper() != "CLOSED"]
+    if blockers:
+        return f"#{n} is blocked by open {', '.join(blockers)}"
+    return None
+
+
+def worktree_entries(repo):
+    """`git worktree list --porcelain` as dicts: path, head, branch (short name) and the flags."""
+    entries, current = [], None
+    for line in git_ok(repo.main, "worktree", "list", "--porcelain").splitlines():
+        if not line.strip():
+            current = None
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            current = {"path": value, "branch": None}
+            entries.append(current)
+        elif current is not None:
+            if key == "branch":
+                current["branch"] = value[len("refs/heads/"):] if value.startswith("refs/heads/") else value
+            elif key == "HEAD":
+                current["head"] = value
+            else:
+                current[key] = value or True
+    return entries
+
+
+def branch_refs(repo, prefix):
+    """Short names under a ref prefix (refs/heads/t/, refs/remotes/origin/t/), newest commit first."""
+    out = git(repo.main, "for-each-ref", "--sort=-committerdate", "--format=%(refname)", prefix.rstrip("/"))
+    names = []
+    for ref in out.stdout.splitlines() if out.returncode == 0 else []:
+        if ref.startswith(prefix):
+            names.append(ref[len(prefix) - len("t/"):])
+    return names
+
+
+def ref_exists(repo, ref):
+    return git(repo.main, "rev-parse", "--verify", "--quiet", ref + "^{commit}").returncode == 0
+
+
+def fetch_origin(repo):
+    if git(repo.main, "remote", "get-url", "origin").returncode != 0:
+        warn("no origin remote; branching from the local main")
+        return
+    done = git(repo.main, "fetch", "origin")
+    if done.returncode != 0:
+        warn(f"git fetch origin failed ({last_line(done.stderr) or f'exit {done.returncode}'}); "
+             "working from the local refs")
+
+
+def ensure_exclude(repo):
+    """`.claude/worktrees/` in the shared .git/info/exclude, so the main checkout never lists the worktrees."""
+    path = os.path.join(repo.common_dir, "info", "exclude")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        text = ""
+    except OSError as err:
+        raise Problem(f"cannot read {path}: {err.strerror or err}") from None
+    wanted = {EXCLUDE_LINE, EXCLUDE_LINE.rstrip("/"), "/" + EXCLUDE_LINE, "/" + EXCLUDE_LINE.rstrip("/")}
+    if any(line.strip() in wanted for line in text.splitlines()):
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(("" if not text or text.endswith("\n") else "\n") + EXCLUDE_LINE + "\n")
+    except OSError as err:
+        raise Problem(f"cannot write {path}: {err.strerror or err}") from None
+
+
+def make_worktree(repo, number, title):
+    """(branch, worktree, created): an existing worktree on t/N-*, else a new one on the right branch."""
+    pattern = re.compile(rf"^t/{number}-.")
+    git(repo.main, "worktree", "prune")                    # entries whose folder is gone would block the add
+    for entry in worktree_entries(repo):
+        if entry.get("branch") and pattern.match(entry["branch"]) and os.path.isdir(entry["path"]):
+            return entry["branch"], os.path.realpath(entry["path"]), False
+    remote = [b for b in branch_refs(repo, "refs/remotes/origin/t/") if pattern.match(b)]
+    local = [b for b in branch_refs(repo, "refs/heads/t/") if pattern.match(b)]
+    branch = (remote or local or [f"t/{number}-{slugify(title)}"])[0]
+    path = os.path.join(repo.worktrees_dir, branch.replace("/", "-"))
+    if os.path.exists(path) and (not os.path.isdir(path) or os.listdir(path)):
+        raise Problem(f"{path} exists but is not a worktree on {branch}; move it away, then start again")
+    if branch in local:
+        cmd = ["worktree", "add", path, branch]
+    elif branch in remote:
+        cmd = ["worktree", "add", "--track", "-b", branch, path, f"origin/{branch}"]
+    else:
+        base = next((ref for ref in ("origin/main", "main") if ref_exists(repo, ref)), None)
+        if base is None:
+            raise Problem(f"neither origin/main nor main exists in {repo.main}; nothing to branch from")
+        cmd = ["worktree", "add", "--no-track", "-b", branch, path, base]
+    os.makedirs(repo.worktrees_dir, exist_ok=True)
+    git_ok(repo.main, *cmd)
+    return branch, os.path.realpath(path), True
+
+
+def run_setup(repo, worktree):
+    """HARNESS_WORKTREE_SETUP or the detected setup, in a new worktree; a failure is a warning."""
+    cmd = setting("HARNESS_WORKTREE_SETUP", settings_env(repo.main))
+    if not cmd:
+        if os.path.isfile(os.path.join(worktree, "uv.lock")):
+            cmd = "uv sync"
+        elif os.path.isfile(os.path.join(worktree, "package-lock.json")):
+            cmd = "npm ci"
+    if not cmd:
+        return
+    try:
+        done = subprocess.run(cmd, shell=True, cwd=worktree, capture_output=True, text=True, errors="replace",
+                              stdin=subprocess.DEVNULL, timeout=SETUP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        warn(f"worktree setup `{cmd}` timed out after {SETUP_TIMEOUT} s in {worktree}")
+        return
+    except OSError as err:
+        warn(f"worktree setup `{cmd}` could not run: {err.strerror or err}")
+        return
+    if done.returncode != 0:
+        why = last_line(done.stderr) or last_line(done.stdout) or f"exit {done.returncode}"
+        warn(f"worktree setup `{cmd}` failed in {worktree}: {why}")
+
+
+def copy_includes(repo, worktree):
+    """Copy the main checkout's gitignored files that match .worktreeinclude, when the worktree lacks them."""
+    include = os.path.join(repo.main, ".worktreeinclude")
+    if not os.path.isfile(include):
+        return []
+    listed = git(repo.main, "ls-files", "-z", "--others", "--ignored", f"--exclude-from={include}")
+    if listed.returncode != 0:
+        warn(f"cannot list the files .worktreeinclude names: {last_line(listed.stderr)}")
+        return []
+    inside = os.path.relpath(repo.worktrees_dir, repo.main).replace(os.sep, "/") + "/"
+    paths = [p for p in listed.stdout.split("\0") if p and not p.startswith(inside)]
+    if not paths:
+        return []
+    ignored = git(repo.main, "check-ignore", "-z", "--stdin", input="\0".join(paths) + "\0")
+    if ignored.returncode not in (0, 1):                  # 1: none of them is ignored
+        warn(f"git check-ignore failed: {last_line(ignored.stderr)}")
+        return []
+    copied = []
+    for rel in sorted({p for p in ignored.stdout.split("\0") if p}):
+        src, dst = os.path.join(repo.main, rel), os.path.join(worktree, rel)
+        if os.path.lexists(dst) or not (os.path.isfile(src) or os.path.islink(src)):
+            continue
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst, follow_symlinks=False)
+            copied.append(rel)
+        except OSError as err:
+            warn(f"cannot copy {rel} into the worktree: {err.strerror or err}")
+    return copied
+
+
+def hostname():
+    name = socket.gethostname() or "localhost"
+    return name[:-len(".local")] if name.endswith(".local") else name
+
+
+def start_ticket(repo, number, venue):
+    """Everything `start` does except printing; the ticket record, the branch and the worktree."""
+    record = board_json(repo, "show", number, "--json")
+    if not isinstance(record, dict):
+        raise Problem(f"harness-board show {number} printed no ticket")
+    why = refusal(record)
+    if why:
+        raise Problem(why)
+    fetch_origin(repo)
+    ensure_exclude(repo)
+    branch, worktree, created = make_worktree(repo, number, record.get("title"))
+    if created:
+        run_setup(repo, worktree)
+    copy_includes(repo, worktree)
+    cache = read_cache(repo, number) or dict(record)
+    if cache.get("branch") != branch or not cache.get("started_at"):
+        cache["started_at"] = iso(now())
+    cache.update(branch=branch, worktree=worktree)
+    write_json(repo.ticket_path(number), cache)
+    if record.get("status") != "in-progress":
+        board(repo, "status", number, "in-progress", "--comment", f"Started on {branch} ({hostname()}, {venue})")
+    tier = record.get("tier") if record.get("tier") in TIERS else DEFAULT_TIER
+    return {"number": number, "branch": branch, "worktree": worktree, "tier": tier,
+            "title": record.get("title") or ""}
+
+
+# --------------------------------------------------------------- budgets
+def budgets_path():
+    return home("budgets.json")
+
+
+def load_budgets():
+    data = read_json(budgets_path())
+    data = data if isinstance(data, dict) else {}
+    for name in BUDGETS:
+        if not isinstance(data.get(name), dict):
+            data[name] = {"exhausted_until": None, "reason": ""}
+    return data
+
+
+def exhausted_until(entry, at=None):
+    """The time a budget is exhausted until, when that is still ahead; else None."""
+    until = parse_iso(entry.get("exhausted_until")) if isinstance(entry, dict) else None
+    return until if until is not None and until > (at or now()) else None
+
+
+def exhaust(budgets, name, reason, hours):
+    budgets[name] = {"exhausted_until": iso(now() + dt.timedelta(hours=hours)), "reason": one_line(reason)}
+    write_json(budgets_path(), budgets)
+
+
+def budget_line(name, entry):
+    until = exhausted_until(entry)
+    if until is None:
+        return f"{name}: available"
+    reason = one_line(entry.get("reason") or "")
+    return f"{name}: exhausted until {iso(until)}" + (f" ({reason})" if reason else "")
+
+
+# --------------------------------------------------------------- runs
+def runs_dir():
+    return home("runs")
+
+
+def load_runs():
+    folder = runs_dir()
+    try:
+        names = sorted(n for n in os.listdir(folder) if n.endswith(".json") and not n.startswith("."))
+    except OSError:
+        return []
+    records = []
+    for name in names:
+        data = read_json(os.path.join(folder, name))
+        if isinstance(data, dict):
+            data.setdefault("id", name[:-len(".json")])
+            records.append(data)
+    return records
+
+
+def save_run(record):
+    write_json(os.path.join(runs_dir(), f"{record['id']}.json"), record)
+
+
+def elapsed_seconds(text):
+    """Seconds from ps's etime ([[dd-]hh:]mm:ss), or None."""
+    days, _, clock = text.strip().rpartition("-")
+    try:
+        parts = [int(p) for p in clock.split(":")]
+        day_count = int(days) if days else 0
+    except ValueError:
+        return None
+    if not 1 <= len(parts) <= 3:
+        return None
+    hours, minutes, seconds = [0] * (3 - len(parts)) + parts
+    return day_count * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def pid_alive(pid, launched=None):
+    """Whether `pid` is still the process dispatch launched at `launched`: running, not a zombie, and not a
+    recycled pid (a process that started well after the launch). The command line cannot tell: claude
+    rewrites its process title to `claude`."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except (OSError, OverflowError):
+        return False
+    ps = shutil.which("ps") or "/bin/ps"
+    try:
+        done = subprocess.run([ps, "-o", "stat=,etime=", "-p", str(pid)], capture_output=True, text=True,
+                              errors="replace", stdin=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return True                                     # cannot tell better than kill did
+    fields = done.stdout.split()
+    if done.returncode != 0 or not fields:
+        return False
+    if fields[0].startswith("Z"):
+        return False
+    elapsed = elapsed_seconds(fields[1]) if len(fields) > 1 else None
+    if launched is None or elapsed is None:
+        return True
+    began = now() - dt.timedelta(seconds=elapsed)
+    return began <= launched + dt.timedelta(seconds=PID_SLACK)
+
+
+def claude_agents(include_done=False):
+    """{id: entry} from `claude agents --json`, or None when it cannot be read."""
+    cmd = [claude_exe(), "agents", "--json"] + (["--all"] if include_done else [])
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL,
+                              timeout=AGENTS_TIMEOUT, env=child_env())
+        data = json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if isinstance(data, dict):
+        data = next((v for v in data.values() if isinstance(v, list)), None)
+    if not isinstance(data, list):
+        return None
+    return {str(a["id"]): a for a in data if isinstance(a, dict) and a.get("id") is not None}
+
+
+class Agents:
+    """`claude agents --json` read at most once per variant."""
+
+    def __init__(self):
+        self.cache = {}
+
+    def get(self, include_done=False):
+        if include_done not in self.cache:
+            self.cache[include_done] = claude_agents(include_done)
+        return self.cache[include_done]
+
+
+def is_bg(record):
+    return record.get("venue") == "bg" or bool(record.get("bg_id"))
+
+
+def run_live(record, agents):
+    if record.get("ended_at"):
+        return False
+    if is_bg(record):
+        listing = agents.get()
+        if listing is None:
+            return True                                 # cannot tell: never start a second run beside it
+        entry = listing.get(str(record.get("bg_id")))
+        return bool(entry) and entry.get("state") in LIVE_STATES
+    return pid_alive(record.get("pid"), parse_iso(record.get("started_at")))
+
+
+def log_tail(path):
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - TAIL_BYTES))
+            data = fh.read()
+    except (OSError, TypeError):
+        return []
+    return data.decode("utf-8", errors="replace").splitlines()[-LOG_TAIL:]
+
+
+def last_result(lines):
+    """The last JSON object printed in the log (claude -p --output-format json prints one), or None."""
+    for line in reversed(lines):
+        text = line.strip()
+        if text.startswith("{"):
+            try:
+                data = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(data, dict):
+                return data
+    return None
+
+
+def matched_line(lines, pattern):
+    for line in reversed(lines):
+        if pattern.search(line):
+            text = one_line(line)
+            if len(text) > REASON_MAX:                  # a long JSON line: the part around the match
+                found = pattern.search(text)
+                at = max(0, (found.start() if found else 0) - REASON_MAX // 2)
+                text = text[at:at + REASON_MAX]
+            return text
+    return None
+
+
+def classify(lines):
+    """(outcome, reason) of a finished headless run from its log tail.
+
+    A JSON result without is_error is `ok` whatever its text says; otherwise billing and auth errors are
+    told apart by their wording, and anything else is `error`."""
+    result = last_result(lines)
+    if result is not None and result.get("is_error") is not True:
+        return "ok", None
+    for outcome, pattern in (("billing", BILLING_RE), ("auth", AUTH_RE)):
+        line = matched_line(lines, pattern)
+        if line:
+            return outcome, line
+    return "error", None
+
+
+def mtime_iso(path):
+    try:
+        return iso(dt.datetime.fromtimestamp(os.path.getmtime(path), dt.timezone.utc))
+    except (OSError, TypeError, ValueError):
+        return iso(now())
+
+
+def sweep(records, agents):
+    """Close the records whose run has ended; a billing or auth failure marks the api budget. Saves."""
+    for record in records:
+        if record.get("ended_at"):
+            continue
+        if is_bg(record):
+            listing = agents.get(include_done=True)
+            if listing is None:
+                continue
+            entry = listing.get(str(record.get("bg_id")))
+            state = entry.get("state") if entry else None
+            if entry is not None and state not in ENDED_STATES:
+                continue
+            record["ended_at"] = iso(now())
+            record["outcome"] = ENDED_STATES.get(state, "unknown")
+        else:
+            if pid_alive(record.get("pid"), parse_iso(record.get("started_at"))):
+                continue
+            record["ended_at"] = mtime_iso(record.get("log"))
+            outcome, reason = classify(log_tail(record.get("log")))
+            record["outcome"] = outcome
+            if outcome in ("billing", "auth"):
+                exhaust(load_budgets(), "api", f"{outcome}: {reason}", EXHAUST_HOURS)
+        save_run(record)
+
+
+def run_state(record, agents):
+    if record.get("ended_at"):
+        exit_code = record.get("exit")
+        return f"exited {exit_code}" if exit_code is not None else f"ended {record.get('outcome') or '?'}"
+    if is_bg(record):
+        listing = agents.get()
+        entry = listing.get(str(record.get("bg_id"))) if listing else None
+        if entry and entry.get("state") in LIVE_STATES:
+            return entry["state"]
+        return "unknown" if listing is None else "ended (run --sweep)"
+    alive = pid_alive(record.get("pid"), parse_iso(record.get("started_at")))
+    return f"alive (pid {record.get('pid')})" if alive else "exited (run --sweep)"
+
+
+def of_repo(record, repo):
+    return record.get("repo") == repo.main or str(record.get("id", "")).startswith(repo.key + "-")
+
+
+# --------------------------------------------------------------- launching
+def launch(repo, ticket, venue):
+    """Start one session for a started ticket and write its run record."""
+    n = ticket["number"]
+    started = now()
+    rid = f"{repo.key}-{n}-{started.strftime('%Y%m%d%H%M%S')}"
+    log = os.path.join(runs_dir(), f"{rid}.log")
+    os.makedirs(runs_dir(), exist_ok=True)
+    record = {"id": rid, "ticket": n, "repo": repo.main, "worktree": ticket["worktree"], "branch": ticket["branch"],
+              "venue": venue, "log": log, "started_at": iso(started), "ended_at": None, "exit": None,
+              "outcome": None}
+    prompt = f"/harness:work {n}"
+    if venue == "headless":
+        settings = json.dumps({"apiKeyHelper": api_key_cmd()})
+        argv = [claude_exe(), "-p", prompt, "--permission-mode", "auto", "--output-format", "json",
+                "--settings", settings]
+        try:
+            with open(log, "ab") as out:
+                proc = subprocess.Popen(argv, cwd=ticket["worktree"], start_new_session=True, stdout=out,
+                                        stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=child_env())
+        except OSError as err:
+            return failed(record, f"cannot launch {argv[0]}: {err.strerror or err}")
+        record["pid"] = proc.pid
+    else:
+        name = f"{repo.name} #{n} {ticket.get('title') or ''}".strip()
+        argv = [claude_exe(), "--bg", "-n", name, prompt]
+        try:
+            done = subprocess.run(argv, cwd=ticket["worktree"], capture_output=True, text=True, errors="replace",
+                                  stdin=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT, env=child_env())
+        except (OSError, subprocess.SubprocessError) as err:
+            return failed(record, f"cannot launch {argv[0]} --bg: {err}")
+        try:
+            with open(log, "a", encoding="utf-8") as out:
+                out.write(done.stdout + done.stderr)
+        except OSError:
+            pass
+        m = BG_ID_RE.search(done.stdout + "\n" + done.stderr)
+        if done.returncode != 0 or not m:
+            why = last_line(done.stderr) or last_line(done.stdout) or f"exit {done.returncode}"
+            return failed(record, f"claude --bg gave no session id: {why}")
+        record["bg_id"] = m.group(1)
+    save_run(record)
+    return record
+
+
+def failed(record, why):
+    """A launch that never ran: recorded as ended in error, so the next dispatch picks the ticket up again."""
+    record.update(ended_at=iso(now()), outcome="error", error=one_line(why))
+    save_run(record)
+    raise Problem(why)
+
+
+def redispatch_candidates(repo, records, live):
+    """In-progress tickets whose last run ended (within the window) without a pull request: dispatched again."""
+    cutoff = now() - REDISPATCH_WINDOW
+    latest = {}
+    for record in records:
+        n = record.get("ticket")
+        if isinstance(n, int) and (n not in latest or str(record.get("started_at")) > str(latest[n].get("started_at"))):
+            latest[n] = record
+    out = []
+    for n, record in sorted(latest.items()):
+        ended = parse_iso(record.get("ended_at"))
+        if n in live or ended is None or ended < cutoff:
+            continue
+        try:
+            issue = gh_json(repo, ["issue", "view", str(n), "--json", "number,title,state,labels"])
+            if not isinstance(issue, dict) or str(issue.get("state", "")).upper() != "OPEN":
+                continue
+            labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
+            if "status:in-progress" not in labels:
+                continue
+            prs = gh_json(repo, ["pr", "list", "--head", str(record.get("branch") or ""), "--state", "all",
+                                 "--json", "number", "--limit", "1"]) if record.get("branch") else []
+        except Problem as err:
+            warn(f"#{n}: cannot check whether its ended run needs another: {err}")
+            continue
+        if prs:
+            continue
+        out.append({"number": n, "title": issue.get("title") or "", "tier": None,
+                    "again": record.get("outcome") or "ended"})
+    return out
+
+
+# --------------------------------------------------------------- commands
+def cmd_start(repo, args):
+    ticket = start_ticket(repo, args.number, args.venue)
+    context = board(repo, "show", args.number, "--markdown").rstrip("\n")
+    data = {"number": ticket["number"], "branch": ticket["branch"], "worktree": ticket["worktree"],
+            "tier": ticket["tier"], "context": context}
+    emit(args, data, f"{ticket['worktree']}\n\n{context}")
+
+
+def cmd_attempt(repo, args):
+    n = args.number
+    cache = read_cache(repo, n)
+    if cache is None:
+        raise Problem(f"no ticket cache for #{n} ({repo.ticket_path(n)}); run harness-work start {n} first")
+    tier = args.tier or (cache.get("tier") if cache.get("tier") in TIERS else DEFAULT_TIER)
+    attempts = cache.get("attempts") if isinstance(cache.get("attempts"), list) else []
+    attempts.append({"stage": args.stage, "tier": tier, "result": args.result, "at": iso(now())})
+    cache["attempts"] = attempts
+    write_json(repo.ticket_path(n), cache)
+    failures = 0
+    for entry in reversed([a for a in attempts if isinstance(a, dict) and a.get("stage") == args.stage]):
+        if entry.get("result") != "fail":
+            break
+        failures += 1
+    next_tier = None
+    if args.result == "pass":
+        action = "done"
+    elif failures == 1:
+        action = "retry"
+    elif failures == 2:
+        action, next_tier = "escalate", NEXT_TIER[tier]
+    else:
+        action = "needs-input"
+    emit(args, {"number": n, "stage": args.stage, "result": args.result, "tier": tier, "failures": failures,
+                "action": action, "next_tier": next_tier},
+         f"{action} {next_tier}" if next_tier else action)
+
+
+def cmd_dispatch(repo, args):
+    if args.max < 1:
+        raise Problem("--max must be at least 1")
+    agents = Agents()
+    records = load_runs()
+    sweep(records, agents)
+    mine = [r for r in records if of_repo(r, repo)]
+    api_until = exhausted_until(load_budgets()["api"])
+    venue = args.venue or ("bg" if api_until else "headless")
+    if args.venue == "headless" and api_until:
+        warn(f"the api budget is exhausted until {iso(api_until)}; launching headless anyway (--venue headless)")
+    live = {}
+    for record in mine:
+        if isinstance(record.get("ticket"), int) and run_live(record, agents):
+            live.setdefault(record["ticket"], record)
+    ready = board_json(repo, "ready", "--json")
+    ready = [r for r in ready if isinstance(r, dict)] if isinstance(ready, list) else []
+    candidates, seen = [], set()
+    for row in redispatch_candidates(repo, mine, live) + ready:
+        n = row.get("number")
+        if isinstance(n, int) and n not in seen:
+            seen.add(n)
+            candidates.append(row)
+    slots = args.max - len(live)
+    plan, skipped = [], []
+    for row in candidates:
+        if row["number"] in live:
+            skipped.append({"number": row["number"], "why": f"live run {live[row['number']]['id']}"})
+        elif len(plan) < slots or not args.dry_run:
+            plan.append(row)
+        else:
+            skipped.append({"number": row["number"], "why": f"over --max {args.max}"})
+
+    def describe(row):
+        detail = f"tier {row['tier']}" if row.get("tier") else f"again after {row.get('again')}"
+        return f"#{row['number']} {row.get('title') or ''} ({detail})"
+
+    if args.dry_run:
+        lines = [f"Dry run: venue {venue}, {len(live)} live, {max(0, slots)} of {args.max} slots free."]
+        lines += [f"would start {describe(row)} and launch {venue}" for row in plan]
+        lines += [f"skip #{s['number']}: {s['why']}" for s in skipped]
+        if not candidates:
+            lines.append("No ready tickets.")
+        emit(args, {"venue": venue, "dry_run": True, "live": [r["id"] for r in live.values()],
+                    "plan": plan, "skipped": skipped}, "\n".join(lines))
+        return
+    if not candidates:
+        emit(args, {"venue": venue, "launched": [], "failed": []}, "No ready tickets.")
+        return
+    if slots <= 0:
+        emit(args, {"venue": venue, "launched": [], "failed": []},
+             f"{len(live)} live runs; --max {args.max} reached, nothing launched.")
+        return
+    if not plan:
+        emit(args, {"venue": venue, "launched": [], "failed": []},
+             "Nothing to launch: " + "; ".join(f"#{s['number']} has a {s['why']}" for s in skipped) + ".")
+        return
+    if shutil.which(claude_exe()) is None:
+        raise Problem(f"claude not found ({claude_exe()}); nothing started")
+    launched, failures = [], []
+    for row in plan:
+        if len(launched) >= slots:
+            break
+        n = row["number"]
+        try:
+            ticket = start_ticket(repo, n, venue)
+            if not ticket["title"]:
+                ticket["title"] = row.get("title") or ""
+            record = launch(repo, ticket, venue)
+        except Problem as err:
+            failures.append({"number": n, "error": one_line(err)})
+            if not args.json:
+                print(f"#{n} not launched: {one_line(err)}", file=sys.stderr, flush=True)
+            continue
+        launched.append(record)
+        if not args.json:
+            where = f"pid {record['pid']}, log {record['log']}" if venue == "headless" else f"id {record['bg_id']}"
+            print(f"#{n} {venue} on {record['branch']} ({where})", flush=True)
+    if args.json:
+        emit(args, {"venue": venue, "launched": launched, "failed": failures}, "")
+    if failures:
+        sys.exit(1)
+
+
+def cmd_runs(args):
+    agents = Agents()
+    records = load_runs()
+    if args.sweep:
+        sweep(records, agents)
+    cutoff = now() - RECENT
+    shown = []
+    for record in records:
+        ended = parse_iso(record.get("ended_at"))
+        if args.all or not record.get("ended_at") or (ended is not None and ended >= cutoff):
+            shown.append(dict(record, state=run_state(record, agents)))
+    shown.sort(key=lambda r: str(r.get("started_at")))
+    if args.json:
+        emit(args, shown, "")
+    elif not shown:
+        print("No runs." if args.all else "No runs alive or ended in the last 24 h (--all lists every run).")
+    else:
+        rows = [("RUN", "TICKET", "VENUE", "STATE", "STARTED")]
+        for r in shown:
+            rows.append((str(r.get("id")), f"{os.path.basename(str(r.get('repo') or ''))} #{r.get('ticket')}",
+                         str(r.get("venue")), r["state"], str(r.get("started_at"))))
+        print(table(rows))
+
+
+def cmd_budget(args):
+    budgets = load_budgets()
+    action = args.action or "status"
+    if action == "exhaust":
+        if not args.hours > 0:
+            raise Problem("--hours must be more than 0")
+        if not args.reason.strip():
+            raise Problem("--reason is empty")
+        exhaust(budgets, args.name, args.reason, args.hours)
+        names = [args.name]
+    elif action == "reset":
+        budgets[args.name] = {"exhausted_until": None, "reason": ""}
+        write_json(budgets_path(), budgets)
+        names = [args.name]
+    else:
+        names = list(BUDGETS) + sorted(k for k in budgets if k not in BUDGETS and isinstance(budgets[k], dict))
+    data = {name: {"exhausted_until": budgets[name].get("exhausted_until"),
+                   "reason": budgets[name].get("reason") or "",
+                   "exhausted": exhausted_until(budgets[name]) is not None} for name in names}
+    emit(args, data, "\n".join(budget_line(name, budgets[name]) for name in names))
+
+
+def cmd_worktrees(repo, args):
+    if args.stale < 0:
+        raise Problem("--stale must be 0 or more days")
+    base = os.path.realpath(repo.worktrees_dir) + os.sep
+    rows, gh_failed = [], None
+    current = now()
+    for entry in worktree_entries(repo):
+        path = os.path.realpath(entry["path"])
+        if not path.startswith(base) or entry.get("bare"):
+            continue
+        when = None
+        if os.path.isdir(path):
+            log = git(path, "log", "-1", "--format=%ct")
+            if log.returncode == 0 and log.stdout.strip().isdigit():
+                when = dt.datetime.fromtimestamp(int(log.stdout.strip()), dt.timezone.utc)
+            status = git(path, "status", "--porcelain")
+            dirty = status.returncode == 0 and bool(status.stdout.strip())
+        else:
+            dirty = False
+        pr = None
+        branch = entry.get("branch")
+        if branch and gh_failed is None:
+            try:
+                found = gh_json(repo, ["pr", "list", "--head", branch, "--state", "all", "--json",
+                                       "number,state,isDraft", "--limit", "1"])
+                if isinstance(found, list) and found and isinstance(found[0], dict):
+                    pr = {"number": found[0].get("number"), "state": str(found[0].get("state") or "").upper(),
+                          "draft": bool(found[0].get("isDraft"))}
+            except Problem as err:
+                gh_failed = err
+                warn(f"PR states unknown: {err}")
+        age_days = (current - when).total_seconds() / 86400 if when else None
+        stale = age_days is not None and age_days > args.stale and not (pr and pr["state"] == "OPEN")
+        rows.append({"path": path, "branch": branch, "last_commit": iso(when) if when else None,
+                     "age_days": round(age_days, 2) if age_days is not None else None, "pr": pr,
+                     "dirty": dirty, "missing": not os.path.isdir(path), "stale": stale})
+    if args.json:
+        emit(args, rows, "")
+        return
+    if not rows:
+        print("No ticket worktrees.")
+        return
+    lines = [("BRANCH", "AGE", "PR", "FLAGS", "PATH")]
+    for r in rows:
+        age = age_text(r["age_days"] * 86400) if r["age_days"] is not None else "?"
+        pr = "-" if not r["pr"] else f"#{r['pr']['number']} {r['pr']['state'].lower()}" + \
+            (" draft" if r["pr"]["draft"] else "")
+        flags = ",".join(f for f in ("stale", "dirty", "missing") if r[f]) or "-"
+        lines.append((r["branch"] or "(detached)", age, pr, flags, os.path.relpath(r["path"], repo.main)))
+    print(table(lines))
+
+
+def cmd_worktree_remove(repo, args):
+    branch = args.branch[len("refs/heads/"):] if args.branch.startswith("refs/heads/") else args.branch
+    if branch in ("main", "master"):
+        raise Problem(f"refusing to remove {branch}")
+    git(repo.main, "worktree", "prune")
+    entry = next((e for e in worktree_entries(repo) if e.get("branch") == branch), None)
+    has_branch = ref_exists(repo, f"refs/heads/{branch}")
+    if entry is None and not has_branch:
+        raise Problem(f"no worktree and no local branch {branch}")
+    done = []
+    if entry is not None:
+        path = os.path.realpath(entry["path"])
+        if path == repo.main:
+            raise Problem(f"{branch} is checked out in the main checkout {repo.main}; switch it to main first")
+        status = git_ok(path, "status", "--porcelain")
+        changed = [line[3:] for line in status.splitlines() if line.strip()]
+        if changed and not args.discard:
+            more = f" and {len(changed) - DIRTY_SHOWN} more" if len(changed) > DIRTY_SHOWN else ""
+            raise Problem(f"{path} has uncommitted changes: {', '.join(changed[:DIRTY_SHOWN])}{more}; "
+                          "commit and push them, or pass --discard to throw them away")
+        git_ok(repo.main, "worktree", "remove", *(["--force"] if args.discard else []), path)
+        done.append(f"removed worktree {path}")
+    if has_branch:
+        git_ok(repo.main, "branch", "-D", branch)
+        done.append(f"deleted branch {branch}")
+    print("\n".join(done))
+
+
+# --------------------------------------------------------------- arguments
+def issue_number(text):
+    digits = text.lstrip("#")
+    if not digits.isdigit() or int(digits) <= 0:
+        raise argparse.ArgumentTypeError(f"not an issue number: {text!r}")
+    return int(digits)
+
+
+def parser():
+    repo_help = "the project (default: CLAUDE_PROJECT_DIR, else the cwd's repository)"
+    with_repo = argparse.ArgumentParser(add_help=False)
+    with_repo.add_argument("--repo", metavar="PATH", help=repo_help)
+    with_json = argparse.ArgumentParser(add_help=False)
+    with_json.add_argument("--json", action="store_true", help="print JSON")
+    nested_json = argparse.ArgumentParser(add_help=False)     # never resets a --json given before the action
+    nested_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
+    ap = Parser(prog="harness-work", description="Ticket worktrees, attempts, dispatch, runs and budgets.")
+    sub = ap.add_subparsers(dest="cmd", metavar="{start,attempt,dispatch,runs,budget,worktrees,worktree}")
+    sub.required = True
+
+    start = sub.add_parser("start", parents=[with_repo, with_json],
+                           help="branch and worktree for a ticket, status in-progress, its context")
+    start.add_argument("number", type=issue_number, metavar="N")
+    start.add_argument("--venue", default="interactive", choices=("interactive",) + VENUES,
+                       help="named in the start comment (dispatch passes its own)")
+
+    attempt = sub.add_parser("attempt", parents=[with_repo, with_json],
+                             help="record a stage's result; prints done, retry, escalate <tier> or needs-input")
+    attempt.add_argument("number", type=issue_number, metavar="N")
+    attempt.add_argument("stage", choices=STAGES)
+    attempt.add_argument("result", choices=("pass", "fail"))
+    attempt.add_argument("--tier", choices=TIERS, help="the tier this attempt ran at (default: the ticket's)")
+
+    dispatch = sub.add_parser("dispatch", parents=[with_repo, with_json],
+                              help="start and launch a session per ready ticket")
+    dispatch.add_argument("--max", type=int, default=3, help="live runs at most (default 3)")
+    dispatch.add_argument("--venue", choices=VENUES,
+                          help="default: headless, or bg while the api budget is exhausted")
+    dispatch.add_argument("--dry-run", action="store_true", help="print the plan; start and launch nothing")
+
+    runs = sub.add_parser("runs", parents=[with_json], help="dispatched runs, alive or ended in the last 24 h")
+    runs.add_argument("--sweep", action="store_true", help="close ended runs and classify their outcome")
+    runs.add_argument("--all", action="store_true", help="every run on record")
+
+    budget = sub.add_parser("budget", parents=[with_json], help="the api and cloud budgets")
+    budget_sub = budget.add_subparsers(dest="action", metavar="{status,exhaust,reset}")
+    budget_sub.add_parser("status", parents=[nested_json], help="each budget's state (the default)")
+    ex = budget_sub.add_parser("exhaust", parents=[nested_json], help="mark a budget exhausted")
+    ex.add_argument("name", choices=BUDGETS)
+    ex.add_argument("--reason", required=True, metavar="TEXT")
+    ex.add_argument("--hours", type=float, default=EXHAUST_HOURS, help="default 24")
+    reset = budget_sub.add_parser("reset", parents=[nested_json], help="mark a budget available")
+    reset.add_argument("name", choices=BUDGETS)
+
+    wts = sub.add_parser("worktrees", parents=[with_repo, with_json],
+                         help="the ticket worktrees with age, PR state and the stale flag")
+    wts.add_argument("--stale", type=float, default=7, metavar="DAYS", help="default 7")
+
+    wt = sub.add_parser("worktree", help="one ticket worktree")
+    wt_sub = wt.add_subparsers(dest="action", metavar="{remove}")
+    wt_sub.required = True
+    rm = wt_sub.add_parser("remove", parents=[with_repo], help="remove a worktree and delete its branch")
+    rm.add_argument("branch")
+    rm.add_argument("--discard", action="store_true", help="remove it even with uncommitted changes")
+    return ap
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        if args.cmd == "runs":
+            cmd_runs(args)
+        elif args.cmd == "budget":
+            cmd_budget(args)
+        else:
+            command = {"start": cmd_start, "attempt": cmd_attempt, "dispatch": cmd_dispatch,
+                       "worktrees": cmd_worktrees, "worktree": cmd_worktree_remove}[args.cmd]
+            command(open_repo(args.repo), args)
+    except Problem as err:
+        sys.exit(f"harness-work: {one_line(err)}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:                      # the reader went away (| head): stop quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
+    except Exception as err:                     # never a traceback: one line, exit 1
+        sys.exit(f"harness-work: {type(err).__name__}: {one_line(err)}")

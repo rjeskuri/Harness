@@ -1,82 +1,134 @@
 # Harness
 
-Ryan's personal Claude Code harness: one repository that installs the same agents, skills, hooks and a companion sprite into every project, without touching any project's own guardrails.
+Ryan's personal Claude Code harness, v2: one plugin installed once at user scope, applied to every project. The board is the context: every unit of work is a GitHub issue, an epic with task sub-issues, and agents read the ticket before they work and write status back to it. Tests come first and are proven to fail before any source changes. Nothing happens on main: each ticket gets its own branch and worktree, and work lands through a pull request. Your part is to plan, answer tickets that need input, and land pull requests.
 
-Built 2026-10-06 against Claude Code 2.1.285 (CLI) and 2.1.289 (VS Code extension). New to the CLI or to harnesses? Start with the [first-run guide](docs/guide.md). The design and every contract live in [docs/design.md](docs/design.md). The starter kit this grew out of is kept under [claude-code-starter-macos/](claude-code-starter-macos/), and its claims were checked one by one in [docs/verification.md](docs/verification.md).
+Built 2026-10-13 against Claude Code 2.1.296 and gh 2.99.0. New to the CLI? Start with the [first-run guide](docs/guide.md). The design and every contract live in [docs/design.md](docs/design.md).
 
 ## What is in here
 
 | Path | What it is |
 |---|---|
-| `.claude-plugin/marketplace.json` | The marketplace `ryan`, with the two plugins below |
-| `plugins/harness/` | Agents (`coder`, `quick`, `reviewer`, `researcher`), skills (`spec`, `build`, `ship`, `handoff`, `learn`, `standup`, `worklog`), hooks (notify, session brief, secret scan, verify on stop), command-line tools (`harness-standup`, `harness-worklog`, `harness-projects`) |
-| `plugins/companion/` | The Game Boy robot that lives above the prompt |
-| `user/CLAUDE.md` | Personal instructions for every project, including the model routing rule; installed at `~/.claude/CLAUDE.md` |
-| `user/settings.snippet.json` | The model and effort settings merged into `~/.claude/settings.json` |
+| `.claude-plugin/marketplace.json` | The marketplace `ryan`, with one plugin: `harness` |
+| `plugins/harness/agents/` | planner, test-author, test-breaker, coder, reviewer, researcher, quick |
+| `plugins/harness/skills/` | plan, work, land, new-project, learn, standup, handoff, worklog |
+| `plugins/harness/hooks/` | The hook scripts and `hooks.json` |
+| `plugins/harness/bin/` | The nine `harness-*` tools, on the Bash PATH in every session |
+| `plugins/harness/templates/` | Ticket, PR body and project scaffold templates |
+| `plugins/harness/tests/` | Offline tests for the hooks and tools, with a fake `gh` |
+| `user/CLAUDE.md` | Personal instructions for every project; installed at `~/.claude/CLAUDE.md` |
+| `user/settings.snippet.json` | Model and effort settings merged into `~/.claude/settings.json` |
+| `scripts/install.sh` | The installer |
+| `docs/` | Design, first-run guide, verification report, research notes |
 
 ## Install
 
 ```sh
-claude plugin marketplace add /Users/ryaneskuri/portfolio_projects/Harness
-claude plugin install harness@ryan
-claude plugin install companion@ryan
-cp user/CLAUDE.md ~/.claude/CLAUDE.md
+sh scripts/install.sh
 ```
 
-Both plugins install at user scope, so they apply in every project on this machine. A marketplace added from a local path loads its plugins in place: edit a file here, then `/reload-plugins` in an open session or start a new one.
+It adds the marketplace, installs the plugin, copies `user/CLAUDE.md` to `~/.claude/CLAUDE.md` with a dated backup, merges the model settings into `~/.claude/settings.json` with a dated backup, and installs the daily digest with `harness-digest --install-launchd`. Safe to run again. The marketplace loads from this folder in place, so an edit here applies at the next session or after `/reload-plugins`.
 
-Check it: `claude plugin list` shows both plugins; in a session `/hooks` lists Notification, SessionStart, PostToolUse and Stop, `/` shows the `/harness:` skills, and in a terminal session the robot appears above the prompt. The VS Code chat panel has no band above the prompt, so there the robot shows only in the integrated terminal.
+Once, store the API key that dispatched runs bill to. The command prompts for the key, so it never touches a command line:
 
-## Model routing
+```sh
+security add-generic-password -a "$USER" -s harness-anthropic -w
+```
 
-| Role | Who | Model |
+Then register your projects: `harness-projects discover`, and `harness-projects add <path> [--billable --client <name>]` for each one.
+
+## The loop
+
+1. `/harness:new-project [path]` interviews you, scaffolds the repo, creates the private GitHub repository and labels, and registers it.
+2. `/harness:plan <request>` interviews you, has the planner propose an epic and tasks, and creates the issues once you approve.
+3. `/harness:work` dispatches one headless run per ready ticket; `/harness:work N` runs ticket N in this session.
+4. A ticket that needs you gets a comment and a notification; reply in a comment, then `/harness:work N` picks up the answer.
+5. `/harness:land` lists PRs awaiting you; `/harness:land P` summarizes one, asks once, squash-merges, cleans up and closes the ticket.
+
+## Agents and routing
+
+| Agent | Model | Job |
 |---|---|---|
-| Design decisions, orchestration, final review | the main session | Fable |
-| Implementation | `harness:coder` | Opus |
-| Trivial mechanical tasks | `harness:quick` | Sonnet |
-| Fresh-context review | `harness:reviewer` | Fable |
-| Fact-checking and research | `harness:researcher` | Opus |
+| `planner` | Opus, xhigh | Turns an interviewed request into an epic and tasks; creates nothing |
+| `test-author` | tier | Writes the tests a ticket names and shows them red; may not edit source |
+| `test-breaker` | tier | Tries to pass the new tests with a cheat in a scratch copy; may not edit tests |
+| `coder` | tier | Makes the tests and the verify command green, commits; may not edit tests |
+| `reviewer` | Fable, xhigh | Reviews the branch against the definition of done; findings go on the PR |
+| `researcher` | Opus | Answers from primary sources |
+| `quick` | Sonnet | Trivial mechanical tasks outside the ticket loop |
 
-Effort is xhigh for every tier. Change it per agent with the `effort` field in the agent's frontmatter, or per model under `modelSettings` in `~/.claude/settings.json`. The rule that makes the main session delegate is in `user/CLAUDE.md`.
+The main session runs Opus 5.5 at high effort. `harness-board tier N` picks the tier from the ticket's labels: `size:S` and `risk:low` on a non-bug gives Sonnet; `size:L` or `risk:high` gives Fable; anything else gives Opus. Escalation is by failure, recorded with `harness-work attempt`: a stage's first failure retries at the same tier, the second re-runs one tier up, the third stops and asks on the ticket.
 
-## Daily use
+## Skills
 
-- **Console.** In a terminal, `claude agents` lists every session across every repo, waiting ones first, and lets you peek, attach, rename and stop them. `claude --bg -n "<name>" "<task>"` in a repo starts a background session; `claude attach <id>` opens one.
-- **Morning.** In any session, `/harness:standup`: one section per registered project with git state, next steps, hours this month on billable work, and the sessions that are running or waiting. First time: `harness-projects discover`, then `harness-projects add <path> [--billable --client <name>]`.
-- **A change.** `/harness:spec <idea>` interviews you and writes `docs/agent/specs/<date>-<slug>.md`. `/harness:build <spec>` has Opus implement it and Fable review it. `/harness:ship [pr]` verifies, reviews, commits and optionally opens a PR.
-- **Context.** `/harness:handoff` writes `docs/agent/handoff.md` before you `/clear`; the next session is briefed from it automatically.
-- **Hours.** `/harness:worklog` at the end of a session on a billable project recomputes the day's hours from the session transcripts and writes a client-facing description.
-- **Lessons.** `/harness:learn` turns a session's corrections into proposed edits to CLAUDE.md, rules, skills or hooks.
-- **Companion.** `/companion` hides or shows the robot.
+| Skill | What it does |
+|---|---|
+| `/harness:new-project [path]` | Interview, scaffold, private GitHub repo, labels, registry entry |
+| `/harness:plan [request]` | Interview, planner proposal, issues on the board after approval |
+| `/harness:work [issue#]` | One ticket to a ready PR here, or dispatch every ready ticket |
+| `/harness:land [PR#]` | PRs awaiting you, or one PR merged after one confirmation |
+| `/harness:standup` | Every project: git state, board counts, PRs, needs-input tickets, stale worktrees, budgets |
+| `/harness:learn` | Lessons from the session become `chore` tickets, not edits |
+| `/harness:handoff` | Writes `docs/agent/handoff.md` before `/clear` |
+| `/harness:worklog` | Hours and a client note on a billable project |
 
 ## Hooks
 
-| Hook | When | What |
+| Hook | When | What it enforces |
 |---|---|---|
-| notify | a permission prompt, idle, a background agent needs input or finished | macOS notification naming the repo (terminal-notifier, else AppleScript, else the terminal bell) |
-| session brief | session start, resume, after compaction | Branch, uncommitted count, last commit, next steps from `docs/agent/handoff.md` or `docs/PROGRESS.md`, pending items from `docs/plans/feature_list.json`, hours this month. Skipped in a project that has its own SessionStart hook |
-| secret scan | after every edit or write | Blocks the edit when the file holds a high-confidence secret pattern (cloud, GitHub, Slack, OpenAI, Anthropic, Stripe, private keys, Jotform-style keys) and tells Claude to remove it |
-| verify on stop | when Claude tries to end a turn after editing | Runs the project's `CLAUDE_VERIFY_CMD` and hands failures back, at most twice in a row, and not again until something changes. Opt-in per project; skipped in a project that has its own Stop hook. Hooks run outside the sandbox, so the verify command runs with your full permissions: point it only at test commands you trust |
+| notify | permission prompt, idle, a background agent needs input or finished | A macOS notification naming the repo |
+| session brief | start, resume, compaction | Branch and last commit; on a ticket branch the ticket, its definition of done and the red run; otherwise the board counts; exhausted budgets |
+| secret scan | after every edit and Bash call | Flags a high-confidence secret in a changed file so Claude removes it |
+| verify on stop | when Claude ends a turn after edits | Runs `CLAUDE_VERIFY_CMD` and hands failures back, at most twice |
+| branch guard | before edits and Bash | Refuses edits, commits and pushes on main or master; refuses force pushes everywhere |
+| tests first | before edits | On a `t/N-` branch, refuses source edits until a current red run exists; the test-author edits tests only, the coder and breaker never edit tests |
+| read-only guard | before Bash | Keeps planner, reviewer and researcher from changing files |
 
-## Per-project setup
+Hooks run outside the sandbox with your permissions. Point `CLAUDE_VERIFY_CMD` and `HARNESS_TEST_CMD` only at commands you trust.
 
-A project needs nothing to benefit from the harness. To get more out of it:
+## Tools
 
-- A lean `CLAUDE.md` with the commands, where things live, conventions and "done means".
-- `CLAUDE_VERIFY_CMD` in `.claude/settings.json` under `env` to turn on verify-on-stop, for example `"CLAUDE_VERIFY_CMD": "scripts/verify.sh --fast"`.
-- `docs/agent/` for specs and the handoff note.
-- `worklog/` on a billable project; `harness-worklog init` creates the time-zone timeline.
+| Tool | What it does |
+|---|---|
+| `harness-board` | The board: labels, epics, tasks, status, comments, needs-input, tier |
+| `harness-work` | Start a ticket's branch and worktree, record attempts, dispatch runs, budgets, worktrees |
+| `harness-red` | Prove the branch's tests fail before the implementation; the breaker's scratch copy |
+| `harness-pr` | Open, review, check, mark ready, ultrareview and land pull requests |
+| `harness-scaffold` | Set up a new or existing repo for the harness |
+| `harness-digest` | The daily digest across projects; installs its launchd job |
+| `harness-projects` | The project registry |
+| `harness-standup` | The cross-project standup behind `/harness:standup` |
+| `harness-worklog` | Hours from session transcripts for invoicing |
 
-Projects with their own hooks, skills and agents keep them; the harness adds to them.
+## Per-project settings
 
-## Customizing
+Under `env` in the project's `.claude/settings.json`; `.claude/settings.local.json` overrides it, and the process environment overrides both.
 
-- Notifications: `HARNESS_NOTIFY_APP` (bundle id to bring forward, default VS Code) and `HARNESS_NOTIFY_SOUND` (a macOS sound name, empty for silent) in `~/.claude/settings.json` under `env`.
-- Secret scan: `HARNESS_SECRET_SCAN=0` turns it off; a file containing `harness: allow-secrets` is skipped.
-- Verify on stop: `CLAUDE_VERIFY_TIMEOUT` seconds (default 300).
+| Variable | Meaning | Default |
+|---|---|---|
+| `CLAUDE_VERIFY_CMD` | Whole suite plus lint; verify on stop and the coder run it | none, verify on stop off |
+| `HARNESS_TEST_CMD` | Runs named test files; `{files}` becomes the paths | detected from `uv.lock`, `pyproject.toml`, `package.json` |
+| `HARNESS_TEST_PATTERNS` | Globs that mark a path as a test | `tests/**`, `test_*.py`, `*.test.js` and similar |
+| `HARNESS_SOURCE_EXEMPT` | Globs tests-first never gates | docs, markdown, config, lock files |
+| `HARNESS_WORKTREE_SETUP` | Command run in a fresh worktree | `uv sync` or `npm ci`, then `.worktreeinclude` files copied |
+| `HARNESS_ALLOW_MAIN` | `1` turns the branch guard off for this project | unset |
+| `HARNESS_TEST_TIMEOUT` | Seconds for a red run | 300 |
+
+Machine-wide, under `env` in `~/.claude/settings.json`: `HARNESS_API_KEY_CMD` (default reads the keychain entry above), `HARNESS_NOTIFY_APP`, `HARNESS_NOTIFY_SOUND`, `HARNESS_SECRET_SCAN`, `CLAUDE_VERIFY_TIMEOUT`.
+
+## Budgets
+
+| Work | Bills to |
+|---|---|
+| Interactive sessions, including `/harness:work N` | The Max subscription |
+| Dispatched headless runs | The API key, read from the keychain |
+| Ultrareview on `risk:high` PRs | claude.ai usage credits, about 5 to 25 dollars a run |
+
+When a headless run fails on billing or auth, the API budget is marked exhausted for 24 hours and dispatch falls back to background sessions on the subscription. A credits failure on ultrareview marks the cloud budget the same way. `harness-work budget status` shows the state; `harness-work budget reset api` clears it after a top-up.
 
 ## Troubleshooting
 
-- `claude plugin validate .` checks the marketplace and both plugins; `claude plugin test plugins/companion` runs the mod's tests; `python3 -m unittest discover -s plugins/harness/tests -v` runs the hook and tool tests.
-- `claude --debug hooks` logs every hook run with its exit code and output to `~/.claude/debug/<session-id>.txt` (or `claude --debug-file /tmp/hooks.log` to pick the file); hook runs are never printed in the terminal. `/plugin` in a session shows load errors on its Errors tab.
-- A hook that misbehaves can be paused for one session with `"disableAllHooks": true` in `.claude/settings.local.json`.
+- `claude plugin validate .` checks the marketplace and the plugin.
+- `python3 -m unittest discover -s plugins/harness/tests -v` runs the hook and tool tests.
+- `claude --debug` logs every hook run with its exit code to `~/.claude/debug/<session-id>.txt`; nothing prints in the terminal. `/plugin` shows load errors on its Errors tab.
+- `HARNESS_ALLOW_MAIN=1` under `env` in a project's `.claude/settings.local.json` turns the branch guard off there. It is the escape hatch, not a habit.
+- `"disableAllHooks": true` in `.claude/settings.local.json` pauses every hook in that project.
