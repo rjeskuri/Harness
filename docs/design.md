@@ -216,7 +216,7 @@ harness-red check               proof: tests fail, source untouched; record writ
 test-breaker (tier)             scratch copy; cheat attempt; pass means tests go back to the author (max 2 rounds)
 coder (tier)                    source only; new tests and CLAUDE_VERIFY_CMD green; commits
 reviewer (fable)                findings JSON; split by the ticket's files: the rest become new tickets
-harness-pr open N               push, draft PR from the template (Closes #N, DoD, red proof, verify tail)
+harness-pr open N [--notes F]   push, draft PR from the template (Closes #N, DoD, red proof, verify tail); --notes adds a `## Notes` section (second pass, out-of-scope file) that the Resolution repeats
 harness-pr review P --findings  inline review comments from the findings on the ticket's files
 coder (tier)                    fixes every posted finding, whatever its severity, in commits after the review;
                                 push; the reviewer re-checks and its findings are posted again (max 2 rounds)

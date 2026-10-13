@@ -5,7 +5,7 @@ the checks, mark it ready, read the comments, list the PRs awaiting the user, ru
 (squash merge, then the worktree, the branch, the main checkout and the ticket).
 
 Usage:
-    harness-pr open N [--worktree PATH] [--verify-log F] [--review F] [--json]
+    harness-pr open N [--worktree PATH] [--verify-log F] [--review F] [--notes F] [--json]
     harness-pr review P --findings F [--checked TEXT] [--model NAME]
     harness-pr checks P [--wait] [--timeout 1200] [--json]
     harness-pr ready P [--ticket N]
@@ -625,7 +625,7 @@ def render(template, values):
     return PLACEHOLDER.sub(lambda m: values.get(m.group(1), m.group(0)), template)
 
 
-def pr_body(number, ticket, red, verify_text, findings):
+def pr_body(number, ticket, red, verify_text, findings, notes=None):
     sections = ticket.get("sections") if isinstance(ticket.get("sections"), dict) else {}
     dod = [str(x).strip() for x in sections.get("definition_of_done") or [] if str(x).strip()]
     tests = [str(x).strip() for x in sections.get("tests") or [] if str(x).strip()]
@@ -633,6 +633,7 @@ def pr_body(number, ticket, red, verify_text, findings):
     values = {
         "number": str(number),
         "summary": first_paragraph(sections.get("request")) or ticket.get("title") or f"Ticket #{number}.",
+        "notes_section": f"## Notes\n{notes}\n\n" if notes else "",
         "dod_checklist": "\n".join(dod) or "None listed on the ticket.",
         "tests_list": tests_block(tests, red),
         "red_kind": str(red.get("kind") or "unknown") if red else "none",
@@ -668,9 +669,11 @@ def cmd_open(args):
     if dirty:
         raise Problem(f"uncommitted changes in {repo.root}: {listing(dirty)}; commit or remove them first")
     verify_text = read_text(args.verify_log, "verify log") if args.verify_log else None
+    notes_text = read_text(args.notes, "notes file") if args.notes else None
+    notes = notes_text.rstrip().strip("\n") if notes_text and notes_text.strip() else None
     findings = load_findings(args.review) if args.review else None
     ticket = show_ticket(repo, number)
-    body = pr_body(number, ticket, red_record(repo), verify_text, findings)
+    body = pr_body(number, ticket, red_record(repo), verify_text, findings, notes)
     title = f"{ticket.get('title') or f'Ticket {number}'} (#{number})"
 
     push = git(repo.root, "push", "-u", "origin", branch, timeout=PUSH_TIMEOUT)
@@ -1371,7 +1374,7 @@ def changed_files(repo, number, cwd):
 
 def resolution_body(data, files, sha, url):
     """The `**Resolution**` comment for a landed PR, from `gh pr view --json body,url` and its changed `files`: the
-    Summary section, the files changed, the Definition of done as landed, the red-run and verify lines, the PR and
+    Summary and Notes sections, the files changed, the Definition of done as landed, the red-run and verify lines, the PR and
     the squash sha. What the body lacks is left out."""
     body = data.get("body") or ""
     sections = body_sections(body)
@@ -1380,6 +1383,8 @@ def resolution_body(data, files, sha, url):
     parts = [RESOLUTION]
     if sections.get("summary", "").strip():
         parts += ["", sections["summary"]]
+    if sections.get("notes", "").strip():
+        parts += ["", "Notes:", sections["notes"]]
     if files:
         parts += ["", f"Files changed ({len(files)}):"] + [f"- `{path}`" for path in files]
     if sections.get("definition of done", "").strip():
@@ -1649,6 +1654,7 @@ def parser():
     op.add_argument("--worktree", metavar="PATH", help="the ticket worktree (default: the cwd)")
     op.add_argument("--verify-log", metavar="F", help=f"the verify output; its last {VERIFY_TAIL_LINES} lines go in")
     op.add_argument("--review", metavar="F", help="the reviewer's findings JSON")
+    op.add_argument("--notes", metavar="F", help="markdown for a Notes section: a second pass, out-of-scope files")
     op.add_argument("--json", action="store_true", help='print {"number", "url"}')
 
     rv = sub.add_parser("review", help="post the reviewer's findings as a COMMENT review, inline where possible")

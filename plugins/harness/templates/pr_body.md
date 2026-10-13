@@ -3,7 +3,7 @@ Closes #{{number}}
 ## Summary
 {{summary}}
 
-## Definition of done
+{{notes_section}}## Definition of done
 {{dod_checklist}}
 
 ## Tests

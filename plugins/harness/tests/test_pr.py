@@ -1970,5 +1970,202 @@ class LandGate(GateAsserts, WorktreeTest):
                 self.assertIn(GATE_FAILURE_TEXT, p.stderr)                           # the warning names the failure
 
 
+# =========================================================================== notes
+NOTES_TEXTS = [
+    "Second pass: the first review found the frob loop off by one; fixed in widget.py.",
+    ("Second pass, after the review:\n\n- `widget.py` frobs from a copy now (finding 1).\n"
+     "- Left `legacy/frob_old.py` alone: out of scope for #12.\n\nFollow-up: ticket the legacy cleanup."),
+    ("Out of scope but touched: `docs/gizmo.md` (a typo fix that rode along).\n```\nkept as is\n```\n"
+     "The placeholders {{risks}} and {{summary}} in this text stay literal."),
+    # sub-headings (`###`) belong to the Notes section; only a `## ` heading outside a code fence ends it
+    "Second pass notes.\n\n### Files outside scope\n- `docs/gizmo.md`\n\n### Why\nIt rode along with the fix.",
+    # a fenced block that holds `## ` lines, one of them the literal Definition of done heading, after a blank line
+    ("Out of scope: the parser fixture.\n\n```\n\n## Definition of done\n## not a heading\n```\n"
+     "Tail line after the fence."),
+]
+
+
+class OpenNotes(WorktreeTest):
+    """`harness-pr open N --notes F`: the file's markdown becomes a `## Notes` section of the PR body between
+    Summary and Definition of done, and the Resolution comment `land` posts repeats it."""
+
+    def setUp(self):
+        super().setUp()
+        self.verify_log = write(os.path.join(self.tmp, "verify.log"), "verify line 1\nVERIFY OK\n")
+        self.review = write(os.path.join(self.tmp, "findings.json"), json.dumps(FINDINGS))
+        self.outputs(**{"harness-board": {"show": {"stdout": json.dumps(board_ticket("low"))},
+                                          "comment": {"stdout": "https://github.com/o/r/issues/12#c1\n"},
+                                          "epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}},
+                        "harness-red": {"status": {"stdout": json.dumps(RED_RECORD)}}})
+        write(self.state_path("tickets", "12.json"),
+              json.dumps({"number": 12, "parent": {"number": 3, "title": "Widgets", "goal": ""}}))
+
+    # ------------------------------------------------------------------ open
+    def open_body(self, notes=None, existing=False):
+        """The PR body `harness-pr open` hands to gh: with --notes F when `notes` is the text of the file."""
+        self.scenario([{"match": ["pr", "list"], "stdout_json": [{"number": 34, "url": PR_URL}] if existing else []},
+                       {"match": ["pr", "create"], "stdout": PR_URL + "\n"},
+                       {"match": ["pr", "edit", "34"], "stdout": PR_URL + "\n"}])
+        args = ["open", "12", "--verify-log", self.verify_log, "--review", self.review]
+        if notes is not None:
+            args += ["--notes", write(os.path.join(self.tmp, "notes.md"), notes)]
+        self.ok(*args, cwd=self.wt)
+        calls = [c for c in self.gh_calls() if c["argv"][:2] in (["pr", "create"], ["pr", "edit"])]
+        self.assertEqual(len(calls), 1, self.gh_argv())
+        return calls[0]["stdin"]
+
+    @staticmethod
+    def headings(body):
+        """[(line index, `## ` heading line)] outside code fences, as the section parser sees them."""
+        found, fenced = [], False
+        for i, line in enumerate(body.splitlines()):
+            if re.match(r"^\s{0,3}(```|~~~)", line):
+                fenced = not fenced
+            elif not fenced and line.startswith("## "):
+                found.append((i, line))
+        return found
+
+    def notes_section(self, body):
+        """The text between the `## Notes` heading and the next `## ` heading outside a code fence (blank lines at
+        the ends dropped)."""
+        heads = self.headings(body)
+        self.assertEqual([h for _, h in heads].count("## Notes"), 1, body)
+        at = [i for i, h in heads if h == "## Notes"][0]
+        end = next((i for i, _ in heads if i > at), len(body.splitlines()))
+        return "\n".join(body.splitlines()[at + 1:end]).strip("\n")
+
+    def test_notes_file_becomes_a_section_in_place(self):
+        for text in NOTES_TEXTS:
+            with self.subTest(notes=text[:30]):
+                body = self.open_body(text + "\n")
+                lines = body.splitlines()
+                self.assertEqual([h for _, h in self.headings(body)],
+                                 ["## Summary", "## Notes", "## Definition of done", "## Tests", "## Review",
+                                  "## Risks"], body)
+                self.assertEqual(self.notes_section(body), text.strip("\n"))
+                self.assertLess(body.index("## Summary"), body.index("## Notes"))
+                self.assertLess(body.index("## Notes"), body.index("## Definition of done"))
+                # directly under Summary (its text, a blank line, the heading) and directly above the checklist
+                self.assertIn("## Summary\nAdd a widget that frobs. It must frob twice.\n\n## Notes\n", body)
+                self.assertIn(text + "\n\n## Definition of done\n- [ ] The widget frobs twice", body)
+                self.assertEqual(lines[0], "Closes #12")
+                self.assertEqual(body.count(text), 1)
+                self.assertNotIn("{{number}}", body)
+                if "{{risks}}" in text:
+                    self.assertIn("{{risks}} and {{summary}}", body)
+
+    def test_notes_change_nothing_else_in_the_body(self):
+        plain = self.open_body()
+        for text in NOTES_TEXTS:
+            with self.subTest(notes=text[:30]):
+                body = self.open_body(text + "\n")
+                section = f"## Notes\n{text}\n\n"
+                self.assertEqual(body.count(section), 1, body)
+                self.assertEqual(body.replace(section, "", 1), plain)
+
+    def test_notes_are_placed_by_the_template_not_by_the_first_matching_text(self):
+        """A request whose first paragraph mentions `## Definition of done` (in a code span) puts that text in the
+        Summary, ahead of the real heading: the Notes still go between the two real headings."""
+        ticket = board_ticket("low")
+        ticket["sections"]["request"] = ("Add the `## Definition of done` heading to the widget docs, after "
+                                         "`## Summary`.\nIt must render.\n\nThe second paragraph is not the summary.")
+        self.outputs(**{"harness-board": {"show": {"stdout": json.dumps(ticket)},
+                                          "comment": {"stdout": "https://github.com/o/r/issues/12#c1\n"}},
+                        "harness-red": {"status": {"stdout": json.dumps(RED_RECORD)}}})
+        summary = "Add the `## Definition of done` heading to the widget docs, after `## Summary`. It must render."
+        plain = self.open_body()
+        self.assertIn(f"## Summary\n{summary}\n\n## Definition of done\n", plain)
+        for text in NOTES_TEXTS:
+            with self.subTest(notes=text[:30]):
+                body = self.open_body(text + "\n")
+                self.assertEqual([h for _, h in self.headings(body)],
+                                 ["## Summary", "## Notes", "## Definition of done", "## Tests", "## Review",
+                                  "## Risks"], body)
+                self.assertIn(f"## Summary\n{summary}\n\n## Notes\n{text}\n\n## Definition of done\n", body)
+                self.assertEqual(self.notes_section(body), text)
+                self.assertEqual(body.replace(f"## Notes\n{text}\n\n", "", 1), plain)
+
+    def test_notes_reach_the_edit_of_an_existing_pr(self):
+        body = self.open_body(NOTES_TEXTS[1], existing=True)
+        self.assertEqual(self.gh_argv()[1], ["pr", "edit", "34", "--body-file", "-"])
+        self.assertEqual(self.notes_section(body), NOTES_TEXTS[1])
+
+    def test_no_notes_no_heading(self):
+        body = self.open_body()
+        self.assertNotIn("Notes", body)
+        self.assertEqual([line for line in body.splitlines() if line.startswith("## ")],
+                         ["## Summary", "## Definition of done", "## Tests", "## Review", "## Risks"])
+        self.assertIn("## Summary\nAdd a widget that frobs. It must frob twice.\n\n## Definition of done\n", body)
+        self.assertNotIn("{{", body)
+
+    def test_a_missing_notes_file_stops_before_anything_is_pushed(self):
+        self.scenario([])
+        p = self.pr("open", "12", "--notes", os.path.join(self.tmp, "no-such-notes.md"), cwd=self.wt)
+        self.assertOneLineError(p, "no-such-notes.md")
+        self.assertNotIn("unrecognized", p.stderr)            # the flag exists; it is the file that is missing
+        self.assertIn("notes", p.stderr.replace("no-such-notes.md", ""))
+        self.assertEqual(self.gh_calls(), [])
+        self.assertFalse(any(line.startswith("git") and " push " in line for line in self.order()), self.order())
+
+    # ------------------------------------------------------------------ land
+    resolution_calls = LandResolution.resolution_calls
+    posted = LandResolution.posted
+    resolutions = LandResolution.resolutions
+
+    def land_with_notes(self, fx, notes, where="before_dod"):
+        """Land the fixture's PR whose body holds a Notes section: where `harness-pr open --notes` renders it
+        (`before_dod`), or hand-moved to sit between Review and Risks (`after_review`) or at the very end (`last`)."""
+        text = pr_body_text(fx)
+        section = f"## Notes\n{notes}\n\n"
+        if where == "before_dod":
+            body = text.replace("## Definition of done", section + "## Definition of done", 1)
+        elif where == "after_review":
+            body = text.replace("## Risks", section + "## Risks", 1)
+        else:
+            body = text + "\n\n" + section.rstrip("\n") + "\n"
+        self.assertEqual(body.count("## Notes\n"), 1)
+        self.scenario(self.resolution_calls(dict(fx, body=body)))
+        self.ok("land", str(fx["pr"]), "--yes", cwd=self.main, stubs=False)
+        found = self.resolutions()
+        self.assertEqual(len(found), 1, f"want one Resolution comment, got {len(found)}: {self.posted()}")
+        return found[0][2]
+
+    def test_resolution_repeats_the_notes(self):
+        cases = ((FIXTURE_A, 1, "before_dod"), (FIXTURE_B, 2, "before_dod"), (FIXTURE_A, 0, "before_dod"),
+                 (FIXTURE_A, 4, "before_dod"),        # a fenced `## Definition of done` inside the notes
+                 (FIXTURE_B, 4, "after_review"), (FIXTURE_A, 3, "after_review"), (FIXTURE_B, 3, "last"),
+                 (FIXTURE_A, 4, "last"), (FIXTURE_B, 1, "last"))
+        for fx, n, where in cases:
+            text = NOTES_TEXTS[n]
+            with self.subTest(pr=fx["pr"], notes=n, where=where):
+                resolution = self.land_with_notes(fx, text, where)
+                self.assertIn(text, resolution)
+                self.assertEqual(resolution.count(text), 1)
+                lines = resolution.rstrip().splitlines()
+                self.assertEqual(lines[0], RESOLUTION)
+                self.assertEqual(lines[-1].strip(), HARNESS_MARK)
+                # in a sensible place: after the summary, before the PR link and squash sha that close it
+                at_notes = resolution.index(text)
+                self.assertGreater(at_notes, resolution.index(fx["summary"]))
+                self.assertLess(at_notes, resolution.index(f"PR: https://github.com/o/r/pull/{fx['pr']}"))
+                self.assertLess(at_notes, resolution.index(f"Squash commit: {fx['sha']}"))
+                # the rest of the Resolution is as before: the checklist, the files, no other PR body section
+                for item in fx["dod"]:
+                    self.assertIn(item, resolution)
+                for path in fx["files"]:
+                    self.assertIn(f"- `{path}`", resolution)
+                for left_out in ("## Tests", "## Review", "## Risks", "Closes #12", fx["review"], "None noted."):
+                    self.assertNotIn(left_out, resolution)
+                # the Notes do not swallow the Definition of done that follows them in the PR body
+                self.assertEqual(resolution.count("Definition of done:"), 1)
+
+    def test_resolution_without_notes_has_no_notes(self):
+        self.scenario(self.resolution_calls(FIXTURE_A))
+        self.ok("land", "34", "--yes", cwd=self.main, stubs=False)
+        found = self.resolutions()
+        self.assertEqual(len(found), 1)
+        self.assertNotIn("Notes", found[0][2])
+
+
 if __name__ == "__main__":
     unittest.main()
