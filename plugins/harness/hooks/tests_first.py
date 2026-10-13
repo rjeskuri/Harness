@@ -519,19 +519,19 @@ def find_writes(guard, args: list[str], cwd: str | None) -> str | None:
 
 
 def unseen_writes(guard, part, name: str, args: list[str], here: str | None):
-    """(why, the directories it writes in) when `part` writes files whose paths cannot
-    be seen: an inline program, patch taking the files from its diff, find -exec;
-    (None, []) otherwise."""
+    """(why, the directories it writes in, None for one that cannot be resolved) when
+    `part` writes files whose paths cannot be seen: an inline program, patch taking the
+    files from its diff, find -exec; (None, []) otherwise. An inline program writes
+    where it runs: no directories."""
     if name == "patch":
         found = guard.writes(part, name, args, here)
-        dirs = [p for _, p, _, exact in found if not exact and p is not None]
-        if dirs:
-            return [why for _, _, why, exact in found if not exact][0], dirs
+        hidden = [(p, why) for _, p, why, exact in found if not exact]
+        if hidden:
+            return hidden[0][1], [p for p, _ in hidden]
     if name == "find":
         why = find_writes(guard, args, here)
         if why:
-            roots = [guard.absolute(r, here) for r in find_roots(args)]
-            return why, [r for r in roots if r is not None]
+            return why, [guard.absolute(r, here) for r in find_roots(args)]
     return guard.code_writes(name, args, part), []
 
 
@@ -562,8 +562,9 @@ def check_bash(command: str, cwd: str, role: str) -> None:
                 return
         if role in ROLES:
             why, dirs = unseen_writes(guard, part, name, args, here)
-            places = [existing_dir(d) for d in dirs]
-            if here is not None and os.path.isdir(here):
+            places = [existing_dir(d) for d in dirs if d is not None]
+            # where it runs, when that is where it writes or a directory is unknown
+            if (not dirs or None in dirs) and here is not None and os.path.isdir(here):
                 places.append(here)
             if why and any(guarded(facts_at(p, cache)) is not None for p in places):
                 deny(f'Refused "{guard.shown(part.text)}": {why}. {INLINE}')
