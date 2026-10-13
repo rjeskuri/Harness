@@ -806,6 +806,28 @@ def pr_data(fx):
             "closingIssuesReferences": [{"number": 12}]}
 
 
+FILES_PAGE = 30          # GitHub's page size for GET repos/O/R/pulls/N/files when none is asked for
+
+
+def files_calls(pr, paths):
+    """`gh api repos/o/r/pulls/N/files`, which lists every changed file (`gh pr view --json files` stops at
+    100): GitHub's pages of 30 objects with a `filename`. With --paginate gh prints one JSON array per page,
+    back to back; with --paginate --slurp one array of the pages; without --paginate only the first page. The
+    endpoint is one argv token, `repos/o/r/pulls/N/files` with or without `?per_page=100`."""
+    objects = [{"sha": hashlib.sha1(path.encode()).hexdigest(), "filename": path, "status": "modified",
+                "additions": 3, "deletions": 1, "changes": 4,
+                "blob_url": f"https://github.com/o/r/blob/{SHA}/{path}", "patch": "@@ -1 +1 @@\n-old\n+new"}
+               for path in paths]
+    pages = [objects[i:i + FILES_PAGE] for i in range(0, len(objects), FILES_PAGE)] or [[]]
+    back_to_back = "".join(json.dumps(page, indent=2) for page in pages)
+    calls = []
+    for endpoint in (f"repos/o/r/pulls/{pr}/files", f"repos/o/r/pulls/{pr}/files?per_page=100"):
+        calls += [{"contains": [endpoint, "--paginate", "--slurp"], "stdout": json.dumps(pages)},
+                  {"contains": [endpoint, "--paginate"], "stdout": back_to_back},
+                  {"contains": [endpoint], "stdout": json.dumps(pages[0], indent=2)}]
+    return calls
+
+
 TICKET_12_BODY = ("## Request\nAdd a widget that frobs.\n\n## Definition of done\n- [ ] The widget frobs twice\n\n"
                   "## Tests that must pass\n- `tests/test_widget.py::test_frob`: frobs twice\n")
 
@@ -868,6 +890,10 @@ FIXTURE_C["body"] = "\n".join([
     "Verify:", "```", *FIXTURE_C["verify"], "```", "",
     "## Review", FIXTURE_C["review"], "",
     "## Risks", *FIXTURE_C["risks"], ""])
+# A PR wider than `gh pr view --json files` reaches: 130 changed files, of which the PR view holds the first 100.
+FIXTURE_WIDE = dict(FIXTURE_A, pr=72, sha=hashlib.sha1(b"fixture-wide").hexdigest(),
+                    summary="Every service module logs through the structured logger.",
+                    files=[f"services/svc_{i:03d}/logging.py" for i in range(1, 131)])
 
 
 class Land(WorktreeTest):
@@ -884,6 +910,7 @@ class Land(WorktreeTest):
                 {"match": ["issue", "view", "12", "--json", "state,labels,comments"], "stdout_json": issue},
                 {"match": ["issue", "edit", "12"], "stdout": ""},
                 {"match": ["pr", "view", "34"], "stdout_json": pr_data(FIXTURE_A)},
+                *files_calls(34, FIXTURE_A["files"]),
                 {"match": ["issue", "view", "12"],
                  "stdout_json": dict(issue, number=12, title="Add the widget", body=TICKET_12_BODY,
                                      url="https://github.com/o/r/issues/12")},
@@ -1056,8 +1083,12 @@ class LandResolution(Land):
     """`land` leaves one `**Resolution**` comment on the ticket, posted through `harness-board comment` before the
     `Landed in` comment. These run the real harness-board (no stubs), so every comment reaches the fake gh's log."""
 
-    def resolution_calls(self, fx, state="OPEN", issue_state="OPEN", comments=()):
+    def resolution_calls(self, fx, state="OPEN", issue_state="OPEN", comments=(), view_files=None, after=None):
+        """The land conversation for the fixture's PR. `view_files`: the files `gh pr view --json` holds (all of
+        the fixture's by default; GitHub stops at 100), while the files endpoint always lists them all; `after`:
+        the answer to the PR read after the merge (`gh pr view P --json body,...`), in place of the PR's data."""
         pr, sha = str(fx["pr"]), fx["sha"]
+        view = pr_data(dict(fx, files=fx["files"] if view_files is None else view_files))
         url = f"https://github.com/o/r/pull/{pr}"
         issue = {"number": 12, "title": "Add the widget", "url": "https://github.com/o/r/issues/12",
                  "body": TICKET_12_BODY, "state": issue_state,
@@ -1069,7 +1100,8 @@ class LandResolution(Land):
                  "stdout_json": land_view(url=url, state=state)},
                 REPO_VIEW,
                 {"match": ["pr", "merge", pr], "stdout": ""},
-                {"match": ["pr", "view", pr], "stdout_json": pr_data(fx)},
+                {"match": ["pr", "view", pr], **(after or {"stdout_json": view})},
+                *files_calls(pr, fx["files"]),
                 {"match": ["issue", "view", "12"], "stdout_json": issue},
                 {"match": ["issue", "edit", "12"], "stdout": ""},
                 {"match": ["issue", "close", "12"], "stdout": ""},
@@ -1372,6 +1404,83 @@ class LandResolution(Land):
                 self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed],
                                  [f"Landed in {fx['sha']}"])
                 self.assertLess(index, landed[0][0], "the Resolution goes before Landed in")
+
+    # ------------------------------------------------------------------ every changed file
+    def files_listed(self, body):
+        """(N of the one `Files changed (N):` line, the paths on the list lines that follow it)."""
+        lines = body.splitlines()
+        heads = [i for i, line in enumerate(lines) if line.strip().startswith("Files changed")]
+        self.assertEqual(len(heads), 1, f"want one `Files changed (N):` line:\n{body}")
+        m = re.match(r"^Files changed \((\d+)\):$", lines[heads[0]].strip())
+        self.assertIsNotNone(m, f"the files line reads `Files changed (N):`, got {lines[heads[0]]!r}")
+        paths = []
+        for line in lines[heads[0] + 1:]:
+            item = re.match(r"^\s*[-*+]\s+(.*)$", line)
+            if not item:
+                break
+            paths.append(item.group(1).replace("`", "").strip().split(" ")[0])
+        return int(m.group(1)), paths
+
+    def test_land_resolution_lists_every_changed_file_past_the_first_hundred(self):
+        """`gh pr view --json files` stops at 100 files. A PR touching 130 gets all 130 in its Resolution, from
+        the paginated files endpoint, and the count says 130; the rest of the Resolution and `Landed in` as
+        usual."""
+        fx = FIXTURE_WIDE
+        self.land(fx, view_files=fx["files"][:100])
+        index, number, body = self.one_resolution()
+        self.assertEqual(number, "12")
+        count, listed = self.files_listed(body)
+        for nth in (101, 130):
+            path = fx["files"][nth - 1]
+            self.assertTrue(path in listed, f"changed file no. {nth}, {path}, missing from the Resolution, which "
+                                            f"lists {len(listed)} files under `Files changed ({count}):`")
+        self.assertEqual(count, 130, "want `Files changed (130):`")
+        self.assertEqual(sorted(listed), sorted(fx["files"]), "every changed file, each listed once")
+        self.assertResolution(body, fx)
+        landed = self.landed(12)
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed], [f"Landed in {fx['sha']}"])
+        self.assertLess(index, landed[0][0], "the Resolution goes before Landed in")
+
+    def test_land_resolution_lists_a_short_prs_files_once(self):
+        """Three files, listed alike by the PR view and the files endpoint: `Files changed (3):` and each path
+        once, whichever the land reads."""
+        self.land(FIXTURE_A)
+        _, _, body = self.one_resolution()
+        count, listed = self.files_listed(body)
+        self.assertEqual(sorted(listed), sorted(FIXTURE_A["files"]), f"each changed file once:\n{body}")
+        self.assertEqual(count, 3, f"want `Files changed (3):`:\n{body}")
+        self.assertResolution(body, FIXTURE_A)
+
+    # ------------------------------------------------------------------ a failed read after the merge
+    def test_land_posts_nothing_when_the_pr_read_after_the_merge_fails_and_the_resume_posts_both(self):
+        """The merge goes through, then reading the PR for the Resolution (`gh pr view P --json body,...`) fails:
+        no comment at all on the ticket, since `Landed in` alone would keep a resume from adding the Resolution,
+        and land fails naming the step. A second land on the merged PR posts one Resolution, then `Landed in`."""
+        self.scenario(self.resolution_calls(FIXTURE_A, after={"stderr": "GraphQL: something\n", "exit": 1}))
+        p = self.pr("land", "34", "--yes", cwd=self.main, stubs=False)
+        self.assertOneLineError(p, "PR #34 is merged", "#12", "gh pr view 34", "GraphQL: something")
+        self.assertRegex(p.stderr, r"(?i)\bresolution\b", "the error names the step that failed: the Resolution")
+        argv = self.gh_argv()
+        self.assertTrue(any(a[:2] == ["pr", "merge"] for a in argv), "the merge went through")
+        self.assertTrue(any(a[:3] == ["pr", "view", "34"] and "--json" in a[:-1]
+                            and "body" in a[a.index("--json") + 1].split(",") for a in argv),
+                        "the land read the PR's body after the merge, and that read failed")
+        self.assertEqual([a for a in argv if a[:2] == ["issue", "comment"]], [], "no issue comment at all")
+        self.assertEqual(self.posted(), [], "no comment of any kind on the ticket")
+        ticket = [line for line in p.stdout.splitlines() if line.startswith("Ticket:")]
+        self.assertEqual(len(ticket), 1, p.stdout)
+        self.assertNotIn("commented", ticket[0])
+
+        bodies = [b for _, _, b in self.posted(12)]        # what the ticket shows the resume: nothing
+        self.land(FIXTURE_A, state="MERGED", issue_state="CLOSED", comments=self.as_comments(bodies))
+        self.assertFalse(any(a[:2] == ["pr", "merge"] for a in self.gh_argv()), "the resume does not merge again")
+        found = self.resolutions(12)
+        self.assertEqual(len(found), 1, f"the resume posts one Resolution, got {len(found)}: {self.posted()}")
+        index, _, body = found[0]
+        self.assertResolution(body, FIXTURE_A)
+        landed = self.landed(12)
+        self.assertEqual([b.replace(HARNESS_MARK, "").strip() for _, _, b in landed], [f"Landed in {SHA}"])
+        self.assertLess(index, landed[0][0], "the Resolution goes before Landed in")
 
 
 class LandRefusals(PrTest):
