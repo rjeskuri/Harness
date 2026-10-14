@@ -83,6 +83,22 @@ def write(path, text):
     return path
 
 
+def project_argv(argv):
+    """(subcommand, positionals, {option: value}) of a `gh project ...` argv, whatever the flag order."""
+    pos, opts, i = [], {}, 2
+    while i < len(argv):
+        name, eq, value = argv[i][2:].partition("=")
+        if not argv[i].startswith("--"):
+            pos.append(argv[i])
+        else:
+            if not eq:
+                i += 1
+                value = argv[i] if i < len(argv) else None
+            opts[name] = [opts[name], value] if name in opts else value
+        i += 1
+    return argv[1], pos, opts
+
+
 def executable(path, text):
     write(path, text)
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -853,6 +869,26 @@ class Ready(PrTest):
         p = self.pr("ready", "34")
         self.assertOneLineError(p, "PR #34 is ready, but", "gh issue edit failed")
         self.assertEqual(len(self.notifications()), 1)
+
+    def test_ready_with_the_real_board_mirrors_in_review_to_the_configured_project(self):
+        """#64: no stubs, HARNESS_PROJECT set: the real harness-board sets the ticket's project item to "In review",
+        on the URL gh reports for the issue (not one built from the remote)."""
+        url = "https://ghe.example.com/o/r/issues/12"
+        self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, self.view([12]),
+                       {"match": ["issue", "view", "12"], "stdout_json": {
+                           "number": 12, "url": url, "labels": [{"name": "task"}, {"name": "status:in-progress"}]}},
+                       {"match": ["issue", "edit", "12"], "stdout": url + "\n"},
+                       {"match": ["issue", "comment", "12"], "stdout": url + "#issuecomment-1\n"},
+                       {"match": ["project"], "stdout": ""}])
+        p = self.ok("ready", "34", stubs=False, HARNESS_PROJECT="rjeskuri/7")
+        self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
+        argvs = self.gh_argv()
+        self.assertIn(["issue", "edit", "12", "--add-label", "status:in-review", "--remove-label",
+                       "status:in-progress"], argvs)
+        projects = [a for a in argvs if a[:1] == ["project"]]
+        self.assertEqual(len(projects), 1, projects)
+        self.assertEqual(project_argv(projects[0]), ("item-edit", ["7"], {"owner": "rjeskuri", "url": url,
+                                                                           "field": "Status", "value": "In review"}))
 
 
 class ReadyGate(GateAsserts, PrTest):
