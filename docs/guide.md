@@ -90,6 +90,25 @@ The PR body is laid out the same way every time:
 | Review | Finding counts by severity and the high findings |
 | Risks | Filled for `risk:high` tickets |
 
+## Projects board
+
+Optional. A GitHub Projects board shows your tickets as a kanban with each epic as a swim lane. It is a mirror: the `status:*` and `priority:high` labels stay authoritative, `harness-board` writes the board, and no ticket state is ever taken from it; only `project check` and `project sync` read it, to compare it with the labels. Dragging a card to another column changes nothing on the ticket. For an open issue, the next status change on it, or the next `harness-board project sync`, puts the card back from the labels. A closed issue's card dragged out of Done stays there until auto-archive removes it, and a drag between epic lanes may change the issue's parent. To change a ticket's status, use `harness-board status` or the loop, not the board.
+
+One-time setup:
+
+1. **Scope.** `gh auth refresh -h github.com -s project`. Without the `project` scope every board call fails with a warning; the tools keep working.
+2. **Project.** In the GitHub web UI, create a new private user project (separate from the existing "Claude Kanban") from a blank Board layout, not the Kanban template: the template already has a Priority field with P0 to P2 and other Status options. Note its owner and number from the URL, `github.com/users/<owner>/projects/<number>`.
+3. **Status options.** Rename or replace the Status field's options so they are exactly Ready, In progress, In review, Blocked, Needs input, Done. The tools match options by name, so a renamed option is a failed write.
+4. **Priority field.** Add a single-select field named Priority with the options High and Normal.
+5. **Views.** A board view grouped by Parent issue (enable that field first), so the epics are the swim lanes; a Priority view; a Blocked view filtered by `is:blocked` (if the filter is available; only a 2025-08-21 GitHub changelog entry mentions it). Turn on auto-archive for Done items so the board stays small: `project sync` reads at most 1000 items and adds nothing to a board larger than that.
+6. **Point the harness at it.** In `~/.claude/settings.json`, under `env`, set `"HARNESS_PROJECT": "<owner>/<number>"`.
+7. **Check.** `harness-board project check` names every missing Status or Priority option and exits 1, or prints one line and exits 0.
+8. **Back-fill.** `harness-board project sync --all-projects --dry-run` prints each change it would make, one line per change (an add and its Status write are two lines), then a summary; run it again without `--dry-run` to add the open issues of every registered project and set their Status and Priority from the labels. After the back-fill most cards have no Priority: an unset Priority counts as Normal, and only `priority:high` tickets get High, so the Priority view's "No Priority" group is expected. Run `harness-board project sync` (no `--all-projects`) to do one repository.
+
+From then on `epic create`, `task create` and every status change (including `harness-work start`, `needs-input` and `harness-pr ready`) update the board. A closed issue becomes Done through the project's built-in workflow. A failed board call is one `harness-board: warning:` line, shown by `harness-work` and `harness-pr` too, and never stops the command; run `project sync` to repair the drift. `project check` and `project sync` themselves report failures and exit 1.
+
+Turn it off by removing `HARNESS_PROJECT` from `~/.claude/settings.json`, or for one run with `HARNESS_PROJECT=""` in the environment; with it unset or empty no `gh project` call is made.
+
 ## Budgets and quota
 
 | Work | Bills to | When it runs out |
