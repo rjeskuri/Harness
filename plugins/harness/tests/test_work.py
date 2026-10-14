@@ -3360,6 +3360,122 @@ OPTION_SENTENCES = ["You may skip `harness-pr ready`.",
                     "You may end the turn after the coder."]
 
 
+PLUGIN = os.path.dirname(HERE)
+REPO_ROOT = os.path.dirname(os.path.dirname(PLUGIN))
+
+
+def read_repo_file(*parts):
+    with open(os.path.join(*parts), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def sentences(text):
+    return [s.strip() for s in re.split(r"(?<=[.;:])\s+|\n", text) if s.strip()]
+
+
+class ReviewModel(unittest.TestCase):
+    """Ticket #67: the review runs on Opus 5.5; Fable only for a risk:high ticket or after the review stage has
+    escalated by failure. The work skill takes the model from `harness-board tier N --stage review`."""
+
+    def routing_paragraph(self):
+        lines = [ln for ln in skill_body().splitlines() if ln.startswith("You orchestrate")]
+        self.assertEqual(len(lines), 1, "no routing paragraph (the one that starts 'You orchestrate')")
+        return lines[0]
+
+    def review_step(self):
+        lines = [ln for ln in skill_body().splitlines() if re.match(r"^5[.)]\s+\*\*Review", ln)]
+        self.assertEqual(len(lines), 1, "no numbered step 5 named Review")
+        return lines[0]
+
+    def test_the_skill_takes_the_reviewers_model_from_tier_stage_review(self):
+        body = skill_body()
+        self.assertRegex(body, r"harness-board tier N --stage review")
+        # ... in the routing paragraph or in the review step, where the orchestrator picks the model
+        where = self.routing_paragraph() + "\n" + self.review_step()
+        self.assertRegex(where, r"harness-board tier N --stage review", where)
+        # the review step itself says which model the reviewer gets
+        step = self.review_step()
+        self.assertRegex(step, r"--stage review", step)
+
+    def test_fable_is_for_risk_high_or_escalation_only(self):
+        where = self.routing_paragraph() + "\n" + self.review_step()
+        text = " ".join(where.split())
+        self.assertRegex(text.lower(), r"risk:high", text)
+        self.assertRegex(text.lower(), r"escalat", text)
+        for sentence in sentences(where):
+            low = sentence.lower()
+            if "fable" in low and "review" in low:
+                with self.subTest(sentence=sentence):
+                    self.assertTrue("risk:high" in low or "escalat" in low or "--stage review" in low,
+                                    "an unconditional Fable review: " + sentence)
+
+    def test_no_unconditional_review_on_fable_anywhere_in_the_skill(self):
+        body = skill_body()
+        self.assertNotRegex(body.lower(), r"or reviewing on fable", "the old unconditional rule is still there")
+        for sentence in sentences(body):
+            low = sentence.lower()
+            if "fable" in low and re.search(r"\breview(?:s|er|ing)?\b", low) and "ultrareview" not in low:
+                with self.subTest(sentence=sentence):
+                    self.assertTrue("risk:high" in low or "escalat" in low or "--stage review" in low,
+                                    "an unconditional Fable review: " + sentence)
+
+    def test_fable_effort_is_still_xhigh_when_fable_is_used(self):
+        body = skill_body()
+        self.assertRegex(body, r"model: fable.{0,40}effort: xhigh|effort: xhigh.{0,40}model: fable")
+
+    def test_the_reviewer_agent_runs_on_opus(self):
+        front = read_repo_file(PLUGIN, "agents", "reviewer.md").split("\n---", 1)[0]
+        models = re.findall(r"(?m)^model:\s*(\S+)\s*$", front)
+        self.assertEqual(models, ["opus"], front)
+        self.assertNotRegex(front, r"(?m)^model:\s*fable")
+
+    def test_the_reviewer_agent_takes_the_default_effort(self):
+        # Opus runs at its default (high); xhigh is passed on the Agent call only when Fable is used.
+        front = read_repo_file(PLUGIN, "agents", "reviewer.md").split("\n---", 1)[0]
+        self.assertNotRegex(front, r"(?m)^effort:\s*xhigh", front)
+
+    def test_no_sentence_naming_fable_says_always_or_every(self):
+        # Fable is conditional (risk:high or escalation); "always"/"every" next to it makes it unconditional.
+        def fable_sentences(text):
+            return [s for s in re.split(r"(?<=[.!?;])\s+|\n", text) if re.search(r"fable", s, re.I)]
+        for sentence in fable_sentences(skill_body()):
+            with self.subTest(file="work/SKILL.md", sentence=sentence[:100]):
+                self.assertIsNone(re.search(r"\b(always|every)\b", re.sub(r"every agent call", "", sentence, flags=re.I), re.I), sentence)
+        for name in (("user", "CLAUDE.md"), ("README.md",), ("docs", "guide.md"), ("docs", "design.md")):
+            for line in read_repo_file(REPO_ROOT, *name).splitlines():
+                if re.search(r"reviewer", line, re.I):
+                    for sentence in fable_sentences(line):
+                        with self.subTest(file="/".join(name), sentence=sentence[:100]):
+                            self.assertIsNone(re.search(r"\b(always|every)\b", re.sub(r"every agent call", "", sentence, flags=re.I), re.I), sentence)
+
+    def test_the_reviewer_table_rows_name_fable_only_with_risk_high(self):
+        # README, guide and design list the reviewer in a table; its model cell may say Fable only for risk:high.
+        for name in (("README.md",), ("docs", "guide.md"), ("docs", "design.md")):
+            rows = [ln for ln in read_repo_file(REPO_ROOT, *name).splitlines()
+                    if ln.lstrip().startswith("|") and re.search(r"`reviewer`", ln)]
+            with self.subTest(file="/".join(name)):
+                self.assertTrue(rows, "no reviewer table row")
+            for row in rows:
+                cells = [c.strip() for c in row.strip().strip("|").split("|")][:-1]    # all but the description
+                for cell in cells:
+                    if re.search(r"fable", cell, re.I):
+                        with self.subTest(file="/".join(name), cell=cell):
+                            self.assertIn("risk:high", cell.lower(), row)
+
+    def test_no_user_facing_doc_says_every_review_runs_on_fable(self):
+        # DoD: nothing in the skills, agents or docs says every review runs on Fable.
+        claude_md = read_repo_file(REPO_ROOT, "user", "CLAUDE.md")
+        self.assertTrue("reviewer` (always)" not in claude_md, "user/CLAUDE.md still says Fable is for the reviewer (always)")
+        self.assertTrue("Fable for judgment stages" not in claude_md, "user/CLAUDE.md still says Fable for judgment stages")
+        for name in (("user", "CLAUDE.md"), ("README.md",), ("docs", "guide.md"), ("docs", "design.md")):
+            for line in read_repo_file(REPO_ROOT, *name).splitlines():
+                low = line.lower()
+                if "reviewer" in low and "fable" in low and not low.lstrip().startswith("#"):
+                    with self.subTest(file="/".join(name), line=line[:80]):
+                        self.assertTrue("risk:high" in low or "escalat" in low or "opus" in low,
+                                        "reviewer row names Fable unconditionally: " + line)
+
+
 class SkillWording(unittest.TestCase):
     """The wording checks themselves, on text swapped in at test time: a rule in the outline's words or a plain
     prohibition passes, the breaker's inverted skill and each option sentence fails."""

@@ -52,11 +52,11 @@ Then register your projects: `harness-projects discover`, and `harness-projects 
 | `test-author` | tier | Writes the tests a ticket names and shows them red; may not edit source |
 | `test-breaker` | tier | Tries to pass the new tests with a cheat in a scratch copy; may not edit tests |
 | `coder` | tier | Makes the tests and the verify command green, commits; may not edit tests |
-| `reviewer` | Fable, xhigh | Reviews the branch against the definition of done; findings go on the PR |
+| `reviewer` | Opus (Fable, xhigh, for risk:high) | Reviews the branch against the definition of done; findings go on the PR |
 | `researcher` | Opus | Answers from primary sources |
 | `quick` | Sonnet | Trivial mechanical tasks outside the ticket loop |
 
-The main session runs Opus 5.5 at high effort. `harness-board tier N` picks the tier from the ticket's labels: `size:S` and `risk:low` on a non-bug gives Sonnet; `size:L` or `risk:high` gives Fable; anything else gives Opus. Escalation is by failure, recorded with `harness-work attempt`: a stage's first failure retries at the same tier, the second re-runs one tier up, the third stops and asks on the ticket.
+The main session runs Opus 5.5 at high effort. `harness-board tier N` picks the tier from the ticket's labels: `size:S` and `risk:low` on a non-bug gives Sonnet; `size:L` or `risk:high` gives Fable; anything else gives Opus. Reviews run on Opus: `harness-board tier N --stage review` gives Fable only for a `risk:high` ticket, and the review stage is recorded with `harness-work attempt N review pass|fail --tier <that output>`, so its second failure re-runs the review on Fable. Escalation is by failure, recorded with `harness-work attempt`: a stage's first failure retries at the same tier, the second re-runs one tier up, the third stops and asks on the ticket.
 
 ## Skills
 

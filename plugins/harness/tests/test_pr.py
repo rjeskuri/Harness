@@ -580,7 +580,8 @@ class Review(PrTest):
     def test_review_routes_on_diff_findings_inline_and_the_rest_to_the_body(self):
         self.scenario([REPO_VIEW, {"match": ["pr", "diff", "34"], "stdout": DIFF},
                        {"match": ["api", "-X", "POST", "repos/o/r/pulls/34/reviews"], "stdout": "{}"}])
-        p = self.ok("review", "34", "--findings", self.findings(REVIEW_FINDINGS))
+        # #67: the default model is now opus; this test is about routing, so it names the model it expects in the body.
+        p = self.ok("review", "34", "--findings", self.findings(REVIEW_FINDINGS), "--model", "fable")
         self.assertIn("7 findings (4 inline, 3 in the body)", p.stdout)
         calls = self.gh_calls()
         self.assertEqual([c["argv"] for c in calls], [
@@ -613,6 +614,26 @@ class Review(PrTest):
         self.assertEqual(second["comments"], [])
         self.assertTrue(second["body"].startswith("Harness review (opus): 2 findings, 1 high, 1 medium, 0 low."))
         self.assertIn("- `widget.py:2` [high] Added line, wrong value.", second["body"])
+
+    def posted_body(self, *extra):
+        self.scenario([REPO_VIEW, {"match": ["pr", "diff", "34"], "stdout": DIFF},
+                       {"match": ["api", "-X", "POST", "repos/o/r/pulls/34/reviews"], "stdout": "{}"}])
+        self.ok("review", "34", "--findings", self.findings(REVIEW_FINDINGS[:2]), *extra)
+        posts = [c for c in self.gh_calls() if c["argv"][0] == "api"]
+        self.assertEqual(len(posts), 1)
+        return json.loads(posts[0]["stdin"])["body"]
+
+    def test_review_without_model_names_opus_in_the_body(self):
+        # Ticket #67: the default model is opus, so the body names the model that actually ran.
+        body = self.posted_body()
+        self.assertTrue(body.startswith("Harness review (opus): 2 findings, 1 high, 1 medium, 0 low."), body)
+        self.assertNotIn("fable", body)
+
+    def test_review_model_option_is_named_in_the_body(self):
+        for model in ("fable", "opus", "sonnet"):
+            with self.subTest(model=model):
+                body = self.posted_body("--model", model)
+                self.assertTrue(body.startswith(f"Harness review ({model}): 2 findings, "), body)
 
     def test_review_with_no_findings_posts_a_plain_comment_review(self):
         self.scenario([{"match": ["pr", "review", "34"], "stdout": ""}])

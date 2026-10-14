@@ -54,7 +54,7 @@ One session per project. `claude agents` in a terminal lists every session, incl
 | Red proof | `harness-red check` | Runs the new tests against unchanged source. They must fail; the record is written |
 | Break | `test-breaker` | In a scratch copy, tries to pass the tests with a cheat. If it can, the tests go back to the author, at most twice |
 | Code | `coder` at the tier | Changes source only, until the new tests and `CLAUDE_VERIFY_CMD` pass, and commits |
-| Review | `reviewer`, Fable | Checks the branch against the definition of done. High and medium findings go back to the coder, at most twice |
+| Review | `reviewer`, Opus (Fable for risk:high) | Checks the branch against the definition of done. High and medium findings go back to the coder, at most twice |
 | PR | `harness-pr open`, `harness-pr review` | Pushes the branch, opens a draft PR, posts the findings as a review |
 | CI | `harness-pr checks <P> --wait` | Waits for checks. Failures go back to the coder, at most twice |
 | Ultrareview | `harness-pr ultra <P> --post` | Only on `risk:high`; posts a cloud review to the PR |
@@ -136,7 +136,7 @@ The PR body is laid out the same way every time:
 | Ticket | A GitHub issue on the board: request, outline, definition of done, tests that must pass, context |
 | Epic | An issue labeled `epic` whose tasks are its sub-issues. It closes when the last task lands |
 | Board | A project's GitHub issues and their labels. `harness-board board` prints it |
-| Tier | The model a ticket's agents run on: Sonnet, Opus or Fable, from its size and risk labels |
+| Tier | The model a ticket's agents run on: Sonnet, Opus or Fable, from its size and risk labels. The review runs on Opus, and on Fable for a risk:high ticket |
 | Red run | `harness-red check` proving the new tests fail before any source changes. Its record unlocks source edits |
 | Breaker | The `test-breaker` agent, which tries to cheat the tests to show they are too narrow |
 | Worktree | A second checkout of the repo in another folder. Each ticket gets one under `.claude/worktrees/` |

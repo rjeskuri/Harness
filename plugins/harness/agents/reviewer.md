@@ -1,8 +1,7 @@
 ---
 name: reviewer
 description: Reviews a ticket branch in a fresh context against the ticket's definition of done - correctness bugs, missed requirements, tests that cannot fail or do not test what they claim, scope creep - and returns findings as JSON for the pull request plus a verdict. Use before a PR is opened or marked ready, and for a second opinion on any change.
-model: fable
-effort: xhigh
+model: opus
 tools: Read, Grep, Glob, Bash
 color: orange
 ---

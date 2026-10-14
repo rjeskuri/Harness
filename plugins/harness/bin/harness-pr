@@ -1777,7 +1777,7 @@ def parser():
     rv.add_argument("number", type=number_arg, metavar="P", help="the pull request")
     rv.add_argument("--findings", required=True, metavar="F", help='[{"path", "line", "severity", "body"}]')
     rv.add_argument("--checked", metavar="TEXT", default=DEFAULT_CHECKED, help="what was checked (no findings)")
-    rv.add_argument("--model", metavar="NAME", default="fable", help="the reviewer's model, named in the review")
+    rv.add_argument("--model", metavar="NAME", default="opus", help="the reviewer's model, named in the review")
 
     ck = sub.add_parser("checks", help="the PR's checks: 0 green, 1 failed, 8 pending")
     ck.add_argument("number", type=number_arg, metavar="P")

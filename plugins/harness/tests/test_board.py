@@ -1489,6 +1489,95 @@ class Tier(BoardTest):
         self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "sonnet", "source": "github"})
 
 
+# Ticket #67: reviews run on Opus 5.5; `tier N --stage review` gives fable only for a risk:high ticket, whatever the
+# type or size, and opus for every other combination. Plain `tier N` keeps the rubric (size:L or risk:high gives fable;
+# size:S, risk:low and not a bug gives sonnet; else opus).
+class TierReviewStage(BoardTest):
+    TYPES = ("task", "bug", "chore", "refactor")
+    SIZES = ("S", "M", "L")
+
+    def tier(self, labels, *extra):
+        self.put_cache(12, {"number": 12, "labels": list(labels)})
+        p = self.ok("tier", "12", *extra)
+        self.assertEqual(self.calls(), [])                  # from the cache: no gh call
+        return p.stdout.strip()
+
+    def test_review_stage_is_fable_exactly_when_the_ticket_is_risk_high(self):
+        for kind in self.TYPES:
+            for size in self.SIZES:
+                for risk, expected in (("low", "opus"), ("high", "fable")):
+                    with self.subTest(kind=kind, size=size, risk=risk):
+                        self.assertEqual(self.tier([kind, "size:" + size, "risk:" + risk], "--stage", "review"),
+                                         expected)
+
+    def test_review_stage_named_cases(self):
+        self.assertEqual(self.tier(["task", "size:L", "risk:low"], "--stage", "review"), "opus")   # not fable by size
+        self.assertEqual(self.tier(["task", "size:S", "risk:low"], "--stage", "review"), "opus")   # not sonnet
+        self.assertEqual(self.tier(["bug", "size:S", "risk:low"], "--stage", "review"), "opus")
+        self.assertEqual(self.tier(["task", "size:S", "risk:high"], "--stage", "review"), "fable")
+        self.assertEqual(self.tier(["bug", "size:L", "risk:high", "status:in-progress", "priority:high"],
+                                   "--stage", "review"), "fable")
+
+    def test_review_stage_without_a_risk_label_is_opus(self):
+        for labels in (["task", "size:L"], ["chore", "size:S"], ["task"], []):
+            with self.subTest(labels=labels):
+                self.assertEqual(self.tier(labels, "--stage", "review"), "opus")
+
+    def test_review_stage_option_may_come_before_the_number_and_works_with_json(self):
+        self.put_cache(12, {"number": 12, "labels": ["task", "size:L", "risk:high"]})
+        self.assertEqual(self.ok("tier", "--stage", "review", "12").stdout.strip(), "fable")
+        p = self.ok("tier", "12", "--stage", "review", "--json")
+        self.assertEqual(json.loads(p.stdout)["tier"], "fable")
+        self.put_cache(13, {"number": 13, "labels": ["task", "size:L", "risk:low"]})
+        p = self.ok("tier", "13", "--stage", "review", "--json")
+        self.assertEqual(json.loads(p.stdout)["tier"], "opus")
+
+    def test_review_stage_is_fetched_without_a_cache(self):
+        self.scenario([{"match": ["issue", "view", "12", "--json", "labels"],
+                        "stdout_json": {"labels": [{"name": "refactor"}, {"name": "size:L"}, {"name": "risk:low"}]}}])
+        self.assertEqual(self.ok("tier", "12", "--stage", "review").stdout.strip(), "opus")
+
+    def test_a_stage_other_than_review_is_a_usage_error_naming_review(self):
+        self.put_cache(12, {"number": 12, "labels": ["task", "size:L", "risk:high"]})
+        for stage in ("code", "bogus", "Review", ""):
+            with self.subTest(stage=stage):
+                p = self.board("tier", "12", "--stage", stage)
+                self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(p.stdout.strip(), "")                  # no tier is printed
+                self.assertIn("review", p.stderr)                       # names the allowed value
+                self.assertNotIn("Traceback", p.stderr)
+
+    def test_review_stage_falls_through_a_cache_without_labels_to_github(self):
+        # A cache with a stored tier but no labels cannot answer the review stage (the stored tier is the rubric's,
+        # not the review's): the labels are fetched. Plain `tier` still answers from the cache.
+        self.put_cache(12, {"number": 12, "tier": "fable"})
+        self.scenario([{"match": ["issue", "view", "12", "--json", "labels"],
+                        "stdout_json": {"labels": [{"name": "task"}, {"name": "size:L"}, {"name": "risk:low"}]}}])
+        self.assertEqual(self.ok("tier", "12", "--stage", "review").stdout.strip(), "opus")
+        self.assertEqual(len(self.calls()), 1)
+        p = self.ok("tier", "12", "--stage", "review", "--json")
+        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "opus", "source": "github"})
+        before = len(self.calls())
+        p = self.ok("tier", "12", "--json")
+        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "fable", "source": "cache"})
+        self.assertEqual(len(self.calls()), before)                 # plain tier made no gh call
+
+    def test_plain_tier_is_unchanged_for_every_combination(self):
+        # Already true today: pins the rubric (derived here from its statement, not from the tool) so the change
+        # cannot leak into the other agents' tiers.
+        for kind in self.TYPES:
+            for size in self.SIZES:
+                for risk in ("low", "high"):
+                    if size == "L" or risk == "high":
+                        expected = "fable"
+                    elif size == "S" and kind != "bug":
+                        expected = "sonnet"
+                    else:
+                        expected = "opus"
+                    with self.subTest(kind=kind, size=size, risk=risk):
+                        self.assertEqual(self.tier([kind, "size:" + size, "risk:" + risk]), expected)
+
+
 # ======================================================================= errors, repo resolution, help
 class Errors(BoardTest):
     def test_gh_missing(self):
