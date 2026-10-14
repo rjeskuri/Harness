@@ -40,7 +40,7 @@ Options considered:
 | Board columns can only be "any single select or iteration field". Dragging a card to another column sets that value. | https://docs.github.com/en/issues/planning-and-tracking-with-projects/customizing-views-in-your-project/customizing-the-board-layout |
 | Horizontal groups (swim lanes) can use a custom field value. "You cannot group by title, labels, reviewers, or linked pull requests." | same |
 | The built-in "Parent issue" and "Sub-issue progress" fields are hidden by default and can be enabled. "The "Parent issue" field can be used to group items." | https://docs.github.com/en/issues/planning-and-tracking-with-projects/understanding-fields/about-parent-issue-and-sub-issue-progress-fields |
-| Issue dependencies are not a project field. A board shows a "Blocked" icon, and the filters `is:blocked`, `is:blocking` and `blocked-by:` exist. | https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/creating-issue-dependencies; https://github.blog/changelog/2025-08-21-dependencies-on-issues/ |
+| Issue dependencies are not a project field. "You can view blocked issues in your projects and in the repository Issues tab", and the filters `is:blocked` and `blocked-by:` find them. | https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/creating-issue-dependencies; https://github.blog/changelog/2025-08-21-dependencies-on-issues/ |
 | A parent holds up to 100 sub-issues, nested up to 8 levels deep. Projects can "build views, filter, and group by parent issue". | https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/adding-sub-issues |
 
 ### Automation and limits
@@ -87,7 +87,7 @@ Views:
 ## How harness-board writes and syncs
 
 - **Config.** `HARNESS_PROJECT=<owner>/<number>`, read from the process environment, then from `env` in `~/.claude/settings.json`. It is one setting for the whole machine, not per repository. harness-board reads no settings file today, so A1 adds that reader. When the setting is unset, nothing below runs.
-- **Create.** `epic create` and `task create` add the issue with `gh project item-add <n> --owner <o> --url <issue url>`. They then set Status to Ready and, with `--priority`, set Priority to High.
+- **Create.** `epic create` and `task create` add the issue with `gh project item-add <n> --owner <o> --url <issue url>`, then set Status to Ready. `task create --priority` also sets Priority to High; `epic create` has no `--priority`, so epics get no Priority write.
   - The harness adds items itself rather than relying on auto-add, because Free allows a single auto-add workflow and it does not back-fill existing issues.
 - **Status.** The shared `set_status` helper (behind `status` and `needs-input`, and `harness-work start` through them) swaps the labels as today. It then calls `gh project item-edit <n> --owner <o> --url <issue url> --field Status --value "<option>"`: one call, by name, with no ID cache.
 - **Close.** The built-in "closed → Done" workflow covers `close`, `epic-check` and `harness-pr land`. `harness-pr` itself does not change.
@@ -110,7 +110,7 @@ These are not yet created on GitHub. They form one epic, "Projects board as a mi
 
 **A1. Mirror status and priority.**
 - Add a reader for `HARNESS_PROJECT`: the environment first, then `env` in `~/.claude/settings.json`. Unset means no project calls at all.
-- `epic create` and `task create`: once the issue exists, call `item-add --url`, then `item-edit --field Status --value Ready`. With `--priority`, also set `--field Priority --value High`.
+- `epic create` and `task create`: once the issue exists, call `item-add --url`, then `item-edit --field Status --value Ready`. `task create --priority` also sets `--field Priority --value High`; epics get no Priority write (`epic create` has no `--priority`).
 - `set_status`: after the label swap, call `item-edit --field Status --value <option>`. The status keys map to the options: ready to Ready, in-progress to In progress, in-review to In review, blocked to Blocked, needs-input to Needs input.
 - A failed project call warns once and leaves the exit code unchanged.
 - Tests (`tests/test_board.py`, fakegh):
@@ -134,7 +134,7 @@ These are not yet created on GitHub. They form one epic, "Projects board as a mi
   - `check` passes on complete fields, and reports a missing option.
 
 **A3. Docs.**
-- In `docs/design.md`, replace "no Projects board" (the interview decisions and The board) with the mirrored-view design, including `HARNESS_PROJECT` in the settings table and the new subcommands under harness-board.
+- In `docs/design.md`, replace "no Projects board" (the interview decisions and The board) with the mirrored-view design, adding `HARNESS_PROJECT` to the sentence listing the machine-wide settings under `env` in `~/.claude/settings.json` (after the per-project table), and the new subcommands under harness-board.
 - In `docs/guide.md`, cover:
   - the one-time setup: `gh auth refresh -s project`, then create the project, the Priority field, the Epics, Priority and Blocked views and auto-archive in the web UI
   - setting `HARNESS_PROJECT`
