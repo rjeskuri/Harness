@@ -26,6 +26,11 @@ Usage:
 Every comment posted here ends with the line `<!-- harness -->` (hidden on GitHub), so `answers` can tell the
 harness's own comments, posted under the owner's account, from the owner's replies.
 
+With HARNESS_PROJECT=OWNER/NUMBER (the environment first, where an empty value means off; else `env` in
+~/.claude/settings.json), `epic create` and `task create` add the issue to that GitHub Projects board with
+Status Ready (and Priority High for `task create --priority`), and every status change sets the item's Status.
+The labels stay the source of truth: a failed project call is one warning on stderr and never fails the command.
+
 gh is HARNESS_GH when set, else `gh` on PATH.
 """
 from __future__ import annotations
@@ -88,6 +93,8 @@ EVIDENCE_LINES = 60     # lines of evidence in a needs-input comment
 LIST_LIMIT = "200"
 GH_TIMEOUT = 60         # seconds per gh call
 LINK_RETRY_DELAY = 1.0  # seconds before the one retry of a sub-issue link
+PROJECT_SETTING = "HARNESS_PROJECT"   # OWNER/NUMBER of the Projects board the status is mirrored to
+PROJECT_VALUE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[1-9][0-9]*")
 DEFAULT_APP = "com.microsoft.VSCode"
 DEFAULT_SOUND = "Glass"
 CHECKBOX = re.compile(r"^[-*+]\s+\[[ xX]\]")
@@ -378,6 +385,59 @@ def by_harness(body):
     """Was this comment posted by the harness? The marker, or (older comments) a body the harness writes."""
     body = body or ""
     return MARKER in body or body.lstrip().startswith(HARNESS_PREFIXES)
+
+
+# --------------------------------------------------------------- the Projects board mirror
+def warn(message):
+    print(f"harness-board: warning: {one_line(message)}", file=sys.stderr)
+
+
+def settings_project():
+    """env.HARNESS_PROJECT of ~/.claude/settings.json when that parses as a JSON object and it is a string."""
+    try:
+        with open(home(".claude", "settings.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, RecursionError):
+        return None
+    env = data.get("env") if isinstance(data, dict) else None
+    value = env.get(PROJECT_SETTING) if isinstance(env, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def project_setting():
+    """(owner, number) of the board to mirror to, or None: the environment first (an empty value is off), else
+    the settings file. A value that is not OWNER/NUMBER is one warning and no mirroring."""
+    value = os.environ.get(PROJECT_SETTING)
+    if value is None:
+        value = settings_project()
+    if not value:
+        return None
+    if not PROJECT_VALUE.fullmatch(value):
+        warn(f"{PROJECT_SETTING}={value!r} is not OWNER/NUMBER; the Projects board is not updated")
+        return None
+    owner, number = value.split("/")
+    return owner, number
+
+
+def mirror(repo, project, url, fields, add=False):
+    """Add the issue at `url` to the board (when `add`), then set each (field, option) by name. The first failing
+    call stops the rest with one warning; the labels already changed, so this never fails the command."""
+    owner, number = project
+    target = [number, "--owner", owner, "--url", url]
+    calls = ([["project", "item-add"] + target] if add else []) + \
+        [["project", "item-edit"] + target + ["--field", field, "--value", value] for field, value in fields]
+    for call in calls:
+        try:
+            gh(repo, call)
+        except Problem as err:
+            warn(f"the Projects board {owner}/{number} was not updated: {err}")
+            return
+
+
+def mirror_created(repo, url, priority=False):
+    project = project_setting()
+    if project:
+        mirror(repo, project, url, [("Status", "Ready")] + ([("Priority", "High")] if priority else []), add=True)
 
 
 # --------------------------------------------------------------- labels, tiers, the cache
@@ -734,6 +794,7 @@ def cmd_epic_create(repo, args):
         + ([f"risk:{args.risk}"] if args.risk else [])
     out = gh(repo, ["issue", "create", "--title", args.title, "--body-file", path] + label_args(labels), stdin)
     number, url = created_issue(out)
+    mirror_created(repo, url)
     emit(args, {"number": number, "url": url}, f"#{number} {url}")
 
 
@@ -781,6 +842,7 @@ def cmd_task_create(repo, args):
         + (["needs-local"] if args.needs_local else []) + (["priority:high"] if args.priority else [])
     out = gh(repo, ["issue", "create", "--title", args.title, "--body-file", path] + label_args(labels), stdin)
     number, url = created_issue(out)
+    mirror_created(repo, url, args.priority)
     result = {"number": number, "url": url, "parent": args.parent, "linked": None, "blocked_by": []}
 
     def fail(message):
@@ -841,8 +903,10 @@ def cmd_ready(repo, args):
 
 
 def set_status(repo, number, status, comment=None):
-    """Swap the status label (remove every other status:*, add the new one), comment when asked."""
-    data = gh_json(repo, ["issue", "view", str(number), "--json", "labels"])
+    """Swap the status label (remove every other status:*, add the new one), mirror it to the Projects board when
+    one is configured, comment when asked."""
+    project = project_setting()
+    data = gh_json(repo, ["issue", "view", str(number), "--json", "labels,url" if project else "labels"])
     names = label_names(data.get("labels") if isinstance(data, dict) else None)
     new = "status:" + status
     removed = [name for name in names if name.startswith("status:") and name != new]
@@ -850,6 +914,12 @@ def set_status(repo, number, status, comment=None):
     for name in removed:
         cmd += ["--remove-label", name]
     gh(repo, cmd)
+    if project:
+        url = data.get("url") if isinstance(data, dict) else None
+        if isinstance(url, str) and url.strip():
+            mirror(repo, project, url.strip(), [("Status", STATUS_TITLES[status])])
+        else:
+            warn(f"gh issue view {number} gave no url; the Projects board {'/'.join(project)} is not updated")
     if comment:
         gh(repo, ["issue", "comment", str(number), "--body", marked(comment)])
     labels = [name for name in names if name not in removed] + ([new] if new not in names else [])
@@ -1045,7 +1115,7 @@ def parser():
     tc.add_argument("--blocked-by", action="append", metavar="N[,N]", help="issues that must close first")
     tc.add_argument("--no-tests", action="store_true", help="docs or config only; exempt from tests-first")
     tc.add_argument("--needs-local", action="store_true", help="needs this Mac's files or credentials")
-    tc.add_argument("--priority", action="store_true", help="label priority:high")
+    tc.add_argument("--priority", action="store_true", help="label priority:high (and Priority High on the board)")
 
     show = sub.add_parser("show", parents=[common], help="fetch a ticket, write its cache, print it")
     show.add_argument("number", type=issue_number, metavar="N")

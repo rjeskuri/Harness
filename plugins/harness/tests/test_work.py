@@ -98,6 +98,22 @@ def write(path, text):
     return path
 
 
+def project_argv(argv):
+    """(subcommand, positionals, {option: value}) of a `gh project ...` argv, whatever the flag order."""
+    pos, opts, i = [], {}, 2
+    while i < len(argv):
+        name, eq, value = argv[i][2:].partition("=")
+        if not argv[i].startswith("--"):
+            pos.append(argv[i])
+        else:
+            if not eq:
+                i += 1
+                value = argv[i] if i < len(argv) else None
+            opts[name] = [opts[name], value] if name in opts else value
+        i += 1
+    return argv[1], pos, opts
+
+
 def executable(path, text):
     write(path, text)
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -466,6 +482,25 @@ class Start(WorkTest):
                 self.assertEqual(p.stdout, "")
                 self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
         self.assertFalse([c for c in self.gh_calls() if c[:2] == ["issue", "edit"]])
+
+    def test_start_mirrors_in_progress_to_the_configured_project(self):
+        """#64: with HARNESS_PROJECT set, the real harness-board's status change during start sets the project
+        item's Status to "In progress", on the URL gh reports for the issue (not one built from the remote)."""
+        url = "https://ghe.example.com/o/r/issues/12"
+        self.scenario(issues=[dict(issue(), url=url)])
+        with open(self.scenario_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["calls"].insert(0, {"match": ["project"], "stdout": ""})
+        write(self.scenario_path, json.dumps(data))
+        p = self.ok("start", "12", "--json", env=self.env(HARNESS_PROJECT="acme-org/23"))
+        self.assertEqual(json.loads(p.stdout)["previous_status"], "ready")
+        projects = [c for c in self.gh_calls() if c[:1] == ["project"]]
+        self.assertEqual(len(projects), 1, projects)
+        argv = projects[0]
+        self.assertEqual(project_argv(argv), ("item-edit", ["23"], {"owner": "acme-org", "url": url, "field": "Status",
+                                                                     "value": "In progress"}))
+        edit = next(c for c in self.gh_calls() if c[:2] == ["issue", "edit"])
+        self.assertLess(self.gh_calls().index(edit), self.gh_calls().index(argv), "the label changes first")
 
 
 # =========================================================================== attempt
