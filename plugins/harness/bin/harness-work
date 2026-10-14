@@ -6,7 +6,7 @@ of a headless or background session per ready ticket, the run records, the budge
 Usage:
     harness-work start N [--venue interactive|headless|bg]
     harness-work attempt N tests|breaker|code|review|ci pass|fail [--tier sonnet|opus|fable]
-    harness-work dispatch [--max 3] [--venue headless|bg] [--dry-run]
+    harness-work dispatch [--max 3] [--venue headless|bg | --api] [--dry-run]
     harness-work runs [--sweep] [--all]
     harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
     harness-work worktrees [--stale DAYS]
@@ -33,12 +33,13 @@ run ended without a ready pull request, a draft counting as none, until 3 runs o
 a billing or auth run not counting) that has no live run, up to --max minus the live runs. When the branch has an
 open draft PR, the prompt and the start comment name it and say the worktree may hold uncommitted work from the
 previous run. Launched sessions get neither
-the dispatching session's identity nor ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN. headless:
-`claude -p "/harness:work N"` billed through {"apiKeyHelper": HARNESS_API_KEY_CMD} (the key itself never
-reaches a command line or the environment); bg, the default while the api budget is exhausted:
-`claude --bg -n "<repo> #N <title>" "/harness:work N"`. --venue headless while the api budget is exhausted (judged
-after the sweep, which can be what exhausts it) is refused, --dry-run too: nothing starts, the exit is non-zero and
-the message names the time and `harness-work budget reset api`.
+the dispatching session's identity nor ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN. bg, the
+default whatever the budgets say, runs on the subscription: `claude --bg -n "<repo> #N <title>" "/harness:work N"`.
+headless, only with --venue headless or its alias --api (--api with --venue bg is an error): `claude -p
+"/harness:work N"` billed to the API key through {"apiKeyHelper": HARNESS_API_KEY_CMD} (the key itself never
+reaches a command line or the environment). headless while the api budget is exhausted (judged after the sweep,
+which can be what exhausts it) is refused, --dry-run too: nothing starts, the exit is non-zero and the message
+names the time and `harness-work budget reset api`.
 
 runs --sweep: closes the records of runs that ended and classifies each (ok, error, billing, auth; a bg run by its
 `claude agents` state). A headless `ok` whose issue is OPEN and still status:in-progress with no ready pull request
@@ -1177,9 +1178,10 @@ def cmd_dispatch(repo, args):
     mine = [r for r in records if of_repo(r, repo)]
     api_until = exhausted_until(load_budgets()["api"])    # after the sweep, which can be what exhausts it
     if args.venue == "headless" and api_until:
-        raise Problem(f"the api budget is exhausted until {iso(api_until)}; nothing started. Use --venue bg, or "
-                      f"`harness-work budget reset api` once the api key works again")
-    venue = args.venue or ("bg" if api_until else "headless")
+        raise Problem(f"the api budget is exhausted until {iso(api_until)}; nothing started. Dispatch "
+                      f"without --api or --venue headless to run on the subscription, or `harness-work budget reset "
+                      f"api` once the api key works again")
+    venue = args.venue or "bg"
     live = live_runs(mine, agents)
     ready = board_json(repo, "ready", "--json")
     ready = [r for r in ready if isinstance(r, dict)] if isinstance(ready, list) else []
@@ -1430,7 +1432,10 @@ def parser():
                               help="start and launch a session per ready ticket")
     dispatch.add_argument("--max", type=int, default=3, help="live runs at most (default 3)")
     dispatch.add_argument("--venue", choices=VENUES,
-                          help="default: headless, or bg while the api budget is exhausted (headless is then refused)")
+                          help="default: bg (the subscription); headless bills the API key and is refused while the "
+                               "api budget is exhausted")
+    dispatch.add_argument("--api", action="store_true",
+                          help="alias for --venue headless: runs headless, billed to the API key")
     dispatch.add_argument("--dry-run", action="store_true", help="print the plan; start and launch nothing")
 
     runs = sub.add_parser("runs", parents=[with_json], help="dispatched runs, alive or ended in the last 24 h")
@@ -1461,7 +1466,12 @@ def parser():
 
 
 def main():
-    args = parser().parse_args()
+    ap = parser()
+    args = ap.parse_args()
+    if args.cmd == "dispatch" and args.api:
+        if args.venue == "bg":
+            ap.error("dispatch: --api is --venue headless and cannot go with --venue bg")
+        args.venue = "headless"
     try:
         if args.cmd == "runs":
             cmd_runs(args)
