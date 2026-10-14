@@ -29,13 +29,16 @@ runs first, before anything refreshes the ticket cache. --json prints previous_s
 answers (the owner's replies; [] unless the ticket was needs-input) and waiting (needs-input with no answer).
 
 dispatch: sweeps the runs, then starts and launches each ready ticket (and each in-progress ticket whose last
-run ended without a ready pull request, a draft counting as none, until 3 runs of it ended in the last 7 days)
-that has no live run, up to --max minus the live runs. When the branch has an open draft PR, the prompt and the start
-comment name it and say the worktree may hold uncommitted work from the previous run. Launched sessions get neither
+run ended without a ready pull request, a draft counting as none, until 3 runs of it ended in the last 7 days,
+a billing or auth run not counting) that has no live run, up to --max minus the live runs. When the branch has an
+open draft PR, the prompt and the start comment name it and say the worktree may hold uncommitted work from the
+previous run. Launched sessions get neither
 the dispatching session's identity nor ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN. headless:
 `claude -p "/harness:work N"` billed through {"apiKeyHelper": HARNESS_API_KEY_CMD} (the key itself never
 reaches a command line or the environment); bg, the default while the api budget is exhausted:
-`claude --bg -n "<repo> #N <title>" "/harness:work N"`.
+`claude --bg -n "<repo> #N <title>" "/harness:work N"`. --venue headless while the api budget is exhausted (judged
+after the sweep, which can be what exhausts it) is refused, --dry-run too: nothing starts, the exit is non-zero and
+the message names the time and `harness-work budget reset api`.
 
 runs --sweep: closes the records of runs that ended and classifies each (ok, error, billing, auth; a bg run by its
 `claude agents` state). A headless `ok` whose issue is OPEN and still status:in-progress with no ready pull request
@@ -76,6 +79,7 @@ TAIL_BYTES = 256 * 1024
 RECENT = dt.timedelta(hours=24)
 REDISPATCH_WINDOW = dt.timedelta(days=7)   # an ended run older than this is not picked up again
 REDISPATCH_MAX = 3            # ended runs of a ticket within the window after which dispatch skips it
+UNCOUNTED = ("billing", "auth")   # outcomes of runs that do not count toward REDISPATCH_MAX: the budget's fault
 EXHAUST_HOURS = 24.0
 REASON_MAX = 200
 DIRTY_SHOWN = 10
@@ -1067,9 +1071,10 @@ def ask_without_pr(repo, n, branch):
 
 def redispatch_candidates(repo, records, live, *, capped_only=False):
     """In-progress tickets whose last run ended (within the window) without a ready pull request: dispatched again,
-    unless REDISPATCH_MAX runs of the ticket ended within the window. (candidates, skipped, the id of the record
-    each skipped ticket's cap rests on: its latest started). `capped_only` skips the gh check for tickets under
-    the cap, whose answer the caller would discard."""
+    unless REDISPATCH_MAX runs of the ticket ended within the window, billing and auth runs not counting (the
+    budget's failure, not the ticket's). (candidates, skipped, the id of the record each skipped ticket's cap rests
+    on: its latest started). `capped_only` skips the gh check for tickets under the cap, whose answer the caller
+    would discard."""
     cutoff = now() - REDISPATCH_WINDOW
     latest, ended_runs = {}, {}
     for record in records:
@@ -1079,7 +1084,7 @@ def redispatch_candidates(repo, records, live, *, capped_only=False):
         if n not in latest or str(record.get("started_at")) > str(latest[n].get("started_at")):
             latest[n] = record
         ended = parse_iso(record.get("ended_at"))
-        if ended is not None and ended >= cutoff:
+        if ended is not None and ended >= cutoff and record.get("outcome") not in UNCOUNTED:
             ended_runs[n] = ended_runs.get(n, 0) + 1
     out, skipped, capped_ids = [], [], {}
     for n, record in sorted(latest.items()):
@@ -1170,10 +1175,11 @@ def cmd_dispatch(repo, args):
     records = load_runs()
     sweep(records, agents)
     mine = [r for r in records if of_repo(r, repo)]
-    api_until = exhausted_until(load_budgets()["api"])
-    venue = args.venue or ("bg" if api_until else "headless")
+    api_until = exhausted_until(load_budgets()["api"])    # after the sweep, which can be what exhausts it
     if args.venue == "headless" and api_until:
-        warn(f"the api budget is exhausted until {iso(api_until)}; launching headless anyway (--venue headless)")
+        raise Problem(f"the api budget is exhausted until {iso(api_until)}; nothing started. Use --venue bg, or "
+                      f"`harness-work budget reset api` once the api key works again")
+    venue = args.venue or ("bg" if api_until else "headless")
     live = live_runs(mine, agents)
     ready = board_json(repo, "ready", "--json")
     ready = [r for r in ready if isinstance(r, dict)] if isinstance(ready, list) else []
@@ -1424,7 +1430,7 @@ def parser():
                               help="start and launch a session per ready ticket")
     dispatch.add_argument("--max", type=int, default=3, help="live runs at most (default 3)")
     dispatch.add_argument("--venue", choices=VENUES,
-                          help="default: headless, or bg while the api budget is exhausted")
+                          help="default: headless, or bg while the api budget is exhausted (headless is then refused)")
     dispatch.add_argument("--dry-run", action="store_true", help="print the plan; start and launch nothing")
 
     runs = sub.add_parser("runs", parents=[with_json], help="dispatched runs, alive or ended in the last 24 h")
