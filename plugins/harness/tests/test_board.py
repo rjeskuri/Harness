@@ -1440,8 +1440,9 @@ UNSET = "<unset>"     # an item with no value for the field: gh item-list leaves
 ABSENT = "<absent>"   # an issue that is not an item on the board
 
 # One row per open issue: (type, status label or None, priority:high?, board Status, board Priority). Expected
-# writes, from the ticket: a missing issue is added, then Status is set from its status label (none without a
-# label) and Priority to High (priority:high) or Normal; an item is edited only in the fields that disagree.
+# writes, from the ticket and the #74 review: a missing issue is added, then Status is set from its status label
+# (none without a label) and Priority to High only with priority:high. An item is edited only in the fields that
+# disagree; an unset board Priority counts as Normal, so only High against Normal (either way) is Priority drift.
 SYNC_ROWS = [
     ("task", "ready", True, "Ready", "High"),                  # in agreement
     ("task", "in-progress", False, "In progress", "Normal"),   # in agreement
@@ -1452,17 +1453,17 @@ SYNC_ROWS = [
     ("task", "in-progress", True, "In progress", "Normal"),    # Priority drift to High
     ("task", "in-review", False, "In review", "High"),         # Priority drift to Normal
     ("task", "needs-input", True, "Needs input", UNSET),       # Priority unset, wants High
-    ("refactor", "blocked", False, "Blocked", UNSET),          # Priority unset, wants Normal
-    ("task", "ready", False, ABSENT, None),                    # missing: add, Ready, Normal
+    ("refactor", "blocked", False, "Blocked", UNSET),          # Priority unset counts as Normal: no write
+    ("task", "ready", False, ABSENT, None),                    # missing: add, Ready
     ("task", "in-review", True, ABSENT, None),                 # missing: add, In review, High
-    ("task", None, False, ABSENT, None),                       # missing, no status label: add, Normal
+    ("task", None, False, ABSENT, None),                       # missing, no status label: add only
     ("task", None, False, "Ready", "Normal"),                  # no status label: Status left alone
     ("task", None, True, UNSET, "Normal"),                     # no status label: Priority only
     ("epic", "blocked", True, "Blocked", "High"),              # in agreement
-    ("task", "needs-input", False, ABSENT, None),              # missing: add, Needs input, Normal
+    ("task", "needs-input", False, ABSENT, None),              # missing: add, Needs input
     ("task", "in-progress", True, "In review", "Normal"),      # both drift
 ]
-SYNC_ROWS_WRITES, SYNC_ROWS_ADDS = 23, 4    # counted by hand from the comments above
+SYNC_ROWS_WRITES, SYNC_ROWS_ADDS = 19, 4    # counted by hand from the comments above
 
 
 def sync_issue(slug, number, kind, status, high, state="OPEN"):
@@ -1515,7 +1516,8 @@ def expected_writes(project, issues, items):
             writes.append(item_add(project, it["url"]))
         if status and (item is None or item.get("status") != status):
             writes.append(item_edit(project, it["url"], "Status", status))
-        if item is None or item.get("priority") != priority:
+        board_priority = "Normal" if item is None else (item.get("priority") or "Normal")   # unset is Normal
+        if board_priority != priority:
             writes.append(item_edit(project, it["url"], "Priority", priority))
     return writes
 
@@ -1707,10 +1709,11 @@ class ProjectSync(BoardTest):
                                      f"closed #{closed} is not reported\n{p.stdout}")
 
     def test_items_in_agreement_make_no_write_and_no_change_line(self):
-        agree = [SYNC_ROWS[i] for i in (0, 1, 13, 15)] + [("bug", "needs-input", False, "Needs input", "Normal")]
-        for project, slug, numbers in (("rjeskuri/7", "rjeskuri/alpha", [12, 13, 14, 15, 16]),
-                                       ("acme-org/23", "acme-org/widgets", [205, 3, 77, 41, 9]),
-                                       ("someone/1", "someone/tools", [8, 6, 4, 2, 1])):
+        agree = [SYNC_ROWS[i] for i in (0, 1, 9, 13, 15)] + [("bug", "needs-input", False, "Needs input", "Normal"),
+                                                              ("task", None, False, UNSET, UNSET)]
+        for project, slug, numbers in (("rjeskuri/7", "rjeskuri/alpha", [12, 13, 14, 15, 16, 17, 18]),
+                                       ("acme-org/23", "acme-org/widgets", [205, 3, 77, 41, 9, 120, 64]),
+                                       ("someone/1", "someone/tools", [8, 6, 4, 2, 1, 30, 11])):
             with self.subTest(project=project):
                 issues, items = rows_world(slug, numbers, agree)
                 closed, closed_items = self.closed_issues(slug, 500)
@@ -1766,11 +1769,12 @@ class ProjectSync(BoardTest):
                 self.assertIn(fields[0][1], lines[0])
 
     def test_a_missing_issue_is_added_then_its_fields_set(self):
-        cases = [("rjeskuri/7", "rjeskuri/alpha", 14, ("task", "ready", False), [("Status", "Ready"),
-                                                                                  ("Priority", "Normal")]),
+        cases = [("rjeskuri/7", "rjeskuri/alpha", 14, ("task", "ready", False), [("Status", "Ready")]),
                  ("acme-org/23", "acme-org/widgets", 207, ("epic", "in-progress", True),
                   [("Status", "In progress"), ("Priority", "High")]),
-                 ("someone/1", "someone/tools", 2, ("task", None, True), [("Priority", "High")])]
+                 ("someone/1", "someone/tools", 2, ("task", None, True), [("Priority", "High")]),
+                 ("rjeskuri/12", "rjeskuri/beta", 63, ("chore", None, False), []),
+                 ("acme-org/4", "acme-org/gears", 9, ("bug", "blocked", False), [("Status", "Blocked")])]
         for project, slug, number, (kind, status, high), fields in cases:
             with self.subTest(project=project, number=number):
                 it = sync_issue(slug, number, kind, status, high)
@@ -1863,9 +1867,8 @@ class ProjectSync(BoardTest):
                 self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
                 rest = [w for w in expected if w[2]["url"] != bad_add]
-                self.assertWritesEqual(rest + [item_add(project, bad_add)] +
-                                       [w for w in self.writes() if w[0] == "item-edit" and w[2]["url"] == bad_add],
-                                       "every other write is still attempted")
+                self.assertWritesEqual(rest + [item_add(project, bad_add)],
+                                       "every other write is still attempted; a failed add gets no edit")
                 for url in bad_edits + [bad_add]:
                     self.assertTrue(self.change_lines(p.stderr, url), f"{url} is named on stderr\n{p.stderr}")
 
@@ -1962,6 +1965,95 @@ class ProjectSync(BoardTest):
                 warnings = [line for line in p.stderr.splitlines() if line.strip()]
                 self.assertEqual(len(warnings), 1, p.stderr)
                 self.assertIn(str(total), warnings[0])
+
+    # ------------------------------------------------------------------ the #74 review
+    def test_an_unset_priority_counts_as_normal(self):
+        """Only High against Normal is Priority drift; an unset board Priority is Normal. Hand-written cases."""
+        for project, slug, number, high, board_priority, fields in (
+                ("rjeskuri/7", "rjeskuri/alpha", 12, False, UNSET, []),
+                ("acme-org/23", "acme-org/widgets", 230, False, UNSET, []),
+                ("someone/1", "someone/tools", 5, True, UNSET, [("Priority", "High")]),
+                ("rjeskuri/12", "rjeskuri/beta", 77, True, "Normal", [("Priority", "High")]),
+                ("acme-org/4", "acme-org/gears", 3, False, "High", [("Priority", "Normal")]),
+                ("someone/30", "someone/stuff", 41, False, "Normal", []),
+                ("rjeskuri/7", "rjeskuri/alpha", 99, True, "High", [])):
+            with self.subTest(project=project, number=number, high=high, board=board_priority):
+                issues, items = rows_world(slug, [number], [("task", "in-review", high, "In review", board_priority)])
+                self.add_repo("main", self.repo, slug, issues)
+                self.build(items)
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                url = f"https://github.com/{slug}/issues/{number}"
+                self.assertEqual(self.writes(), [item_edit(project, url, f, v) for f, v in fields])
+                self.assertEqual(len(self.change_lines(p.stdout, url)), len(fields), p.stdout)
+
+    def test_all_projects_warns_once_per_unusable_registered_path_and_still_syncs_the_rest(self):
+        project = "acme-org/23"
+        alpha, widgets = self.new_repo("alpha"), self.new_repo("widgets")
+        missing = os.path.join(self.tmp, "gone-away")
+        plain = self.mk("not-a-repo")
+        no_remote = self.mk("no-remote")
+        subprocess.run([GIT, "-C", no_remote, "-c", "init.defaultBranch=main", "init", "-q"], env=self.env(), check=True)
+        a_issues, a_items = rows_world("rjeskuri/alpha", [5, 6, 7, 8], [SYNC_ROWS[2], SYNC_ROWS[6], SYNC_ROWS[10],
+                                                                       SYNC_ROWS[0]])
+        w_issues, w_items = rows_world("acme-org/widgets", [5, 6, 7], [SYNC_ROWS[7], SYNC_ROWS[17], SYNC_ROWS[1]])
+        self.add_repo("alpha", alpha, "rjeskuri/alpha", a_issues)
+        self.add_repo("widgets", widgets, "acme-org/widgets", w_issues)
+        items = a_items + w_items
+        expected = expected_writes(project, a_issues, items) + expected_writes(project, w_issues, items)
+        for order in ([missing, alpha, plain, no_remote, widgets], [plain, widgets, no_remote, alpha, missing]):
+            with self.subTest(order=[os.path.basename(p) for p in order]):
+                self.registry(order)
+                self.build(items)
+                p = self.sync("--all-projects", HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertWritesEqual(expected, "the usable repositories are still synced")
+                for bad in (missing, plain, no_remote):
+                    named = [line for line in p.stderr.splitlines() if bad in line]
+                    self.assertEqual(len(named), 1, f"one warning naming {bad}\n{p.stderr}")
+
+    def test_an_issue_list_at_its_limit_of_1000_warns_and_exits_1(self):
+        project, slug = "rjeskuri/7", "rjeskuri/alpha"
+        for count, code in ((1000, 1), (999, 0)):
+            with self.subTest(count=count):
+                rows = [("task", "ready", False, "Ready", "Normal")] * count
+                issues, items = rows_world(slug, list(range(1, count + 1)), rows)
+                self.add_repo("main", self.repo, slug, issues)
+                self.build(items)
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, code, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(self.writes(), [])
+                if code:
+                    self.assertIn("1000", p.stderr)
+                else:
+                    self.assertEqual(p.stderr.strip(), "")
+
+    def test_all_projects_with_no_registered_project_says_so_and_exits_0(self):
+        registry = os.path.join(self.home, ".claude", "harness", "projects.json")
+        for what in ("empty registry", "no registry file"):
+            with self.subTest(what=what):
+                if what == "empty registry":
+                    self.registry([])
+                elif os.path.exists(registry):
+                    os.unlink(registry)
+                self.build([board_item("rjeskuri/alpha", 4, "Ready", "Normal")])
+                p = self.sync("--all-projects", HARNESS_PROJECT="rjeskuri/7")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("no registered projects", p.stdout.lower())
+                self.assertEqual(self.writes(), [])
+
+    def test_repo_and_all_projects_together_is_an_error(self):
+        self.add_repo("main", self.repo, "rjeskuri/alpha", [sync_issue("rjeskuri/alpha", 3, "task", "ready", False)])
+        self.registry([self.repo])
+        self.build([])
+        for argv in (["--all-projects", "--repo", self.repo], ["--repo", self.repo, "--all-projects", "--dry-run"]):
+            with self.subTest(argv=argv):
+                p = self.sync(*argv, HARNESS_PROJECT="rjeskuri/7")
+                self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(self.writes(), [])
 
 
 class ProjectCheck(BoardTest):
