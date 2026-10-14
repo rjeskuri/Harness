@@ -635,6 +635,162 @@ class Dispatch(WorkTest):
         self.assertEqual(len(self.run_records()), 3)
         self.assertFalse([c for c in self.gh_calls() if c[:2] in (["issue", "edit"], ["issue", "comment"])])
 
+    # ---- ticket #50: an exhausted api budget never launches headless, whatever --venue says
+    def api_until(self):
+        return self.read_json(self.budgets_path())["api"]["exhausted_until"]
+
+    def assertRefusedHeadless(self, p, until):
+        """Exit non-zero, the message names when the budget is exhausted until and how to launch headless again."""
+        out = p.stdout + p.stderr
+        self.assertNotEqual(p.returncode, 0, out)
+        self.assertIn("harness-work budget reset api", out)
+        self.assertIn(until, out)
+        self.assertNotIn("would start", out)
+        self.assertNotIn("launching headless anyway", out)
+
+    def assertNothingStarted(self, records_before):
+        self.assertEqual(self.claude_calls(), [])
+        self.assertFalse([c for c in self.gh_calls() if c[:2] in (["issue", "edit"], ["issue", "comment"])],
+                         self.gh_calls())
+        self.assertEqual(sorted(r["id"] for r in self.run_records()), sorted(records_before))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+
+    def test_venue_headless_is_refused_while_the_api_budget_is_exhausted(self):
+        # #12 is ready on the board; #15 is in progress after a billing run (the #43 case): either would be launched.
+        ended = self.write_run(15, pid=self.dead_pid(), started_at=iso_ago(hours=2), ended_at=iso_ago(hours=1),
+                               outcome="billing")
+        in_progress = issue(15, labels=IN_PROGRESS, title="Billing victim")
+        for hours, reason in ((1, "billing: credit balance is too low"), (30, "auth: invalid api key")):
+            with self.subTest(hours=hours):
+                self.write_budget("api", hours, reason)
+                until = self.api_until()
+                self.scenario(issues=[issue(), in_progress], ready=[ready_row(12)])
+                for path in (self.gh_log, self.claude_log):
+                    if os.path.exists(path):
+                        os.unlink(path)
+
+                p = self.work("dispatch", "--venue", "headless", env=self.env(**CREDENTIALS))
+                self.assertRefusedHeadless(p, until)
+                self.assertNotIn("headless on", p.stdout)
+                self.assertNothingStarted([ended["id"]])
+
+                p = self.work("dispatch", "--venue", "headless", "--max", "5", "--dry-run")
+                self.assertRefusedHeadless(p, until)                # the dry run says the same and plans nothing
+                self.assertNotIn("launch headless", p.stdout)
+                self.assertNothingStarted([ended["id"]])
+
+                p = self.work("dispatch", "--venue", "headless", "--dry-run", "--json")
+                self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNothingStarted([ended["id"]])
+                self.assertEqual(self.read_json(self.budgets_path())["api"]["exhausted_until"], until)
+
+        # Without --venue the same board launches both on bg, as before: the refusal changed nothing.
+        p = self.ok("dispatch", env=self.env(**CREDENTIALS))
+        self.assertRegex(p.stdout, rf"(?m)^#12 bg on {re.escape(BRANCH)} \(id abc123\)$")
+        self.assertRegex(p.stdout, r"(?m)^#15 bg on t/15-\S+ \(id abc123\)$")
+        calls = self.claude_calls()
+        self.assertEqual(sorted(c["argv"][-1] for c in calls), ["/harness:work 12", "/harness:work 15"])
+        for call in calls:
+            self.assertEqual(call["argv"][:2], ["--bg", "-n"])
+            self.assertNotIn("-p", call["argv"])
+            for name in CREDENTIALS:
+                self.assertNotIn(name, call["env"])
+        self.assertEqual(sorted(r["venue"] for r in self.run_records() if not r.get("ended_at")), ["bg", "bg"])
+
+    def unswept_failure(self, result):
+        """The overnight #43 case from a clean slate: no budgets file; #15 in progress with a headless run whose
+        process is gone, not yet swept, its log ending in `result`; #12 ready on the board. Returns the record."""
+        shutil.rmtree(self.runs_dir(), True)
+        for path in (self.budgets_path(), self.gh_log, self.claude_log):
+            if os.path.exists(path):
+                os.unlink(path)
+        record = self.write_run(15, pid=self.dead_pid(), started_at=iso_ago(minutes=20))
+        write(record["log"], CONNECTORS_WARNING + "\n" + json.dumps(result) + "\n")
+        self.scenario(issues=[issue(), issue(15, labels=IN_PROGRESS, title="Billing victim")],
+                      ready=[ready_row(12)])
+        return record
+
+    def test_venue_headless_is_refused_when_dispatchs_own_sweep_exhausts_the_api_budget(self):
+        # The budget is judged after dispatch's sweep: the sweep finds the billing (or auth) failure, marks the api
+        # budget, and --venue headless is then refused, as it must have been at 23:55:51Z on 2026-10-13.
+        low = dict(API_401, api_error_status=400, result="Credit balance is too low")
+        cases = [("billing", low, ()), ("auth", API_401, ()), ("billing", low, ("--dry-run",)),
+                 ("auth", API_401_HELPER, ("--dry-run",))]
+        for outcome, result, extra in cases:
+            with self.subTest(outcome=outcome, extra=extra):
+                record = self.unswept_failure(result)
+                p = self.work("dispatch", "--venue", "headless", "--max", "5", *extra, env=self.env(**CREDENTIALS))
+                self.assertTrue(os.path.exists(self.budgets_path()), p.stdout + p.stderr)
+                api = self.read_json(self.budgets_path())["api"]
+                self.iso_close_to(api["exhausted_until"], dt.timedelta(hours=24))
+                self.assertTrue(api["reason"].startswith(outcome + ": "), api["reason"])
+                self.assertRefusedHeadless(p, api["exhausted_until"])
+                self.assertNotIn("headless on", p.stdout)
+                self.assertNotIn("launch headless", p.stdout)
+                self.assertNothingStarted([record["id"]])
+                [swept] = self.run_records()
+                self.assertEqual(swept["outcome"], outcome)
+                self.assertTrue(swept["ended_at"])
+
+        # The same board without --venue: the sweep exhausts the budget and both tickets go to bg, as before.
+        record = self.unswept_failure(low)
+        p = self.ok("dispatch", env=self.env(**CREDENTIALS))
+        self.assertRegex(p.stdout, rf"(?m)^#12 bg on {re.escape(BRANCH)} \(id abc123\)$")
+        self.assertRegex(p.stdout, r"(?m)^#15 bg on t/15-\S+ \(id abc123\)$")
+        calls = self.claude_calls()
+        self.assertEqual(sorted(c["argv"][-1] for c in calls), ["/harness:work 12", "/harness:work 15"])
+        for call in calls:
+            self.assertEqual(call["argv"][:2], ["--bg", "-n"])
+            self.assertNotIn("-p", call["argv"])
+        self.assertEqual({r["id"]: r["outcome"] for r in self.run_records() if r["id"] == record["id"]},
+                         {record["id"]: "billing"})
+        self.assertEqual(sorted(r["venue"] for r in self.run_records() if not r.get("ended_at")), ["bg", "bg"])
+
+    def test_venue_headless_is_refused_while_the_api_budget_is_exhausted_even_with_nothing_to_launch(self):
+        self.write_budget("api", 5, "auth: invalid api key")
+        until = self.api_until()
+        self.scenario()                                                 # no ready ticket, no run on record
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra):
+                p = self.work("dispatch", "--venue", "headless", *extra)
+                self.assertRefusedHeadless(p, until)
+                self.assertNothingStarted([])
+        p = self.ok("dispatch", "--venue", "bg")                        # bg is still fine: nothing to do
+        self.assertIn("No ready tickets.", p.stdout)
+        self.assertEqual(self.claude_calls(), [])
+
+    def test_venue_headless_launches_headless_while_the_api_budget_is_available(self):
+        # Four ways the api budget is not exhausted: no budgets file, its time has passed, only the cloud budget is
+        # exhausted, and `harness-work budget reset api` after an exhaustion (the refusal's advice).
+        def no_file():
+            if os.path.exists(self.budgets_path()):
+                os.unlink(self.budgets_path())
+
+        def reset():
+            self.write_budget("api", 6, "billing: credit balance is too low")
+            self.ok("budget", "reset", "api")
+
+        setups = [(12, "Add the board tool", no_file), (13, "Second ticket", lambda: self.write_budget("api", -2)),
+                  (14, "Third ticket", lambda: self.write_budget("cloud", 5)), (16, "Fourth ticket", reset)]
+        for n, title, setup in setups:
+            with self.subTest(ticket=n):
+                shutil.rmtree(self.runs_dir(), True)
+                if os.path.exists(self.claude_log):
+                    os.unlink(self.claude_log)
+                setup()
+                self.scenario(issues=[issue(n, title=title)], ready=[ready_row(n, title)])
+                p = self.ok("dispatch", "--venue", "headless")
+                self.assertRegex(p.stdout, rf"(?m)^#{n} headless on t/{n}-\S+ \(pid \d+, log ")
+                self.assertNotIn("budget reset", p.stdout + p.stderr)
+                [record] = self.run_records()
+                self.assertEqual((record["ticket"], record["venue"]), (n, "headless"))
+                self.assertTrue(wait_for(lambda: len(self.claude_calls()) == 1))
+                argv = self.claude_calls()[0]["argv"]
+                self.assertEqual(argv[:7], ["-p", f"/harness:work {n}", "--permission-mode", "auto",
+                                            "--output-format", "json", "--settings"])
+                self.assertEqual(json.loads(argv[7]), {"apiKeyHelper": DEFAULT_KEY_CMD})
+                self.assertTrue(wait_for(lambda: pid_gone(record["pid"])))
+
 
 IN_PROGRESS = ("task", "status:in-progress", "size:S", "risk:low")
 
@@ -659,9 +815,10 @@ class RedispatchCap(WorkTest):
                 f"{last['ended_at']}); run it in this session with /harness:work {ticket}, or wait for the window")
 
     def capped_pair(self):
-        """#12: three ended runs, the last ok; #15: four, the last billing. Both in progress without a PR."""
+        """#12: three ended runs, the last ok; #15: four, the last early. Both in progress without a PR. (No billing
+        or auth run here: those do not count toward the cap, ticket #50, so the counts 3 and 4 are unambiguous.)"""
         first = self.ended(12, ["error", "error", "ok"], [30, 20, 10])
-        second = self.ended(15, ["error", "ok", "error", "billing"], [60, 50, 40, 5])
+        second = self.ended(15, ["error", "ok", "error", "early"], [60, 50, 40, 5])
         self.scenario(issues=[issue(12, labels=IN_PROGRESS), issue(15, labels=IN_PROGRESS, title="Second")])
         return first[-1], second[-1]
 
@@ -697,7 +854,7 @@ class RedispatchCap(WorkTest):
         self.assertEqual(self.claude_calls(), [])
 
     def test_the_skip_text_follows_the_last_run_not_the_first(self):
-        records = self.ended(12, ["billing", "error", "auth"], [40, 30, 20])
+        records = self.ended(12, ["early", "error", "ok"], [40, 30, 20])      # billing/auth would not count (#50)
         self.scenario(issues=[issue(12, labels=IN_PROGRESS)])
         p = self.ok("dispatch", "--dry-run")
         self.assertIn("skip #12: " + self.skip_why(12, 3, records[-1]), p.stdout.splitlines())
@@ -872,7 +1029,7 @@ class RedispatchCap(WorkTest):
         # third STARTED newest. Dispatch reads the record that started last (its outcome is "last: ..."); so does `runs`.
         self.run_at(12, "error", 50, 40)
         self.run_at(12, "ok", 45, 2)                                      # newest ended_at
-        newest_started = self.run_at(12, "billing", 30, 20)               # newest started_at
+        newest_started = self.run_at(12, "early", 30, 20)                 # newest started_at
         self.scenario(issues=[issue(12, labels=IN_PROGRESS)])
         self.assertEqual(self.marked(), {12: [newest_started["id"]]})
         p = self.ok("dispatch", "--dry-run")
@@ -894,8 +1051,8 @@ class RedispatchCap(WorkTest):
     def test_runs_and_dispatch_agree_on_which_tickets_are_capped(self):
         other = self.sibling()
         cap12 = self.three(12)
-        cap16 = [self.run_at(16, o, s, e) for o, s, e in (("error", 100, 90), ("error", 80, 70),
-                                                          ("billing", 60, 50), ("auth", 11, 5))]
+        cap16 = [self.run_at(16, o, s, e) for o, s, e in (("error", 100, 90), ("billing", 80, 70),
+                                                          ("early", 60, 50), ("auth", 30, 25), ("error", 11, 5))]
         self.three(13)                                                          # has a pull request
         self.three(14)                                                          # and a live run
         self.live_run_of(14)
@@ -1016,6 +1173,152 @@ class RedispatchCap(WorkTest):
         self.assertEqual(self.gh_calls(), [])
         # the same records, from inside the repository, are marked: the difference is the cwd alone
         self.assertEqual(self.marked(), {12: [records[-1]["id"]]})
+
+    # ---- ticket #50: billing and auth runs are the budget's fault, not the ticket's: they do not count toward the cap
+    def cap_lines(self, text):
+        """{ticket: its skip line} for the cap skips in a dispatch's text output."""
+        return {int(m.group(1)): line for line in text.splitlines()
+                for m in [re.match(r"skip #(\d+): \d+ runs ended without a ready pull request", line)] if m}
+
+    def assertCapSkip(self, line, n, last):
+        self.assertTrue(line.startswith(f"skip #{n}: "), line)
+        self.assertTrue(line.endswith(f"in 7 days (last: {last['outcome']} at {last['ended_at']}); run it in this "
+                                      f"session with /harness:work {n}, or wait for the window"), line)
+
+    def assertRelaunchedOnBg(self, failing):
+        """`failing` holds, per ticket, outcomes that are all billing or auth. With the api budget exhausted each
+        ticket is redispatched on bg with no cap skip and no `capped` mark; #15 (error, early, ok) is the capped
+        control in the same dispatch."""
+        self.write_budget("api", 12, "billing: credit balance is too low")
+        titles = {n: f"Budget victim {n}" for n in failing}
+        last = {}
+        for n, outcomes in failing.items():
+            hours = [10 * (len(outcomes) - i) + n % 7 for i in range(len(outcomes))]
+            last[n] = self.ended(n, outcomes, hours)[-1]
+        control = self.ended(15, ["error", "early", "ok"], [30, 20, 10])
+        self.scenario(issues=[issue(n, labels=IN_PROGRESS, title=titles[n]) for n in failing]
+                      + [issue(15, labels=IN_PROGRESS, title="Control")])
+
+        self.assertEqual(self.marked(), {15: [control[-1]["id"]]})      # `runs` marks only the control
+
+        p = self.ok("dispatch", "--dry-run", "--max", "9")
+        self.assertIn("Dry run: venue bg,", p.stdout)
+        for n in failing:
+            self.assertIn(f"would start #{n} {titles[n]} (again after {last[n]['outcome']}) and launch bg",
+                          p.stdout.splitlines())
+            self.assertNotIn(f"skip #{n}:", p.stdout)
+        self.assertEqual(sorted(self.cap_lines(p.stdout)), [15])
+        self.assertCapSkip(self.cap_lines(p.stdout)[15], 15, control[-1])
+        data = self.ok_json("dispatch", "--dry-run", "--max", "9", "--json")
+        self.assertEqual(data["venue"], "bg")
+        self.assertEqual([row["number"] for row in data["plan"]], sorted(failing))
+        self.assertEqual([s["number"] for s in data["skipped"]], [15])
+        self.assertEqual(self.claude_calls(), [])
+
+        p = self.ok("dispatch", "--max", "9", env=self.env(**CREDENTIALS))       # for real
+        self.assertEqual(sorted(self.cap_lines(p.stdout)), [15])
+        for n in failing:
+            self.assertRegex(p.stdout, rf"(?m)^#{n} bg on t/{n}-\S+ \(id abc123\)$")
+            self.assertNotIn(f"skip #{n}:", p.stdout)
+        calls = self.claude_calls()
+        self.assertEqual(sorted(c["argv"][-1] for c in calls), sorted(f"/harness:work {n}" for n in failing))
+        for call in calls:
+            n = int(call["argv"][-1].split()[-1])
+            self.assertEqual(call["argv"], ["--bg", "-n", f"proj #{n} {titles[n]}", "--permission-mode", "auto",
+                                            f"/harness:work {n}"])
+            for name in CREDENTIALS:
+                self.assertNotIn(name, call["env"])
+        fresh = [r for r in self.run_records() if not r.get("ended_at")]
+        self.assertEqual(sorted((r["ticket"], r["venue"], r.get("bg_id")) for r in fresh),
+                         [(n, "bg", "abc123") for n in sorted(failing)])
+
+    def test_billing_runs_do_not_cap_a_ticket_and_it_is_redispatched_on_bg(self):
+        self.assertRelaunchedOnBg({12: ["billing", "billing", "billing"],
+                                   13: ["billing", "billing", "billing", "billing", "billing"]})
+
+    def test_auth_runs_do_not_cap_a_ticket_and_it_is_redispatched_on_bg(self):
+        self.assertRelaunchedOnBg({12: ["auth", "auth", "auth"],
+                                   14: ["auth", "billing", "billing", "auth"],
+                                   16: ["billing", "auth", "auth", "billing", "auth", "billing"]})
+
+    def test_only_runs_other_than_billing_and_auth_count_toward_the_cap(self):
+        # Only billing and auth are left out of the count: every other outcome counts, the bg ones (`stopped`,
+        # `unknown`) and any state kept as is (`timeout`) included, not just ok, error and early.
+        under = {12: ["early", "billing", "early", "billing"],          # fewer than three count: redispatched
+                 13: ["billing", "billing", "early", "early"],
+                 14: ["auth", "early", "billing", "error", "auth"],
+                 17: ["error", "auth", "billing", "auth", "billing", "ok"],
+                 19: ["early", "early"],
+                 22: ["stopped", "auth", "billing"],
+                 23: ["timeout", "billing", "unknown", "auth"]}
+        capped = {16: ["early", "early", "early", "billing"],           # three or more count: capped
+                  18: ["billing", "early", "error", "early"],
+                  20: ["early", "auth", "error", "ok"],
+                  21: ["auth", "error", "billing", "early", "billing", "ok", "auth"],
+                  24: ["stopped", "unknown", "early", "billing"],
+                  25: ["timeout", "billing", "timeout", "stopped", "auth", "early"],
+                  26: ["unknown", "unknown", "auth", "unknown"]}
+        counted = {16: 3, 18: 3, 20: 3, 21: 3, 24: 3, 25: 4, 26: 3}     # the runs that count, as the skip says
+        last = {}
+        for n, outcomes in sorted({**under, **capped}.items()):
+            hours = [8 * (len(outcomes) - i) + n % 5 for i in range(len(outcomes))]
+            last[n] = self.ended(n, outcomes, hours)[-1]
+        self.scenario(issues=[issue(n, labels=IN_PROGRESS, title=f"Mixed {n}") for n in sorted(last)])
+
+        self.assertEqual(self.marked(), {n: [last[n]["id"]] for n in capped})
+
+        p = self.ok("dispatch", "--dry-run", "--max", "9")
+        self.assertIn("Dry run: venue headless,", p.stdout)
+        for n in under:
+            self.assertIn(f"would start #{n} Mixed {n} (again after {last[n]['outcome']}) and launch headless",
+                          p.stdout.splitlines())
+        lines = self.cap_lines(p.stdout)
+        self.assertEqual(sorted(lines), sorted(capped))
+        for n in capped:
+            self.assertCapSkip(lines[n], n, last[n])
+            self.assertEqual(lines[n], f"skip #{n}: " + self.skip_why(n, counted[n], last[n]))
+            self.assertNotIn(f"would start #{n} ", p.stdout)
+        data = self.ok_json("dispatch", "--dry-run", "--max", "9", "--json")
+        self.assertEqual([row["number"] for row in data["plan"]], sorted(under))
+        self.assertEqual(sorted(s["number"] for s in data["skipped"] if "advice" in s), sorted(capped))
+        self.assertEqual({s["number"]: s for s in data["skipped"]},
+                         {n: {"number": n, "why": self.skip_why(n, counted[n], last[n]), "runs": counted[n],
+                              "window_days": 7, "advice": f"/harness:work {n}"} for n in capped})
+        self.assertEqual(self.claude_calls(), [])
+
+    def test_an_ended_run_without_an_outcome_counts_toward_the_cap(self):
+        # Only billing and auth are left out: an ended record whose outcome is null still counts.
+        none3 = self.ended(12, [None, None, None], [30, 20, 10])
+        mixed = self.ended(13, [None, "early", "stopped", "billing"], [35, 25, 15, 5])
+        self.ended(14, [None, "billing", None, "auth"], [36, 26, 16, 6])            # two count: redispatched
+        self.scenario(issues=[issue(n, labels=IN_PROGRESS, title=f"Null {n}") for n in (12, 13, 14)])
+        self.assertEqual(self.marked(), {12: [none3[-1]["id"]], 13: [mixed[-1]["id"]]})
+        capped, data = self.skipped_by_cap()
+        self.assertEqual(capped, [12, 13])
+        self.assertEqual([row["number"] for row in data["plan"]], [14])
+        self.assertEqual({s["number"]: s["runs"] for s in data["skipped"]}, {12: 3, 13: 3})
+
+    def test_billing_runs_do_not_cap_a_ticket_after_the_budget_is_reset_and_it_relaunches_headless(self):
+        self.write_budget("api", 12, "billing: credit balance is too low")
+        last = self.ended(12, ["billing", "billing", "billing"], [30, 20, 10])[-1]
+        control = self.ended(15, ["unknown", "error", "stopped"], [31, 21, 11])
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS, title="Credits added"),
+                              issue(15, labels=IN_PROGRESS, title="Control")])
+        self.ok("budget", "reset", "api")                                   # credits added
+        self.assertEqual(self.marked(), {15: [control[-1]["id"]]})
+        p = self.ok("dispatch", "--dry-run")
+        self.assertIn(f"would start #12 Credits added (again after {last['outcome']}) and launch headless",
+                      p.stdout.splitlines())
+        self.assertEqual(sorted(self.cap_lines(p.stdout)), [15])
+        p = self.ok("dispatch", "--venue", "headless")
+        self.assertRegex(p.stdout, r"(?m)^#12 headless on t/12-\S+ \(pid \d+, log ")
+        self.assertTrue(wait_for(lambda: len(self.claude_calls()) == 1))
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"][:7], ["-p", "/harness:work 12", "--permission-mode", "auto",
+                                            "--output-format", "json", "--settings"])
+        [fresh] = [r for r in self.run_records() if not r.get("ended_at")]
+        self.assertEqual((fresh["ticket"], fresh["venue"]), (12, "headless"))
+        self.assertTrue(wait_for(lambda: pid_gone(fresh["pid"])))
 
 
 def sha12(path):
