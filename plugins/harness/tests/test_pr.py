@@ -391,6 +391,25 @@ class Open(WorktreeTest):
         self.assertEqual(body.splitlines()[-1], "None noted.")
         self.assertEqual(self.stub_calls("harness-board"), [["show", "12", "--json", "--repo", self.main]])
 
+    def test_open_shows_the_warning_lines_of_every_board_call(self):
+        """#69: warnings pass through from every harness-board call, not only `status`: open's `show` and `comment`
+        each exit 0 with a warning among other stderr; open's stderr is exactly those warnings, once each, in call
+        order, and its stdout is unchanged."""
+        show_warning = "harness-board: warning: the Projects board acme/3 was not updated: show (token-n1)"
+        comment_warning = "harness-board: warning: the Projects board acme/3 was not updated: comment (token-p2)"
+        self.outputs(**{"harness-board": {
+            "show": {"stdout": json.dumps(board_ticket("low")),
+                     "stderr": f"harness-board: note: chatter (token-q3)\n{show_warning}\n"},
+            "comment": {"stdout": "https://github.com/o/r/issues/12#c1\n",
+                        "stderr": f"{comment_warning}\nwarning: chatter without the prefix (token-r4)\n"}},
+            "harness-red": {"status": {"stdout": json.dumps(RED_RECORD)}}})
+        self.scenario([{"match": ["pr", "list"], "stdout_json": []},
+                       {"match": ["pr", "create"], "stdout": PR_URL + "\n"}])
+        p = self.ok("open", "12", cwd=self.wt)
+        self.assertEqual(p.stdout, f"#34 {PR_URL}\n")
+        self.assertEqual(p.stderr.splitlines(), [show_warning, comment_warning], p.stderr)
+        self.assertEqual([a[0] for a in self.stub_calls("harness-board")], ["show", "comment"])
+
     def test_open_refuses_a_dirty_tree(self):
         write(os.path.join(self.wt, "widget.py"), "def frob():\n    return 3\n")
         write(os.path.join(self.wt, "notes.txt"), "scratch\n")
@@ -889,6 +908,70 @@ class Ready(PrTest):
         self.assertEqual(len(projects), 1, projects)
         self.assertEqual(project_argv(projects[0]), ("item-edit", ["7"], {"owner": "rjeskuri", "url": url,
                                                                            "field": "Status", "value": "In review"}))
+
+    # ------------------------------------------------- #69: harness-board's Projects warning reaches the user
+    def real_board_scenario(self, project_call):
+        """ready 34 closing #12 with the real harness-board; `project_call` answers any `gh project ...`."""
+        url = "https://github.com/o/r/issues/12"
+        self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, self.view([12]),
+                       {"match": ["issue", "view", "12"], "stdout_json": {
+                           "number": 12, "url": url, "labels": [{"name": "task"}, {"name": "status:in-progress"}]}},
+                       {"match": ["issue", "edit", "12"], "stdout": url + "\n"},
+                       {"match": ["issue", "comment", "12"], "stdout": url + "#issuecomment-1\n"},
+                       dict(project_call, match=["project"])])
+
+    def test_ready_passes_the_board_warning_through_when_the_project_item_edit_fails(self):
+        """Real harness-board, a failing `gh project item-edit`: ready still exits 0 with its usual stdout, and
+        harness-board's one warning line, naming that board and gh's error, is on ready's stderr exactly once. The
+        board comes from the environment in one case and from ~/.claude/settings.json in the other."""
+        cases = [("rjeskuri/7", "HTTP 403: missing the project scope (token-d4)", "env"),
+                 ("some-org/42", "could not find the item (token-e5)", "settings")]
+        for project, why, source in cases:
+            with self.subTest(project=project, source=source):
+                self.real_board_scenario({"stderr": why + "\n", "exit": 1})
+                settings = os.path.join(self.home, ".claude", "settings.json")
+                if source == "settings":
+                    write(settings, json.dumps({"env": {"HARNESS_PROJECT": project}}))
+                    p = self.ok("ready", "34", stubs=False)
+                else:
+                    p = self.ok("ready", "34", stubs=False, HARNESS_PROJECT=project)
+                owner, number = project.split("/")
+                self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
+                self.assertEqual(p.stderr.splitlines(), [f"harness-board: warning: the Projects board {owner}/{number} "
+                                                         f"was not updated: gh project item-edit {number} failed: "
+                                                         f"{why}"], p.stderr)
+                self.assertIn(["issue", "edit", "12", "--add-label", "status:in-review", "--remove-label",
+                               "status:in-progress"], self.gh_argv(), "the labels still changed")
+                self.assertEqual(len(self.notifications()), 1 if source == "env" else 2)
+
+    def test_ready_shows_only_the_warning_lines_of_a_successful_board_call(self):
+        """A board that exits 0 with stderr: each `harness-board: warning:` line reaches ready's stderr once, in
+        order; its other stderr lines stay hidden. A board with only other stderr leaves ready's stderr empty."""
+        warnings = ["harness-board: warning: the Projects board acme/3 was not updated: gh project item-edit 3 "
+                    "failed: stub says no (token-f6)",
+                    "harness-board: warning: HARNESS_PROJECT='x' is not OWNER/NUMBER; the Projects board is not "
+                    "updated (token-g7)"]
+        chatter = ["harness-board: note: chatter (token-h8)", "warning: chatter without the prefix (token-i9)",
+                   "gh: some progress line (token-j0)"]
+        runs = [([chatter[0], warnings[0], chatter[1]], [warnings[0]]),
+                ([warnings[1], chatter[2], warnings[0]], [warnings[1], warnings[0]]),
+                (chatter, [])]
+        for stderr, shown in runs:
+            with self.subTest(stderr=stderr):
+                self.outputs(**{"harness-board": {"status": {"stderr": "\n".join(stderr) + "\n", "exit": 0}}})
+                self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, self.view([12])])
+                p = self.ok("ready", "34")
+                self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
+                self.assertEqual(p.stderr.splitlines(), shown, p.stderr)
+                self.assertEqual([a[:3] for a in self.stub_calls("harness-board")], [["status", "12", "in-review"]])
+
+    def test_ready_stderr_is_unchanged_without_the_project_setting(self):
+        """No HARNESS_PROJECT anywhere, real harness-board: no project call and ready's stderr is empty as before."""
+        self.real_board_scenario({"stderr": "should never run\n", "exit": 1})
+        p = self.ok("ready", "34", stubs=False)
+        self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
+        self.assertEqual(p.stderr, "")
+        self.assertEqual([a for a in self.gh_argv() if a[:1] == ["project"]], [])
 
 
 class ReadyGate(GateAsserts, PrTest):

@@ -48,7 +48,8 @@ with no ready pull request of its branch in any state (none, or only drafts) end
 A bg failed or stopped run is never early. When gh cannot tell, or the record names no repository, it stays `ok`
 with a warning. One command asks gh once per ticket and branch.
 
-Siblings (harness-board) are found on PATH, else next to this script. gh is HARNESS_GH when set, else `gh`;
+A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through to stderr, in order;
+its other stderr stays hidden. Siblings (harness-board) are found on PATH, else next to this script. gh is HARNESS_GH when set, else `gh`;
 claude is HARNESS_CLAUDE when set, else `claude`.
 """
 from __future__ import annotations
@@ -371,8 +372,12 @@ def open_repo(path):
     return Repo(path or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
 
 
+BOARD_WARNING = "harness-board: warning:"
+
+
 def board(repo, *args):
-    """harness-board in the project; its stdout, or a Problem with its error line."""
+    """harness-board in the project; its stdout, or a Problem with its error line. On success its
+    `harness-board: warning:` stderr lines go to our stderr, in order; its other stderr stays hidden."""
     env = dict(os.environ, CLAUDE_PROJECT_DIR=repo.main)
     done = run([sibling("harness-board")] + [str(a) for a in args], cwd=repo.main, env=env, timeout=TOOL_TIMEOUT)
     if done.returncode != 0:
@@ -380,6 +385,9 @@ def board(repo, *args):
         if why.startswith("harness-board: "):
             why = why[len("harness-board: "):]
         raise Problem(f"harness-board {' '.join(str(a) for a in args[:2])}: {why}")
+    for line in (done.stderr or "").splitlines():
+        if line.startswith(BOARD_WARNING):
+            print(line, file=sys.stderr, flush=True)
     return done.stdout
 
 

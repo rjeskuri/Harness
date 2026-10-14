@@ -91,6 +91,24 @@ sys.exit(2)
 """
 
 
+# #69: a harness-board that runs the real one and adds stderr chatter that is not a harness-board warning, before
+# and after; its exit code is the real one's. With NOISY_WARN set, a `show` also ends with a warning line of its own,
+# `harness-board: warning: <NOISY_WARN> from show <number> <format>`.
+CHATTER = ("harness-board: note: chatter before the call", "warning: chatter without the harness-board prefix")
+NOISY_BOARD = """#!/bin/sh
+printf '%s\\n' "$*" >> "$NOISY_LOG"
+printf '%s\\n' "{before}" >&2
+"{{python}}" "{{board}}" "$@"
+rc=$?
+printf '%s\\n' "{after}" >&2
+if [ "$1" = show ] && [ -n "$NOISY_WARN" ]; then
+    printf 'harness-board: warning: %s from show %s %s\\n' "$NOISY_WARN" "$2" "$3" >&2
+fi
+exit $rc
+""".format(before=CHATTER[0], after=CHATTER[1])
+WARNING = "harness-board: warning: "
+
+
 def write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
@@ -132,7 +150,10 @@ def setUpModule():
     os.makedirs(toolbin)
     os.symlink(GIT, os.path.join(toolbin, "git"))
     os.symlink(sys.executable, os.path.join(toolbin, "python3"))
-    BINS.update(root=root, fakebin=fakebin, toolbin=toolbin)
+    noisybin = os.path.join(root, "noisybin")       # only on PATH when a test puts it there
+    executable(os.path.join(noisybin, "harness-board"), NOISY_BOARD.format(
+        python=sys.executable, board=os.path.join(os.path.dirname(TOOL), "harness-board")))
+    BINS.update(root=root, fakebin=fakebin, toolbin=toolbin, noisybin=noisybin)
 
 
 def tearDownModule():
@@ -501,6 +522,94 @@ class Start(WorkTest):
                                                                      "value": "In progress"}))
         edit = next(c for c in self.gh_calls() if c[:2] == ["issue", "edit"])
         self.assertLess(self.gh_calls().index(edit), self.gh_calls().index(argv), "the label changes first")
+
+    # ------------------------------------------------- #69: harness-board's Projects warning reaches the user
+    def project_scenario(self, project_call, numbers=(12,)):
+        """The issues, with `project_call` (the fake gh's answer to any `gh project ...`) ahead of the rest."""
+        self.scenario(issues=[issue(n) for n in numbers])
+        with open(self.scenario_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["calls"].insert(0, dict(project_call, match=["project"]))
+        write(self.scenario_path, json.dumps(data))
+
+    def test_start_passes_the_board_warning_through_when_the_project_item_edit_fails(self):
+        """A failing `gh project item-edit` during start: start still exits 0, and harness-board's one warning line,
+        naming that board and gh's error, is on start's stderr exactly once (not on stdout). The board comes from
+        the environment in one case and from ~/.claude/settings.json in the other; text and --json output alike."""
+        cases = [(12, "acme-org/23", "HTTP 403: missing the project scope (token-a1)", "env", []),
+                 (13, "other-owner/5", "item not found on the board (token-b2)", "settings", ["--json"])]
+        for number, project, why, source, flags in cases:
+            with self.subTest(number=number, source=source):
+                self.project_scenario({"stderr": why + "\n", "exit": 1}, numbers=(12, 13))
+                if source == "settings":
+                    write(os.path.join(self.home, ".claude", "settings.json"),
+                          json.dumps({"env": {"HARNESS_PROJECT": project}}))
+                    env = self.env()
+                else:
+                    env = self.env(HARNESS_PROJECT=project)
+                p = self.ok("start", str(number), *flags, env=env)
+                owner, board_number = project.split("/")
+                expected = (f"{WARNING}the Projects board {owner}/{board_number} was not updated: "
+                            f"gh project item-edit {board_number} failed: {why}")
+                self.assertEqual(p.stderr.splitlines(), [expected], p.stderr)
+                self.assertNotIn(WARNING, p.stdout)
+                if flags:
+                    self.assertEqual(json.loads(p.stdout)["previous_status"], "ready")
+                else:
+                    self.assertTrue(p.stdout.startswith(self.worktree_path(f"t/{number}-add-the-board-tool")),
+                                    p.stdout)
+                self.assertIn(["issue", "edit", str(number), "--add-label", "status:in-progress",
+                               "--remove-label", "status:ready"],
+                              [c[:7] for c in self.gh_calls()], "the labels still changed")
+
+    def test_start_keeps_other_board_stderr_hidden(self):
+        """harness-board succeeds but writes other lines on stderr (a wrapper around the real one): only warning
+        lines reach start's stderr, from every board call start makes (both `show`s as well as `status`), each
+        once and in call order; with no warning anywhere, start's stderr stays empty as today. A ticket already in
+        progress gets no status change, and its `show` warnings still come through."""
+        noisy = os.pathsep.join([BINS["noisybin"], BINS["fakebin"], BINS["toolbin"], "/usr/bin", "/bin"])
+        why = "HTTP 401: token expired (token-c3)"
+        self.project_scenario({"stderr": why + "\n", "exit": 1}, numbers=(12, 13))
+        log = os.path.join(self.tmp, "noisy.log")
+        p = self.ok("start", "12", env=self.env(PATH=noisy, HARNESS_PROJECT="acme-org/31", NOISY_LOG=log,
+                                                NOISY_WARN="token-k1"))
+        self.assertIn("status 12 in-progress", read_text(log), "the chattering board ran")
+        self.assertEqual(p.stderr.splitlines(), [
+            f"{WARNING}token-k1 from show 12 --json",
+            f"{WARNING}the Projects board acme-org/31 was not updated: gh project item-edit 31 failed: {why}",
+            f"{WARNING}token-k1 from show 12 --markdown"], p.stderr)
+        for line in CHATTER:
+            self.assertNotIn(line, p.stderr)
+        self.project_scenario({"stdout": ""}, numbers=(12, 13))
+        p = self.ok("start", "13", env=self.env(PATH=noisy, HARNESS_PROJECT="acme-org/31", NOISY_LOG=log))
+        self.assertIn("status 13 in-progress", read_text(log))
+        self.assertEqual(p.stderr, "")
+        self.assertTrue([c for c in self.gh_calls() if c[:2] == ["project", "item-edit"]], "the mirror ran")
+
+        self.project_scenario({"stderr": "should never run\n", "exit": 1}, numbers=())
+        with open(self.scenario_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["calls"].insert(0, {"match": ["issue", "view", "14"], "stdout_json": issue(
+            14, labels=("task", "status:in-progress", "size:S", "risk:low"))})
+        write(self.scenario_path, json.dumps(data))
+        p = self.ok("start", "14", env=self.env(PATH=noisy, HARNESS_PROJECT="acme-org/31", NOISY_LOG=log,
+                                                NOISY_WARN="token-m3"))
+        self.assertNotIn("status 14", read_text(log), "no status change from in-progress")
+        self.assertEqual(p.stderr.splitlines(), [f"{WARNING}token-m3 from show 14 --json",
+                                                 f"{WARNING}token-m3 from show 14 --markdown"], p.stderr)
+
+    def test_start_stderr_is_unchanged_without_the_project_setting(self):
+        """No HARNESS_PROJECT anywhere: no project call, and start's stderr is empty as before #69, with the plain
+        board and with one that chatters on stderr."""
+        noisy = os.pathsep.join([BINS["noisybin"], BINS["fakebin"], BINS["toolbin"], "/usr/bin", "/bin"])
+        self.project_scenario({"stderr": "should never run\n", "exit": 1}, numbers=(12, 13))
+        log = os.path.join(self.tmp, "noisy.log")
+        for number, env in ((12, self.env()), (13, self.env(PATH=noisy, NOISY_LOG=log))):
+            with self.subTest(number=number):
+                p = self.ok("start", str(number), env=env)
+                self.assertEqual(p.stderr, "")
+        self.assertIn("status 13 in-progress", read_text(log), "the chattering board ran")
+        self.assertEqual([c for c in self.gh_calls() if c[:1] == ["project"]], [])
 
 
 # =========================================================================== attempt
