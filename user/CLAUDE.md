@@ -24,10 +24,10 @@
 
 ## Model routing
 
-- Default: Opus 5.5 at high effort, for the main session and every agent. `harness-board tier N` maps a ticket's labels to a tier: size:S and risk:low on a non-bug gives `sonnet`; size:L or risk:high gives `fable`; otherwise `opus`. Pass that as `model` on the Agent call. When escalating or reviewing on Fable, pass `model: fable` and `effort: xhigh` on the Agent call.
+- Default: Opus 5.5 at high effort, for the main session and every agent. `harness-board tier N` maps a ticket's labels to a tier: size:S and risk:low on a non-bug gives `sonnet`; size:L or risk:high gives `fable`; otherwise `opus`. Pass that as `model` on the Agent call. The reviewer's model comes from `harness-board tier N --stage review`: Opus 5.5, and Fable only when the ticket is risk:high. When a stage escalates to Fable, or the review runs on a risk:high ticket, pass `model: fable` and `effort: xhigh` on the Agent call.
 - Escalation is by failure, recorded with `harness-work attempt`: a stage's first failure retries at the same tier, the second re-runs one tier up, the third stops with needs-input.
-- Fable is for `harness:reviewer` (always) and for escalations. `harness:planner` is Opus at xhigh. `harness:researcher` answers from primary sources. `harness:quick` (Sonnet) does trivial mechanical tasks outside tickets.
-- Parallel work: `/harness:work` with no number dispatches a session per ready ticket. A Workflow is yours to launch when it pays off, Opus workers for coding, Fable for judgment stages. Say what you launched and why.
+- Standard reviews run on Opus 5.5. `harness:reviewer` runs on Fable when the ticket is risk:high or when the review stage escalates by failure (`harness-work attempt` says `escalate fable`). `harness:planner` is Opus at xhigh. `harness:researcher` answers from primary sources. `harness:quick` (Sonnet) does trivial mechanical tasks outside tickets.
+- Parallel work: `/harness:work` with no number dispatches a session per ready ticket. A Workflow is yours to launch when it pays off, Opus workers for coding and for judgment stages, Fable only when the ticket is risk:high. Say what you launched and why.
 
 ## Budgets
 

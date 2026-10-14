@@ -134,7 +134,7 @@ Labels (name, color, meaning), created idempotently by `harness-board labels ens
 | risk | `risk:low` E6E6E6, `risk:high` B60205 (data loss, money, live systems, security, minors' data) |
 | flags | `no-tests` EDEDED (docs or config only; exempt from tests-first), `needs-local` FEF2C0 (needs this Mac's files or credentials), `priority:high` FF7F0E |
 
-Tier rubric, implemented once in `harness-board tier`: `size:S` and `risk:low` and type not `bug` gives `sonnet`; `size:L` or `risk:high` gives `fable`; everything else gives `opus`. Escalation order is sonnet, opus, fable.
+Tier rubric, implemented once in `harness-board tier`: `size:S` and `risk:low` and type not `bug` gives `sonnet`; `size:L` or `risk:high` gives `fable`; everything else gives `opus`. Escalation order is sonnet, opus, fable. The review stage has its own rule, `harness-board tier N --stage review`: `fable` for `risk:high`, `opus` for everything else.
 
 Task body template (`templates/ticket_task.md`; the planner fills it, the scaffold installs it as a GitHub issue template too):
 
@@ -192,11 +192,11 @@ Squash commit: <full sha>
 | `test-author` | opus (tier override per call), effort inherited | all | Writes the tests the ticket names, broad behavior first, against the public interface, and runs them to show them red. The tests-first hook denies it any source edit. |
 | `test-breaker` | opus (tier override), inherited | all | In the scratch copy, writes the cheapest implementation that could pass the new tests (constants, special-casing the fixtures) and runs them. If it passes, the tests are too narrow. Denied test edits by the hook. |
 | `coder` | opus (tier override), inherited | all | Makes the tests and the verify command green with the smallest coherent change, commits on the ticket branch, reports evidence. Denied test edits by the hook; stops and reports when the change outgrows the size cap. |
-| `reviewer` | fable, xhigh | Read, Grep, Glob, Bash (read-only guard) | Reviews the branch against the ticket's definition of done; returns findings as JSON lines for the PR. |
+| `reviewer` | opus (fable, xhigh, for risk:high) | Read, Grep, Glob, Bash (read-only guard) | Reviews the branch against the ticket's definition of done; returns findings as JSON lines for the PR. |
 | `researcher` | opus, inherited | WebFetch, WebSearch, Read, Grep, Glob, Bash (read-only guard) | Primary-source fact checking, as in v1. |
 | `quick` | sonnet, inherited | all | Trivial mechanical tasks outside the ticket loop, as in v1. |
 
-The orchestrator passes `model` on the Agent call from `harness-board tier` (and `effort` too once the Agent tool offers it: `high` by default, `xhigh` when escalating to Fable). The read-only guard (`readonly_bash.py`) now covers `planner`, `reviewer` and `researcher`.
+The orchestrator passes `model` on the Agent call from `harness-board tier` (and `effort` too once the Agent tool offers it: `high` by default, `xhigh` when escalating to Fable). The reviewer's model comes from `harness-board tier N --stage review`: `opus`, and `fable` (with `xhigh`) when the ticket is `risk:high` or when `harness-work attempt` says `escalate fable` for the review stage. The read-only guard (`readonly_bash.py`) now covers `planner`, `reviewer` and `researcher`.
 
 ## Skills
 
@@ -218,7 +218,7 @@ test-author (tier)              tests only; must show them red
 harness-red check               proof: tests fail, source untouched; record written
 test-breaker (tier)             scratch copy; cheat attempt; pass means tests go back to the author (max 2 rounds)
 coder (tier)                    source only; new tests and CLAUDE_VERIFY_CMD green; commits
-reviewer (fable)                findings JSON; split by the ticket's files: the rest become new tickets
+reviewer (opus; fable if risk:high) findings JSON; split by the ticket's files: the rest become new tickets
 harness-pr open N [--notes F]   push, draft PR from the template (Closes #N, DoD, red proof, verify tail); --notes adds a `## Notes` section (second pass, out-of-scope file) that the Resolution repeats
 harness-pr review P --findings  inline review comments from the findings on the ticket's files
 coder (tier)                    fixes every posted finding, whatever its severity, in commits after the review;
@@ -274,7 +274,7 @@ Failure policy, enforced by `harness-work attempt`: the first failure of a stage
 - `answers N [--since ISO]`: comments by the authenticated user (`gh api user --jq .login`) newer than `--since` (default: the newest `**Needs your input**` comment, else the cache's `fetched_at`, else no bound), skipping the harness's own comments (posted under the same account): every comment harness-board posts (`comment`, `status --comment`, `needs-input`, `close --comment`, `epic-check`) ends with the line `<!-- harness -->`, and older ones are recognised by a body starting `**Needs your input**`, `Started on `, `PR #` or `Landed in `. JSON. `status`, `close` and `epic-check` also refresh an existing cache so the session brief never shows a stale status.
 - `close N [--comment TEXT]`; `epic-check N`: when `subIssuesSummary.completed == total` and total > 0, comment `All tasks landed.` and close the epic.
 - `board`: markdown by status, counts in the headings, `#N title (type, size, risk)` lines; `--json` the same structure.
-- `tier N`: `sonnet`, `opus` or `fable` per the rubric; from the cache when present, else fetched.
+- `tier N [--stage review]`: `sonnet`, `opus` or `fable` per the rubric; from the cache when present, else fetched. With `--stage review` (the only stage accepted) it prints `fable` for a `risk:high` ticket and `opus` otherwise, whatever the type and size.
 
 ### harness-work
 
@@ -404,4 +404,4 @@ Review round on 2026-10-13 (three fresh-context Fable reviews, fixes recorded ab
 
 ## Interview decisions, 2026-10-13
 
-Companion removed (tokens). Board on GitHub Issues with sub-issues, no Projects board, no local files. Main session on Opus 5.5 high; planner Opus xhigh; Fable only for review. Tiers from size and risk labels, escalation once, then needs-input. Tests-first with a hook gate and a red proof, plus the adversarial test review. Worktree per ticket. Agents push ticket branches and open PRs freely; the user merges from the CLI with `land`. CI on PRs and main plus a deploy stub; branch protection when the plan allows (it does not, today). Manual kick-off, background sessions for parallel tickets. Every project adopts the flow, including jotform-glow-sync. Extras: reviewer findings on the PR, CI wait-and-fix, needs-input loop, lessons as tickets, size cap, pre-commit and PR template, daily digest. Budgets: credits first (API for dispatch, usage credits for ultrareview), subscription as the fallback once a budget is exhausted. Changed on 2026-10-14 (#57): dispatch runs on the subscription by default, and the API key is spent only with `--api` or `--venue headless`. Harness, Kalshi and PilatesAttendance get private GitHub repos during the v2 rollout, with confirmation before each push.
+Companion removed (tokens). Board on GitHub Issues with sub-issues, no Projects board, no local files. Main session on Opus 5.5 high; planner Opus xhigh; Fable only for review. Tiers from size and risk labels, escalation once, then needs-input. Tests-first with a hook gate and a red proof, plus the adversarial test review. Worktree per ticket. Agents push ticket branches and open PRs freely; the user merges from the CLI with `land`. CI on PRs and main plus a deploy stub; branch protection when the plan allows (it does not, today). Manual kick-off, background sessions for parallel tickets. Every project adopts the flow, including jotform-glow-sync. Extras: reviewer findings on the PR, CI wait-and-fix, needs-input loop, lessons as tickets, size cap, pre-commit and PR template, daily digest. Budgets: credits first (API for dispatch, usage credits for ultrareview), subscription as the fallback once a budget is exhausted. Changed on 2026-10-14 (#57): dispatch runs on the subscription by default, and the API key is spent only with `--api` or `--venue headless`. Changed on 2026-10-14 (#67): the lines above that say Fable for review are superseded. Standard reviews run on Opus 5.5 (`reviewer.md` has `model: opus`, no effort line); `harness-board tier N --stage review` gives Fable only for a `risk:high` ticket, and the review stage moves to Fable with `xhigh` when `harness-work attempt` says `escalate fable`. Harness, Kalshi and PilatesAttendance get private GitHub repos during the v2 rollout, with confirmation before each push.

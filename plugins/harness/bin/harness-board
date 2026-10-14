@@ -20,7 +20,7 @@ Usage:
     harness-board close N [--comment TEXT]
     harness-board epic-check N
     harness-board board
-    harness-board tier N
+    harness-board tier N [--stage review]
     Every subcommand takes --repo PATH (default: CLAUDE_PROJECT_DIR, else the cwd's repository) and --json.
 
 Every comment posted here ends with the line `<!-- harness -->` (hidden on GitHub), so `answers` can tell the
@@ -987,14 +987,20 @@ def cmd_board(repo, args):
 
 
 def cmd_tier(repo, args):
+    def pick(info):
+        # the review stage runs on Opus 5.5; fable only for a risk:high ticket
+        if args.stage == "review":
+            return "fable" if info["risk"] == "high" else "opus"
+        return info["tier"]
+
     cached = read_cache(repo, args.number)
     if cached and isinstance(cached.get("labels"), list):
-        tier, source = classify(label_names(cached["labels"]))["tier"], "cache"
-    elif cached and cached.get("tier") in TIERS:
+        tier, source = pick(classify(label_names(cached["labels"]))), "cache"
+    elif cached and cached.get("tier") in TIERS and not args.stage:
         tier, source = cached["tier"], "cache"
     else:
         data = gh_json(repo, ["issue", "view", str(args.number), "--json", "labels"])
-        tier, source = classify(label_names(data.get("labels") if isinstance(data, dict) else None))["tier"], "github"
+        tier, source = pick(classify(label_names(data.get("labels") if isinstance(data, dict) else None))), "github"
     emit(args, {"number": args.number, "tier": tier, "source": source}, tier)
 
 
@@ -1086,6 +1092,7 @@ def parser():
 
     tier = sub.add_parser("tier", parents=[common], help="sonnet, opus or fable from the ticket's labels")
     tier.add_argument("number", type=issue_number, metavar="N")
+    tier.add_argument("--stage", choices=("review",), help="the review stage: fable for a risk:high ticket, else opus")
     return ap
 
 
