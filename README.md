@@ -56,7 +56,7 @@ Then register your projects: `harness-projects discover`, and `harness-projects 
 | `researcher` | Opus | Answers from primary sources |
 | `quick` | Sonnet | Trivial mechanical tasks outside the ticket loop |
 
-The main session runs Opus 5.5 at high effort. `harness-board tier N` picks the tier from the ticket's labels: `size:S` and `risk:low` on a non-bug gives Sonnet; `size:L` or `risk:high` gives Fable; anything else gives Opus. Reviews run on Opus: `harness-board tier N --stage review` gives Fable only for a `risk:high` ticket, and the review stage moves to Fable when it escalates by failure. Escalation is by failure, recorded with `harness-work attempt`: a stage's first failure retries at the same tier, the second re-runs one tier up, the third stops and asks on the ticket.
+The main session runs Opus 5.5 at high effort. `harness-board tier N` picks the tier from the ticket's labels: `size:S` and `risk:low` on a non-bug gives Sonnet; `size:L` or `risk:high` gives Fable; anything else gives Opus. Reviews run on Opus: `harness-board tier N --stage review` gives Fable only for a `risk:high` ticket, and the review stage is recorded with `harness-work attempt N review pass|fail --tier <that output>`, so its second failure re-runs the review on Fable. Escalation is by failure, recorded with `harness-work attempt`: a stage's first failure retries at the same tier, the second re-runs one tier up, the third stops and asks on the ticket.
 
 ## Skills
 

@@ -1,5 +1,5 @@
 {
-  "_comment": "Merged into ~/.claude/settings.json by scripts/install.sh: model and effortLevel replace, modelSettings merges per model id, nothing else is touched. Opus 5.5 at high is the default everywhere; Fable (review, escalations) runs at xhigh; Sonnet (size:S risk:low tickets) at high.",
+  "_comment": "Merged into ~/.claude/settings.json by scripts/install.sh: model and effortLevel replace, modelSettings merges per model id, nothing else is touched. Opus 5.5 at high is the default everywhere; Fable (risk:high reviews, size:L and risk:high tiers, escalations) runs at xhigh; Sonnet (size:S risk:low tickets) at high.",
   "model": "opus",
   "effortLevel": "high",
   "modelSettings": {
