@@ -2483,6 +2483,42 @@ class EndedEarly(WorkTest):
         self.assertEqual({row["number"]: row.get("again") for row in data["plan"]},
                          {40: "early", 41: "early", 48: "error"})
 
+    def test_an_early_bg_run_shows_early_even_when_the_listing_gives_an_exit_code(self):
+        # Should `claude agents` give an exitCode, the record keeps it, but an early end is what `runs` shows: the 0
+        # of a done session says less than that its ticket is still in progress without a ready PR. Any other ended
+        # run with an exit code still shows `exited N` (a done one with a ready PR, a failed one with or without
+        # a draft), each with its own code.
+        cases = {   # n: (bg id, agents state, exitCode, open PRs = PRs of any state, outcome, state shown)
+            60: ("s-e01", "done", 0, [], "early", "ended early (no PR)"),
+            61: ("s-e02", "done", 0, draft(88), "early", "ended early (draft PR #88)"),
+            62: ("s-e03", "done", 0, draft(47), "early", "ended early (draft PR #47)"),
+            63: ("s-e04", "done", 0, ready_pr(89), "ok", "exited 0"),
+            64: ("s-e05", "failed", 3, [], "error", "exited 3"),
+            65: ("s-e06", "failed", 1, draft(90), "error", "exited 1"),
+        }
+        self.bg_runs({n: c[:2] for n, c in cases.items()})
+        agents = json.dumps([{"id": c[0], "kind": "background", "state": c[1], "exitCode": c[2], "cwd": self.repo,
+                              "name": f"proj #{n} {TITLE}"} for n, c in cases.items()])
+        self.write_scenario({n: (IN_PROGRESS, c[3], c[3]) for n, c in cases.items()})
+
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json",
+                                                     env=self.env(FAKECLAUDE_AGENTS=agents))}
+        expected = {n: c[4] for n, c in cases.items()}
+        shown = {n: c[5] for n, c in cases.items()}
+        self.assertEqual({n: rows[n]["outcome"] for n in rows}, expected)
+        self.assertEqual({n: rows[n]["state"] for n in rows}, shown)
+        saved = {r["ticket"]: r for r in self.run_records()}
+        self.assertEqual({n: saved[n]["exit"] for n in saved}, {n: c[2] for n, c in cases.items()})
+        self.assertEqual({n: saved[n].get("draft_pr") for n in (60, 61, 62)}, {60: None, 61: 88, 62: 47})
+
+        # Without a sweep, from the saved records alone: the same states, in --json and in the table.
+        self.assertEqual({r["ticket"]: r["state"] for r in self.ok_json("runs", "--json")}, shown)
+        lines = self.run_lines()
+        for n, state in shown.items():
+            with self.subTest(ticket=n):
+                self.assertIn(state, lines[n])
+                self.assertEqual("exited" in lines[n], expected[n] != "early", lines[n])
+
 
 def draft(number):
     """`pr list` rows: one open draft pull request."""
