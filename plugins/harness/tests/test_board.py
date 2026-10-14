@@ -104,7 +104,65 @@ def setUpModule():
     for name in ("terminal-notifier", "osascript"):
         executable(os.path.join(fakebin, name), f'#!/bin/sh\nexec "{py}" "{recorder}" "$0" "$@"\n')
         executable(os.path.join(failbin, name), f'#!/bin/sh\nNOTIFY_EXIT=1 exec "{py}" "{recorder}" "$0" "$@"\n')
-    BINS.update(root=root, fakebin=fakebin, altbin=altbin, failbin=failbin)
+    # reposbin: a gh that picks the fakegh scenario by repository (its -R/--repo value, a repos/OWNER/REPO api
+    # path, else the cwd's registered checkout) and logs {"repo", "argv"} to $REPOS_LOG; see ProjectSync.
+    reposgh = write(os.path.join(root, "reposgh.py"), REPOS_GH.replace("@HERE@", repr(HERE)))
+    reposbin = os.path.join(root, "reposbin")
+    executable(os.path.join(reposbin, "gh"), f'#!/bin/sh\nexec "{py}" "{reposgh}" "$@"\n')
+    BINS.update(root=root, fakebin=fakebin, altbin=altbin, failbin=failbin, reposbin=reposbin)
+
+
+REPOS_GH = r'''
+import json, os, re, sys
+sys.path.insert(0, @HERE@)
+import fakegh
+argv = sys.argv[1:]
+with open(os.environ["FAKEGH_REPOS"], encoding="utf-8") as fh:
+    world = json.load(fh)
+slug = None
+for i, tok in enumerate(argv):
+    if tok in ("-R", "--repo") and i + 1 < len(argv):
+        slug = argv[i + 1]
+    elif tok.startswith("--repo="):
+        slug = tok[len("--repo="):]
+    elif argv[:1] == ["api"]:
+        m = re.match(r"/?repos/([^/{}]+/[^/?{}]+)", tok)
+        if m:
+            slug = m.group(1)
+key = None
+if slug:
+    key = world["slugs"].get("/".join(slug.rstrip("/").split("/")[-2:]))
+else:
+    cwd = os.path.realpath(os.getcwd())
+    for path, k in sorted(world["paths"].items(), key=lambda kv: -len(kv[0])):
+        if cwd == path or cwd.startswith(path + os.sep):
+            key = k
+            break
+with open(os.environ["REPOS_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({"repo": key, "argv": argv}) + "\n")
+os.environ["FAKEGH_SCENARIO"] = world["scenarios"].get(key) or world["default"]
+sys.argv = ["gh"] + argv
+if argv[:2] != ["issue", "list"]:
+    sys.exit(fakegh.main())
+# gh issue list returns at most --limit issues (default 30), as the real one does
+limit = 30
+for i, tok in enumerate(argv):
+    if tok in ("-L", "--limit") and i + 1 < len(argv):
+        limit = int(argv[i + 1])
+    elif tok.startswith("--limit="):
+        limit = int(tok[len("--limit="):])
+import io
+real, sys.stdout = sys.stdout, io.StringIO()
+code = fakegh.main()
+out, sys.stdout = sys.stdout.getvalue(), real
+try:
+    data = json.loads(out)
+    out = json.dumps(data[:limit]) if isinstance(data, list) else out
+except ValueError:
+    pass
+sys.stdout.write(out)
+sys.exit(code)
+'''
 
 
 def tearDownModule():
@@ -1375,6 +1433,750 @@ class ProjectMirror(BoardTest):
                     self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                     self.assertEqual(p.stderr, "", "a command that never mirrors does not read the setting")
                     self.assertFalse([a for a in self.calls() if a[:1] == ["project"]])
+
+
+# ======================================================================= project check, project sync (#65)
+UNSET = "<unset>"     # an item with no value for the field: gh item-list leaves the key out
+ABSENT = "<absent>"   # an issue that is not an item on the board
+
+# One row per open issue: (type, status label or None, priority:high?, board Status, board Priority). Expected
+# writes, from the ticket and the #74 review: a missing issue is added, then Status is set from its status label
+# (none without a label) and Priority to High only with priority:high. An item is edited only in the fields that
+# disagree; an unset board Priority counts as Normal, so only High against Normal (either way) is Priority drift.
+SYNC_ROWS = [
+    ("task", "ready", True, "Ready", "High"),                  # in agreement
+    ("task", "in-progress", False, "In progress", "Normal"),   # in agreement
+    ("task", "in-review", False, "In progress", "Normal"),     # Status drift
+    ("bug", "blocked", True, "Done", "High"),                  # Status drift (a drag to Done)
+    ("task", "needs-input", False, UNSET, "Normal"),           # Status unset
+    ("chore", "ready", False, "Blocked", "High"),              # both drift
+    ("task", "in-progress", True, "In progress", "Normal"),    # Priority drift to High
+    ("task", "in-review", False, "In review", "High"),         # Priority drift to Normal
+    ("task", "needs-input", True, "Needs input", UNSET),       # Priority unset, wants High
+    ("refactor", "blocked", False, "Blocked", UNSET),          # Priority unset counts as Normal: no write
+    ("task", "ready", False, ABSENT, None),                    # missing: add, Ready
+    ("task", "in-review", True, ABSENT, None),                 # missing: add, In review, High
+    ("task", None, False, ABSENT, None),                       # missing, no status label: add only
+    ("task", None, False, "Ready", "Normal"),                  # no status label: Status left alone
+    ("task", None, True, UNSET, "Normal"),                     # no status label: Priority only
+    ("epic", "blocked", True, "Blocked", "High"),              # in agreement
+    ("task", "needs-input", False, ABSENT, None),              # missing: add, Needs input
+    ("task", "in-progress", True, "In review", "Normal"),      # both drift
+]
+SYNC_ROWS_WRITES, SYNC_ROWS_ADDS = 19, 4    # counted by hand from the comments above
+
+
+def sync_issue(slug, number, kind, status, high, state="OPEN"):
+    labels = [kind] + (["status:" + status] if status else []) + (["priority:high"] if high else []) + ["size:M"]
+    return {"number": number, "title": f"Ticket {number} of {slug}", "url": f"https://github.com/{slug}/issues/{number}",
+            "labels": [{"name": n} for n in labels], "state": state}
+
+
+def board_item(slug, number, status=UNSET, priority=UNSET, kind="Issue", labels=()):
+    """An item as `gh project item-list --format json` prints it (checked against gh 2.99.0)."""
+    path = "pull" if kind == "PullRequest" else "issues"
+    item = {"id": f"PVTI_{slug.replace('/', '_')}_{number}_{kind}", "title": f"Ticket {number} of {slug}",
+            "content": {"number": number, "repository": slug, "title": f"Ticket {number} of {slug}", "type": kind,
+                        "url": f"https://github.com/{slug}/{path}/{number}"},
+            "repository": "https://github.com/" + slug, "labels": list(labels)}
+    if status != UNSET:
+        item["status"] = status
+    if priority != UNSET:
+        item["priority"] = priority
+    return item
+
+
+def draft_item(title, status="Ready"):
+    return {"id": "PVTI_draft_" + title.replace(" ", "_"), "title": title, "status": status,
+            "content": {"body": "", "title": title, "type": "DraftIssue"}}
+
+
+def rows_world(slug, numbers, rows=SYNC_ROWS):
+    """(open issues, their board items) for `rows` numbered by `numbers`; item labels match the issue's, as gh's do."""
+    issues, items = [], []
+    for number, (kind, status, high, board_status, board_priority) in zip(numbers, rows):
+        it = sync_issue(slug, number, kind, status, high)
+        issues.append(it)
+        if board_status != ABSENT:
+            items.append(board_item(slug, number, board_status, board_priority,
+                                    labels=[label["name"] for label in it["labels"]]))
+    return issues, items
+
+
+def expected_writes(project, issues, items):
+    """The write calls sync owes for `issues` against `items`, from the ticket's rules."""
+    on_board = {i["content"]["url"]: i for i in items if i.get("content", {}).get("url")}
+    writes = []
+    for it in issues:
+        names = [label["name"] for label in it["labels"]]
+        status = next((PROJECT_OPTIONS[n[len("status:"):]] for n in names if n.startswith("status:")), None)
+        priority = "High" if "priority:high" in names else "Normal"
+        item = on_board.get(it["url"])
+        if item is None:
+            writes.append(item_add(project, it["url"]))
+        if status and (item is None or item.get("status") != status):
+            writes.append(item_edit(project, it["url"], "Status", status))
+        board_priority = "Normal" if item is None else (item.get("priority") or "Normal")   # unset is Normal
+        if board_priority != priority:
+            writes.append(item_edit(project, it["url"], "Priority", priority))
+    return writes
+
+
+def counts(calls):
+    """A multiset of project calls, comparable regardless of order."""
+    out = {}
+    for sub, pos, opts in calls:
+        key = json.dumps([sub, pos, sorted(opts.items(), key=lambda kv: kv[0])], default=str)
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
+class ProjectSync(BoardTest):
+    """`harness-board project sync [--repo PATH | --all-projects] [--dry-run]` against HARNESS_PROJECT: reads the
+    board (item-list --format json --limit 1000) and each repository's open issues (gh issue list), adds the open
+    issues missing from the board and corrects Status and Priority drift with one item-edit per drifted field, by
+    the same status map as the mirror; closed issues, pull requests, drafts and other repositories' items are left
+    alone. Every gh call goes through reposbin's gh, which answers per repository, so the issue list must be read
+    in (or for) the repository being synced."""
+
+    def setUp(self):
+        super().setUp()
+        self.world_path = os.path.join(self.tmp, "world.json")
+        self.repos_log = os.path.join(self.tmp, "repos.log")
+        self.world = {"paths": {}, "slugs": {}, "scenarios": {}, "default": self.scenario_path}
+        self.repo_specs = {}
+
+    def env(self, **extra):
+        env = super().env(**extra)
+        if hasattr(self, "world_path"):
+            env["PATH"] = BINS["reposbin"] + os.pathsep + env["PATH"]
+            env.update(FAKEGH_REPOS=self.world_path, REPOS_LOG=self.repos_log)
+        return env
+
+    # ------------------------------------------------------------------ the fake world
+    def new_repo(self, name):
+        path = self.mk(name)
+        subprocess.run([GIT, "-C", path, "-c", "init.defaultBranch=main", "init", "-q"], env=self.env(), check=True)
+        subprocess.run([GIT, "-C", path, "remote", "add", "origin", f"https://github.com/x/{name}.git"],
+                       env=self.env(), check=True)
+        return path
+
+    def add_repo(self, key, path, slug, issues, closed=()):
+        self.repo_specs[key] = dict(path=os.path.realpath(path), slug=slug, issues=list(issues), closed=list(closed))
+
+    def build(self, items, project_calls=(), total=None):
+        """Write one scenario per repository (its repo view and issue lists, then the shared board) and the
+        default scenario (the board only), and clear the logs. `total` is item-list's totalCount (default: all)."""
+        board = list(project_calls) + [
+            {"match": ["project", "item-list"],
+             "stdout_json": {"items": items, "totalCount": len(items) if total is None else total}},
+            {"match": ["project", "item-add"], "stdout": ""},
+            {"match": ["project", "item-edit"], "stdout": ""}]
+        self.world.update(paths={}, slugs={}, scenarios={})
+        for key, spec in self.repo_specs.items():
+            calls = [{"match": ["repo", "view"], "stdout_json": {"nameWithOwner": spec["slug"]}},
+                     {"contains": ["issue", "list", "--state", "all"], "stdout_json": spec["issues"] + spec["closed"]},
+                     {"contains": ["issue", "list", "--state", "closed"], "stdout_json": spec["closed"]},
+                     {"match": ["issue", "list"], "stdout_json": spec["issues"]}] + board
+            path = os.path.join(self.tmp, f"scenario-{key}.json")
+            write(path, json.dumps({"calls": calls}))
+            self.world["paths"][spec["path"]] = key
+            self.world["slugs"][spec["slug"]] = key
+            self.world["scenarios"][key] = path
+        self.scenario(board)
+        write(self.world_path, json.dumps(self.world))
+        for leftover in [self.repos_log] + [p + ".state.json" for p in self.world["scenarios"].values()]:
+            if os.path.exists(leftover):
+                os.unlink(leftover)
+
+    def logged(self):
+        if not os.path.exists(self.repos_log):
+            return []
+        with open(self.repos_log, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def writes(self):
+        return [project_call(e["argv"]) for e in self.logged()
+                if e["argv"][:2] in (["project", "item-add"], ["project", "item-edit"])]
+
+    def registry(self, paths):
+        write(os.path.join(self.home, ".claude", "harness", "projects.json"), json.dumps(
+            {"version": 1, "projects": [{"path": p, "name": os.path.basename(p), "billable": False, "client": "",
+                                         "notes": ""} for p in paths]}))
+
+    def sync(self, *extra, cwd=None, **env):
+        return self.board("project", "sync", *extra, cwd=cwd, **env)
+
+    # ------------------------------------------------------------------ assertions
+    def assertWritesEqual(self, expected, what=""):
+        self.assertEqual(counts(self.writes()), counts(expected), f"{what}\nwrites: {self.writes()}")
+
+    def assertAddsFirst(self):
+        writes = self.writes()
+        for i, (sub, _, opts) in enumerate(writes):
+            if sub == "item-add":
+                edits_before = [w for w in writes[:i] if w[0] == "item-edit" and w[2].get("url") == opts.get("url")]
+                self.assertEqual(edits_before, [], f"{opts.get('url')} is edited before it is added")
+
+    def assertReadTheBoard(self, project):
+        owner, number = project.rsplit("/", 1)
+        reads = [project_call(e["argv"]) for e in self.logged() if e["argv"][:2] == ["project", "item-list"]]
+        self.assertTrue(reads, "no gh project item-list call")
+        for sub, pos, opts in reads:
+            self.assertEqual(pos, [number], reads)
+            self.assertEqual((opts.get("owner"), opts.get("format"), opts.get("limit")), (owner, "json", "1000"), reads)
+
+    def assertListedIssues(self, key):
+        self.assertTrue([e for e in self.logged() if e["argv"][:2] == ["issue", "list"] and e["repo"] == key],
+                        f"no gh issue list for {key}: {self.logged()}")
+
+    def change_lines(self, stdout, url):
+        number = url.rsplit("/", 1)[1]
+        pattern = re.compile(r"(?:#%s|%s)(?!\d)" % (number, re.escape(url)))
+        return [line for line in stdout.splitlines() if pattern.search(line)]
+
+    def assertChangeLines(self, stdout, issues, expected):
+        """One line per change: an issue with no change is never named; one with changes is named on at least one
+        and at most one line per write, and those lines carry each new value (and `add` for an added one)."""
+        for it in issues:
+            mine = [w for w in expected if w[2]["url"] == it["url"]]
+            lines = self.change_lines(stdout, it["url"])
+            if not mine:
+                self.assertEqual(lines, [], f"#{it['number']} needs no change\n{stdout}")
+                continue
+            self.assertTrue(1 <= len(lines) <= len(mine), f"#{it['number']}: {len(mine)} changes\n{stdout}")
+            text = "\n".join(lines)
+            for sub, _, opts in mine:
+                if sub == "item-add":
+                    self.assertIn("add", text.lower(), f"#{it['number']} is added\n{stdout}")
+                else:
+                    self.assertIn(opts["value"], text, f"#{it['number']} {opts['field']}\n{stdout}")
+
+    def foreign_items(self, slug, clash):
+        """Board items sync must not touch: another repository's issue with the same number as `clash`, a pull
+        request and a draft, each disagreeing with every label in sight."""
+        return [board_item("someone-else/elsewhere", clash, "Done", "High", labels=["status:ready"]),
+                board_item(slug, clash + 1000, "Blocked", UNSET, kind="PullRequest"),
+                draft_item(f"Idea for {slug}")]
+
+    def closed_issues(self, slug, base):
+        """Closed issues, one drifted on the board and one missing from it: the built-in workflow owns them."""
+        closed = [sync_issue(slug, base, "task", "in-review", True, state="CLOSED"),
+                  sync_issue(slug, base + 1, "task", "ready", False, state="CLOSED")]
+        return closed, [board_item(slug, base, "In progress", "Normal", labels=["task", "status:in-review"])]
+
+    def standard_world(self, project, slug, numbers, closed_base):
+        issues, items = rows_world(slug, numbers)
+        closed, closed_items = self.closed_issues(slug, closed_base)
+        items = items + closed_items + self.foreign_items(slug, numbers[2])
+        self.add_repo("main", self.repo, slug, issues, closed)
+        return issues, items
+
+    WORLDS = [("rjeskuri/7", "rjeskuri/alpha", list(range(3, 21)), 90),
+              ("acme-org/23", "acme-org/widgets", [101 + 7 * i for i in range(18)], 300),
+              ("someone/1", "someone/tools", [40 + 3 * i for i in range(18)][::-1], 7)]
+
+    # ------------------------------------------------------------------ broad: the whole repair
+    def test_sync_adds_missing_issues_and_corrects_status_and_priority_drift(self):
+        for project, slug, numbers, closed_base in self.WORLDS:
+            with self.subTest(project=project, slug=slug):
+                issues, items = self.standard_world(project, slug, numbers, closed_base)
+                self.build(items)
+                expected = expected_writes(project, issues, items)
+                self.assertEqual((len(expected), sum(w[0] == "item-add" for w in expected)),
+                                 (SYNC_ROWS_WRITES, SYNC_ROWS_ADDS), "the test's own model")
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertWritesEqual(expected)
+                self.assertAddsFirst()
+                self.assertReadTheBoard(project)
+                self.assertListedIssues("main")
+                self.assertChangeLines(p.stdout, issues, expected)
+
+    def test_sync_leaves_closed_issues_pull_requests_drafts_and_other_repositories_alone(self):
+        for project, slug, numbers, closed_base in self.WORLDS:
+            with self.subTest(project=project):
+                issues, items = self.standard_world(project, slug, numbers, closed_base)
+                self.build(items)
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                ours = {it["url"] for it in issues}
+                strays = [w for w in self.writes() if w[2].get("url") not in ours]
+                self.assertEqual(strays, [], "only this repository's open issues are written")
+                for closed in (closed_base, closed_base + 1):
+                    self.assertEqual(self.change_lines(p.stdout, f"https://github.com/{slug}/issues/{closed}"), [],
+                                     f"closed #{closed} is not reported\n{p.stdout}")
+
+    def test_items_in_agreement_make_no_write_and_no_change_line(self):
+        agree = [SYNC_ROWS[i] for i in (0, 1, 9, 13, 15)] + [("bug", "needs-input", False, "Needs input", "Normal"),
+                                                              ("task", None, False, UNSET, UNSET)]
+        for project, slug, numbers in (("rjeskuri/7", "rjeskuri/alpha", [12, 13, 14, 15, 16, 17, 18]),
+                                       ("acme-org/23", "acme-org/widgets", [205, 3, 77, 41, 9, 120, 64]),
+                                       ("someone/1", "someone/tools", [8, 6, 4, 2, 1, 30, 11])):
+            with self.subTest(project=project):
+                issues, items = rows_world(slug, numbers, agree)
+                closed, closed_items = self.closed_issues(slug, 500)
+                self.add_repo("main", self.repo, slug, issues, closed)
+                self.build(items + closed_items + self.foreign_items(slug, numbers[0]))
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(self.writes(), [])
+                self.assertReadTheBoard(project)
+                for it in issues:
+                    self.assertEqual(self.change_lines(p.stdout, it["url"]), [], p.stdout)
+
+    def test_dry_run_prints_the_changes_and_writes_nothing(self):
+        for project, slug, numbers, closed_base in self.WORLDS:
+            with self.subTest(project=project):
+                issues, items = self.standard_world(project, slug, numbers, closed_base)
+                self.build(items)
+                expected = expected_writes(project, issues, items)
+                p = self.sync("--dry-run", HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(self.writes(), [], "--dry-run makes no item-add or item-edit call")
+                self.assertReadTheBoard(project)
+                self.assertListedIssues("main")
+                self.assertChangeLines(p.stdout, issues, expected)
+
+    def test_each_single_drift_is_one_edit_of_that_field(self):
+        """One issue per run, so the edit depends on the issue's own labels and item only."""
+        cases = [("rjeskuri/7", "rjeskuri/alpha", 31, ("task", "in-review", False, "Ready", "Normal"),
+                  [("Status", "In review")]),
+                 ("acme-org/23", "acme-org/widgets", 4, ("task", "blocked", False, "In progress", "Normal"),
+                  [("Status", "Blocked")]),
+                 ("someone/1", "someone/tools", 250, ("bug", "ready", False, "Needs input", "Normal"),
+                  [("Status", "Ready")]),
+                 ("rjeskuri/12", "rjeskuri/beta", 66, ("task", "needs-input", False, "Done", "Normal"),
+                  [("Status", "Needs input")]),
+                 ("acme-org/4", "acme-org/gears", 19, ("task", "in-progress", False, "Blocked", "Normal"),
+                  [("Status", "In progress")]),
+                 ("rjeskuri/7", "rjeskuri/alpha", 8, ("task", "ready", True, "Ready", "Normal"),
+                  [("Priority", "High")]),
+                 ("someone/1", "someone/tools", 120, ("task", "blocked", False, "Blocked", "High"),
+                  [("Priority", "Normal")])]
+        for project, slug, number, row, fields in cases:
+            with self.subTest(project=project, number=number, row=row):
+                issues, items = rows_world(slug, [number], [row])
+                self.add_repo("main", self.repo, slug, issues)
+                self.build(items)
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                url = f"https://github.com/{slug}/issues/{number}"
+                self.assertEqual(self.writes(), [item_edit(project, url, f, v) for f, v in fields])
+                lines = self.change_lines(p.stdout, url)
+                self.assertEqual(len(lines), 1, p.stdout)
+                self.assertIn(fields[0][1], lines[0])
+
+    def test_a_missing_issue_is_added_then_its_fields_set(self):
+        cases = [("rjeskuri/7", "rjeskuri/alpha", 14, ("task", "ready", False), [("Status", "Ready")]),
+                 ("acme-org/23", "acme-org/widgets", 207, ("epic", "in-progress", True),
+                  [("Status", "In progress"), ("Priority", "High")]),
+                 ("someone/1", "someone/tools", 2, ("task", None, True), [("Priority", "High")]),
+                 ("rjeskuri/12", "rjeskuri/beta", 63, ("chore", None, False), []),
+                 ("acme-org/4", "acme-org/gears", 9, ("bug", "blocked", False), [("Status", "Blocked")])]
+        for project, slug, number, (kind, status, high), fields in cases:
+            with self.subTest(project=project, number=number):
+                it = sync_issue(slug, number, kind, status, high)
+                other = board_item(slug, number + 1, "Ready", "Normal", labels=["task", "status:ready"])
+                self.add_repo("main", self.repo, slug, [it, sync_issue(slug, number + 1, "task", "ready", False)])
+                self.build([other])
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                url = it["url"]
+                writes = self.writes()
+                self.assertEqual(writes[0], item_add(project, url), writes)
+                self.assertEqual(counts(writes[1:]), counts([item_edit(project, url, f, v) for f, v in fields]))
+                self.assertTrue(self.change_lines(p.stdout, url), p.stdout)
+                self.assertEqual(self.change_lines(p.stdout, other["content"]["url"]), [], p.stdout)
+
+    def test_repo_option_syncs_that_repository_from_elsewhere(self):
+        project, slug = "acme-org/23", "acme-org/widgets"
+        issues, items = rows_world(slug, [61, 62, 63, 64], [SYNC_ROWS[2], SYNC_ROWS[1], SYNC_ROWS[10], SYNC_ROWS[7]])
+        self.add_repo("main", self.repo, slug, issues)
+        self.build(items)
+        p = self.sync("--repo", self.repo, cwd=self.home, HARNESS_PROJECT=project)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertWritesEqual(expected_writes(project, issues, items))
+        self.assertListedIssues("main")
+
+    def test_the_project_may_come_from_settings(self):
+        project, slug = "rjeskuri/9", "rjeskuri/alpha"
+        write(os.path.join(self.home, ".claude", "settings.json"),
+              json.dumps({"env": {"HARNESS_PROJECT": project}, "model": "opus"}))
+        issues, items = rows_world(slug, [5, 6], [SYNC_ROWS[3], SYNC_ROWS[11]])
+        self.add_repo("main", self.repo, slug, issues)
+        self.build(items)
+        p = self.sync()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertWritesEqual(expected_writes(project, issues, items))
+        self.assertReadTheBoard(project)
+
+    # ------------------------------------------------------------------ --all-projects
+    def test_all_projects_covers_each_registered_repository(self):
+        project = "rjeskuri/12"
+        alpha, widgets, tools = self.new_repo("alpha"), self.new_repo("widgets"), self.new_repo("tools")
+        # alpha and widgets share issue numbers, with different drift: matching by number alone fails
+        a_issues, a_items = rows_world("rjeskuri/alpha", [5, 6, 7, 8, 9, 10, 11, 12, 13], SYNC_ROWS[:9])
+        w_issues, w_items = rows_world("acme-org/widgets", [5, 6, 7, 8, 9, 10, 11, 12, 13], SYNC_ROWS[9:])
+        agree = [SYNC_ROWS[0], SYNC_ROWS[1], SYNC_ROWS[15]]
+        t_issues, t_items = rows_world("someone/tools", [40, 41, 42], agree)
+        # the current checkout is not registered: its drift stays
+        u_issues, u_items = rows_world("o/unregistered", [5, 6, 7], [SYNC_ROWS[2], SYNC_ROWS[10], SYNC_ROWS[6]])
+        self.add_repo("alpha", alpha, "rjeskuri/alpha", a_issues,
+                      [sync_issue("rjeskuri/alpha", 70, "task", "ready", False, state="CLOSED")])
+        self.add_repo("widgets", widgets, "acme-org/widgets", w_issues)
+        self.add_repo("tools", tools, "someone/tools", t_issues)
+        self.add_repo("cwd", self.repo, "o/unregistered", u_issues)
+        self.registry([alpha, widgets, tools])
+        items = a_items + w_items + t_items + u_items + [draft_item("Loose idea")]
+        expected = (expected_writes(project, a_issues, items) + expected_writes(project, w_issues, items)
+                    + expected_writes(project, t_issues, items))
+        self.assertEqual(expected_writes(project, t_issues, items), [], "tools is in agreement")
+        for dry in (False, True):
+            with self.subTest(dry_run=dry):
+                self.build(items)
+                p = self.sync("--all-projects", *(["--dry-run"] if dry else []), HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertWritesEqual([] if dry else expected)
+                if not dry:
+                    self.assertAddsFirst()
+                for key in ("alpha", "widgets", "tools"):
+                    self.assertListedIssues(key)
+                self.assertReadTheBoard(project)
+                changed = {w[2]["url"] for w in expected}
+                lines = [line for line in p.stdout.splitlines() if re.search(r"#\d|/issues/\d", line)]
+                self.assertTrue(len(changed) <= len(lines) <= len(expected),
+                                f"{len(changed)} issues changed in {len(expected)} writes\n{p.stdout}")
+
+    # ------------------------------------------------------------------ failures
+    def test_a_failing_write_is_named_the_rest_still_run_and_sync_exits_1(self):
+        for project, slug, numbers, closed_base in self.WORLDS:
+            with self.subTest(project=project):
+                issues, items = self.standard_world(project, slug, numbers, closed_base)
+                bad_edits = [issues[2]["url"], issues[6]["url"]]     # a Status drift and a Priority drift
+                bad_add = issues[11]["url"]                          # a missing issue
+                failing = [{"contains": ["project", "item-edit", url], "stderr": FAILED_SCOPE, "exit": 1}
+                           for url in bad_edits]
+                failing.append({"contains": ["project", "item-add", bad_add],
+                                "stderr": "GraphQL: Could not add item\n", "exit": 1})
+                self.build(items, failing)
+                expected = expected_writes(project, issues, items)
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                rest = [w for w in expected if w[2]["url"] != bad_add]
+                self.assertWritesEqual(rest + [item_add(project, bad_add)],
+                                       "every other write is still attempted; a failed add gets no edit")
+                for url in bad_edits + [bad_add]:
+                    self.assertTrue(self.change_lines(p.stderr, url), f"{url} is named on stderr\n{p.stderr}")
+
+    def test_a_failing_board_read_is_one_line_and_writes_nothing(self):
+        for project in ("rjeskuri/7", "acme-org/23"):
+            with self.subTest(project=project):
+                issues, items = rows_world("rjeskuri/alpha", [3, 4, 5], SYNC_ROWS[2:5])
+                self.add_repo("main", self.repo, "rjeskuri/alpha", issues)
+                self.build(items, [{"match": ["project", "item-list"], "stderr": FAILED_SCOPE, "exit": 1}])
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertOneLineError(p, "item-list")
+                self.assertEqual(self.writes(), [])
+
+    # ------------------------------------------------------------------ gaps the test-breaker named: the issue
+    # list's default cap, stale labels on board items, odd status labels, a board larger than the item-list read
+    def test_every_open_issue_is_synced_past_gh_issue_lists_default_of_30(self):
+        """The fake gh issue list returns at most --limit issues (default 30), like gh."""
+        for project, slug, numbers in (("rjeskuri/7", "rjeskuri/alpha", list(range(1, 38))),
+                                       ("acme-org/23", "acme-org/widgets", [500 - 4 * i for i in range(41)])):
+            with self.subTest(project=project, issues=len(numbers)):
+                rows = [SYNC_ROWS[i % len(SYNC_ROWS)] for i in range(len(numbers))]
+                issues, items = rows_world(slug, numbers, rows)
+                self.add_repo("main", self.repo, slug, issues)
+                self.build(items)
+                expected = expected_writes(project, issues, items)
+                late = {it["url"] for it in issues[30:]}
+                self.assertTrue([w for w in expected if w[2]["url"] in late], "issues past 30 need writes")
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertWritesEqual(expected, "every open issue, not just the first 30")
+
+    def test_labels_come_from_the_issue_not_the_board_items_stale_copy(self):
+        cases = [("rjeskuri/7", "rjeskuri/alpha", 17, ["task", "status:blocked"], ["task", "status:ready"],
+                  "Ready", "Normal", [("Status", "Blocked")]),
+                 ("acme-org/23", "acme-org/widgets", 230, ["task", "status:ready"], ["task", "status:blocked"],
+                  "Blocked", "Normal", [("Status", "Ready")]),
+                 ("someone/1", "someone/tools", 5, ["task", "status:in-review"],
+                  ["task", "status:in-review", "priority:high"], "In review", "High", [("Priority", "Normal")]),
+                 ("rjeskuri/12", "rjeskuri/beta", 88, ["bug", "status:ready", "priority:high"], ["bug", "status:ready"],
+                  "Ready", "Normal", [("Priority", "High")])]
+        for project, slug, number, issue_labels, item_labels, status, priority, fields in cases:
+            with self.subTest(project=project, number=number):
+                it = {"number": number, "title": f"T {number}", "url": f"https://github.com/{slug}/issues/{number}",
+                      "labels": [{"name": n} for n in issue_labels], "state": "OPEN"}
+                self.add_repo("main", self.repo, slug, [it])
+                self.build([board_item(slug, number, status, priority, labels=item_labels)])
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(self.writes(), [item_edit(project, it["url"], f, v) for f, v in fields])
+
+    def test_an_unknown_or_doubled_status_label_is_one_warning_and_no_status_write(self):
+        cases = [("rjeskuri/7", "rjeskuri/alpha", [21, 22, 23, 24, 25]),
+                 ("acme-org/23", "acme-org/widgets", [310, 9, 144, 2, 77])]
+        for project, slug, (done, foo, double, plain, highdone) in cases:
+            with self.subTest(project=project):
+                odd = {done: ["task", "status:done"], foo: ["task", "status:foo"],
+                       double: ["task", "status:ready", "status:blocked"],
+                       highdone: ["task", "status:done", "priority:high"]}
+                issues = [{"number": n, "title": f"T {n}", "url": f"https://github.com/{slug}/issues/{n}",
+                           "labels": [{"name": x} for x in labels], "state": "OPEN"} for n, labels in odd.items()]
+                issues.append(sync_issue(slug, plain, "task", "in-review", False))
+                items = [board_item(slug, n, "In progress", "Normal", labels=odd[n]) for n in odd]
+                items.append(board_item(slug, plain, "Ready", "Normal", labels=["task", "status:in-review"]))
+                self.add_repo("main", self.repo, slug, issues)
+                self.build(items)
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                url = f"https://github.com/{slug}/issues/"
+                self.assertWritesEqual([item_edit(project, url + str(highdone), "Priority", "High"),
+                                        item_edit(project, url + str(plain), "Status", "In review")],
+                                       "no Status write for an odd status label; Priority still follows")
+                warnings = [line for line in p.stderr.splitlines() if line.strip()]
+                self.assertEqual(len(warnings), len(odd), p.stderr)
+                for n in odd:
+                    self.assertEqual(len(self.change_lines(p.stderr, url + str(n))), 1, f"#{n}\n{p.stderr}")
+                self.assertEqual(self.change_lines(p.stderr, url + str(plain)), [], p.stderr)
+
+    def test_a_truncated_board_adds_nothing_fixes_drift_warns_with_the_count_and_exits_1(self):
+        for project, slug, numbers, total in (("rjeskuri/7", "rjeskuri/alpha", list(range(3, 21)), 1437),
+                                              ("acme-org/23", "acme-org/widgets", [101 + 7 * i for i in range(18)],
+                                               1002)):
+            with self.subTest(project=project, total=total):
+                issues, items = rows_world(slug, numbers)
+                self.add_repo("main", self.repo, slug, issues)
+                self.build(items, total=total)
+                on_board = {i["content"]["url"] for i in items}
+                expected = [w for w in expected_writes(project, issues, items) if w[2]["url"] in on_board]
+                self.assertTrue(expected)
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertFalse([w for w in self.writes() if w[0] == "item-add"], "no add from a partial board")
+                self.assertWritesEqual(expected, "drift on the items it has is still fixed")
+                warnings = [line for line in p.stderr.splitlines() if line.strip()]
+                self.assertEqual(len(warnings), 1, p.stderr)
+                self.assertIn(str(total), warnings[0])
+
+    # ------------------------------------------------------------------ the #74 review
+    def test_an_unset_priority_counts_as_normal(self):
+        """Only High against Normal is Priority drift; an unset board Priority is Normal. Hand-written cases."""
+        for project, slug, number, high, board_priority, fields in (
+                ("rjeskuri/7", "rjeskuri/alpha", 12, False, UNSET, []),
+                ("acme-org/23", "acme-org/widgets", 230, False, UNSET, []),
+                ("someone/1", "someone/tools", 5, True, UNSET, [("Priority", "High")]),
+                ("rjeskuri/12", "rjeskuri/beta", 77, True, "Normal", [("Priority", "High")]),
+                ("acme-org/4", "acme-org/gears", 3, False, "High", [("Priority", "Normal")]),
+                ("someone/30", "someone/stuff", 41, False, "Normal", []),
+                ("rjeskuri/7", "rjeskuri/alpha", 99, True, "High", [])):
+            with self.subTest(project=project, number=number, high=high, board=board_priority):
+                issues, items = rows_world(slug, [number], [("task", "in-review", high, "In review", board_priority)])
+                self.add_repo("main", self.repo, slug, issues)
+                self.build(items)
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                url = f"https://github.com/{slug}/issues/{number}"
+                self.assertEqual(self.writes(), [item_edit(project, url, f, v) for f, v in fields])
+                self.assertEqual(len(self.change_lines(p.stdout, url)), len(fields), p.stdout)
+
+    def test_all_projects_warns_once_per_unusable_registered_path_and_still_syncs_the_rest(self):
+        project = "acme-org/23"
+        alpha, widgets = self.new_repo("alpha"), self.new_repo("widgets")
+        missing = os.path.join(self.tmp, "gone-away")
+        plain = self.mk("not-a-repo")
+        no_remote = self.mk("no-remote")
+        subprocess.run([GIT, "-C", no_remote, "-c", "init.defaultBranch=main", "init", "-q"], env=self.env(), check=True)
+        a_issues, a_items = rows_world("rjeskuri/alpha", [5, 6, 7, 8], [SYNC_ROWS[2], SYNC_ROWS[6], SYNC_ROWS[10],
+                                                                       SYNC_ROWS[0]])
+        w_issues, w_items = rows_world("acme-org/widgets", [5, 6, 7], [SYNC_ROWS[7], SYNC_ROWS[17], SYNC_ROWS[1]])
+        self.add_repo("alpha", alpha, "rjeskuri/alpha", a_issues)
+        self.add_repo("widgets", widgets, "acme-org/widgets", w_issues)
+        items = a_items + w_items
+        expected = expected_writes(project, a_issues, items) + expected_writes(project, w_issues, items)
+        for order in ([missing, alpha, plain, no_remote, widgets], [plain, widgets, no_remote, alpha, missing]):
+            with self.subTest(order=[os.path.basename(p) for p in order]):
+                self.registry(order)
+                self.build(items)
+                p = self.sync("--all-projects", HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertWritesEqual(expected, "the usable repositories are still synced")
+                for bad in (missing, plain, no_remote):
+                    named = [line for line in p.stderr.splitlines() if bad in line]
+                    self.assertEqual(len(named), 1, f"one warning naming {bad}\n{p.stderr}")
+
+    def test_an_issue_list_at_its_limit_of_1000_warns_and_exits_1(self):
+        project, slug = "rjeskuri/7", "rjeskuri/alpha"
+        for count, code in ((1000, 1), (999, 0)):
+            with self.subTest(count=count):
+                rows = [("task", "ready", False, "Ready", "Normal")] * count
+                issues, items = rows_world(slug, list(range(1, count + 1)), rows)
+                self.add_repo("main", self.repo, slug, issues)
+                self.build(items)
+                p = self.sync(HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, code, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(self.writes(), [])
+                if code:
+                    self.assertIn("1000", p.stderr)
+                else:
+                    self.assertEqual(p.stderr.strip(), "")
+
+    def test_all_projects_with_no_registered_project_says_so_and_exits_0(self):
+        registry = os.path.join(self.home, ".claude", "harness", "projects.json")
+        for what in ("empty registry", "no registry file"):
+            with self.subTest(what=what):
+                if what == "empty registry":
+                    self.registry([])
+                elif os.path.exists(registry):
+                    os.unlink(registry)
+                self.build([board_item("rjeskuri/alpha", 4, "Ready", "Normal")])
+                p = self.sync("--all-projects", HARNESS_PROJECT="rjeskuri/7")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("no registered projects", p.stdout.lower())
+                self.assertEqual(self.writes(), [])
+
+    def test_repo_and_all_projects_together_is_an_error(self):
+        self.add_repo("main", self.repo, "rjeskuri/alpha", [sync_issue("rjeskuri/alpha", 3, "task", "ready", False)])
+        self.registry([self.repo])
+        self.build([])
+        for argv in (["--all-projects", "--repo", self.repo], ["--repo", self.repo, "--all-projects", "--dry-run"]):
+            with self.subTest(argv=argv):
+                p = self.sync(*argv, HARNESS_PROJECT="rjeskuri/7")
+                self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(self.writes(), [])
+
+
+class ProjectCheck(BoardTest):
+    """`harness-board project check`: gh project field-list N --owner O --format json; Status needs Ready,
+    In progress, In review, Blocked, Needs input and Done, Priority needs High and Normal, by name. Complete:
+    exit 0. Otherwise each missing field or option is named and the exit is 1."""
+
+    STATUS = ["Ready", "In progress", "In review", "Blocked", "Needs input", "Done"]
+    PRIORITY = ["High", "Normal"]
+
+    def fields(self, status=STATUS, priority=PRIORITY, extra=()):
+        """A field-list as gh 2.99.0 prints it; None leaves the field out."""
+        def plain(name, n):
+            return {"id": f"PVTF_x{n}", "name": name, "type": "ProjectV2Field"}
+
+        def select(name, n, options):
+            return {"id": f"PVTSSF_x{n}", "name": name, "type": "ProjectV2SingleSelectField",
+                    "options": [{"id": f"{n}{i:06x}", "name": o} for i, o in enumerate(options)]}
+        out = [plain("Title", 1), plain("Assignees", 2)]
+        if status is not None:
+            out.append(select("Status", 3, status))
+        out += [plain("Labels", 4), plain("Repository", 5), plain("Parent issue", 6), plain("Sub-issues progress", 7)]
+        if priority is not None:
+            out.append(select("Priority", 8, priority))
+        out += [select(name, 9 + i, opts) for i, (name, opts) in enumerate(extra)]
+        return {"fields": out, "totalCount": len(out)}
+
+    def check(self, fields, project, **env):
+        self.scenario([REPO_VIEW, {"match": ["project", "field-list"], "stdout_json": fields}])
+        return self.board("project", "check", HARNESS_PROJECT=project, **env)
+
+    def assertFieldListed(self, project):
+        owner, number = project.rsplit("/", 1)
+        reads = [project_call(a) for a in self.calls() if a[:2] == ["project", "field-list"]]
+        self.assertEqual(len(reads), 1, self.calls())
+        sub, pos, opts = reads[0]
+        self.assertEqual((pos, opts.get("owner"), opts.get("format")), ([number], owner, "json"), reads)
+        self.assertFalse([a for a in self.calls() if a[:2] in (["project", "item-add"], ["project", "item-edit"])])
+
+    def test_a_complete_board_passes(self):
+        cases = [("rjeskuri/7", self.fields()),
+                 ("acme-org/23", self.fields(status=["Backlog"] + self.STATUS[::-1], priority=["Low", "Normal", "High"],
+                                             extra=[("Size", ["S", "M", "L"])])),
+                 ("someone/1", self.fields(status=self.STATUS[3:] + self.STATUS[:3]))]
+        for project, fields in cases:
+            with self.subTest(project=project):
+                p = self.check(fields, project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertFieldListed(project)
+
+    def test_each_missing_field_or_option_is_named_and_check_exits_1(self):
+        s = self.STATUS
+        cases = [("rjeskuri/7", self.fields(status=[o for o in s if o != "Needs input"]), ["Needs input"]),
+                 ("acme-org/23", self.fields(status=["Ready", "In progress", "In review", "Done"]),
+                  ["Blocked", "Needs input"]),
+                 ("someone/1", self.fields(priority=None), ["Priority"]),
+                 ("rjeskuri/12", self.fields(priority=["High", "Low"]), ["Normal"]),
+                 ("acme-org/4", self.fields(status=["Ready", "Doing", "In review", "Blocked", "Needs input", "Done"],
+                                            priority=["Normal"]), ["In progress", "High"]),
+                 ("someone/30", self.fields(status=None), ["Status"])]
+        for project, fields, missing in cases:
+            with self.subTest(project=project, missing=missing):
+                p = self.check(fields, project)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                output = p.stdout + p.stderr
+                for name in missing:
+                    self.assertIn(name, output)
+                self.assertFieldListed(project)
+
+    def test_options_that_are_present_are_not_reported(self):
+        p = self.check(self.fields(status=[o for o in self.STATUS if o != "Needs input"]), "acme-org/23")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        output = p.stdout + p.stderr
+        for present in ("In review", "Blocked", "High", "Normal"):
+            self.assertNotIn(present, output)
+        p = self.check(self.fields(priority=["High"]), "rjeskuri/7")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("Normal", p.stdout + p.stderr)
+        for present in self.STATUS[1:5]:
+            self.assertNotIn(present, p.stdout + p.stderr)
+
+    def test_a_failing_field_list_is_one_line_and_exit_1(self):
+        self.scenario([REPO_VIEW, {"match": ["project", "field-list"], "stderr": FAILED_SCOPE, "exit": 1}])
+        p = self.board("project", "check", HARNESS_PROJECT="rjeskuri/7")
+        self.assertOneLineError(p, "field-list")
+
+
+class ProjectNeedsTheSetting(BoardTest):
+    """check and sync need a project: unset, empty or not OWNER/NUMBER is an error naming HARNESS_PROJECT, before
+    any gh project call."""
+
+    def test_check_and_sync_without_a_valid_setting_fail_naming_it(self):
+        settings = os.path.join(self.home, ".claude", "settings.json")
+        for env, settings_text in (({}, None), ({}, json.dumps({"env": {"OTHER": "1"}})),
+                                   ({"HARNESS_PROJECT": ""}, json.dumps({"env": {"HARNESS_PROJECT": "rjeskuri/7"}})),
+                                   ({"HARNESS_PROJECT": "rjeskuri"}, None), ({}, json.dumps(
+                                       {"env": {"HARNESS_PROJECT": "acme-org/x"}}))):
+            if settings_text is None and os.path.exists(settings):
+                os.unlink(settings)
+            elif settings_text is not None:
+                write(settings, settings_text)
+            for argv in (["project", "check"], ["project", "sync"], ["project", "sync", "--dry-run"],
+                         ["project", "sync", "--all-projects"]):
+                with self.subTest(env=env, settings=settings_text, argv=argv):
+                    self.scenario([REPO_VIEW, {"match": ["issue", "list"], "stdout_json": []},
+                                   {"match": ["project"], "stdout_json": {"fields": [], "items": [],
+                                                                         "totalCount": 0}}])
+                    p = self.board(*argv, **env)
+                    self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
+                    self.assertIn("HARNESS_PROJECT", p.stderr)
+                    self.assertFalse([a for a in self.calls() if a[:1] == ["project"]], self.calls())
+
+    def test_help_for_the_project_subcommands(self):
+        for argv in (["project", "--help"], ["project", "check", "--help"], ["project", "sync", "--help"]):
+            p = self.board(*argv)
+            self.assertEqual(p.returncode, 0, (argv, p.stderr))
+            self.assertIn("usage:", p.stdout)
+        p = self.board("project", "sync", "--help")
+        for option in ("--dry-run", "--all-projects", "--repo"):
+            self.assertIn(option, p.stdout)
 
 
 # ======================================================================= answers, epic-check, board
