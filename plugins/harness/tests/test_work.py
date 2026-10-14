@@ -2371,6 +2371,118 @@ class EndedEarly(WorkTest):
         self.assertNotIn("#92", started[35])
         self.assertNotIn("#91", started[35])
 
+    # ---- #57: bg is the default venue, so a bg run that ends `done` is judged like a headless `ok`
+    def bg_runs(self, cases):
+        """cases: {n: (bg id, `claude agents` state)}. Writes an unended bg run record for each ticket (repo proj,
+        branch t/<n>-x, no pid, no log) and returns the FAKECLAUDE_AGENTS listing that reports each state. The
+        listing gives no exitCode, as `claude agents --json` documents none."""
+        for n, (bg_id, _state) in cases.items():
+            self.write_run(n, venue="bg", bg_id=bg_id, log=None)
+        return json.dumps([{"id": bg_id, "kind": "background", "state": state, "cwd": self.repo,
+                            "name": f"proj #{n} {TITLE}"} for n, (bg_id, state) in cases.items()])
+
+    def test_a_done_bg_run_on_an_in_progress_ticket_without_a_ready_pr_ended_early(self):
+        # The same facts that make a headless `ok` early make a bg `done` early: the issue OPEN, status:in-progress,
+        # and no ready PR of its branch in any state (none, or only drafts). The early run keeps the newest open
+        # draft as draft_pr. Anything else that ends `done` stays `ok`; `failed` and `stopped` are never upgraded,
+        # whatever the board says. gh failing for a done run leaves it `ok` (the facts are missing), as headless.
+        in_review = ("task", "status:in-review", "size:S", "risk:low")
+        needs_input = ("task", "status:needs-input", "size:S", "risk:low")
+        merged = [{"number": 95, "state": "MERGED", "isDraft": False}]
+        cases = {   # n: (bg id, agents state, labels, open PRs, PRs of any state, outcome, state shown)
+            40: ("s-9f1", "done", IN_PROGRESS, [], [], "early", "ended early (no PR)"),
+            41: ("s-0a7", "done", IN_PROGRESS, draft(91), draft(91), "early", "ended early (draft PR #91)"),
+            42: ("s-c3e", "done", IN_PROGRESS, draft(57), draft(57), "early", "ended early (draft PR #57)"),
+            43: ("s-b12", "done", IN_PROGRESS, ready_pr(92), ready_pr(92), "ok", "ended ok"),
+            44: ("s-77d", "done", in_review, [], [], "ok", "ended ok"),
+            45: ("s-e05", "done", in_review, draft(93), draft(93), "ok", "ended ok"),
+            46: ("s-5aa", "done", IN_PROGRESS, [], [], "ok", "ended ok"),          # the issue is CLOSED (below)
+            47: ("s-2d4", "done", IN_PROGRESS, [], merged, "ok", "ended ok"),
+            51: ("s-6c0", "done", needs_input, [], [], "ok", "ended ok"),
+            52: ("s-31f", "done", IN_PROGRESS, [], [], "ok", "ended ok"),          # gh issue view fails (below)
+            48: ("s-d8b", "failed", IN_PROGRESS, [], [], "error", "ended error"),
+            49: ("s-4e9", "failed", IN_PROGRESS, draft(94), draft(94), "error", "ended error"),
+            50: ("s-a60", "stopped", IN_PROGRESS, [], [], "stopped", "ended stopped"),
+        }
+        agents = self.bg_runs({n: c[:2] for n, c in cases.items()})
+        self.write_scenario({n: c[2:5] for n, c in cases.items()}, states={46: "CLOSED"}, failing={52: "issue"})
+
+        p = self.work("runs", "--sweep", "--json", env=self.env(FAKECLAUDE_AGENTS=agents))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rows = {r["ticket"]: r for r in json.loads(p.stdout)}
+        expected = {n: c[5] for n, c in cases.items()}
+        shown = {n: c[6] for n, c in cases.items()}
+        self.assertEqual({n: rows[n]["outcome"] for n in rows}, expected)
+        self.assertEqual({n: rows[n]["state"] for n in rows}, shown)
+        for n in cases:
+            self.assertTrue(rows[n]["ended_at"], rows[n])
+
+        saved = {r["ticket"]: r for r in self.run_records()}
+        self.assertEqual({n: r["outcome"] for n, r in saved.items()}, expected)
+        self.assertEqual({n: saved[n].get("draft_pr") for n in (40, 41, 42)}, {40: None, 41: 91, 42: 57})
+        for n in (43, 44, 45, 46, 47, 48, 49, 50, 51, 52):         # only an early run names a draft
+            self.assertIsNone(saved[n].get("draft_pr"), saved[n])
+
+        # Without a sweep, from the saved records alone: the same states, in --json and in the table.
+        self.assertEqual({r["ticket"]: r["state"] for r in self.ok_json("runs", "--json")}, shown)
+        lines = self.run_lines()
+        for n, state in shown.items():
+            with self.subTest(ticket=n):
+                self.assertIn(state, lines[n])
+                self.assertEqual("ended early" in lines[n], expected[n] == "early", lines[n])
+        self.assertIn("api: available", self.ok("budget", "status").stdout)   # not a budget failure
+
+    def test_only_the_board_and_the_pr_decide_a_bg_early_never_the_ticket_or_the_session_id(self):
+        # Each ticket keeps its bg id across the passes while its agents state, labels and PRs rotate, so neither the
+        # ticket number nor the session id can tell early from ok; a done run's outcome follows the board and the
+        # branch's PRs, a failed run stays error.
+        states = [   # (agents state, labels, open PRs, PRs of any state, outcome, state shown)
+            ("done", IN_PROGRESS, [], [], "early", "ended early (no PR)"),
+            ("done", IN_PROGRESS, draft(66), draft(66), "early", "ended early (draft PR #66)"),
+            ("done", IN_PROGRESS, ready_pr(67), ready_pr(67), "ok", "ended ok"),
+            ("failed", IN_PROGRESS, [], [], "error", "ended error"),
+            ("done", ("task", "status:in-review", "size:S", "risk:low"), draft(68), draft(68), "ok", "ended ok"),
+        ]
+        tickets = {9: "s-x1", 23: "s-k4", 58: "s-q7", 104: "s-m2", 311: "s-z9"}
+        for k in range(len(states)):
+            self.fresh()
+            plan = {n: states[(j + k) % len(states)] for j, n in enumerate(tickets)}
+            agents = self.bg_runs({n: (bg_id, plan[n][0]) for n, bg_id in tickets.items()})
+            self.write_scenario({n: s[1:4] for n, s in plan.items()})
+            rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json",
+                                                         env=self.env(FAKECLAUDE_AGENTS=agents))}
+            with self.subTest(rotation=k):
+                self.assertEqual({n: rows[n]["outcome"] for n in rows}, {n: s[4] for n, s in plan.items()})
+                self.assertEqual({n: rows[n]["state"] for n in rows}, {n: s[5] for n, s in plan.items()})
+                self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()},
+                                 {n: s[4] for n, s in plan.items()})
+
+    def test_dispatch_runs_a_bg_early_ticket_again_after_early(self):
+        # One dispatch sweeps four bg runs and plans the redispatch: #40 (done, no PR) and #41 (done, only draft #91)
+        # go again after early, the draft named; #43 (done, ready PR) is not run again; #48 (failed) goes again after
+        # error, not early.
+        cases = {40: ("s-9f1", "done", []), 41: ("s-0a7", "done", draft(91)),
+                 43: ("s-b12", "done", ready_pr(92)), 48: ("s-d8b", "failed", [])}
+        agents = self.bg_runs({n: c[:2] for n, c in cases.items()})
+        self.write_scenario({n: (IN_PROGRESS, c[2], c[2]) for n, c in cases.items()})
+
+        p = self.ok("dispatch", "--dry-run", env=self.env(FAKECLAUDE_AGENTS=agents))
+        starts = {int(m.group(1)): line for line in p.stdout.splitlines()
+                  for m in [re.match(r"would start #(\d+) ", line)] if m}
+        self.assertEqual(sorted(starts), [40, 41, 48], p.stdout)
+        self.assertIn("would start #40 Add the board tool (again after early)", starts[40])
+        self.assertIn("(again after early", starts[41])
+        self.assertIn("#91", starts[41])
+        self.assertIn("(again after error)", starts[48])
+        self.assertNotIn("early", starts[48])
+        self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()},
+                         {40: "early", 41: "early", 43: "ok", 48: "error"})
+        self.assertEqual(next(r for r in self.run_records() if r["ticket"] == 41).get("draft_pr"), 91)
+
+        data = self.ok_json("dispatch", "--dry-run", "--json", env=self.env(FAKECLAUDE_AGENTS=agents))
+        self.assertEqual({row["number"]: row.get("again") for row in data["plan"]},
+                         {40: "early", 41: "early", 48: "error"})
+
 
 def draft(number):
     """`pr list` rows: one open draft pull request."""
