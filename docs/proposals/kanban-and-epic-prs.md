@@ -5,7 +5,7 @@ Ticket #54, epic #52. Written 2026-10-14 against gh 2.99.0 and the code on main 
 ## Recommendation in short
 
 1. **Board: add a GitHub Projects board as a mirrored view and keep labels as the source of truth.** Use one user-owned project across all repositories. Status is the column field. The lanes are grouped by Parent issue (the epic), with Priority and Repository as alternate views. `harness-board` writes Status on every status change, one `gh project item-edit` call each, and never reads the board, except in a `project sync` command that repairs drift. No reader of labels changes: `ready`, `board`, session_brief, standup, digest and dispatch all stay as they are.
-2. **Epic pull requests: opt-in per epic (an `epic-branch` flag), not the new default.** Task branches cut from and merge into `e/<epic>-<slug>`. The per-task loop (tests first, Fable review, CI, Resolution) is unchanged. Ryan reviews and lands one pull request from the epic branch to main, merged with a merge commit so each task's squash sha stays on main. A named checkpoint lands a snapshot branch `cp/E-K`, which closes nothing.
+2. **Epic pull requests: opt-in per epic (an `epic-branch` flag), not the new default.** Task branches cut from and merge into `e/<epic>-<slug>`. The per-task loop (tests first, Fable review, CI, Resolution) is unchanged. Ryan reviews and lands one pull request from the epic branch to main, merged with a merge commit so each task's squash sha stays on main. No PR from the epic branch exists until the epic completes. A named checkpoint lands the epic branch the same way, without closing the epic, and re-cuts it from main.
 3. **Decisions Ryan has to make first** (see [Decisions for Ryan](#decisions-for-ryan)):
    - Whether agents may merge task pull requests into an epic branch. Without that, epic pull requests add review load rather than remove it.
    - Granting the `project` token scope.
@@ -62,7 +62,7 @@ Not confirmed:
 | Closing keywords "are interpreted only when the pull request targets the repository's *default* branch. If the pull request targets *any other branch* … merging the PR has no effect on the issues." | https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue |
 | When a merged pull request's head branch is deleted, GitHub retargets every open pull request based on it to that pull request's base. | https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/merging-a-pull-request; https://github.blog/changelog/2020-05-19-pull-request-retargeting |
 | "Automatically delete head branches" deletes head branches after merge. The page does not exempt a branch that is the base of open pull requests (**UNVERIFIED** either way). | https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-the-automatic-deletion-of-branches |
-| `PUT /repos/O/R/pulls/N/update-branch` "Updates the pull request branch with the latest upstream changes by merging HEAD from the base branch". It returns 202 (accepted; the merge is queued and happens asynchronously) and 422 for "Validation failed, or the endpoint has been spammed", a head-sha mismatch included. **UNVERIFIED:** the response to a merge conflict. | https://docs.github.com/en/rest/pulls/pulls#update-a-pull-request-branch |
+| `PUT /repos/O/R/pulls/N/update-branch` "Updates the pull request branch with the latest upstream changes by merging HEAD from the base branch". It returns 202 (accepted; the merge is queued and happens asynchronously) and 422 for "Validation failed, or the endpoint has been spammed", a head-sha mismatch included. Not used: sync merges with plain git (step 11). | https://docs.github.com/en/rest/pulls/pulls#update-a-pull-request-branch |
 | Protected branches and rulesets are unavailable on private repositories under GitHub Free, as design.md already records. | https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches; https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets |
 | rjeskuri/Harness has merge commits, squash and rebase allowed, and `deleteBranchOnMerge` true. | `gh repo view --json ...` (2026-10-14) |
 
@@ -126,51 +126,59 @@ Options considered:
 
 1. **Opt in.** The planner, or Ryan, labels the epic `epic-branch`, a new flag. Epics without it run exactly as today.
 2. **`harness-work epic start E`:**
-   - Creates `e/E-<slug>` from `origin/main` and pushes it.
-   - Opens a draft pull request from `e/E-<slug>` to `main`, titled `<epic title> (#E)`, with a body of `Closes #E` and the task list.
-   - Comments on the epic.
+   - Creates `e/E-<slug>` from `origin/main` and pushes it through the tool's own `git` subprocess.
+   - Opens **no** pull request. GitHub refuses a pull request whose head has no commits beyond its base ("No commits between"), and a long-lived epic PR has other problems (step 10). The epic's running diff is the compare view `https://github.com/O/R/compare/main...e/E-<slug>`. **UNVERIFIED:** the exact refusal text, though the design no longer depends on it.
+   - Comments on the epic with the branch name and that compare link.
    - Run by `/harness:plan` on approval, or lazily by the first `harness-work start` of a task.
-3. **Task start.** `harness-work start N` for a task whose parent carries `epic-branch` cuts `t/N-<slug>` from `origin/e/E-<slug>`, which `git ls-remote` resolves by the `e/E-` prefix. Worktrees stay per task, as today.
+3. **Task start.** `harness-work start N` for a task whose parent carries `epic-branch`:
+   - Runs `epic sync E` first (step 11; a no-op when the epic branch already contains main).
+   - Cuts `t/N-<slug>` from `origin/e/E-<slug>`, found by the `e/E-` prefix with its trailing dash, so `e/5-` never matches `e/52-`.
+   - Worktrees stay per task, as today.
 4. **Red run.** `harness-red check` defaults its base to the epic branch, via the merge-base with `origin/e/E-*`. Today it is `origin/main`.
 5. **Open.** `harness-pr open N` uses `--base e/E-<slug>`. The body keeps `Closes #N`, but GitHub ignores it on a non-default base. `ready` and `land` therefore take the ticket from the head branch `t/N-` when `closingIssuesReferences` is empty. `TICKET_BRANCH` already exists in harness-pr.
 6. **Per-task review and CI are unchanged.** The reviewer, the findings gate, `checks --wait` and ultrareview for risk:high all run on the task pull request.
    - CI already runs: both `.github/workflows/ci.yml` and `templates/ci.yml` trigger on `pull_request:` with no branch filter.
 7. **Task land into the epic branch.** `harness-pr land P` on a pull request whose base is `e/*`:
-   - Squash-merges into the epic branch and removes the worktree and branch, as today.
+   - **Merge method, squash by default.** It uses `--merge` instead when the head brings commits from main that the base lacks, which is what a sync-conflict chore does (step 11). The test is `git rev-list --count origin/main ^<head sha>` being smaller than `git rev-list --count origin/main ^origin/<base>`. A squash would drop main's parentage, and the epic branch would keep showing main's changes as its own.
+   - Removes the worktree and branch, as today.
    - Closes the ticket itself (`land_ticket` already does when GitHub has not).
    - Posts the Resolution with one added line, `Base: e/E-<slug>`, and the usual `Landed in <sha>`.
    - Calls `epic-check`.
    - Who runs this land is the main decision (D1).
-8. **Epic complete.** With an `epic-branch` epic, `epic-check` no longer closes the epic. When all tasks are closed, it marks the epic pull request ready, sets the epic `status:in-review`, and notifies Ryan.
-9. **Epic land.** `/harness:land <epic PR>` runs `harness-pr land` with three differences:
-   - **Merge commit**: `gh pr merge --merge`, not `--squash`, for any head on `e/*` or `cp/*`. Each task's squash commit then reaches main with its sha intact, so every task's `Landed in <sha>` stays true on main. Squashing the epic would orphan those shas.
-   - **Refusal**: it refuses while any open pull request has the epic branch as its base. Deleting the branch would retarget them to main (fact above), so an unfinished task would silently become a main-bound pull request.
-   - **Epic Resolution**: it posts a Resolution on the epic that lists each task's Resolution title, squash sha and pull request. The epic closes through `Closes #E`, because that pull request targets main.
-10. **Checkpoint.** `harness-pr checkpoint E [--name K]`:
-    - Pushes the snapshot branch `cp/E-K` at the epic branch's tip and opens a pull request from it to main.
-    - The snapshot lives outside the `e/` namespace on purpose. `start` and `harness-red` find the epic branch by the `e/E-` prefix, and a name like `e/E-<slug>-cpK` would also match that prefix.
-    - Ryan lands the snapshot with a merge commit; auto-delete removes only the snapshot.
-    - The checkpoint PR body closes nothing: no `Closes #E`, and no epic Resolution. It names the epic and the tasks it carries. The epic closes only through its own PR.
-    - The epic branch keeps going. The next sync merges main back in, a trivial merge.
-    - Merging the epic branch itself at a checkpoint would get it deleted by `deleteBranchOnMerge`, which is on in every scaffolded repository.
-11. **Sync.** `harness-work epic sync E` brings main into the epic branch:
-    - Calls `PUT repos/O/R/pulls/<epic PR>/update-branch` with `expected_head_sha` set to the tip it read. This is a server-side merge with no local checkout of `e/*`.
-    - Runs before `epic start` hands out a task base, and before the epic pull request is marked ready.
-    - **A 202 only queues the merge.** Sync then polls until `origin/e/E-<slug>` moves past the sha it sent, or until the PR's `mergeable` settles. It cuts no task base before one of those happens.
-    - **A 422 is ambiguous.** It can mean a head-sha mismatch, the "endpoint has been spammed" rate limit, or a validation failure. Sync re-reads the tip and retries a bounded number of times.
-    - **Only a confirmed conflict files the chore.** A conflict is confirmed when `mergeable` is `CONFLICTING` and the tip has not moved. Sync then files a `chore` ticket "Merge main into e/E-<slug>". That ticket is worked in a worktree on a `t/` branch based on the epic branch, and lands like any task.
-    - **Anything else exits non-zero** and names the response, so the next sync tries again.
-    - **UNVERIFIED:** the exact update-branch response on a conflict.
+8. **Epic complete.** With an `epic-branch` epic, `epic-check` no longer closes the epic. When all tasks are closed, it runs `harness-pr epic open E`, which does the following:
+   - Runs `epic sync E`, then checks `git rev-list --count origin/main..origin/e/E-<slug>`.
+   - **When the count is 0** (everything already reached main through checkpoints): it opens no PR. The epic gets its Resolution and is closed directly.
+   - **Otherwise:** it opens a ready pull request from `e/E-<slug>` to `main`, titled `<epic title> (#E)`, with `Closes #E` and the task list. It sets the epic `status:in-review` and notifies Ryan.
+9. **Epic land.** `/harness:land <epic PR>` runs `harness-pr land`, which recognises an `e/*` head and does four things differently:
+   - **Merge commit**: `gh pr merge --merge`, not `--squash`. Each task's squash commit then reaches main with its sha intact, so every task's `Landed in <sha>` stays true on main. Squashing the epic would orphan those shas.
+   - **Refusal**: it refuses while any open pull request has the epic branch as its base, drafts included. Deleting the branch, through `--delete-branch` or auto-delete, would retarget them to main (fact above), so an unfinished task would silently become a main-bound pull request.
+   - **Completion** (the PR closes `#E`): it posts the epic Resolution, listing each task's Resolution title, squash sha and pull request. The epic closes through `Closes #E`, because that pull request targets main.
+   - **Checkpoint** (the PR closes nothing): see step 10.
+10. **Checkpoint.** `harness-pr epic open E --checkpoint K` opens the same kind of pull request from `e/E-<slug>` to main.
+    - The body names the epic, the checkpoint and the tasks it carries, and has no `Closes #E`.
+    - Ryan lands it with `/harness:land` as in step 9: merge commit, and the same refusal while task PRs are open against the epic branch.
+    - After the merge, `--delete-branch` (and `deleteBranchOnMerge`) remove `e/E-<slug>`. `land` then re-cuts `e/E-<slug>` from the new `origin/main` and pushes it through its own subprocess.
+    - It comments `Checkpoint K landed in <merge sha>` on the epic, and the epic stays open.
+    - Task branches cut from the old tip need nothing: that tip is now an ancestor of main and of the new epic branch, so their later PRs into `e/E-<slug>` show only their own commits.
+    - There is no snapshot branch and never a second open PR from the same head. The earlier `cp/E-K` design merged the epic tip into main while a long-lived epic PR stayed open. GitHub may then treat that PR as merged, deleting the branch, retargeting task PRs and closing `#E`. The design no longer depends on that behavior; it stays **UNVERIFIED**, with the experiment below.
+11. **Sync.** `harness-work epic sync E` brings main into the epic branch with plain git, run by the tool. It needs no pull request and no update-branch call.
+    - `git fetch origin`. If `git merge-base --is-ancestor origin/main origin/e/E-<slug>` succeeds, there is nothing to merge: it prints `e/E-<slug> already contains main` and exits 0.
+    - Otherwise it makes a detached worktree at `origin/e/E-<slug>` under `~/.claude/harness/repos/<key>/epic/E` and runs `git merge --no-ff origin/main` there.
+    - **Clean merge:** `git push origin HEAD:refs/heads/e/E-<slug>`, never forced. If the epic branch moved meanwhile (a task landed), the push is rejected as non-fast-forward, and sync fetches and redoes the merge once before failing. It then removes the worktree.
+    - **Conflict:** `git merge --abort`, remove the worktree, and file a `chore` ticket "Merge main into e/E-<slug>" with `no-tests` and the conflicting paths. It is worked on a `t/` branch cut from the epic branch, where the coder runs `git merge origin/main` and resolves (a merge on a `t/` branch is allowed by the guard). It lands into the epic branch by step 7's `--merge` rule, so main's ancestry is kept.
+    - Everything is synchronous and local: no queued server merge and no polling.
+    - **Where it runs:** at task start (step 3), before an epic or checkpoint PR opens (steps 8 and 10), and by hand.
+    - The hook never sees the tool's git calls, so the B1 push denial does not block it. A clean merge of main adds only reviewed main code, so it skips per-task review. Any conflict resolution goes through a reviewed chore PR.
 
 ### What changes in each tool
 
 | Piece | Change |
 |---|---|
-| `harness-board` | Adds the `epic-branch` flag to the label table. `epic-check` marks the epic pull request ready instead of closing, for flagged epics. `show --json` exposes `epic_branch`. |
-| `harness-work` | New `epic start E` and `epic sync E`. `start N` bases on the epic branch when the parent is flagged. The worktree layout is unchanged. |
+| `harness-board` | Adds the `epic-branch` flag to the label table. For flagged epics, `epic-check` runs `harness-pr epic open E` instead of closing; it closes directly when nothing is left to land. `show --json` exposes `epic_branch`. |
+| `harness-work` | New `epic start E` (branch only, no PR) and `epic sync E`. Sync is a local `git merge` in a tool-owned detached worktree, with a nothing-to-merge early return. `start N` syncs, then bases on the epic branch, when the parent is flagged. Ticket worktrees are unchanged. |
 | `harness-red` | Default `--base`: the epic branch for a task of a flagged epic, else `origin/main`. |
-| `harness-pr` | Changes to: <ul><li>`open`: `--base` from the ticket's epic.</li><li>`ready` and `land`: ticket from the head branch as a fallback.</li><li>`land`: merge method by base (squash into `e/*` or for a task to main; merge commit for an `e/*` or `cp/*` head into main) and the open-children refusal.</li></ul> Adds: <ul><li>the epic Resolution</li><li>`checkpoint`</li></ul> |
-| `hooks/branch_guard.py` | `PROTECTED` becomes a predicate: `main`, `master`, `e/*` or `cp/*`. <ul><li>**Linked worktrees.** Today a linked worktree is exempt: `protected_repo` returns None when the git dir differs from the common dir ("its branch is never main"), and `holder` exempts `.claude/worktrees/`. That premise fails for `e/*`. The guard instead denies creating such a checkout: `git worktree add` naming an `e/*` or `cp/*` branch, and `git switch`/`git checkout` of one, in any repository. No flow needs one, because conflict chores run on `t/` branches.</li><li>**Checkouts that already exist.** As a second line, `protected_repo` judges a linked worktree whose own branch is `e/*` or `cp/*` by the main rules, instead of returning None. `holder` stops exempting a `.claude/worktrees/` path whose worktree is on such a branch. A bare `git push` from there is then denied as rule (b) denies it on main.</li><li>**Pushes.** Every push whose destination names `e/*` or `cp/*` is denied, on any branch, creation included. The harness tools create, push and merge these branches through their own subprocesses, which the hook never sees.</li></ul> Force pushes are already denied everywhere. |
+| `harness-pr` | Changes to: <ul><li>`open`: `--base` from the ticket's epic.</li><li>`ready` and `land`: ticket from the head branch as a fallback.</li><li>`land`: <ul><li>merge method: squash a task into `e/*`, except `--merge` when the head brings main commits the base lacks; merge commit for an `e/*` head into main</li><li>the open-children refusal</li><li>after a checkpoint, re-cut the epic branch</li></ul></li></ul> Adds: <ul><li>`epic open E [--checkpoint K]`</li><li>the epic Resolution</li></ul> |
+| `hooks/branch_guard.py` | `PROTECTED` becomes a predicate: `main`, `master` or `e/*`. <ul><li>**Linked worktrees.** Today a linked worktree is exempt: `protected_repo` returns None when the git dir differs from the common dir ("its branch is never main"), and `holder` exempts `.claude/worktrees/`. That premise fails for `e/*`. The guard instead denies creating such a checkout: `git worktree add` naming an `e/*` branch, and `git switch`/`git checkout` of one, in any repository. No agent flow needs one. Conflict chores run on `t/` branches, and sync's detached worktree is made by the tool, which the hook never sees.</li><li>**Checkouts that already exist.** As a second line, `protected_repo` judges a linked worktree whose own branch is `e/*` by the main rules, instead of returning None. `holder` stops exempting a `.claude/worktrees/` path whose worktree is on such a branch. A bare `git push` from there is then denied as rule (b) denies it on main.</li><li>**Pushes.** Every push whose destination names `e/*` is denied, on any branch, creation included. The harness tools create, push and merge these branches through their own subprocesses, which the hook never sees.</li></ul> Force pushes are already denied everywhere. |
 | `hooks/tests_first.py`, `session_brief.py` | No change. Tasks are still on `t/` branches. |
 | Skills | <ul><li>`plan`: asks per epic whether to use an epic branch (default no).</li><li>`work`: `start` hides the base. Under D1, the loop gains a step after `harness-pr ready`: `harness-pr land P` for a task PR whose base is `e/*`.</li><li>`land`: lists epic and checkpoint pull requests separately and says "merge commit".</li></ul> |
 | `docs/design.md`, `user/CLAUDE.md` | <ul><li>The board section, the land section, and the interview note "no Projects board".</li><li>Under D1, three texts change together with the `work` skill, in ticket B4:<ul><li>design.md principle 3: "landing goes through a pull request the user merges"</li><li>the work-loop listing</li><li>user/CLAUDE.md "Never on main": "Only I merge" becomes "Only I merge to main; the harness merges task PRs into `e/*` after the gates".</li></ul></li></ul> |
@@ -179,12 +187,12 @@ Options considered:
 
 | | Today: one PR per task to main | Epic branch: task PRs into `e/*`, one PR to main |
 |---|---|---|
-| Agent cost | One Fable review and one CI run per task | <ul><li>Same per task.</li><li>Plus epic PR runs. Every push to `e/*` fires `pull_request` (synchronize) on the open epic PR. That is one extra CI run per task landing (each squash into `e/*`) and one per sync that moves the tip: about 2N runs plus one per sync, in place of N.</li><li>Plus, optionally, one Fable review of the whole epic diff. For a 5-task epic that is up to about 1,500 lines, roughly 5x one task review's tokens.</li></ul> |
+| Agent cost | One Fable review and one CI run per task | <ul><li>Same per task.</li><li>Plus one CI run per epic or checkpoint PR. No PR from `e/*` is open during the epic, and CI's `push` trigger covers only main, so task landings and syncs on `e/*` run nothing: about N+1 runs in place of N.</li><li>Each task PR's CI runs on its merge with the current `e/*`, so main's synced changes are exercised there.</li><li>Plus, optionally, one Fable review of the whole epic diff. For a 5-task epic that is up to about 1,500 lines, roughly 5x one task review's tokens.</li></ul> |
 | Ryan's review load | N land decisions, each about 300 lines, with a ticket beside it | <ul><li>D1 yes (agents land tasks): 1 decision over the cumulative diff.</li><li>D1 no: N+1 decisions, which is more than today.</li></ul> The per-task PRs, reviews and Resolutions stay available to read. |
 | Deploys and main churn | Every task reaches main and runs `deploy.yml` (push on main) | One deploy per epic or checkpoint. This is the real gain for live projects such as jotform-glow-sync. |
 | Conflict risk | Low: tasks branch from fresh main. Parallel sibling tasks conflict with each other. | <ul><li>Siblings conflict exactly as today, against `e/*` instead of main.</li><li>New: the epic branch drifts from main for the life of the epic. Mitigated by `epic sync`, cheap for a solo repository with one or two live epics.</li><li>New: the retarget hazard, handled by the land refusal.</li></ul> |
 | One bad task | Already on main, possibly deployed. Fix with a revert PR to main. | <ul><li>On `e/*` only. Fix with a revert or fix task into `e/*`; main is untouched.</li><li>A bad task found at the epic review is reverted on `e/*` before the epic lands.</li><li>Cost: head-of-line blocking. The good siblings wait for the bad one, unless a checkpoint lands them first.</li></ul> |
-| Abandoning the work | Each landed task stays; a revert per task | Close the epic PR; main never saw it. Good tasks can be salvaged by cherry-picking their squash shas. |
+| Abandoning the work | Each landed task stays; a revert per task | Leave `e/*` unmerged (close the epic PR if one is open); main never saw it. Good tasks can be salvaged by cherry-picking their squash shas. |
 | Tool complexity | Today's | About 300 to 500 more lines across harness-pr, harness-work, harness-board and branch_guard, plus their tests. |
 
 **Verdict.** The epic flow pays off only when D1 is yes, or when batching deploys matters. For the Harness repository itself (no deploy, small tasks), per-task PRs remain the better fit. That is why the flow should be opt-in per epic, not the new default.
@@ -196,7 +204,7 @@ Options considered:
   - Alternative: Ryan keeps merging every PR, and epic PRs only batch deploys.
 - **D2. The `project` scope.** Run `gh auth refresh -s project` once. Without it, the board part is off and `HARNESS_PROJECT` stays unset.
 - **D3. Board drags.** The next sync overwrites a drag (recommended). The alternative is two-way sync, which is option C and is rejected above.
-- **D4. Epic diff review.** Either add a Fable review of the whole epic PR before it is marked ready, or rely on the per-task reviews. Recommended: add it for risk:high epics only.
+- **D4. Epic diff review.** Either add a Fable review of the whole epic diff before `epic open` opens the PR, or rely on the per-task reviews. Recommended: add it for risk:high epics only.
 
 ## 5. Tickets to implement it
 
@@ -231,22 +239,22 @@ These are not created on GitHub. Two epics, so the board part can ship without t
 | # | Title | Type | Size | Risk | Blocked by |
 |---|---|---|---|---|---|
 | B1 | branch_guard protects e/* epic branches like main | task | M | high | — |
-| B2 | harness-work epic start and epic sync create and refresh an epic branch and its draft PR | task | M | low | B1 |
+| B2 | harness-work epic start and epic sync create an epic branch and merge main into it | task | M | low | B1 |
 | B3 | Tasks of an epic-branch epic branch from, test against and open PRs into the epic branch | task | M | low | B2 |
-| B4 | harness-pr land merges task PRs into the epic branch and readies the epic PR when all tasks land | task | M | high | B3, D1 |
-| B5 | harness-pr lands an epic PR with a merge commit and checkpoints through snapshot branches | task | M | high | B4 |
+| B4 | harness-pr land merges task PRs into the epic branch and opens the epic PR when all tasks land | task | M | high | B3, D1 |
+| B5 | harness-pr lands epic and checkpoint PRs with a merge commit and re-cuts the epic branch after a checkpoint | task | M | high | B4 |
 | B6 | Skills, user CLAUDE.md and design.md describe the epic-branch flow | chore, no-tests | S | low | B5 |
 
 - **B1.**
-  - `PROTECTED` becomes a match on `main`, `master`, `e/` plus anything, or `cp/` plus anything.
+  - `PROTECTED` becomes a match on `main`, `master`, or `e/` plus anything.
   - Deny checking out a protected branch, in any repository:
-    - `git worktree add` naming an `e/*` or `cp/*` branch
+    - `git worktree add` naming an `e/*` branch
     - `git switch` or `git checkout` of one
-  - Judge a linked worktree on `e/*` or `cp/*` by the main rules:
+  - Judge a linked worktree on `e/*` by the main rules:
     - `protected_repo` returns that worktree's top-level and branch, instead of None, when its own branch is protected and not main or master.
     - `holder` no longer exempts a `.claude/worktrees/` path whose worktree is on such a branch.
-  - Deny every push whose destination names `e/*` or `cp/*`, creation included. The harness tools push through their own subprocesses.
-  - `harness-work worktree remove` refuses `e/*` and `cp/*`.
+  - Deny every push whose destination names `e/*`, creation included. The harness tools push through their own subprocesses.
+  - `harness-work worktree remove` refuses `e/*`.
   - Tests:
     - The main cases mirrored for an `e/3-x` checkout: edit, commit, `sed -i`, redirect and bare push denied.
     - The same in a linked worktree on `e/3-x`, created with plain `git` in the test so the guard is not in the way. This covers a bare `git push` and a write to a path under `.claude/worktrees/e-3-x/`.
@@ -258,52 +266,64 @@ These are not created on GitHub. Two epics, so the board part can ship without t
   - `epic start E`:
     - Refuses an epic without the flag.
     - Creates `e/E-<slug>` from `origin/main` and pushes it.
-    - Opens a draft PR to main with `Closes #E`.
-    - Comments on the epic.
-    - Is idempotent: reuses an existing branch and PR.
+    - Opens no PR.
+    - Comments on the epic with the compare link.
+    - Is idempotent: reuses an existing branch.
   - `epic sync E`:
-    - Calls `update-branch` on the epic PR with `expected_head_sha`.
-    - After a 202, polls until the tip moves or `mergeable` settles.
-    - Retries a 422 after re-reading the tip.
-    - Files the conflict chore only on a confirmed conflict: `CONFLICTING` with an unmoved tip.
-    - Exits non-zero otherwise.
-  - Tests: run against a temporary origin and fakegh.
+    - After `git fetch`, returns early with exit 0 when `git merge-base --is-ancestor origin/main origin/e/E-<slug>` succeeds.
+    - Otherwise runs `git merge --no-ff origin/main` in a detached worktree under the repo's state directory and pushes `HEAD:refs/heads/e/E-<slug>`, never forced.
+    - A non-fast-forward rejection gets one fetch and redo.
+    - A conflict aborts the merge and files the `no-tests` chore with the conflicting paths.
+    - Removes the worktree on every path.
+  - Tests, against a temporary origin and fakegh:
+    - Nothing to merge: no push.
+    - main moved: a merge commit whose second parent is main's tip, pushed.
+    - A conflict: no push, and the chore filed.
+    - A race: the push rejected once, then succeeding.
 - **B3.**
   - `harness-work start N`:
     - Bases on `origin/e/<parent>-*` when the parent is flagged.
-    - Runs `epic start` first when the branch is missing.
+    - Runs `epic start` first when the branch is missing, else `epic sync`.
   - `harness-red check`: defaults its base to that branch.
   - `harness-pr open`: `--base` the epic branch.
   - `harness-pr ready`: falls back to the ticket from the head branch when `closingIssuesReferences` is empty.
   - Tests: the base used by each tool, and the ready fallback.
 - **B4.**
   - `land` on a PR whose base is `e/*`:
-    - Squash-merges.
+    - Squash-merges, or uses `--merge` when the head brings main commits the base lacks (the two `rev-list --count` figures of step 7).
     - Closes the ticket explicitly.
     - Posts the Resolution with a `Base:` line.
     - Calls `epic-check`.
-  - `epic-check` on a flagged epic with all tasks closed:
-    - Marks the epic PR ready, sets `status:in-review` and notifies, instead of closing.
+  - `epic-check` on a flagged epic with all tasks closed, instead of closing:
+    - Runs `harness-pr epic open E`, which syncs, then opens a ready PR from `e/E-<slug>` to main with `Closes #E`, sets `status:in-review` and notifies.
+    - When `origin/main..origin/e/E-<slug>` is empty, it closes the epic directly with its Resolution.
+  - Tests: squash versus merge for a plain task versus a sync chore, and the epic PR opened or skipped.
   - If D1 is yes, three texts change in this same ticket, so the merge rule never says two things at once:
     - The `work` skill lands the task PR itself after `ready`, only for an `e/*` base.
     - `user/CLAUDE.md` "Never on main": "Only I merge" becomes "Only I merge to main".
     - design.md principle 3 and the work-loop listing.
   - Risk is high because it changes who merges.
 - **B5.**
-  - `land` on a PR whose head is `e/*` or `cp/*`: uses `--merge`.
-  - `land` on a PR whose head is `e/*` also:
-    - Refuses while any open PR has that head as its base, naming them.
+  - `land` on a PR whose head is `e/*`:
+    - Uses `--merge`.
+    - Refuses while any open PR (drafts included) has that head as its base, naming them.
+  - On a completion PR (closes `#E`):
     - Posts the epic Resolution, aggregating each task's newest Resolution (title, squash sha, PR).
-  - `checkpoint E --name K`:
-    - Pushes `cp/E-K` at the tip.
-    - Opens a PR to main whose body names the epic and the tasks it carries, and closes nothing (no `Closes #E`).
-    - Its land posts no epic Resolution and leaves the epic open.
+  - On a checkpoint PR (closes nothing):
+    - Comments `Checkpoint K landed in <sha>` on the epic.
+    - Re-cuts `e/E-<slug>` from the new `origin/main` and pushes it.
+    - Leaves the epic open.
+  - `epic open E --checkpoint K`:
+    - Syncs first.
+    - Refuses when `origin/main..origin/e/E-<slug>` is empty.
+    - Opens the PR with a body that names the tasks carried and has no `Closes`.
   - Tests:
-    - The merge method chosen by base and head.
+    - The merge method chosen by head.
     - The retarget refusal.
-    - The Resolution text.
-    - A checkpoint body without `Closes`.
-    - `start` and `harness-red` resolve `e/E-` and not `cp/E-K`.
+    - The completion Resolution.
+    - The checkpoint body without `Closes`.
+    - The re-cut branch at the new main.
+    - A task branch cut before the checkpoint whose PR afterwards shows only its own commits.
 - **B6.**
   - The `plan` skill asks about epic branches per epic.
   - The `land` skill lists epic PRs and checkpoints.
@@ -320,6 +340,15 @@ These are not created on GitHub. Two epics, so the board part can ship without t
 - Whether the auto-add limit follows the owner's plan.
 - Whether views can be created through the API.
 - Whether "Automatically delete head branches" spares a branch that is the base of open PRs. The design avoids relying on it either way.
-- The `update-branch` response on a merge conflict.
+- The `update-branch` response on a merge conflict. This no longer matters: sync uses plain git.
+
+### Experiments to run in a scratch repository
+
+Before B5 merges, run these in a throwaway private repository (not one of Ryan's projects):
+
+1. **No commits between.** Push a branch `e/1-x` at main's tip and run `gh pr create --base main --head e/1-x`. Expect a refusal. This confirms why step 2 opens no PR.
+2. **Merged-by-reachability.** Open PR A from `e/1-x` to main. Push `cp/1-1` at `e/1-x`'s tip, open PR B from it, and merge B with a merge commit. Record whether GitHub marks A as merged, deletes `e/1-x` under auto-delete, retargets PRs based on `e/1-x`, or closes an issue A names with `Closes`. This is the `cp/` design's hazard. The chosen design never has two PRs from one tip, so this only confirms the rejection.
+3. **Checkpoint and re-cut.** Merge PR A with a merge commit, auto-delete on. Push a new `e/1-x` from the new main. Open a task PR from a branch cut from the old tip. Expect its diff to show only its own commits, and no warning on the closed PR A.
+4. **Sync-chore landing.** On a `t/` branch cut from `e/1-x`, merge a conflicting main and resolve it. Merge that PR into `e/1-x` with `--merge`. Expect `git merge-base --is-ancestor origin/main origin/e/1-x` to succeed, and the compare view to stop showing main's changes. Repeat with `--squash` to see the failure step 7 prevents.
 - Ryan's account plan: `gh api user --jq .plan.name` printed nothing with the current scopes. The Free assumption comes from design.md, which recorded 403s on rulesets.
 - Every `gh project` behavior is quoted from local `--help` and the docs. None was exercised, because the token lacks the `project` scope.
