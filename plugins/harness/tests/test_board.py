@@ -1324,6 +1324,58 @@ class ProjectMirror(BoardTest):
                 self.assertEqual(p.stdout.strip(), f"#58 {url}")
                 self.assertEqual(self.project_calls(), [])
 
+    def test_a_padded_or_zero_led_value_is_invalid(self):
+        """The value must be exactly OWNER/NUMBER: a leading zero, surrounding blanks or a trailing newline are
+        not stripped into a valid one. The warning names the value (blanks aside)."""
+        for value in ("acme-org/07", " acme-org/7", "acme-org/7 ", "acme-org/7\n", "rjeskuri/012"):
+            for source in ("environment", "settings"):
+                with self.subTest(value=value, source=source):
+                    env = {"HARNESS_PROJECT": value} if source == "environment" else {}
+                    self.settings(json.dumps({"env": {"HARNESS_PROJECT": value if source == "settings"
+                                                      else "someone/5"}}))
+                    self.status_scenario(44, "in-progress")
+                    p = self.board("status", "44", "blocked", **env)
+                    self.assertOneWarning(p, value.strip())
+                    self.assertEqual(p.stdout.strip(), "#44 status:blocked")
+                    self.assertIn(self.label_swap(44, "blocked", "in-progress"), self.calls())
+                    self.assertEqual(self.project_calls(), [])
+
+    def test_status_without_an_issue_url_warns_once_and_makes_no_project_call(self):
+        for number, url in ((12, None), (47, ""), (93, "   ")):
+            with self.subTest(number=number, url=url):
+                labels = [{"name": "task"}, {"name": "status:ready"}]
+                reply = {"labels": labels, "number": number}
+                if url is not None:
+                    reply["url"] = url
+                self.scenario([REPO_VIEW, {"match": ["issue", "view", str(number)], "stdout_json": reply},
+                               {"match": ["project"], "stdout": ""}], default={"stdout": ""})
+                p = self.board("status", str(number), "in-progress", HARNESS_PROJECT="acme-org/23")
+                self.assertOneWarning(p)
+                self.assertEqual(p.stdout.strip(), f"#{number} status:in-progress")
+                self.assertIn(self.label_swap(number, "in-progress", "ready"), self.calls())
+                self.assertEqual(self.project_calls(), [])
+
+    def test_commands_that_never_mirror_print_no_warning_for_an_invalid_value(self):
+        epic_state = {"state": "OPEN", "subIssuesSummary": {"total": 2, "completed": 1, "percentCompleted": 50}}
+        self.scenario([REPO_VIEW,
+                       {"match": ["issue", "view", "3"], "stdout_json": epic_state},
+                       {"match": ["issue", "view", "12"], "stdout_json": issue()},
+                       {"match": ["issue", "list"], "stdout_json": []},
+                       {"match": ["api", "user"], "stdout": "rjeskuri\n"},
+                       {"match": ["project"], "stdout": ""}],
+                      default={"stdout": "https://github.com/o/r/issues/12#issuecomment-1\n"})
+        commands = [("show", "12"), ("show", "12", "--markdown"), ("ready",), ("comment", "12", "--body", "Note."),
+                    ("close", "12"), ("epic-check", "3"), ("board",), ("answers", "12")]
+        for value, source in (("acme-org", "environment"), ("acme-org/x", "settings"), ("/7", "environment")):
+            env = {"HARNESS_PROJECT": value} if source == "environment" else {}
+            self.settings(json.dumps({"env": {"HARNESS_PROJECT": value}}) if source == "settings" else "{}")
+            for argv in commands:
+                with self.subTest(value=value, command=" ".join(argv)):
+                    p = self.board(*argv, **env)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertEqual(p.stderr, "", "a command that never mirrors does not read the setting")
+                    self.assertFalse([a for a in self.calls() if a[:1] == ["project"]])
+
 
 # ======================================================================= answers, epic-check, board
 class Answers(BoardTest):
