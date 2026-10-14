@@ -1128,6 +1128,21 @@ class TierReviewStage(BoardTest):
                 self.assertIn("review", p.stderr)                       # names the allowed value
                 self.assertNotIn("Traceback", p.stderr)
 
+    def test_review_stage_falls_through_a_cache_without_labels_to_github(self):
+        # A cache with a stored tier but no labels cannot answer the review stage (the stored tier is the rubric's,
+        # not the review's): the labels are fetched. Plain `tier` still answers from the cache.
+        self.put_cache(12, {"number": 12, "tier": "fable"})
+        self.scenario([{"match": ["issue", "view", "12", "--json", "labels"],
+                        "stdout_json": {"labels": [{"name": "task"}, {"name": "size:L"}, {"name": "risk:low"}]}}])
+        self.assertEqual(self.ok("tier", "12", "--stage", "review").stdout.strip(), "opus")
+        self.assertEqual(len(self.calls()), 1)
+        p = self.ok("tier", "12", "--stage", "review", "--json")
+        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "opus", "source": "github"})
+        before = len(self.calls())
+        p = self.ok("tier", "12", "--json")
+        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "fable", "source": "cache"})
+        self.assertEqual(len(self.calls()), before)                 # plain tier made no gh call
+
     def test_plain_tier_is_unchanged_for_every_combination(self):
         # Already true today: pins the rubric (derived here from its statement, not from the tool) so the change
         # cannot leak into the other agents' tiers.
