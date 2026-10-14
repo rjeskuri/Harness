@@ -42,10 +42,11 @@ which can be what exhausts it) is refused, --dry-run too: nothing starts, the ex
 names the time and `harness-work budget reset api`.
 
 runs --sweep: closes the records of runs that ended and classifies each (ok, error, billing, auth; a bg run by its
-`claude agents` state). A headless `ok` whose issue is OPEN and still status:in-progress with no ready pull request
-of its branch in any state (none, or only drafts) ended early: outcome `early`, shown as `ended early (draft PR #N)`
-naming the open draft, else `ended early (no PR)`. When gh cannot tell, or the
-record names no repository, it stays `ok` with a warning. One command asks gh once per ticket and branch.
+`claude agents` state, done being ok). An `ok` run, headless or bg, whose issue is OPEN and still status:in-progress
+with no ready pull request of its branch in any state (none, or only drafts) ended early: outcome `early`, shown as
+`ended early (draft PR #N)` naming the open draft, else `ended early (no PR)`, even when the run has an exit code.
+A bg failed or stopped run is never early. When gh cannot tell, or the record names no repository, it stays `ok`
+with a warning. One command asks gh once per ticket and branch.
 
 Siblings (harness-board) are found on PATH, else next to this script. gh is HARNESS_GH when set, else `gh`;
 claude is HARNESS_CLAUDE when set, else `claude`.
@@ -911,30 +912,32 @@ def sweep(records, agents):
             if entry is not None and not state_ended(state):
                 continue
             record["ended_at"] = iso(now())
-            record["outcome"] = ENDED_STATES.get(state, str(state)) if entry is not None else "unknown"
+            outcome = ENDED_STATES.get(state, str(state)) if entry is not None else "unknown"
             code = entry.get("exitCode", entry.get("exit")) if entry is not None else None
             if isinstance(code, int) and not isinstance(code, bool):
                 record["exit"] = code               # only when the listing gives one; headless runs keep null
+            reason = None
         else:
             if pid_alive(record.get("pid"), parse_iso(record.get("started_at"))):
                 continue
             record["ended_at"] = mtime_iso(record.get("log"))
             outcome, reason = classify(log_tail(record.get("log")))
-            early = ended_early(record, repos) if outcome == "ok" else None
-            if early is not None:
-                outcome = "early"
-                if early.get("draft_pr"):
-                    record["draft_pr"] = early["draft_pr"]
-            record["outcome"] = outcome
-            if outcome in ("billing", "auth"):
-                exhaust(load_budgets(), "api", f"{outcome}: {reason}", EXHAUST_HOURS)
+        # a bg `done` is judged like a headless `ok`; failed, stopped and the rest never become early
+        early = ended_early(record, repos) if outcome == "ok" else None
+        if early is not None:
+            outcome = "early"
+            if early.get("draft_pr"):
+                record["draft_pr"] = early["draft_pr"]
+        record["outcome"] = outcome
+        if outcome in ("billing", "auth") and not is_bg(record):
+            exhaust(load_budgets(), "api", f"{outcome}: {reason}", EXHAUST_HOURS)
         save_run(record)
 
 
 def ended_early(record, repos):
-    """The issue (as without_pr gives it) when an `ok` headless run left its ticket in progress with no ready pull
-    request: the session ended its turn before the work did. None, with a warning, when the repository or gh cannot
-    tell. `repos` caches Repo by path."""
+    """The issue (as without_pr gives it) when an `ok` run (headless, or bg `done`) left its ticket in progress with no
+    ready pull request: the session ended its turn before the work did. None, with a warning, when the repository or
+    gh cannot tell. `repos` caches Repo by path."""
     n = record.get("ticket")
     if not isinstance(n, int):
         return None
@@ -953,12 +956,12 @@ def ended_early(record, repos):
 
 def run_state(record, agents):
     if record.get("ended_at"):
+        if record.get("outcome") == "early":           # wins over an exit code: the 0 of a done bg run says less
+            pr = record.get("draft_pr")
+            return f"ended early (draft PR #{pr})" if pr else "ended early (no PR)"
         exit_code = record.get("exit")
         if exit_code is not None:
             return f"exited {exit_code}"
-        if record.get("outcome") == "early":
-            pr = record.get("draft_pr")
-            return f"ended early (draft PR #{pr})" if pr else "ended early (no PR)"
         return f"ended {record.get('outcome') or '?'}"
     if is_bg(record):
         listing = agents.get()

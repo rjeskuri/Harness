@@ -43,5 +43,5 @@ Gathered 2026-10-13 by an Opus research agent from the raw markdown of the offic
 - Per-call effort waits for 2.1.292 on stable; routing uses `model` per call and frontmatter `effort` where fixed.
 - Deny-on-main is a PreToolUse hook on Edit|Write|NotebookEdit and Bash, resolving the branch from the file's directory, never from `cwd` alone.
 - Worktree per ticket: `git worktree add .claude/worktrees/<ticket> -b <branch> origin/main`, copy `.worktreeinclude` files ourselves, `cd` and start the session there; clean up with `git worktree remove`.
-- Dispatch billed to the API key: headless `claude -p … --settings '{"apiKeyHelper": "…"}'`, not `--bg`. Cloud dispatch is out of scope (subscription billing, TTY, no plugins). Ultrareview is the scriptable consumer of usage credits.
+- Dispatch billed to the API key: headless `claude -p … --settings '{"apiKeyHelper": "…"}'`, not `--bg`. Changed on 2026-10-14 (#57): `--bg` on the subscription is now the dispatch default, and headless on the API key is the opt-in (`--api` or `--venue headless`). Cloud dispatch is out of scope (subscription billing, TTY, no plugins). Ultrareview is the scriptable consumer of usage credits.
 - The daily digest is a local launchd job, not a routine.

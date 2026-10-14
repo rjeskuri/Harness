@@ -120,7 +120,7 @@ echo "  harness-projects discover      # find your repos"
 echo "  /harness:standup               # the cross-project brief"
 echo "  claude agents                  # the fleet console, in a terminal"
 echo
-echo "Once, for dispatched ticket work billed to the API: store the API key in your login keychain with"
+echo "Once, for /harness:work --api runs billed to the API key: store the API key in your login keychain with"
 echo '  security add-generic-password -a "$USER" -s harness-anthropic -w'
 echo "It prompts for the key, so the key never touches a command line or your shell history."
 echo "Outside Claude Code the tools are in $HERE/plugins/harness/bin (harness-projects discover, for one)."
