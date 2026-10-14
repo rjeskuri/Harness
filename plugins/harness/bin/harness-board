@@ -36,7 +36,8 @@ The labels stay the source of truth: a failed project call is one warning on std
 `project check` (gh project field-list) names each Status or Priority option the board lacks and exits 1 if any.
 `project sync` reads the board (gh project item-list) and the open issues of the repository, or of every project
 in ~/.claude/harness/projects.json with --all-projects, adds the missing issues and corrects Status and Priority
-drift from the labels, one line per change; --dry-run prints the lines and writes nothing. Both need the setting.
+drift from the labels (an unset Priority counts as Normal, so only High against Normal is drift), one line per
+change; --dry-run prints the lines and writes nothing. Both need the setting.
 
 gh is HARNESS_GH when set, else `gh` on PATH.
 """
@@ -1168,7 +1169,8 @@ def open_issues(repo):
 
 
 def cmd_project_sync(args):
-    """Add the open issues missing from the board and correct Status and Priority drift, by the labels. Exit 1
+    """Add the open issues missing from the board and correct Status and Priority drift, by the labels; an unset
+    Priority is Normal, so an added issue gets a Priority write only for High. Exit 1
     when a write fails, a repository is skipped or a read was cut at its limit; the rest still runs."""
     owner, number = required_project()
     if args.all_projects and getattr(args, "repo", None):
@@ -1236,7 +1238,9 @@ def cmd_project_sync(args):
             steps = [] if item is not None else [(["project", "item-add"] + target, f"{url}: add to the board")]
             for field, value in (("Status", status), ("Priority", priority)):
                 old = item.get(field.lower()) if item is not None else None
-                if value and (item is None or old != value):
+                # an unset Priority is Normal, so only High against Normal is drift (and an add sets only High)
+                current = (old or "Normal") if field == "Priority" else old
+                if value and current != value:
                     steps.append((["project", "item-edit"] + target + ["--field", field, "--value", value],
                                   f"{url}: {field} {old or '(unset)'} -> {value}"))
             for call, line in steps:
