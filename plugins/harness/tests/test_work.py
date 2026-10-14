@@ -621,7 +621,7 @@ class Dispatch(WorkTest):
         self.scenario(issues=[in_progress])
         p = self.ok("dispatch", "--dry-run")                   # three: the fourth dispatch skips it
         self.assertNotIn("would start", p.stdout)
-        self.assertIn("skip #12: 3 runs ended without a pull request in 7 days (last: error at ", p.stdout)
+        self.assertIn("skip #12: 3 runs ended without a ready pull request in 7 days (last: error at ", p.stdout)
         self.assertIn("run it in this session with /harness:work 12, or wait for the window", p.stdout)
         self.assertNotIn("harness-board status 12 ready", p.stdout)
         data = self.ok_json("dispatch", "--dry-run", "--json")
@@ -655,7 +655,7 @@ class RedispatchCap(WorkTest):
         return records
 
     def skip_why(self, ticket, runs, last):
-        return (f"{runs} runs ended without a pull request in 7 days (last: {last['outcome']} at "
+        return (f"{runs} runs ended without a ready pull request in 7 days (last: {last['outcome']} at "
                 f"{last['ended_at']}); run it in this session with /harness:work {ticket}, or wait for the window")
 
     def capped_pair(self):
@@ -1110,7 +1110,7 @@ class DispatchRunsByRepoField(WorkTest):
         self.ended_runs(14, other)                              # the sibling's: never ours to redispatch or cap
         self.scenario(issues=[issue(labels=in_progress), issue(14, labels=in_progress, title="Theirs")])
         p = self.ok("dispatch", "--dry-run")
-        self.assertIn("skip #12: 3 runs ended without a pull request in 7 days (last: error at ", p.stdout)
+        self.assertIn("skip #12: 3 runs ended without a ready pull request in 7 days (last: error at ", p.stdout)
         self.assertIn("run it in this session with /harness:work 12, or wait for the window", p.stdout)
         self.assertNotIn("would start #12", p.stdout)
         self.assertNotIn("#14", p.stdout)
@@ -1407,6 +1407,10 @@ EARLY_RESULT = {"type": "result", "subtype": "success", "is_error": False, "num_
                 "result": "I've started ticket #7 and the test-author is writing the tests now in the background. "
                           "Next comes the red check, then the breaker and the coder.",
                 "total_cost_usd": 0.41, "stop_reason": "end_turn"}
+# The result of the headless run of #31 (2026-10-13 20:43Z, #42): it ended mid-review with the round-2 fix uncommitted
+# in the worktree and PR #41 still a draft.
+ROUND2_RESULT = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 3, "duration_ms": 5520143,
+                 "result": "The coder is on fix round 2; waiting for its report.", "stop_reason": "end_turn"}
 IN_PROGRESS = ("task", "status:in-progress", "size:S", "risk:low")
 
 
@@ -1540,7 +1544,7 @@ class EndedEarly(WorkTest):
             12: (EARLY_RESULT, IN_PROGRESS, [], [], "early"),
             13: ({"type": "result", "is_error": False, "result": "PR #31 is ready for review."},
                  IN_PROGRESS, [], [], "early"),                           # the text claims a PR; there is none
-            14: (EARLY_RESULT, IN_PROGRESS, pr_open, pr_open, "ok"),      # a PR exists: ok
+            14: (EARLY_RESULT, IN_PROGRESS, pr_open, pr_open, "early"),   # only a draft PR: still early (#42)
             15: (EARLY_RESULT, IN_PROGRESS, [], pr_merged, "ok"),          # a merged PR counts (--state all)
             16: (EARLY_RESULT, ("task", "status:in-review", "size:S", "risk:low"), [], [], "ok"),
             17: (EARLY_RESULT, ("task", "status:needs-input", "size:S", "risk:low"), [], [], "ok"),
@@ -1563,15 +1567,18 @@ class EndedEarly(WorkTest):
         self.assertEqual({n: rows[n]["outcome"] for n in rows}, expected)
         saved = {r["ticket"]: r["outcome"] for r in self.run_records()}
         self.assertEqual(saved, expected)
-        for n, outcome in expected.items():
+        states = {n: ("ended early (draft PR #40)" if n == 14 else "ended early (no PR)") if outcome == "early"
+                  else f"ended {outcome}" for n, outcome in expected.items()}
+        for n, state in states.items():
             with self.subTest(ticket=n):
-                state = "ended early (no PR)" if outcome == "early" else f"ended {outcome}"
                 self.assertEqual(rows[n]["state"], state)
 
         lines = self.run_lines()
         for n, outcome in expected.items():
             with self.subTest(ticket=n, text=True):
-                self.assertEqual("ended early (no PR)" in lines[n], outcome == "early", lines[n])
+                self.assertEqual("ended early" in lines[n], outcome == "early", lines[n])
+                if outcome == "early":
+                    self.assertIn(states[n], lines[n])
 
     def test_only_the_board_and_the_pr_decide_early_never_the_ticket_number_or_the_log(self):
         # Every ticket goes through every label, issue and PR state across the passes (a rotation), each run's log is
@@ -1582,8 +1589,8 @@ class EndedEarly(WorkTest):
         in_review = ("task", "status:in-review", "size:S", "risk:low")
         states = [   # (labels, open PRs, PRs of any state, issue state, outcome)
             (IN_PROGRESS, [], [], "OPEN", "early"),
-            (IN_PROGRESS, [{"number": 60, "state": "OPEN", "isDraft": True}],
-             [{"number": 60, "state": "OPEN", "isDraft": True}], "OPEN", "ok"),
+            (IN_PROGRESS, [{"number": 60, "state": "OPEN", "isDraft": True}],     # only a draft: early (#42)
+             [{"number": 60, "state": "OPEN", "isDraft": True}], "OPEN", "early"),
             (IN_PROGRESS, [{"number": 61, "state": "OPEN", "isDraft": False}],
              [{"number": 61, "state": "OPEN", "isDraft": False}], "OPEN", "ok"),
             (IN_PROGRESS, [], [{"number": 62, "state": "MERGED", "isDraft": False}], "OPEN", "ok"),
@@ -1613,7 +1620,8 @@ class EndedEarly(WorkTest):
                 self.assertEqual({n: rows[n]["outcome"] for n in rows}, expected)
                 self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()}, expected)
                 for n, outcome in expected.items():
-                    self.assertEqual(rows[n]["state"], "ended early (no PR)" if outcome == "early" else "ended ok")
+                    early = "ended early (draft PR #60)" if plan[n][1] else "ended early (no PR)"
+                    self.assertEqual(rows[n]["state"], early if outcome == "early" else "ended ok")
                 # Early needs both facts: the ticket's labels and every PR of its branch, merged and closed included.
                 calls = self.gh_calls()
                 for n in (n for n, o in expected.items() if o == "early"):
@@ -1656,10 +1664,10 @@ class EndedEarly(WorkTest):
 
     def test_dispatch_asks_gh_about_a_freshly_ended_run_once(self):
         # Three headless runs ended ok since the last sweep: #7 in progress with no PR (early, dispatched again), #8 in
-        # progress with an open PR, #9 in review. One dispatch closes them (the sweep) and picks what to run again
+        # progress with an open ready PR, #9 in review. One dispatch closes them (the sweep) and picks what to run again
         # (the redispatch); both need `issue view` and `pr list --head` for the same ticket and branch, and the
         # answer is the same, so each is asked at most once per ticket in one invocation.
-        pr_open = [{"number": 40, "state": "OPEN", "isDraft": True}]
+        pr_open = [{"number": 40, "state": "OPEN", "isDraft": False}]
         for n in (7, 8, 9):
             self.ended_run(n, EARLY_RESULT)
         self.write_scenario({7: (IN_PROGRESS, [], []), 8: (IN_PROGRESS, pr_open, pr_open),
@@ -1680,6 +1688,353 @@ class EndedEarly(WorkTest):
                 self.assertLessEqual(len(heads), 1, calls)
                 if n == 7:                                  # early needs both facts: asked exactly once each
                     self.assertEqual((len(views), len(heads)), (1, 1), calls)
+
+    # ---- #42: a draft pull request is not a ready one
+    def test_a_draft_pull_request_does_not_make_an_early_end_ok(self):
+        # The run of #31 on 2026-10-13 ended `success` mid-review with its fix uncommitted and PR #41 still a draft.
+        # Several tickets, each with its own draft PR number (and two different logs), so neither the PR number
+        # nor the ticket can be a constant; #8 has no PR at all (the old early), #12 a ready PR (ok).
+        cases = {   # n: (log, open PRs = PRs of any state, outcome, state)
+            7: (ROUND2_RESULT, draft(41), "early", "ended early (draft PR #41)"),
+            13: (EARLY_RESULT, draft(58), "early", "ended early (draft PR #58)"),
+            31: (ROUND2_RESULT, draft(9), "early", "ended early (draft PR #9)"),
+            8: (ROUND2_RESULT, [], "early", "ended early (no PR)"),
+            12: (ROUND2_RESULT, ready_pr(77), "ok", "ended ok"),
+        }
+        for n, (result, *_rest) in cases.items():
+            self.ended_run(n, result)
+        self.write_scenario({n: (IN_PROGRESS, prs, prs) for n, (_r, prs, _o, _s) in cases.items()})
+
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+        self.assertEqual({n: rows[n]["outcome"] for n in rows}, {n: c[2] for n, c in cases.items()})
+        self.assertEqual({n: rows[n]["state"] for n in rows}, {n: c[3] for n, c in cases.items()})
+        for n in cases:
+            self.assertTrue(rows[n]["ended_at"], rows[n])
+            self.assertIsNone(rows[n]["exit"])
+        self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()}, {n: c[2] for n, c in cases.items()})
+
+        # Without a sweep, from the saved records alone: the same states, in --json and in the table.
+        self.assertEqual({r["ticket"]: r["state"] for r in self.ok_json("runs", "--json")},
+                         {n: c[3] for n, c in cases.items()})
+        lines = self.run_lines()
+        for n, (_r, prs, outcome, state) in cases.items():
+            with self.subTest(ticket=n):
+                self.assertIn(state, lines[n])
+                for other in (c[1][0]["number"] for m, c in cases.items() if m != n and c[1]):
+                    self.assertNotIn(f"PR #{other})", lines[n])
+        self.assertNotIn("draft", lines[8] + lines[12])
+        self.assertIn("api: available", self.ok("budget", "status").stdout)   # not a budget failure
+
+    def test_a_ready_pull_request_or_a_waiting_ticket_is_a_normal_end(self):
+        # The same log for every run; only the board and the branch's PRs differ. A ready PR, a ticket the run moved
+        # to in-review or needs-input (draft or not), a merged PR and a closed issue are normal ends: `ok`, never
+        # dispatched again. #26 (in progress, draft only) is the control that does end early.
+        in_review = ("task", "status:in-review", "size:S", "risk:low")
+        needs_input = ("task", "status:needs-input", "size:S", "risk:low")
+        merged = [{"number": 74, "state": "MERGED", "isDraft": False}]
+        cases = {   # n: (labels, open PRs, PRs of any state, outcome)
+            20: (IN_PROGRESS, ready_pr(70), ready_pr(70), "ok"),
+            21: (in_review, draft(71), draft(71), "ok"),
+            22: (needs_input, draft(72), draft(72), "ok"),
+            23: (in_review, ready_pr(73), ready_pr(73), "ok"),
+            24: (IN_PROGRESS, [], merged, "ok"),
+            25: (IN_PROGRESS, draft(75), draft(75), "ok"),             # the issue is CLOSED (below)
+            27: (needs_input, [], [], "ok"),
+            26: (IN_PROGRESS, draft(76), draft(76), "early"),
+        }
+        for n in cases:
+            self.ended_run(n, ROUND2_RESULT)
+        self.write_scenario({n: c[:3] for n, c in cases.items()}, states={25: "CLOSED"})
+
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+        expected = {n: c[3] for n, c in cases.items()}
+        self.assertEqual({n: rows[n]["outcome"] for n in rows}, expected)
+        self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()}, expected)
+        lines = self.run_lines()
+        for n, outcome in expected.items():
+            with self.subTest(ticket=n):
+                if outcome == "ok":
+                    self.assertEqual(rows[n]["state"], "ended ok")
+                    self.assertNotIn("early", lines[n])
+        self.assertEqual(rows[26]["state"], "ended early (draft PR #76)")
+
+        p = self.ok("dispatch", "--dry-run")
+        started = [line for line in p.stdout.splitlines() if line.startswith("would start #")]
+        self.assertEqual(len(started), 1, p.stdout)
+        self.assertTrue(started[0].startswith("would start #26 "), p.stdout)
+        self.assertIn("#76", started[0])
+        data = self.ok_json("dispatch", "--dry-run", "--json")
+        self.assertEqual([row["number"] for row in data["plan"]], [26])
+        self.assertEqual(data["skipped"], [])
+
+    def test_dispatch_asks_gh_about_a_freshly_ended_draft_run_once(self):
+        # The draft case of the gh-once guarantee: #10 and #11 in progress with only a draft PR each (#43, #44),
+        # #7 with no PR, #8 with a ready PR. One dispatch sweeps all four (early, early, early, ok) and redispatches
+        # the three early ones; `issue view` and `pr list --head` are asked exactly once for each early ticket, the
+        # draft's PR number included in that one answer.
+        for n in (7, 8, 10, 11):
+            self.ended_run(n, ROUND2_RESULT)
+        self.write_scenario({7: (IN_PROGRESS, [], []), 8: (IN_PROGRESS, ready_pr(40), ready_pr(40)),
+                             10: (IN_PROGRESS, draft(43), draft(43)), 11: (IN_PROGRESS, draft(44), draft(44))})
+
+        p = self.ok("dispatch", "--dry-run")
+        self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()},
+                         {7: "early", 8: "ok", 10: "early", 11: "early"})
+        starts = {n: [ln for ln in p.stdout.splitlines() if ln.startswith(f"would start #{n} ")] for n in (7, 8, 10, 11)}
+        self.assertEqual({n: len(found) for n, found in starts.items()}, {7: 1, 8: 0, 10: 1, 11: 1}, p.stdout)
+        self.assertIn("#43", starts[10][0])
+        self.assertNotIn("#44", starts[10][0])
+        self.assertIn("#44", starts[11][0])
+        self.assertNotIn("#43", starts[11][0])
+        calls = self.gh_calls()
+        for n in (7, 8, 10, 11):
+            with self.subTest(ticket=n):
+                views = [a for a in calls if a[:3] == ["issue", "view", str(n)]]
+                heads = [a for a in calls if a[:2] == ["pr", "list"] and "--head" in a
+                         and a[a.index("--head") + 1] == f"t/{n}-x"]
+                self.assertLessEqual(len(views), 1, calls)
+                self.assertLessEqual(len(heads), 1, calls)
+                if n != 8:                                  # early needs both facts: asked exactly once each
+                    self.assertEqual((len(views), len(heads)), (1, 1), calls)
+
+    def test_every_pull_request_of_the_branch_counts_and_the_open_draft_is_named(self):
+        # A branch can have several PRs (gh lists them newest first). Early means none of them, in any state, is
+        # ready: an old closed or merged non-draft PR beside an open draft is a normal end, wherever it sits in the
+        # list (a row without isDraft is not a draft). Only drafts, closed ones included, is early, and the state
+        # names the open draft, the newest. gh is asked with --state all; the rows are what it would return.
+        def pr(number, state, is_draft=None):
+            row = {"number": number, "state": state}
+            if is_draft is not None:
+                row["isDraft"] = is_draft
+            return row
+        cases = {   # n: (PRs of any state, newest first; outcome, state)
+            30: ([pr(81, "OPEN", True), pr(80, "CLOSED", False)], "ok", "ended ok"),
+            31: ([pr(83, "OPEN", True), pr(82, "MERGED", False)], "ok", "ended ok"),
+            32: ([pr(85, "OPEN", True), pr(84, "CLOSED", True)], "early", "ended early (draft PR #85)"),
+            33: ([pr(87, "CLOSED", False), pr(86, "OPEN", True)], "ok", "ended ok"),
+            34: ([pr(89, "OPEN", True), pr(88, "MERGED")], "ok", "ended ok"),
+            35: ([pr(93, "OPEN", True), pr(92, "CLOSED", True), pr(91, "CLOSED", True)], "early",
+                 "ended early (draft PR #93)"),
+        }
+        for n in cases:
+            self.ended_run(n, ROUND2_RESULT)
+        self.write_scenario({n: (IN_PROGRESS, [r for r in prs if r["state"] == "OPEN"], prs)
+                             for n, (prs, _o, _s) in cases.items()})
+
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+        self.assertEqual({n: rows[n]["outcome"] for n in rows}, {n: c[1] for n, c in cases.items()})
+        self.assertEqual({n: rows[n]["state"] for n in rows}, {n: c[2] for n, c in cases.items()})
+        self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()}, {n: c[1] for n, c in cases.items()})
+
+        p = self.ok("dispatch", "--dry-run")
+        started = {int(m.group(1)): line for line in p.stdout.splitlines()
+                   for m in [re.match(r"would start #(\d+) ", line)] if m}
+        self.assertEqual(sorted(started), [32, 35], p.stdout)
+        self.assertIn("#85", started[32])
+        self.assertNotIn("#84", started[32])
+        self.assertIn("#93", started[35])
+        self.assertNotIn("#92", started[35])
+        self.assertNotIn("#91", started[35])
+
+
+def draft(number):
+    """`pr list` rows: one open draft pull request."""
+    return [{"number": number, "state": "OPEN", "isDraft": True}]
+
+
+def ready_pr(number):
+    """`pr list` rows: one open pull request marked ready for review."""
+    return [{"number": number, "state": "OPEN", "isDraft": False}]
+
+
+# =========================================================================== #42: redispatch of a draft-PR run
+class RedispatchDraft(WorkTest):
+    """A run that ended with its ticket in progress and only a draft PR is dispatched again: the plan's `again`
+    reason, the start comment and the prompt name the PR, and the prompt says the worktree may hold uncommitted
+    work. The cap (3 ended runs in 7 days) holds for it, with the "ended without a ready pull request" line."""
+
+    def setUp(self):
+        super().setUp()
+        # The ticket branch exists, pushed, with its worktree and the previous run's uncommitted fix in it.
+        self.wt = self.worktree_path()
+        self.git(self.repo, "worktree", "add", "-q", "-b", BRANCH, self.wt, "main")
+        write(os.path.join(self.wt, "board.py"), "def ready():\n    return []\n")
+        self.git(self.wt, "add", "-A")
+        self.git(self.wt, "commit", "-q", "-m", "Round 1")
+        self.git(self.wt, "push", "-q", "-u", "origin", BRANCH)
+        self.dirty = write(os.path.join(self.wt, "board.py"), "def ready():\n    return ['round 2']\n")
+
+    def write_scenario(self, drafts, ready=()):
+        """drafts: {ticket: (branch, its draft PR number, or None for no PR)}; every ticket OPEN and
+        status:in-progress. ready: tickets on the board as status:ready (no run, no PR), listed by `harness-board
+        ready`."""
+        calls = [{"match": ["issue", "view", str(n)],
+                  "stdout_json": issue(n, labels=IN_PROGRESS, title=TITLE if n == 12 else f"Ticket {n}")}
+                 for n in drafts]
+        calls += [{"match": ["issue", "view", str(n)], "stdout_json": issue(n, title=f"Ticket {n}")} for n in ready]
+        for n, (branch, pr) in drafts.items():
+            calls.append({"contains": ["pr", "list", "--head", branch], "stdout_json": draft(pr) if pr else []})
+        calls += [
+            {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}},
+            {"match": ["issue", "list"], "stdout_json": [ready_row(n, f"Ticket {n}") for n in ready]},
+            {"match": ["issue", "edit"], "stdout": ""},
+            {"match": ["issue", "comment"], "stdout": "https://github.com/o/r/issues/12#issuecomment-1\n"},
+            {"match": ["pr", "list"], "stdout_json": []},
+            {"match": ["api", "user"], "stdout": "rjeskuri\n"},
+            {"match": ["api"], "stdout_json": []},
+        ]
+        write(self.scenario_path, json.dumps({"calls": calls}))
+        state = self.scenario_path + ".state.json"
+        if os.path.exists(state):
+            os.unlink(state)
+
+    def ended_run(self, n, branch, worktree, result=None, **fields):
+        record = self.write_run(n, pid=self.dead_pid(), branch=branch, worktree=worktree, **fields)
+        write(record["log"], CONNECTORS_WARNING + "\n" + json.dumps(result or ROUND2_RESULT) + "\n")
+        return record
+
+    def comment_bodies(self, n):
+        """The text of every `gh issue comment n` call: its --body, else what came on stdin (--body-file -)."""
+        bodies = []
+        with open(self.gh_log, encoding="utf-8") as fh:
+            for line in fh:
+                entry = json.loads(line)
+                argv = entry["argv"]
+                if argv[:3] == ["issue", "comment", str(n)]:
+                    bodies.append(argv[argv.index("--body") + 1] if "--body" in argv else entry.get("stdin") or "")
+        return bodies
+
+    def test_dispatch_picks_the_ticket_up_again_and_names_the_pull_request(self):
+        other = os.path.join(self.repo, ".claude", "worktrees", "t-15-x")
+        self.ended_run(12, BRANCH, self.wt)                    # the #31 case: draft PR #41, fix uncommitted
+        self.ended_run(15, "t/15-x", other, result=EARLY_RESULT)
+        self.write_scenario({12: (BRANCH, 41), 15: ("t/15-x", 58)})
+
+        # Dry run: both tickets come back, each `again` reason naming its own draft PR.
+        p = self.ok("dispatch", "--dry-run")
+        lines = p.stdout.splitlines()
+        starts = {n: [ln for ln in lines if ln.startswith(f"would start #{n} ")] for n in (12, 15)}
+        self.assertEqual({n: len(found) for n, found in starts.items()}, {12: 1, 15: 1}, p.stdout)
+        [line12], [line15] = starts[12], starts[15]
+        self.assertIn("again after early", line12)
+        self.assertIn("#41", line12)
+        self.assertNotIn("#58", line12)
+        self.assertIn("again after early", line15)
+        self.assertIn("#58", line15)
+        self.assertNotIn("#41", line15)
+        self.assertNotIn("No ready tickets.", p.stdout)
+        self.assertNotIn("skip #", p.stdout)
+        self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()}, {12: "early", 15: "early"})
+        data = self.ok_json("dispatch", "--dry-run", "--json")
+        self.assertEqual([row["number"] for row in data["plan"]], [12, 15])
+        self.assertEqual(self.claude_calls(), [])
+
+        # For real, one slot: #12 is launched in its existing worktree, the uncommitted work left alone.
+        p = self.ok("dispatch", "--max", "1")
+        self.assertIn(f"#12 headless on {BRANCH} (pid ", p.stdout)
+        launched = [r for r in self.run_records() if r.get("ended_at") is None]
+        self.assertEqual([r["ticket"] for r in launched], [12])
+        self.assertTrue(wait_for(lambda: '"type": "result"' in read_text(launched[0]["log"])))
+        self.assertTrue(wait_for(lambda: pid_gone(launched[0]["pid"])))
+        [call] = self.claude_calls()
+        argv = call["argv"]
+        self.assertEqual(argv[0], "-p")
+        prompt = argv[1]
+        self.assertTrue(prompt.startswith("/harness:work 12"), prompt)
+        self.assertIn("#41", prompt)
+        self.assertNotIn("#58", prompt)
+        self.assertIn("uncommitted", prompt.lower())
+        self.assertIn("git status", prompt)
+        self.assertIn("review", prompt.lower())                # it reads the PR's review comments first
+        self.assertEqual(os.path.realpath(call["cwd"]), self.wt)
+        self.assertEqual(read_text(self.dirty), "def ready():\n    return ['round 2']\n")
+
+        bodies = self.comment_bodies(12)
+        self.assertTrue([b for b in bodies if "#41" in b and "uncommitted" in b.lower()], bodies)
+        self.assertFalse([b for b in bodies if "#58" in b], bodies)
+        self.assertEqual(self.comment_bodies(15), [])
+
+        # The cap is unchanged: three ended runs of #12 in the window, so the next dispatch skips it with the capped
+        # line; #15 (one ended run) still comes back.
+        shutil.rmtree(self.runs_dir(), True)
+        os.unlink(self.gh_log)
+        runs12 = [self.ended_run(12, BRANCH, self.wt, id=f"{self.key}-12-2026100{i + 1}090000",
+                                 started_at=iso_ago(hours=hours + 1), ended_at=iso_ago(hours=hours), outcome=outcome)
+                  for i, (outcome, hours) in enumerate((("error", 30), ("early", 20), ("early", 10)))]
+        self.ended_run(15, "t/15-x", other, result=EARLY_RESULT)
+        self.write_scenario({12: (BRANCH, 41), 15: ("t/15-x", 58)})
+        last = runs12[-1]
+        why = (f"3 runs ended without a ready pull request in 7 days (last: early at {last['ended_at']}); "
+               f"run it in this session with /harness:work 12, or wait for the window")
+        p = self.ok("dispatch", "--dry-run")
+        self.assertIn("skip #12: " + why, p.stdout.splitlines())
+        self.assertFalse([ln for ln in p.stdout.splitlines() if ln.startswith("would start #12")], p.stdout)
+        self.assertTrue([ln for ln in p.stdout.splitlines() if ln.startswith("would start #15 ")], p.stdout)
+        data = self.ok_json("dispatch", "--dry-run", "--json")
+        self.assertEqual([row["number"] for row in data["plan"]], [15])
+        self.assertEqual(data["skipped"], [{"number": 12, "why": why, "runs": 3, "window_days": 7,
+                                            "advice": "/harness:work 12"}])
+        table = self.ok("runs", "--all").stdout.splitlines()
+        [row] = [ln for ln in table if last["id"] in ln]
+        self.assertIn("capped", row)
+        self.assertEqual(sum("capped" in ln for ln in table), 1)
+        sessions = [c for c in self.claude_calls() if "-p" in c["argv"] or "--bg" in c["argv"]]
+        self.assertEqual(len(sessions), 1)                     # nothing launched after the one run above
+
+    def test_only_a_draft_pull_request_puts_the_pr_and_uncommitted_work_in_the_prompt(self):
+        # One dispatch launches three tickets: #12 after an early run with draft PR #41 (the #31 case), #15 after an
+        # early run with no PR, #16 fresh from the board (status:ready, never run). Only #12's prompt and start
+        # comment name a PR and the uncommitted work; the other two get the plain prompt and no such comment, so the
+        # PR text cannot be a constant of every launch.
+        self.ended_run(12, BRANCH, self.wt)
+        self.ended_run(15, "t/15-x", os.path.join(self.repo, ".claude", "worktrees", "t-15-x"), result=EARLY_RESULT)
+        self.write_scenario({12: (BRANCH, 41), 15: ("t/15-x", None)}, ready=[16])
+
+        p = self.ok("dispatch", "--dry-run")
+        starts = {n: [ln for ln in p.stdout.splitlines() if ln.startswith(f"would start #{n} ")] for n in (12, 15, 16)}
+        self.assertEqual({n: len(found) for n, found in starts.items()}, {12: 1, 15: 1, 16: 1}, p.stdout)
+        self.assertIn("#41", starts[12][0])
+        self.assertIn("(again after early)", starts[15][0])    # no PR: the reason as before #42
+        self.assertNotIn("#41", starts[15][0] + starts[16][0])
+
+        p = self.ok("dispatch", "--max", "3")
+        launched = [r for r in self.run_records() if r.get("ended_at") is None]
+        self.assertEqual(sorted(r["ticket"] for r in launched), [12, 15, 16], p.stdout)
+        for record in launched:
+            self.assertTrue(wait_for(lambda: '"type": "result"' in read_text(record["log"])))
+            self.assertTrue(wait_for(lambda: pid_gone(record["pid"])))
+        prompts = {}
+        for call in self.claude_calls():
+            argv = call["argv"]
+            self.assertEqual(argv[0], "-p", argv)
+            m = re.match(r"/harness:work (\d+)\b", argv[1])
+            self.assertTrue(m, argv[1])
+            prompts[int(m.group(1))] = argv[1]
+        self.assertEqual(sorted(prompts), [12, 15, 16])
+
+        pr_words = re.compile(r"\bPR\b|pull request", re.IGNORECASE)
+        self.assertIn("#41", prompts[12])
+        self.assertIn("uncommitted", prompts[12].lower())
+        self.assertIn("git status", prompts[12])
+        self.assertEqual(prompts[16], "/harness:work 16")     # a plain dispatch: the prompt is unchanged
+        for n in (15, 16):
+            with self.subTest(ticket=n):
+                prompt = prompts[n]
+                self.assertNotIn("uncommitted", prompt.lower())
+                self.assertNotIn("git status", prompt)
+                self.assertNotIn("review", prompt.lower())
+                self.assertNotIn("#41", prompt)
+                self.assertNotRegex(prompt, pr_words)
+
+        self.assertTrue([b for b in self.comment_bodies(12) if "#41" in b and "uncommitted" in b.lower()],
+                        self.comment_bodies(12))
+        self.assertTrue(self.comment_bodies(16))               # the plain "Started on ..." comment
+        for n in (15, 16):
+            with self.subTest(ticket=n, comment=True):
+                for body in self.comment_bodies(n):
+                    self.assertNotIn("uncommitted", body.lower())
+                    self.assertNotIn("#41", body)
+                    self.assertNotRegex(body, pr_words)
 
 
 # =========================================================================== the work skill

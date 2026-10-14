@@ -29,16 +29,18 @@ runs first, before anything refreshes the ticket cache. --json prints previous_s
 answers (the owner's replies; [] unless the ticket was needs-input) and waiting (needs-input with no answer).
 
 dispatch: sweeps the runs, then starts and launches each ready ticket (and each in-progress ticket whose last
-run ended without a pull request, until 3 runs of it ended in the last 7 days) that has no live run, up to --max
-minus the live runs. Launched sessions get neither the dispatching session's identity nor ANTHROPIC_API_KEY,
-ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN. headless:
+run ended without a ready pull request, a draft counting as none, until 3 runs of it ended in the last 7 days)
+that has no live run, up to --max minus the live runs. When the branch has an open draft PR, the prompt and the start
+comment name it and say the worktree may hold uncommitted work from the previous run. Launched sessions get neither
+the dispatching session's identity nor ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN. headless:
 `claude -p "/harness:work N"` billed through {"apiKeyHelper": HARNESS_API_KEY_CMD} (the key itself never
 reaches a command line or the environment); bg, the default while the api budget is exhausted:
 `claude --bg -n "<repo> #N <title>" "/harness:work N"`.
 
 runs --sweep: closes the records of runs that ended and classifies each (ok, error, billing, auth; a bg run by its
-`claude agents` state). A headless `ok` whose issue is OPEN and still status:in-progress with no pull request of
-its branch in any state ended early: outcome `early`, shown as `ended early (no PR)`. When gh cannot tell, or the
+`claude agents` state). A headless `ok` whose issue is OPEN and still status:in-progress with no ready pull request
+of its branch in any state (none, or only drafts) ended early: outcome `early`, shown as `ended early (draft PR #N)`
+naming the open draft, else `ended early (no PR)`. When gh cannot tell, or the
 record names no repository, it stays `ok` with a warning. One command asks gh once per ticket and branch.
 
 Siblings (harness-board) are found on PATH, else next to this script. gh is HARNESS_GH when set, else `gh`;
@@ -610,11 +612,12 @@ def issue_labels(repo, number):
     return [lb.get("name") for lb in labels or [] if isinstance(lb, dict)]
 
 
-def start_ticket(repo, number, venue):
+def start_ticket(repo, number, venue, draft_pr=None):
     """Everything `start` does except printing; the ticket record, the branch and the worktree.
 
     A needs-input ticket's answers are read before `show` refreshes the ticket cache. The status goes to
-    in-progress except from in-review (a revision pass) and from needs-input without an answer (waiting)."""
+    in-progress except from in-review (a revision pass) and from needs-input without an answer (waiting).
+    `draft_pr`: dispatch's redispatch of a run that left only that open draft PR; a start comment names it."""
     answers = []
     if "status:needs-input" in issue_labels(repo, number):
         found = board_json(repo, "answers", number, "--json")
@@ -640,10 +643,14 @@ def start_ticket(repo, number, venue):
     waiting = previous == "needs-input" and not answers
     if previous not in ("in-progress", "in-review") and not waiting:
         board(repo, "status", number, "in-progress", "--comment", f"Started on {branch} ({hostname()}, {venue})")
+    if draft_pr:
+        board(repo, "comment", number, "--body", f"Started again on {branch} ({hostname()}, {venue}): draft PR "
+                                                 f"#{draft_pr} is open and the worktree may hold uncommitted work "
+                                                 f"from the previous run")
     tier = record.get("tier") if record.get("tier") in TIERS else DEFAULT_TIER
     return {"number": number, "branch": branch, "worktree": worktree, "tier": tier,
             "title": record.get("title") or "", "previous_status": previous, "answers": answers,
-            "waiting": waiting}
+            "waiting": waiting, "draft_pr": draft_pr}
 
 
 # --------------------------------------------------------------- budgets
@@ -908,8 +915,11 @@ def sweep(records, agents):
                 continue
             record["ended_at"] = mtime_iso(record.get("log"))
             outcome, reason = classify(log_tail(record.get("log")))
-            if outcome == "ok" and ended_early(record, repos):
+            early = ended_early(record, repos) if outcome == "ok" else None
+            if early is not None:
                 outcome = "early"
+                if early.get("draft_pr"):
+                    record["draft_pr"] = early["draft_pr"]
             record["outcome"] = outcome
             if outcome in ("billing", "auth"):
                 exhaust(load_budgets(), "api", f"{outcome}: {reason}", EXHAUST_HOURS)
@@ -917,22 +927,23 @@ def sweep(records, agents):
 
 
 def ended_early(record, repos):
-    """Whether an `ok` headless run left its ticket in progress with no pull request: the session ended its turn
-    before the work did. False, with a warning, when the repository or gh cannot tell. `repos` caches Repo by path."""
+    """The issue (as without_pr gives it) when an `ok` headless run left its ticket in progress with no ready pull
+    request: the session ended its turn before the work did. None, with a warning, when the repository or gh cannot
+    tell. `repos` caches Repo by path."""
     n = record.get("ticket")
     if not isinstance(n, int):
-        return False
+        return None
     path = str(record.get("repo") or "")
     if not path:                    # never the cwd's repository: its issue n may be another ticket
         warn(f"#{n}: cannot check whether its run ended early: the run record names no repository")
-        return False
+        return None
     try:
         if path not in repos:
             repos[path] = Repo(path)
-        return without_pr(repos[path], n, record.get("branch")) is not None
+        return without_pr(repos[path], n, record.get("branch"))
     except Problem as err:
         warn(f"#{n}: cannot check whether its run ended early: {err}")
-        return False
+        return None
 
 
 def run_state(record, agents):
@@ -940,7 +951,10 @@ def run_state(record, agents):
         exit_code = record.get("exit")
         if exit_code is not None:
             return f"exited {exit_code}"
-        return "ended early (no PR)" if record.get("outcome") == "early" else f"ended {record.get('outcome') or '?'}"
+        if record.get("outcome") == "early":
+            pr = record.get("draft_pr")
+            return f"ended early (draft PR #{pr})" if pr else "ended early (no PR)"
+        return f"ended {record.get('outcome') or '?'}"
     if is_bg(record):
         listing = agents.get()
         entry = listing.get(str(record.get("bg_id"))) if listing else None
@@ -970,6 +984,10 @@ def launch(repo, ticket, venue):
               "venue": venue, "log": log, "started_at": iso(started), "ended_at": None, "exit": None,
               "outcome": None}
     prompt = f"/harness:work {n}"
+    if ticket.get("draft_pr"):
+        prompt += (f"\n\nThe previous run ended early: draft PR #{ticket['draft_pr']} is open and the worktree may "
+                   f"hold uncommitted work from that run. Read `git status` and the PR's review comments before "
+                   f"deciding what to do.")
     if venue == "headless":
         settings = json.dumps({"apiKeyHelper": api_key_cmd()})
         argv = [claude_exe(), "-p", prompt, "--permission-mode", "auto", "--output-format", "json",
@@ -1011,11 +1029,13 @@ def failed(record, why):
 
 
 WITHOUT_PR = {}     # (main checkout, ticket, branch): the issue, None or the Problem, asked once per command
+PR_ROWS = 100       # pull requests of a branch read by ask_without_pr
 
 
 def without_pr(repo, n, branch):
-    """The issue of ticket n when it is OPEN and status:in-progress and `branch` has no pull request in any state,
-    else None. A failing gh call raises Problem. One command asks gh once per ticket and branch: dispatch's sweep
+    """The issue of ticket n when it is OPEN and status:in-progress and `branch` has no ready pull request in any
+    state (none, or only drafts), else None; its `draft_pr` is the newest open draft's number, or None. A failing
+    gh call raises Problem. One command asks gh once per ticket and branch: dispatch's sweep
     and its redispatch share the answer, a failure included."""
     key = (repo.main, n, branch)
     if key not in WITHOUT_PR:
@@ -1036,13 +1056,17 @@ def ask_without_pr(repo, n, branch):
     labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
     if "status:in-progress" not in labels:
         return None
-    prs = gh_json(repo, ["pr", "list", "--head", str(branch), "--state", "all", "--json", "number",
-                         "--limit", "1"]) if branch else []
-    return None if prs else issue
+    prs = gh_json(repo, ["pr", "list", "--head", str(branch), "--state", "all", "--json", "number,state,isDraft",
+                         "--limit", str(PR_ROWS)]) if branch else []
+    rows = [pr for pr in prs if isinstance(pr, dict)] if isinstance(prs, list) else []
+    if any(pr.get("isDraft") is not True for pr in rows):    # a ready one, merged or closed too: a normal end
+        return None
+    drafts = [pr.get("number") for pr in rows if str(pr.get("state", "")).upper() == "OPEN"]   # newest first
+    return dict(issue, draft_pr=drafts[0] if drafts else None)
 
 
 def redispatch_candidates(repo, records, live, *, capped_only=False):
-    """In-progress tickets whose last run ended (within the window) without a pull request: dispatched again,
+    """In-progress tickets whose last run ended (within the window) without a ready pull request: dispatched again,
     unless REDISPATCH_MAX runs of the ticket ended within the window. (candidates, skipped, the id of the record
     each skipped ticket's cap rests on: its latest started). `capped_only` skips the gh check for tickets under
     the cap, whose answer the caller would discard."""
@@ -1074,13 +1098,14 @@ def redispatch_candidates(repo, records, live, *, capped_only=False):
         again = record.get("outcome") or "ended"
         if ended_runs.get(n, 0) >= REDISPATCH_MAX:
             days = REDISPATCH_WINDOW.days
-            skipped.append({"number": n, "why": f"{ended_runs[n]} runs ended without a pull request in {days} days "
-                                                f"(last: {again} at {record.get('ended_at')}); run it in this "
+            skipped.append({"number": n, "why": f"{ended_runs[n]} runs ended without a ready pull request in {days} "
+                                                f"days (last: {again} at {record.get('ended_at')}); run it in this "
                                                 f"session with /harness:work {n}, or wait for the window",
                             "runs": ended_runs[n], "window_days": days, "advice": f"/harness:work {n}"})
             capped_ids[n] = record.get("id")
             continue
-        out.append({"number": n, "title": issue.get("title") or "", "tier": None, "again": again})
+        out.append({"number": n, "title": issue.get("title") or "", "tier": None, "again": again,
+                    "draft_pr": issue.get("draft_pr")})
     return out, skipped, capped_ids
 
 
@@ -1171,6 +1196,8 @@ def cmd_dispatch(repo, args):
 
     def describe(row):
         detail = f"tier {row['tier']}" if row.get("tier") else f"again after {row.get('again')}"
+        if row.get("draft_pr"):
+            detail += f", draft PR #{row['draft_pr']}"
         return f"#{row['number']} {row.get('title') or ''} ({detail})"
 
     if args.dry_run:
@@ -1205,7 +1232,7 @@ def cmd_dispatch(repo, args):
             break
         n = row["number"]
         try:
-            ticket = start_ticket(repo, n, venue)
+            ticket = start_ticket(repo, n, venue, row.get("draft_pr"))
             if not ticket["title"]:
                 ticket["title"] = row.get("title") or ""
             record = launch(repo, ticket, venue)
