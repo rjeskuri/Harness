@@ -28,7 +28,7 @@ sh scripts/install.sh
 
 It adds the marketplace, installs the plugin, copies `user/CLAUDE.md` to `~/.claude/CLAUDE.md` with a dated backup, merges the model settings into `~/.claude/settings.json` with a dated backup, and installs the daily digest with `harness-digest --install-launchd`. Safe to run again. The marketplace loads from this folder in place, so an edit here applies at the next session or after `/reload-plugins`.
 
-Once, store the API key that dispatched runs bill to. The command prompts for the key, so it never touches a command line:
+Once, store the API key that `/harness:work --api` runs bill to. The command prompts for the key, so it never touches a command line:
 
 ```sh
 security add-generic-password -a "$USER" -s harness-anthropic -w
@@ -40,7 +40,7 @@ Then register your projects: `harness-projects discover`, and `harness-projects 
 
 1. `/harness:new-project [path]` interviews you, scaffolds the repo, creates the private GitHub repository and labels, and registers it.
 2. `/harness:plan <request>` interviews you, has the planner propose an epic and tasks, and creates the issues once you approve.
-3. `/harness:work` dispatches one headless run per ready ticket; `/harness:work N` runs ticket N in this session.
+3. `/harness:work` dispatches one background session on the subscription per ready ticket (`/harness:work --api`: headless runs on the API key); `/harness:work N` runs ticket N in this session.
 4. A ticket that needs you gets a comment and a notification; reply in a comment, then `/harness:work N` picks up the answer.
 5. `/harness:land` lists PRs awaiting you; `/harness:land P` summarizes one, asks once, squash-merges, cleans up and closes the ticket.
 
@@ -120,10 +120,11 @@ Machine-wide, under `env` in `~/.claude/settings.json`: `HARNESS_API_KEY_CMD` (d
 | Work | Bills to |
 |---|---|
 | Interactive sessions, including `/harness:work N` | The Max subscription |
-| Dispatched headless runs | The API key, read from the keychain |
+| Dispatched runs, `/harness:work` (the default) | The Max subscription |
+| Dispatched headless runs, `/harness:work --api` or `--venue headless` | The API key, read from the keychain |
 | Ultrareview on `risk:high` PRs | claude.ai usage credits, about 5 to 25 dollars a run |
 
-When a headless run fails on billing or auth, the API budget is marked exhausted for 24 hours and dispatch falls back to background sessions on the subscription. A credits failure on ultrareview marks the cloud budget the same way. `harness-work budget status` shows the state; `harness-work budget reset api` clears it after a top-up.
+When a headless run fails on billing or auth, the API budget is marked exhausted for 24 hours, and until then `--api` and `--venue headless` are refused; dispatch without them still runs on the subscription. A credits failure on ultrareview marks the cloud budget the same way. `harness-work budget status` shows the state; `harness-work budget reset api` clears it after a top-up.
 
 ## Troubleshooting
 

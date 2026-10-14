@@ -31,7 +31,7 @@
 
 ## Budgets
 
-- Interactive sessions run on the subscription. Dispatched tickets run headless on the API key (`harness-work dispatch`) and fall back to a background session on the subscription when the API budget is exhausted. `risk:high` pull requests get `claude ultrareview` on usage credits. `harness-work budget status` shows what is exhausted; report it, do not fight it.
+- Interactive sessions and dispatched tickets run on the subscription by default: `harness-work dispatch` launches background sessions. The API key is spent only on request: `/harness:work --api` (or `harness-work dispatch --venue headless`) launches headless runs billed to it. While the API budget is exhausted, `--api` and `--venue headless` are refused. `risk:high` pull requests get `claude ultrareview` on usage credits. `harness-work budget status` shows what is exhausted; report it, do not fight it.
 
 ## Across projects
 

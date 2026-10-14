@@ -1,7 +1,8 @@
 """Tests for harness-work: start (branch and worktree from origin/main, an existing remote branch reused, the
 exclude line, the worktree setup, .worktreeinclude copies, refusals), attempt's retry, escalate and
-needs-input sequence, dispatch (dry-run plan, headless launch billed through apiKeyHelper, the bg fallback
-while the api budget is exhausted, re-dispatch of a run that ended without a PR), runs --sweep's outcome
+needs-input sequence, dispatch (dry-run plan, bg on the subscription by default whatever the api budget says,
+--venue headless billed through apiKeyHelper and refused while the api budget is exhausted, re-dispatch of a run
+that ended without a PR), runs --sweep's outcome
 classification and the budget it marks, budget status, exhaust and reset, worktrees and worktree remove.
 
     python3 -m unittest discover -s plugins/harness/tests -v
@@ -510,8 +511,8 @@ class Dispatch(WorkTest):
         self.scenario(issues=[issue(), issue(13), issue(14)],
                       ready=[ready_row(12), ready_row(13, "Second"), ready_row(14, "Third")])
         p = self.ok("dispatch", "--dry-run", "--max", "2")
-        self.assertIn("venue headless, 1 live, 1 of 2 slots free", p.stdout)
-        self.assertIn("would start #12 Add the board tool (tier sonnet) and launch headless", p.stdout)
+        self.assertIn("venue bg, 1 live, 1 of 2 slots free", p.stdout)
+        self.assertIn("would start #12 Add the board tool (tier sonnet) and launch bg", p.stdout)
         self.assertIn(f"skip #13: live run {self.key}-13-", p.stdout)
         self.assertIn("skip #14: over --max 2", p.stdout)
         self.assertNotIn("would start #13", p.stdout)
@@ -525,7 +526,7 @@ class Dispatch(WorkTest):
         self.scenario(issues=[issue()], ready=[ready_row(12)])
         env = self.env(HARNESS_API_KEY_CMD=f"cat {keyfile}", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="parent",
                        **CREDENTIALS)
-        p = self.ok("dispatch", env=env)
+        p = self.ok("dispatch", "--venue", "headless", env=env)
         self.assertIn(f"#12 headless on {BRANCH} (pid ", p.stdout)
 
         [record] = self.run_records()
@@ -566,7 +567,7 @@ class Dispatch(WorkTest):
 
     def test_headless_default_api_key_command(self):
         self.scenario(issues=[issue()], ready=[ready_row(12)])
-        self.ok("dispatch")
+        self.ok("dispatch", "--venue", "headless")
         self.assertTrue(wait_for(lambda: len(self.claude_calls()) == 1))
         argv = self.claude_calls()[0]["argv"]
         self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), {"apiKeyHelper": DEFAULT_KEY_CMD})
@@ -600,7 +601,7 @@ class Dispatch(WorkTest):
         self.write_run(12, pid=self.dead_pid(), ended_at=iso_ago(hours=1), outcome="billing")
         self.scenario(issues=[issue(labels=("task", "status:in-progress", "size:S", "risk:low"))])
         p = self.ok("dispatch", "--dry-run")
-        self.assertIn("would start #12 Add the board tool (again after billing) and launch headless", p.stdout)
+        self.assertIn("would start #12 Add the board tool (again after billing) and launch bg", p.stdout)
         self.scenario(issues=[issue(labels=("task", "status:in-progress", "size:S", "risk:low"))],
                       prs=[{"number": 7}])
         p = self.ok("dispatch", "--dry-run")
@@ -791,6 +792,237 @@ class Dispatch(WorkTest):
                 self.assertEqual(json.loads(argv[7]), {"apiKeyHelper": DEFAULT_KEY_CMD})
                 self.assertTrue(wait_for(lambda: pid_gone(record["pid"])))
 
+    # ---- ticket #57: without --venue, dispatch runs on the subscription (bg) whatever the api budget says
+    def budget_states(self):
+        """(label, setup) for every state of the api budget: no budgets file, an exhaustion whose time has passed,
+        only the cloud budget exhausted, `budget reset api` after an exhaustion, and the api budget exhausted."""
+        def no_file():
+            if os.path.exists(self.budgets_path()):
+                os.unlink(self.budgets_path())
+
+        def reset():
+            self.write_budget("api", 6, "billing: credit balance is too low")
+            self.ok("budget", "reset", "api")
+
+        return [("no budgets file", no_file), ("expired", lambda: self.write_budget("api", -2, "billing: old")),
+                ("cloud only", lambda: self.write_budget("cloud", 5, "cloud: out")), ("reset", reset),
+                ("api exhausted", lambda: self.write_budget("api", 3, "billing: credit balance is too low"))]
+
+    def fresh_logs(self):
+        for record in self.run_records():                  # a headless child still running would log into the next case
+            if isinstance(record.get("pid"), int):
+                wait_for(lambda: pid_gone(record["pid"]))
+        shutil.rmtree(self.runs_dir(), True)
+        for path in (self.gh_log, self.claude_log):
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_default_venue_is_bg_whatever_the_api_budget_says(self):
+        keyfile = write(os.path.join(self.tmp, "key.txt"), SECRET + "\n")
+        key_cmd = f"cat {keyfile}"
+        tickets = [(12, "Add the board tool"), (13, "Second ticket"), (14, "Third ticket"), (16, "Fourth ticket"),
+                   (17, "Fifth ticket")]
+        for (label, setup), (n, title) in zip(self.budget_states(), tickets):
+            with self.subTest(budget=label, ticket=n):
+                self.fresh_logs()
+                setup()
+                budgets_before = read_text(self.budgets_path())
+                status_before = self.ok("budget").stdout
+                bg_id = f"bg{n}{label[:2]}"
+                self.scenario(issues=[issue(n, title=title)], ready=[ready_row(n, title)])
+                env = self.env(HARNESS_API_KEY_CMD=key_cmd, FAKECLAUDE_BG_ID=bg_id, **CREDENTIALS)
+                p = self.ok("dispatch", env=env)
+                self.assertRegex(p.stdout, rf"(?m)^#{n} bg on t/{n}-\S+ \(id {bg_id}\)$")
+                self.assertNotIn("headless", p.stdout + p.stderr)
+                self.assertNotIn("budget reset", p.stdout + p.stderr)
+
+                [call] = self.claude_calls()                   # one session, on the subscription login
+                self.assertEqual(call["argv"], ["--bg", "-n", f"proj #{n} {title}", "--permission-mode", "auto",
+                                                f"/harness:work {n}"])
+                self.assertNotIn(key_cmd, json.dumps(call["argv"]))
+                self.assertNotIn(SECRET, json.dumps(call))
+                for name, value in CREDENTIALS.items():          # no exported key or token bills instead
+                    self.assertNotIn(name, call["env"])
+                    self.assertNotIn(value, json.dumps(call))
+                [record] = self.run_records()
+                self.assertTrue(record["branch"].startswith(f"t/{n}-"), record["branch"])
+                self.assertEqual(os.path.realpath(call["cwd"]), self.worktree_path(record["branch"]))
+                self.assertEqual((record["ticket"], record["venue"], record["bg_id"], record["ended_at"]),
+                                 (n, "bg", bg_id, None))
+                self.assertNotIn("pid", record)
+                comment = next(c for c in self.gh_calls() if c[:2] == ["issue", "comment"] and c[2] == str(n))
+                body = comment[comment.index("--body") + 1]
+                self.assertTrue(body.splitlines()[0].endswith(", bg)"), body)
+
+                # dispatch leaves the budgets as it found them: the default does not depend on them or change them
+                self.assertEqual(read_text(self.budgets_path()), budgets_before)
+                self.assertEqual(self.ok("budget").stdout, status_before)
+
+    def test_dry_run_plan_names_bg_by_default_and_headless_only_on_request(self):
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "/harness:work 13"])
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        self.write_run(13, pid=live.pid)
+        board = dict(issues=[issue(), issue(13), issue(14, title="Third"), issue(15, title="Fourth")],
+                     ready=[ready_row(12), ready_row(13, "Second"), ready_row(14, "Third"), ready_row(15, "Fourth")])
+        for (label, setup), most in zip(self.budget_states()[:4], (2, 3, 4, 5)):    # the api budget is available
+            with self.subTest(budget=label, max=most):
+                setup()
+                self.scenario(**board)
+                free = most - 1
+                planned = [n for n in (12, 14, 15)][:free]
+                for venue, extra in (("bg", ()), ("bg", ("--venue", "bg")), ("headless", ("--venue", "headless"))):
+                    p = self.ok("dispatch", "--dry-run", "--max", str(most), *extra)
+                    self.assertIn(f"Dry run: venue {venue}, 1 live, {free} of {most} slots free.", p.stdout)
+                    starts = [ln for ln in p.stdout.splitlines() if ln.startswith("would start #")]
+                    self.assertEqual(len(starts), len(planned), p.stdout)
+                    for line in starts:
+                        self.assertTrue(line.endswith(f"and launch {venue}"), line)
+                    other = "headless" if venue == "bg" else "launch bg"
+                    self.assertNotIn(other, p.stdout)
+                    data = self.ok_json("dispatch", "--dry-run", "--max", str(most), "--json", *extra)
+                    self.assertEqual(data["venue"], venue)
+                    self.assertEqual([row["number"] for row in data["plan"]], planned)
+                self.assertEqual(self.claude_calls(), [])
+                self.assertEqual(len(self.run_records()), 1)
+                self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+
+    def test_a_redispatched_ticket_launches_bg_by_default(self):
+        # #12 ended early, #15 ended in an error, both still in progress with no PR; #16 is fresh from the board.
+        # No budgets file: the api budget is available, and still every launch goes to the subscription.
+        self.write_run(12, id=f"{self.key}-12-20261013090000", pid=self.dead_pid(), started_at=iso_ago(hours=3),
+                       ended_at=iso_ago(hours=2), outcome="early")
+        self.write_run(15, id=f"{self.key}-15-20261013080000", pid=self.dead_pid(), started_at=iso_ago(hours=5),
+                       ended_at=iso_ago(hours=4), outcome="error")
+        titles = {12: "Ended early", 15: "Errored", 16: "Fresh"}
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS, title=titles[12]),
+                              issue(15, labels=IN_PROGRESS, title=titles[15]), issue(16, title=titles[16])],
+                      ready=[ready_row(16, titles[16])])
+        self.assertFalse(os.path.exists(self.budgets_path()))
+
+        p = self.ok("dispatch", "--dry-run")
+        self.assertIn("would start #12 Ended early (again after early) and launch bg", p.stdout.splitlines())
+        self.assertIn("would start #15 Errored (again after error) and launch bg", p.stdout.splitlines())
+        self.assertNotIn("headless", p.stdout)
+
+        p = self.ok("dispatch", "--max", "3", env=self.env(FAKECLAUDE_BG_ID="redo57", **CREDENTIALS))
+        for n in (12, 15, 16):
+            self.assertRegex(p.stdout, rf"(?m)^#{n} bg on t/{n}-\S+ \(id redo57\)$")
+        self.assertNotIn("headless", p.stdout)
+        calls = {int(c["argv"][-1].split()[1]): c for c in self.claude_calls()}
+        self.assertEqual(sorted(calls), [12, 15, 16])
+        for n, call in calls.items():
+            with self.subTest(ticket=n):
+                self.assertEqual(call["argv"], ["--bg", "-n", f"proj #{n} {titles[n]}", "--permission-mode", "auto",
+                                                f"/harness:work {n}"])
+                for name in CREDENTIALS:
+                    self.assertNotIn(name, call["env"])
+        fresh = [r for r in self.run_records() if not r.get("ended_at")]
+        self.assertEqual(sorted((r["ticket"], r["venue"], r.get("bg_id"), "pid" in r) for r in fresh),
+                         [(12, "bg", "redo57", False), (15, "bg", "redo57", False), (16, "bg", "redo57", False)])
+
+    # ---- ticket #57: `--api` is the CLI's own alias for `--venue headless`, the only other way onto the API key
+    def test_api_launches_headless_on_the_api_key_while_the_budget_is_available(self):
+        tickets = [(12, "Add the board tool", ("--api",)), (13, "Second ticket", ("--api", "--venue", "headless")),
+                   (14, "Third ticket", ("--venue", "headless", "--api")), (16, "Fourth ticket", ("--api",))]
+        for (label, setup), (n, title, flags) in zip(self.budget_states()[:4], tickets):
+            with self.subTest(budget=label, ticket=n, flags=flags):
+                self.fresh_logs()
+                setup()
+                keyfile = write(os.path.join(self.tmp, f"key{n}.txt"), SECRET + "\n")
+                key_cmd = f"cat {keyfile}"
+                self.scenario(issues=[issue(n, title=title)], ready=[ready_row(n, title)])
+                p = self.ok("dispatch", *flags, env=self.env(HARNESS_API_KEY_CMD=key_cmd, **CREDENTIALS))
+                self.assertRegex(p.stdout, rf"(?m)^#{n} headless on t/{n}-\S+ \(pid \d+, log ")
+                self.assertNotIn(" bg on ", p.stdout)
+                [record] = self.run_records()
+                self.assertEqual((record["ticket"], record["venue"]), (n, "headless"))
+                self.assertIsInstance(record["pid"], int)
+                self.assertNotIn("bg_id", record)
+                self.assertTrue(wait_for(lambda: len(self.claude_calls()) == 1))
+                [call] = self.claude_calls()
+                self.assertEqual(call["argv"][:7], ["-p", f"/harness:work {n}", "--permission-mode", "auto",
+                                                    "--output-format", "json", "--settings"])
+                self.assertEqual(json.loads(call["argv"][7]), {"apiKeyHelper": key_cmd})
+                self.assertEqual(len(call["argv"]), 8)
+                self.assertEqual(os.path.realpath(call["cwd"]), self.worktree_path(record["branch"]))
+                self.assertNotIn(SECRET, json.dumps(call))
+                for name in CREDENTIALS:
+                    self.assertNotIn(name, call["env"])
+                comment = next(c for c in self.gh_calls() if c[:2] == ["issue", "comment"] and c[2] == str(n))
+                self.assertTrue(comment[comment.index("--body") + 1].splitlines()[0].endswith(", headless)"))
+                self.assertTrue(wait_for(lambda: pid_gone(record["pid"])))
+
+    def test_api_dry_run_plans_headless(self):
+        self.scenario(issues=[issue(), issue(13), issue(14, title="Third")],
+                      ready=[ready_row(12), ready_row(13, "Second"), ready_row(14, "Third")])
+        for most, flags in ((1, ("--api",)), (2, ("--api", "--venue", "headless")), (3, ("--api",))):
+            with self.subTest(max=most, flags=flags):
+                p = self.ok("dispatch", "--dry-run", "--max", str(most), *flags)
+                self.assertIn(f"Dry run: venue headless, 0 live, {most} of {most} slots free.", p.stdout)
+                starts = [ln for ln in p.stdout.splitlines() if ln.startswith("would start #")]
+                self.assertEqual(len(starts), most, p.stdout)
+                for line in starts:
+                    self.assertTrue(line.endswith("and launch headless"), line)
+                self.assertNotIn("launch bg", p.stdout)
+                data = self.ok_json("dispatch", "--dry-run", "--max", str(most), "--json", *flags)
+                self.assertEqual(data["venue"], "headless")
+                self.assertEqual([row["number"] for row in data["plan"]], [12, 13, 14][:most])
+        self.assertEqual(self.claude_calls(), [])
+        self.assertEqual(self.run_records(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+
+    def test_api_is_refused_while_the_api_budget_is_exhausted(self):
+        ended = self.write_run(15, pid=self.dead_pid(), started_at=iso_ago(hours=2), ended_at=iso_ago(hours=1),
+                               outcome="billing")
+        in_progress = issue(15, labels=IN_PROGRESS, title="Billing victim")
+        for hours, reason in ((1, "billing: credit balance is too low"), (30, "auth: invalid api key")):
+            for flags in (("--api",), ("--api", "--venue", "headless")):
+                for extra in ((), ("--dry-run",), ("--dry-run", "--json")):
+                    with self.subTest(hours=hours, flags=flags, extra=extra):
+                        self.write_budget("api", hours, reason)
+                        until = self.api_until()
+                        self.scenario(issues=[issue(), in_progress], ready=[ready_row(12)])
+                        for path in (self.gh_log, self.claude_log):
+                            if os.path.exists(path):
+                                os.unlink(path)
+                        p = self.work("dispatch", *flags, "--max", "5", *extra, env=self.env(**CREDENTIALS))
+                        if "--json" in extra:
+                            self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                        else:
+                            self.assertRefusedHeadless(p, until)
+                            self.assertNotIn("launch headless", p.stdout)
+                            self.assertNotIn("headless on", p.stdout)
+                        self.assertNothingStarted([ended["id"]])
+                        self.assertEqual(self.api_until(), until)
+        # nothing to launch at all: still refused
+        self.scenario()
+        p = self.work("dispatch", "--api")
+        self.assertRefusedHeadless(p, self.api_until())
+
+    def test_api_with_venue_bg_is_an_error_and_starts_nothing(self):
+        self.scenario(issues=[issue()], ready=[ready_row(12)])            # the api budget is available
+        # --api alone is a known flag (so the error below is the conflict, not an unknown argument)
+        p = self.ok("dispatch", "--api", "--dry-run")
+        self.assertIn("would start #12 Add the board tool (tier sonnet) and launch headless", p.stdout)
+        for flags in (("--api", "--venue", "bg"), ("--venue", "bg", "--api")):
+            for extra in ((), ("--dry-run",)):
+                with self.subTest(flags=flags, extra=extra):
+                    p = self.work("dispatch", *flags, *extra, env=self.env(**CREDENTIALS))
+                    self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn("--api", p.stderr)
+                    self.assertNotIn("unrecognized", p.stderr)
+                    self.assertNotIn("would start", p.stdout)
+                    self.assertNothingStarted([])
+        p = self.ok("dispatch", "--venue", "bg", "--dry-run")              # the control: the same board plans bg
+        self.assertIn("would start #12 Add the board tool (tier sonnet) and launch bg", p.stdout)
+
+    def test_dispatch_help_says_bg_is_the_default_venue(self):
+        # --venue states bg as the default with no budget condition; --api says it bills the API key. The checker
+        # itself is proven on right and wrong help texts in SkillWording.
+        p = self.ok("dispatch", "--help")
+        self.assertEqual(help_venue_problems(p.stdout), [], p.stdout)
+
 
 IN_PROGRESS = ("task", "status:in-progress", "size:S", "risk:low")
 
@@ -867,8 +1099,8 @@ class RedispatchCap(WorkTest):
         self.scenario(issues=[issue(13, labels=IN_PROGRESS, title="Two"),
                               issue(16, labels=IN_PROGRESS, title="Straddling")])
         p = self.ok("dispatch", "--dry-run")
-        self.assertIn("would start #13 Two (again after ok) and launch headless", p.stdout)
-        self.assertIn("would start #16 Straddling (again after ok) and launch headless", p.stdout)
+        self.assertIn("would start #13 Two (again after ok) and launch bg", p.stdout)
+        self.assertIn("would start #16 Straddling (again after ok) and launch bg", p.stdout)
         self.assertNotIn("skip #", p.stdout)
         data = self.ok_json("dispatch", "--dry-run", "--json")
         self.assertEqual(data["skipped"], [])
@@ -1268,9 +1500,9 @@ class RedispatchCap(WorkTest):
         self.assertEqual(self.marked(), {n: [last[n]["id"]] for n in capped})
 
         p = self.ok("dispatch", "--dry-run", "--max", "9")
-        self.assertIn("Dry run: venue headless,", p.stdout)
+        self.assertIn("Dry run: venue bg,", p.stdout)
         for n in under:
-            self.assertIn(f"would start #{n} Mixed {n} (again after {last[n]['outcome']}) and launch headless",
+            self.assertIn(f"would start #{n} Mixed {n} (again after {last[n]['outcome']}) and launch bg",
                           p.stdout.splitlines())
         lines = self.cap_lines(p.stdout)
         self.assertEqual(sorted(lines), sorted(capped))
@@ -1306,7 +1538,7 @@ class RedispatchCap(WorkTest):
                               issue(15, labels=IN_PROGRESS, title="Control")])
         self.ok("budget", "reset", "api")                                   # credits added
         self.assertEqual(self.marked(), {15: [control[-1]["id"]]})
-        p = self.ok("dispatch", "--dry-run")
+        p = self.ok("dispatch", "--venue", "headless", "--dry-run")
         self.assertIn(f"would start #12 Credits added (again after {last['outcome']}) and launch headless",
                       p.stdout.splitlines())
         self.assertEqual(sorted(self.cap_lines(p.stdout)), [15])
@@ -1375,7 +1607,7 @@ class DispatchRunsByRepoField(WorkTest):
                       ready=[ready_row(12), ready_row(13, "Second"), ready_row(14, "Third"),
                              ready_row(15, "Fourth")])
         p = self.ok("dispatch", "--dry-run", "--max", "3")
-        self.assertIn("venue headless, 1 live, 2 of 3 slots free", p.stdout)
+        self.assertIn("venue bg, 1 live, 2 of 3 slots free", p.stdout)
         self.assertIn(f"skip #13: live run {ours['id']}", p.stdout)
         self.assertNotIn("would start #13", p.stdout)
         # the sibling's live run on #14 is not ours: #14 is planned here, and the sibling's run is not named
@@ -1425,7 +1657,7 @@ class DispatchRunsByRepoField(WorkTest):
         self.ended_runs(12, spelled, count=2)
         self.scenario(issues=[issue(labels=in_progress)])
         p = self.ok("dispatch", "--dry-run")
-        self.assertIn("would start #12 Add the board tool (again after error) and launch headless", p.stdout)
+        self.assertIn("would start #12 Add the board tool (again after error) and launch bg", p.stdout)
 
     def test_a_run_of_a_directory_differing_only_in_case_is_not_ours_on_a_case_sensitive_file_system(self):
         upper = os.path.join(self.tmp, "PROJ")
@@ -2139,6 +2371,154 @@ class EndedEarly(WorkTest):
         self.assertNotIn("#92", started[35])
         self.assertNotIn("#91", started[35])
 
+    # ---- #57: bg is the default venue, so a bg run that ends `done` is judged like a headless `ok`
+    def bg_runs(self, cases):
+        """cases: {n: (bg id, `claude agents` state)}. Writes an unended bg run record for each ticket (repo proj,
+        branch t/<n>-x, no pid, no log) and returns the FAKECLAUDE_AGENTS listing that reports each state. The
+        listing gives no exitCode, as `claude agents --json` documents none."""
+        for n, (bg_id, _state) in cases.items():
+            self.write_run(n, venue="bg", bg_id=bg_id, log=None)
+        return json.dumps([{"id": bg_id, "kind": "background", "state": state, "cwd": self.repo,
+                            "name": f"proj #{n} {TITLE}"} for n, (bg_id, state) in cases.items()])
+
+    def test_a_done_bg_run_on_an_in_progress_ticket_without_a_ready_pr_ended_early(self):
+        # The same facts that make a headless `ok` early make a bg `done` early: the issue OPEN, status:in-progress,
+        # and no ready PR of its branch in any state (none, or only drafts). The early run keeps the newest open
+        # draft as draft_pr. Anything else that ends `done` stays `ok`; `failed` and `stopped` are never upgraded,
+        # whatever the board says. gh failing for a done run leaves it `ok` (the facts are missing), as headless.
+        in_review = ("task", "status:in-review", "size:S", "risk:low")
+        needs_input = ("task", "status:needs-input", "size:S", "risk:low")
+        merged = [{"number": 95, "state": "MERGED", "isDraft": False}]
+        cases = {   # n: (bg id, agents state, labels, open PRs, PRs of any state, outcome, state shown)
+            40: ("s-9f1", "done", IN_PROGRESS, [], [], "early", "ended early (no PR)"),
+            41: ("s-0a7", "done", IN_PROGRESS, draft(91), draft(91), "early", "ended early (draft PR #91)"),
+            42: ("s-c3e", "done", IN_PROGRESS, draft(57), draft(57), "early", "ended early (draft PR #57)"),
+            43: ("s-b12", "done", IN_PROGRESS, ready_pr(92), ready_pr(92), "ok", "ended ok"),
+            44: ("s-77d", "done", in_review, [], [], "ok", "ended ok"),
+            45: ("s-e05", "done", in_review, draft(93), draft(93), "ok", "ended ok"),
+            46: ("s-5aa", "done", IN_PROGRESS, [], [], "ok", "ended ok"),          # the issue is CLOSED (below)
+            47: ("s-2d4", "done", IN_PROGRESS, [], merged, "ok", "ended ok"),
+            51: ("s-6c0", "done", needs_input, [], [], "ok", "ended ok"),
+            52: ("s-31f", "done", IN_PROGRESS, [], [], "ok", "ended ok"),          # gh issue view fails (below)
+            48: ("s-d8b", "failed", IN_PROGRESS, [], [], "error", "ended error"),
+            49: ("s-4e9", "failed", IN_PROGRESS, draft(94), draft(94), "error", "ended error"),
+            50: ("s-a60", "stopped", IN_PROGRESS, [], [], "stopped", "ended stopped"),
+        }
+        agents = self.bg_runs({n: c[:2] for n, c in cases.items()})
+        self.write_scenario({n: c[2:5] for n, c in cases.items()}, states={46: "CLOSED"}, failing={52: "issue"})
+
+        p = self.work("runs", "--sweep", "--json", env=self.env(FAKECLAUDE_AGENTS=agents))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rows = {r["ticket"]: r for r in json.loads(p.stdout)}
+        expected = {n: c[5] for n, c in cases.items()}
+        shown = {n: c[6] for n, c in cases.items()}
+        self.assertEqual({n: rows[n]["outcome"] for n in rows}, expected)
+        self.assertEqual({n: rows[n]["state"] for n in rows}, shown)
+        for n in cases:
+            self.assertTrue(rows[n]["ended_at"], rows[n])
+
+        saved = {r["ticket"]: r for r in self.run_records()}
+        self.assertEqual({n: r["outcome"] for n, r in saved.items()}, expected)
+        self.assertEqual({n: saved[n].get("draft_pr") for n in (40, 41, 42)}, {40: None, 41: 91, 42: 57})
+        for n in (43, 44, 45, 46, 47, 48, 49, 50, 51, 52):         # only an early run names a draft
+            self.assertIsNone(saved[n].get("draft_pr"), saved[n])
+
+        # Without a sweep, from the saved records alone: the same states, in --json and in the table.
+        self.assertEqual({r["ticket"]: r["state"] for r in self.ok_json("runs", "--json")}, shown)
+        lines = self.run_lines()
+        for n, state in shown.items():
+            with self.subTest(ticket=n):
+                self.assertIn(state, lines[n])
+                self.assertEqual("ended early" in lines[n], expected[n] == "early", lines[n])
+        self.assertIn("api: available", self.ok("budget", "status").stdout)   # not a budget failure
+
+    def test_only_the_board_and_the_pr_decide_a_bg_early_never_the_ticket_or_the_session_id(self):
+        # Each ticket keeps its bg id across the passes while its agents state, labels and PRs rotate, so neither the
+        # ticket number nor the session id can tell early from ok; a done run's outcome follows the board and the
+        # branch's PRs, a failed run stays error.
+        states = [   # (agents state, labels, open PRs, PRs of any state, outcome, state shown)
+            ("done", IN_PROGRESS, [], [], "early", "ended early (no PR)"),
+            ("done", IN_PROGRESS, draft(66), draft(66), "early", "ended early (draft PR #66)"),
+            ("done", IN_PROGRESS, ready_pr(67), ready_pr(67), "ok", "ended ok"),
+            ("failed", IN_PROGRESS, [], [], "error", "ended error"),
+            ("done", ("task", "status:in-review", "size:S", "risk:low"), draft(68), draft(68), "ok", "ended ok"),
+        ]
+        tickets = {9: "s-x1", 23: "s-k4", 58: "s-q7", 104: "s-m2", 311: "s-z9"}
+        for k in range(len(states)):
+            self.fresh()
+            plan = {n: states[(j + k) % len(states)] for j, n in enumerate(tickets)}
+            agents = self.bg_runs({n: (bg_id, plan[n][0]) for n, bg_id in tickets.items()})
+            self.write_scenario({n: s[1:4] for n, s in plan.items()})
+            rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json",
+                                                         env=self.env(FAKECLAUDE_AGENTS=agents))}
+            with self.subTest(rotation=k):
+                self.assertEqual({n: rows[n]["outcome"] for n in rows}, {n: s[4] for n, s in plan.items()})
+                self.assertEqual({n: rows[n]["state"] for n in rows}, {n: s[5] for n, s in plan.items()})
+                self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()},
+                                 {n: s[4] for n, s in plan.items()})
+
+    def test_dispatch_runs_a_bg_early_ticket_again_after_early(self):
+        # One dispatch sweeps four bg runs and plans the redispatch: #40 (done, no PR) and #41 (done, only draft #91)
+        # go again after early, the draft named; #43 (done, ready PR) is not run again; #48 (failed) goes again after
+        # error, not early.
+        cases = {40: ("s-9f1", "done", []), 41: ("s-0a7", "done", draft(91)),
+                 43: ("s-b12", "done", ready_pr(92)), 48: ("s-d8b", "failed", [])}
+        agents = self.bg_runs({n: c[:2] for n, c in cases.items()})
+        self.write_scenario({n: (IN_PROGRESS, c[2], c[2]) for n, c in cases.items()})
+
+        p = self.ok("dispatch", "--dry-run", env=self.env(FAKECLAUDE_AGENTS=agents))
+        starts = {int(m.group(1)): line for line in p.stdout.splitlines()
+                  for m in [re.match(r"would start #(\d+) ", line)] if m}
+        self.assertEqual(sorted(starts), [40, 41, 48], p.stdout)
+        self.assertIn("would start #40 Add the board tool (again after early)", starts[40])
+        self.assertIn("(again after early", starts[41])
+        self.assertIn("#91", starts[41])
+        self.assertIn("(again after error)", starts[48])
+        self.assertNotIn("early", starts[48])
+        self.assertEqual({r["ticket"]: r["outcome"] for r in self.run_records()},
+                         {40: "early", 41: "early", 43: "ok", 48: "error"})
+        self.assertEqual(next(r for r in self.run_records() if r["ticket"] == 41).get("draft_pr"), 91)
+
+        data = self.ok_json("dispatch", "--dry-run", "--json", env=self.env(FAKECLAUDE_AGENTS=agents))
+        self.assertEqual({row["number"]: row.get("again") for row in data["plan"]},
+                         {40: "early", 41: "early", 48: "error"})
+
+    def test_an_early_bg_run_shows_early_even_when_the_listing_gives_an_exit_code(self):
+        # Should `claude agents` give an exitCode, the record keeps it, but an early end is what `runs` shows: the 0
+        # of a done session says less than that its ticket is still in progress without a ready PR. Any other ended
+        # run with an exit code still shows `exited N` (a done one with a ready PR, a failed one with or without
+        # a draft), each with its own code.
+        cases = {   # n: (bg id, agents state, exitCode, open PRs = PRs of any state, outcome, state shown)
+            60: ("s-e01", "done", 0, [], "early", "ended early (no PR)"),
+            61: ("s-e02", "done", 0, draft(88), "early", "ended early (draft PR #88)"),
+            62: ("s-e03", "done", 0, draft(47), "early", "ended early (draft PR #47)"),
+            63: ("s-e04", "done", 0, ready_pr(89), "ok", "exited 0"),
+            64: ("s-e05", "failed", 3, [], "error", "exited 3"),
+            65: ("s-e06", "failed", 1, draft(90), "error", "exited 1"),
+        }
+        self.bg_runs({n: c[:2] for n, c in cases.items()})
+        agents = json.dumps([{"id": c[0], "kind": "background", "state": c[1], "exitCode": c[2], "cwd": self.repo,
+                              "name": f"proj #{n} {TITLE}"} for n, c in cases.items()])
+        self.write_scenario({n: (IN_PROGRESS, c[3], c[3]) for n, c in cases.items()})
+
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json",
+                                                     env=self.env(FAKECLAUDE_AGENTS=agents))}
+        expected = {n: c[4] for n, c in cases.items()}
+        shown = {n: c[5] for n, c in cases.items()}
+        self.assertEqual({n: rows[n]["outcome"] for n in rows}, expected)
+        self.assertEqual({n: rows[n]["state"] for n in rows}, shown)
+        saved = {r["ticket"]: r for r in self.run_records()}
+        self.assertEqual({n: saved[n]["exit"] for n in saved}, {n: c[2] for n, c in cases.items()})
+        self.assertEqual({n: saved[n].get("draft_pr") for n in (60, 61, 62)}, {60: None, 61: 88, 62: 47})
+
+        # Without a sweep, from the saved records alone: the same states, in --json and in the table.
+        self.assertEqual({r["ticket"]: r["state"] for r in self.ok_json("runs", "--json")}, shown)
+        lines = self.run_lines()
+        for n, state in shown.items():
+            with self.subTest(ticket=n):
+                self.assertIn(state, lines[n])
+                self.assertEqual("exited" in lines[n], expected[n] != "early", lines[n])
+
 
 def draft(number):
     """`pr list` rows: one open draft pull request."""
@@ -2233,7 +2613,7 @@ class RedispatchDraft(WorkTest):
         self.assertEqual(self.claude_calls(), [])
 
         # For real, one slot: #12 is launched in its existing worktree, the uncommitted work left alone.
-        p = self.ok("dispatch", "--max", "1")
+        p = self.ok("dispatch", "--venue", "headless", "--max", "1")
         self.assertIn(f"#12 headless on {BRANCH} (pid ", p.stdout)
         launched = [r for r in self.run_records() if r.get("ended_at") is None]
         self.assertEqual([r["ticket"] for r in launched], [12])
@@ -2300,7 +2680,7 @@ class RedispatchDraft(WorkTest):
         self.assertIn("(again after early)", starts[15][0])    # no PR: the reason as before #42
         self.assertNotIn("#41", starts[15][0] + starts[16][0])
 
-        p = self.ok("dispatch", "--max", "3")
+        p = self.ok("dispatch", "--venue", "headless", "--max", "3")
         launched = [r for r in self.run_records() if r.get("ended_at") is None]
         self.assertEqual(sorted(r["ticket"] for r in launched), [12, 15, 16], p.stdout)
         for record in launched:
@@ -2544,7 +2924,179 @@ def closing_problems(lines):
     return problems
 
 
+def dispatch_section(body=None):
+    """The text under the skill's dispatch heading, up to the next heading."""
+    body = skill_body() if body is None else body
+    m = re.search(r"(?im)^#{1,6} .*\bdispatch\b.*$", body)
+    if not m:
+        return ""
+    rest = body[m.end():]
+    nxt = re.search(r"(?m)^#{1,6} ", rest)
+    return rest[:nxt.start()] if nxt else rest
+
+
+def argument_hint():
+    m = re.search(r"(?m)^argument-hint:\s*(.*)$", skill_front())
+    return m.group(1) if m else ""
+
+
+def dispatch_venue_problems(section, hint):
+    """What the dispatch section and the argument-hint get wrong about ticket #57's venues; [] when they say: the
+    hint offers `--api` and `--venue`, the subscription is the default, `--api` reaches harness-work dispatch (as its
+    own flag passed through, or as `--venue headless`) and bills the API key, and every mention of headless or the
+    API key is tied to that opt-in."""
+    problems = []
+    if "--api" not in hint:
+        problems.append("the argument-hint has no --api")
+    if "--venue" not in hint:
+        problems.append("the argument-hint has no --venue")
+    sentences = sentences_of(" ".join(section.replace("`", "").split()).lower())
+    clauses = [c for s in sentences for c in re.split(r";\s*", s)]
+    if not any("harness-work dispatch" in s and ("$arguments" in s or "--api" in s or "--venue headless" in s)
+               for s in sentences):
+        problems.append("no sentence passes --api to harness-work dispatch")
+    # The default is the subscription, unconditionally: a clause that says so and names no budget condition.
+    if not any("subscription" in c and says_default(c) and not BUDGET_WORDS.search(c) for c in clauses):
+        problems.append("no clause says the subscription is the default, unconditionally")
+    for c in clauses:
+        if "subscription" in c and BUDGET_CONDITION.search(c):
+            problems.append(f"the subscription is tied to an exhausted budget: {c}")
+        if says_default(c) and re.search(r"\bheadless\b|\bapi key\b", c):
+            problems.append(f"headless or the api key as a default: {c}")
+    if not any(opt_in_trigger(s) and "api key" in strip_parens(s) and re.search(r"\bbill", s) for s in sentences):
+        problems.append("no sentence says --api bills the api key")
+    for s in sentences:
+        if re.search(r"\bheadless\b|\bapi key\b", s) and not opt_in_trigger(s):
+            problems.append(f"headless or the api key without --api as its trigger: {s}")
+        if re.search(r"--api\b[^.;]*\bimpl(?:ied|icit)", s):
+            problems.append(f"--api as implied: {s}")
+    return problems
+
+
+# A budget as the condition of what precedes it ("once the api budget is exhausted", "only while the budget lasts");
+# "whatever the budgets say" is not one.
+BUDGET_WORDS = re.compile(r"\b(?:once|unless|only|when|while|if|until|after)\b[^.;]*\b(?:exhausted|budgets?)\b")
+BUDGET_CONDITION = re.compile(r"\b(?:once|unless|only when|when|while|if|until|after)\b[^.;]*\bexhausted\b")
+DEFAULT = re.compile(r"\bdefault\b")
+
+
+def says_default(text):
+    """A 'default' in lower-cased `text` that is not negated."""
+    return any(not negated(text, m.start()) for m in DEFAULT.finditer(text))
+
+
+def strip_parens(text):
+    """`text` without its parenthetical asides, nested ones included."""
+    while True:
+        out = re.sub(r"\([^()]*\)", " ", text)
+        if out == text:
+            return out
+        text = out
+
+
+def opt_in_trigger(sentence):
+    """True when lower-cased `sentence` names `--api` or `--venue headless` outside parentheses, not after
+    'without', 'no', 'unless', 'never' or 'not': the opt-in is the trigger, not an aside."""
+    text = strip_parens(sentence)
+    for m in re.finditer(r"--api\b|--venue headless", text):
+        if not set(WORD.findall(text[:m.start()])[-2:]) & {"without", "no", "unless", "never", "not"}:
+            return True
+    return False
+
+
+def option_help(stdout, option):
+    """The help text argparse prints for `option` (its metavar dropped), joined into one line; '' when absent."""
+    lines = stdout.splitlines()
+    start = next((i for i, ln in enumerate(lines) if re.match(r"^(?:options|optional arguments):", ln)), None)
+    if start is None:
+        return ""
+    for i in range(start + 1, len(lines)):
+        m = re.match(rf"^\s+{re.escape(option)}(?![\w-])(.*)$", lines[i])
+        if not m:
+            continue
+        parts = [m.group(1)]
+        for ln in lines[i + 1:]:
+            if not ln[:1].isspace() or ln.strip().startswith("-") or not ln.strip():
+                break
+            parts.append(ln.strip())
+        return re.sub(r"\{[^}]*\}", " ", " ".join(" ".join(parts).split())).strip()
+    return ""
+
+
+def help_venue_problems(stdout):
+    """What `harness-work dispatch --help` gets wrong about ticket #57; [] when --venue states bg as the default
+    with no budget condition on it, and --api says it bills the API key."""
+    problems = []
+    venue = option_help(stdout, "--venue").lower()
+    if not venue:
+        problems.append("no --venue entry")
+    if not (re.search(r"\bdefault[: ]+(?:is )?(?:the )?`?bg\b", venue) or re.search(r"\bbg\b[^.;]*\(default\)", venue)):
+        problems.append(f"bg is not the stated default: {venue}")
+    if re.search(r"\bdefault[^.;)]*\b(?:exhausted|budget)\b", venue):
+        problems.append(f"the default is tied to the budget: {venue}")
+    for clause in re.split(r"[.;]", venue):
+        if re.search(r"\bbg\b", clause) and BUDGET_CONDITION.search(clause):
+            problems.append(f"bg is tied to an exhausted budget: {clause}")
+    api = option_help(stdout, "--api").lower()
+    if not api:
+        problems.append("no --api entry")
+    elif not (re.search(r"\bapi key\b", api) and re.search(r"\bbill", api)):
+        problems.append(f"--api does not say it bills the api key: {api}")
+    return problems
+
+
+def design_venue_problems(text):
+    """What docs/design.md gets wrong about ticket #57; [] when principle 5 says dispatched work runs on the
+    subscription by default (no budget condition, headless never the default) and ties the API key to `--api` or
+    `--venue headless`, the headless venue bullet names that opt-in and is never the default, and the bg bullet is the
+    default, not a fallback and not conditioned on an exhausted budget."""
+    problems = []
+    lines = text.splitlines()
+    principles = [ln for ln in lines if re.match(r"^5\. \*\*", ln)]
+    if len(principles) != 1:
+        return [f"{len(principles)} principle-5 lines"]
+    p = principles[0].replace("`", "").lower()
+    clauses = re.split(r"[.;]\s*", p)
+    if not any("subscription" in c and "dispatch" in c and says_default(c) and not BUDGET_WORDS.search(c)
+               for c in clauses):
+        problems.append("principle 5 has no clause: dispatched work runs on the subscription by default")
+    if re.search(r"\bdefaults? (?:to )?headless\b", p) or re.search(r"\bdefault only when\b", p):
+        problems.append("principle 5 makes headless the default, or the default conditional")
+    for c in clauses:
+        if says_default(c) and re.search(r"\bheadless\b|\bapi key\b|\bapi\b(?! budget)", c):
+            problems.append(f"principle 5 makes the api a default: {c}")
+    if not any(re.search(r"\bapi\b", s) and ("--api" in s or "--venue headless" in s) for s in sentences_of(p)):
+        problems.append("principle 5 does not tie the api key to --api or --venue headless")
+    if re.search(r"dispatched ticket work runs headless and bills the api key", p):
+        problems.append("principle 5 keeps the old headless default")
+    headless = [ln for ln in lines if ln.lstrip().startswith("- venue `headless`")]
+    bg = [ln for ln in lines if ln.lstrip().startswith("- venue `bg`")]
+    if len(headless) != 1 or len(bg) != 1:
+        return problems + [f"{len(headless)} headless and {len(bg)} bg venue bullets"]
+    h, b = headless[0].replace("`", "").lower(), bg[0].replace("`", "").lower()
+    if says_default(h):
+        problems.append(f"the headless bullet is a default: {h[:120]}")
+    if not ("--api" in h or "on request" in h or "only with --venue headless" in h):
+        problems.append(f"the headless bullet names no opt-in: {h[:120]}")
+    if not says_default(b):
+        problems.append(f"the bg bullet is not the default: {b[:120]}")
+    if "fallback" in b:
+        problems.append(f"the bg bullet is a fallback: {b[:120]}")
+    if re.search(r"\bdefault[^.;]*\bexhausted\b", b):
+        problems.append(f"the bg default is conditioned on an exhausted budget: {b[:120]}")
+    return problems
+
+
 class WorkSkill(unittest.TestCase):
+    def test_dispatch_says_the_subscription_is_the_default_and_api_opts_in_to_the_key(self):
+        # Ticket #57: `/harness:work --api` reaches `harness-work dispatch` (its own `--api` flag, passed through, an
+        # alias for `--venue headless`) and bills the API key; the subscription (bg) is the default. The hint keeps
+        # `--venue headless|bg` beside `--api`.
+        section = dispatch_section()
+        self.assertTrue(section.strip(), "no dispatch section")
+        self.assertIn("harness-work dispatch", section)
+        self.assertEqual(dispatch_venue_problems(section, argument_hint()), [], (argument_hint(), section))
+
     def closing_lines(self):
         return closing_lines()
 
@@ -2643,6 +3195,15 @@ class WorkSkill(unittest.TestCase):
         for line in lines:
             self.assertIn("harness-board show", line)
             self.assertNotIn("start JSON", line)
+
+    def test_the_design_doc_says_dispatch_defaults_to_bg_and_headless_is_opt_in(self):
+        # Ticket #57: principle 5 and the dispatch venue bullets say the subscription (bg) is the default and the API
+        # key is spent only through `--api` / `--venue headless`. The checker is proven on right and wrong text in
+        # SkillWording.
+        design = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "docs", "design.md")
+        with open(design, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertEqual(design_venue_problems(text), [])
 
     def test_the_first_paragraph_says_one_turn_foreground_agents_and_when_the_turn_ends(self):
         para = first_paragraph()
@@ -2825,6 +3386,175 @@ class SkillWording(unittest.TestCase):
         for text in weaker:
             with self.subTest(weaker=text):
                 self.assertNotEqual(findings_rule_problems(text.lower()), [])
+
+    def test_the_dispatch_venue_check_takes_any_wording_of_the_opt_in_and_rejects_the_old_default(self):
+        hint = '"[issue# | --api | --max N | --venue headless|bg | --dry-run]"'
+        right = [
+            "Run `harness-work dispatch $ARGUMENTS`. Without `--api` every run is a background session on the "
+            "subscription, the default; `--api` (the tool's alias for `--venue headless`) bills the API key and is "
+            "refused while the API budget is exhausted.",
+            "Run `harness-work dispatch` with the arguments, passing no `--venue`: every run is a background session "
+            "on the subscription, the default. With `--api`, run `harness-work dispatch --venue headless` with the "
+            "other arguments instead: headless runs billed to the API key, refused while the API budget is exhausted.",
+            "The subscription is the default: without `--api` the dispatch passes no venue, so `harness-work dispatch "
+            "--max N` launches background sessions. `/harness:work --api` bills the API key: it runs `harness-work "
+            "dispatch --venue headless`, which is refused while the API budget is exhausted.",
+        ]
+        for text in right:
+            with self.subTest(right=text):
+                self.assertEqual(dispatch_venue_problems(text, hint), [])
+        self.assertIn("the argument-hint has no --api",
+                      dispatch_venue_problems(right[0], '"[issue# | --max N | --venue headless|bg | --dry-run]"'))
+        self.assertIn("the argument-hint has no --venue",
+                      dispatch_venue_problems(right[0], '"[issue# | --api | --max N | --dry-run]"'))
+        wrong = {
+            # the paragraph before #57: headless on the API key, the subscription only as the fallback
+            "old": "Run `harness-work dispatch $ARGUMENTS`. It starts a worktree per ready ticket and launches a "
+                   "headless run billed to the API key, or a background session on the subscription when the API "
+                   "budget is exhausted.",
+            "headless by default": "Run `harness-work dispatch $ARGUMENTS`; it launches headless runs by default, "
+                                   "and `--api` is accepted too. The subscription is used when the API budget is "
+                                   "exhausted.",
+            "no mapping": "Run `harness-work dispatch` with no `--venue`: the subscription is the default. `--api` "
+                          "bills the API key.",
+            "untied": right[0] + " Dispatched runs are billed to the API key.",
+            "api bills the subscription": "Run `harness-work dispatch` with no `--venue`: the subscription is the "
+                                          "default. With `--api`, run `harness-work dispatch --venue headless`; it "
+                                          "still bills the subscription.",
+            "not the default": "The subscription is not the default: without `--api` dispatch passes no venue. With "
+                               "`--api`, run `harness-work dispatch --venue headless`, billed to the API key.",
+        }
+        for name, text in wrong.items():
+            with self.subTest(wrong=name):
+                self.assertNotEqual(dispatch_venue_problems(text, hint), [])
+
+        # Breaker round 1 (reconstructed from its report: the old meaning, headless on the API key by default and the
+        # subscription only once the budget is exhausted, in words that passed the first checker). Each case is
+        # right[1] or right[0] with one fault, and must fail for that fault.
+        faults = {
+            "the breaker's cheat": (
+                "Run `harness-work dispatch $ARGUMENTS`. Dispatch launches a headless run on the API key by default "
+                "(`--api` is implied) and bills the API key; the subscription is the default only when the API budget "
+                "is exhausted.", "no clause says the subscription is the default, unconditionally"),
+            "default once exhausted": (
+                right[1].replace("on the subscription, the default.",
+                                 "on the subscription, the default once the API budget is exhausted."),
+                "no clause says the subscription is the default, unconditionally"),
+            "subscription only when exhausted": (
+                right[0] + " The subscription is used only when the API budget is exhausted.",
+                "the subscription is tied to an exhausted budget"),
+            "headless by default with --api": (
+                right[0] + " Dispatch with `--api` runs headless by default and bills the API key.",
+                "headless or the api key as a default"),
+            "parenthetical opt-in": (
+                right[0] + " Runs go headless on the API key (see `--api`).",
+                "headless or the api key without --api as its trigger"),
+            "implied opt-in": (
+                right[0] + " Runs go headless (`--api` is implied).",
+                "headless or the api key without --api as its trigger"),
+            "--api is implied outside parentheses": (
+                right[0] + " With `--api` implied, runs go headless.", "--api as implied"),
+            "without --api is headless": (
+                right[0] + " Without `--api`, runs go headless on the API key.",
+                "headless or the api key without --api as its trigger"),
+            "bills only in parentheses": (
+                "Run `harness-work dispatch $ARGUMENTS`. Every run is a background session on the subscription, the "
+                "default. Dispatch can also go headless with `--venue headless` (`--api` bills the API key).",
+                "no sentence says --api bills the api key"),
+        }
+        for name, (text, fault) in faults.items():
+            with self.subTest(fault=name):
+                problems = dispatch_venue_problems(text, hint)
+                self.assertTrue(any(p.startswith(fault) for p in problems), (fault, problems))
+
+    def test_the_help_check_takes_bg_as_the_default_and_rejects_a_budget_condition(self):
+        def fake_help(venue, api):
+            return ("usage: harness-work dispatch [-h] [--max MAX] [--venue {headless,bg}] [--api] [--dry-run]\n\n"
+                    "options:\n  -h, --help            show this help message and exit\n"
+                    "  --max MAX             live runs at most (default 3)\n"
+                    f"  --venue {{headless,bg}}\n                        {venue}\n"
+                    f"  --api                 {api}\n"
+                    "  --dry-run             print the plan; start and launch nothing\n")
+        venue_ok = "default: bg (the subscription); headless bills the api key and is refused while the api " \
+                   "budget is exhausted"
+        api_ok = "alias for --venue headless: bills the API key"
+        for venue, api in ((venue_ok, api_ok), ("bg, the subscription (default); headless only on request", api_ok),
+                           ("the default is bg, whatever the budgets say", "run headless, billed to the API key")):
+            with self.subTest(right=venue):
+                self.assertEqual(help_venue_problems(fake_help(venue, api)), [])
+        wrong = {
+            "default: headless, or bg while the api budget is exhausted (headless is then refused)":
+                "bg is not the stated default",
+            "bg is the default once the api budget is exhausted; headless otherwise": "bg is not the stated default",
+            "default: bg when the api budget is exhausted, else headless": "the default is tied to the budget",
+            "headless; bg (default) only when the api budget is exhausted": "bg is tied to an exhausted budget",
+        }
+        for venue, fault in wrong.items():
+            with self.subTest(wrong=venue):
+                problems = help_venue_problems(fake_help(venue, api_ok))
+                self.assertTrue(any(p.startswith(fault) for p in problems), (fault, problems))
+        problems = help_venue_problems(fake_help(venue_ok, "same as --venue headless"))
+        self.assertTrue(any(p.startswith("--api does not say it bills the api key") for p in problems), problems)
+        no_api = fake_help(venue_ok, api_ok).replace(f"  --api                 {api_ok}\n", "")
+        self.assertIn("no --api entry", help_venue_problems(no_api))
+
+    def test_the_design_check_takes_bg_as_the_default_and_rejects_the_old_meaning(self):
+        principle = ("5. **Spend the subscription first.** Interactive sessions and dispatched ticket work use the "
+                     "Max subscription by default. The API key is spent only on request: `harness-work dispatch "
+                     "--api` (or `--venue headless`) runs headless and bills it; high-risk pull requests get "
+                     "ultrareview, which bills claude.ai usage credits.")
+        headless = ("  - venue `headless` (only with `--api` or `--venue headless`; refused while `api` is "
+                    "exhausted): in the worktree, `claude -p \"/harness:work N\"` ...")
+        bg = ("  - venue `bg` (the default, whatever the budgets say): in the worktree, `claude --bg -n \"<repo> #N "
+              "<title>\"` ...")
+
+        def doc(p=principle, h=headless, b=bg):
+            return "\n".join(["## Principles", "", p, "", "- `dispatch ...`: then launch:", h, b])
+
+        self.assertEqual(design_venue_problems(doc()), [])
+        self.assertEqual(design_venue_problems(doc(h=headless.replace("only with `--api` or `--venue headless`",
+                                                                      "on request"))), [])
+        old_principle = ("5. **Spend credits before the subscription.** Interactive sessions use the Max subscription. "
+                         "Dispatched ticket work runs headless and bills the API key; high-risk pull requests get "
+                         "ultrareview, which bills claude.ai usage credits. When a budget is exhausted the dispatcher "
+                         "falls back one step and remembers for a day.")
+        old_headless = ("  - venue `headless` (default when `budgets.json` shows `api` not exhausted; refused, as "
+                        "above, while it is exhausted): in the worktree, `claude -p \"/harness:work N\"` ...")
+        old_bg = ("  - venue `bg` (fallback, the default while `api` is exhausted): in the worktree, `claude --bg -n "
+                  "\"<repo> #N <title>\"` ...")
+        wrong = {
+            "old principle": (dict(p=old_principle), "principle 5 keeps the old headless default"),
+            "defaults to headless": (dict(p=principle.replace(
+                "Interactive sessions and dispatched ticket work use the Max subscription by default.",
+                "Dispatched ticket work defaults to headless on the API key.")),
+                "principle 5 makes headless the default"),
+            "default only when": (dict(p=principle.replace(
+                "use the Max subscription by default.",
+                "use the Max subscription by default only when the API budget is exhausted.")),
+                "principle 5 has no clause: dispatched work runs on the subscription by default"),
+            "api by default, subscription once exhausted (the breaker's meaning)": (dict(p=(
+                "5. **Spend credits before the subscription.** Dispatched ticket work runs on the API key by default "
+                "(`--api`); the subscription is the default dispatch venue once the API budget is exhausted.")),
+                "principle 5 has no clause: dispatched work runs on the subscription by default"),
+            "opt-in only when exhausted": (dict(p=(
+                "5. **Spend the subscription first.** Dispatched ticket work runs on the subscription by default. "
+                "The API key is spent only when the API budget is exhausted.")),
+                "principle 5 does not tie the api key to --api or --venue headless"),
+            "old headless bullet": (dict(h=old_headless), "the headless bullet is a default"),
+            "headless bullet without opt-in": (dict(h=(
+                "  - venue `headless` (refused while `api` is exhausted): in the worktree, `claude -p ...`")),
+                "the headless bullet names no opt-in"),
+            "old bg bullet": (dict(b=old_bg), "the bg bullet is a fallback"),
+            "bg default once exhausted": (dict(b=(
+                "  - venue `bg` (the default once `api` is exhausted): in the worktree, `claude --bg ...`")),
+                "the bg default is conditioned on an exhausted budget"),
+            "bg not the default": (dict(b="  - venue `bg`: in the worktree, `claude --bg ...`"),
+                                   "the bg bullet is not the default"),
+        }
+        for name, (parts, fault) in wrong.items():
+            with self.subTest(wrong=name):
+                problems = design_venue_problems(doc(**parts))
+                self.assertTrue(any(p.startswith(fault) for p in problems), (fault, problems))
 
 
 # =========================================================================== budget

@@ -22,7 +22,7 @@ Each project keeps its own `CLAUDE.md`, hooks, rules and skills. The harness add
 In a terminal, in this order.
 
 1. **Install.** `sh ~/portfolio_projects/Harness/scripts/install.sh`. It installs the plugin, your `CLAUDE.md`, the model settings and the daily digest, and backs up what it replaces. `claude --version` should print 2.1.296 or newer.
-2. **Store the API key.** `security add-generic-password -a "$USER" -s harness-anthropic -w` prompts for the key and keeps it in the keychain. Dispatched runs read it from there, so it never appears on a command line or in the environment.
+2. **Store the API key.** `security add-generic-password -a "$USER" -s harness-anthropic -w` prompts for the key and keeps it in the keychain. Only `/harness:work --api` (or `--venue headless`) runs read it, from there, so it never appears on a command line or in the environment.
 3. **Check GitHub.** `gh auth status` should show your account. The board needs it.
 4. **Register your projects.** `harness-projects discover` lists repos with Claude Code sessions. Add each with `harness-projects add <path>`. Mark client work billable: `harness-projects add ~/jotform-glow-sync --billable --client "Global G.L.O.W."`.
 5. **Put the first repo on the board.** `cd` into it, start `claude`, and trust the folder when asked. Run `/harness:new-project`. It interviews you, shows the scaffold plan, and asks before it creates the private GitHub repository and pushes. A repo that already has commits gets the scaffold through a chore ticket and a PR: your first PR to land.
@@ -95,10 +95,11 @@ The PR body is laid out the same way every time:
 | Work | Bills to | When it runs out |
 | --- | --- | --- |
 | Your interactive sessions, including `/harness:work N` | The Max subscription | Wait for the window; `/usage` shows the five-hour and seven-day limits |
-| `/harness:work` dispatch | The API key in the keychain | A billing or auth failure marks the `api` budget exhausted for 24 hours. Dispatch then starts background sessions on the subscription |
+| `/harness:work` dispatch (the default) | The Max subscription: one background session per ticket | Wait for the window, as for interactive sessions |
+| `/harness:work --api` (or `--venue headless`) dispatch | The API key in the keychain | A billing or auth failure marks the `api` budget exhausted for 24 hours. Until then `--api` and `--venue headless` are refused; dispatch without them still runs on the subscription |
 | Ultrareview on `risk:high` PRs | claude.ai usage credits, about 5 to 25 dollars a run | A credits failure marks the `cloud` budget exhausted for 24 hours |
 
-`harness-work budget status` shows both budgets. After a top-up, `harness-work budget reset api` clears the mark. `harness-work budget exhaust api --reason <text>` forces the fallback by hand. The session brief and the standup name an exhausted budget.
+`harness-work budget status` shows both budgets. After a top-up, `harness-work budget reset api` clears the mark. `harness-work budget exhaust api --reason <text>` marks it exhausted by hand, which stops `--api` runs. The session brief and the standup name an exhausted budget.
 
 ## When something looks wrong
 
@@ -109,7 +110,7 @@ The PR body is laid out the same way every time:
 | `harness-red check` says the tests pass | They do not test the change. Back to the test-author; only a `refactor` ticket proceeds on green |
 | `no checks registered` from `harness-pr checks` | The repo has no CI on pull requests. The scaffold's `.github/workflows/ci.yml` is missing, or `--no-ci` skipped it and the project's own CI does not run on PRs |
 | A headless run died | `harness-work runs --sweep` shows each run's exit and outcome: `ok`, `billing`, `auth` or `error`. The log is in `~/.claude/harness/runs/`. The next `/harness:work` re-dispatches a ticket still in progress without a PR |
-| Budget exhausted | `harness-work budget status`. Top up, then `harness-work budget reset api`. Until then dispatch uses the subscription |
+| Budget exhausted | `harness-work budget status`. Top up, then `harness-work budget reset api`. Until then `--api` and `--venue headless` are refused; dispatch runs on the subscription, its default, either way |
 | Old worktrees pile up | `harness-work worktrees` lists them and flags stale ones; `harness-work worktree remove <branch>` removes one |
 | Standup says the fleet could not be read | The `claude` binary was not found. The tool looks on PATH, then in `~/.local/bin` |
 | `/hooks` lists nothing from the harness | Trust the folder, then `/reload-plugins`. `claude plugin validate ~/portfolio_projects/Harness` checks the plugin. `claude --debug` logs every hook run with its exit code to `~/.claude/debug/<session-id>.txt` |
@@ -140,7 +141,7 @@ The PR body is laid out the same way every time:
 | Breaker | The `test-breaker` agent, which tries to cheat the tests to show they are too narrow |
 | Worktree | A second checkout of the repo in another folder. Each ticket gets one under `.claude/worktrees/` |
 | Land | Squash-merge a PR, remove its worktree and branch, close the ticket: `/harness:land <P>` |
-| Headless run | A `claude -p` session that dispatch starts per ticket, billed to the API key, logged under `~/.claude/harness/runs/` |
+| Headless run | A `claude -p` session that dispatch starts per ticket only with `--api` or `--venue headless`, billed to the API key, logged under `~/.claude/harness/runs/` |
 | Budget | The API key or the usage credits. An exhausted one is skipped for 24 hours |
 | Digest | The daily summary across projects, written to `~/.claude/harness/digest/` |
 | Session | One conversation with Claude Code in one folder, with its own context window |
