@@ -71,7 +71,7 @@ SESSION_USES = {
 }
 HOOKIO_USES = {
     "after_edit.py": ("read_input", "hook_cwd", "edited_path", "run_fail_open"),
-    "notify.py": ("read_input", "run_fail_open"),
+    "notify.py": ("read_input", "emit", "run_fail_open"),
 }
 # Helpers the two session hooks copy today (by name or renamed).
 COPY_NAMES = (
@@ -1001,6 +1001,627 @@ class EndToEndTests(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertEqual(r.stdout, b"")
                 self.assertEqual(r.stderr.decode("utf-8"), f"{hook}: {token}\n")
+
+
+# ================================================================ static backstops against hidden copies
+
+SESSION_HOOKS = ("after_edit.py", "verify_on_stop.py")
+ALL_FOUR = ("after_edit.py", "verify_on_stop.py", "notify.py")
+
+
+def literal_str(node) -> bool:
+    return isinstance(node, ast.JoinedStr) or (
+        isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
+
+
+def has_status_constant(node) -> bool:
+    return any(
+        isinstance(n, ast.Constant) and n.value == "status" for n in ast.walk(node)
+    )
+
+
+class NoDisguisedCopiesTests(unittest.TestCase):
+    """The lexical checks above are beaten by splitting a literal or renaming a name;
+    these close the common disguises. The runtime tests below are the main guard."""
+
+    def test_session_hooks_do_not_make_the_state_dir_or_run_git_status_themselves(self):
+        for hook in SESSION_HOOKS:
+            tree = hook_tree(hook)
+            found = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    found += [f"import {a.name}" for a in node.names if a.name == "tempfile"]
+                elif isinstance(node, ast.ImportFrom) and node.module == "tempfile":
+                    found.append("from tempfile import ...")
+                elif isinstance(node, ast.Name) and node.id == "tempfile":
+                    found.append(f"tempfile (line {node.lineno}): state dir")
+                elif isinstance(node, ast.Attribute) and node.attr == "sha1":
+                    found.append(f".sha1 (line {node.lineno}): state dir key")
+                elif isinstance(node, ast.Constant) and node.value == "sha1":
+                    found.append(f"'sha1' (line {node.lineno})")
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "subprocess"
+                    and has_status_constant(node)
+                ):
+                    found.append(f"subprocess with 'status' (line {node.lineno}): porcelain_status")
+            with self.subTest(hook=hook):
+                self.assertEqual(found, [])
+
+    def test_no_hook_builds_a_string_from_literals_or_reaches_for_sys_by_name(self):
+        """Guards against disguises: "a" + "b", "x" + f"-{y}", getattr(sys, "std" + "in"),
+        __import__, eval and exec. Green today, and must stay so."""
+        for hook in ALL_FOUR:
+            found = []
+            for node in ast.walk(hook_tree(hook)):
+                if (
+                    isinstance(node, ast.BinOp)
+                    and isinstance(node.op, ast.Add)
+                    and literal_str(node.left)
+                    and literal_str(node.right)
+                ):
+                    found.append(f"literal + literal (line {node.lineno})")
+                elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    if node.func.id in ("__import__", "eval", "exec", "compile"):
+                        found.append(f"{node.func.id}() (line {node.lineno})")
+                    elif (
+                        node.func.id == "getattr"
+                        and node.args
+                        and isinstance(node.args[0], ast.Name)
+                        and node.args[0].id in ("sys", "os", "subprocess")
+                    ):
+                        found.append(f"getattr({node.args[0].id}, ...) (line {node.lineno})")
+                elif isinstance(node, ast.Import):
+                    found += [f"import {a.name}" for a in node.names if a.name == "importlib"]
+            with self.subTest(hook=hook):
+                self.assertEqual(found, [])
+
+
+# ================================================================ the hooks go through the lib at runtime
+
+
+# harness_lib.sessionstate stand-in: calls the real module, records every name the hook
+# touches, and steers: the state dir is keyed on $SESSIONSTATE_TEST_ROOT when set,
+# porcelain_status answers with the bytes in $SESSIONSTATE_TEST_STATUS_FILE when set, and
+# status_paths adds $SESSIONSTATE_TEST_EXTRA (relative to the root it was given). A hook
+# doing any of these jobs with a private copy shows it in where its files land.
+TRACED_SESSIONSTATE = '''from __future__ import annotations
+
+import os as _os
+from pathlib import Path as _Path
+
+from harness_lib import _real_sessionstate as _real
+
+
+def _record(name):
+    path = _os.environ.get("SESSIONSTATE_TEST_TRACE")
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(name + "\\n")
+
+
+class _Traced:
+    def __init__(self, real):
+        object.__setattr__(self, "_real", real)
+
+    def __getattr__(self, name):
+        _record("SessionState." + name)
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+
+class SessionState:
+    @classmethod
+    def for_repo(cls, root, data):
+        _record("SessionState.for_repo")
+        steer = _os.environ.get("SESSIONSTATE_TEST_ROOT")
+        return _Traced(_real.SessionState.for_repo(_Path(steer) if steer else root, data))
+
+
+def porcelain_status(root, timeout):
+    _record("porcelain_status")
+    canned = _os.environ.get("SESSIONSTATE_TEST_STATUS_FILE")
+    if canned:
+        with open(canned, "rb") as fh:
+            return fh.read()
+    return _real.porcelain_status(root, timeout)
+
+
+def status_paths(root, out):
+    _record("status_paths")
+    got = _real.status_paths(root, out)
+    extra = _os.environ.get("SESSIONSTATE_TEST_EXTRA")
+    return got + [_Path(root) / extra] if extra else got
+'''
+
+# harness_lib.hookio stand-in, as in tests/test_hookio.py: records the calls and steers
+# the answers (input, cwd, edited path), marks emit and the fail-open name.
+TRACED_HOOKIO = '''from __future__ import annotations
+
+import json as _json
+import os as _os
+
+from harness_lib import _real_hookio as _real
+
+MARK = _os.environ.get("HOOKIO_TEST_MARK", "")
+
+
+def _record(name):
+    path = _os.environ.get("HOOKIO_TEST_TRACE")
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(name + "\\n")
+
+
+def read_input():
+    _record("read_input")
+    data = _real.read_input()
+    crash = _os.environ.get("HOOKIO_TEST_CRASH")
+    if crash:
+        raise RuntimeError(crash)
+    swap = _os.environ.get("HOOKIO_TEST_DATA")
+    return _json.loads(swap) if swap else data
+
+
+def hook_cwd(data):
+    _record("hook_cwd")
+    got = _real.hook_cwd(data)
+    return _os.environ.get("HOOKIO_TEST_CWD") or got
+
+
+def edited_path(data):
+    _record("edited_path")
+    got = _real.edited_path(data)
+    return _os.environ.get("HOOKIO_TEST_EDITED") or got
+
+
+def deny(reason):
+    _record("deny")
+    return _real.deny("[" + MARK + "] " + reason)
+
+
+def emit(obj):
+    _record("emit")
+    return _real.emit(dict(obj, hookio_mark=MARK))
+
+
+def run_fail_open(name, main):
+    _record("run_fail_open")
+    return _real.run_fail_open(name + "<" + MARK + ">", main)
+'''
+
+AWS_KEY = "AKIA" + "Q7R2M5K9T3W8Z4B6"  # split so this file holds no whole key
+
+
+class TracedCase(unittest.TestCase):
+    """Hooks run as hooks.json runs them, next to a lib whose sessionstate and hookio
+    record what the hook calls and can steer what it gets back."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="harness-sessionstate-traced-")).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.env = clean_env(self.tmp)
+        self.tmpdir = Path(self.env["TMPDIR"])
+        self.mark = "mark-" + uuid.uuid4().hex[:8]
+        self.cases = 0
+        self.decoy = self.tmp / "decoy"
+        self.decoy.mkdir()
+
+    def git(self, repo: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repo), *args], check=True, capture_output=True, env=self.env
+        )
+
+    def make_repo(self) -> Path:
+        self.cases += 1
+        repo = self.tmp / f"case{self.cases}" / "proj"
+        repo.mkdir(parents=True)
+        self.git(repo, "init", "-q", "-b", "main")
+        (repo / "README.md").write_text("hello\n")
+        (repo / "app.py").write_text("x = 1\n")
+        self.git(repo, "add", "-A")
+        self.git(repo, "commit", "-q", "-m", "Initial commit")
+        return repo
+
+    def traced_plugin(self) -> Path:
+        root = self.tmp / "plugin-traced"
+        if root.is_dir():
+            return root
+        self.assertTrue(SESSIONSTATE_PY.is_file(), f"{SESSIONSTATE_PY} does not exist")
+        shutil.copytree(HOOKS, root / "hooks", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(LIB, root / "lib", ignore=shutil.ignore_patterns("__pycache__"))
+        pkg = root / "lib" / "harness_lib"
+        shutil.copyfile(pkg / "hookio.py", pkg / "_real_hookio.py")
+        shutil.copyfile(SESSIONSTATE_PY, pkg / "_real_sessionstate.py")
+        (pkg / "hookio.py").write_text(TRACED_HOOKIO, encoding="utf-8")
+        (pkg / "sessionstate.py").write_text(TRACED_SESSIONSTATE, encoding="utf-8")
+        return root
+
+    def run_traced(self, hook: str, stdin: dict, cwd: Path, env: dict | None = None):
+        """(result, the lib names the hook called)."""
+        trace = self.tmp / f"trace-{uuid.uuid4().hex[:8]}"
+        extra = dict(
+            env or {},
+            HOOKIO_TEST_MARK=self.mark,
+            HOOKIO_TEST_TRACE=str(trace),
+            SESSIONSTATE_TEST_TRACE=str(trace),
+        )
+        r = subprocess.run(
+            [sys.executable, "-B", str(self.traced_plugin() / "hooks" / hook)],
+            input=json.dumps(stdin).encode("utf-8"),
+            capture_output=True,
+            env=dict(self.env, **extra),
+            cwd=str(cwd),
+            timeout=120,
+        )
+        called = trace.read_text(encoding="utf-8").split() if trace.is_file() else []
+        return r, set(called)
+
+    def tool_event(self, repo: Path, tool: str, session: str = "sess-1", **tool_input) -> dict:
+        return {
+            "session_id": session,
+            "transcript_path": "/dev/null",
+            "cwd": str(repo),
+            "permission_mode": "default",
+            "hook_event_name": "PostToolUse",
+            "tool_name": tool,
+            "tool_input": tool_input,
+            "tool_response": {"success": True},
+        }
+
+    def stop_event(self, repo: Path, session: str = "sess-1") -> dict:
+        return {
+            "session_id": session,
+            "transcript_path": "/dev/null",
+            "cwd": str(repo),
+            "permission_mode": "default",
+            "hook_event_name": "Stop",
+            "stop_hook_active": False,
+        }
+
+    def steer_root(self) -> Path:
+        """A directory that is not the repo: state keyed on it proves the hook asked the
+        lib for its state dir."""
+        root = self.tmp / "steer-root"
+        root.mkdir(exist_ok=True)
+        return root
+
+
+class HooksCallSessionStateTests(TracedCase):
+    def assert_called(self, called: set, names) -> None:
+        self.assertEqual(sorted(set(names) - called), [], f"called: {sorted(called)}")
+
+    def test_an_edit_is_recorded_through_the_lib_in_the_dir_it_names(self):
+        repo = self.make_repo()
+        steer = self.steer_root()
+        r, called = self.run_traced(
+            "after_edit.py",
+            self.tool_event(repo, "Edit", file_path=str(repo / "app.py")),
+            repo,
+            {"SESSIONSTATE_TEST_ROOT": str(steer)},
+        )
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""))
+        self.assertEqual(
+            (expected_dir(self.tmpdir, steer) / "dirty-sess-1").read_text(),
+            f"{repo / 'app.py'}\n",
+        )
+        self.assertFalse(expected_dir(self.tmpdir, repo).exists())  # no private state dir
+        self.assert_called(called, ("SessionState.for_repo", "SessionState.record"))
+
+    def test_a_bash_call_scans_what_the_libs_status_lists_and_keeps_its_stamp_there(self):
+        repo = self.make_repo()
+        steer = self.steer_root()
+        readme, extra = repo / "README.md", repo / "listed-by-the-lib.txt"
+        extra.write_text("e\n")
+        exclude = repo / ".git" / "info" / "exclude"
+        exclude.write_text(exclude.read_text() + "listed-by-the-lib.txt\n")  # git never lists it
+        now = time.time()
+        os.utime(readme, (now - 30, now - 30))  # tracked and unchanged: git never lists it
+        os.utime(extra, (now - 5, now - 5))
+        status = self.tmp / "status.bin"
+        status.write_bytes(b" M README.md\0")
+        self.assertEqual(self.reference_status(repo), b"")
+        r, called = self.run_traced(
+            "after_edit.py",
+            self.tool_event(repo, "Bash", command="sh gen.sh"),
+            repo,
+            {
+                "SESSIONSTATE_TEST_ROOT": str(steer),
+                "SESSIONSTATE_TEST_STATUS_FILE": str(status),
+                "SESSIONSTATE_TEST_EXTRA": "listed-by-the-lib.txt",
+            },
+        )
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""))
+        sdir = expected_dir(self.tmpdir, steer)
+        self.assertEqual(  # newest first
+            (sdir / "dirty-sess-1").read_text().splitlines(), [str(extra), str(readme)]
+        )
+        self.assertGreater(float((sdir / "bash-scan-sess-1").read_text()), now)
+        self.assertFalse(expected_dir(self.tmpdir, repo).exists())
+        self.assert_called(
+            called,
+            (
+                "SessionState.for_repo",
+                "SessionState.record",
+                "SessionState.stamp",
+                "porcelain_status",
+                "status_paths",
+            ),
+        )
+
+    def reference_status(self, repo: Path) -> bytes:
+        return subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        ).stdout
+
+    def test_the_stop_hook_reads_the_dirty_list_and_keeps_its_state_in_the_libs_dir(self):
+        repo = self.make_repo()
+        steer = self.steer_root()
+        env = {"SESSIONSTATE_TEST_ROOT": str(steer)}
+        r, _ = self.run_traced(
+            "after_edit.py", self.tool_event(repo, "Edit", file_path=str(repo / "app.py")), repo, env
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        status = self.tmp / "status.bin"
+        status.write_bytes(b" M README.md\0")
+        tag = uuid.uuid4().hex[:6]
+        r, called = self.run_traced(
+            "verify_on_stop.py",
+            self.stop_event(repo),
+            repo,
+            dict(
+                env,
+                SESSIONSTATE_TEST_STATUS_FILE=str(status),
+                CLAUDE_VERIFY_CMD=f"echo nope-{tag}; exit 1",
+            ),
+        )
+        self.assertEqual((r.returncode, r.stderr), (0, b""))
+        out = json.loads(r.stdout.decode("utf-8"))  # blocked: it found the lib's dirty list
+        self.assertEqual(out["decision"], "block", out)
+        self.assertEqual(out["hookio_mark"], self.mark)
+        self.assertIn(f"nope-{tag}", out["reason"])
+        sdir = expected_dir(self.tmpdir, steer)
+        state = json.loads((sdir / "verify-sess-1.json").read_text())
+        self.assertEqual(state["blocks"], 1)
+        self.assertFalse(expected_dir(self.tmpdir, repo).exists())
+        self.assertTrue(
+            {
+                "SessionState.for_repo",
+                "SessionState.dirty_files",
+                "SessionState.verify_file",
+                "porcelain_status",
+                "status_paths",
+            }
+            <= called,
+            sorted(called),
+        )
+
+    def test_a_changed_tree_is_recorded_and_a_green_run_clears_it_through_the_lib(self):
+        repo = self.make_repo()
+        steer = self.steer_root()
+        sdir = expected_dir(self.tmpdir, steer)
+        status = self.tmp / "status.bin"
+        env = {
+            "SESSIONSTATE_TEST_ROOT": str(steer),
+            "SESSIONSTATE_TEST_STATUS_FILE": str(status),
+            "SESSIONSTATE_TEST_EXTRA": "via-status-paths.txt",
+        }
+        status.write_bytes(b" M README.md\0")
+        r, _ = self.run_traced(
+            "verify_on_stop.py",
+            self.stop_event(repo),
+            repo,
+            dict(env, CLAUDE_VERIFY_CMD="exit 1"),
+        )
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""))  # first stop: tree only
+        self.assertFalse((sdir / "dirty-sess-1").exists())
+        self.assertIn("tree", json.loads((sdir / "verify-sess-1.json").read_text()))
+
+        status.write_bytes(b" M README.md\0?? other.txt\0")  # the tree changed
+        r, called = self.run_traced(
+            "verify_on_stop.py",
+            self.stop_event(repo),
+            repo,
+            dict(env, CLAUDE_VERIFY_CMD="exit 1"),
+        )
+        self.assertEqual((r.returncode, r.stderr), (0, b""))
+        self.assertEqual(json.loads(r.stdout.decode("utf-8"))["decision"], "block")
+        self.assertEqual(
+            (sdir / "dirty-sess-1").read_text().splitlines(),
+            [str(repo / "README.md"), str(repo / "other.txt"), str(repo / "via-status-paths.txt")],
+        )
+        self.assertIn("SessionState.record", called)
+
+        r, called = self.run_traced(
+            "verify_on_stop.py",
+            self.stop_event(repo),
+            repo,
+            dict(env, CLAUDE_VERIFY_CMD="true"),
+        )
+        self.assertEqual(
+            json.loads(r.stdout.decode("utf-8"))["systemMessage"], "verify_on_stop: true passed."
+        )
+        self.assertFalse((sdir / "dirty-sess-1").exists())
+        self.assertIn("SessionState.clear_dirty", called)
+        self.assertFalse(expected_dir(self.tmpdir, repo).exists())
+
+
+class HooksWriteWhereSessionStateSaysTests(StateCase):
+    """With the real lib, the three files land exactly at the paths SessionState names."""
+
+    def run_hook(self, hook: str, payload: dict, cwd: Path, env: dict | None = None):
+        return subprocess.run(
+            [sys.executable, "-B", str(HOOKS / hook)],
+            input=json.dumps(payload).encode("utf-8"),
+            capture_output=True,
+            env=dict(self.env, **(env or {})),
+            cwd=str(cwd),
+            timeout=120,
+        )
+
+    def test_dirty_list_stamp_and_verify_state_are_at_the_named_paths(self):
+        repo = self.make_repo()
+        data = {"session_id": "odd/session id"}
+        st = self.mod.SessionState.for_repo(repo, data)
+        event = dict(data, cwd=str(repo), permission_mode="default")
+        edited = repo / "app.py"
+        r = self.run_hook(
+            "after_edit.py",
+            dict(event, tool_name="Edit", tool_input={"file_path": str(edited)}),
+            repo,
+        )
+        self.assertEqual((r.returncode, r.stderr), (0, b""))
+        self.assertEqual(st.dirty.read_text(), f"{edited}\n")
+        self.assertEqual(st.dirty_files(), [edited])
+
+        self.git(repo, "mv", "README.md", "GUIDE.md")
+        fresh = repo / "fresh file.txt"
+        fresh.write_text("f\n")
+        r = self.run_hook(
+            "after_edit.py", dict(event, tool_name="Bash", tool_input={"command": "x"}), repo
+        )
+        self.assertEqual((r.returncode, r.stderr), (0, b""))
+        self.assertGreater(float(st.stamp("bash-scan").read_text()), time.time() - 600)
+        self.assertEqual(
+            set(st.dirty_files()), {edited, repo / "GUIDE.md", fresh}
+        )  # the rename's new name, not its source
+
+        r = self.run_hook(
+            "verify_on_stop.py",
+            dict(event, hook_event_name="Stop", stop_hook_active=False),
+            repo,
+            {"CLAUDE_VERIFY_CMD": "true"},
+        )
+        self.assertEqual(
+            json.loads(r.stdout.decode("utf-8")), {"systemMessage": "verify_on_stop: true passed."}
+        )
+        state = json.loads(st.verify_file.read_text())
+        self.assertEqual(state["blocks"], 0)
+        self.assertFalse(st.dirty.exists())
+        self.assertEqual(
+            sorted(p.name for p in st.dir.iterdir()),
+            ["bash-scan-odd_session_id", "verify-odd_session_id.json"],
+        )
+
+
+class HooksCallHookioTests(TracedCase):
+    """after_edit.py and notify.py act on hookio's steered answers at runtime."""
+
+    def steered_edit(self, repo: Path, edited: Path, extra: dict | None = None):
+        # stdin: another session, an event with no path, in a decoy directory; the data
+        # hookio's read_input hands back names the real session
+        decoy_event = self.tool_event(self.decoy, "Edit", "sess-other")
+        data = self.tool_event(self.decoy, "Edit", "sess-1", file_path=str(self.decoy / "nothing"))
+        data.pop("cwd")
+        env = dict(
+            HOOKIO_TEST_DATA=json.dumps(data),
+            HOOKIO_TEST_CWD=str(repo),
+            HOOKIO_TEST_EDITED=str(edited),
+        )
+        env.update(extra or {})
+        return self.run_traced("after_edit.py", decoy_event, self.decoy, env)
+
+    def test_after_edit_takes_its_input_cwd_and_path_from_hookio(self):
+        repo = self.make_repo()
+        r, called = self.steered_edit(repo, repo / "app.py")
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""))
+        sdir = expected_dir(self.tmpdir, repo)
+        self.assertEqual((sdir / "dirty-sess-1").read_text(), f"{repo / 'app.py'}\n")
+        self.assertFalse((sdir / "dirty-sess-other").exists())
+        self.assertEqual(sorted(p.name for p in sdir.iterdir()), ["dirty-sess-1"])
+        for name in ("read_input", "hook_cwd", "edited_path", "run_fail_open"):
+            self.assertIn(name, called)
+
+    def test_after_edit_still_exits_2_on_a_secret_through_run_fail_open(self):
+        repo = self.make_repo()
+        leaky = repo / "leaky.py"
+        leaky.write_text(f'KEY = "{AWS_KEY}"\n')
+        r, called = self.steered_edit(repo, leaky)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(r.stdout, b"")
+        self.assertTrue(
+            r.stderr.decode("utf-8").startswith(
+                f"SECRET pattern in {leaky}:1 (AWS access key id): AKIA"
+            ),
+            r.stderr,
+        )
+        self.assertIn("run_fail_open", called)
+        self.assertEqual(  # recorded first, as always
+            (expected_dir(self.tmpdir, repo) / "dirty-sess-1").read_text(), f"{leaky}\n"
+        )
+
+    def test_both_hooks_fail_open_through_hookios_run_fail_open(self):
+        token = "crash-" + uuid.uuid4().hex[:8]
+        repo = self.make_repo()
+        for hook in HOOKIO_USES:
+            with self.subTest(hook=hook):
+                r, called = self.run_traced(
+                    hook,
+                    self.tool_event(repo, "Edit", file_path=str(repo / "app.py")),
+                    repo,
+                    {"HOOKIO_TEST_CRASH": token},
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout, b"")
+                self.assertEqual(r.stderr.decode("utf-8"), f"{hook}<{self.mark}>: {token}\n")
+                self.assertIn("run_fail_open", called)
+
+    def fake_notifier(self) -> tuple[Path, Path]:
+        bindir = self.tmp / "bin-notifier"
+        bindir.mkdir(exist_ok=True)
+        log = self.tmp / "terminal-notifier.args"
+        script = bindir / "terminal-notifier"
+        script.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {log}\n')
+        script.chmod(0o755)
+        return bindir, log
+
+    def test_notify_reads_its_event_from_hookio_and_rings_the_bell_through_emit(self):
+        tag = uuid.uuid4().hex[:6]
+        decoy_event = {"session_id": "sess-other", "cwd": "/x/decoy-repo", "message": "decoy"}
+        data = {
+            "session_id": "sess-1",
+            "cwd": f"/x/steered-{tag}",
+            "message": f"steered message {tag}",
+            "title": "Steered",
+        }
+        bindir, log = self.fake_notifier()
+        r, called = self.run_traced(
+            "notify.py",
+            decoy_event,
+            self.decoy,
+            {"HOOKIO_TEST_DATA": json.dumps(data), "PATH": str(bindir)},
+        )
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""))
+        args = log.read_text().splitlines()
+        self.assertEqual(
+            dict(zip(args[::2], args[1::2])),
+            {
+                "-title": "Steered",
+                "-subtitle": f"steered-{tag}",
+                "-message": f"steered message {tag}",
+                "-group": "claude-code-sess-1",
+                "-activate": "com.microsoft.VSCode",
+                "-sound": "Glass",
+            },
+        )
+        none = self.tmp / "bin-none"
+        none.mkdir()
+        r, called2 = self.run_traced(
+            "notify.py", decoy_event, self.decoy, {"HOOKIO_TEST_DATA": json.dumps(data), "PATH": str(none)}
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(  # written by hookio.emit: it adds the mark
+            json.loads(r.stdout.decode("utf-8")),
+            {"terminalSequence": "\u0007", "hookio_mark": self.mark},
+        )
+        for name in ("read_input", "run_fail_open"):
+            self.assertIn(name, called)
+        self.assertIn("emit", called2)
 
 
 if __name__ == "__main__":
