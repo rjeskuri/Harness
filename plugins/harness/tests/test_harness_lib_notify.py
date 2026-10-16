@@ -9,8 +9,12 @@ function for harness-board, harness-pr, harness-digest and hooks/notify.py.
   terminal-notifier is missing, fails, or cannot be run), never raising.
 - env_setting, succeeded and applescript_string, DEFAULT_APP and DEFAULT_SOUND.
 - One copy: the three bin tools and hooks/notify.py define none of the helpers or an
-  argv builder of their own, spell none of the notifier names, flags or settings, and
-  bind the lib's notify from harness_lib.notify.
+  argv builder of their own, spell none of the notifier names, flags or settings (with
+  string pieces folded, so "ter" + "minal-notifier" counts), and bind and use the lib's
+  notify from harness_lib.notify.
+- Each bin tool's notifying path (board needs-input, pr ready, the digest), driven with
+  its own test module's fixtures from a plugin copy whose lib notify is instrumented,
+  hands the lib its message, group and title and runs no notifier of its own.
 - hooks/notify.py, from a plugin tree whose lib is instrumented, hands the lib's notify
   its message, group, title and subtitle, and rings the bell only when notify says False;
   with the lib missing it fails open with one stderr line, as the #79 hooks do.
@@ -50,6 +54,12 @@ HOOKS = PLUGIN / "hooks"
 LIB = PLUGIN / "lib"
 NOTIFY_PY = LIB / "harness_lib" / "notify.py"
 BEL = "\u0007"
+
+if str(TESTS) not in sys.path:
+    sys.path.insert(0, str(TESTS))
+import test_board as tb  # noqa: E402  the guard modules: their fixtures drive each tool's notifying path
+import test_digest as td  # noqa: E402
+import test_pr as tp  # noqa: E402
 
 # The four places that carried a copy, per the ticket.
 COPIES = {
@@ -125,7 +135,16 @@ def setUpModule() -> None:
             os.symlink(target, base / f"bin-{folder}" / name)
 
 
+    # the guard modules' fixtures (fake gh, recorders, the digest's repositories), which
+    # the *NotifiesThroughTheLib classes reuse
+    for module in (tb, tp, td):
+        module.setUpModule()
+
+
 def tearDownModule() -> None:
+    for module in (tb, tp, td):
+        module.tearDownModule()
+    _SHARED.pop("sentinel_tree", None)
     base = _SHARED.pop("base", None)
     if base:
         shutil.rmtree(base, ignore_errors=True)
@@ -467,18 +486,104 @@ NAMES_IN_STRINGS = (
 FLAGS = ("-title", "-subtitle", "-message", "-group", "-activate", "-sound")
 
 
+UNKNOWN = "\0"  # a piece of a string the fold cannot know
+
+
+class Folder:
+    """Folds string expressions to their text, so a name split across pieces is still
+    seen: "ter" + "minal-notifier", "-" + "title", "display" + f" notification {x}",
+    "%s-notifier" % "terminal", "".join(["os", "ascript"]), and names bound once (anywhere
+    in the file) to such an expression. A piece it cannot know becomes UNKNOWN."""
+
+    def __init__(self, tree) -> None:
+        self.docs = docstring_ids(tree)
+        assigned: dict = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                assigned.setdefault(node.targets[0].id, []).append(node.value)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+                assigned.setdefault(node.target.id, []).append(node.value)
+        self.assigned = {name: values[0] for name, values in assigned.items() if len(values) == 1}
+
+    def fold(self, node, depth: int = 0):
+        """The text of `node`, or None when it is not a string expression at all."""
+        if depth > 20:
+            return None
+        if isinstance(node, ast.Constant):
+            return node.value if isinstance(node.value, str) else None
+        if isinstance(node, ast.JoinedStr):
+            parts = []
+            for value in node.values:
+                text = self.fold(value, depth + 1) if isinstance(value, ast.Constant) else None
+                parts.append(text if text is not None else UNKNOWN)
+            return "".join(parts)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = self.fold(node.left, depth + 1), self.fold(node.right, depth + 1)
+            if left is None and right is None:
+                return None
+            return (left if left is not None else UNKNOWN) + (right if right is not None else UNKNOWN)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            left = self.fold(node.left, depth + 1)
+            if left is None:
+                return None
+            args = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+            texts = [self.fold(a, depth + 1) for a in args]
+            out = left
+            for text in texts:
+                out = out.replace("%s", text if text is not None else UNKNOWN, 1)
+            return out
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "join"
+            and len(node.args) == 1
+            and isinstance(node.args[0], (ast.List, ast.Tuple))
+        ):
+            sep = self.fold(node.func.value, depth + 1)
+            if sep is None:
+                return None
+            pieces = [self.fold(e, depth + 1) for e in node.args[0].elts]
+            return sep.join(p if p is not None else UNKNOWN for p in pieces)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in self.assigned:
+            return self.fold(self.assigned[node.id], depth + 1)
+        return None
+
+
 def notifier_strings(tree) -> list[str]:
-    docs = docstring_ids(tree)
+    folder = Folder(tree)
     found = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docs:
-            text = node.value
-            for word in NAMES_IN_STRINGS:
-                if word.lower() in text.lower():
-                    found.append(f"{word} in {text!r} (line {node.lineno})")
-            if text in FLAGS:
-                found.append(f"{text!r} (line {node.lineno})")
-    return found
+        if not isinstance(node, ast.expr) or id(node) in folder.docs:
+            continue
+        text = folder.fold(node)
+        if text is None:
+            continue
+        line = getattr(node, "lineno", "?")
+        for word in NAMES_IN_STRINGS:
+            if word.lower() in text.lower():
+                found.append(f"{word} in {text!r} (line {line})")
+        if text in FLAGS:
+            found.append(f"{text!r} (line {line})")
+    return sorted(set(found))
+
+
+def lib_bindings(tree) -> set:
+    """The names a file binds from harness_lib.notify (or to it, or to harness_lib)."""
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "harness_lib.notify":
+            names.update(a.asname or a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module == "harness_lib":
+            names.update(a.asname or a.name for a in node.names if a.name == "notify")
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "harness_lib.notify":
+                    names.add(a.asname or "harness_lib")
+    return names
+
+
+def loaded_names(tree) -> set:
+    return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
 
 
 def load_with_loader(path: Path) -> types.ModuleType:
@@ -550,6 +655,36 @@ class OneCopyTests(unittest.TestCase):
                         imports = True
             with self.subTest(file=label):
                 self.assertTrue(imports, f"{label} does not import harness_lib.notify")
+
+    def test_the_folder_sees_split_names(self):
+        """The spelling check folds the ways a name can be split (the test-breaker's
+        round 1 hid the copies this way)."""
+        source = '''
+A = "ter"
+B = A + "minal-notifier"
+def f(x):
+    one = "-" + "title"
+    two = "display" + f" notification {x}"
+    three = "".join(["os", "ascript"])
+    four = "%s.microsoft.VSCode" % "com"
+    five = "HARNESS_" "NOTIFY_APP"
+    return [B, one, two, three, four, five, "-" "sound"]
+'''
+        found = " | ".join(notifier_strings(ast.parse(source)))
+        for word in ("terminal-notifier", "'-title'", "display notification", "osascript",
+                     "com.microsoft.VSCode", "HARNESS_NOTIFY_APP", "'-sound'"):
+            with self.subTest(word=word):
+                self.assertIn(word, found)
+        self.assertEqual(notifier_strings(ast.parse('"""terminal-notifier in a docstring"""\nX = "--title"\n')), [])
+
+    def test_the_lib_binding_is_used(self):
+        """The names bound from harness_lib.notify are read somewhere, not only imported."""
+        for label, path in COPIES.items():
+            tree = parse(path)
+            bound = lib_bindings(tree)
+            with self.subTest(file=label):
+                self.assertTrue(bound, f"{label} binds nothing from harness_lib.notify")
+                self.assertTrue(bound & loaded_names(tree), f"{label} imports {sorted(bound)} but never uses them")
 
     def check_binds_the_lib(self, module: types.ModuleType, label: str) -> None:
         lib = sys.modules.get("harness_lib.notify")
@@ -725,6 +860,119 @@ class HookUsesTheLibTests(unittest.TestCase):
         self.assertEqual(len(lines), 1, r.stderr)
         self.assertTrue(lines[0].startswith("notify.py:"), lines[0])
         self.assertIn("harness_lib", lines[0])
+
+
+# ================================================================ the tools run the lib's notify
+#
+# Each tool's notifying path (board needs-input, pr ready, the digest), driven with the
+# fixtures of its own test module, but run from a copy of the plugin whose
+# lib/harness_lib/notify.py is SENTINEL_NOTIFY: the sentinel must receive the tool's
+# message, group and title, and the fake terminal-notifier and osascript on PATH (which
+# log to $NOTIFY_LOG) must never run, so the tool has no notifier of its own.
+
+
+def sentinel_tree() -> Path:
+    tree = _SHARED.get("sentinel_tree")
+    if tree is None:
+        tree = _SHARED["base"] / "plugin-sentinel"
+        def ignore(folder, names):
+            skip = {"__pycache__"} | ({"tests"} if Path(folder).resolve() == PLUGIN else set())
+            return [n for n in names if n in skip]
+
+        shutil.copytree(PLUGIN, tree, ignore=ignore)
+        (tree / "lib" / "harness_lib" / "notify.py").write_text(SENTINEL_NOTIFY, encoding="utf-8")
+        _SHARED["sentinel_tree"] = tree
+    return tree
+
+
+def own_tests_only(cls):
+    """Turn off the test methods a fixture class inherits from the guard modules, so only
+    the ones defined here run (unittest skips non-callable test attributes)."""
+    for name in dir(cls):
+        if name.startswith("test") and name not in cls.__dict__:
+            setattr(cls, name, None)
+    return cls
+
+
+class SentinelLog:
+    def sentinel_env(self, result: str = "true") -> dict:
+        self.sentinel_log = Path(self.tmp) / f"sentinel-{uuid.uuid4().hex[:6]}.log"
+        return {"SENTINEL_LOG": str(self.sentinel_log), "SENTINEL_RESULT": result}
+
+    def sentinel_calls(self) -> list:
+        if not self.sentinel_log.exists():
+            return []
+        return [json.loads(ln) for ln in self.sentinel_log.read_text(encoding="utf-8").splitlines()]
+
+    def assert_no_notifier_ran(self, log) -> None:
+        self.assertFalse(os.path.exists(log) and Path(log).read_text().strip(), "the tool ran a notifier itself")
+
+
+@own_tests_only
+class BoardNotifiesThroughTheLib(SentinelLog, tb.Status):
+    def board(self, *args, cwd=None, **env):
+        tool = str(sentinel_tree() / "bin" / "harness-board")
+        return subprocess.run([sys.executable, tool] + list(args), cwd=cwd or self.repo, env=self.env(**env),
+                              capture_output=True, text=True, timeout=60)
+
+    def test_needs_input_hands_its_message_and_group_to_the_lib(self):
+        for number in ("12", "47"):
+            for result in ("true", "false"):
+                with self.subTest(number=number, result=result):
+                    self.scenario([{"match": ["issue", "view", number], "stdout_json": {"labels": []}}],
+                                  default={"stdout": ""})
+                    if os.path.exists(self.notify_log):
+                        os.unlink(self.notify_log)
+                    env = self.sentinel_env(result)
+                    p = self.ok("needs-input", number, "--question", "Ship it?", "--json", **env)
+                    self.assertEqual(self.sentinel_calls(), [{
+                        "message": f"proj #{number} needs input",
+                        "group": f"harness-{self.key()}-{number}",
+                        "title": "Harness",
+                        "subtitle": "",
+                    }])
+                    self.assertIs(json.loads(p.stdout)["notified"], result == "true")  # the lib's answer
+                    self.assert_no_notifier_ran(self.notify_log)
+
+
+@own_tests_only
+class PrNotifiesThroughTheLib(SentinelLog, tp.Ready):
+    def pr(self, *args, cwd=None, stubs=True, **env):
+        tool = str(sentinel_tree() / "bin" / "harness-pr")
+        return subprocess.run([sys.executable, tool] + list(args), cwd=cwd or self.main,
+                              env=self.env(stubs=stubs, **env), capture_output=True, text=True, timeout=120)
+
+    def test_ready_hands_its_message_and_group_to_the_lib(self):
+        self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, self.view([12])])
+        p = self.ok("ready", "34", **self.sentinel_env())
+        self.assertEqual(p.stdout, f"PR #34 ready for review: {tp.PR_URL}\n")
+        self.assertEqual(self.sentinel_calls(), [{
+            "message": "proj PR #34 ready for review: Add the widget (#12)",
+            "group": f"harness-{self.key()}-pr-34",
+            "title": "Harness",
+            "subtitle": "",
+        }])
+        self.assert_no_notifier_ran(self.notify_log)
+
+
+@own_tests_only
+class DigestNotifiesThroughTheLib(SentinelLog, td.Digest):
+    def run_tool(self, *args, **extra):
+        tool = str(sentinel_tree() / "bin" / "harness-digest")
+        return subprocess.run([sys.executable, tool] + list(args), cwd=self.tmp, env=self.env(**extra),
+                              capture_output=True, text=True, timeout=60)
+
+    def test_digest_hands_its_message_and_group_to_the_lib(self):
+        self.world()
+        p = self.run_tool(**self.sentinel_env())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.sentinel_calls(), [{
+            "message": "Harness digest: 1 PRs to review, 2 need input, 2 stale",
+            "group": "harness-digest",
+            "title": "Harness",
+            "subtitle": "",
+        }])
+        self.assert_no_notifier_ran(self.notifylog)
 
 
 if __name__ == "__main__":
