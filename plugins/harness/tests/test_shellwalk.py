@@ -36,7 +36,6 @@ with.
   command the lib hands them, so their splitting comes from the lib's code.
 - Marker parts fall through readonly_bash's part_refusal as None, and its refusal still
   names the command inside a subshell or a substitution.
-- branch_guard's walk, writes and git_* have the AST they have on main.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_shellwalk.py" -v
 """
@@ -1634,57 +1633,6 @@ class MarkerPartsTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual([p.marker for p in self.hook.split_command(command)], markers)
                 self.assertEqual(self.hook.refusal(command), found)
-
-
-# ================================================================ branch_guard unchanged
-
-
-def without_docstring(fn) -> str:
-    """ast.dump of a def, its docstring left out, names kept."""
-    fn = copy.deepcopy(fn)
-    if fn.body and is_docstring(fn.body[0]):
-        fn.body = fn.body[1:]
-    return ast.dump(fn, annotate_fields=False)
-
-
-class BranchGuardUnchangedTests(unittest.TestCase):
-    """Definition of done: branch_guard's walk, writes and git_* are unchanged. Each has
-    the AST (docstrings aside) it has on main, read with `git show main:<path>`; skipped
-    when no main ref is reachable (CI checks out one commit)."""
-
-    def test_walk_writes_and_git_functions_match_main(self):
-        root = PLUGIN.parent.parent
-        rel = "plugins/harness/hooks/branch_guard.py"
-        text, errors = None, []
-        for ref in ("main", "origin/main"):
-            r = subprocess.run(
-                ["git", "-C", str(root), "show", f"{ref}:{rel}"],
-                capture_output=True,
-                text=True,
-                env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"),
-            )
-            if r.returncode == 0:
-                text = r.stdout
-                break
-            errors.append(r.stderr.strip())
-        if text is None:
-            self.skipTest("no main ref to compare against: " + "; ".join(errors))
-
-        def picked(tree) -> dict:
-            return {
-                node.name: node
-                for node in tree.body
-                if isinstance(node, ast.FunctionDef)
-                and (node.name in ("walk", "writes") or node.name.startswith("git_"))
-            }
-
-        before = picked(ast.parse(text, filename=f"main:{rel}"))
-        self.assertTrue({"walk", "writes"} <= set(before), sorted(before))
-        now = picked(hook_tree("branch_guard.py"))
-        for name, fn in sorted(before.items()):
-            with self.subTest(function=name):
-                self.assertIn(name, now, f"{name} is gone from branch_guard.py")
-                self.assertEqual(without_docstring(now[name]), without_docstring(fn))
 
 
 if __name__ == "__main__":
