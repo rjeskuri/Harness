@@ -1078,6 +1078,7 @@ class HooksFollowTheLibTests(LoaderTestCase):
                 "paths.py": paths_source.replace("{token!r}", repr(self.token)).replace(
                     "{token}", self.token
                 ),
+                "settings.py": (LIB / "harness_lib" / "settings.py").read_text(encoding="utf-8"),
             },
         )
         return root

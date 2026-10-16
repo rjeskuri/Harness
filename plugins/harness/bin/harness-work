@@ -67,7 +67,15 @@ import sys
 import tempfile
 import unicodedata
 
-HERE = os.path.dirname(os.path.realpath(__file__))
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.settings import setting, settings_env
+except Exception as exc:  # one line, exit 1, like the __main__ wrapper below
+    sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
+
+HERE =os.path.dirname(os.path.realpath(__file__))
 STAGES = ("tests", "breaker", "code", "review", "ci")
 TIERS = ("sonnet", "opus", "fable")
 NEXT_TIER = {"sonnet": "opus", "opus": "fable", "fable": "fable"}
@@ -408,27 +416,6 @@ def gh_json(repo, args):
         return json.loads(done.stdout or "null")
     except ValueError:
         raise Problem(f"gh {' '.join(args[:2])} printed something other than JSON") from None
-
-
-def settings_env(root):
-    """`env` from the project's settings files; settings.local.json wins over settings.json."""
-    merged = {}
-    for name in ("settings.json", "settings.local.json"):
-        data = read_json(os.path.join(root, ".claude", name))
-        env = data.get("env") if isinstance(data, dict) else None
-        if isinstance(env, dict):
-            merged.update(env)
-    return merged
-
-
-def setting(name, file_env):
-    value = os.environ.get(name)
-    if value is not None and value.strip():
-        return value.strip()
-    value = file_env.get(name)
-    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
-        return str(value).strip() or None
-    return None
 
 
 def api_key_cmd():
