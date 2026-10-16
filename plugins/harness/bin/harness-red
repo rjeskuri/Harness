@@ -44,14 +44,6 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, repo_key
-except Exception as exc:
-    sys.stderr.write(f"harness-red: cannot load harness_lib from {_LIB}: {exc}\n")
-    sys.exit(1)
-
-_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
-if _LIB not in sys.path:
-    sys.path.insert(0, _LIB)
-try:
     from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
 except Exception as exc:  # one line, exit 1, like the __main__ wrapper below
     sys.exit(f"harness-red: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
