@@ -2217,6 +2217,30 @@ class ToolFailRulesTests(ToolTestCase):
                     self.assert_one_line_exit_1(r, tool, lib)
         self.assertEqual(self.state_dirs(), [])  # no key was guessed, nothing written
 
+    def test_a_lib_error_with_newlines_in_its_message_still_gives_one_line(self):
+        """The import error's message is flattened: embedded newlines must not add stderr lines."""
+        message = "first line\nsecond line\n  third"
+        repo = self.make_repo()
+        self.issue_scenario()
+        root = self.tmp / "plugin-multiline"
+        shutil.copytree(PLUGIN, root, ignore=shutil.ignore_patterns("__pycache__", "tests", "lib"))
+        self.write_lib(
+            root, {"__init__.py": f"raise RuntimeError({message!r})\n", "paths.py": ""}
+        )
+        for tool, args in self.invocations():
+            with self.subTest(tool=tool):
+                r = self.run_tool(root / "bin" / tool, args, repo)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(r.stdout, "")
+                lines = r.stderr.splitlines()
+                self.assertEqual(len(lines), 1, r.stderr)
+                self.assertTrue(lines[0].startswith(f"{tool}:"), lines[0])
+                self.assertIn("harness_lib", lines[0])
+                for fragment in ("first line", "second line", "third"):
+                    self.assertIn(fragment, lines[0])
+        self.assertEqual(self.state_dirs(), [])
+
     def test_the_line_comes_before_any_argument_parsing(self):
         """--help and an unknown command still give the one line: the lib loads at module top."""
         repo = self.make_repo()

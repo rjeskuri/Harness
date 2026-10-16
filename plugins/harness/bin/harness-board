@@ -60,8 +60,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
-    sys.stderr.write(f"harness-board: cannot load harness_lib from {_LIB}: {exc}\n")
-    sys.exit(1)
+    sys.exit(f"harness-board: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 # name, color, meaning (the meaning is the label's description on GitHub)
 LABELS = [
