@@ -8,13 +8,19 @@ function for harness-board, harness-pr, harness-digest and hooks/notify.py.
   or blank: that part off), and the osascript fallback as hooks/notify.py does it (when
   terminal-notifier is missing, fails, or cannot be run), never raising.
 - env_setting, succeeded and applescript_string, DEFAULT_APP and DEFAULT_SOUND.
-- One copy: the three bin tools and hooks/notify.py define none of the helpers or an
-  argv builder of their own, spell none of the notifier names, flags or settings (with
-  string pieces folded, so "ter" + "minal-notifier" counts), and bind and use the lib's
-  notify from harness_lib.notify.
+- One copy: every Python file under the plugin but the lib's notify.py (the bin tools,
+  the hooks, the rest of the lib, the templates; tests aside) defines none of the helpers
+  or an argv builder of its own, spells none of the notifier names, flags or settings
+  (with string pieces folded, so "ter" + "minal-notifier" counts), and assigns neither
+  default; the three bin tools and hooks/notify.py bind and use the lib's notify from
+  harness_lib.notify. The test-breaker's round 2 parked the old copy in a second lib
+  module as a fallback the tools called when the lib said False: the scan covers every
+  file for that.
 - Each bin tool's notifying path (board needs-input, pr ready, the digest), driven with
   its own test module's fixtures from a plugin copy whose lib notify is instrumented,
-  hands the lib its message, group and title and runs no notifier of its own.
+  hands the lib its message, group and title exactly once, whether the lib answers True
+  or False, runs no notifier of its own either way, and reports the lib's answer where it
+  reports one (board --json and the digest --json "notified").
 - hooks/notify.py, from a plugin tree whose lib is instrumented, hands the lib's notify
   its message, group, title and subtitle, and rings the bell only when notify says False;
   with the lib missing it fails open with one stderr line, as the #79 hooks do.
@@ -34,6 +40,7 @@ import importlib.util
 import inspect
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -69,8 +76,15 @@ COPIES = {
     "hooks/notify.py": HOOKS / "notify.py",
 }
 HELPERS = ("env_setting", "succeeded", "applescript_string")
-# The argv builders: the tools' notify, the hook's two via_ functions.
+# The argv builders: the tools' notify, the hook's two via_ functions. Any other function
+# with "notif" in its name (old_notify, notify_legacy, _notify) counts as one too: outside
+# the lib there is nothing left to notify with.
 BUILDERS = ("notify", "via_terminal_notifier", "via_osascript")
+BUILDER_STEM = "notif"
+# Strings that spell a notifier name legitimately, outside any notification block, as
+# (file relative to the plugin) -> the exact whole strings allowed there: the tests-first
+# hook lists osascript among the interpreters `find -exec` may run. Nothing else today.
+ALLOWED_SPELLINGS = {"hooks/tests_first.py": {"osascript"}}
 
 FAKE_NOTIFIER = """#!{python}
 import json, os, sys
@@ -549,14 +563,16 @@ class Folder:
         return None
 
 
-def notifier_strings(tree) -> list[str]:
+def notifier_strings(tree, allow=frozenset()) -> list[str]:
+    """The notifier names, flags and settings spelled in `tree`'s strings (folded), each
+    with its line; a folded string that is exactly one of `allow` is passed over."""
     folder = Folder(tree)
     found = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.expr) or id(node) in folder.docs:
             continue
         text = folder.fold(node)
-        if text is None:
+        if text is None or text in allow:
             continue
         line = getattr(node, "lineno", "?")
         for word in NAMES_IN_STRINGS:
@@ -565,6 +581,76 @@ def notifier_strings(tree) -> list[str]:
         if text in FLAGS:
             found.append(f"{text!r} (line {line})")
     return sorted(set(found))
+
+
+def scanned_files() -> dict:
+    """Every Python file under the plugin, by its path relative to the plugin: each .py
+    file and each extensionless file whose shebang names python (the bin tools), under
+    bin, hooks, lib, skills, templates and whatever else is there, except the tests, any
+    __pycache__ and the lib's notify.py, the one place the notifier may live."""
+    found = {}
+    for path in sorted(PLUGIN.rglob("*")):
+        if not path.is_file() or path == NOTIFY_PY:
+            continue
+        rel = path.relative_to(PLUGIN)
+        if rel.parts[0] == "tests" or "__pycache__" in rel.parts:
+            continue
+        if path.suffix == ".py":
+            found[rel.as_posix()] = path
+        elif path.suffix == "":
+            with open(path, "rb") as fh:
+                first = fh.readline()
+            if first.startswith(b"#!") and b"python" in first:
+                found[rel.as_posix()] = path
+    return found
+
+
+def parsed(path: Path):
+    """The file's AST, or None when it is not Python as it stands (a template with
+    {{placeholders}}): the checks then read its text instead."""
+    try:
+        return parse(path)
+    except SyntaxError:
+        return None
+
+
+def is_builder_name(name: str) -> bool:
+    return name in HELPERS + BUILDERS or BUILDER_STEM in name.lower()
+
+
+def defined_builders(path: Path) -> list:
+    tree = parsed(path)
+    if tree is None:
+        names = re.findall(r"^\s*(?:async\s+)?def\s+(\w+)", path.read_text(encoding="utf-8"), re.M)
+    else:
+        names = [n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    return sorted({n for n in names if is_builder_name(n)})
+
+
+def spelled_names(label: str, path: Path) -> list:
+    tree = parsed(path)
+    allow = ALLOWED_SPELLINGS.get(label, set())
+    if tree is not None:
+        return notifier_strings(tree, allow)
+    text = path.read_text(encoding="utf-8")
+    found = [f"{w} in the text" for w in NAMES_IN_STRINGS if w.lower() in text.lower() and w not in allow]
+    found += [f"{f!r} in the text" for f in FLAGS if re.search(r"""["']""" + re.escape(f) + r"""["']""", text)]
+    return sorted(found)
+
+
+def assigned_defaults(path: Path) -> list:
+    tree = parsed(path)
+    if tree is None:
+        names = re.findall(r"^\s*(DEFAULT_APP|DEFAULT_SOUND)\s*(?::[^=]*)?=", path.read_text(encoding="utf-8"), re.M)
+    else:
+        names = [
+            target.id
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            if isinstance(target, ast.Name)
+        ]
+    return sorted(set(names) & {"DEFAULT_APP", "DEFAULT_SOUND"})
 
 
 def lib_bindings(tree) -> set:
@@ -603,43 +689,65 @@ def load_with_exec(path: Path) -> types.ModuleType:
 
 
 class OneCopyTests(unittest.TestCase):
-    def test_no_copy_defines_the_helpers_or_a_builder(self):
-        for label, path in COPIES.items():
-            tree = parse(path)
-            defined = sorted(
-                {
-                    node.name
-                    for node in ast.walk(tree)
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                }
-                & set(HELPERS + BUILDERS)
-            )
-            with self.subTest(file=label):
-                self.assertEqual(defined, [])
+    """One copy, in lib/harness_lib/notify.py: every other Python file under the plugin
+    defines no helper or builder, spells no notifier name, flag or setting, and assigns
+    neither default, so no second copy can sit in a sibling module (a `_legacy.py`) as the
+    fallback a tool calls when the lib says False. The four former copies, besides, bind
+    and use the lib's notify."""
 
-    def test_no_copy_spells_the_notifiers_flags_or_settings(self):
-        """Outside docstrings, no tool or the hook names terminal-notifier, osascript, the
-        AppleScript command, the two settings or the default app, or uses a notifier flag
-        as a string: only the lib builds the argv."""
-        for label, path in COPIES.items():
-            with self.subTest(file=label):
-                self.assertEqual(notifier_strings(parse(path)), [])
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.files = scanned_files()
 
-    def test_no_copy_assigns_the_defaults(self):
-        for label, path in COPIES.items():
-            tree = parse(path)
-            assigned = sorted(
-                {
-                    target.id
-                    for node in ast.walk(tree)
-                    if isinstance(node, (ast.Assign, ast.AnnAssign))
-                    for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
-                    if isinstance(target, ast.Name)
-                }
-                & {"DEFAULT_APP", "DEFAULT_SOUND"}
-            )
+    def test_the_scan_covers_the_plugin(self):
+        """The scan reaches the four former copies, every other bin tool and hook, the rest
+        of the lib and the templates, and leaves out the tests and the lib's notify.py."""
+        former = [path.relative_to(PLUGIN).as_posix() for path in COPIES.values()]
+        for label in former + ["bin/harness-work", "hooks/tests_first.py", "lib/harness_lib/paths.py",
+                               "lib/harness_lib/__init__.py", "templates/test_smoke.py"]:
             with self.subTest(file=label):
-                self.assertEqual(assigned, [])
+                self.assertIn(label, self.files)
+        self.assertNotIn("lib/harness_lib/notify.py", self.files)
+        self.assertFalse([f for f in self.files if f.startswith("tests/")])
+        self.assertFalse([f for f in self.files if "__pycache__" in f])
+        for label, path in self.files.items():
+            self.assertTrue(path.is_file(), label)
+        self.assertIsNone(parsed(self.files["templates/test_smoke.py"]))  # read as text, not skipped
+
+    def test_no_file_defines_the_helpers_or_a_builder(self):
+        for label, path in self.files.items():
+            with self.subTest(file=label):
+                self.assertEqual(defined_builders(path), [], f"{label} defines a notifier helper or builder")
+
+    def test_no_file_spells_the_notifiers_flags_or_settings(self):
+        """Outside docstrings, no file but the lib's notify.py names terminal-notifier,
+        osascript, the AppleScript command, the two settings or the default app, or uses a
+        notifier flag as a string: only the lib builds the argv. The one allowance is the
+        tests-first hook's interpreter list (ALLOWED_SPELLINGS)."""
+        for label, path in self.files.items():
+            with self.subTest(file=label):
+                self.assertEqual(spelled_names(label, path), [], f"{label} spells the notifier")
+
+    def test_no_file_assigns_the_defaults(self):
+        for label, path in self.files.items():
+            with self.subTest(file=label):
+                self.assertEqual(assigned_defaults(path), [], f"{label} assigns a notifier default")
+
+    def test_the_allowance_is_exact_and_the_stem_catches_renamed_builders(self):
+        """The tests-first allowance passes "osascript" as a whole string there and nothing
+        more; a renamed builder (old_notify) is still a builder."""
+        allowed = ast.parse('INTERPRETERS = {"perl", "osascript"}\n')
+        self.assertEqual(notifier_strings(allowed, {"osascript"}), [])
+        self.assertEqual(len(notifier_strings(allowed)), 1)
+        fallback = ast.parse('exe = shutil.which("osascript")\nscript = "display notification " + x\n')
+        found = notifier_strings(fallback, {"osascript"})  # the AppleScript command still fires, osascript not
+        self.assertTrue(found and all(f.startswith("display notification in") for f in found), found)
+        for name in ("old_notify", "notify_legacy", "_notify", "Notifier", "via_terminal_notifier", "succeeded"):
+            with self.subTest(name=name):
+                self.assertTrue(is_builder_name(name))
+        for name in ("main", "read_input", "clean", "cmd_needs_input", "notes"):
+            with self.subTest(name=name):
+                self.assertFalse(is_builder_name(name))
 
     def test_each_copy_imports_harness_lib_notify(self):
         for label, path in COPIES.items():
@@ -943,16 +1051,24 @@ class PrNotifiesThroughTheLib(SentinelLog, tp.Ready):
                               env=self.env(stubs=stubs, **env), capture_output=True, text=True, timeout=120)
 
     def test_ready_hands_its_message_and_group_to_the_lib(self):
-        self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, self.view([12])])
-        p = self.ok("ready", "34", **self.sentinel_env())
-        self.assertEqual(p.stdout, f"PR #34 ready for review: {tp.PR_URL}\n")
-        self.assertEqual(self.sentinel_calls(), [{
-            "message": "proj PR #34 ready for review: Add the widget (#12)",
-            "group": f"harness-{self.key()}-pr-34",
-            "title": "Harness",
-            "subtitle": "",
-        }])
-        self.assert_no_notifier_ran(self.notify_log)
+        """Whether the lib's notify answers True or False: the sentinel is called exactly
+        once with ready's message and group, no notifier on PATH runs (a tool with a
+        fallback of its own would run one when the lib says False), and ready's exit code
+        and output, which carry no notified value, are the same either way."""
+        for result in ("true", "false"):
+            with self.subTest(result=result):
+                self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, self.view([12])])
+                if os.path.exists(self.notify_log):
+                    os.unlink(self.notify_log)
+                p = self.ok("ready", "34", **self.sentinel_env(result))
+                self.assertEqual(p.stdout, f"PR #34 ready for review: {tp.PR_URL}\n")
+                self.assertEqual(self.sentinel_calls(), [{
+                    "message": "proj PR #34 ready for review: Add the widget (#12)",
+                    "group": f"harness-{self.key()}-pr-34",
+                    "title": "Harness",
+                    "subtitle": "",
+                }])
+                self.assert_no_notifier_ran(self.notify_log)
 
 
 @own_tests_only
@@ -963,16 +1079,33 @@ class DigestNotifiesThroughTheLib(SentinelLog, td.Digest):
                               capture_output=True, text=True, timeout=60)
 
     def test_digest_hands_its_message_and_group_to_the_lib(self):
+        """Whether the lib's notify answers True or False, printing Markdown or --json: the
+        sentinel is called exactly once with the digest's message and group, no notifier
+        on PATH runs, the digest exits 0, and --json's "notified" is the lib's answer, not
+        that of a fallback of the digest's own."""
         self.world()
-        p = self.run_tool(**self.sentinel_env())
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(self.sentinel_calls(), [{
+        expected = {
             "message": "Harness digest: 1 PRs to review, 2 need input, 2 stale",
             "group": "harness-digest",
             "title": "Harness",
             "subtitle": "",
-        }])
-        self.assert_no_notifier_ran(self.notifylog)
+        }
+        for result in ("true", "false"):
+            for args in ((), ("--json",)):
+                with self.subTest(result=result, args=args):
+                    if os.path.exists(self.notifylog):
+                        os.unlink(self.notifylog)
+                    p = self.run_tool(*args, **self.sentinel_env(result))
+                    self.assertEqual(p.returncode, 0, p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
+                    self.assertEqual(self.sentinel_calls(), [expected])
+                    self.assert_no_notifier_ran(self.notifylog)
+                    if args:
+                        data = json.loads(p.stdout)
+                        self.assertEqual(data["counts"], {"prs": 1, "needs_input": 2, "stale": 2})
+                        self.assertIs(data["notified"], result == "true")  # the lib's answer
+                    else:
+                        self.assertTrue(p.stdout.startswith("# Harness digest, "), p.stdout[:80])
 
 
 if __name__ == "__main__":
