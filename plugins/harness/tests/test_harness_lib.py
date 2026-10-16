@@ -50,6 +50,7 @@ PLUGIN = TESTS.parent
 HOOKS = PLUGIN / "hooks"
 LIB = PLUGIN / "lib"
 PATHS_PY = LIB / "harness_lib" / "paths.py"
+SHELLWALK_PY = LIB / "harness_lib" / "shellwalk.py"  # the shell walker (#85); real in every instrumented lib here
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 GIT_IDENTITY = {
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -1069,8 +1070,12 @@ class HooksFollowTheLibTests(LoaderTestCase):
     imply: the hook's behaviour comes from the lib's code, not from a copy of its own."""
 
     def instrumented(self, label: str, paths_source: str) -> Path:
+        """A plugin tree whose lib has the instrumented paths.py; the rest of the lib
+        (shellwalk.py, which branch_guard imports too) is the checkout's, so only the
+        state-key helpers differ from the real lib."""
         root = self.tmp / f"plugin-{label}"
         shutil.copytree(HOOKS, root / "hooks", ignore=shutil.ignore_patterns("__pycache__"))
+        self.assertTrue(SHELLWALK_PY.is_file(), f"{SHELLWALK_PY} does not exist")
         self.write_lib(
             root,
             {
@@ -1078,6 +1083,7 @@ class HooksFollowTheLibTests(LoaderTestCase):
                 "paths.py": paths_source.replace("{token!r}", repr(self.token)).replace(
                     "{token}", self.token
                 ),
+                "shellwalk.py": SHELLWALK_PY.read_text(encoding="utf-8"),
             },
         )
         return root
