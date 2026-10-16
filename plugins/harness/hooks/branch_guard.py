@@ -59,8 +59,16 @@ import re
 import shlex
 import subprocess
 import sys
-import unicodedata
 from pathlib import Path
+
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.paths import canonical_path, same_entry
+except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
+    sys.stderr.write(f"branch_guard.py: cannot load harness_lib from {_LIB}: {exc}\n")
+    sys.exit(0)
 
 MAX_SHOWN = 160
 MAX_DEPTH = 8
@@ -254,39 +262,6 @@ def existing_dir(path: str) -> str:
             break
         p = parent
     return p
-
-
-def canonical_path(path):
-    """The real path of `path` with each component spelled as its parent directory lists
-    it, so every spelling of one directory on a case-insensitive file system gives one
-    string. From the first component that cannot be found on, the rest stays as spelled."""
-    real = os.path.realpath(path)
-    done, parts = os.sep, [part for part in real.split(os.sep) if part]
-    for i, part in enumerate(parts):
-        try:
-            names = os.listdir(done)
-        except OSError:
-            return os.path.join(done, *parts[i:])
-        if part not in names:
-            fold = unicodedata.normalize("NFC", part).casefold()
-            given = os.path.join(done, part)
-            for name in names:
-                if unicodedata.normalize("NFC", name).casefold() == fold and same_entry(
-                    given, os.path.join(done, name)
-                ):
-                    part = name
-                    break
-            else:
-                return os.path.join(done, *parts[i:])
-        done = os.path.join(done, part)
-    return done
-
-
-def same_entry(a, b):
-    try:
-        return os.path.samefile(a, b)
-    except OSError:
-        return False
 
 
 def toplevel(directory: str | None) -> Path | None:
