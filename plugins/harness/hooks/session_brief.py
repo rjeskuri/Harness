@@ -20,10 +20,13 @@ Matcher (hooks.json): startup|resume|compact. Adds at most 40 lines of context:
   - Hours this month: the sum of this month's rows in worklog/worklog.csv.
 On startup it also names the session after the repo (sessionTitle).
 
-It prints nothing when the project's .claude/settings.json declares its own SessionStart
-hook, so a project with a bespoke brief is not briefed twice. Outside a git repo the
-heading carries no git facts, and the sections are read from the directory itself. Fails
-open: an error means a shorter brief or none, never a blocked session.
+When the project's .claude/settings.json declares its own SessionStart hook, it prints
+no brief, so a project with a bespoke brief is not briefed twice; only when harness_lib
+cannot be loaded does it still print the one harness_lib warning line there. Outside a
+git repo the heading carries no git facts, and the sections are read from the directory
+itself. Fails open: an error means a shorter brief or none, never a blocked session.
+Without harness_lib it writes one line to stderr, puts one Warning: line naming
+harness_lib in the brief, and leaves out the ticket state.
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
