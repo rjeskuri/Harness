@@ -59,7 +59,8 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table, warn
-    from harness_lib.text import as_list, first_line, home, now_iso, one_line, parse_iso, read_text, write_json
+    from harness_lib.text import (as_list, first_line, harness_home, home, now_iso, one_line, parse_iso, read_json,
+                                  read_text, write_json)
 except Exception as exc:                        # a missing or broken lib: one line, never a traceback
     sys.exit(f"harness-board: cannot load harness_lib from {_LIB}: {exc}")
 
@@ -222,7 +223,7 @@ class Repo:
         common_dir = os.path.normpath(os.path.join(self.root, common.stdout.strip()))
         reported = os.path.realpath(os.path.dirname(common_dir))
         self.main = canonical_path(reported)
-        self.key = adopt_old_state(home(".claude", "harness", "repos"), self.main, reported, path)
+        self.key = adopt_old_state(harness_home("repos"), self.main, reported, path)
         self.name = os.path.basename(self.main)
         remotes = git(self.root, "remote")
         if remotes.returncode != 0 or not remotes.stdout.split():
@@ -241,7 +242,7 @@ class Repo:
         return self._slug
 
     def ticket_path(self, number):
-        return home(".claude", "harness", "repos", self.key, "tickets", f"{number}.json")
+        return harness_home("repos", self.key, "tickets", f"{number}.json")
 
 
 def open_repo(path):
@@ -334,9 +335,8 @@ def by_harness(body):
 def settings_project():
     """env.HARNESS_PROJECT of ~/.claude/settings.json when that parses as a JSON object and it is a string."""
     try:
-        with open(home(".claude", "settings.json"), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError, RecursionError):
+        data = read_json(home(".claude", "settings.json"))
+    except RecursionError:                      # deeply nested JSON: read_json lets it through
         return None
     env = data.get("env") if isinstance(data, dict) else None
     value = env.get(PROJECT_SETTING) if isinstance(env, dict) else None
@@ -414,11 +414,7 @@ def classify(names, closed=False):
 
 
 def read_cache(repo, number):
-    try:
-        with open(repo.ticket_path(number), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return None
+    data = read_json(repo.ticket_path(number))
     return data if isinstance(data, dict) else None
 
 
@@ -806,7 +802,7 @@ def cmd_show(repo, args):
     if args.markdown:
         print(context_markdown(record, task_resolutions(repo, record.get("tasks") or [])))
     else:
-        print(json.dumps(record, indent=2, ensure_ascii=False))
+        emit(True, record, "")
 
 
 def cmd_ready(repo, args):
@@ -929,7 +925,7 @@ def cmd_answers(repo, args):
         if by_harness(body) or (since is not None and (when is None or when <= since)):
             continue
         out.append({"author": author, "created_at": c.get("createdAt"), "body": body, "url": c.get("url")})
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    emit(True, out, "")
 
 
 def cmd_close(repo, args):
@@ -1045,7 +1041,7 @@ def cmd_project_check(args):
 
 def load_projects():
     """The registered project paths, in registry order (the registry harness-standup and harness-digest read)."""
-    path = home(".claude", "harness", "projects.json")
+    path = harness_home("projects.json")
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)

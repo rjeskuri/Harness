@@ -45,8 +45,9 @@ _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
-    from harness_lib.cli import Parser, Problem, run_main, table, warn
-    from harness_lib.text import as_list, first_line, home, last_line, one_line, parse_iso, read_text, write_text
+    from harness_lib.cli import Parser, Problem, emit, run_main, table, warn
+    from harness_lib.text import (as_list, first_line, harness_home, home, last_line, one_line, parse_iso, read_json,
+                                  read_text, write_text)
 except Exception as exc:                        # a missing or broken lib: one line, never a traceback
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {exc}")
 
@@ -127,7 +128,7 @@ def fence_safe(text):
 
 def short_home(path):
     """~/... for a path under HOME, for messages."""
-    root = os.path.expanduser("~")
+    root = home()
     return "~" + path[len(root):] if path.startswith(root + os.sep) else path
 
 
@@ -321,7 +322,7 @@ class Repo:
         common_dir = os.path.normpath(os.path.join(self.root, common.stdout.strip()))
         reported = os.path.realpath(os.path.dirname(common_dir))
         self.main = canonical_path(reported)
-        self.key = adopt_old_state(home(".claude", "harness", "repos"), self.main, reported, path)
+        self.key = adopt_old_state(harness_home("repos"), self.main, reported, path)
         self.name = os.path.basename(self.main)
         self._slug = None
 
@@ -336,7 +337,7 @@ class Repo:
         return self._slug
 
     def state(self, *parts):
-        return home(".claude", "harness", "repos", self.key, *parts)
+        return harness_home("repos", self.key, *parts)
 
 
 def open_repo(path=None):
@@ -1061,7 +1062,7 @@ def cmd_comments(args):
             raise Problem(f"--since: not an ISO-8601 time: {args.since!r}")
     found = conversation(conversation_of(repo, number), since, args.unresolved)
     if args.json:
-        print(json.dumps(dict({"number": number}, **found), indent=2, ensure_ascii=False))
+        emit(True, dict({"number": number}, **found), "")
         return 0
     if not any(found.values()):
         print(f"No {'unresolved threads' if args.unresolved else 'comments'} on PR #{number}.")
@@ -1125,7 +1126,7 @@ def awaiting_in(repo, project=None):
 
 
 def registry_projects():
-    path = home(".claude", "harness", "projects.json")
+    path = harness_home("projects.json")
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -1154,7 +1155,7 @@ def cmd_awaiting(args):
     else:
         rows = awaiting_in(open_repo())
     if args.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        emit(True, rows, "")
     elif not rows:
         print("No pull requests awaiting you.")
     else:
@@ -1208,12 +1209,8 @@ def severity_line(findings):
 
 
 def mark_cloud_exhausted(reason):
-    path = home(".claude", "harness", "budgets.json")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        data = {}
+    path = harness_home("budgets.json")
+    data = read_json(path)
     data = data if isinstance(data, dict) else {}
     until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=EXHAUSTED_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     data["cloud"] = {"exhausted_until": until, "reason": reason}
@@ -1283,11 +1280,7 @@ def worktree_for(main, branch):
 
 def ticket_parent(repo, number):
     """The ticket's epic: `parent` in the ticket cache, else GitHub's sub-issue parent (404: none)."""
-    try:
-        with open(repo.state("tickets", f"{number}.json"), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        data = None
+    data = read_json(repo.state("tickets", f"{number}.json"))
     parent = data.get("parent") if isinstance(data, dict) else None
     n = parent.get("number") if isinstance(parent, dict) else None
     if isinstance(n, int) and n > 0:
