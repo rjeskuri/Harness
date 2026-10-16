@@ -42,6 +42,14 @@ import time
 import unicodedata
 from pathlib import Path
 
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.notify import notify
+except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
+    sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
+
 HERE = Path(__file__).resolve().parent
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 TICKET_BRANCH = re.compile(r"^t/(\d+)-")
@@ -81,8 +89,6 @@ TOOL_TIMEOUT = 180
 ULTRA_MINUTES = 30
 EXHAUSTED_HOURS = 24
 DEFAULT_CHECKED = "the diff against the ticket's definition of done"
-DEFAULT_APP = "com.microsoft.VSCode"
-DEFAULT_SOUND = "Glass"
 LAND_FIELDS = "isDraft,mergeable,headRefName,closingIssuesReferences,statusCheckRollup,title,url,state"
 AWAIT_FIELDS = "number,title,isDraft,createdAt,url,headRefName,closingIssuesReferences,statusCheckRollup"
 CONVERSATION = """query($owner: String!, $repo: String!, $number: Int!) {
@@ -521,47 +527,6 @@ def closing_numbers(view):
         if isinstance(n, int) and n not in out:
             out.append(n)
     return out
-
-
-# --------------------------------------------------------------- notifications (as hooks/notify.py)
-def env_setting(name, default):
-    value = os.environ.get(name)
-    return default if value is None else value.strip()
-
-
-def succeeded(cmd):
-    return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=10).returncode == 0
-
-
-def applescript_string(text):
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def notify(message, group):
-    """A macOS notification: terminal-notifier when on PATH, else osascript. Never fails."""
-    title = "Harness"
-    app = env_setting("HARNESS_NOTIFY_APP", DEFAULT_APP)
-    sound = env_setting("HARNESS_NOTIFY_SOUND", DEFAULT_SOUND)
-    try:
-        exe = shutil.which("terminal-notifier")
-        if exe:
-            cmd = [exe, "-title", title, "-message", message, "-group", group]
-            cmd += ["-activate", app] if app else []
-            cmd += ["-sound", sound] if sound else []
-            if succeeded(cmd):
-                return True
-    except (OSError, subprocess.SubprocessError):
-        pass
-    try:
-        exe = shutil.which("osascript")
-        if exe:
-            script = f"display notification {applescript_string(message)} with title {applescript_string(title)}"
-            if sound:
-                script += f" sound name {applescript_string(sound)}"
-            return succeeded([exe, "-e", script])
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return False
 
 
 # --------------------------------------------------------------- findings

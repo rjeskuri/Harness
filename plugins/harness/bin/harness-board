@@ -49,12 +49,19 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unicodedata
+
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.notify import notify
+except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
+    sys.exit(f"harness-board: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 # name, color, meaning (the meaning is the label's description on GitHub)
 LABELS = [
@@ -107,8 +114,6 @@ PROJECT_FIELDS = (("Status", [STATUS_TITLES[s] for s in STATUSES] + ["Done"]), (
 FIELD_LIMIT = "100"     # a project holds at most 50 fields
 ITEM_LIMIT = "1000"     # the board items project sync reads
 ISSUE_LIMIT = "1000"    # the open issues per repository project sync reads
-DEFAULT_APP = "com.microsoft.VSCode"
-DEFAULT_SOUND = "Glass"
 CHECKBOX = re.compile(r"^[-*+]\s+\[[ xX]\]")
 BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*\S)")
 HEADING = re.compile(r"^##\s+(.*?)\s*#*\s*$")
@@ -739,47 +744,6 @@ def context_markdown(record, resolutions=None):
     if len(lines) > CONTEXT_LINES:
         lines = lines[:CONTEXT_LINES - 1] + [f"[... cut at {CONTEXT_LINES} lines; harness-board show {n} has it all]"]
     return "\n".join(lines)
-
-
-# --------------------------------------------------------------- notifications (as hooks/notify.py)
-def env_setting(name, default):
-    value = os.environ.get(name)
-    return default if value is None else value.strip()
-
-
-def succeeded(cmd):
-    return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=10).returncode == 0
-
-
-def applescript_string(text):
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def notify(message, group):
-    """A macOS notification: terminal-notifier when on PATH, else osascript. Never fails."""
-    title = "Harness"
-    app = env_setting("HARNESS_NOTIFY_APP", DEFAULT_APP)
-    sound = env_setting("HARNESS_NOTIFY_SOUND", DEFAULT_SOUND)
-    try:
-        exe = shutil.which("terminal-notifier")
-        if exe:
-            cmd = [exe, "-title", title, "-message", message, "-group", group]
-            cmd += ["-activate", app] if app else []
-            cmd += ["-sound", sound] if sound else []
-            if succeeded(cmd):
-                return True
-    except (OSError, subprocess.SubprocessError):
-        pass
-    try:
-        exe = shutil.which("osascript")
-        if exe:
-            script = f"display notification {applescript_string(message)} with title {applescript_string(title)}"
-            if sound:
-                script += f" sound name {applescript_string(sound)}"
-            return succeeded([exe, "-e", script])
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return False
 
 
 # --------------------------------------------------------------- output
