@@ -50,6 +50,16 @@ import sys
 import tempfile
 from pathlib import Path
 
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.hookio import emit, hook_cwd, read_input, run_fail_open
+    from harness_lib.settings import setting, settings_env
+except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
+    sys.stderr.write(f"verify_on_stop.py: cannot load harness_lib from {_LIB}: {exc}\n")
+    sys.exit(0)
+
 MAX_CONSECUTIVE_BLOCKS = 2
 TAIL_LINES = 60
 DEFAULT_TIMEOUT = 300.0
@@ -62,14 +72,6 @@ GUIDANCE = (
 )
 
 _child: subprocess.Popen | None = None
-
-
-def read_input() -> dict:
-    try:
-        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 def git(root: Path, *args: str, timeout: float = 20) -> subprocess.CompletedProcess:
@@ -115,11 +117,6 @@ def tail(text: str, n: int = TAIL_LINES) -> str:
     return "\n".join([f"... ({len(lines) - n} earlier lines omitted)", *lines[-n:]])
 
 
-def emit(obj: dict) -> None:
-    sys.stdout.write(json.dumps(obj))
-    sys.stdout.flush()
-
-
 # ---------- settings ----------
 
 
@@ -134,31 +131,6 @@ def declares_stop_hook(root: Path) -> bool:
     hooks = data.get("hooks") if isinstance(data, dict) else None
     entries = hooks.get("Stop") if isinstance(hooks, dict) else None
     return isinstance(entries, list) and bool(entries)
-
-
-def settings_env(root: Path) -> dict:
-    """`env` from the project's settings files; settings.local.json wins over settings.json."""
-    merged: dict = {}
-    for name in ("settings.json", "settings.local.json"):
-        try:
-            data = json.loads((root / ".claude" / name).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        env = data.get("env") if isinstance(data, dict) else None
-        if isinstance(env, dict):
-            merged.update(env)
-    return merged
-
-
-def setting(name: str, file_env: dict) -> str | None:
-    value = os.environ.get(name)
-    if value is not None and value.strip():
-        return value.strip()
-    value = file_env.get(name)
-    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
-        text = str(value).strip()
-        return text or None
-    return None
 
 
 def verify_timeout(file_env: dict) -> float:
@@ -301,9 +273,7 @@ def run_command(cmd: str, root: Path, timeout: float) -> tuple[int, str]:
 
 def main() -> int:
     data = read_input()
-    cwd = Path(
-        str(data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
-    )
+    cwd = Path(hook_cwd(data))
     git_root = repo_root(cwd)
     root = git_root or cwd
     if declares_stop_hook(root) or data.get("background_tasks"):
@@ -433,8 +403,5 @@ if __name__ == "__main__":
             signal.signal(_sig, on_signal)
         except (OSError, ValueError):
             pass
-    try:
-        main()
-    except Exception as exc:  # fail open: a broken hook must never trap the session
-        sys.stderr.write(f"verify_on_stop.py: {exc}\n")
-    sys.exit(0)
+    # fail open: a broken hook must never trap the session
+    sys.exit(run_fail_open("verify_on_stop.py", main))

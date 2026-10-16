@@ -38,7 +38,15 @@ import signal
 import subprocess
 import sys
 import tempfile
-import unicodedata
+
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.paths import adopt_old_state, canonical_path, repo_key
+    from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
+except Exception as exc:  # one line, exit 1, like the __main__ wrapper below
+    sys.exit(f"harness-red: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 TEST_PATTERNS = ("tests/**,test/**,**/test_*.py,**/*_test.py,**/conftest.py,**/*_test.js,**/*.test.js,"
                  "**/*.test.ts,**/*_test.ts,spec/**")
@@ -75,55 +83,9 @@ class Parser(argparse.ArgumentParser):
 
 
 # --------------------------------------------------------------- globs and settings
-def glob_match(pattern, path):
-    """Does the repo-relative `path` match `pattern`? Split on '/', '**' consumes zero or more segments,
-    other segments use fnmatch; a pattern without '/' matches the basename."""
-    pattern = pattern.strip()
-    if not pattern:
-        return False
-    if "/" not in pattern:
-        return fnmatch.fnmatch(path.rsplit("/", 1)[-1], pattern)
-    return _segments_match(pattern.split("/"), path.split("/"))
-
-
-def _segments_match(pats, parts):
-    if not pats:
-        return not parts
-    if pats[0] == "**":
-        return any(_segments_match(pats[1:], parts[i:]) for i in range(len(parts) + 1))
-    return bool(parts) and fnmatch.fnmatch(parts[0], pats[0]) and _segments_match(pats[1:], parts[1:])
-
-
-def settings_env(root, names=("settings.json", "settings.local.json")):
-    """`env` from the project's settings files; settings.local.json wins over settings.json."""
-    merged = {}
-    for name in names:
-        try:
-            with open(os.path.join(root, ".claude", name), encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        env = data.get("env") if isinstance(data, dict) else None
-        if isinstance(env, dict):
-            merged.update(env)
-    return merged
-
-
-def setting(name, file_env):
-    """The environment first, then the settings files' `env`; None when unset or blank."""
-    value = os.environ.get(name)
-    if value is not None and value.strip():
-        return value.strip()
-    value = file_env.get(name)
-    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
-        text = str(value).strip()
-        return text or None
-    return None
-
-
 def globs(name, file_env, default):
     raw = setting(name, file_env)
-    return [p.strip() for p in (default if raw is None else raw).split(",") if p.strip()]
+    return patterns(default if raw is None else raw)
 
 
 def read_text(path):
@@ -178,78 +140,6 @@ def git(root, *args, check=True):
         said = [ln.strip() for ln in p.stderr.splitlines() if ln.strip()]
         raise Problem(f"git {' '.join(args)} failed: {said[-1] if said else f'exit {p.returncode}'}")
     return p
-
-
-# ---------- the state key (the same helpers in every harness tool and hook) ----------
-
-
-def canonical_path(path):
-    """The real path of `path` with each component spelled as its parent directory lists
-    it, so every spelling of one directory on a case-insensitive file system gives one
-    string. From the first component that cannot be found on, the rest stays as spelled."""
-    real = os.path.realpath(path)
-    done, parts = os.sep, [part for part in real.split(os.sep) if part]
-    for i, part in enumerate(parts):
-        try:
-            names = os.listdir(done)
-        except OSError:
-            return os.path.join(done, *parts[i:])
-        if part not in names:
-            fold = unicodedata.normalize("NFC", part).casefold()
-            given = os.path.join(done, part)
-            for name in names:
-                if unicodedata.normalize("NFC", name).casefold() == fold and same_entry(
-                    given, os.path.join(done, name)
-                ):
-                    part = name
-                    break
-            else:
-                return os.path.join(done, *parts[i:])
-        done = os.path.join(done, part)
-    return done
-
-
-def same_entry(a, b):
-    try:
-        return os.path.samefile(a, b)
-    except OSError:
-        return False
-
-
-def path_key(path):
-    """The first 12 hex digits of the sha1 of the path string as it is spelled."""
-    return hashlib.sha1(str(path).encode("utf-8", "surrogateescape")).hexdigest()[:12]
-
-
-def repo_key(path):
-    """The state key of a main working tree: path_key of its canonical path."""
-    return path_key(canonical_path(path))
-
-
-def adopt_old_state(repos, main, *spelled):
-    """The state key of the canonical main tree `main`. When repos/<key> does not exist
-    yet, the directory an earlier version keyed by the spelling in use is renamed to it:
-    the spelling of `main` that one of `spelled` (the main tree as git reported it, the
-    path the tool started from) uses. Only this repository's; when both exist, both stay."""
-    key = path_key(main)
-    target = os.path.join(repos, key)
-    if os.path.lexists(target):
-        return key
-    depth = len(main.split(os.sep))
-    for path in spelled:
-        if not path:
-            continue
-        old = os.sep.join(os.path.realpath(path).split(os.sep)[:depth])
-        if old == main or canonical_path(old) != main:
-            continue
-        source = os.path.join(repos, path_key(old))
-        if os.path.isdir(source):
-            try:
-                os.rename(source, target)
-            except OSError:
-                pass
-            break
-    return key
 
 
 class Repo:
