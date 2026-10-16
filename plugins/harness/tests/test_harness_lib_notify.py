@@ -76,11 +76,14 @@ COPIES = {
     "hooks/notify.py": HOOKS / "notify.py",
 }
 HELPERS = ("env_setting", "succeeded", "applescript_string")
-# The argv builders: the tools' notify, the hook's two via_ functions. Any other function
-# with "notif" in its name (old_notify, notify_legacy, _notify) counts as one too: outside
-# the lib there is nothing left to notify with.
-BUILDERS = ("notify", "via_terminal_notifier", "via_osascript")
-BUILDER_STEM = "notif"
+# Functions that are a copy by their name alone: the helpers and the hook's two via_
+# builders. Any other function, whatever its name (old_notify, ping, notify), is a builder
+# when it does what one does: it runs a process (subprocess.*, shutil.which, os.exec*,
+# os.spawn*, os.system, os.popen, directly or through a function of the same file that
+# does) and its body spells a notifier name or flag (folded). A notify_on_merge that runs
+# gh and then calls the lib's notify is not one.
+NAMED_BUILDERS = HELPERS + ("via_terminal_notifier", "via_osascript")
+RUNNER_MODULES = ("subprocess", "shutil", "os")
 # Strings that spell a notifier name legitimately, outside any notification block, as
 # (file relative to the plugin) -> the exact whole strings allowed there: the tests-first
 # hook lists osascript among the interpreters `find -exec` may run. Nothing else today.
@@ -566,9 +569,12 @@ class Folder:
 def notifier_strings(tree, allow=frozenset()) -> list[str]:
     """The notifier names, flags and settings spelled in `tree`'s strings (folded), each
     with its line; a folded string that is exactly one of `allow` is passed over."""
-    folder = Folder(tree)
+    return notifier_hits(ast.walk(tree), Folder(tree), allow)
+
+
+def notifier_hits(nodes, folder: Folder, allow=frozenset()) -> list[str]:
     found = []
-    for node in ast.walk(tree):
+    for node in nodes:
         if not isinstance(node, ast.expr) or id(node) in folder.docs:
             continue
         text = folder.fold(node)
@@ -583,16 +589,17 @@ def notifier_strings(tree, allow=frozenset()) -> list[str]:
     return sorted(set(found))
 
 
-def scanned_files() -> dict:
+def scanned_files(root: Path = PLUGIN) -> dict:
     """Every Python file under the plugin, by its path relative to the plugin: each .py
     file and each extensionless file whose shebang names python (the bin tools), under
     bin, hooks, lib, skills, templates and whatever else is there, except the tests, any
     __pycache__ and the lib's notify.py, the one place the notifier may live."""
     found = {}
-    for path in sorted(PLUGIN.rglob("*")):
-        if not path.is_file() or path == NOTIFY_PY:
+    skip = root / "lib" / "harness_lib" / "notify.py"
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path == skip:
             continue
-        rel = path.relative_to(PLUGIN)
+        rel = path.relative_to(root)
         if rel.parts[0] == "tests" or "__pycache__" in rel.parts:
             continue
         if path.suffix == ".py":
@@ -605,26 +612,100 @@ def scanned_files() -> dict:
     return found
 
 
+PLACEHOLDER = re.compile(r"\{\{\s*\w+\s*\}\}")
+
+
 def parsed(path: Path):
-    """The file's AST, or None when it is not Python as it stands (a template with
-    {{placeholders}}): the checks then read its text instead."""
-    try:
-        return parse(path)
-    except SyntaxError:
-        return None
+    """The file's AST: as it stands, or else with each {{placeholder}} (a template's)
+    replaced by a name. None when it is still not Python: the checks then read its text."""
+    text = path.read_text(encoding="utf-8")
+    for source in (text, PLACEHOLDER.sub("harness_placeholder", text)):
+        try:
+            return ast.parse(source, filename=str(path))
+        except SyntaxError:
+            continue
+    return None
 
 
-def is_builder_name(name: str) -> bool:
-    return name in HELPERS + BUILDERS or BUILDER_STEM in name.lower()
+def runner_imports(tree):
+    """(alias -> module) for `import subprocess [as sp]` and the like, and (bare name ->
+    "module.attr") for `from subprocess import run [as r]` and the like."""
+    modules, bare = {}, {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name in RUNNER_MODULES:
+                    modules[a.asname or a.name] = a.name
+        elif isinstance(node, ast.ImportFrom) and node.module in RUNNER_MODULES:
+            for a in node.names:
+                bare[a.asname or a.name] = f"{node.module}.{a.name}"
+    return modules, bare
 
 
-def defined_builders(path: Path) -> list:
+def is_runner(qualified: str) -> bool:
+    module, _, attr = qualified.partition(".")
+    if module == "subprocess":
+        return True
+    if module == "shutil":
+        return attr == "which"
+    if module == "os":
+        return attr.startswith(("exec", "spawn", "posix_spawn", "system", "popen"))
+    return False
+
+
+def builders_in(tree, allow=frozenset()) -> list:
+    """The functions in `tree` that are a notifier copy: named as a helper or via_ builder,
+    or running a process (directly or through a same-file function that does) while
+    their body, or a module-level value it reads, spells a notifier name or flag."""
+    folder = Folder(tree)
+    modules, bare = runner_imports(tree)
+    fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    runs, called, spells = {}, {}, {}
+    for fn in fns:
+        direct, names = False, set()
+        nodes = list(ast.walk(fn))
+        for node in nodes:
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                names.add(func.attr)
+                if isinstance(func.value, ast.Name) and func.value.id in modules:
+                    direct = direct or is_runner(f"{modules[func.value.id]}.{func.attr}")
+            elif isinstance(func, ast.Name):
+                names.add(func.id)
+                if func.id in bare:
+                    direct = direct or is_runner(bare[func.id])
+        reads = [n.id for n in nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)]
+        for name in reads:
+            if name in folder.assigned:
+                nodes.extend(ast.walk(folder.assigned[name]))
+        runs[id(fn)], called[id(fn)] = direct, names
+        spells[id(fn)] = bool(notifier_hits(nodes, folder, allow))
+    changed = True
+    while changed:  # a function that calls a same-file function that runs a process runs one
+        running = {fn.name for fn in fns if runs[id(fn)]}
+        changed = False
+        for fn in fns:
+            if not runs[id(fn)] and called[id(fn)] & running:
+                runs[id(fn)] = changed = True
+    return sorted({fn.name for fn in fns if fn.name in NAMED_BUILDERS or (runs[id(fn)] and spells[id(fn)])})
+
+
+RUNNER_TEXT = re.compile(r"\b(?:subprocess\.|shutil\.which|os\.(?:exec|spawn|posix_spawn|system|popen))")
+
+
+def defined_builders(label: str, path: Path) -> list:
     tree = parsed(path)
-    if tree is None:
-        names = re.findall(r"^\s*(?:async\s+)?def\s+(\w+)", path.read_text(encoding="utf-8"), re.M)
-    else:
-        names = [n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
-    return sorted({n for n in names if is_builder_name(n)})
+    allow = ALLOWED_SPELLINGS.get(label, set())
+    if tree is not None:
+        return builders_in(tree, allow)
+    text = path.read_text(encoding="utf-8")
+    names = re.findall(r"^\s*(?:async\s+)?def\s+(\w+)", text, re.M)
+    found = {n for n in names if n in NAMED_BUILDERS}
+    if RUNNER_TEXT.search(text) and spelled_names(label, path):
+        found.add("(runs a process and spells a notifier, read as text)")
+    return sorted(found)
 
 
 def spelled_names(label: str, path: Path) -> list:
@@ -712,12 +793,11 @@ class OneCopyTests(unittest.TestCase):
         self.assertFalse([f for f in self.files if "__pycache__" in f])
         for label, path in self.files.items():
             self.assertTrue(path.is_file(), label)
-        self.assertIsNone(parsed(self.files["templates/test_smoke.py"]))  # read as text, not skipped
 
     def test_no_file_defines_the_helpers_or_a_builder(self):
         for label, path in self.files.items():
             with self.subTest(file=label):
-                self.assertEqual(defined_builders(path), [], f"{label} defines a notifier helper or builder")
+                self.assertEqual(defined_builders(label, path), [], f"{label} defines a notifier helper or builder")
 
     def test_no_file_spells_the_notifiers_flags_or_settings(self):
         """Outside docstrings, no file but the lib's notify.py names terminal-notifier,
@@ -733,21 +813,167 @@ class OneCopyTests(unittest.TestCase):
             with self.subTest(file=label):
                 self.assertEqual(assigned_defaults(path), [], f"{label} assigns a notifier default")
 
-    def test_the_allowance_is_exact_and_the_stem_catches_renamed_builders(self):
+    def test_the_allowance_is_exact_and_builders_are_found_by_what_they_do(self):
         """The tests-first allowance passes "osascript" as a whole string there and nothing
-        more; a renamed builder (old_notify) is still a builder."""
+        more. A function is a builder by a helper's or via_ builder's name, or by running a
+        process while spelling a notifier, whatever it is called; a function that has
+        "notif" in its name but only calls the lib's notify (or runs gh) is not one."""
         allowed = ast.parse('INTERPRETERS = {"perl", "osascript"}\n')
         self.assertEqual(notifier_strings(allowed, {"osascript"}), [])
         self.assertEqual(len(notifier_strings(allowed)), 1)
         fallback = ast.parse('exe = shutil.which("osascript")\nscript = "display notification " + x\n')
         found = notifier_strings(fallback, {"osascript"})  # the AppleScript command still fires, osascript not
         self.assertTrue(found and all(f.startswith("display notification in") for f in found), found)
-        for name in ("old_notify", "notify_legacy", "_notify", "Notifier", "via_terminal_notifier", "succeeded"):
-            with self.subTest(name=name):
-                self.assertTrue(is_builder_name(name))
-        for name in ("main", "read_input", "clean", "cmd_needs_input", "notes"):
-            with self.subTest(name=name):
-                self.assertFalse(is_builder_name(name))
+
+        for name in NAMED_BUILDERS:
+            with self.subTest(named=name):
+                self.assertEqual(builders_in(ast.parse(f"def {name}(x):\n    return x\n")), [name])
+
+        legitimate = '''
+import os
+import subprocess
+from harness_lib.notify import notify
+
+def notify_on_merge(pr):
+    subprocess.run(["gh", "pr", "merge", str(pr)], check=False)
+    return notify(f"merged #{pr}", "harness-merge")
+
+def cmd_notifications(args):
+    return notify("proj needs input", "harness-proj-12", "Harness")
+
+def notifications_enabled():
+    return os.environ.get("HARNESS_QUIET") != "1"
+
+def spell_only():
+    return "terminal-notifier is optional"  # spells, runs nothing (the spelling check's job)
+
+def main():
+    return cmd_notifications([]) or notify_on_merge(3)
+'''
+        self.assertEqual(builders_in(ast.parse(legitimate)), [])
+
+        # The test-breaker's round 1, (a): renamed, string-split copies in the bin tools,
+        # in the shapes it can take.
+        renamed = {
+            "direct": '''
+import shutil, subprocess
+def ping(message, group, title="Harness"):
+    exe = shutil.which("ter" + "minal-notifier")
+    if exe:
+        return subprocess.run([exe, "-" + "title", title, "-" "message", message, "-group", group]).returncode == 0
+    return False
+def cmd_needs_input(args):
+    return ping("proj #1 needs input", "harness-proj-1")
+''',
+            "through a same-file runner": '''
+import subprocess
+from subprocess import run as _r
+A = "os"
+def _ok(cmd):
+    return _r(cmd, stdin=subprocess.DEVNULL, capture_output=True).returncode == 0
+def _alert(message, title):
+    return _ok(["".join([A, "ascript"]), "-e", "display" + f" notification {message} with title {title}"])
+''',
+            "module-level argv and an aliased module": '''
+import subprocess as sp
+FLAGS = ["-ti" "tle", "-message"]
+TN = "%s-notifier" % "terminal"
+def send(message, title):
+    return sp.call([TN] + [FLAGS[0], title, FLAGS[1], message]) == 0
+''',
+            "os.exec": '''
+import os
+def bell(message):
+    os.execvp("osa" + "script", ["osa" + "script", "-e", "display notification " + message])
+''',
+        }
+        expected = {"direct": ["ping"], "through a same-file runner": ["_alert"],
+                    "module-level argv and an aliased module": ["send"], "os.exec": ["bell"]}
+        for shape, source in renamed.items():
+            with self.subTest(cheat="a", shape=shape):
+                tree = ast.parse(source)
+                self.assertEqual(builders_in(tree), expected[shape])
+                self.assertTrue(notifier_strings(tree))
+
+    def test_a_copy_parked_in_a_sibling_lib_module_is_caught(self):
+        """The test-breaker's round 2, (b): old_notify moved to lib/harness_lib/_legacy.py
+        and called as `notify(...) or _legacy.old_notify(...)`: the scan reaches the module,
+        and the builder and spelling checks both name it there."""
+        root = Path(tempfile.mkdtemp(prefix="harness-notify-scan-")).resolve()
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "lib" / "harness_lib").mkdir(parents=True)
+        (root / "bin").mkdir()
+        (root / "tests").mkdir()
+        (root / "lib" / "harness_lib" / "notify.py").write_text('X = "terminal-notifier"\n', encoding="utf-8")
+        (root / "lib" / "harness_lib" / "_legacy.py").write_text('''
+import shutil
+import subprocess
+
+def _run(cmd):
+    return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True).returncode == 0
+
+def old_notify(message, group, title="Harness"):
+    tn = shutil.which("terminal-" + "notifier")
+    if tn and _run([tn, "-title", title, "-message", message, "-group", group]):
+        return True
+    osa = shutil.which("osa" "script")
+    return bool(osa) and _run([osa, "-e", "display notification " + repr(message)])
+''', encoding="utf-8")
+        executable(root / "bin" / "harness-pr", '''#!/usr/bin/env python3
+from harness_lib.notify import notify
+from harness_lib import _legacy
+
+def cmd_ready(n):
+    return notify(f"PR #{n} ready", f"harness-pr-{n}") or _legacy.old_notify(f"PR #{n} ready", f"harness-pr-{n}")
+''')
+        (root / "tests" / "test_x.py").write_text('def old_notify():\n    return "osascript"\n', encoding="utf-8")
+        files = scanned_files(root)
+        self.assertEqual(sorted(files), ["bin/harness-pr", "lib/harness_lib/_legacy.py"])
+        legacy = files["lib/harness_lib/_legacy.py"]
+        self.assertEqual(defined_builders("lib/harness_lib/_legacy.py", legacy), ["old_notify"])
+        self.assertTrue(spelled_names("lib/harness_lib/_legacy.py", legacy))
+        self.assertEqual(defined_builders("bin/harness-pr", files["bin/harness-pr"]), [])
+
+    def test_the_scan_reads_a_file_whether_or_not_it_parses(self):
+        """A file is checked as Python as it stands, as a template with its {{placeholders}}
+        filled, or, when neither parses, as text: a copy is found in each, and a clean file
+        of each kind passes."""
+        tmp = Path(tempfile.mkdtemp(prefix="harness-notify-parse-")).resolve()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        copy = '''import subprocess
+import {{pkg}}
+
+def alert(message):
+    return subprocess.run(["terminal-notifier", "-message", message]).returncode == 0
+'''
+        clean = '''"""The smoke test: the package imports."""
+
+import {{pkg}}
+
+
+def test_package_imports():
+    assert {{pkg}}.__version__
+'''
+        cases = [
+            # (name, text, parses after filling, builders, spells)
+            ("plain-copy.py", copy.replace("{{pkg}}", "pkg"), True, ["alert"], True),
+            ("template-copy.py", copy, True, ["alert"], True),
+            ("broken-copy.py", copy + "def oops(:\n", False, None, True),
+            ("plain-clean.py", clean.replace("{{pkg}}", "pkg"), True, [], False),
+            ("template-clean.py", clean, True, [], False),
+            ("broken-clean.py", clean + "def oops(:\n", False, [], False),
+        ]
+        for name, text, parses, builders, spells in cases:
+            with self.subTest(file=name):
+                path = tmp / name
+                path.write_text(text, encoding="utf-8")
+                self.assertEqual(parsed(path) is not None, parses)
+                found = defined_builders(f"templates/{name}", path)
+                if builders is None:
+                    self.assertTrue(found, "a copy read as text is not found")
+                else:
+                    self.assertEqual(found, builders)
+                self.assertEqual(bool(spelled_names(f"templates/{name}", path)), spells)
 
     def test_each_copy_imports_harness_lib_notify(self):
         for label, path in COPIES.items():
@@ -873,12 +1099,14 @@ class HookUsesTheLibTests(unittest.TestCase):
 
     def plugin(self, lib: str) -> Path:
         """hooks/ copied from the checkout, with lib/ 'sentinel' (the checkout's lib, its
-        notify.py replaced by SENTINEL_NOTIFY) or 'missing'."""
+        notify.py replaced by SENTINEL_NOTIFY), 'broken' (its notify.py raising on import)
+        or 'missing'."""
         root = self.tmp / f"plugin-{lib}"
         shutil.copytree(HOOKS, root / "hooks", ignore=shutil.ignore_patterns("__pycache__"))
-        if lib == "sentinel":
+        if lib in ("sentinel", "broken"):
             shutil.copytree(LIB, root / "lib", ignore=shutil.ignore_patterns("__pycache__"))
-            (root / "lib" / "harness_lib" / "notify.py").write_text(SENTINEL_NOTIFY, encoding="utf-8")
+            text = SENTINEL_NOTIFY if lib == "sentinel" else 'raise RuntimeError("broken lib")\n'
+            (root / "lib" / "harness_lib" / "notify.py").write_text(text, encoding="utf-8")
         else:
             self.assertEqual(lib, "missing")
         return root
@@ -962,12 +1190,84 @@ class HookUsesTheLibTests(unittest.TestCase):
         self.assertFalse(self.notify_log.exists(), "the hook ran a notifier itself")
 
     def test_missing_lib_fails_open_with_one_line(self):
-        root = self.plugin("missing")
-        r = self.run_hook(root, self.PAYLOAD)
+        """With harness_lib missing or failing to import: one stderr line, exit 0, and the
+        bell on stdout. A Notification hook's stderr reaches no one, so without the bell a
+        broken lib would make every prompt silent."""
+        for lib in ("missing", "broken"):
+            with self.subTest(lib=lib):
+                root = self.plugin(lib)
+                r = self.run_hook(root, self.PAYLOAD)
+                lines = r.stderr.splitlines()
+                self.assertEqual(len(lines), 1, r.stderr)
+                self.assertTrue(lines[0].startswith("notify.py:"), lines[0])
+                self.assertIn("harness_lib", lines[0])
+                self.assertEqual(json.loads(r.stdout or "null"), {"terminalSequence": BEL}, r.stdout)
+                self.assertFalse(self.notify_log.exists(), "the hook ran a notifier itself")
+
+
+# ================================================================ the tools without the lib
+
+
+class ToolsWithoutTheLibTests(unittest.TestCase):
+    """harness-board, harness-pr and harness-digest run from a plugin copy whose lib/ is
+    missing, or whose harness_lib/notify.py raises on import: one stderr line
+    `<tool>: cannot load harness_lib from <lib>: <error>`, no traceback, nothing on stdout,
+    exit 1, and no notifier run."""
+
+    TOOLS = {"harness-board": ["board"], "harness-pr": ["ready", "34"], "harness-digest": ["--json"]}
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="harness-notify-nolib-")).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.notify_log = self.tmp / "notify.log"
+
+    def plugin(self, lib: str, token: str = "") -> Path:
+        root = self.tmp / f"plugin-{lib}"
+        shutil.copytree(BIN, root / "bin", ignore=shutil.ignore_patterns("__pycache__"))
+        if lib == "broken":
+            shutil.copytree(LIB, root / "lib", ignore=shutil.ignore_patterns("__pycache__"))
+            (root / "lib" / "harness_lib" / "notify.py").write_text(
+                f'raise RuntimeError("broken lib {token}")\n', encoding="utf-8")
+        else:
+            self.assertEqual(lib, "missing")
+        return root
+
+    def run_tool(self, root: Path, tool: str):
+        env = {
+            "PATH": str(_SHARED["base"] / "bin-both"),
+            "HOME": str(self.tmp),
+            "LANG": "en_US.UTF-8",
+            "NOTIFY_LOG": str(self.notify_log),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": _SHARED["pycache"],
+        }
+        return subprocess.run([sys.executable, str(root / "bin" / tool)] + self.TOOLS[tool], capture_output=True,
+                              text=True, env=env, cwd=str(self.tmp), timeout=60)
+
+    def check(self, root: Path, tool: str, error_has: str) -> None:
+        r = self.run_tool(root, tool)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertEqual(r.stdout, "")
+        self.assertNotIn("Traceback", r.stderr)
         lines = r.stderr.splitlines()
         self.assertEqual(len(lines), 1, r.stderr)
-        self.assertTrue(lines[0].startswith("notify.py:"), lines[0])
-        self.assertIn("harness_lib", lines[0])
+        prefix = f"{tool}: cannot load harness_lib from {root / 'lib'}: "
+        self.assertTrue(lines[0].startswith(prefix), f"{lines[0]!r} does not start with {prefix!r}")
+        self.assertIn(error_has, lines[0][len(prefix):])
+        self.assertFalse(self.notify_log.exists(), f"{tool} ran a notifier itself")
+
+    def test_missing_lib_is_one_line_and_exit_1(self):
+        root = self.plugin("missing")
+        for tool in self.TOOLS:
+            with self.subTest(tool=tool):
+                self.check(root, tool, "harness_lib")
+
+    def test_a_lib_that_fails_to_import_is_one_line_with_its_error(self):
+        token = uuid.uuid4().hex[:10]
+        root = self.plugin("broken", token)
+        for tool in self.TOOLS:
+            with self.subTest(tool=tool):
+                self.check(root, tool, f"broken lib {token}")
 
 
 # ================================================================ the tools run the lib's notify

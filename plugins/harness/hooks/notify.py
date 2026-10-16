@@ -21,7 +21,8 @@ tools share.
 HARNESS_NOTIFY_SOUND names a sound from /System/Library/Sounds (default Glass). Setting it,
 or HARNESS_NOTIFY_APP, to an empty string turns that part off.
 
-Always exits 0; without harness_lib it writes one line to stderr, as the other hooks do.
+Always exits 0; without harness_lib it writes one line to stderr, as the other hooks do, and
+asks for the bell, since a Notification hook's stderr reaches no one.
 Try it with:
     echo '{"message": "test", "cwd": "'"$PWD"'"}' | python3 hooks/notify.py
 
@@ -40,8 +41,10 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.notify import notify
-except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
+except Exception as exc:  # fail open: one line, and the bell, since this stderr reaches no one
     sys.stderr.write(f"notify.py: cannot load harness_lib from {_LIB}: {exc}\n")
+    sys.stdout.write(json.dumps({"terminalSequence": "\u0007"}))
+    sys.stdout.flush()
     sys.exit(0)
 
 DEFAULT_TITLE = "Claude Code"
