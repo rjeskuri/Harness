@@ -619,6 +619,18 @@ class LoaderTestCase(unittest.TestCase):
             (pkg / name).write_text(text, encoding="utf-8")
         return root / "lib"
 
+    def write_instrumented_lib(self, root: Path, paths_source: str) -> Path:
+        """root/lib: the checkout's real lib (every module in it, so tools that import
+        harness_lib.cli, text, notify and the like keep working), with paths.py replaced by
+        paths_source filled in with this test's token."""
+        self.assertTrue(PATHS_PY.is_file(), f"{PATHS_PY} does not exist")
+        shutil.copytree(LIB, root / "lib", ignore=shutil.ignore_patterns("__pycache__"))
+        (root / "lib" / "harness_lib" / "paths.py").write_text(
+            paths_source.replace("{token!r}", repr(self.token)).replace("{token}", self.token),
+            encoding="utf-8",
+        )
+        return root / "lib"
+
     def plugin(self, lib: str) -> Path:
         """A plugin tree under tmp: the checkout's hooks/ and a lib/ that is
         'real' (copied from the checkout), 'missing', 'syntax' (paths.py does not parse),
@@ -1090,15 +1102,7 @@ class HooksFollowTheLibTests(LoaderTestCase):
     def instrumented(self, label: str, paths_source: str) -> Path:
         root = self.tmp / f"plugin-{label}"
         shutil.copytree(HOOKS, root / "hooks", ignore=shutil.ignore_patterns("__pycache__"))
-        self.write_lib(
-            root,
-            {
-                "__init__.py": "from __future__ import annotations\n",
-                "paths.py": paths_source.replace("{token!r}", repr(self.token)).replace(
-                    "{token}", self.token
-                ),
-            },
-        )
+        self.write_instrumented_lib(root, paths_source)
         return root
 
     def sentinel_key(self, main: Path) -> str:
@@ -1156,6 +1160,21 @@ class HooksFollowTheLibTests(LoaderTestCase):
         r = self.run_hook(root / "hooks" / "tests_first.py", self.payload("Edit", tool_input, wt), wt)
         self.assertEqual((r.returncode, r.stderr), (0, ""))
         return self.deny_reason(r)
+
+    def test_instrumented_tree_carries_every_other_lib_module(self):
+        """Later tickets add harness_lib modules: the instrumented tree keeps them and
+        swaps in only paths.py."""
+        root = self.instrumented("carry", "# instrumented {token}\n")
+        pkg = root / "lib" / "harness_lib"
+        real = {p.name for p in (LIB / "harness_lib").glob("*.py")}
+        self.assertEqual({p.name for p in pkg.glob("*.py")}, real)
+        self.assertEqual(
+            (pkg / "paths.py").read_text(encoding="utf-8"), f"# instrumented {self.token}\n"
+        )
+        for name in real - {"paths.py"}:
+            self.assertEqual(
+                (pkg / name).read_bytes(), (LIB / "harness_lib" / name).read_bytes(), name
+            )
 
     def test_tests_first_reads_the_red_run_under_the_libs_key(self):
         root = self.instrumented("sentinel", SENTINEL_PATHS)
@@ -1817,21 +1836,13 @@ class ToolTestCase(LoaderTestCase):
 
     def tree(self, label: str, lib: str, paths_source: str | None = None) -> Path:
         """<tmp>/plugin-<label>: the plugin minus tests/ and lib/, then lib/ as `lib` says
-        ('real', 'missing', 'syntax', 'raises', 'incomplete') or, with paths_source, an
-        importable lib whose paths.py is that source (filled in with this test's token)."""
+        ('real', 'missing', 'syntax', 'raises', 'incomplete') or, with paths_source, a copy
+        of the real lib whose paths.py is that source (filled in with this test's token)."""
         root = self.tmp / f"plugin-{label}"
         shutil.copytree(PLUGIN, root, ignore=shutil.ignore_patterns("__pycache__", "tests", "lib"))
         init = "from __future__ import annotations\n"
         if paths_source is not None:
-            self.write_lib(
-                root,
-                {
-                    "__init__.py": init,
-                    "paths.py": paths_source.replace("{token!r}", repr(self.token)).replace(
-                        "{token}", self.token
-                    ),
-                },
-            )
+            self.write_instrumented_lib(root, paths_source)
         elif lib == "real":
             self.assertTrue(PATHS_PY.is_file(), f"{PATHS_PY} does not exist")
             shutil.copytree(LIB, root / "lib", ignore=shutil.ignore_patterns("__pycache__"))
@@ -1945,6 +1956,21 @@ def adopt_old_state(repos, main, *spelled):
 class ToolsFollowTheLibTests(ToolTestCase):
     """Each tool, from a tree whose lib is instrumented, keys its state the way that
     lib says: the behaviour comes from the lib's code, not from a copy of its own."""
+
+    def test_instrumented_tree_carries_every_other_lib_module(self):
+        """Later tickets add harness_lib.cli, text, notify...: the instrumented tree keeps
+        them (so the tools still import) and swaps in only paths.py."""
+        root = self.tree("carry", "real", "# instrumented {token}\n")
+        pkg = root / "lib" / "harness_lib"
+        real = {p.name for p in (LIB / "harness_lib").glob("*.py")}
+        self.assertEqual({p.name for p in pkg.glob("*.py")}, real)
+        self.assertEqual(
+            (pkg / "paths.py").read_text(encoding="utf-8"), f"# instrumented {self.token}\n"
+        )
+        for name in real - {"paths.py"}:
+            self.assertEqual(
+                (pkg / name).read_bytes(), (LIB / "harness_lib" / name).read_bytes(), name
+            )
 
     def test_each_tool_opens_the_state_directory_adopt_old_state_names(self):
         """Not path_key(canonical_path(main)), not repo_key(main), not a sha1: the key

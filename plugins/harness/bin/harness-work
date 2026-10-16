@@ -74,7 +74,7 @@ except Exception as exc:  # no state key can be guessed without the lib: one lin
     sys.stderr.write(f"harness-work: cannot load harness_lib from {_LIB}: {exc}\n")
     sys.exit(1)
 
-HERE =os.path.dirname(os.path.realpath(__file__))
+HERE = os.path.dirname(os.path.realpath(__file__))
 STAGES = ("tests", "breaker", "code", "review", "ci")
 TIERS = ("sonnet", "opus", "fable")
 NEXT_TIER = {"sonnet": "opus", "opus": "fable", "fable": "fable"}
