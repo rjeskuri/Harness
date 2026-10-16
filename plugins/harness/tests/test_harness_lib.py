@@ -1071,16 +1071,17 @@ class HooksFollowTheLibTests(LoaderTestCase):
     def instrumented(self, label: str, paths_source: str) -> Path:
         root = self.tmp / f"plugin-{label}"
         shutil.copytree(HOOKS, root / "hooks", ignore=shutil.ignore_patterns("__pycache__"))
-        self.write_lib(
-            root,
-            {
-                "__init__.py": "from __future__ import annotations\n",
-                "paths.py": paths_source.replace("{token!r}", repr(self.token)).replace(
-                    "{token}", self.token
-                ),
-                "settings.py": (LIB / "harness_lib" / "settings.py").read_text(encoding="utf-8"),
-            },
-        )
+        files = {
+            "__init__.py": "from __future__ import annotations\n",
+            "paths.py": paths_source.replace("{token!r}", repr(self.token)).replace(
+                "{token}", self.token
+            ),
+        }
+        # Only paths.py is instrumented; the rest of the lib (hookio.py, #87) is the real one.
+        for extra in sorted((LIB / "harness_lib").glob("*.py")):
+            if extra.name not in files:
+                files[extra.name] = extra.read_text(encoding="utf-8")
+        self.write_lib(root, files)
         return root
 
     def sentinel_key(self, main: Path) -> str:

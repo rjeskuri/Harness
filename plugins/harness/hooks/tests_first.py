@@ -65,6 +65,7 @@ _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
+    from harness_lib.hookio import deny, edited_path, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.settings import glob_match, patterns, setting, settings_env
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
@@ -123,24 +124,6 @@ FIND_OPTIONS = {"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"}
 # writers, since what their program writes cannot be seen.
 INTERPRETERS = {"perl", "ruby", "php", "awk", "gawk", "lua", "Rscript", "osascript"}
 INLINE = "Write files with Edit or Write so the tests-first rules can see the path."
-
-
-def read_input() -> dict:
-    try:
-        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def deny(reason: str) -> None:
-    decision = {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": reason,
-    }
-    sys.stdout.write(json.dumps({"hookSpecificOutput": decision}))
-    sys.stdout.flush()
 
 
 def read_json(path: Path) -> dict | None:
@@ -546,7 +529,7 @@ def check(data: dict) -> None:
         return
     agent = data.get("agent_type")
     role = agent.rsplit(":", 1)[-1] if isinstance(agent, str) else ""
-    cwd = str(data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    cwd = hook_cwd(data)
     if tool == "Bash":
         command = tool_input.get("command")
         if isinstance(command, str) and command.strip():
@@ -554,7 +537,7 @@ def check(data: dict) -> None:
         return
     if tool not in ("Edit", "Write", "NotebookEdit"):
         return
-    raw = tool_input.get("file_path") or tool_input.get("notebook_path")
+    raw = edited_path(data)
     if not isinstance(raw, str) or not raw.strip():
         return
     path = os.path.join(cwd, os.path.expanduser(raw))
@@ -569,8 +552,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:  # fail open: a broken guard must never trap the agent
-        sys.stderr.write(f"tests_first.py: {exc}\n")
-    sys.exit(0)
+    # fail open: a broken guard must never trap the agent
+    sys.exit(run_fail_open("tests_first.py", main))
