@@ -866,9 +866,9 @@ def cmd_checks(args):
     pending = [e for e in entries if e["bucket"] == "pending"]
     logs = failed_logs(repo, failed) if failed else []
     if args.json:
-        print(json.dumps({"number": number, "state": state, "checks": entries,
-                          "failed": [e["name"] for e in failed], "pending": [e["name"] for e in pending],
-                          "logs": logs}, indent=2, ensure_ascii=False))
+        emit(True, {"number": number, "state": state, "checks": entries,
+                    "failed": [e["name"] for e in failed], "pending": [e["name"] for e in pending],
+                    "logs": logs}, "")
     if state == "none":
         warn("harness-pr", f"no checks registered on PR #{number}")
         return 0
