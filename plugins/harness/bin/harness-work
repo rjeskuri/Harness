@@ -75,7 +75,7 @@ try:
 except Exception as exc:  # one line, exit 1, like the __main__ wrapper below
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
-HERE =os.path.dirname(os.path.realpath(__file__))
+HERE = os.path.dirname(os.path.realpath(__file__))
 STAGES = ("tests", "breaker", "code", "review", "ci")
 TIERS = ("sonnet", "opus", "fable")
 NEXT_TIER = {"sonnet": "opus", "opus": "fable", "fable": "fable"}
