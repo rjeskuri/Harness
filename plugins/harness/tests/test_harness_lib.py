@@ -345,13 +345,11 @@ def reference_bodies() -> dict:
     return found
 
 
-def helper_internals(tree) -> list[str]:
-    """The distinctive pieces of the helpers' bodies found in a hook: the casefold
-    component walk, os.path.samefile, and sha1(...).hexdigest()[:12]."""
+def state_key_slices(tree) -> list[str]:
+    """Where a hook cuts a digest to 12 hex digits (`<x>.hexdigest()[:12]`): the shape
+    of path_key's state key."""
     found = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr in ("casefold", "samefile"):
-            found.append(f"{node.attr} (line {node.lineno})")
         if isinstance(node, ast.Subscript):
             value, piece = node.value, node.slice
             if isinstance(piece, ast.Index):  # Python 3.8
@@ -383,11 +381,13 @@ def docstring_ids(tree) -> set:
     return ids
 
 
-def spelled(tree, words: tuple) -> list[str]:
-    """Where a hook spells one of `words` (case ignored): as a name, an attribute, an
-    imported module, or inside a string that is not a docstring (so hashlib.new("sha1"),
-    getattr(os, "listdir") and os.__dict__["listdir"] count; prose does not)."""
-    docs = docstring_ids(tree)
+def spelled(tree, words: tuple, docs: set | None = None) -> list[str]:
+    """Where `tree` spells one of `words` (case ignored): as a name, an attribute, an
+    imported module, or inside a string that is not a docstring (so hashlib.new("sha1")
+    and getattr(os, "listdir") count; prose does not). `docs` are the docstring ids of
+    the whole module when `tree` is one def inside it."""
+    if docs is None:
+        docs = docstring_ids(tree)
     found = []
 
     def hit(text: str, node) -> None:
@@ -414,36 +414,47 @@ def spelled(tree, words: tuple) -> list[str]:
     return found
 
 
-def computed_names(tree) -> list[str]:
-    """Every way a hook could reach a function without spelling its name: getattr and
-    its kin with a name that is not a string literal, a namespace looked up by key
-    (__dict__, vars, globals, locals), __import__ and importlib, exec and eval, and
-    hashlib.new or any other .new() with a computed algorithm name."""
+def _literal(expr) -> bool:
+    return isinstance(expr, ast.Constant) and isinstance(expr.value, str)
+
+
+def _on_hashlib(expr) -> bool:
+    return isinstance(expr, ast.Name) and expr.id == "hashlib"
+
+
+def hashlib_by_computed_name(tree) -> list[str]:
+    """hashlib.new(<not a literal>) and getattr(hashlib, <not a literal>): the two ways
+    to reach sha1 without spelling it. Any other computed name is allowed."""
     found = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            name = func.id if isinstance(func, ast.Name) else None
-            attr = func.attr if isinstance(func, ast.Attribute) else None
-            first = node.args[0] if node.args else None
-            literal = isinstance(first, ast.Constant) and isinstance(first.value, str)
-            if name in ("getattr", "setattr", "hasattr", "delattr"):
-                target = node.args[1] if len(node.args) > 1 else None
-                if not (isinstance(target, ast.Constant) and isinstance(target.value, str)):
-                    found.append(f"{name} with a computed name (line {node.lineno})")
-            elif name in ("__import__", "exec", "eval", "compile", "vars", "globals", "locals"):
-                found.append(f"{name}() (line {node.lineno})")
-            elif attr in ("import_module", "attrgetter", "methodcaller"):
-                found.append(f".{attr}() (line {node.lineno})")
-            elif attr == "new" and node.args and not literal:
-                found.append(f".new() with a computed name (line {node.lineno})")
-        elif isinstance(node, ast.Attribute) and node.attr in (
-            "__dict__",
-            "__getattribute__",
-            "__getattr__",
-            "__builtins__",
+        if not isinstance(node, ast.Call):
+            continue
+        func, args = node.func, node.args
+        if isinstance(func, ast.Attribute) and func.attr == "new" and _on_hashlib(func.value):
+            if not (args and _literal(args[0])):
+                found.append(f"hashlib.new with a computed name (line {node.lineno})")
+        elif (
+            isinstance(func, ast.Name)
+            and func.id == "getattr"
+            and len(args) > 1
+            and _on_hashlib(args[0])
+            and not _literal(args[1])
         ):
-            found.append(f"{node.attr} (line {node.lineno})")
+            found.append(f"getattr(hashlib, <computed>) (line {node.lineno})")
+    return found
+
+
+def spelling_walks(tree) -> list[str]:
+    """Each def that both lists a directory (listdir, scandir) and compares spellings
+    (casefold, samefile): canonical_path's component walk, or a copy of it. Either
+    one alone is not reported."""
+    docs = docstring_ids(tree)
+    found = []
+    for fn in defs(tree):
+        lists = spelled(fn, ("listdir", "scandir"), docs)
+        compares = spelled(fn, ("casefold", "samefile"), docs)
+        if lists and compares:
+            found.append(f"{fn.name} (line {fn.lineno}): {lists[0]}; {compares[0]}")
     return found
 
 
@@ -452,33 +463,39 @@ def hook_tree(name: str):
 
 
 class HooksImportTheLibTests(unittest.TestCase):
-    # Static backstops against a disguised copy of the helpers. Each one hits only the
-    # copies in the hooks as they are today (checked by hand: the sha1 is spelled only in
-    # path_key and in prose, listdir only in canonical_path, and no hook reaches a name
-    # by computation), so a hook that imports the five names from the lib passes.
+    # Static backstops against a copy of the five helpers in a hook. They are narrow on
+    # purpose: the instrumented-lib runs in HooksFollowTheLibTests are the main guard
+    # (they catch a disguised copy by what the hook does), and each check here bans only
+    # a shape a copy needs. When a later change has a legitimate use of a banned shape,
+    # revisit the check and its docstring rather than work around it.
 
     def test_no_hook_computes_a_sha1(self):
-        """The state key is the lib's: no hook spells sha1 outside its docstrings, in any
-        form (hashlib.sha1, hashlib.new("sha1"), getattr(hashlib, "sha1"), _sha1)."""
+        """Guards against a hook computing a state key of its own (path_key's sha1):
+        no hook spells sha1 or _hashlib outside its docstrings (hashlib.sha1,
+        hashlib.new("sha1"), getattr(hashlib, "sha1"), _sha1), reaches hashlib by a
+        computed name, or cuts a digest to [:12]. A legitimate future sha1 in a hook (a
+        content hash, say) means revisiting this check."""
         for name in HOOK_NAMES:
+            tree = hook_tree(name)
             with self.subTest(hook=name):
-                self.assertEqual(spelled(hook_tree(name), ("sha1", "_hashlib")), [])
+                self.assertEqual(spelled(tree, ("sha1", "_hashlib")), [])
+                self.assertEqual(hashlib_by_computed_name(tree), [])
+                self.assertEqual(state_key_slices(tree), [])
 
-    def test_no_hook_lists_a_directory(self):
-        """Matching a path component against its directory's entries is canonical_path's
-        job, in the lib: no hook spells listdir or scandir."""
+    def test_no_hook_walks_a_directory_to_match_a_spelling(self):
+        """Guards against a copy of canonical_path's component walk: no def in a hook
+        both lists a directory (listdir, scandir) and compares spellings (casefold,
+        samefile). Either one alone is allowed (str.casefold, os.scandir). A legitimate
+        future def that needs both means revisiting this check."""
         for name in HOOK_NAMES:
             with self.subTest(hook=name):
-                self.assertEqual(spelled(hook_tree(name), ("listdir", "scandir")), [])
-
-    def test_no_hook_reaches_a_name_by_computation(self):
-        """getattr(x, "case" + "fold") and its kin hide a helper from the checks above:
-        every attribute and module a hook uses is spelled as a literal."""
-        for name in HOOK_NAMES:
-            with self.subTest(hook=name):
-                self.assertEqual(computed_names(hook_tree(name)), [])
+                self.assertEqual(spelling_walks(hook_tree(name)), [])
 
     def test_no_hook_carries_a_renamed_copy(self):
+        """Guards against a renamed copy: no def in a hook has the body (names and
+        docstring aside) of canonical_path, same_entry, path_key or adopt_old_state as
+        the lib or a bin tool spells it. A legitimate def that happens to normalise to
+        one of those bodies means revisiting this check."""
         refs = reference_bodies()
         self.assertEqual(sorted(set(refs.values())), sorted(COMPARED), "reference bodies missing")
         for name in HOOK_NAMES:
@@ -491,13 +508,8 @@ class HooksImportTheLibTests(unittest.TestCase):
             with self.subTest(hook=name):
                 self.assertEqual(copies, [])
 
-    def test_no_hook_carries_the_helpers_internals(self):
-        for name in HOOK_NAMES:
-            tree = ast.parse((HOOKS / name).read_text(encoding="utf-8"), filename=name)
-            with self.subTest(hook=name):
-                self.assertEqual(helper_internals(tree), [])
-
     def test_no_hook_defines_any_of_the_five(self):
+        """Guards against a copy under the lib's own name, which would shadow the import."""
         for name in HOOK_NAMES:
             tree = ast.parse((HOOKS / name).read_text(encoding="utf-8"), filename=name)
             defined = {
@@ -736,6 +748,7 @@ class SessionBriefWarningTests(LoaderTestCase):
         r = self.run_hook(root / "hooks" / "session_brief.py", payload, project)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("Traceback", r.stderr)
+        self.assertTrue(r.stdout.strip(), f"no SessionStart output; stderr: {r.stderr!r}")
         out = json.loads(r.stdout)["hookSpecificOutput"]
         self.assertEqual(out["hookEventName"], "SessionStart")
         return r, out["additionalContext"].splitlines()
@@ -764,6 +777,65 @@ class SessionBriefWarningTests(LoaderTestCase):
         project.mkdir()
         r, lines = self.brief(self.plugin("missing"), project)
         self.assertEqual(len([ln for ln in lines if "harness_lib" in ln]), 1, lines)
+
+    def own_session_start(self, project: Path) -> None:
+        """The project declares its own SessionStart hook (as in tests/test_hooks.py), and
+        has a handoff whose next steps the full brief would show."""
+        (project / ".claude").mkdir(parents=True, exist_ok=True)
+        own = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}]}}
+        (project / ".claude" / "settings.json").write_text(json.dumps(own))
+        (project / "docs" / "agent").mkdir(parents=True, exist_ok=True)
+        (project / "docs/agent/handoff.md").write_text(
+            f"# Handoff\n\n## Next steps\n- finish {self.token}\n"
+        )
+
+    def test_a_broken_lib_warns_even_when_the_project_has_its_own_session_start(self):
+        """The project's own SessionStart hook replaces the brief, but not the warning:
+        a broken or missing lib still gives exactly one line, the harness_lib warning,
+        and nothing else of the brief (no heading, no handoff), plus one stderr line."""
+        for lib in BROKEN:
+            for where in ("repo", "plain"):
+                with self.subTest(lib=lib, where=where):
+                    if where == "repo":
+                        project = self.make_repo()
+                    else:
+                        self.cases = getattr(self, "cases", 0) + 1
+                        project = self.tmp / f"case{self.cases}" / "plain"
+                        project.mkdir(parents=True)
+                    self.own_session_start(project)
+                    r, lines = self.brief(self.plugin_once(lib), project)
+                    self.assertEqual(len(lines), 1, lines)
+                    self.assertIn("harness_lib", lines[0])
+                    self.assertFalse(lines[0].startswith("## Session brief"), lines)
+                    self.assertNotIn(f"finish {self.token}", lines[0])  # not the handoff
+                    if lib == "raises":
+                        self.assertIn(self.token, lines[0])
+                    self.assert_one_line_fail_open(r, "session_brief.py", lib)
+
+    def test_the_real_lib_with_its_own_session_start_gives_no_output(self):
+        """With the real lib, a project's own SessionStart hook still means no brief at
+        all, as before: empty stdout, empty stderr, exit 0."""
+        root = self.plugin("real")
+        repo = self.make_repo()
+        plain = self.tmp / "plain-own"
+        plain.mkdir()
+        for project in (repo, plain):
+            with self.subTest(project=project.name):
+                self.own_session_start(project)
+                payload = {
+                    "session_id": "sess-1",
+                    "transcript_path": "/dev/null",
+                    "cwd": str(project),
+                    "permission_mode": "default",
+                    "hook_event_name": "SessionStart",
+                    "source": "startup",
+                }
+                r = self.run_hook(root / "hooks" / "session_brief.py", payload, project)
+                self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+
+    def plugin_once(self, lib: str) -> Path:
+        root = self.tmp / f"plugin-{lib}"
+        return root if root.is_dir() else self.plugin(lib)
 
     def test_a_broken_lib_gives_the_brief_without_ticket_state(self):
         """Without the lib there is no state key: the brief keeps its heading and notes

@@ -635,20 +635,26 @@ def main() -> int:
     )
     git_root = repo_root(cwd)
     root = git_root or cwd
+    warning = []
+    if LIB_PROBLEM:  # the guards fail open without the lib, so the session hears of it
+        warning.append(
+            f"Warning: {LIB_PROBLEM}; the guard hooks allow every call"
+            " and this brief has no ticket state."
+        )
     if declares_session_start(root):
+        # The project's own hook replaces the brief and its title, but not the warning.
+        if not warning:
+            return 0
+        out = {"hookEventName": "SessionStart", "additionalContext": clip(warning[0])}
+        sys.stdout.write(json.dumps({"hookSpecificOutput": out}))
+        sys.stdout.flush()
         return 0
     name = root.name or str(root)
     # Outside a git repo the heading has no git facts; the sections come from the cwd.
     head, branch = f"## Session brief: {name}", None
     if git_root is not None:
         head, branch = heading(git_root, name)
-    lines = [head]
-    if LIB_PROBLEM:  # the guards fail open without the lib, so the session hears of it
-        lines.append(
-            f"Warning: {LIB_PROBLEM}; the guard hooks allow every call"
-            " and this brief has no ticket state."
-        )
-    lines += [*extras(git_root, branch, started, cwd), *sections(root)]
+    lines = [head, *warning, *extras(git_root, branch, started, cwd), *sections(root)]
     brief = "\n".join(clip(ln) for ln in lines[:MAX_LINES])
 
     out = {"hookEventName": "SessionStart", "additionalContext": brief}
