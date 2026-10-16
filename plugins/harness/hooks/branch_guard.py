@@ -65,6 +65,7 @@ _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
+    from harness_lib.hookio import deny, edited_path, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import canonical_path, same_entry
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
     sys.stderr.write(f"branch_guard.py: cannot load harness_lib from {_LIB}: {exc}\n")
@@ -180,24 +181,6 @@ JS_WRITERS = re.compile(
     r"|truncateSync|symlink|symlinkSync)\s*\("
     r"|\bBun\.write\s*\("
 )
-
-
-def read_input() -> dict:
-    try:
-        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def deny(reason: str) -> None:
-    decision = {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": reason,
-    }
-    sys.stdout.write(json.dumps({"hookSpecificOutput": decision}))
-    sys.stdout.flush()
 
 
 def shown(text: str) -> str:
@@ -335,10 +318,7 @@ def notes_or_ignored(path: str, top: Path) -> bool:
 
 
 def check_edit(data: dict, cwd: str) -> None:
-    tool_input = data.get("tool_input")
-    if not isinstance(tool_input, dict):
-        return
-    raw = tool_input.get("file_path") or tool_input.get("notebook_path")
+    raw = edited_path(data)
     if not isinstance(raw, str) or not raw.strip():
         return
     path = os.path.join(cwd, os.path.expanduser(raw))
@@ -1443,7 +1423,7 @@ def main() -> int:
     if os.environ.get("HARNESS_ALLOW_MAIN", "").strip() == "1":
         return 0
     data = read_input()
-    cwd = str(data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    cwd = hook_cwd(data)
     tool = data.get("tool_name")
     if tool in ("Edit", "Write", "NotebookEdit"):
         check_edit(data, cwd)
@@ -1453,8 +1433,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:  # fail open: a broken guard must never trap the agent
-        sys.stderr.write(f"branch_guard.py: {exc}\n")
-    sys.exit(0)
+    # fail open: a broken guard must never trap the agent
+    sys.exit(run_fail_open("branch_guard.py", main))

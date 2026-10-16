@@ -49,12 +49,37 @@ _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
+    from harness_lib.hookio import emit, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
 
     LIB_PROBLEM = ""
 except Exception as exc:  # fail open: the brief goes on without ticket state and says why
     LIB_PROBLEM = f"cannot load harness_lib from {_LIB}: {exc}"
     sys.stderr.write(f"session_brief.py: {LIB_PROBLEM}\n")
+
+    # The brief must still reach the session without the lib (the guards are off then),
+    # so only here does this hook keep its own copy of the hook I/O it needs.
+    def read_input() -> dict:
+        try:
+            data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def hook_cwd(data: dict) -> str:
+        return str(data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+
+    def emit(obj: dict) -> None:
+        sys.stdout.write(json.dumps(obj))
+        sys.stdout.flush()
+
+    def run_fail_open(name: str, main) -> int:
+        try:
+            code = main()
+        except Exception as exc:
+            sys.stderr.write(f"{name}: {exc}\n")
+            return 0
+        return 0 if code is None else code
 
 MAX_LINES = 40
 MAX_LINE_CHARS = 300
@@ -92,14 +117,6 @@ HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
 LABEL_RE = re.compile(r"^(\s*)(?:[-*+]\s+)?\*\*([^*]+?)\*\*\s*:?\s*(.*)$")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 LIST_PREFIX_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
-
-
-def read_input() -> dict:
-    try:
-        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 def git(
@@ -633,9 +650,7 @@ def extras(
 def main() -> int:
     started = time.monotonic()
     data = read_input()
-    cwd = Path(
-        str(data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
-    )
+    cwd = Path(hook_cwd(data))
     git_root = repo_root(cwd)
     root = git_root or cwd
     warning = []
@@ -649,8 +664,7 @@ def main() -> int:
         if not warning:
             return 0
         out = {"hookEventName": "SessionStart", "additionalContext": clip(warning[0])}
-        sys.stdout.write(json.dumps({"hookSpecificOutput": out}))
-        sys.stdout.flush()
+        emit({"hookSpecificOutput": out})
         return 0
     name = root.name or str(root)
     # Outside a git repo the heading has no git facts; the sections come from the cwd.
@@ -663,14 +677,10 @@ def main() -> int:
     out = {"hookEventName": "SessionStart", "additionalContext": brief}
     if data.get("source") == "startup":
         out["sessionTitle"] = name
-    sys.stdout.write(json.dumps({"hookSpecificOutput": out}))
-    sys.stdout.flush()
+    emit({"hookSpecificOutput": out})
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:  # fail open: no brief rather than a broken session start
-        sys.stderr.write(f"session_brief.py: {exc}\n")
-    sys.exit(0)
+    # fail open: no brief rather than a broken session start
+    sys.exit(run_fail_open("session_brief.py", main))
