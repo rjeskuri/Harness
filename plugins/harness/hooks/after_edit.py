@@ -27,17 +27,24 @@ Standard library only; works with the python3 from Xcode's command line tools (3
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import os
 import re
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
+
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.hookio import edited_path, hook_cwd, read_input, run_fail_open
+    from harness_lib.sessionstate import SessionState, porcelain_status, status_paths
+except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
+    sys.stderr.write(f"after_edit.py: cannot load harness_lib from {_LIB}: {exc}\n")
+    sys.exit(0)
 
 MAX_SCAN_BYTES = 2 * 1024 * 1024
 MAX_REPORTED = 10
@@ -84,14 +91,6 @@ COMPILED = [
 ]
 
 
-def read_input() -> dict:
-    try:
-        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def git_toplevel(start: Path) -> Path | None:
     """Git top-level for `start`, or None outside a repo or when git fails."""
     try:
@@ -113,41 +112,6 @@ def git_toplevel(start: Path) -> Path | None:
 def repo_root(start: Path) -> Path:
     """Git top-level for `start`, or `start` itself outside a repo."""
     return git_toplevel(start) or start
-
-
-def state_dir(root: Path) -> Path:
-    """Per-repo scratch directory shared with verify_on_stop.py (outside the repo)."""
-    key = os.path.normcase(str(root.resolve())).encode("utf-8", "surrogateescape")
-    d = (
-        Path(tempfile.gettempdir())
-        / "claude-harness"
-        / hashlib.sha1(key).hexdigest()[:12]
-    )
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def session_key(data: dict) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]", "_", str(data.get("session_id") or "nosession"))
-
-
-def record_edit(cwd: Path, path: Path, data: dict) -> None:
-    if "\n" in str(path):
-        return
-    record(repo_root(cwd), [path], data)
-
-
-def record(root: Path, paths: list[Path], data: dict) -> None:
-    """Append `paths` to <state>/dirty-<session_id>, skipping any with a newline in it."""
-    lines = "".join(f"{p}\n" for p in paths if "\n" not in str(p))
-    if not lines:
-        return
-    try:
-        flag = state_dir(root) / f"dirty-{session_key(data)}"
-        with flag.open("a", encoding="utf-8", errors="surrogateescape") as fh:
-            fh.write(lines)
-    except OSError:
-        pass
 
 
 def scan(text: str) -> list[tuple[int, str, str]]:
@@ -197,38 +161,6 @@ def report(shown: Path, hits: list[tuple[int, str, str]]) -> None:
 # ---------- after a Bash call ----------
 
 
-def git_status(root: Path) -> bytes | None:
-    """`git status --porcelain=v1 -z --untracked-files=all` output, or None when git fails."""
-    try:
-        out = subprocess.run(
-            ["git", "--no-optional-locks", "-C", str(root), "status"]
-            + ["--porcelain=v1", "-z", "--untracked-files=all"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=STATUS_TIMEOUT,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return out.stdout if out.returncode == 0 else None
-
-
-def status_paths(root: Path, out: bytes) -> list[Path]:
-    """The paths in `git status --porcelain=v1 -z` output: one "XY path" field per entry,
-    and for a rename or copy (R or C in X or Y) a second field, its source, skipped here."""
-    paths = []
-    fields = out.split(b"\0")
-    i = 0
-    while i < len(fields):
-        entry = fields[i]
-        i += 1
-        if len(entry) < 4:
-            continue
-        paths.append(root / os.fsdecode(entry[3:]))
-        if b"R" in entry[:2] or b"C" in entry[:2]:
-            i += 1
-    return paths
-
-
 def recent_files(paths: list[Path], since: float) -> list[Path]:
     """Regular files under 2 MB modified after `since`: newest first, at most 100."""
     found = []
@@ -261,13 +193,15 @@ def after_bash(cwd: Path, data: dict) -> int:
     if root is None:
         return 0
     started = time.time()
-    out = git_status(root)
+    out = porcelain_status(root, STATUS_TIMEOUT)
     if out is None:
         return 0
-    stamp = state_dir(root) / f"bash-scan-{session_key(data)}"
+    state = SessionState.for_repo(root, data)
+    stamp = state.stamp("bash-scan")
     files = recent_files(status_paths(root, out), last_bash_scan(stamp, started))
-    record(root, files, data)  # first, so the Stop hook runs even if the scan objects
+    state.record(files)  # first, so the Stop hook runs even if the scan objects
     try:
+        state.ensure_dir()
         stamp.write_text(f"{started:.6f}\n", encoding="utf-8")
     except OSError:
         pass
@@ -284,24 +218,18 @@ def after_bash(cwd: Path, data: dict) -> int:
 
 def main() -> int:
     data = read_input()
-    cwd = Path(
-        str(data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
-    )
+    cwd = Path(hook_cwd(data))
     if data.get("tool_name") == "Bash":
         return after_bash(cwd, data)
-    tool_input = data.get("tool_input")
-    if not isinstance(tool_input, dict):
-        return 0
-    raw = tool_input.get("file_path") or tool_input.get("notebook_path")
+    raw = edited_path(data)
     if not isinstance(raw, str) or not raw.strip():
         return 0
 
     shown = Path(raw) if os.path.isabs(raw) else cwd / raw
     path = shown.resolve()
 
-    record_edit(
-        cwd, path, data
-    )  # first, so the Stop hook runs even if the scan objects
+    # first, so the Stop hook runs even if the scan objects
+    SessionState.for_repo(repo_root(cwd), data).record([path])
 
     hits = secret_hits(path)
     if not hits:
@@ -312,9 +240,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    try:
-        code = main()
-    except Exception as exc:  # fail open: only a confirmed secret may exit non-zero
-        sys.stderr.write(f"after_edit.py: {exc}\n")
-        code = 0
-    sys.exit(code)
+    # fail open: only a confirmed secret may exit non-zero
+    sys.exit(run_fail_open("after_edit.py", main))

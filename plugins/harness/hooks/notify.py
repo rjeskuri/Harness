@@ -27,26 +27,26 @@ Standard library only; works with the python3 from Xcode's command line tools (3
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.hookio import emit, read_input, run_fail_open
+except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
+    sys.stderr.write(f"notify.py: cannot load harness_lib from {_LIB}: {exc}\n")
+    sys.exit(0)
+
 DEFAULT_TITLE = "Claude Code"
 DEFAULT_MESSAGE = "Claude Code needs your attention"
 DEFAULT_APP = "com.microsoft.VSCode"
 DEFAULT_SOUND = "Glass"
 MAX_TEXT = 300  # characters; notification banners show far less
-
-
-def read_input() -> dict:
-    try:
-        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 def env_setting(name: str, default: str) -> str:
@@ -125,14 +125,10 @@ def main() -> int:
         except (OSError, subprocess.SubprocessError):
             shown = False
     if not shown:
-        sys.stdout.write(json.dumps({"terminalSequence": "\u0007"}))
-        sys.stdout.flush()
+        emit({"terminalSequence": "\u0007"})
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:  # fail open: a broken hook never gets in the way
-        sys.stderr.write(f"notify.py: {exc}\n")
-    sys.exit(0)
+    # fail open: a broken hook never gets in the way
+    sys.exit(run_fail_open("notify.py", main))
