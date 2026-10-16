@@ -67,6 +67,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.hookio import deny, edited_path, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import canonical_path, same_entry
+    from harness_lib.settings import setting, settings_env
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
     sys.stderr.write(f"branch_guard.py: cannot load harness_lib from {_LIB}: {exc}\n")
     sys.exit(0)
@@ -188,31 +189,6 @@ def shown(text: str) -> str:
 
 
 # ---------- settings ----------
-
-
-def settings_env(root: Path) -> dict:
-    """`env` from the project's settings files; settings.local.json wins over settings.json."""
-    merged: dict = {}
-    for name in ("settings.json", "settings.local.json"):
-        try:
-            data = json.loads((root / ".claude" / name).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        env = data.get("env") if isinstance(data, dict) else None
-        if isinstance(env, dict):
-            merged.update(env)
-    return merged
-
-
-def setting(name: str, file_env: dict) -> str | None:
-    value = os.environ.get(name)
-    if value is not None and value.strip():
-        return value.strip()
-    value = file_env.get(name)
-    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
-        text = str(value).strip()
-        return text or None
-    return None
 
 
 def allow_main(root: Path | None) -> bool:

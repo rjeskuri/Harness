@@ -53,7 +53,6 @@ Standard library only; works with the python3 from Xcode's command line tools (3
 
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import json
 import os
@@ -68,6 +67,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.hookio import deny, edited_path, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
+    from harness_lib.settings import glob_match, patterns, setting, settings_env
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
     sys.stderr.write(f"tests_first.py: cannot load harness_lib from {_LIB}: {exc}\n")
     sys.exit(0)
@@ -137,29 +137,6 @@ def read_json(path: Path) -> dict | None:
 # ---------- globs ----------
 
 
-def glob_match(pattern: str, path: str) -> bool:
-    """`path` (repo-relative, / separators) against `pattern`: split on /, `**` consumes
-    zero or more segments, other segments use fnmatch; a pattern without / matches the
-    basename."""
-    if "/" not in pattern:
-        return fnmatch.fnmatchcase(path.rsplit("/", 1)[-1], pattern)
-    return match_segments(pattern.split("/"), path.split("/"))
-
-
-def match_segments(pats: list[str], segs: list[str]) -> bool:
-    if not pats:
-        return not segs
-    if pats[0] == "**":
-        return any(match_segments(pats[1:], segs[k:]) for k in range(len(segs) + 1))
-    return bool(segs) and (
-        fnmatch.fnmatchcase(segs[0], pats[0]) and match_segments(pats[1:], segs[1:])
-    )
-
-
-def patterns(text: str) -> list[str]:
-    return [p.strip() for p in text.split(",") if p.strip()]
-
-
 def classify(rel: str, file_env: dict) -> str:
     """ "test", "exempt" or "source"."""
     tests = patterns(
@@ -171,28 +148,6 @@ def classify(rel: str, file_env: dict) -> str:
     if any(glob_match(p, rel) for p in patterns(exempt)):
         return "exempt"
     return "source"
-
-
-# ---------- settings ----------
-
-
-def classification_env(main_tree: Path) -> dict:
-    """`env` from the main checkout's tracked .claude/settings.json, the only file that
-    may say what a test is: worktree files and settings.local.json are agent-editable."""
-    data = read_json(main_tree / ".claude" / "settings.json")
-    env = data.get("env") if data else None
-    return env if isinstance(env, dict) else {}
-
-
-def setting(name: str, file_env: dict) -> str | None:
-    value = os.environ.get(name)
-    if value is not None and value.strip():
-        return value.strip()
-    value = file_env.get(name)
-    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
-        text = str(value).strip()
-        return text or None
-    return None
 
 
 # ---------- the repo holding the file ----------
@@ -376,7 +331,9 @@ def path_refusal(
     rel = relative_path(path, facts["top"])
     if rel is None:
         return None
-    kind = classify(rel, classification_env(facts["main"]))
+    # What a test is comes from the main checkout's tracked .claude/settings.json only:
+    # worktree files and settings.local.json are agent-editable.
+    kind = classify(rel, settings_env(facts["main"], ("settings.json",)))
     kind = role_kind(rel, kind)
     why = role_refusal(role, kind, rel)
     if why is None and kind == "source" and ticket is not True:
@@ -434,7 +391,8 @@ def bulk_refusal(directory: str | None, role: str, cache: dict) -> str | None:
         return None
     top = str(facts["top"])
     out = git(top, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
-    file_env = classification_env(facts["main"])
+    # The main checkout's tracked settings.json only, not settings.local.json (see path_refusal).
+    file_env = settings_env(facts["main"], ("settings.json",))
     found = None
     for rel in sorted(set(out.stdout.split("\0")) - {""}):
         kind = role_kind(rel, classify(rel, file_env))
