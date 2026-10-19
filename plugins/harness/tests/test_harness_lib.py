@@ -50,6 +50,7 @@ PLUGIN = TESTS.parent
 HOOKS = PLUGIN / "hooks"
 LIB = PLUGIN / "lib"
 PATHS_PY = LIB / "harness_lib" / "paths.py"
+SHELLWALK_PY = LIB / "harness_lib" / "shellwalk.py"  # the shell walker (#85); real in every instrumented lib here
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 GIT_IDENTITY = {
     "GIT_CONFIG_NOSYSTEM": "1",
