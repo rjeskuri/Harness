@@ -24,12 +24,14 @@ with.
   no string constant in the plugin holds the walker's code; after loading, no object in
   a guard's namespace (one level into containers and classes) carries the walker's
   bytecode or a table's value.
-- Fail open: each guard, copied with hooks/ into a temporary plugin tree whose lib/ lacks
-  shellwalk.py or has a broken one, run as hooks.json runs it on a Bash call it denies
-  with the real lib: exit 0, one stderr line naming harness_lib, the lib directory and
-  (when only shellwalk.py is broken) shellwalk, nothing on stdout. A symlink to the
-  checkout's hook next to a broken lib still denies (the lib is found from the hook's
-  real path); a copy there fails open.
+- Fail open: each guard, copied with hooks/ into a temporary plugin tree whose lib/ is
+  the checkout's except that shellwalk.py is absent or broken (or whose lib/ is missing
+  altogether), run as hooks.json runs it on a Bash call it denies with the real lib:
+  exit 0, one stderr line naming harness_lib, the lib directory and (when only
+  shellwalk.py is broken) shellwalk, nothing on stdout. Every other lib module is real,
+  so the line can only be about the walker. A symlink to the checkout's hook next to a
+  broken lib still denies (the lib is found from the hook's real path); a copy there
+  fails open.
 - The guards follow the lib: from a tree whose shellwalk.py is the checkout's with one
   behavioural edit inside a function body (split_command swaps ls and rm; command_words
   skips a wrapper word only it knows) and no other difference, both guards judge the
@@ -66,7 +68,6 @@ PLUGIN = TESTS.parent
 HOOKS = PLUGIN / "hooks"
 LIB = PLUGIN / "lib"
 SHELLWALK_PY = LIB / "harness_lib" / "shellwalk.py"
-PATHS_PY = LIB / "harness_lib" / "paths.py"
 INIT_PY = LIB / "harness_lib" / "__init__.py"
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 GIT_IDENTITY = {
@@ -1360,56 +1361,48 @@ class WalkerLoaderTestCase(unittest.TestCase):
         self.git(repo, "commit", "-q", "-m", "Initial commit")
         return repo
 
-    def write_lib(self, root: Path, files: dict) -> Path:
-        pkg = root / "lib" / "harness_lib"
-        pkg.mkdir(parents=True)
-        for name, text in files.items():
-            (pkg / name).write_text(text, encoding="utf-8")
-        return root / "lib"
-
-    def real_paths(self) -> dict:
-        """The checkout's __init__.py and paths.py: the lib is intact but for shellwalk.py."""
-        self.assertTrue(PATHS_PY.is_file(), f"{PATHS_PY} does not exist")
-        return {
-            "__init__.py": INIT_PY.read_text(encoding="utf-8"),
-            "paths.py": PATHS_PY.read_text(encoding="utf-8"),
-        }
+    def real_lib(self, root: Path) -> Path:
+        """The checkout's whole lib/ copied under `root` (__pycache__ left out), so every
+        other module a guard imports (hookio, paths, settings, whatever the lib grows to
+        hold) is the real one and only shellwalk.py can be the thing that breaks. Returns
+        the copy's shellwalk.py for the caller to replace or remove."""
+        self.assertTrue(SHELLWALK_PY.is_file(), f"{SHELLWALK_PY} does not exist")
+        shutil.copytree(LIB, root / "lib", ignore=shutil.ignore_patterns("__pycache__"))
+        walker = root / "lib" / "harness_lib" / "shellwalk.py"
+        self.assertTrue(walker.is_file(), f"{walker} was not copied")
+        return walker
 
     def plugin(self, lib: str) -> Path:
         """A plugin tree under tmp: the checkout's hooks/ and a lib/ that is 'real'
-        (copied from the checkout), 'missing', or has the real paths.py and a shellwalk.py
-        that is 'no-shellwalk' (absent), 'syntax' (does not parse), 'raises' (raises
+        (copied from the checkout), 'missing', or the checkout's with only shellwalk.py
+        changed: 'no-shellwalk' (absent), 'syntax' (does not parse), 'raises' (raises
         RuntimeError) or 'incomplete' (lacks split_command)."""
         root = self.tmp / f"plugin-{lib}"
         shutil.copytree(HOOKS, root / "hooks", ignore=shutil.ignore_patterns("__pycache__"))
+        if lib == "missing":
+            return root
+        walker = self.real_lib(root)
         if lib == "real":
-            self.assertTrue(SHELLWALK_PY.is_file(), f"{SHELLWALK_PY} does not exist")
-            shutil.copytree(LIB, root / "lib", ignore=shutil.ignore_patterns("__pycache__"))
-        elif lib == "missing":
             pass
+        elif lib == "no-shellwalk":
+            walker.unlink()
+        elif lib == "syntax":
+            walker.write_text("def split_command(:\n    return\n", encoding="utf-8")
+        elif lib == "raises":
+            walker.write_text(f"raise RuntimeError({self.token!r})\n", encoding="utf-8")
+        elif lib == "incomplete":
+            walker.write_text("def closing(text, i):\n    return len(text)\n", encoding="utf-8")
         else:
-            files = self.real_paths()
-            if lib == "syntax":
-                files["shellwalk.py"] = "def split_command(:\n    return\n"
-            elif lib == "raises":
-                files["shellwalk.py"] = f"raise RuntimeError({self.token!r})\n"
-            elif lib == "incomplete":
-                files["shellwalk.py"] = "def closing(text, i):\n    return len(text)\n"
-            else:
-                self.assertEqual(lib, "no-shellwalk")
-            self.write_lib(root, files)
+            self.fail(f"unknown lib variant {lib!r}")
         return root
 
     def instrumented(self, kind: str) -> Path:
         """A plugin tree whose lib is the checkout's, with shellwalk.py instrumented
         ('swap' or 'wrap'); the instrumented module has exactly the real one's attributes."""
-        self.assertTrue(SHELLWALK_PY.is_file(), f"{SHELLWALK_PY} does not exist")
         root = self.tmp / f"plugin-{kind}"
         shutil.copytree(HOOKS, root / "hooks", ignore=shutil.ignore_patterns("__pycache__"))
-        files = self.real_paths()
-        files["shellwalk.py"] = instrumented_source(kind, self.token)
-        self.write_lib(root, files)
-        patched = root / "lib" / "harness_lib" / "shellwalk.py"
+        patched = self.real_lib(root)
+        patched.write_text(instrumented_source(kind, self.token), encoding="utf-8")
         self.assertEqual(
             attribute_names(load_with_loader(patched, "_" + kind)),
             attribute_names(load_with_loader(SHELLWALK_PY, "_real_" + kind)),
@@ -1470,7 +1463,7 @@ class WalkerLoaderTestCase(unittest.TestCase):
         if lib == "raises":
             self.assertIn(self.token, line)  # the error itself, not a fixed message
         elif lib != "missing":
-            self.assertIn("shellwalk", line)  # paths.py is fine; the line says what is not
+            self.assertIn("shellwalk", line)  # the rest of the lib is fine; the line says what is not
         self.assertEqual(r.stdout.strip(), "")  # no decision: the call is allowed
         return line
 
@@ -1508,13 +1501,11 @@ class WalkerFailOpenTests(WalkerLoaderTestCase):
         """A symlink to the checkout's guard, next to a broken lib/, still loads the
         checkout's lib and denies: the prologue resolves __file__ with realpath. A copy
         of the guard in the same place finds only the broken lib and fails open."""
-        self.assertTrue(SHELLWALK_PY.is_file(), f"{SHELLWALK_PY} does not exist")
         for hook in GUARDS:
             elsewhere = self.tmp / f"elsewhere-{hook[:-3]}"
             (elsewhere / "hooks").mkdir(parents=True)
-            files = self.real_paths()
-            files["shellwalk.py"] = f"raise RuntimeError({self.token!r})\n"
-            self.write_lib(elsewhere, files)
+            walker = self.real_lib(elsewhere)
+            walker.write_text(f"raise RuntimeError({self.token!r})\n", encoding="utf-8")
             link = elsewhere / "hooks" / hook
             os.symlink(HOOKS / hook, link)
             copied = elsewhere / "hooks" / ("copy_of_" + hook)
