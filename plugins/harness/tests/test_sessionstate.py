@@ -811,6 +811,45 @@ class HooksUseSessionStateTests(unittest.TestCase):
 STD_STREAMS = ("stdin", "stdout", "__stdin__", "__stdout__")
 
 
+def lib_load_handler_ids(tree) -> set[int]:
+    """Node ids inside the except handlers of the module-level `try:` whose body is only
+    `from harness_lib... import ...`. That handler runs when hookio itself failed to load,
+    so it cannot use hookio's helpers (notify.py asks for the bell there, by hand)."""
+    ids: set[int] = set()
+    for stmt in tree.body:
+        if (
+            isinstance(stmt, ast.Try)
+            and stmt.body
+            and all(
+                isinstance(b, ast.ImportFrom)
+                and (b.module == "harness_lib" or (b.module or "").startswith("harness_lib."))
+                for b in stmt.body
+            )
+        ):
+            for handler in stmt.handlers:
+                ids.update(id(n) for n in ast.walk(handler))
+    return ids
+
+
+def stream_uses(tree) -> list[str]:
+    """Direct uses of the standard streams outside the lib-load failure handler."""
+    exempt = lib_load_handler_ids(tree)
+    found = []
+    for node in ast.walk(tree):
+        if id(node) in exempt:
+            continue
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+            and node.attr in STD_STREAMS
+        ):
+            found.append(f"sys.{node.attr} (line {node.lineno}): read_input / emit")
+        elif isinstance(node, ast.ImportFrom) and node.module == "sys":
+            found += [f"from sys import {a.name}" for a in node.names if a.name in STD_STREAMS]
+    return found
+
+
 def main_block(tree):
     for stmt in tree.body:
         if (
@@ -852,23 +891,48 @@ class AfterEditAndNotifyUseHookioTests(unittest.TestCase):
     def test_neither_hook_touches_the_standard_streams_or_spells_the_helpers(self):
         for hook in HOOKIO_USES:
             tree = hook_tree(hook)
-            found = []
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Attribute)
-                    and isinstance(node.value, ast.Name)
-                    and node.value.id == "sys"
-                    and node.attr in STD_STREAMS
-                ):
-                    found.append(f"sys.{node.attr} (line {node.lineno}): read_input / emit")
-                elif isinstance(node, ast.ImportFrom) and node.module == "sys":
-                    found += [f"from sys import {a.name}" for a in node.names if a.name in STD_STREAMS]
+            found = stream_uses(tree)
             for line, text in string_constants(tree):
                 for marker, why in (("PROJECT_DIR", "hook_cwd"), ("notebook", "edited_path")):
                     if marker in text:
                         found.append(f"{text!r} (line {line}): {why}")
             with self.subTest(hook=hook):
                 self.assertEqual(found, [])
+
+    def test_only_the_lib_load_failure_handler_may_touch_the_streams(self):
+        """The exemption above covers the except of the module-level harness_lib import
+        and nothing else: the same stream use anywhere else is still reported."""
+        handler = (
+            "import json, sys\n"
+            "try:\n"
+            "    from harness_lib.hookio import emit\n"
+            "    from harness_lib.notify import notify\n"
+            "except Exception:\n"
+            "    sys.stdout.write(json.dumps({'terminalSequence': '\\u0007'}))\n"
+            "    sys.stdout.flush()\n"
+            "    sys.exit(0)\n"
+        )
+        self.assertEqual(stream_uses(ast.parse(handler)), [])
+        flagged = {
+            "in the try body": handler.replace(
+                "    from harness_lib.notify import notify\n",
+                "    from harness_lib.notify import notify\n    sys.stdout.flush()\n",
+            ),
+            "after the try": handler + "sys.stdout.write('x')\n",
+            "in main": handler + "def main():\n    return sys.stdin.read()\n",
+            "in __main__": handler + "if __name__ == '__main__':\n    sys.stdout.flush()\n",
+            "a try of a non-lib import": (
+                "import sys\ntry:\n    import json\nexcept Exception:\n    sys.stdout.write('x')\n"
+            ),
+            "a nested try of the lib": (
+                "import sys\ndef main():\n    try:\n        from harness_lib.hookio import emit\n"
+                "    except Exception:\n        sys.stdout.write('x')\n"
+            ),
+            "from sys import stdout": handler + "from sys import stdout\n",
+        }
+        for where, source in flagged.items():
+            with self.subTest(where=where):
+                self.assertNotEqual(stream_uses(ast.parse(source)), [])
 
     def test_the_main_block_runs_run_fail_open_and_has_no_tail_of_its_own(self):
         for hook in HOOKIO_USES:
