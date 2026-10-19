@@ -43,11 +43,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
@@ -55,6 +53,7 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.hookio import emit, hook_cwd, read_input, run_fail_open
+    from harness_lib.sessionstate import SessionState, porcelain_status, status_paths
     from harness_lib.settings import setting, settings_env
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
     sys.stderr.write(f"verify_on_stop.py: cannot load harness_lib from {_LIB}: {exc}\n")
@@ -96,20 +95,6 @@ def repo_root(start: Path) -> Path | None:
     return Path(top) if out.returncode == 0 and top else None
 
 
-def state_dir(root: Path) -> Path:
-    """Per-repo scratch directory shared with after_edit.py, which creates it."""
-    key = os.path.normcase(str(root.resolve())).encode("utf-8", "surrogateescape")
-    return (
-        Path(tempfile.gettempdir())
-        / "claude-harness"
-        / hashlib.sha1(key).hexdigest()[:12]
-    )
-
-
-def session_key(data: dict) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]", "_", str(data.get("session_id") or "nosession"))
-
-
 def tail(text: str, n: int = TAIL_LINES) -> str:
     lines = [ln for ln in text.strip().splitlines() if ln.strip()]
     if len(lines) <= n:
@@ -145,59 +130,6 @@ def verify_timeout(file_env: dict) -> float:
 
 
 # ---------- what changed ----------
-
-
-def dirty_files(flag: Path) -> list[Path]:
-    try:
-        lines = flag.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
-    except OSError:
-        return []
-    return sorted({Path(p) for p in lines if p.strip()})
-
-
-def record(flag: Path, files: list[Path]) -> None:
-    """Add `files` to the dirty list, as after_edit.py does for an edit."""
-    try:
-        flag.parent.mkdir(parents=True, exist_ok=True)
-        with flag.open("a", encoding="utf-8", errors="surrogateescape") as fh:
-            fh.write("".join(f"{f}\n" for f in files if "\n" not in str(f)))
-    except OSError:
-        pass
-
-
-def worktree_status(git_root: Path | None) -> bytes | None:
-    """`git status --porcelain=v1 -z --untracked-files=all` output: empty outside git,
-    None when git fails."""
-    if git_root is None:
-        return b""
-    try:
-        out = subprocess.run(
-            ["git", "--no-optional-locks", "-C", str(git_root), "status"]
-            + ["--porcelain=v1", "-z", "--untracked-files=all"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=STATUS_TIMEOUT,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return out.stdout if out.returncode == 0 else None
-
-
-def status_paths(root: Path, out: bytes) -> list[Path]:
-    """The paths in `git status --porcelain=v1 -z` output: one "XY path" field per entry,
-    and for a rename or copy (R or C in X or Y) a second field, its source, skipped here."""
-    paths = []
-    fields = out.split(b"\0")
-    i = 0
-    while i < len(fields):
-        entry = fields[i]
-        i += 1
-        if len(entry) < 4:
-            continue
-        paths.append(root / os.fsdecode(entry[3:]))
-        if b"R" in entry[:2] or b"C" in entry[:2]:
-            i += 1
-    return paths
 
 
 def fingerprint(git_root: Path | None, files: list[Path]) -> str:
@@ -283,12 +215,9 @@ def main() -> int:
     if not cmd:
         return 0
 
-    sdir = state_dir(root)
-    session = session_key(data)
-    dirty = sdir / f"dirty-{session}"
-    state_file = sdir / f"verify-{session}.json"
+    session = SessionState.for_repo(root, data)
     try:
-        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state = json.loads(session.verify_file.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         state = {}
     if not isinstance(state, dict):
@@ -298,32 +227,39 @@ def main() -> int:
 
     def save() -> None:
         try:
-            sdir.mkdir(parents=True, exist_ok=True)
-            state_file.write_text(json.dumps(state), encoding="utf-8")
+            session.ensure_dir()
+            session.verify_file.write_text(json.dumps(state), encoding="utf-8")
         except OSError:
             pass
 
     # The working tree as git lists it, kept as `tree` at the end of every stop, so files
     # changed through Bash count even when after_edit.py did not record them. When git
     # fails the last known tree stands.
-    status = worktree_status(git_root)
+    status = porcelain_status(git_root, STATUS_TIMEOUT)
     listed = status_paths(git_root, status) if git_root is not None and status else []
     seen = state.get("tree")
     tree = hashlib.sha256(status).hexdigest() if status is not None else None
     if tree is not None:
         state["tree"] = tree
-    if not dirty.is_file():
+    if not session.dirty.is_file():
         if tree is None or seen is None or tree == seen:
             save()  # a session's first stop only records the tree
             return 0
-        record(dirty, listed)  # changed since the last stop: an edit until a green run
+        # Changed since the last stop: an edit until a green run. The list is created
+        # even when git lists nothing (the tree went clean), so it is there to be read.
+        try:
+            session.ensure_dir()
+            session.dirty.touch()
+        except OSError:
+            pass
+        session.record(listed)
 
     fresh = not data.get("stop_hook_active")  # not a continuation a Stop hook forced
     if fresh:
         state["blocks"] = 0
         save()
 
-    fp = fingerprint(git_root, sorted(set(dirty_files(dirty)) | set(listed)))
+    fp = fingerprint(git_root, sorted(set(session.dirty_files()) | set(listed)))
     if fp == state.get("green"):
         save()
         return 0
@@ -371,10 +307,7 @@ def main() -> int:
         state.pop("attempted", None)
         state.pop("attempted_cmd", None)
         save()
-        try:
-            dirty.unlink()
-        except OSError:
-            pass
+        session.clear_dirty()
         emit({"systemMessage": f"verify_on_stop: {cmd} passed."})
         return 0
 

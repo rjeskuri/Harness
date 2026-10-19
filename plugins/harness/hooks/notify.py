@@ -40,6 +40,7 @@ _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
+    from harness_lib.hookio import emit, read_input, run_fail_open
     from harness_lib.notify import notify
 except Exception as exc:  # fail open: one line, and the bell, since this stderr reaches no one
     sys.stderr.write(f"notify.py: cannot load harness_lib from {_LIB}: {exc}\n")
@@ -50,14 +51,6 @@ except Exception as exc:  # fail open: one line, and the bell, since this stderr
 DEFAULT_TITLE = "Claude Code"
 DEFAULT_MESSAGE = "Claude Code needs your attention"
 MAX_TEXT = 300  # characters; notification banners show far less
-
-
-def read_input() -> dict:
-    try:
-        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 def clean(text: object) -> str:
@@ -75,14 +68,10 @@ def main() -> int:
     group = "claude-code-" + (clean(data.get("session_id")) or "session")
 
     if not notify(message, group, title, subtitle):
-        sys.stdout.write(json.dumps({"terminalSequence": "\u0007"}))
-        sys.stdout.flush()
+        emit({"terminalSequence": "\u0007"})
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:  # fail open: a broken hook never gets in the way
-        sys.stderr.write(f"notify.py: {exc}\n")
-    sys.exit(0)
+    # fail open: a broken hook never gets in the way
+    sys.exit(run_fail_open("notify.py", main))
