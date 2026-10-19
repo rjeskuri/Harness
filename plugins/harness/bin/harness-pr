@@ -30,24 +30,25 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
-import unicodedata
 from pathlib import Path
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
+    from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
+    from harness_lib.cli import Parser, Problem, emit, run_main, table, warn
+    from harness_lib.text import (as_list, first_line, harness_home, home, last_line, one_line, parse_iso, read_json,
+                                  read_text, write_text)
     from harness_lib.notify import notify
-except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
+except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 HERE = Path(__file__).resolve().parent
@@ -103,64 +104,8 @@ CONVERSATION = """query($owner: String!, $repo: String!, $number: Int!) {
 }"""
 
 
-class Problem(Exception):
-    """A bad invocation, a failed precondition or a failed call: printed as one line, exit 1."""
-
-
-class Parser(argparse.ArgumentParser):
-    """argparse that reports a bad invocation in one line and exits 1."""
-
-    def error(self, message):
-        sys.exit(f"{self.prog}: error: {message}")
-
-
-def one_line(text):
-    return " ".join(str(text).split())
-
-
-def first_line(text):
-    for line in (text or "").splitlines():
-        if line.strip():
-            return line.strip()
-    return ""
-
-
-def last_line(text):
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    return lines[-1] if lines else ""
-
-
-def warn(message):
-    sys.stderr.write(f"harness-pr: warning: {one_line(message)}\n")
-
-
-def home(*parts):
-    return os.path.join(os.path.expanduser("~"), *parts)
-
-
 def plural(n, word):
     return f"{n} {word}" + ("" if n == 1 else "s")
-
-
-def parse_iso(text):
-    """A timezone-aware datetime from ISO-8601 (a trailing Z and a naive time both mean UTC), or None."""
-    if not isinstance(text, str) or not text.strip():
-        return None
-    text = text.strip()
-    if text.endswith(("Z", "z")):
-        text = text[:-1] + "+00:00"
-    try:
-        when = dt.datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)
-
-
-def as_list(value):
-    """gh lists come as a JSON list or as {"nodes": [...]}; anything else is empty."""
-    if isinstance(value, dict):
-        value = value.get("nodes")
-    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
 
 
 def tail(text, n):
@@ -179,34 +124,9 @@ def fence_safe(text):
     return text.replace("```", "'''")
 
 
-def read_text(path, what):
-    try:
-        with open(os.path.expanduser(path), encoding="utf-8", errors="replace") as fh:
-            return fh.read()
-    except OSError as err:
-        raise Problem(f"cannot read {what} {path}: {err.strerror or err}") from None
-
-
-def write_file(path, text):
-    """Write through a temporary file in the same folder, renamed over the old one."""
-    folder = os.path.dirname(path)
-    os.makedirs(folder, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".harness-pr-", dir=folder)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def short_home(path):
     """~/... for a path under HOME, for messages."""
-    root = os.path.expanduser("~")
+    root = home()
     return "~" + path[len(root):] if path.startswith(root + os.sep) else path
 
 
@@ -310,78 +230,6 @@ def fast_forward_blockers(path, target):
     return identical, blocking
 
 
-# ---------- the state key (the same helpers in every harness tool and hook) ----------
-
-
-def canonical_path(path):
-    """The real path of `path` with each component spelled as its parent directory lists
-    it, so every spelling of one directory on a case-insensitive file system gives one
-    string. From the first component that cannot be found on, the rest stays as spelled."""
-    real = os.path.realpath(path)
-    done, parts = os.sep, [part for part in real.split(os.sep) if part]
-    for i, part in enumerate(parts):
-        try:
-            names = os.listdir(done)
-        except OSError:
-            return os.path.join(done, *parts[i:])
-        if part not in names:
-            fold = unicodedata.normalize("NFC", part).casefold()
-            given = os.path.join(done, part)
-            for name in names:
-                if unicodedata.normalize("NFC", name).casefold() == fold and same_entry(
-                    given, os.path.join(done, name)
-                ):
-                    part = name
-                    break
-            else:
-                return os.path.join(done, *parts[i:])
-        done = os.path.join(done, part)
-    return done
-
-
-def same_entry(a, b):
-    try:
-        return os.path.samefile(a, b)
-    except OSError:
-        return False
-
-
-def path_key(path):
-    """The first 12 hex digits of the sha1 of the path string as it is spelled."""
-    return hashlib.sha1(str(path).encode("utf-8", "surrogateescape")).hexdigest()[:12]
-
-
-def repo_key(path):
-    """The state key of a main working tree: path_key of its canonical path."""
-    return path_key(canonical_path(path))
-
-
-def adopt_old_state(repos, main, *spelled):
-    """The state key of the canonical main tree `main`. When repos/<key> does not exist
-    yet, the directory an earlier version keyed by the spelling in use is renamed to it:
-    the spelling of `main` that one of `spelled` (the main tree as git reported it, the
-    path the tool started from) uses. Only this repository's; when both exist, both stay."""
-    key = path_key(main)
-    target = os.path.join(repos, key)
-    if os.path.lexists(target):
-        return key
-    depth = len(main.split(os.sep))
-    for path in spelled:
-        if not path:
-            continue
-        old = os.sep.join(os.path.realpath(path).split(os.sep)[:depth])
-        if old == main or canonical_path(old) != main:
-            continue
-        source = os.path.join(repos, path_key(old))
-        if os.path.isdir(source):
-            try:
-                os.rename(source, target)
-            except OSError:
-                pass
-            break
-    return key
-
-
 class Repo:
     """The repository: its toplevel (`root`, maybe a linked worktree), its main working tree, the state key
     shared by both, and (on demand) OWNER/REPO."""
@@ -400,7 +248,7 @@ class Repo:
         common_dir = os.path.normpath(os.path.join(self.root, common.stdout.strip()))
         reported = os.path.realpath(os.path.dirname(common_dir))
         self.main = canonical_path(reported)
-        self.key = adopt_old_state(home(".claude", "harness", "repos"), self.main, reported, path)
+        self.key = adopt_old_state(harness_home("repos"), self.main, reported, path)
         self.name = os.path.basename(self.main)
         self._slug = None
 
@@ -415,7 +263,7 @@ class Repo:
         return self._slug
 
     def state(self, *parts):
-        return home(".claude", "harness", "repos", self.key, *parts)
+        return harness_home("repos", self.key, *parts)
 
 
 def open_repo(path=None):
@@ -731,7 +579,7 @@ def cmd_open(args):
         try:
             board(repo, "comment", str(number), "--body", f"Pull request: {url}")
         except Problem as err:
-            warn(f"PR #{pr} is open, but the ticket comment failed: {err}")
+            warn("harness-pr", f"PR #{pr} is open, but the ticket comment failed: {err}")
     if args.json:
         print(json.dumps({"number": pr, "url": url}))
     else:
@@ -804,8 +652,8 @@ def cmd_review(args):
     slug = repo.slug()
     diff = gh_run(["pr", "diff", str(number)], repo.root)
     if diff.returncode != 0:
-        warn(f"gh pr diff {number} failed ({first_line(diff.stderr) or f'exit {diff.returncode}'}); "
-             "every finding goes in the review body")
+        warn("harness-pr", f"gh pr diff {number} failed ({first_line(diff.stderr) or f'exit {diff.returncode}'}); "
+                           "every finding goes in the review body")
         lines = set()
     else:
         lines = diff_lines(diff.stdout)
@@ -818,7 +666,8 @@ def cmd_review(args):
     payload = {"event": "COMMENT", "body": review_body(args.model, findings, outside), "comments": comments}
     done = gh_run(call, repo.root, stdin=json.dumps(payload))
     if done.returncode != 0 and comments:
-        warn(f"GitHub refused the inline comments ({first_line(done.stderr) or f'exit {done.returncode}'}); "
+        warn("harness-pr",
+             f"GitHub refused the inline comments ({first_line(done.stderr) or f'exit {done.returncode}'}); "
              "posting every finding in the review body")
         inline, outside = [], findings
         payload = {"event": "COMMENT", "body": review_body(args.model, findings, outside), "comments": []}
@@ -902,11 +751,11 @@ def cmd_checks(args):
     pending = [e for e in entries if e["bucket"] == "pending"]
     logs = failed_logs(repo, failed) if failed else []
     if args.json:
-        print(json.dumps({"number": number, "state": state, "checks": entries,
-                          "failed": [e["name"] for e in failed], "pending": [e["name"] for e in pending],
-                          "logs": logs}, indent=2, ensure_ascii=False))
+        emit(True, {"number": number, "state": state, "checks": entries,
+                    "failed": [e["name"] for e in failed], "pending": [e["name"] for e in pending],
+                    "logs": logs}, "")
     if state == "none":
-        warn(f"no checks registered on PR #{number}")
+        warn("harness-pr", f"no checks registered on PR #{number}")
         return 0
     if state == "success":
         if not args.json:
@@ -1035,7 +884,7 @@ def cmd_ready(args):
     notify(f"{repo.name} PR #{number} ready for review: {title}", f"harness-{repo.key}-pr-{number}")
     print(f"PR #{number} ready for review: {url}")
     if not tickets:
-        warn(f"PR #{number} names no ticket (no Closes #N, no --ticket); no status changed")
+        warn("harness-pr", f"PR #{number} names no ticket (no Closes #N, no --ticket); no status changed")
     if error:
         raise Problem(f"PR #{number} is ready, but {error}")
     return 0
@@ -1098,7 +947,7 @@ def cmd_comments(args):
             raise Problem(f"--since: not an ISO-8601 time: {args.since!r}")
     found = conversation(conversation_of(repo, number), since, args.unresolved)
     if args.json:
-        print(json.dumps(dict({"number": number}, **found), indent=2, ensure_ascii=False))
+        emit(True, dict({"number": number}, **found), "")
         return 0
     if not any(found.values()):
         print(f"No {'unresolved threads' if args.unresolved else 'comments'} on PR #{number}.")
@@ -1162,7 +1011,7 @@ def awaiting_in(repo, project=None):
 
 
 def registry_projects():
-    path = home(".claude", "harness", "projects.json")
+    path = harness_home("projects.json")
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -1178,12 +1027,6 @@ def registry_projects():
     return out
 
 
-def table(rows):
-    """Left-aligned columns, two spaces apart."""
-    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
-    return "\n".join("  ".join([c.ljust(w) for c, w in zip(r, widths)] + [r[-1]]).rstrip() for r in rows)
-
-
 def cmd_awaiting(args):
     rows, errors = [], []
     if args.all_projects:
@@ -1197,7 +1040,7 @@ def cmd_awaiting(args):
     else:
         rows = awaiting_in(open_repo())
     if args.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        emit(True, rows, "")
     elif not rows:
         print("No pull requests awaiting you.")
     else:
@@ -1208,7 +1051,7 @@ def cmd_awaiting(args):
                  str(r["unresolved"]), r["url"]] for r in rows]
         print(table([head] + body))
     for line in errors:
-        warn(line)
+        warn("harness-pr", line)
     return 0
 
 
@@ -1251,16 +1094,12 @@ def severity_line(findings):
 
 
 def mark_cloud_exhausted(reason):
-    path = home(".claude", "harness", "budgets.json")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        data = {}
+    path = harness_home("budgets.json")
+    data = read_json(path)
     data = data if isinstance(data, dict) else {}
     until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=EXHAUSTED_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     data["cloud"] = {"exhausted_until": until, "reason": reason}
-    write_file(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", prefix=".harness-pr-")
     return until
 
 
@@ -1281,7 +1120,7 @@ def cmd_ultra(args):
         raise Problem(f"claude ultrareview {number} did not finish in {ULTRA_MINUTES + 10} minutes") from None
     path = repo.state("ultra", f"{number}.json")
     if done.stdout.strip():
-        write_file(path, done.stdout)
+        write_text(path, done.stdout, prefix=".harness-pr-")
     if done.returncode != 0:
         output = (done.stdout or "") + "\n" + (done.stderr or "")
         hit = next((line for line in output.splitlines() if BILLING.search(line)), None)
@@ -1326,11 +1165,7 @@ def worktree_for(main, branch):
 
 def ticket_parent(repo, number):
     """The ticket's epic: `parent` in the ticket cache, else GitHub's sub-issue parent (404: none)."""
-    try:
-        with open(repo.state("tickets", f"{number}.json"), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        data = None
+    data = read_json(repo.state("tickets", f"{number}.json"))
     parent = data.get("parent") if isinstance(data, dict) else None
     n = parent.get("number") if isinstance(parent, dict) else None
     if isinstance(n, int) and n > 0:
@@ -1539,7 +1374,7 @@ def merge_preconditions(repo, number, view):
     if mergeable == "CONFLICTING":
         raise Problem(f"PR #{number} conflicts with main; update the branch, then land again")
     if mergeable == "UNKNOWN":
-        warn(f"GitHub has not worked out whether PR #{number} merges cleanly; trying the merge")
+        warn("harness-pr", f"GitHub has not worked out whether PR #{number} merges cleanly; trying the merge")
     entries = check_entries(view.get("statusCheckRollup"))
     checks = overall(entries)
     if checks == "failure":
@@ -1549,7 +1384,7 @@ def merge_preconditions(repo, number, view):
         raise Problem(f"checks are still running on PR #{number}: " + ", ".join(
             e["name"] for e in entries if e["bucket"] == "pending") + f"; harness-pr checks {number} --wait")
     if checks == "none":
-        warn(f"no checks registered on PR #{number}")
+        warn("harness-pr", f"no checks registered on PR #{number}")
     return view
 
 
@@ -1561,13 +1396,14 @@ def land_gate(repo, number, accept):
     except Problem as err:
         if not accept:
             raise Problem(f"cannot check the harness review findings of PR #{number}: {err}") from None
-        warn(f"cannot check the harness review findings of PR #{number} ({err}); landing it (--accept-findings)")
+        warn("harness-pr",
+             f"cannot check the harness review findings of PR #{number} ({err}); landing it (--accept-findings)")
         return
     if findings and not accept:
         raise Problem(unaddressed(number, review, findings)
                       + f"; fix them and push, or harness-pr land {number} --accept-findings to land it anyway")
     if findings:
-        warn(unaddressed(number, review, findings) + "; landing it (--accept-findings)")
+        warn("harness-pr", unaddressed(number, review, findings) + "; landing it (--accept-findings)")
 
 
 def cmd_land(args):
@@ -1591,7 +1427,7 @@ def cmd_land(args):
         land_gate(repo, number, args.accept_findings)
     tickets = closing_numbers(view)
     if not tickets:
-        warn(f"PR #{number} closes no issue (no Closes #N in its body); no ticket to close")
+        warn("harness-pr", f"PR #{number} closes no issue (no Closes #N in its body); no ticket to close")
     branch = view.get("headRefName") or ""
     title = view.get("title") or ""
 
@@ -1602,7 +1438,7 @@ def cmd_land(args):
         merged = pr_view(repo, number, "mergeCommit", main).get("mergeCommit")
         sha = str(merged.get("oid") or "") if isinstance(merged, dict) else ""
     except Problem as err:
-        warn(f"could not read the merge commit: {err}")
+        warn("harness-pr", f"could not read the merge commit: {err}")
     merged_as = f" as {sha[:12]}." if sha else "."
     summary = [(f'PR #{number} "{title}" was already merged into main' if resume
                 else f'Merged PR #{number} "{title}" into main') + merged_as]
@@ -1659,7 +1495,7 @@ def cmd_land(args):
             try:
                 identical, blocking = fast_forward_blockers(main, target)
             except Problem as err:
-                warn(f"could not compare the main checkout with the landed content: {err}")
+                warn("harness-pr", f"could not compare the main checkout with the landed content: {err}")
         if blocking:
             problems.append(f"the main checkout {main} has uncommitted changes that differ from the landed content "
                             f"and that the fast-forward would overwrite: {listing(blocking)}; main not pulled")
@@ -1695,8 +1531,8 @@ def cmd_land(args):
             try:
                 listed = changed_files(repo, number, main)
             except Problem as err:
-                warn(f"could not list PR #{number}'s files ({err}); the Resolution lists the {len(files)} "
-                     "that gh pr view returned")
+                warn("harness-pr", f"could not list PR #{number}'s files ({err}); the Resolution lists the "
+                                   f"{len(files)} that gh pr view returned")
             else:
                 files = listed if len(listed) >= len(files) else files
             made["text"] = resolution_body(data, files, sha, view.get("url"))
@@ -1802,12 +1638,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except BrokenPipeError:                      # the reader went away (| head): stop quietly
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        sys.exit(1)
-    except Exception as err:                     # never a traceback: one line, exit 1
-        sys.exit(f"harness-pr: {type(err).__name__}: {one_line(err)}")
+    run_main("harness-pr", main)

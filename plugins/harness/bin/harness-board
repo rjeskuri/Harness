@@ -44,16 +44,23 @@ gh is HARNESS_GH when set, else `gh` on PATH.
 from __future__ import annotations
 
 import argparse
-import datetime as dt
-import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
-import unicodedata
+
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
+    from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table, warn
+    from harness_lib.text import (as_list, first_line, harness_home, home, now_iso, one_line, parse_iso, read_json,
+                                  read_text, write_json)
+except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
+    sys.exit(f"harness-board: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 if _LIB not in sys.path:
@@ -120,75 +127,6 @@ HEADING = re.compile(r"^##\s+(.*?)\s*#*\s*$")
 FENCE = re.compile(r"^\s{0,3}(```|~~~)")
 
 
-class Problem(Exception):
-    """A bad invocation, a failed precondition or a failed gh call: printed as one line, exit 1."""
-
-
-class Parser(argparse.ArgumentParser):
-    """argparse that reports a bad invocation in one line and exits 1."""
-
-    def error(self, message):
-        sys.exit(f"{self.prog}: error: {message}")
-
-
-def one_line(text):
-    return " ".join(str(text).split())
-
-
-def first_line(text):
-    for line in (text or "").splitlines():
-        if line.strip():
-            return line.strip()
-    return ""
-
-
-def home(*parts):
-    return os.path.join(os.path.expanduser("~"), *parts)
-
-
-def now_iso():
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def parse_iso(text):
-    """A timezone-aware datetime from ISO-8601 (a trailing Z and a naive time both mean UTC), or None."""
-    if not isinstance(text, str) or not text.strip():
-        return None
-    text = text.strip()
-    if text.endswith(("Z", "z")):
-        text = text[:-1] + "+00:00"
-    try:
-        when = dt.datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)
-
-
-def as_list(value):
-    """gh lists come as a JSON list or as {"nodes": [...]}; anything else is empty."""
-    if isinstance(value, dict):
-        value = value.get("nodes")
-    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
-
-
-def write_json(path, data):
-    """Write JSON through a temporary file in the same folder, renamed over the old one."""
-    folder = os.path.dirname(path)
-    os.makedirs(folder, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".ticket-", suffix=".json", dir=folder)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
-            fh.write("\n")
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 # --------------------------------------------------------------- the repository
 def git(path, *args):
     try:
@@ -198,78 +136,6 @@ def git(path, *args):
         raise Problem("git not found on PATH") from None
     except subprocess.TimeoutExpired:
         raise Problem(f"git {args[0]} timed out in {path}") from None
-
-
-# ---------- the state key (the same helpers in every harness tool and hook) ----------
-
-
-def canonical_path(path):
-    """The real path of `path` with each component spelled as its parent directory lists
-    it, so every spelling of one directory on a case-insensitive file system gives one
-    string. From the first component that cannot be found on, the rest stays as spelled."""
-    real = os.path.realpath(path)
-    done, parts = os.sep, [part for part in real.split(os.sep) if part]
-    for i, part in enumerate(parts):
-        try:
-            names = os.listdir(done)
-        except OSError:
-            return os.path.join(done, *parts[i:])
-        if part not in names:
-            fold = unicodedata.normalize("NFC", part).casefold()
-            given = os.path.join(done, part)
-            for name in names:
-                if unicodedata.normalize("NFC", name).casefold() == fold and same_entry(
-                    given, os.path.join(done, name)
-                ):
-                    part = name
-                    break
-            else:
-                return os.path.join(done, *parts[i:])
-        done = os.path.join(done, part)
-    return done
-
-
-def same_entry(a, b):
-    try:
-        return os.path.samefile(a, b)
-    except OSError:
-        return False
-
-
-def path_key(path):
-    """The first 12 hex digits of the sha1 of the path string as it is spelled."""
-    return hashlib.sha1(str(path).encode("utf-8", "surrogateescape")).hexdigest()[:12]
-
-
-def repo_key(path):
-    """The state key of a main working tree: path_key of its canonical path."""
-    return path_key(canonical_path(path))
-
-
-def adopt_old_state(repos, main, *spelled):
-    """The state key of the canonical main tree `main`. When repos/<key> does not exist
-    yet, the directory an earlier version keyed by the spelling in use is renamed to it:
-    the spelling of `main` that one of `spelled` (the main tree as git reported it, the
-    path the tool started from) uses. Only this repository's; when both exist, both stay."""
-    key = path_key(main)
-    target = os.path.join(repos, key)
-    if os.path.lexists(target):
-        return key
-    depth = len(main.split(os.sep))
-    for path in spelled:
-        if not path:
-            continue
-        old = os.sep.join(os.path.realpath(path).split(os.sep)[:depth])
-        if old == main or canonical_path(old) != main:
-            continue
-        source = os.path.join(repos, path_key(old))
-        if os.path.isdir(source):
-            try:
-                os.rename(source, target)
-            except OSError:
-                pass
-            break
-    return key
 
 
 class Repo:
@@ -289,7 +155,7 @@ class Repo:
         common_dir = os.path.normpath(os.path.join(self.root, common.stdout.strip()))
         reported = os.path.realpath(os.path.dirname(common_dir))
         self.main = canonical_path(reported)
-        self.key = adopt_old_state(home(".claude", "harness", "repos"), self.main, reported, path)
+        self.key = adopt_old_state(harness_home("repos"), self.main, reported, path)
         self.name = os.path.basename(self.main)
         remotes = git(self.root, "remote")
         if remotes.returncode != 0 or not remotes.stdout.split():
@@ -308,7 +174,7 @@ class Repo:
         return self._slug
 
     def ticket_path(self, number):
-        return home(".claude", "harness", "repos", self.key, "tickets", f"{number}.json")
+        return harness_home("repos", self.key, "tickets", f"{number}.json")
 
 
 def open_repo(path):
@@ -382,14 +248,6 @@ def body_file(path):
     return full, None
 
 
-def read_text(path, what):
-    try:
-        with open(os.path.expanduser(path), encoding="utf-8", errors="replace") as fh:
-            return fh.read()
-    except OSError as err:
-        raise Problem(f"cannot read {what} {path}: {err.strerror or err}") from None
-
-
 def marked(body):
     """The comment body with MARKER as its own last line (once)."""
     text = (body or "").rstrip()
@@ -406,16 +264,11 @@ def by_harness(body):
 
 
 # --------------------------------------------------------------- the Projects board mirror
-def warn(message):
-    print(f"harness-board: warning: {one_line(message)}", file=sys.stderr)
-
-
 def settings_project():
     """env.HARNESS_PROJECT of ~/.claude/settings.json when that parses as a JSON object and it is a string."""
     try:
-        with open(home(".claude", "settings.json"), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError, RecursionError):
+        data = read_json(home(".claude", "settings.json"))
+    except RecursionError:                      # deeply nested JSON: read_json lets it through
         return None
     env = data.get("env") if isinstance(data, dict) else None
     value = env.get(PROJECT_SETTING) if isinstance(env, dict) else None
@@ -435,7 +288,7 @@ def project_setting():
     if not value:
         return None
     if not PROJECT_VALUE.fullmatch(value):
-        warn(f"{PROJECT_SETTING}={value!r} is not OWNER/NUMBER; the Projects board is not updated")
+        warn("harness-board", f"{PROJECT_SETTING}={value!r} is not OWNER/NUMBER; the Projects board is not updated")
         return None
     owner, number = value.split("/")
     return owner, number
@@ -452,7 +305,7 @@ def mirror(repo, project, url, fields, add=False):
         try:
             gh(repo, call)
         except Problem as err:
-            warn(f"the Projects board {owner}/{number} was not updated: {err}")
+            warn("harness-board", f"the Projects board {owner}/{number} was not updated: {err}")
             return
 
 
@@ -493,11 +346,7 @@ def classify(names, closed=False):
 
 
 def read_cache(repo, number):
-    try:
-        with open(repo.ticket_path(number), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return None
+    data = read_json(repo.ticket_path(number))
     return data if isinstance(data, dict) else None
 
 
@@ -512,7 +361,7 @@ def refresh_cache(repo, number, labels=None, status=None):
     if status is not None:
         record["status"] = status
     try:
-        write_json(repo.ticket_path(number), record)
+        write_json(repo.ticket_path(number), record, prefix=".ticket-")
     except OSError:
         pass
 
@@ -603,7 +452,7 @@ def save_record(repo, record):
     for key, default in PRESERVED:
         record[key] = old.get(key, default)
     try:
-        write_json(repo.ticket_path(record["number"]), record)
+        write_json(repo.ticket_path(record["number"]), record, prefix=".ticket-")
     except OSError as err:
         raise Problem(f"cannot write {repo.ticket_path(record['number'])}: {err.strerror or err}") from None
 
@@ -747,16 +596,6 @@ def context_markdown(record, resolutions=None):
 
 
 # --------------------------------------------------------------- output
-def emit(args, data, text):
-    print(json.dumps(data, indent=2, ensure_ascii=False) if args.json else text)
-
-
-def table(rows):
-    """Left-aligned columns, two spaces apart."""
-    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
-    return "\n".join("  ".join([c.ljust(w) for c, w in zip(r, widths)] + [r[-1]]).rstrip() for r in rows)
-
-
 def issue_line(item):
     return f"#{item['number']} {item['title']} ({item['type']}, {item['size'] or '-'}, {item['risk'] or '-'})"
 
@@ -765,7 +604,7 @@ def issue_line(item):
 def cmd_labels_ensure(repo, args):
     for name, color, meaning in LABELS:
         gh(repo, ["label", "create", name, "--color", color, "--description", meaning, "--force"])
-    emit(args, {"labels": [name for name, _, _ in LABELS], "count": len(LABELS)},
+    emit(args.json, {"labels": [name for name, _, _ in LABELS], "count": len(LABELS)},
          f"{len(LABELS)} labels created or updated.")
 
 
@@ -776,7 +615,7 @@ def cmd_epic_create(repo, args):
     out = gh(repo, ["issue", "create", "--title", args.title, "--body-file", path] + label_args(labels), stdin)
     number, url = created_issue(out)
     mirror_created(repo, url)
-    emit(args, {"number": number, "url": url}, f"#{number} {url}")
+    emit(args.json, {"number": number, "url": url}, f"#{number} {url}")
 
 
 def blocker_numbers(values):
@@ -827,7 +666,7 @@ def cmd_task_create(repo, args):
     result = {"number": number, "url": url, "parent": args.parent, "linked": None, "blocked_by": []}
 
     def fail(message):
-        emit(args, result, f"#{number} {url}")
+        emit(args.json, result, f"#{number} {url}")
         raise Problem(f"created #{number} ({url}) but {message}")
 
     if args.parent:
@@ -845,7 +684,7 @@ def cmd_task_create(repo, args):
         except Problem as err:
             fail(f"could not mark it blocked by #{b}: {err}")
         result["blocked_by"].append(b)
-    emit(args, result, f"#{number} {url}")
+    emit(args.json, result, f"#{number} {url}")
 
 
 def cmd_show(repo, args):
@@ -854,7 +693,7 @@ def cmd_show(repo, args):
     if args.markdown:
         print(context_markdown(record, task_resolutions(repo, record.get("tasks") or [])))
     else:
-        print(json.dumps(record, indent=2, ensure_ascii=False))
+        emit(True, record, "")
 
 
 def cmd_ready(repo, args):
@@ -874,7 +713,7 @@ def cmd_ready(repo, args):
                      "size": kind["size"], "risk": kind["risk"], "tier": kind["tier"], "flags": kind["flags"]})
     rows.sort(key=lambda r: ("priority:high" not in r["flags"], r["number"] or 0))
     if args.json:
-        emit(args, rows, "")
+        emit(args.json, rows, "")
     elif not rows:
         print("No ready tickets.")
     else:
@@ -900,7 +739,8 @@ def set_status(repo, number, status, comment=None):
         if isinstance(url, str) and url.strip():
             mirror(repo, project, url.strip(), [("Status", STATUS_TITLES[status])])
         else:
-            warn(f"gh issue view {number} gave no url; the Projects board {'/'.join(project)} is not updated")
+            warn("harness-board",
+                 f"gh issue view {number} gave no url; the Projects board {'/'.join(project)} is not updated")
     if comment:
         gh(repo, ["issue", "comment", str(number), "--body", marked(comment)])
     labels = [name for name in names if name not in removed] + ([new] if new not in names else [])
@@ -910,7 +750,7 @@ def set_status(repo, number, status, comment=None):
 
 def cmd_status(repo, args):
     removed = set_status(repo, args.number, args.status, args.comment)
-    emit(args, {"number": args.number, "status": args.status, "removed": removed},
+    emit(args.json, {"number": args.number, "status": args.status, "removed": removed},
          f"#{args.number} status:{args.status}")
 
 
@@ -922,7 +762,7 @@ def cmd_comment(repo, args):
         text = stdin if path == "-" else read_text(path, "body file")
         out = gh(repo, ["issue", "comment", str(args.number), "--body-file", "-"], marked(text))
     url = first_line(out.strip().splitlines()[-1] if out.strip() else "")
-    emit(args, {"number": args.number, "url": url}, url or f"commented on #{args.number}")
+    emit(args.json, {"number": args.number, "url": url}, url or f"commented on #{args.number}")
 
 
 def needs_input_body(number, question, evidence):
@@ -948,7 +788,7 @@ def cmd_needs_input(repo, args):
                     needs_input_body(args.number, args.question, evidence)])
     url = first_line(out.strip().splitlines()[-1] if out.strip() else "")
     notified = notify(f"{repo.name} #{args.number} needs input", f"harness-{repo.key}-{args.number}")
-    emit(args, {"number": args.number, "url": url, "notified": notified}, url or f"#{args.number} needs input")
+    emit(args.json, {"number": args.number, "url": url, "notified": notified}, url or f"#{args.number} needs input")
 
 
 def cmd_answers(repo, args):
@@ -976,13 +816,13 @@ def cmd_answers(repo, args):
         if by_harness(body) or (since is not None and (when is None or when <= since)):
             continue
         out.append({"author": author, "created_at": c.get("createdAt"), "body": body, "url": c.get("url")})
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    emit(True, out, "")
 
 
 def cmd_close(repo, args):
     gh(repo, ["issue", "close", str(args.number)] + (["--comment", marked(args.comment)] if args.comment else []))
     refresh_cache(repo, args.number, status="closed")
-    emit(args, {"number": args.number, "closed": True}, f"closed #{args.number}")
+    emit(args.json, {"number": args.number, "closed": True}, f"closed #{args.number}")
 
 
 def cmd_epic_check(repo, args):
@@ -993,14 +833,14 @@ def cmd_epic_check(repo, args):
     result = {"number": args.number, "total": total, "completed": completed, "closed": False}
     if str(data.get("state", "")).upper() == "CLOSED":
         result["closed"] = True
-        emit(args, result, f"#{args.number} is already closed")
+        emit(args.json, result, f"#{args.number} is already closed")
     elif total > 0 and completed == total:
         gh(repo, ["issue", "close", str(args.number), "--comment", marked(EPIC_DONE)])
         refresh_cache(repo, args.number, status="closed")
         result["closed"] = True
-        emit(args, result, f"closed epic #{args.number}: all {total} tasks landed")
+        emit(args.json, result, f"closed epic #{args.number}: all {total} tasks landed")
     else:
-        emit(args, result, f"#{args.number}: {completed} of {total} tasks closed; left open")
+        emit(args.json, result, f"#{args.number}: {completed} of {total} tasks closed; left open")
 
 
 def cmd_board(repo, args):
@@ -1021,7 +861,7 @@ def cmd_board(repo, args):
         else:
             groups[kind["status"] or "no-status"].append(entry)
     if args.json:
-        emit(args, groups, "")
+        emit(args.json, groups, "")
         return
     lines = [f"# Board: {repo.name}"]
     if groups["epics"]:
@@ -1052,7 +892,7 @@ def cmd_tier(repo, args):
     else:
         data = gh_json(repo, ["issue", "view", str(args.number), "--json", "labels"])
         tier, source = pick(classify(label_names(data.get("labels") if isinstance(data, dict) else None))), "github"
-    emit(args, {"number": args.number, "tier": tier, "source": source}, tier)
+    emit(args.json, {"number": args.number, "tier": tier, "source": source}, tier)
 
 
 # --------------------------------------------------------------- project check, project sync
@@ -1092,7 +932,7 @@ def cmd_project_check(args):
 
 def load_projects():
     """The registered project paths, in registry order (the registry harness-standup and harness-digest read)."""
-    path = home(".claude", "harness", "projects.json")
+    path = harness_home("projects.json")
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -1119,7 +959,7 @@ def label_status(url, names):
     if len(found) == 1 and found[0][len("status:"):] in STATUS_TITLES:
         return STATUS_TITLES[found[0][len("status:"):]]
     what = f"the status labels {', '.join(found)}" if len(found) > 1 else f"{found[0]}, not a harness status,"
-    warn(f"{url} has {what} so its Status on the board is left as it is")
+    warn("harness-board", f"{url} has {what} so its Status on the board is left as it is")
     return None
 
 
@@ -1146,7 +986,7 @@ def cmd_project_sync(args):
             try:
                 repo = Repo(path)
             except Problem as err:
-                warn(f"the registered project {path} is skipped: {err}")
+                warn("harness-board", f"the registered project {path} is skipped: {err}")
                 failed = True
                 continue
             if repo.main not in seen:
@@ -1173,7 +1013,8 @@ def cmd_project_sync(args):
     total = total if isinstance(total, int) and not isinstance(total, bool) else None
     truncated = total > len(items) if total is not None else len(items) >= int(ITEM_LIMIT)
     if truncated:
-        warn(f"the Projects board {owner}/{number} holds {total if total is not None else 'at least ' + ITEM_LIMIT} "
+        warn("harness-board",
+             f"the Projects board {owner}/{number} holds {total if total is not None else 'at least ' + ITEM_LIMIT} "
              f"items and item-list read {len(items)}, so no issue is added; archive Done items, then sync again")
         failed = True
     changes, errors, synced = 0, 0, 0
@@ -1183,11 +1024,12 @@ def cmd_project_sync(args):
         except Problem as err:
             if not args.all_projects:
                 raise
-            warn(f"{repo.main} is skipped: {err}")
+            warn("harness-board", f"{repo.main} is skipped: {err}")
             failed = True
             continue
         if len(issues) >= int(ISSUE_LIMIT):
-            warn(f"{repo.main}: gh issue list stopped at its limit of {ISSUE_LIMIT}; later open issues are not synced")
+            warn("harness-board",
+                 f"{repo.main}: gh issue list stopped at its limit of {ISSUE_LIMIT}; later open issues are not synced")
             failed = True
         synced += len(issues)
         for issue in issues:
@@ -1232,13 +1074,6 @@ def cmd_project_sync(args):
 
 
 # --------------------------------------------------------------- arguments
-def issue_number(text):
-    digits = text.lstrip("#")
-    if not digits.isdigit() or int(digits) <= 0:
-        raise argparse.ArgumentTypeError(f"not an issue number: {text!r}")
-    return int(digits)
-
-
 def parser():
     repo_help = "the project (default: CLAUDE_PROJECT_DIR, else the cwd's repository)"
     common = argparse.ArgumentParser(add_help=False)
@@ -1353,12 +1188,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except BrokenPipeError:                      # the reader went away (| head): stop quietly
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        sys.exit(1)
-    except Exception as err:                     # never a traceback: one line, exit 1
-        sys.exit(f"harness-board: {type(err).__name__}: {one_line(err)}")
+    run_main("harness-board", main)
