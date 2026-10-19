@@ -41,7 +41,6 @@ Standard library only; works with the python3 from Xcode's command line tools (3
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import sys
@@ -64,6 +63,7 @@ try:
         split_command,
         stdin_program,
     )
+    from harness_lib.hookio import deny, read_input, run_fail_open
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
     sys.stderr.write(f"readonly_bash.py: cannot load harness_lib from {_LIB}: {exc}\n")
     sys.exit(0)
@@ -126,12 +126,6 @@ PY_WRITERS = re.compile(
 )
 
 
-def read_input() -> dict:
-    try:
-        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 # ---------- judging one simple command ----------
@@ -344,19 +338,10 @@ def main() -> int:
         "tests, so a hook refuses Bash commands that would change files or git state; "
         "describe the change instead of making it."
     )
-    decision = {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": reason,
-    }
-    sys.stdout.write(json.dumps({"hookSpecificOutput": decision}))
-    sys.stdout.flush()
+    deny(reason)
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:  # fail open: a broken guard must never trap the agent
-        sys.stderr.write(f"readonly_bash.py: {exc}\n")
-    sys.exit(0)
+    # fail open: a broken guard must never trap the agent
+    sys.exit(run_fail_open("readonly_bash.py", main))

@@ -36,10 +36,10 @@ _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
+    from harness_lib.notify import notify
     from harness_lib.paths import canonical_path, path_key, repo_key, same_entry
-except Exception as exc:
-    sys.stderr.write(f"harness-digest: cannot load harness_lib from {_LIB}: {exc}\n")
-    sys.exit(1)
+except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
+    sys.exit(f"harness-digest: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 GH_BUDGET = 6             # seconds for one project's gh and git calls (the gh calls run side by side)
 STALE_DAYS = 7            # a ticket worktree with no commit for this long and no open PR is stale
@@ -49,8 +49,6 @@ WIDTH = 160               # a longer title or question is cut
 NEEDS_INPUT = "**Needs your input**"
 FAILED = ("billing", "auth", "error", "early")   # early: ended ok, the ticket still in progress with no PR
 LABEL = "com.ryaneskuri.harness-digest"
-DEFAULT_APP = "com.microsoft.VSCode"
-DEFAULT_SOUND = "Glass"
 DIGEST_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
 
 
@@ -487,47 +485,6 @@ def markdown(data):
     return "\n".join(out).rstrip("\n") + "\n"
 
 
-def env_setting(name, default):
-    """The variable's value, or the default when it is unset. An empty value means off."""
-    value = os.environ.get(name)
-    return default if value is None else value.strip()
-
-
-def applescript_string(text):
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def succeeded(cmd):
-    return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=10).returncode == 0
-
-
-def notify(message):
-    """A macOS notification: terminal-notifier when on PATH, else osascript. Never fails."""
-    title = "Harness"
-    app = env_setting("HARNESS_NOTIFY_APP", DEFAULT_APP)
-    sound = env_setting("HARNESS_NOTIFY_SOUND", DEFAULT_SOUND)
-    try:
-        exe = shutil.which("terminal-notifier")
-        if exe:
-            cmd = [exe, "-title", title, "-message", message, "-group", "harness-digest"]
-            cmd += ["-activate", app] if app else []
-            cmd += ["-sound", sound] if sound else []
-            if succeeded(cmd):
-                return True
-    except (OSError, subprocess.SubprocessError):
-        pass
-    try:
-        exe = shutil.which("osascript")
-        if exe:
-            script = f"display notification {applescript_string(message)} with title {applescript_string(title)}"
-            if sound:
-                script += f" sound name {applescript_string(sound)}"
-            return succeeded([exe, "-e", script])
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return False
-
-
 # --------------------------------------------------------------- the digest
 def digest(now):
     """Read every project, write the digest file, notify; the structure behind it."""
@@ -559,7 +516,7 @@ def digest(now):
     data["notified"] = False
     if c["prs"] or c["needs_input"] or c["stale"]:
         data["notified"] = notify(f"Harness digest: {c['prs']} PRs to review, {c['needs_input']} need input, "
-                                  f"{c['stale']} stale")
+                                  f"{c['stale']} stale", "harness-digest")
     return data, text
 
 

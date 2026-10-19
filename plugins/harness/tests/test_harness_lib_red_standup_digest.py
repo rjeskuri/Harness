@@ -193,7 +193,8 @@ class ToolCase(unittest.TestCase):
             (pkg / name).write_text(text, encoding="utf-8")
 
     def plugin(self, lib: str) -> Path:
-        """A plugin tree under tmp. lib is 'real' (the checkout's), 'sentinel' (SENTINEL_PATHS),
+        """A plugin tree under tmp. lib is 'real' (the checkout's), 'sentinel' (the real lib's
+        other modules, with SENTINEL_PATHS as paths.py),
         'missing', 'syntax' (paths.py does not parse), 'raises' (__init__.py raises RuntimeError)
         or 'incomplete' (paths.py lacks the names)."""
         root = self.tmp / f"plugin-{lib}"
@@ -207,7 +208,14 @@ class ToolCase(unittest.TestCase):
             self.assertTrue(PATHS_PY.is_file(), f"{PATHS_PY} does not exist")
             shutil.copytree(thl.LIB, root / "lib", ignore=shutil.ignore_patterns("__pycache__"))
         elif lib == "sentinel":
-            self.write_lib(root, {"__init__.py": init, "paths.py": SENTINEL_PATHS})
+            # Every real lib module (settings.py and whatever later tickets add) except paths.py,
+            # which is the sentinel: the tools must still get their keys from the lib's paths.py.
+            real = {
+                p.name: p.read_text(encoding="utf-8")
+                for p in sorted((thl.LIB / "harness_lib").glob("*.py"))
+                if p.name not in ("__init__.py", "paths.py")
+            }
+            self.write_lib(root, {**real, "__init__.py": init, "paths.py": SENTINEL_PATHS})
         elif lib == "syntax":
             self.write_lib(root, {"__init__.py": init, "paths.py": "def canonical_path(:\n    return\n"})
         elif lib == "raises":
