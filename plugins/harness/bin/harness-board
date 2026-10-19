@@ -59,15 +59,8 @@ try:
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table, warn
     from harness_lib.text import (as_list, first_line, harness_home, home, now_iso, one_line, parse_iso, read_json,
                                   read_text, write_json)
-except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
-    sys.exit(f"harness-board: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
-
-_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
-if _LIB not in sys.path:
-    sys.path.insert(0, _LIB)
-try:
     from harness_lib.notify import notify
-except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
+except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-board: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 # name, color, meaning (the meaning is the label's description on GitHub)
