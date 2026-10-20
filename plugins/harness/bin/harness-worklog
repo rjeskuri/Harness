@@ -77,28 +77,49 @@ LOCALTIME = "/etc/localtime"
 GITHUB = "GitHub"     # the committer of merges made on github.com: UTC, not evidence of the Mac's zone
 
 
-def in_linked_worktree(path):
-    """Whether `path` is inside a linked git worktree: git's own test, a `commondir` file in its git dir."""
+def git_facts(path, *flags):
+    """The lines `git rev-parse <flags> --absolute-git-dir` prints for `path`, the git dir last;
+    None when git fails or is missing."""
     try:
-        out = subprocess.run(["git", "-C", path, "rev-parse", "--absolute-git-dir"], stdin=subprocess.DEVNULL,
-                             capture_output=True, text=True, timeout=10)
+        out = subprocess.run(["git", "-C", path, "rev-parse", *flags, "--absolute-git-dir"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
+        return None
+    lines = out.stdout.splitlines()
+    if out.returncode != 0 or len(lines) != len(flags) + 1 or not all(lines):
+        return None
+    return lines
+
+
+def linked_to_dot_git(git_dir):
+    """Whether `git_dir` belongs to a linked worktree (it has a `commondir` file, git's own test) whose
+    common dir is named `.git`: a linked worktree of an ordinary repository. A submodule, a linked
+    worktree of a bare repository or of a submodule, and a separate git dir are not."""
+    try:
+        with open(os.path.join(git_dir, "commondir"), encoding="utf-8") as fh:
+            common = fh.read().strip()
+    except OSError:
         return False
-    git_dir = out.stdout.strip()
-    return out.returncode == 0 and bool(git_dir) and os.path.isfile(os.path.join(git_dir, "commondir"))
+    if not common:
+        return False
+    common = os.path.normpath(os.path.join(git_dir, common))
+    return common != os.path.normpath(git_dir) and os.path.basename(common) == ".git"
 
 
 def find_repo(given=None):
     """The repo: `given` (--repo), else $CLAUDE_PROJECT_DIR, kept as spelled (the session folders are
-    named after that spelling) unless it is inside a linked worktree, which stands for its main checkout
-    (the log and the session folders are the repo's, not a ticket branch's); else the current directory's
-    repository's main checkout (main_checkout), else the current directory."""
+    named after that spelling), else the git top level of the current directory, else the current
+    directory. Any of them inside a linked worktree of an ordinary repository (linked_to_dot_git) stands
+    for its main checkout (main_checkout): the log and the session folders are the repo's, not a ticket
+    branch's."""
     path = given or os.environ.get("CLAUDE_PROJECT_DIR")
     if path:
         path = os.path.abspath(os.path.expanduser(path))
-        return (in_linked_worktree(path) and main_checkout(path)) or path
-    here = os.getcwd()
-    return main_checkout(here) or here
+        facts = git_facts(path)
+    else:
+        facts = git_facts(os.getcwd(), "--show-toplevel")
+        path = facts[0] if facts else os.getcwd()
+    return (facts and linked_to_dot_git(facts[-1]) and main_checkout(path)) or path
 
 
 def use_repo(repo):

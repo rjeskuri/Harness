@@ -899,6 +899,115 @@ class WorklogRepoTests(RepoCase):
                 self.assertEqual(mod.transcripts_dirs(found)[0], os.path.join(projects, encoded(expected)))
 
 
+@unittest.skipUnless(GIT, "git is not installed")
+class WorklogOtherLayoutsTests(RepoCase):
+    """PR #126 re-review findings 1 and 2: submodules, bare repositories and separate git dirs.
+
+    The rule before the refactor (main's harness-worklog: find_repo + main_checkout): with no
+    --repo and no $CLAUDE_PROJECT_DIR the repo is git's --show-toplevel of the current directory;
+    that path, or the path given, is replaced by the parent of git's common dir only when git's
+    git dir differs from its common dir (a linked worktree) AND the common dir is named `.git`.
+    So a submodule (common dir <super>/.git/modules/<name>), a linked worktree of a bare
+    repository (common dir /x/proj.git), a linked worktree of a submodule, and a checkout whose
+    git dir lives elsewhere (`git init --separate-git-dir`) all keep their toplevel / the path
+    given; an ordinary linked worktree climbs to its main checkout. The expectations below were
+    derived from that rule and checked against main's harness-worklog run on the same layouts."""
+
+    worklog_add = WorklogRepoTests.worklog_add
+
+    def layouts(self) -> dict:
+        """Real repositories of each layout, by name: the path of each checkout."""
+        t = self.tmp
+        sub_src = self.make_repo("subsrc")
+        sup = self.make_repo("super")
+        self.git(sup, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_src, "mods/sub")
+        self.git(sup, "commit", "-q", "-m", "Add the submodule")
+        sub = os.path.join(sup, "mods", "sub")
+        self.assertTrue(os.path.isfile(os.path.join(sub, ".git")), "the submodule has no gitfile")
+        bare_src = self.make_repo("baresrc")
+        bare = os.path.join(t, "barehold", "proj.git")
+        os.makedirs(os.path.dirname(bare))
+        self.git(t, "clone", "-q", "--bare", bare_src, bare)
+        bare_wt = os.path.join(t, "bare-wt")
+        self.git(bare, "worktree", "add", "-q", "-b", "t/7-bare", bare_wt)
+        sub_wt = os.path.join(t, "sub-wt")
+        self.git(sub, "worktree", "add", "-q", "-b", "t/8-sub", sub_wt)
+        store = os.path.join(t, "store")
+        os.makedirs(store)
+        sep = os.path.join(t, "sep")
+        self.git(t, "init", "-q", "-b", "main", "--separate-git-dir", os.path.join(store, "sep.git"), sep)
+        os.makedirs(os.path.join(sep, "src", "deep"))
+        with open(os.path.join(sep, "src", "deep", "x.py"), "w") as fh:
+            fh.write("x = 1\n")
+        self.git(sep, "add", "-A")
+        self.git(sep, "commit", "-q", "-m", "Initial commit")
+        norm = self.make_repo("norm")
+        norm_wt = self.add_worktree(norm, os.path.join(t, "norm-wt"), "t/9-norm")
+        # sanity: the layouts are what their names say (git's own view, not the code under test)
+        common = lambda p: self.git(p, "rev-parse", "--path-format=absolute", "--git-common-dir")  # noqa: E731
+        self.assertEqual(common(sub), os.path.join(sup, ".git", "modules", "mods", "sub"))
+        self.assertEqual(common(bare_wt), bare)
+        self.assertEqual(common(sub_wt), os.path.join(sup, ".git", "modules", "mods", "sub"))
+        self.assertEqual(common(sep), os.path.join(store, "sep.git"))
+        self.assertEqual(common(norm_wt), os.path.join(norm, ".git"))
+        return {"submodule": sub, "bare-worktree": bare_wt, "submodule-worktree": sub_wt,
+                "separate-git-dir": sep, "norm": norm, "norm-worktree": norm_wt}
+
+    def logs_anywhere(self, description: str) -> list:
+        """Every worklog/worklog.csv under the temp dir, .git dirs included, whose rows carry `description`."""
+        found = []
+        for dirpath, _dirnames, filenames in os.walk(self.tmp):
+            if os.path.basename(dirpath) == "worklog" and "worklog.csv" in filenames:
+                path = os.path.join(dirpath, "worklog.csv")
+                with open(path, encoding="utf-8") as fh:
+                    if description in fh.read():
+                        found.append(os.path.realpath(path))
+        return found
+
+    def log_of(self, owner: str) -> str:
+        return os.path.realpath(os.path.join(owner, "worklog", "worklog.csv"))
+
+    def test_without_a_path_the_log_is_in_the_toplevel_unless_in_a_linked_worktree_of_a_dot_git(self):
+        """Finding 1: no --repo, no $CLAUDE_PROJECT_DIR, run from the checkout and from a subdirectory."""
+        lay = self.layouts()
+        cases = []
+        for name in ("submodule", "bare-worktree", "submodule-worktree", "separate-git-dir"):
+            top = lay[name]
+            for start in (top, os.path.join(top, "src"), os.path.join(top, "src", "deep")):
+                cases.append((name, start, top))
+        for start in (lay["norm-worktree"], os.path.join(lay["norm-worktree"], "src", "deep")):
+            cases.append(("norm-worktree", start, lay["norm"]))  # still its main checkout
+        for n, (name, start, owner) in enumerate(cases):
+            description = f"cwd row {n} {uuid.uuid4().hex[:8]}"
+            with self.subTest(layout=name, cwd=start):
+                self.worklog_add(description, cwd=start)
+                self.assertEqual(self.logs_anywhere(description), [self.log_of(owner)])
+
+    def test_a_given_path_climbs_only_from_a_linked_worktree_of_a_dot_git(self):
+        """Finding 2: --repo and $CLAUDE_PROJECT_DIR keep the path given for a linked worktree of
+        a bare repository or of a submodule (and for a submodule and a separate git dir), and
+        still climb from an ordinary linked worktree."""
+        lay = self.layouts()
+        cases = []
+        for name in ("submodule", "bare-worktree", "submodule-worktree", "separate-git-dir"):
+            top = lay[name]
+            for given in (top, os.path.join(top, "src"), os.path.join(top, "src", "deep")):
+                cases.append((name, given, given))
+        for given in (lay["norm-worktree"], os.path.join(lay["norm-worktree"], "src")):
+            cases.append(("norm-worktree", given, lay["norm"]))
+        n = 0
+        for name, given, owner in cases:
+            for source in ("--repo", "CLAUDE_PROJECT_DIR"):
+                n += 1
+                description = f"given row {n} {uuid.uuid4().hex[:8]}"
+                with self.subTest(layout=name, source=source, given=given):
+                    if source == "--repo":
+                        self.worklog_add(description, cwd=self.tmp, repo_arg=given)
+                    else:
+                        self.worklog_add(description, cwd=self.tmp, project_dir=given)
+                    self.assertEqual(self.logs_anywhere(description), [self.log_of(owner)])
+
+
 # ================================================================ timeouts sized to the hooks (PR #126 finding 2)
 
 
@@ -1045,6 +1154,61 @@ class HookTimeoutTests(SlowGitMixin, RepoCase):
                 self.assertIsNone(result)
                 self.assertLess(took, min(own + SLACK, hooks_json_timeout(hook)),
                                 f"{hook}'s main-checkout lookup took {took:.2f} s against its {own} s")
+
+    def run_guard(self, wt: str, fake: str):
+        """tests_first.py as Claude Code runs it, on an Edit of a source file in `wt`, with the git
+        in `fake` first on PATH: (the finished process, the seconds it took)."""
+        payload = {
+            "session_id": "sess-1", "transcript_path": "/dev/null", "cwd": wt, "permission_mode": "default",
+            "hook_event_name": "PreToolUse", "tool_name": "Edit", "tool_use_id": "toolu_01",
+            "tool_input": {"file_path": os.path.join(wt, "src", "app.py"), "old_string": "a", "new_string": "b"},
+        }
+        env = dict(self.env, PATH=f"{fake}:{self.env['PATH']}")
+        began = time.monotonic()
+        r = subprocess.run([sys.executable, str(HOOKS / "tests_first.py")], input=json.dumps(payload),
+                           capture_output=True, text=True, env=env, cwd=wt, timeout=120)
+        return r, time.monotonic() - began
+
+    def test_tests_first_uncached_lookup_is_no_slower_than_mains_two_git_calls(self):
+        """PR #126 re-review finding 3. On main, tests_first's lookup for a directory was two
+        sequential git calls, each held to GIT_TIMEOUT (`rev-parse --show-toplevel
+        --git-common-dir`, then `symbolic-ref`): at worst 2 x GIT_TIMEOUT, inside the timeout
+        hooks.json gives the hook. Whatever git calls the lookup makes now, a git whose every call
+        answers inside GIT_TIMEOUT (or hangs) must not make the hook take longer than that. Each
+        profile below gives the delay, as a fraction of GIT_TIMEOUT, of a git call that asks for
+        --show-toplevel, for --git-common-dir, and of any other call; a lookup that asks git for
+        the toplevel twice besides main_checkout's call and the branch exceeds the bound in each."""
+        repo = self.make_repo("guard-slow")
+        wt = self.add_worktree(repo, os.path.join(self.tmp, "guard-slow-wt"), BRANCH)
+        own = load_with_loader(HOOKS / "tests_first.py").GIT_TIMEOUT
+        budget = hooks_json_timeout("tests_first.py")
+        bound = min(2 * own + SLACK, budget)
+        for top, common, other in ((0.8, 0.0, 0.8), (0.6, 0.2, 0.9), (0.8, 0.0, 20.0 / own)):
+            with self.subTest(top=top, common=common, other=other):
+                fake = self.slow_git(top=top * own, common=common * own, other=other * own)
+                r, took = self.run_guard(wt, fake)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertLess(took, bound, f"tests_first.py took {took:.2f} s with a git taking "
+                                f"{top * own:.2f}/{common * own:.2f}/{other * own:.2f} s a call; main's worst "
+                                f"case is 2 x {own} s, hooks.json allows {budget} s")
+
+    def test_tests_first_still_decides_with_a_slow_git_inside_its_timeout(self):
+        """The bound above is not met by giving up early: a git taking 0.3 x GIT_TIMEOUT a call
+        still gets the tests-first denial on a ticket branch with no red run, inside the bound."""
+        repo = self.make_repo("guard-patient")
+        wt = self.add_worktree(repo, os.path.join(self.tmp, "guard-patient-wt"), BRANCH)
+        own = load_with_loader(HOOKS / "tests_first.py").GIT_TIMEOUT
+        bound = min(2 * own + SLACK, hooks_json_timeout("tests_first.py"))
+        for frac in (0.0, 0.3):
+            with self.subTest(delay=frac * own):
+                r, took = self.run_guard(wt, self.slow_git(top=frac * own, common=frac * own, other=frac * own))
+                self.assertEqual((r.returncode, r.stderr), (0, ""))
+                decision = json.loads(r.stdout)["hookSpecificOutput"]
+                self.assertEqual(decision["permissionDecision"], "deny")
+                self.assertTrue(decision["permissionDecisionReason"].startswith("Tests first on t/12"),
+                                decision["permissionDecisionReason"])
+                self.assertLess(took, bound)
 
 
 # ================================================================ without the lib's repo.py

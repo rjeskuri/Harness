@@ -181,16 +181,23 @@ def repo_facts(directory: str) -> dict | None:
     """top (the worktree's top-level) and main (the main working tree, main_checkout's,
     which moves state kept under the spelling git reports), both canonical paths, branch
     (None when detached) and spelled (`directory`, for adopt_old_state); None outside a
-    repo."""
-    out = git(directory, "rev-parse", "--show-toplevel")
-    top = out.stdout.strip()
-    if out.returncode != 0 or not top:
+    repo. One git call gives top and HEAD's ref, main_checkout's lookup is held to one more
+    GIT_TIMEOUT: at worst 2 x GIT_TIMEOUT, as on main. Only an unborn branch (that call exits
+    1 with the top alone) costs a third, symbolic-ref, call."""
+    out = git(directory, "rev-parse", "--show-toplevel", "--symbolic-full-name", "--verify", "-q", "HEAD")
+    lines = [ln.strip() for ln in out.stdout.splitlines()]
+    if out.returncode not in (0, 1) or not lines or not lines[0]:
         return None
+    top = lines[0]
     main = main_checkout(directory, timeout=GIT_TIMEOUT)
     if main is None:
         return None
-    head = git(directory, "symbolic-ref", "--short", "-q", "HEAD")
-    branch = head.stdout.strip() if head.returncode == 0 else ""
+    if out.returncode == 0:  # refs/heads/<branch>, or HEAD when detached
+        ref = lines[1] if len(lines) > 1 else ""
+        branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ""
+    else:  # an unborn branch: HEAD names a branch with no commit yet
+        head = git(directory, "symbolic-ref", "--short", "-q", "HEAD")
+        branch = head.stdout.strip() if head.returncode == 0 else ""
     return {
         "top": Path(canonical_path(top)),
         "main": Path(main),
