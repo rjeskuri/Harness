@@ -44,7 +44,9 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, repo_key
+    from harness_lib.repo import NotARepository, RepoError, repo_facts
     from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
+    from harness_lib.text import last_line
 except Exception as exc:  # one line, exit 1, like the __main__ wrapper below
     sys.exit(f"harness-red: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -142,26 +144,25 @@ def git(root, *args, check=True):
     return p
 
 
+def facts_git(root, *args):
+    """git for repo_facts: the toplevel probe may fail (Repo says `not inside a git working tree`); any other
+    failure is raised with git's own last line."""
+    return git(root, *args, check="--show-toplevel" not in args)
+
+
 class Repo:
     """The worktree harness-red runs in: its top level, branch, settings and the per-repository state paths."""
 
     def __init__(self, start):
-        start = os.path.abspath(os.path.expanduser(start))
-        if not os.path.isdir(start):
-            raise Problem(f"not a directory: {start}")
-        top = git(start, "rev-parse", "--show-toplevel", check=False)
-        if top.returncode != 0 or not top.stdout.strip():
-            raise Problem(f"not inside a git working tree: {start}")
-        self.top = top.stdout.strip()
         # The main working tree is the parent of the common git dir, so a linked worktree and its main
         # checkout share one state directory.
-        common = git(self.top, "rev-parse", "--git-common-dir").stdout.strip()
-        if not os.path.isabs(common):
-            common = os.path.join(self.top, common)
-        reported = os.path.realpath(os.path.dirname(os.path.abspath(common)))
-        self.main = canonical_path(reported)
+        try:
+            self.top, _common_dir, self.main, self.key = repo_facts(start, facts_git, last_line)
+        except NotARepository as exc:
+            raise Problem(f"not inside a git working tree: {exc.path}") from None
+        except RepoError as exc:
+            raise Problem(str(exc)) from None
         repos = os.path.join(os.path.expanduser("~"), ".claude", "harness", "repos")
-        self.key = adopt_old_state(repos, self.main, reported, start)
         branch = git(self.top, "symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip()
         if not branch:
             raise Problem(f"HEAD is detached in {self.top}; harness-red runs on a ticket branch")

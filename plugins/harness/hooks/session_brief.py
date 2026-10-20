@@ -51,6 +51,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.hookio import emit, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
+    from harness_lib.repo import main_checkout
 
     LIB_PROBLEM = ""
 except Exception as exc:  # fail open: the brief goes on without ticket state and says why
@@ -427,18 +428,15 @@ def harness_home() -> Path:
 
 def repo_state_dir(root: Path, cwd: Path) -> Path | None:
     """~/.claude/harness/repos/<key>, keyed by the canonical path of the main working
-    tree; state under the key of the spelling git or `cwd` uses is moved there first.
-    None without the lib: the key is harness_lib's alone."""
+    tree (main_checkout); state under the key of the spelling git or `cwd` uses is moved
+    there first. None without the lib: the key is harness_lib's alone."""
     if LIB_PROBLEM:
         return None
-    out = git(root, "rev-parse", "--git-common-dir", timeout=EXTRA_GIT_TIMEOUT)
-    common = out.stdout.strip()
-    if out.returncode != 0 or not common:
+    main = main_checkout(str(root))
+    if main is None:
         return None
-    reported = os.path.dirname(os.path.realpath(os.path.join(str(root), common)))
     repos = harness_home() / "repos"
-    key = adopt_old_state(str(repos), canonical_path(reported), reported, str(cwd))
-    return repos / key
+    return repos / adopt_old_state(str(repos), main, str(cwd))
 
 
 def read_json(path: Path):

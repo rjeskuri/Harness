@@ -67,6 +67,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.hookio import deny, edited_path, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
+    from harness_lib.repo import main_checkout
     from harness_lib.settings import glob_match, patterns, setting, settings_env
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
     sys.stderr.write(f"tests_first.py: cannot load harness_lib from {_LIB}: {exc}\n")
@@ -177,21 +178,24 @@ def existing_dir(path: str) -> str:
 
 
 def repo_facts(directory: str) -> dict | None:
-    """top (the worktree's top-level) and main (the main working tree), both canonical
-    paths, branch (None when detached) and spelled (the main tree as git reported it and
-    `directory`, for adopt_old_state); None outside a repo."""
-    out = git(directory, "rev-parse", "--show-toplevel", "--git-common-dir")
-    lines = [ln.strip() for ln in out.stdout.splitlines()]
-    if out.returncode != 0 or len(lines) < 2 or not all(lines[:2]):
+    """top (the worktree's top-level) and main (the main working tree, main_checkout's,
+    which moves state kept under the spelling git reports), both canonical paths, branch
+    (None when detached) and spelled (`directory`, for adopt_old_state); None outside a
+    repo."""
+    out = git(directory, "rev-parse", "--show-toplevel")
+    top = out.stdout.strip()
+    if out.returncode != 0 or not top:
         return None
-    reported = os.path.dirname(os.path.realpath(os.path.join(directory, lines[1])))
+    main = main_checkout(directory)
+    if main is None:
+        return None
     head = git(directory, "symbolic-ref", "--short", "-q", "HEAD")
     branch = head.stdout.strip() if head.returncode == 0 else ""
     return {
-        "top": Path(canonical_path(lines[0])),
-        "main": Path(canonical_path(reported)),
+        "top": Path(canonical_path(top)),
+        "main": Path(main),
         "branch": branch or None,
-        "spelled": (reported, directory),
+        "spelled": (directory,),
     }
 
 
