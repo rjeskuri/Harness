@@ -88,8 +88,23 @@ def encode(path):
     return re.sub(r"[^A-Za-z0-9]", "-", path)
 
 
-def fresh_seed():
-    return random.SystemRandom().randrange(1 << 32)
+SEED_ENV = "HARNESS_TEST_SEED"
+
+
+def seeds(runs=None):
+    """The seeds for the generated tests: a fresh one per run, or only the one HARNESS_TEST_SEED
+    names, to replay a failure."""
+    fixed = os.environ.get(SEED_ENV, "").strip()
+    if fixed:
+        return [int(fixed)]
+    rng = random.SystemRandom()
+    return [rng.randrange(1 << 32) for _ in range(RANDOM_RUNS if runs is None else runs)]
+
+
+def replay(seed):
+    """The failure message for a generated case: its seed and how to run it again."""
+    return (f"seed {seed}; replay with: {SEED_ENV}={seed} python3 -m unittest discover "
+            f"-s plugins/harness/tests -p test_harness_lib_transcripts.py")
 
 
 # ------------------------------------------------------------------ fixture writers
@@ -737,13 +752,12 @@ class ReadTranscript(Base):
         self.assertEqual(self.t.first_branch(path), "main")
 
     def test_generated_sessions(self):
-        for run in range(RANDOM_RUNS):
-            seed = fresh_seed()
+        for run, seed in enumerate(seeds()):
             story = Story.whole_session(seed)
             with self.subTest(run=run, seed=seed):
                 path = write_jsonl(self.path(f"gen-{run}.jsonl"), story.entries)
                 result = self.t.read_transcript(path)
-                msg = f"seed {seed}"
+                msg = replay(seed)
                 self.assertEqual(result["messages"], story.expected_messages(), msg)
                 self.assertEqual(result["branches"], story.branches, msg)
                 self.assertEqual(result["cost_state"], story.cost, msg)
@@ -763,10 +777,22 @@ class ReadTranscript(Base):
               assistant("2026-10-16T01:00:01.000Z", "m", branch="main")], "feature/z"),
             ([tool_result("2026-10-16T01:00:00.000Z"), assistant("2026-10-16T01:00:01.000Z", "m", branch=None)], None),
             ([], None),
+            # entries without a timestamp are skipped, their gitBranch too
+            ([tool_result(None, gitBranch="t/0-unstamped"),
+              assistant("2026-10-16T01:00:01.000Z", "m", branch="t/43-stamped"),
+              tool_result("2026-10-16T01:00:02.000Z", gitBranch="t/0-unstamped")], "t/43-stamped"),
+            ([assistant(None, "m0", branch="main"),
+              tool_result("2026-10-16T01:00:00.000Z"),
+              api_request("2026-10-16T01:00:01.000Z", "r", gitBranch="t/44-z"),
+              assistant(None, "m1", branch="t/45-also-unstamped")], "t/44-z"),
+            ([tool_result(None, gitBranch="t/46-only-unstamped")], None),
         ]
         for n, (entries, want) in enumerate(cases):
             with self.subTest(case=n):
-                self.assertEqual(self.t.first_branch(write_jsonl(self.path(f"fb{n}.jsonl"), entries)), want)
+                path = write_jsonl(self.path(f"fb{n}.jsonl"), entries)
+                self.assertEqual(self.t.first_branch(path), want)
+                branches = self.t.read_transcript(path)["branches"]
+                self.assertEqual(branches[0] if branches else None, want, "first_branch agrees with branches[0]")
         self.assertIsNone(self.t.first_branch(self.path("missing.jsonl")))
 
     def test_first_branch_does_not_read_the_rest_of_the_file(self):
@@ -892,8 +918,7 @@ class Sessions(Base):
         self.assertEqual(got, [{"id": sid, "path": str(d / f"{sid}.jsonl"), "agents": []} for sid in sorted(ids)])
 
     def test_generated_layouts(self):
-        for run in range(RANDOM_RUNS):
-            seed = fresh_seed()
+        for run, seed in enumerate(seeds()):
             rng = random.Random(seed)
             root = self.tmp / f"gen-{run}"
             hexid = lambda n: "".join(rng.choice("0123456789abcdef") for _ in range(n))  # noqa: E731
@@ -927,7 +952,7 @@ class Sessions(Base):
             want.sort(key=lambda s: folders.index(Path(s["path"]).parent))
             with self.subTest(run=run, seed=seed):
                 got = self.t.sessions([str(f) for f in folders] + [str(root / "missing")])
-                self.assertEqual(got, want, f"seed {seed}")
+                self.assertEqual(got, want, replay(seed))
 
 
 # ------------------------------------------------------------------ session_dirs
@@ -1009,32 +1034,35 @@ class SessionDirs(Base):
             self.folder(sibling)
             self.folder(self.wt(name(), sibling))
             self.folder(os.path.join(main, name()))
-        (self.projects / (encode(self.wt(name(), main)) + "x")).write_text("a file, not a folder", encoding="utf-8")
+        # a plain file named like a worktree folder, under a name no folder above has taken
+        plain = self.projects / (encode(self.wt(name(), main)) + "x")
+        while plain.exists():
+            plain = self.projects / (encode(self.wt(name(), main)) + "x")
+        plain.write_text("a file, not a folder", encoding="utf-8")
         return [own] + sorted(mine, key=os.path.basename)
 
     def test_generated_layouts(self):
-        for run in range(RANDOM_RUNS):
-            seed = fresh_seed()
+        for run, seed in enumerate(seeds()):
             main = str(self.tmp / f"repo{run}_{seed % 1000}.x")
             os.makedirs(main)
             want = self.generated(seed, main)
             with self.subTest(run=run, seed=seed):
                 got = [os.path.normpath(d) for d in self.t.session_dirs(main)]
-                self.assertEqual(got, want, f"seed {seed}")
+                self.assertEqual(got, want, replay(seed))
 
     def test_same_list_as_harness_worklog(self):
         self.populate()
         other = str(self.tmp / "work" / "api-server")
         os.makedirs(other)
         self.folder(self.wt("t-5-a", other))
-        seed = fresh_seed()
+        seed = seeds(1)[0]
         gen = str(self.tmp / "gen_repo")
         os.makedirs(gen)
         self.generated(seed, gen)
         wl = load_worklog()
         for main in (self.main, other, gen, str(self.tmp / "client_repo.v2-other"), str(self.tmp / "never-seen")):
             with self.subTest(main=main, seed=seed):
-                self.assertEqual(self.t.session_dirs(main), wl.transcripts_dirs(main), f"seed {seed}")
+                self.assertEqual(self.t.session_dirs(main), wl.transcripts_dirs(main), replay(seed))
 
     def test_session_dirs_does_not_use_harness_worklog(self):
         """A later ticket makes harness-worklog call this module, so this module must not load it.
