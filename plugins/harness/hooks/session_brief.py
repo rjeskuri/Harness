@@ -54,7 +54,7 @@ try:
 
     LIB_PROBLEM = ""
 except Exception as exc:  # fail open: the brief goes on without ticket state and says why
-    LIB_PROBLEM = f"cannot load harness_lib from {_LIB}: {exc}"
+    LIB_PROBLEM = f"cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}"
     sys.stderr.write(f"session_brief.py: {LIB_PROBLEM}\n")
 
     # The brief must still reach the session without the lib (the guards are off then),
