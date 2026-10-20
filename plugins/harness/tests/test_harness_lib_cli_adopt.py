@@ -530,6 +530,11 @@ class FilesRunTheLib(unittest.TestCase):
         cls.cli = thc.lib_module("cli")
         cls.text = thc.lib_module("text")
         cls.paths = thc.lib_module("paths")
+        # #90 and #91 moved the registry (Project, load_registry, find_project) and GhBatch into these lib
+        # modules: the tools bind them, and their text helpers (same_path, harness_home, first_line) are looked
+        # up there. These modules are shared by every load, so a spy on them is undone (see spy()).
+        cls.registry = thc.lib_module("registry")
+        cls.ghlib = thc.lib_module("gh")
 
     def setUp(self) -> None:
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="harness-adopt-run-"))
@@ -549,11 +554,13 @@ class FilesRunTheLib(unittest.TestCase):
         lib_obj = getattr(self.cli if where == "cli" else self.text, label)
         return lib_obj, [name for name, value in vars(module).items() if value is lib_obj]
 
-    def spy(self, module, label: str, where: str = "text", mark=None) -> None:
+    def spy(self, module, label: str, where: str = "text", mark=None):
         """Replace every name the module binds to the lib's `label` by a recorder that runs the lib's code.
         With `mark`, the recorder returns mark(lib result, *args, **kwargs) instead of the lib's result: a
         value the lib would not give, which the function under test must pass on (calling the lib and
-        discarding its answer for a private recomputation leaves the mark out of the output)."""
+        discarding its answer for a private recomputation leaves the mark out of the output).
+        Returns a function that puts the lib's object back; it also runs at cleanup (a shared lib module such
+        as registry or gh must not keep a recorder past the test)."""
         lib_obj, bound = self.bound_to(module, label, where)
         self.assertTrue(bound, f"{module.__name__} binds no name to the lib's {label}")
         calls = self.calls
@@ -566,11 +573,29 @@ class FilesRunTheLib(unittest.TestCase):
         for name in bound:
             setattr(module, name, recorder)
 
+        def restore():
+            for name in bound:
+                setattr(module, name, lib_obj)
+
+        self.addCleanup(restore)
+        return restore
+
+    def run_main(self, module, argv: list):
+        """module.main() with `argv`, its output swallowed."""
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return module.main()
+
+    def github_repo(self) -> str:
+        """A git repository under the temp folder whose origin is on github.com (so the board is read)."""
+        repo = os.path.join(self.tmp, "ghrepo")
+        os.makedirs(repo, exist_ok=True)
+        for args in (["init", "-q"], ["remote", "add", "origin", "https://github.com/owner/ghrepo.git"]):
+            subprocess.run(["git", "-C", repo] + args, check=True, capture_output=True)
+        return repo
+
     def given(self, label: str) -> list:
         return [args[0] if args else None for name, args, _ in self.calls if name == label]
-
-    def homed(self) -> int:
-        return len(self.given("home")) + len(self.given("harness_home"))
 
     def put(self, rel: str, text: str) -> str:
         path = os.path.join(self.home, rel) if not os.path.isabs(rel) else rel
@@ -642,31 +667,41 @@ class FilesRunTheLib(unittest.TestCase):
 
     def test_standup_raises_the_lib_problem_and_parses_with_the_lib_parser(self):
         standup = thc.load_tool(BIN / "harness-standup")
-        projects = [{"name": "alpha", "path": self.tmp}, {"name": "Alpha", "path": self.home}]
+        # The registry is the lib's (#91): the tool binds registry.py's own objects, no copies.
+        self.assertIs(standup.find_project, self.registry.find_project)
+        self.assertIs(standup.load_registry, self.registry.load_registry)
+        registry = os.path.join(".claude", "harness", "projects.json")
+        self.put(registry, json.dumps({"version": 1, "projects": [{"name": "alpha", "path": self.tmp},
+                                                                  {"name": "Alpha", "path": self.home}]}))
         for key, message in (("gamma", "no registered project named or at 'gamma' (harness-projects list shows "
                                        "them)"),
                              ("ALPHA", "'ALPHA' matches 2 projects; give its path instead")):
             with self.subTest(key=key):
-                err = self.problem(standup.pick, projects, key)
+                err = self.problem(self.run_main, standup, ["harness-standup", key])
                 self.assertEqual(str(err), message)
-        self.put(os.path.join(".claude", "harness", "projects.json"), '{"version": 1}')
-        self.assertRegex(str(self.problem(standup.load_projects)), r'projects\.json: expected \{"version": 1, ')
+        self.put(registry, '{"version": 1}')
+        self.assertRegex(str(self.problem(self.run_main, standup, ["harness-standup"])),
+                         r'projects\.json: expected \{"version": 1, ')
         self.bad_invocation("harness-standup", ["harness-standup", "--nope"],
                             "harness-standup: error: unrecognized arguments: --nope")
 
     def test_standup_reads_the_registry_and_transcripts_under_home_through_the_lib(self):
         standup = thc.load_tool(BIN / "harness-standup")
+        self.assertIs(standup.load_registry, self.registry.load_registry)
         self.spy(standup, "home")
-        try:
-            self.spy(standup, "harness_home")
-        except AssertionError:
-            pass  # standup may spell its harness paths with home(); one of the two must fire
+        # The registry file is found by registry.py (#91), through the lib's harness_home it binds.
+        self.spy(self.registry, "harness_home")
         self.put(os.path.join(".claude", "harness", "projects.json"), json.dumps(
             {"version": 1, "projects": [{"name": "w", "path": "/w/x", "billable": True}, {"path": "/y/z/"}]}))
-        got = standup.load_projects()
-        self.assertEqual([(p["name"], p["path"], p["billable"]) for p in got],
+        got = standup.load_registry()
+        self.assertEqual([(p.name, p.path, p.billable) for p in got],
                          [("w", "/w/x", True), ("z", "/y/z/", False)])
-        self.assertGreaterEqual(self.homed(), 1)
+        self.assertGreaterEqual(len(self.given("harness_home")), 1)
+        # and the transcripts under the same HOME through the tool's own home()
+        folder = os.path.join(self.home, ".claude", "projects", folder_name("/w/x"))
+        self.touch(os.path.join(folder, "a.jsonl"), 1_700_000_000)
+        self.assertEqual(standup.last_session("/w/x"), 1_700_000_000)
+        self.assertGreaterEqual(len(self.given("home")), 1)
 
     def test_standup_finds_a_projects_sessions_through_the_lib_session_folder(self):
         standup = thc.load_tool(BIN / "harness-standup")
@@ -689,18 +724,20 @@ class FilesRunTheLib(unittest.TestCase):
 
     def test_standup_picks_a_project_by_path_through_the_lib_same_path(self):
         standup = thc.load_tool(BIN / "harness-standup")
-        self.spy(standup, "same_path")
+        self.assertIs(standup.find_project, self.registry.find_project)
+        # find_project (#91) looks same_path up in registry.py: the lib's text.same_path, no copy.
+        self.spy(self.registry, "same_path")
         a = os.path.join(self.tmp, "alpha")
         b = os.path.join(self.tmp, "beta")
         os.makedirs(a)
         os.makedirs(b)
         os.symlink(b, os.path.join(self.tmp, "link-to-beta"))
-        projects = [{"name": "one", "path": a}, {"name": "two", "path": b}]
+        projects = [self.registry.Project(path=a, name="one"), self.registry.Project(path=b, name="two")]
         for key, name in ((os.path.join(self.tmp, "beta", "..", "alpha"), "one"),
                           (os.path.join(self.tmp, "link-to-beta"), "two"),
                           (b + "/", "two")):
             with self.subTest(key=key):
-                self.assertEqual(standup.pick(projects, key)["name"], name)
+                self.assertEqual(standup.find_project(projects, key).name, name)
         self.assertGreaterEqual(len(self.given("same_path")), 3)
 
     def test_standup_ages_through_the_lib_age_text(self):
@@ -764,23 +801,25 @@ class FilesRunTheLib(unittest.TestCase):
 
     def test_standup_names_gh_failures_by_their_first_line_through_the_lib(self):
         standup = thc.load_tool(BIN / "harness-standup")
-        self.spy(standup, "first_line")
+        # GhBatch is gh.py's (#90), and it names a failure by gh.py's binding of the lib's first_line.
+        self.assertIs(standup.GhBatch, self.ghlib.GhBatch)
+        self.spy(self.ghlib, "first_line")
+        project = self.registry.Project(path=self.github_repo(), name="ghrepo")
         cases = [
-            ("printf '\\n   HTTP 502: bad gateway  \\nretry later\\n' >&2; exit 1\n", "gh pr list failed: HTTP 502: bad gateway"),
-            ("exit 4\n", "gh pr list failed: exit 4"),
-            ("printf '  \\n<html>oops</html>\\n'; exit 0\n", "gh pr list printed something other than JSON: <html>oops</html>"),
-            ("printf 'HTTP 404: Not Found' >&2; exit 1\n", "gh pr list failed: HTTP 404: Not Found"),
-            ("printf 'not json\\n'; exit 0\n", "gh pr list printed something other than JSON: not json"),
+            ("printf '\\n   HTTP 502: bad gateway  \\nretry later\\n' >&2; exit 1\n", "gh issue list failed: HTTP 502: bad gateway"),
+            ("exit 4\n", "gh issue list failed: exit 4"),
+            ("printf '  \\n<html>oops</html>\\n'; exit 0\n", "gh issue list printed something other than JSON: <html>oops</html>"),
+            ("printf 'HTTP 404: Not Found' >&2; exit 1\n", "gh issue list failed: HTTP 404: Not Found"),
+            ("printf 'not json\\n'; exit 0\n", "gh issue list printed something other than JSON: not json"),
         ]
         for i, (script, message) in enumerate(cases):
             with self.subTest(message=message):
                 gh = self.fake_exe(f"gh{i}", script)
-                batch = standup.GhBatch(gh, [["pr", "list"]], self.tmp, time.monotonic() + 20)
-                try:
-                    err = self.problem(batch.results)
-                finally:
-                    batch.close()
-                self.assertEqual(str(err), message)
+                with mock.patch.dict(os.environ, {"HARNESS_GH": gh}):
+                    got = standup.board_report(project, time.time())
+                # The lib's Problem, as the board's error line (any other exception is prefixed by its type).
+                self.assertEqual(got["board_error"], message)
+                self.assertIsNone(got["board"])
         self.assertGreaterEqual(len(self.given("first_line")), len(cases))
 
     # ================================================== harness-digest
@@ -802,6 +841,11 @@ class FilesRunTheLib(unittest.TestCase):
         self.assertEqual(digest.plist_path(), os.path.join(self.home, "Library", "LaunchAgents",
                                                            "com.ryaneskuri.harness-digest.plist"))
         self.assertGreaterEqual(len(self.given("home")), 1)
+        # The registry is read by registry.py (#91), which finds it through its binding of the lib's
+        # harness_home; digest's own harness_home serves its other files (budgets, runs, the digest folder).
+        self.assertIs(digest.load_registry, self.registry.load_registry)
+        self.calls.clear()
+        self.spy(self.registry, "harness_home")
         self.put(os.path.join(".claude", "harness", "projects.json"), json.dumps(
             {"version": 1, "projects": [{"name": "n", "path": "/p/q"}, {"path": "/r/s/"}, {"path": " "}]}))
         self.assertEqual(digest.load_projects(), [{"name": "n", "path": "/p/q"}, {"name": "s", "path": "/r/s/"}])
@@ -966,15 +1010,13 @@ class FilesRunTheLib(unittest.TestCase):
         alt = os.path.join(self.tmp, "spyhome")
         standup = thc.load_tool(BIN / "harness-standup")
         self.spy(standup, "home", mark=rooted(alt))
-        try:
-            self.spy(standup, "harness_home", mark=rooted(alt, ".claude", "harness"))
-        except AssertionError:
-            pass  # standup may spell its harness paths with home()
+        # The registry's place is registry.py's answer (#91), through its binding of the lib's harness_home.
+        self.spy(self.registry, "harness_home", mark=rooted(alt, ".claude", "harness"))
         self.put(os.path.join(".claude", "harness", "projects.json"),
                  json.dumps({"version": 1, "projects": [{"name": "real", "path": "/real/one"}]}))
         self.put(os.path.join(alt, ".claude", "harness", "projects.json"),
                  json.dumps({"version": 1, "projects": [{"name": "spy", "path": "/s/p"}, {"path": "/t/u"}]}))
-        self.assertEqual([(p["name"], p["path"]) for p in standup.load_projects()], [("spy", "/s/p"), ("u", "/t/u")])
+        self.assertEqual([(p.name, p.path) for p in standup.load_registry()], [("spy", "/s/p"), ("u", "/t/u")])
         for path, real, spied in (("/w/q", 1_600_000_000, 1_650_000_000), ("/a b/c", 1_690_000_000, 1_610_000_000),
                                   ("/plain", 1_620_000_000, 1_630_000_000)):
             with self.subTest(path=path):
@@ -1000,19 +1042,26 @@ class FilesRunTheLib(unittest.TestCase):
         b = os.path.join(self.tmp, "beta")
         os.makedirs(a)
         os.makedirs(b)
-        projects = [{"name": "one", "path": a}, {"name": "two", "path": b}]
+        projects = [self.registry.Project(path=a, name="one"), self.registry.Project(path=b, name="two")]
+        # find_project (#91) asks registry.py's binding of the lib's same_path; the tool picks through it.
         for key, path, name in (("@spy-key", b, "two"), ("@spy-key", a, "one"), ("other key", b, "two")):
             with self.subTest(key=key, name=name):
                 standup = thc.load_tool(BIN / "harness-standup")
-                self.spy(standup, "same_path", mark=also_same(path, key))
-                self.assertEqual(standup.pick(projects, key)["name"], name)
+                restore = self.spy(self.registry, "same_path", mark=also_same(path, key))
+                try:
+                    self.assertEqual(standup.find_project(projects, key).name, name)
+                finally:
+                    restore()
         # A key that is an existing project's own spelling, where the lib's answer is plain string equality: the
         # answer still comes from the lib (here, one that matches only the other project).
         for key, path, name in ((a, b, "two"), (b, a, "one")):
             with self.subTest(key=key, name=name, exact=True):
                 standup = thc.load_tool(BIN / "harness-standup")
-                self.spy(standup, "same_path", mark=exactly_same(path, key))
-                self.assertEqual(standup.pick(projects, key)["name"], name)
+                restore = self.spy(self.registry, "same_path", mark=exactly_same(path, key))
+                try:
+                    self.assertEqual(standup.find_project(projects, key).name, name)
+                finally:
+                    restore()
 
     def test_marked_standup_ages_with_the_lib_age_text(self):
         standup = thc.load_tool(BIN / "harness-standup")
@@ -1063,24 +1112,26 @@ class FilesRunTheLib(unittest.TestCase):
     def test_marked_standup_names_gh_failures_by_the_lib_first_line(self):
         cases = [
             ("printf '\\n   HTTP 502: bad gateway  \\nretry later\\n' >&2; exit 1\n",
-             "gh pr list failed: FL<HTTP 502: bad gateway>"),
-            ("exit 4\n", "gh pr list failed: exit 4"),
+             "gh issue list failed: FL<HTTP 502: bad gateway>"),
+            ("exit 4\n", "gh issue list failed: exit 4"),
             ("printf '  \\n<html>oops</html>\\n'; exit 0\n",
-             "gh pr list printed something other than JSON: FL<<html>oops</html>>"),
-            ("printf 'HTTP 404: Not Found' >&2; exit 1\n", "gh pr list failed: FL<HTTP 404: Not Found>"),
-            ("printf 'not json\\n'; exit 0\n", "gh pr list printed something other than JSON: FL<not json>"),
+             "gh issue list printed something other than JSON: FL<<html>oops</html>>"),
+            ("printf 'HTTP 404: Not Found' >&2; exit 1\n", "gh issue list failed: FL<HTTP 404: Not Found>"),
+            ("printf 'not json\\n'; exit 0\n", "gh issue list printed something other than JSON: FL<not json>"),
         ]
+        project = self.registry.Project(path=self.github_repo(), name="ghrepo")
         for i, (script, message) in enumerate(cases):
             with self.subTest(message=message):
                 standup = thc.load_tool(BIN / "harness-standup")
-                self.spy(standup, "first_line", mark=tagged("FL"))
+                # GhBatch is gh.py's (#90): the line it names is gh.py's first_line's answer.
+                restore = self.spy(self.ghlib, "first_line", mark=tagged("FL"))
                 gh = self.fake_exe(f"ghm{i}", script)
-                batch = standup.GhBatch(gh, [["pr", "list"]], self.tmp, time.monotonic() + 20)
                 try:
-                    err = self.problem(batch.results)
+                    with mock.patch.dict(os.environ, {"HARNESS_GH": gh}):
+                        got = standup.board_report(project, time.time())
                 finally:
-                    batch.close()
-                self.assertEqual(str(err), message)
+                    restore()
+                self.assertEqual(got["board_error"], message)
 
     def test_marked_digest_finds_its_files_where_the_lib_home_and_harness_home_point(self):
         alt = os.path.join(self.tmp, "spyhome")
@@ -1089,6 +1140,8 @@ class FilesRunTheLib(unittest.TestCase):
         self.spy(digest, "harness_home", mark=rooted(alt, ".claude", "harness"))
         self.assertEqual(digest.plist_path(), os.path.join(alt, "Library", "LaunchAgents",
                                                            "com.ryaneskuri.harness-digest.plist"))
+        # The registry's place is registry.py's answer (#91), through its binding of the lib's harness_home.
+        self.spy(self.registry, "harness_home", mark=rooted(alt, ".claude", "harness"))
         self.put(os.path.join(".claude", "harness", "projects.json"),
                  json.dumps({"version": 1, "projects": [{"name": "real", "path": "/real/one"}]}))
         self.put(os.path.join(alt, ".claude", "harness", "projects.json"),
