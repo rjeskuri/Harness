@@ -49,6 +49,7 @@ _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
+    from harness_lib.gh import GH_ENV, gh_binary
     from harness_lib.hookio import emit, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.text import one_line, read_json
@@ -59,7 +60,15 @@ except Exception as exc:  # fail open: the brief goes on without ticket state an
     sys.stderr.write(f"session_brief.py: {LIB_PROBLEM}\n")
 
     # The brief must still reach the session without the lib (the guards are off then),
-    # so only here does this hook keep its own copy of the hook I/O and text helpers it needs.
+    # so only here does this hook keep its own copy of the hook I/O, text helpers and gh lookup it needs.
+    GH_ENV = {"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"}
+
+    def gh_binary() -> str | None:
+        gh = os.environ.get("HARNESS_GH", "gh")
+        if os.sep in gh:
+            return gh if os.path.isfile(gh) and os.access(gh, os.X_OK) else None
+        return shutil.which(gh)
+
     def read_json(path):
         try:
             with open(path, encoding="utf-8") as fh:
@@ -492,22 +501,12 @@ def ticket_part(root: Path, branch: str, cwd: Path) -> list[str]:
     return lines
 
 
-def gh_command() -> str | None:
-    """The gh to run (HARNESS_GH, else gh), or None when it cannot be found."""
-    gh = os.environ.get("HARNESS_GH", "gh")
-    if os.sep in gh:
-        return gh if os.path.isfile(gh) and os.access(gh, os.X_OK) else None
-    return shutil.which(gh)
-
-
 def run_side_by_side(
     cmds: list[list[str]], cwd: Path, timeout: float
 ) -> list[str] | None:
     """stdout of each command, run at the same time; None when one fails or the time runs
     out (then every one still running is stopped)."""
-    env = dict(
-        os.environ, GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", NO_COLOR="1"
-    )
+    env = dict(os.environ, **GH_ENV)
     procs = []
     try:
         for cmd in cmds:
@@ -554,7 +553,7 @@ def label_names(issue) -> set[str]:
 
 def board_part(root: Path) -> list[str]:
     """Board counts from gh, when the repo's origin is on github.com and gh answers in time."""
-    gh = gh_command()
+    gh = gh_binary()
     if gh is None:
         return []
     remote = git(root, "remote", "get-url", "origin", timeout=EXTRA_GIT_TIMEOUT)

@@ -29,11 +29,13 @@ import calendar
 import contextlib
 import copy
 import datetime as dt
+import functools
 import importlib
 import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -74,11 +76,13 @@ USED = {
         "Problem": "cli", "Parser": "cli", "table": "cli", "emit": "cli", "issue_number": "cli", "warn": "cli",
         "one_line": "text", "first_line": "text", "home": "text", "now_iso": "text",
         "parse_iso": "text", "as_list": "text", "read_text": "text", "write_json": "text",
+        "read_json": "text", "harness_home": "text",
     },
     "harness-pr": {
-        "Problem": "cli", "Parser": "cli", "table": "cli",
+        "Problem": "cli", "Parser": "cli", "table": "cli", "warn": "cli", "emit": "cli",
         "one_line": "text", "first_line": "text", "last_line": "text", "home": "text",
         "parse_iso": "text", "as_list": "text", "read_text": "text", "write_text": "text",
+        "read_json": "text", "harness_home": "text", "write_json": "text",
     },
 }
 TOOLS = tuple(USED)
@@ -776,8 +780,10 @@ class TextTime(unittest.TestCase):
 DEFS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 ENDS_BLOCK = (ast.Return, ast.Raise, ast.Continue, ast.Break)
 MAIN_GUARD = ("__name__ == '__main__'", '__name__ == "__main__"')
-# The lib's defs that are references for the copy check: the moved helpers under their lib names.
-LIB_REFERENCE_NAMES = set(MOVED) | {"write_text", "warn"}
+# Every export of cli.py and text.py is a reference for the copy check (plus the private helper write_json and
+# write_text share), and so are the moved helpers under the names the tools carried them by.
+EXPORTS = CLI_NAMES + TEXT_NAMES
+LIB_REFERENCE_NAMES = set(MOVED) | set(EXPORTS) | {"_replace"}
 # Functions the tools define today that nothing in them references (a leftover of the state-key move, #79).
 UNREFERENCED_TODAY = {"repo_key"}
 
@@ -979,12 +985,28 @@ def as_def(lam, name: str):
     return node
 
 
+def is_partial(node) -> bool:
+    """A call of functools.partial (or a bare `partial`) with something to bind."""
+    return isinstance(node, ast.Call) and call_name(node) == "partial" and bool(node.args)
+
+
+def partial_as_def(call, name: str):
+    """`partial(f, a, k=v)` as the def it stands for: `def _(*rest, **kw): return f(a, *rest, k=v, **kw)`."""
+    bound = [ast.unparse(a) for a in call.args[1:]] + ["*_rest"]
+    bound += [f"{k.arg}={ast.unparse(k.value)}" if k.arg else f"**{ast.unparse(k.value)}" for k in call.keywords]
+    node = ast.parse(f"def _(*_rest, **_kw):\n    return {ast.unparse(call.args[0])}({', '.join(bound + ['**_kw'])})"
+                     ).body[0]
+    node.name, node.lineno = name, getattr(call, "lineno", 0)
+    return node
+
+
 def defs_in(tree) -> list:
-    """Every def and class in `tree`, nested ones included, and every lambda as a def named for what it is
-    assigned to."""
+    """Every def and class in `tree`, nested ones included, and every lambda and functools.partial as a def named
+    for what it is assigned to."""
     named = {}
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Lambda):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and (isinstance(node.value, ast.Lambda)
+                                                              or is_partial(node.value)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             names = [t.id for t in targets if isinstance(t, ast.Name)]
             named[id(node.value)] = names[0] if names else "<lambda>"
@@ -994,6 +1016,8 @@ def defs_in(tree) -> list:
             found.append(node)
         elif isinstance(node, ast.Lambda):
             found.append(as_def(node, named.get(id(node), "<lambda>")))
+        elif is_partial(node):
+            found.append(partial_as_def(node, named.get(id(node), "<partial>")))
     return found
 
 
@@ -1003,11 +1027,14 @@ def shape(node) -> str:
     node = pruned(node)
     node.name = "_"
     node.decorator_list = []
+    if hasattr(node, "returns"):
+        node.returns = None                     # annotations are not behavior: a copy may drop or add them
     if not node.body:
         node.body = [ast.Pass()]
     names: dict = {}
     for sub in ast.walk(node):
         if isinstance(sub, ast.arg):
+            sub.annotation = None
             sub.arg = names.setdefault(sub.arg, f"v{len(names)}")
         elif isinstance(sub, ast.Name):
             sub.id = names.setdefault(sub.id, f"v{len(names)}")
@@ -1042,6 +1069,7 @@ def reference_defs() -> list:
     return [(origin, node) for origin, node in found if isinstance(node, DEFS)]
 
 
+@functools.lru_cache(maxsize=None)
 def reference_shapes() -> dict:
     shapes = {}
     for origin, node in reference_defs():
@@ -1049,6 +1077,7 @@ def reference_shapes() -> dict:
     return shapes
 
 
+@functools.lru_cache(maxsize=None)
 def reference_fingerprints() -> dict:
     """The references with at least three calls and constants between them: an empty class matches nothing."""
     prints = {}
@@ -1094,6 +1123,344 @@ def referenced_names(tree) -> set:
     return found
 
 
+def live_tree(tree):
+    """`tree` pruned to its live statements, once: a tree that came out of live_tree is returned as it is."""
+    if getattr(tree, "_live", False):
+        return tree
+    tree = pruned(tree)
+    tree._live = True
+    return tree
+
+
+def stmt_lists(tree) -> list:
+    """Every list of statements in `tree` (module, def, class, loop, branch, try, handler and with bodies), over the
+    live statements only."""
+    found = []
+    for node in ast.walk(live_tree(tree)):
+        for field in ("body", "orelse", "finalbody"):
+            stmts = getattr(node, field, None)
+            if isinstance(stmts, list) and stmts and isinstance(stmts[0], ast.stmt):
+                found.append(stmts)
+    return found
+
+
+def stmts_shape(stmts: list) -> str:
+    """The shape of a run of statements as the body of one argument-less function, names renamed in order of
+    appearance: an inline body and the lib function it was lifted from have the same shape."""
+    empty = ast.arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None,
+                          defaults=[])
+    return shape(ast.FunctionDef(name="_", args=empty, body=copy.deepcopy(stmts), decorator_list=[], returns=None,
+                                 type_comment=None))
+
+
+@functools.lru_cache(maxsize=None)
+def reference_windows() -> dict:
+    """{shape of a lib function's whole body: (origin, number of statements, their types)} for the references with at least
+    three calls and constants between them: what the same statements look like pasted inside another function."""
+    windows = {}
+    for origin, node in reference_defs():
+        body = live(node.body) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else []
+        if not body:
+            continue
+        calls, consts = fingerprint(ast.Module(body=copy.deepcopy(body), type_ignores=[]))
+        if len(calls) + len(consts) >= 3:
+            windows.setdefault(stmts_shape(body), (f"{origin}:{node.name}", len(body),
+                                                   tuple(type(s).__name__ for s in body)))
+    return windows
+
+
+def window_findings(tree, windows: dict) -> list:
+    """(line, origin) for each run of statements anywhere in `tree` shaped like the whole body of a reference."""
+    sizes = sorted({n for _, n, _ in windows.values()})
+    kinds = {kind for _, _, kind in windows.values()}       # statement types in order: cheap to compare first
+    found = []
+    for stmts in stmt_lists(tree):
+        for n in sizes:
+            for i in range(0, len(stmts) - n + 1):
+                if tuple(type(s).__name__ for s in stmts[i:i + n]) not in kinds:
+                    continue
+                key = stmts_shape(stmts[i:i + n])
+                if key in windows:
+                    found.append((stmts[i].lineno, windows[key][0]))
+    return found
+
+
+def is_json_call(node, attr: str) -> bool:
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == attr \
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "json"
+
+
+def call_name(node) -> str:
+    """The last name of what a call calls: `open`, `write_text`, `read`; "" for anything else."""
+    f = node.func if isinstance(node, ast.Call) else None
+    return f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
+
+
+STDIN = ("sys.stdin", "sys.stdin.buffer", "sys.__stdin__")
+
+
+def reads_a_file(call) -> bool:
+    """open(), Path.read_text() or a .read() of anything but standard input."""
+    name = call_name(call)
+    if name in ("open", "read_text"):
+        return True
+    return name == "read" and isinstance(call.func, ast.Attribute) and ast.unparse(call.func.value) not in STDIN
+
+
+def inline_read_findings(tree) -> list:
+    """Lines of a try that reads a file (open, read_text, .read() of a handle; standard input is not a file) and
+    parses it as JSON (json.load, json.loads) and whose handlers all swallow the error (none raises): read_json
+    written out inside another function, however the file is opened and the result kept. A try that turns the
+    error into a Problem is a different, reporting read and is not a copy."""
+    found = []
+    for node in ast.walk(live_tree(tree)):
+        if not isinstance(node, ast.Try) or not node.handlers:
+            continue
+        inside = [sub for stmt in node.body for sub in ast.walk(stmt)]
+        reads = any(isinstance(sub, ast.Call) and reads_a_file(sub) for sub in inside)
+        parses = any(is_json_call(sub, "load") or is_json_call(sub, "loads") for sub in inside)
+        raises = any(isinstance(sub, ast.Raise) for h in node.handlers for sub in ast.walk(h))
+        if reads and parses and not raises:
+            found.append(node.lineno)
+    return found
+
+
+def write_mode(call) -> bool:
+    """Whether an open() call can write: a mode that is not a plain read constant (a variable counts)."""
+    mode = call.args[1] if len(call.args) > 1 else next((k.value for k in call.keywords if k.arg == "mode"), None)
+    if mode is None:
+        return False
+    return not (isinstance(mode, ast.Constant) and isinstance(mode.value, str) and not set(mode.value) & set("wax+"))
+
+
+def inline_write_findings(tree) -> list:
+    """Lines that write a file by hand instead of through write_json or write_text, however the text is held:
+    a temporary file renamed over the target (mkstemp, fdopen, os.replace), open() in a write mode, Path.write_text
+    or write_bytes, json.dump, and json.dumps with indent or ensure_ascii (the pretty JSON write_json writes; emit
+    is the lib's, so the tools print none)."""
+    found = []
+    for node in ast.walk(live_tree(tree)):
+        if not isinstance(node, ast.Call):
+            continue
+        name = call_name(node)
+        base = node.func.value if isinstance(node.func, ast.Attribute) else None
+        if name in ("mkstemp", "fdopen", "write_bytes", "NamedTemporaryFile") \
+                or (name == "replace" and isinstance(base, ast.Name) and base.id == "os") \
+                or (name == "write_text" and isinstance(node.func, ast.Attribute)) \
+                or (name == "open" and write_mode(node)):
+            found.append(node.lineno)
+        elif is_json_call(node, "dump"):
+            found.append(node.lineno)
+        elif is_json_call(node, "dumps") and {k.arg for k in node.keywords} & {"indent", "ensure_ascii"}:
+            found.append(node.lineno)
+    return found
+
+
+STDERR = ("sys.stderr", "sys.__stderr__")
+
+
+def stderr_aliases(tree) -> tuple:
+    """(names bound to stderr, names bound to a stderr printer): `err = sys.stderr`, `from sys import stderr`;
+    `say = functools.partial(print, file=sys.stderr)`, `say = sys.stderr.write`."""
+    streams, printers = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "sys":
+            streams |= {a.asname or a.name for a in node.names if a.name in ("stderr", "__stderr__")}
+        elif isinstance(node, ast.Assign) and ast.unparse(node.value) in STDERR:
+            streams |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            value = node.value
+            printer = (is_partial(value) and ast.unparse(value.args[0]) == "print"
+                       and any(k.arg == "file" and is_stderr(k.value, streams) for k in value.keywords)) \
+                or (isinstance(value, ast.Attribute) and value.attr == "write" and is_stderr(value.value, streams))
+            if printer:
+                printers |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    return streams, printers
+
+
+def is_stderr(expr, streams: set) -> bool:
+    return expr is not None and (ast.unparse(expr) in STDERR or (isinstance(expr, ast.Name) and expr.id in streams))
+
+
+def writes_to_stderr(call, streams: set, printers: set) -> bool:
+    """print(..., file=<stderr>), <stderr>.write(...), or a call of a name bound to one of them."""
+    f = call.func
+    if isinstance(f, ast.Name) and f.id == "print":
+        return any(k.arg == "file" and is_stderr(k.value, streams) for k in call.keywords)
+    if isinstance(f, ast.Attribute) and f.attr == "write":
+        return is_stderr(f.value, streams)
+    return isinstance(f, ast.Name) and f.id in printers
+
+
+def spelt_text(node, names: dict = None, seen: frozenset = frozenset()) -> str:
+    """The text an expression spells as far as its pieces are known: its string constants and chr(<int>) calls, in
+    source order and joined, so "warn" + "ing: " and chr(119) + "arning" both spell a warning. A name in it (an
+    argument, an f-string field, an item of a join or a + chain) is followed to what `names` says it was assigned
+    (every value, in order, each name once), and that text stands where the name stands."""
+    names = names or {}
+    pieces = []
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and hasattr(sub, "lineno"):
+            pieces.append((sub.lineno, sub.col_offset, sub.value))
+        elif isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "chr" \
+                and len(sub.args) == 1 and isinstance(sub.args[0], ast.Constant) and isinstance(sub.args[0].value, int):
+            try:
+                pieces.append((sub.lineno, sub.col_offset, chr(sub.args[0].value)))
+            except (ValueError, OverflowError):
+                pass
+        elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in names and sub.id not in seen:
+            text = "".join(spelt_text(value, names, seen | {sub.id}) for value in names[sub.id])
+            pieces.append((sub.lineno, sub.col_offset, text))
+    return "".join(p for _, _, p in sorted(pieces))
+
+
+def scope_assignments(scope) -> dict:
+    """{name: [values]} of the plain, annotated and augmented (+=) assignments made directly in a module or function
+    body, nested defs and lambdas left to their own scope."""
+    found: dict = {}
+
+    def visit(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, DEFS + (ast.Lambda,)):
+                continue
+            if isinstance(child, ast.Assign):
+                targets = child.targets
+            elif isinstance(child, (ast.AnnAssign, ast.AugAssign)) and child.value is not None:
+                targets = [child.target]
+            else:
+                targets = []
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    found.setdefault(target.id, []).append(child.value)
+            visit(child)
+
+    visit(scope)
+    return found
+
+
+def stderr_warning_findings(tree) -> list:
+    """Lines that write a `... warning: ...` line of their own to stderr: the lib's warn is the one spelling. Only
+    writes to stderr count (print to stdout, a table cell or a file is not a warning line). Stderr is sys.stderr,
+    sys.__stderr__, a name bound to either, or a partial of print or a bound .write on it. The text is what
+    spelt_text reads from the call: string constants and chr(<int>) pieces, and the names in it followed to their
+    assignments in the enclosing functions and at module level. Not covered: text built by a method call on a name
+    (parts.append(...), str.format on a variable template), a loop variable, or a function's return value."""
+    tree = live_tree(tree)
+    streams, printers = stderr_aliases(tree)
+    found = []
+
+    def visit(scope, chain: list):
+        inner = chain + [scope_assignments(scope)]
+        names: dict = {}
+        for level in inner:                                         # outer scopes first; every value counts
+            for name, values in level.items():
+                names.setdefault(name, []).extend(values)
+
+        def calls(node):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, DEFS):
+                    visit(child, inner)
+                    continue
+                if isinstance(child, ast.Call) and writes_to_stderr(child, streams, printers) \
+                        and "warning" in spelt_text(child, names).lower():
+                    found.append(child.lineno)
+                calls(child)
+
+        calls(scope)
+
+    visit(tree, [])
+    return sorted(found)
+
+
+ASCII = [chr(c) for c in range(128)]
+SLUGGED = [not (ch.isascii() and ch.isalnum()) for ch in ASCII]   # what session_folder turns into a dash
+
+
+def slug_pattern_findings(tree) -> list:
+    """Lines of a string constant that, as a regular expression, matches exactly the ASCII characters that
+    session_folder replaces (every non-alphanumeric): r"[^A-Za-z0-9]", r"[\\W_]" or r"\\W|_", however it is used
+    (re.sub, a module-level re.compile, a functools.partial)."""
+    found = []
+    for node in ast.walk(live_tree(tree)):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)) or len(node.value) > 60 \
+                or not set(node.value) & set("[\\|"):
+            continue
+        try:
+            pattern = re.compile(node.value)
+        except (re.error, RecursionError, OverflowError):
+            continue
+        if [pattern.fullmatch(ch) is not None for ch in ASCII] == SLUGGED:
+            found.append(node.lineno)
+    return found
+
+
+def is_dashes(node) -> bool:
+    """A string of dashes only: "-", "---", or "-" * n."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str) and node.value != "" and set(node.value) == {"-"}
+    return isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult) and (is_dashes(node.left)
+                                                                              or is_dashes(node.right))
+
+
+def maps_to_dashes(node, assigned: dict) -> bool:
+    """Whether a translation table (or the expression a name in it was assigned) maps characters to '-': a dict or
+    dict comprehension with a dash value, dict.fromkeys(keys, "-"), or str.maketrans(chars, dashes)."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Dict) and any(is_dashes(v) for v in sub.values if v is not None):
+            return True
+        if isinstance(sub, ast.DictComp) and is_dashes(sub.value):
+            return True
+        if isinstance(sub, ast.Call) and call_name(sub) in ("fromkeys", "maketrans") and len(sub.args) > 1 \
+                and is_dashes(sub.args[1]):
+            return True
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in assigned:
+            value = assigned.pop(sub.id)          # each name followed once: no cycle
+            if maps_to_dashes(value, assigned):
+                return True
+    return False
+
+
+def translate_findings(tree) -> list:
+    """Lines that translate characters to '-' (str.translate, str.maketrans, with the table inline or held in a
+    name): session_folder written another way. A translation that deletes or maps to anything else is not one."""
+    tree = live_tree(tree)
+    assigned = {t.id: n.value for n in ast.walk(tree) if isinstance(n, ast.Assign) for t in n.targets
+                if isinstance(t, ast.Name)}
+    return [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Call)
+            and call_name(node) in ("translate", "maketrans")
+            and maps_to_dashes(ast.Tuple(elts=list(node.args) + [k.value for k in node.keywords], ctx=ast.Load()),
+                               dict(assigned))]
+
+
+def copy_findings(tree) -> list:
+    """Everything in `tree` that is a copy of a cli.py or text.py export: a def, class or lambda shaped like one
+    or calling what one calls on the same constants, a run of statements shaped like one's whole body, a file read
+    or written the way read_json, write_json or write_text do, a warning line of its own. One string per finding."""
+    shapes, prints, windows = reference_shapes(), reference_fingerprints(), reference_windows()
+    tree = live_tree(tree)
+    found = []
+    for node in defs_in(tree):
+        if shape(node) in shapes:
+            found.append(f"{node.name}:{node.lineno} is a copy of {shapes[shape(node)]}")
+        elif fingerprint(node) in prints:
+            found.append(f"{node.name}:{node.lineno} calls what {prints[fingerprint(node)]} calls")
+    found += [f"line {line}: statements shaped like the body of {origin}" for line, origin in
+              window_findings(tree, windows)]
+    found += [f"line {line}: an inline read_json" for line in inline_read_findings(tree)]
+    found += [f"line {line}: a file written by hand (write_json and write_text do that)"
+              for line in inline_write_findings(tree)]
+    found += [f"line {line}: a warning line of its own (the lib's warn)" for line in stderr_warning_findings(tree)]
+    found += [f"line {line}: session_folder's pattern (every non-alphanumeric)" for line in slug_pattern_findings(tree)]
+    found += [f"line {line}: a character translation (session_folder does that)" for line in translate_findings(tree)]
+    return found
+
+
+@functools.lru_cache(maxsize=None)
+def tool_findings(tool: str) -> tuple:
+    return tuple(copy_findings(ast.parse((BIN / tool).read_text(encoding="utf-8"))))
+
+
 class ToolsAdoptTheLib(unittest.TestCase):
     """The source of harness-board and harness-pr: no copy of a moved helper under any name or disguise, every
     lib name imported and used from code that runs, no dead code to hide a use in, the run_main tail, and the
@@ -1105,7 +1472,7 @@ class ToolsAdoptTheLib(unittest.TestCase):
     def test_board_and_pr_define_none_of_the_moved_helpers(self):
         for tool in TOOLS:
             defined = top_level_names(BIN / tool)
-            for name in MOVED:
+            for name in sorted(set(MOVED) | set(EXPORTS)):
                 with self.subTest(tool=tool, name=name):
                     self.assertNotIn(name, defined, f"{tool} still defines {name}")
 
@@ -1212,6 +1579,725 @@ class ToolsAdoptTheLib(unittest.TestCase):
             for name, where in sorted(USED[tool].items()) + [("run_main", "cli")]:
                 with self.subTest(tool=tool, name=name):
                     self.assertIs(getattr(module, name, None), getattr(libs[where], name))
+
+
+class ToolsHaveNoCopyOfAnyExport(unittest.TestCase):
+    """The whole of cli.py and text.py is the reference, not just what #82 moved: read_json, harness_home,
+    same_path, session_folder, parse_iso_seconds, age_text, run_main, warn and the rest are checked by shape, by
+    what they call, as a run of statements pasted inside another function, and as a file read or written by
+    hand."""
+
+    def test_every_public_def_of_cli_and_text_is_a_reference(self):
+        """A new export of either module must be added to the copy check: it cannot be left out silently."""
+        for path in (CLI_PY, TEXT_PY):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            public = {n.name for n in tree.body if isinstance(n, DEFS) and not n.name.startswith("_")}
+            with self.subTest(file=path.name):
+                self.assertLessEqual(public, set(EXPORTS), f"{path.name} exports {sorted(public - set(EXPORTS))} "
+                                                           "that the copy check does not know")
+        referenced = {node.name for origin, node in reference_defs() if origin != "before"}
+        self.assertEqual(sorted(set(EXPORTS) - referenced), [])
+
+    def test_board_and_pr_contain_no_copy_of_any_export_under_any_name_or_inline(self):
+        for tool in TOOLS:
+            with self.subTest(tool=tool):
+                self.assertEqual(list(tool_findings(tool)), [], f"{tool} carries a copy of a harness_lib function")
+
+    def enclosing_calls(self, tool: str, name: str) -> list:
+        """The names of the functions in `tool` that call `name(...)`, one entry per call."""
+        tree = ast.parse((BIN / tool).read_text(encoding="utf-8"))
+        found = []
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                found += [fn.name for sub in ast.walk(fn) if isinstance(sub, ast.Call)
+                          and isinstance(sub.func, ast.Name) and sub.func.id == name]
+        return found
+
+    def test_the_budgets_file_is_written_by_write_json_and_not_by_write_text(self):
+        """Pretty JSON and a newline is write_json (the owner's note on the #82 review: the budgets file is written by
+        write_json with the same bytes); write_text is for text that is not JSON. However the JSON text is held
+        (a variable, +=, an f-string), mark_cloud_exhausted calls write_json and never write_text. Other callers of
+        either are not this test's business: a later state file written through the lib is welcome."""
+        self.assertIn("mark_cloud_exhausted", self.enclosing_calls("harness-pr", "write_json"))
+        self.assertNotIn("mark_cloud_exhausted", self.enclosing_calls("harness-pr", "write_text"))
+
+    def test_board_and_pr_write_no_file_by_hand(self):
+        """No write-mode open, Path.write_text, mkstemp, os.replace, json.dump or indented json.dumps in either
+        tool: files are written by the lib, and the tools have no write that could stand in for it."""
+        for tool in TOOLS:
+            tree = ast.parse((BIN / tool).read_text(encoding="utf-8"))
+            with self.subTest(tool=tool):
+                self.assertEqual(inline_write_findings(tree), [])
+
+
+BAD_PROGS = ("harness_pr", "harness-pr:", "harness-pr ", "harness-board", "harness_board", "Harness-pr", "pr", "")
+
+
+def warn_call_is_spelt(call, tool: str) -> bool:
+    """`warn("<tool>", message)`: the constant tool name first, exactly two positional arguments, no keywords."""
+    return len(call.args) == 2 and not call.keywords and not any(isinstance(a, ast.Starred) for a in call.args) \
+        and isinstance(call.args[0], ast.Constant) and call.args[0].value == tool
+
+
+def warn_spelling_findings(tree, tool: str) -> list:
+    """Every use of `warn` in a tool is a call spelt as warn_call_is_spelt says. `warn` passed, aliased, wrapped in
+    a partial or rebound is a finding too: then a call site could spell the prog name any way."""
+    names, calls = [], {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id == "warn":
+            names.append(n)
+        elif isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "warn":
+            calls[id(n.func)] = n
+    found = []
+    for node in names:
+        call = calls.get(id(node))
+        if call is None:
+            found.append(f"line {node.lineno}: warn used other than called")
+        elif not warn_call_is_spelt(call, tool):
+            found.append(f"line {call.lineno}: {ast.unparse(call)[:80]} is not warn({tool!r}, message)")
+    return found
+
+
+def warn_call_sites(tree) -> list:
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "warn"]
+
+
+class ToolsWarnAndReachStderrOnlyTheirOwnWay(unittest.TestCase):
+    """Every warning a tool gives is the lib's warn with the tool's own name, at every call site (not only the two
+    the run tests drive), and no line the tool writes to stderr by itself is a warning, however it is built: its
+    other stderr lines (failures, a pass-through) are its own business."""
+
+    def tree(self, tool: str):
+        return ast.parse((BIN / tool).read_text(encoding="utf-8"))
+
+    def test_every_warn_call_in_board_and_pr_names_the_tool(self):
+        for tool in TOOLS:
+            tree = self.tree(tool)
+            with self.subTest(tool=tool):
+                self.assertNotEqual(warn_call_sites(tree), [], f"{tool} gives no warning: nothing to check")
+                self.assertEqual(warn_spelling_findings(tree, tool), [])
+
+    def test_a_misspelt_prog_at_any_one_warn_call_site_is_found(self):
+        """Each call site in turn, in an in-memory copy of the tool, gets each wrong spelling: the site's call is
+        refused, and the whole-tool check finds exactly that one site (the first, a middle and the last site run
+        through the whole check; every site through the per-call rule)."""
+        for tool in TOOLS:
+            tree = self.tree(tool)
+            sites = warn_call_sites(tree)
+            whole = {0, len(sites) // 2, len(sites) - 1}
+            for i, call in enumerate(sites):
+                original = call.args[0]
+                for bad in BAD_PROGS:
+                    if bad == tool:
+                        continue
+                    with self.subTest(tool=tool, site=i, line=call.lineno, prog=bad):
+                        call.args[0] = ast.Constant(bad)
+                        try:
+                            self.assertFalse(warn_call_is_spelt(call, tool))
+                            if i in whole:
+                                found = warn_spelling_findings(tree, tool)
+                                self.assertEqual(len(found), 1, found)
+                                self.assertIn(f"line {call.lineno}:", found[0])
+                        finally:
+                            call.args[0] = original
+                self.assertTrue(warn_call_is_spelt(call, tool), f"{tool}:{call.lineno}")
+
+    def test_warn_rebound_wrapped_or_given_a_variable_prog_is_found(self):
+        plants = (
+            'say = warn\n\ndef f():\n    say("harness_x", "m")\n',
+            'say = functools.partial(warn, "{tool}")\n',
+            'PROG = "{tool}"\n\ndef f():\n    warn(PROG, "m")\n',
+            'def f():\n    warn("{tool}", "m", file=sys.stdout)\n',
+            'def f():\n    warn("{tool}", "a", "b")\n',
+            'def f():\n    warn(*("{tool}", "m"))\n',
+            'def f():\n    warn(f"{tool}", "m")\n',
+        )
+        for tool in TOOLS:
+            source = (BIN / tool).read_text(encoding="utf-8")
+            for plant in plants:
+                with self.subTest(tool=tool, plant=plant):
+                    tree = ast.parse(source + "\n\n" + plant.replace("{tool}", tool))
+                    self.assertNotEqual(warn_spelling_findings(tree, tool), [])
+
+    def test_no_line_board_or_pr_write_to_stderr_by_themselves_is_a_warning(self):
+        for tool in TOOLS:
+            with self.subTest(tool=tool):
+                self.assertEqual(stderr_warning_findings(self.tree(tool)), [])
+
+    def test_a_hand_written_stderr_warning_in_board_or_pr_is_found(self):
+        """In the tool's own source: a warning spelt with chr(), one printed to an alias of stderr, and one added
+        inside each function that already writes its own stderr lines (found here, not named) are all found."""
+        plants = (
+            'def caution(msg):\n    print("{tool}: " + chr(119) + "arning: " + msg, file=sys.stderr)\n',
+            'ERR = sys.stderr\n\n\ndef caution(msg):\n    print(f"{tool}: warn" "ing: " + msg, file=ERR)\n',
+            'def caution(m):\n    msg = "{tool}: warning: " + m\n    print(msg, file=sys.stderr)\n',
+            'CAUTION = "{tool}: warning:"\n\n\ndef caution(m):\n    sys.stderr.write(f"{CAUTION} {m}\\n")\n',
+        )
+        for tool in TOOLS:
+            source = (BIN / tool).read_text(encoding="utf-8")
+            for plant in plants:
+                with self.subTest(tool=tool, plant=plant):
+                    tree = ast.parse(source + "\n\n" + plant.replace("{tool}", tool))
+                    self.assertEqual(len(stderr_warning_findings(tree)), 1)
+            tree = self.tree(tool)
+            streams, printers = stderr_aliases(tree)
+            writers = [fn for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and any(isinstance(c, ast.Call) and writes_to_stderr(c, streams, printers) for c in ast.walk(fn))]
+            self.assertNotEqual(writers, [], f"{tool} writes no stderr line of its own: the plant has nowhere to go")
+            for fn in writers:
+                with self.subTest(tool=tool, inside=fn.name):
+                    fn.body.insert(0, ast.parse('sys.stderr.write("x: " + chr(87) + "ARNING: m\\n")').body[0])
+                    try:
+                        self.assertEqual(len(stderr_warning_findings(tree)), 1)
+                    finally:
+                        del fn.body[0]
+
+
+# Renamed, independently written copies of every export, as a tool might paste them: names, parameters and
+# locals changed, annotations and docstrings dropped.
+PLANTED_DEFS = {
+    "Problem": r'''
+class Trouble(Exception):
+    """a failed precondition"""
+''',
+    "Parser": r'''
+class Options(argparse.ArgumentParser):
+    def error(self, msg):
+        sys.exit(f"{self.prog}: error: {msg}")
+''',
+    "run_main": r'''
+def execute(label, entry):
+    try:
+        entry()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
+    except Trouble as e:
+        sys.exit(f"{label}: {squash(e)}")
+    except Exception as e:
+        sys.exit(f"{label}: {type(e).__name__}: {squash(e)}")
+    sys.exit(0)
+''',
+    "emit": r'''
+def show(flag, payload, words):
+    print(json.dumps(payload, indent=2, ensure_ascii=False) if flag else words)
+''',
+    "table": r'''
+def grid(lines):
+    cols = [max(len(l[k]) for l in lines) for k in range(len(lines[0]) - 1)]
+    return "\n".join("  ".join([c.ljust(w) for c, w in zip(l, cols)] + [l[-1]]).rstrip() for l in lines)
+''',
+    "issue_number": r'''
+def ticket_arg(raw):
+    num = raw.lstrip("#")
+    if not num.isdigit() or int(num) <= 0:
+        raise argparse.ArgumentTypeError(f"not an issue number: {raw!r}")
+    return int(num)
+''',
+    "warn": r'''
+def caution(tool, msg):
+    print(f"{tool}: warning: {squash(msg)}", file=sys.stderr)
+''',
+    "one_line": r'''
+def squash(value):
+    return " ".join(str(value).split())
+''',
+    "first_line": r'''
+def head_line(blob):
+    for row in (blob or "").splitlines():
+        if row.strip():
+            return row.strip()
+    return ""
+''',
+    "last_line": r'''
+def tail_line(blob):
+    rows = [row.strip() for row in (blob or "").splitlines() if row.strip()]
+    return rows[-1] if rows else ""
+''',
+    "as_list": r'''
+def records(val):
+    if isinstance(val, dict):
+        val = val.get("nodes")
+    return [v for v in val if isinstance(v, dict)] if isinstance(val, list) else []
+''',
+    "read_text": r'''
+def slurp(where, label):
+    try:
+        with open(os.path.expanduser(where), encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError as e:
+        raise Trouble(f"cannot read {label} {where}: {e.strerror or e}") from None
+''',
+    "read_json": r'''
+def load_blob(where):
+    try:
+        with open(where, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+''',
+    "write_json": r'''
+def save_blob(where, blob, *, pre):
+    def dump(handle):
+        json.dump(blob, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    _swap(where, pre, ".json", dump)
+''',
+    "write_text": r'''
+def save_text(where, body, *, pre):
+    _swap(where, pre, "", lambda handle: handle.write(body))
+''',
+    "home": r'''
+def under_home(*bits):
+    return os.path.join(os.path.expanduser("~"), *bits)
+''',
+    "harness_home": r'''
+def state_path(*bits):
+    return under_home(".claude", "harness", *bits)
+''',
+    "now_iso": r'''
+def stamp():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+''',
+    "parse_iso": r'''
+def to_datetime(raw):
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    raw = raw.strip()
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
+    try:
+        moment = dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=dt.timezone.utc)
+''',
+    "parse_iso_seconds": r'''
+def to_epoch(raw):
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        moment = dt.datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (moment if moment.tzinfo else moment.astimezone()).timestamp()
+''',
+    "age_text": r'''
+def ago(past, present):
+    secs = max(0, present - past)
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h ago"
+    if secs < 86400 * 60:
+        return f"{int(secs // 86400)}d ago"
+    if secs < 86400 * 730:
+        return f"{int(secs // (86400 * 30))}mo ago"
+    return f"{int(secs // (86400 * 365))}y ago"
+''',
+    "same_path": r'''
+def same_place(x, y):
+    return os.path.realpath(os.path.abspath(os.path.expanduser(x))) == os.path.realpath(
+        os.path.abspath(os.path.expanduser(y)))
+''',
+    "session_folder": r'''
+def folder_slug(where):
+    return re.sub(r"[^A-Za-z0-9]", "-", where)
+''',
+}
+# Statements lifted out of an export and pasted inside another function, and the same job written out by hand.
+PLANTED_INLINE = {
+    "read_json, result kept in a variable": r'''
+def settings():
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = None
+    return data
+''',
+    "read_json, one handler for each error": r'''
+def settings():
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError:
+        data = {}
+    except ValueError:
+        data = {}
+    return data
+''',
+    "read_json body verbatim in a branch": r'''
+def settings(use_file):
+    if use_file:
+        try:
+            with open(SETTINGS_PATH, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+    return {}
+''',
+    "one_line body verbatim": r'''
+def describe(err):
+    print("failed")
+    return " ".join(str(err).split())
+''',
+    "first_line body verbatim": r'''
+def title(text):
+    seen = 0
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+''',
+    "write_json spelled out for write_text": r'''
+def save(path, data):
+    write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", prefix=".mine-")
+''',
+    "json.dump to a handle": r'''
+def save(handle, data):
+    json.dump(data, handle, indent=2, ensure_ascii=False)
+''',
+    "temporary file renamed over the target": r'''
+def save(path, text):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+''',
+    "pretty JSON held in a variable, newline added with +=, written with open": r'''
+def save(path, data):
+    body = json.dumps(data, indent=2, ensure_ascii=False)
+    body += "\n"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+''',
+    "pretty JSON in an f-string": r'''
+def save(path, data):
+    body = f"{json.dumps(data, indent=2)}\n"
+    write_text(path, body, prefix=".x-")
+''',
+    "indent only": r'''
+def save(path, data):
+    write_text(path, json.dumps(data, indent=2), prefix=".x-")
+''',
+    "Path.write_text": r'''
+def save(path, data):
+    Path(path).write_text(str(data), encoding="utf-8")
+''',
+    "open for append, mode as a keyword": r'''
+def save(path, line):
+    with open(path, mode="a") as fh:
+        fh.write(line)
+''',
+    "open with a mode held in a variable": r'''
+def save(path, line, how):
+    with open(path, how) as fh:
+        fh.write(line)
+''',
+    "read_json with Path.read_text and json.loads": r'''
+def settings(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+''',
+    "read_json with read() and json.loads, result kept": r'''
+def settings(path):
+    data = None
+    try:
+        fh = open(path, encoding="utf-8")
+        data = json.loads(fh.read())
+    except Exception:
+        pass
+    return data
+''',
+    "a warning line of its own": r'''
+def complain(message):
+    print(f"harness-x: warning: {message}", file=sys.stderr)
+''',
+    "a warning line written to stderr": r'''
+def complain(message):
+    sys.stderr.write("warning: " + message + "\n")
+''',
+    "a warning line built from string pieces, printed to stderr": r'''
+def caution(tool, msg):
+    print(tool + ": " + "warn" + "ing: " + " ".join(str(msg).split()), file=sys.stderr)
+''',
+    "a warning line built from f-string pieces, written to stderr": r'''
+def caution(tool, msg):
+    sys.stderr.write(f"{tool}: WARN" f"ING: {msg}" + "\n")
+''',
+    "a warning spelt with chr(), printed to stderr": r'''
+def caution(msg):
+    print("harness-x: " + chr(119) + "arning: " + msg, file=sys.stderr)
+''',
+    "a warning joined from a list, written to stderr": r'''
+def caution(msg):
+    sys.stderr.write("".join(["harness-x: ", "warn", "ing: ", msg, "\n"]))
+''',
+    "a warning to sys.__stderr__": r'''
+def caution(msg):
+    print("harness-x: warning: " + msg, file=sys.__stderr__)
+''',
+    "a warning through `from sys import stderr`": r'''
+from sys import stderr as err
+
+
+def caution(msg):
+    err.write(f"harness-x: warning: {msg}\n")
+''',
+    "a warning through a partial of print to stderr": r'''
+say = functools.partial(print, file=sys.stderr)
+
+
+def caution(msg):
+    say("harness-x: warning: " + msg)
+''',
+    "a warning through sys.stderr.write held in a name": r'''
+say = sys.stderr.write
+
+
+def caution(msg):
+    say("harness-x: warning: " + msg + "\n")
+''',
+    "a warning held in a local variable, then printed to stderr": r'''
+def caution(m):
+    msg = "harness-x: warning: " + m
+    print(msg, file=sys.stderr)
+''',
+    "a warning built up with += in a variable, then written to stderr": r'''
+def caution(m):
+    msg = "harness-x: "
+    msg += "warn" "ing: " + m + "\n"
+    sys.stderr.write(msg)
+''',
+    "a warning prefix in a module-level constant, in an f-string to stderr": r'''
+PREFIX = "harness-x: warning:"
+
+
+def caution(m):
+    print(f"{PREFIX} {m}", file=sys.stderr)
+''',
+    "a warning through two variables and a join": r'''
+def caution(m):
+    head = "warn"
+    line = " ".join([head + "ing:", m])
+    print(line, file=sys.stderr)
+''',
+    "a warning in an outer function's variable, printed by a nested one": r'''
+def outer(m):
+    label = "harness-x: warning: "
+
+    def inner():
+        sys.stderr.write(label + m + "\n")
+    inner()
+''',
+    "session_folder through str.translate": r'''
+def folder_slug(where):
+    return where.translate({c: "-" for c in range(128) if not chr(c).isalnum()})
+''',
+    "session_folder through str.maketrans": r'''
+SLUG = str.maketrans(dict.fromkeys(string.punctuation + " ", "-"))
+''',
+    "session_folder through a module-level compiled pattern": r'''
+SESS_RE = re.compile(r"[^A-Za-z0-9]")
+
+
+def folder_slug(where):
+    return SESS_RE.sub("-", where)
+''',
+    "session_folder with the pattern spelled [\\W_]": r'''
+def folder_slug(where):
+    return re.sub(r"[\W_]", "-", where)
+''',
+    "session_folder with the pattern spelled \\W|_ in a constant": r'''
+NON_ALNUM = r"\W|_"
+''',
+    "session_folder as a module-level functools.partial": r'''
+folder_slug = functools.partial(re.sub, r"[^A-Za-z0-9]", "-")
+''',
+    "home as a module-level functools.partial": r'''
+under_home = functools.partial(os.path.join, os.path.expanduser("~"))
+''',
+    "harness_home as a partial imported from functools, inside a function": r'''
+def state(*bits):
+    state_path = partial(home, ".claude", "harness")
+    return state_path(*bits)
+''',
+}
+# Reads and writes that are not copies of an export: they report, or are not what the exports do.
+NOT_COPIES = {
+    "a read that reports a bad file as a Problem": r'''
+def load_projects():
+    path = harness_home("projects.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except ValueError as err:
+        raise Problem(f"{path} is not valid JSON ({err})") from None
+    except OSError as err:
+        raise Problem(f"cannot read {path}: {err.strerror or err}") from None
+    return data["projects"]
+''',
+    "json.dumps on one line for gh": r'''
+def post(call, payload):
+    return call(stdin=json.dumps(payload))
+''',
+    "print of compact JSON": r'''
+def show(data):
+    print(json.dumps(data, sort_keys=True))
+''',
+    "a read-mode open, mode given": r'''
+def first_bytes(path):
+    with open(path, "rb") as fh:
+        return fh.read(4)
+''',
+    "a read-mode open with encoding only": r'''
+def text(path):
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+''',
+    "a JSON parse of text already in hand": r'''
+def parsed(out):
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+''',
+    "a stderr line that is not a warning": r'''
+def failed(number, names):
+    sys.stderr.write(f"harness-pr: checks failed on PR #{number}: {', '.join(names)}\n")
+''',
+    "a plain function": r'''
+def ticket(number):
+    return {"number": number, "title": "x" * number}
+''',
+    "a pattern that keeps the dash": r'''
+def slug(name):
+    return re.sub(r"[^A-Za-z0-9-]", "-", name)
+''',
+    "a pattern of the alphanumerics themselves": r'''
+OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
+''',
+    "a pattern of the non-word characters (the underscore kept)": r'''
+def words(text):
+    return re.split(r"\W+", text)
+''',
+    "a functools.partial of something no export does": r'''
+run = functools.partial(subprocess.run, capture_output=True, text=True)
+''',
+    "a count of warnings printed to stdout": r'''
+def summary(n):
+    print(f"{n} warnings found")
+''',
+    "a table cell that says warning": r'''
+def listing():
+    print(table([("#1", "warning")]))
+''',
+    "a warning word written to stdout explicitly": r'''
+def note(msg):
+    print("warning: " + msg, file=sys.stdout)
+    sys.stdout.write("warning\n")
+''',
+    "a variable named for warnings, holding a count, on stderr": r'''
+def report(errors):
+    warnings = len(errors)
+    print(f"harness-x: {warnings} checks failed", file=sys.stderr)
+''',
+    "a warning text in another function's variable, not this one's": r'''
+def a():
+    msg = "harness-x: warning: unrelated"
+    return len(msg)
+
+
+def b(m):
+    msg = "harness-x: " + m
+    print(msg, file=sys.stderr)
+''',
+    "a warning text in a variable printed to stdout": r'''
+def note(m):
+    msg = "warning: " + m
+    print(msg)
+''',
+    "a translation that deletes characters": r'''
+def clean(s):
+    return s.translate({0: None})
+''',
+    "a translation of dashes to underscores": r'''
+UNDERSCORES = str.maketrans("-", "_")
+''',
+    "a JSON parse of standard input": r'''
+def from_stdin():
+    try:
+        return json.loads(sys.stdin.read())
+    except ValueError:
+        return None
+''',
+}
+
+
+class CopyChecksCatchPlants(unittest.TestCase):
+    """The copy check can fail: a renamed copy of any export, in a tool-shaped source, is found; so is the same
+    code nested in a function, and an inline body. Code that merely resembles one is left alone."""
+
+    def test_the_plants_cover_every_export(self):
+        self.assertEqual(sorted(PLANTED_DEFS), sorted(EXPORTS))
+
+    def test_a_renamed_copy_of_each_export_is_found(self):
+        for name, source in PLANTED_DEFS.items():
+            with self.subTest(export=name):
+                self.assertNotEqual(copy_findings(ast.parse(source)), [], f"a renamed {name} was not found")
+
+    def test_a_renamed_copy_nested_in_a_function_or_class_is_found(self):
+        for name, source in PLANTED_DEFS.items():
+            for outer in ("def outer():\n", "class Outer:\n"):
+                with self.subTest(export=name, inside=outer.split()[0]):
+                    nested = outer + textwrap.indent(source, "    ")
+                    self.assertNotEqual(copy_findings(ast.parse(nested)), [])
+
+    def test_a_copy_padded_with_dead_code_and_annotations_is_found(self):
+        padded = r'''
+def read_it(where: str) -> object:
+    """Read the file."""
+    if False:
+        print("never")
+    try:
+        with open(where, encoding="utf-8") as handle:
+            return json.load(handle)
+        print("after the return")
+    except (OSError, ValueError):
+        return None
+    pass
+'''
+        self.assertNotEqual(copy_findings(ast.parse(padded)), [])
+
+    def test_an_inline_body_is_found(self):
+        for what, source in PLANTED_INLINE.items():
+            with self.subTest(what=what):
+                self.assertNotEqual(copy_findings(ast.parse(source)), [], what)
+
+    def test_code_that_only_resembles_an_export_is_not_a_copy(self):
+        for what, source in NOT_COPIES.items():
+            with self.subTest(what=what):
+                self.assertEqual(copy_findings(ast.parse(source)), [], what)
+
+    def test_a_tool_with_a_planted_copy_would_fail_the_tool_check(self):
+        """The real tools' source plus one planted copy is flagged, with the finding naming the plant."""
+        for tool in TOOLS:
+            source = (BIN / tool).read_text(encoding="utf-8")
+            before = len(tool_findings(tool))
+            for export in ("read_json", "age_text"):
+                with self.subTest(tool=tool, export=export):
+                    planted = ast.parse(source + "\n\n" + PLANTED_DEFS[export])
+                    self.assertGreater(len(copy_findings(planted)), before,
+                                       f"{tool} + a renamed {export} passed the copy check")
 
 
 class ToolsRunTheLib(unittest.TestCase):
@@ -1581,16 +2667,155 @@ class ToolsRunTheLib(unittest.TestCase):
         pr = load_tool(BIN / "harness-pr")
         self.assertIs(type(pr.parser()), self.cli.Parser)
 
-    def test_pr_writes_files_through_the_lib(self):
+    def test_pr_writes_the_budgets_file_through_write_json_with_the_same_bytes(self):
+        """mark_cloud_exhausted is write_json(path, data, prefix=".harness-pr-"): the file is indented JSON, non-ASCII
+        kept, one newline at the end, other keys kept, and write_text is not the way it is written."""
+        pr = load_tool(BIN / "harness-pr")
+        budgets = os.path.join(self.tmp, ".claude", "harness", "budgets.json")
+        os.makedirs(os.path.dirname(budgets))
+        with open(budgets, "w", encoding="utf-8") as fh:
+            json.dump({"api": {"exhausted_until": "2030-01-01T00:00:00Z"}, "note": "café"}, fh)
+        self.spy(pr, self.text.read_json, "read_json")
+        self.spy(pr, self.text.write_json, "write_json")
+        self.spy(pr, self.text.write_text, "write_text")
+        untils = []
+        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
+            for reason in ("weekly limit", "quota (token-7) ☃"):
+                until = pr.mark_cloud_exhausted(reason)
+                untils.append(until)
+                want = {"api": {"exhausted_until": "2030-01-01T00:00:00Z"}, "note": "café",
+                        "cloud": {"exhausted_until": until, "reason": reason}}
+                with open(budgets, "rb") as fh:
+                    raw = fh.read()
+                self.assertEqual(raw, (json.dumps(want, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+                self.assertRegex(until, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual(self.given("write_json"), [budgets, budgets])
+        self.assertEqual([kwargs for _, kwargs in self.called("write_json")], [{"prefix": ".harness-pr-"}] * 2)
+        # the data it was given is the whole budgets document, not a stand-in
+        self.assertEqual([args[1] for args, _ in self.called("write_json")], [
+            {"api": {"exhausted_until": "2030-01-01T00:00:00Z"}, "note": "café",
+             "cloud": {"exhausted_until": untils[0], "reason": "weekly limit"}},
+            {"api": {"exhausted_until": "2030-01-01T00:00:00Z"}, "note": "café",
+             "cloud": {"exhausted_until": untils[1], "reason": "quota (token-7) ☃"}}])
+        self.assertEqual(self.called("write_text"), [], "the budgets file is JSON: write_json, not write_text")
+        self.assertEqual(self.given("read_json"), [budgets, budgets])
+        self.assertEqual([n for n in os.listdir(os.path.dirname(budgets)) if n.startswith(".harness-pr-")], [])
+
+    def test_pr_budgets_file_is_whatever_write_json_leaves_and_nothing_after_it(self):
+        """With write_json replaced by a stand-in that writes a marker, the file holds the marker and only the marker
+        after mark_cloud_exhausted: nothing else writes the file before, after or instead of write_json, and
+        write_json is handed the real document (not an empty one) and the return value is its `exhausted_until`."""
+        for reason in ("weekly limit", "plan limit ☃"):
+            with self.subTest(reason=reason):
+                pr = load_tool(BIN / "harness-pr")
+                folder = os.path.join(self.tmp, reason[:4], ".claude", "harness")
+                budgets = os.path.join(folder, "budgets.json")
+                os.makedirs(folder)
+                with open(budgets, "w", encoding="utf-8") as fh:
+                    json.dump({"keep": [1, 2]}, fh)
+                given = []
+
+                def stand_in(path, data, **kwargs):
+                    given.append((path, copy.deepcopy(data), kwargs))
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write("MARKER\n")
+
+                with mock.patch.dict(os.environ, {"HOME": os.path.dirname(os.path.dirname(folder))}), \
+                        mock.patch.object(pr, "write_json", stand_in, create=True):
+                    until = pr.mark_cloud_exhausted(reason)
+                with open(budgets, encoding="utf-8") as fh:
+                    self.assertEqual(fh.read(), "MARKER\n")
+                self.assertEqual(given, [(budgets, {"keep": [1, 2], "cloud": {"exhausted_until": until,
+                                                                              "reason": reason}},
+                                          {"prefix": ".harness-pr-"})])
+                self.assertEqual(os.listdir(folder), ["budgets.json"])
+
+    def test_pr_writes_the_ultrareview_output_through_write_text(self):
+        """Text that is not (known to be) JSON is written as given through write_text, in a `.harness-pr-` temporary
+        file: cmd_ultra saves claude's stdout byte for byte."""
         pr = load_tool(BIN / "harness-pr")
         self.spy(pr, self.text.write_text, "write_text")
-        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
-            for reason in ("weekly limit", "quota (token-7)"):
-                pr.mark_cloud_exhausted(reason)
-        budgets = os.path.join(self.tmp, ".claude", "harness", "budgets.json")
-        self.assertEqual(self.given("write_text"), [budgets, budgets])
-        with open(budgets, encoding="utf-8") as fh:
-            self.assertEqual(json.load(fh)["cloud"]["reason"], "quota (token-7)")
+        saved = os.path.join(self.tmp, "state", "ultra", "9.json")
+        out = '{"findings": [], "note": "\u2603"}\n\n'
+        claude = self.fake_exe("claude", f"printf '%s' '{out}'\n")
+        repo = mock.Mock(root=self.tmp)
+        repo.state = lambda *parts: os.path.join(self.tmp, "state", *parts)
+        args = argparse.Namespace(number=9, post=False)
+        with mock.patch.dict(os.environ, {"HARNESS_CLAUDE": claude, "HOME": self.tmp}), \
+                mock.patch.object(pr, "open_repo", lambda: repo):
+            _, printed, _ = capture(pr.cmd_ultra, args)
+        self.assertIn("no findings", printed)
+        self.assertEqual(self.given("write_text"), [saved])
+        self.assertEqual(self.called("write_text")[0][1], {"prefix": ".harness-pr-"})
+        with open(saved, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), out)
+
+    def test_pr_warns_through_the_lib_with_its_own_spelling_byte_for_byte(self):
+        """`harness-pr: warning: <message on one line>`: the prog name is harness-pr and the message is the tool's
+        own words; a different prog, a different separator or a second line fails it."""
+        pr = load_tool(BIN / "harness-pr")
+        pr.open_repo = lambda: mock.Mock(root=self.tmp)
+        pr.pr_view = lambda repo, number, fields: {"statusCheckRollup": []}
+        args = argparse.Namespace(number=41, wait=False, json=False, timeout=0)
+        with mock.patch.dict(os.environ, {"HOME": self.tmp, "HARNESS_POLL_SECONDS": "0"}):
+            code, out, err = capture(pr.cmd_checks, args)
+        self.assertEqual((code, out), (0, ""))
+        self.assertEqual(err, "harness-pr: warning: no checks registered on PR #41\n")
+        pr = load_tool(BIN / "harness-pr")
+        pr.open_repo = lambda: mock.Mock(root=self.tmp)
+        pr.pr_view = lambda repo, number, fields: {"statusCheckRollup": []}
+        self.spy(pr, self.cli.warn, "warn")
+        args.number = 7
+        with mock.patch.dict(os.environ, {"HOME": self.tmp, "HARNESS_POLL_SECONDS": "0"}):
+            capture(pr.cmd_checks, args)
+        self.assertEqual([a for a, _ in self.called("warn")], [("harness-pr", "no checks registered on PR #7")])
+
+    def test_pr_emits_through_the_lib_with_a_bool(self):
+        """`checks --json` prints its result through the lib's emit(True, data, ""): indented JSON, non-ASCII kept;
+        without --json nothing is emitted."""
+        for number, as_json in ((41, True), (7, True), (12, False)):
+            with self.subTest(number=number, json=as_json):
+                self.calls.clear()
+                pr = load_tool(BIN / "harness-pr")
+                pr.open_repo = lambda: mock.Mock(root=self.tmp)
+                pr.pr_view = lambda repo, n, fields: {"statusCheckRollup": []}
+                self.spy(pr, self.cli.emit, "emit")
+                args = argparse.Namespace(number=number, wait=False, json=as_json, timeout=0)
+                with mock.patch.dict(os.environ, {"HOME": self.tmp, "HARNESS_POLL_SECONDS": "0"}):
+                    code, out, _ = capture(pr.cmd_checks, args)
+                self.assertEqual(code, 0)
+                calls = self.called("emit")
+                if not as_json:
+                    self.assertEqual((calls, out), ([], ""))
+                    continue
+                expected = {"number": number, "state": "none", "checks": [], "failed": [], "pending": [], "logs": []}
+                self.assertEqual(len(calls), 1, calls)
+                self.assertIs(calls[0][0][0], True)
+                self.assertEqual(calls[0][0][1], expected)
+                self.assertEqual(out, json.dumps(expected, indent=2, ensure_ascii=False) + "\n")
+
+    def test_pr_warning_with_a_message_on_several_lines_is_one_line(self):
+        """warn("harness-pr", ...) is `one_line`d by the lib: an `awaiting --all-projects` project that cannot be
+        read is one `harness-pr: warning: <name>: <problem>` line, never two."""
+        pr = load_tool(BIN / "harness-pr")
+        home = os.path.join(self.tmp, "h")
+        os.makedirs(os.path.join(home, ".claude", "harness"))
+        project = os.path.join(self.tmp, "proj")
+        os.makedirs(project)
+        with open(os.path.join(home, ".claude", "harness", "projects.json"), "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "projects": [{"name": "demo", "path": project}]}, fh)
+        pr.git = lambda path, *a: mock.Mock(returncode=0)
+
+        def broken(repo, project=None):
+            raise self.cli.Problem("gh pr list failed:\n  HTTP 502\n  Bad Gateway")
+
+        pr.awaiting_in = broken
+        pr.Repo = lambda path: object()
+        args = argparse.Namespace(all_projects=True, json=False)
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            code, out, err = capture(pr.cmd_awaiting, args)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "harness-pr: warning: demo: gh pr list failed: HTTP 502 Bad Gateway\n")
 
     def test_pr_reads_files_through_the_lib_and_raises_its_problem(self):
         pr = load_tool(BIN / "harness-pr")
@@ -1792,6 +3017,148 @@ class ToolsRunTheLib(unittest.TestCase):
         self.assertEqual(len(self.called("table")), 1)
         self.assertIn("#7", out)
         self.assertIn("#131", out)
+
+
+# ================================================================ the tools without the lib
+
+
+class ToolsWithoutTheLib(unittest.TestCase):
+    """A copy of the tool under a temporary bin/ finds its lib at ../lib (next to bin/). Without it, or with a lib
+    that will not import, the tool says so in one line and exits 1: `<tool>: cannot load harness_lib from <lib>:
+    <error>`, never a traceback, in the style of the hooks' fail-open line."""
+
+    def setUp(self) -> None:
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="harness-nolib-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.env = {"PATH": SYSTEM_PATH, "HOME": self.tmp, "LANG": "en_US.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONIOENCODING": "utf-8"}
+
+    def install(self, tool: str, name: str) -> tuple:
+        """(path of the tool, path of its lib) for a copy of `tool` in <tmp>/<name>/bin, lib not created."""
+        root = os.path.join(self.tmp, name)
+        os.makedirs(os.path.join(root, "bin"))
+        path = os.path.join(root, "bin", tool)
+        shutil.copy(BIN / tool, path)
+        os.chmod(path, 0o755)
+        return path, os.path.join(root, "lib")
+
+    def run_tool(self, path: str, *argv: str) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, "-B", path, *argv], capture_output=True, text=True, env=self.env,
+                              cwd=self.tmp, timeout=60)
+
+    def test_a_tool_with_no_lib_beside_it_says_so_in_one_line_and_exits_1(self):
+        for tool in TOOLS:
+            for argv in ((), ("--help",), ("board",), ("show", "5")):
+                with self.subTest(tool=tool, argv=argv):
+                    path, lib = self.install(tool, f"{tool}-{len(os.listdir(self.tmp))}")
+                    p = self.run_tool(path, *argv)
+                    self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                    self.assertEqual(p.stdout, "")
+                    self.assertEqual(p.stderr, f"{tool}: cannot load harness_lib from {lib}: "
+                                               "No module named 'harness_lib'\n")
+
+    def test_the_lib_path_in_the_line_is_the_one_beside_the_real_tool_not_the_symlink(self):
+        for tool in TOOLS:
+            with self.subTest(tool=tool):
+                path, lib = self.install(tool, f"real-{tool}")
+                link_dir = os.path.join(self.tmp, f"link-{tool}")
+                os.makedirs(link_dir)
+                link = os.path.join(link_dir, tool)
+                os.symlink(path, link)
+                p = self.run_tool(link, "--help")
+                self.assertEqual((p.returncode, p.stdout), (1, ""))
+                self.assertEqual(p.stderr, f"{tool}: cannot load harness_lib from {lib}: "
+                                           "No module named 'harness_lib'\n")
+
+    def test_a_lib_that_fails_to_import_is_one_line_with_the_error_on_that_line(self):
+        for tool in TOOLS:
+            for error in ("boom", "first line\n   second\tline  \n", "café ☃"):
+                with self.subTest(tool=tool, error=error):
+                    path, lib = self.install(tool, f"{tool}-{len(os.listdir(self.tmp))}")
+                    os.makedirs(os.path.join(lib, "harness_lib"))
+                    for name, body in (("__init__.py", ""), ("paths.py", f"raise RuntimeError({error!r})\n")):
+                        with open(os.path.join(lib, "harness_lib", name), "w", encoding="utf-8") as fh:
+                            fh.write(body)
+                    p = self.run_tool(path, "--help")
+                    self.assertEqual((p.returncode, p.stdout), (1, ""))
+                    self.assertEqual(p.stderr, f"{tool}: cannot load harness_lib from {lib}: "
+                                               f"{' '.join(error.split())}\n")
+
+    def lib_imports(self, tool: str) -> dict:
+        """{module under harness_lib: [names]} for every harness_lib import anywhere in the tool's source."""
+        found: dict = {}
+        for node in ast.walk(ast.parse((BIN / tool).read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("harness_lib."):
+                found.setdefault(node.module.split(".", 1)[1], []).extend(a.name for a in node.names)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("harness_lib."):
+                        found.setdefault(alias.name.split(".", 1)[1], [])
+        return found
+
+    def stub_lib(self, lib: str, imports: dict, broken: str, body: str) -> None:
+        """A harness_lib of stubs, no module importing another: each binds the names the tool takes from it, except
+        `broken`, whose source is `body`. Breaking one module therefore breaks that one import line alone."""
+        os.makedirs(os.path.join(lib, "harness_lib"))
+        with open(os.path.join(lib, "harness_lib", "__init__.py"), "w", encoding="utf-8") as fh:
+            fh.write("")
+        for module, names in imports.items():
+            with open(os.path.join(lib, "harness_lib", f"{module}.py"), "w", encoding="utf-8") as fh:
+                fh.write(body if module == broken else "".join(f"{n} = None\n" for n in names))
+
+    def test_each_lib_module_the_tool_imports_failing_alone_is_the_one_line(self):
+        """paths, cli, text and notify (and any harness_lib module the tool imports): with only that module broken,
+        the tool still says `<tool>: cannot load harness_lib from <lib>: <error>` in one line and exits 1. An import
+        moved out of the guarded block, or under a narrower except, leaves a traceback instead."""
+        errors = (
+            (RuntimeError, "broken {module}\n   on  two\tlines "),
+            (KeyError, "{module} ☃"),
+            (ValueError, ""),
+        )
+        for tool in TOOLS:
+            imports = self.lib_imports(tool)
+            self.assertLessEqual({"paths", "cli", "text", "notify"}, set(imports), f"{tool} imports {sorted(imports)}")
+            for module in sorted(imports):
+                variants = [(kind, text.format(module=module)) for kind, text in errors] + [("missing", "")]
+                for kind, text in variants:
+                    label = kind if isinstance(kind, str) else kind.__name__
+                    with self.subTest(tool=tool, module=module, error=label):
+                        path, lib = self.install(tool, f"{tool}-{len(os.listdir(self.tmp))}")
+                        if kind == "missing":            # the module loads but lacks a name the tool takes from it
+                            if not imports[module]:
+                                continue
+                            name = imports[module][0]
+                            body = "".join(f"{n} = None\n" for n in imports[module] if n != name)
+                            where = os.path.join(lib, "harness_lib", f"{module}.py")
+                            error = f"cannot import name {name!r} from 'harness_lib.{module}' ({where})"
+                        else:
+                            body = f"raise {kind.__name__}({text!r})\n"
+                            error = " ".join(str(kind(text)).split())
+                        self.stub_lib(lib, imports, module, body)
+                        p = self.run_tool(path, "--help")
+                        self.assertEqual((p.returncode, p.stdout), (1, ""), p.stderr)
+                        self.assertEqual(p.stderr, f"{tool}: cannot load harness_lib from {lib}: {error}\n")
+
+    def test_the_stub_lib_with_nothing_broken_gets_past_the_load_line(self):
+        """The control for the stubs: with every module loading, the cannot-load line is not printed, so the line
+        above comes from the one broken module."""
+        for tool in TOOLS:
+            with self.subTest(tool=tool):
+                path, lib = self.install(tool, f"stub-ok-{tool}")
+                self.stub_lib(lib, self.lib_imports(tool), broken="", body="")
+                p = self.run_tool(path, "--help")
+                self.assertNotIn("cannot load harness_lib", p.stderr)
+
+    def test_the_same_copy_with_the_lib_beside_it_runs(self):
+        """The control: the line above is about the missing lib and nothing else about the copy."""
+        for tool in TOOLS:
+            with self.subTest(tool=tool):
+                path, lib = self.install(tool, f"ok-{tool}")
+                os.symlink(str(LIB), lib)
+                p = self.run_tool(path, "--help")
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertIn(f"usage: {tool}", p.stdout)
+                self.assertEqual(p.stderr, "")
 
 
 if __name__ == "__main__":

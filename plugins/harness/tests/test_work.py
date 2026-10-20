@@ -644,6 +644,78 @@ class Attempt(WorkTest):
     def test_attempt_without_a_cache_says_to_start(self):
         self.assertOneLineError(self.work("attempt", "12", "code", "fail"), "harness-work start 12")
 
+    def test_fix_stage_allows_two_rounds_then_needs_input(self):
+        write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
+        sequence = [
+            (["fix", "fail"], "retry"),
+            (["fix", "fail"], "needs-input"),                # two rounds at most, never an escalation
+            (["fix", "fail"], "needs-input"),
+            (["fix", "pass"], "done"),
+            (["fix", "fail"], "retry"),                      # a pass ends the run of fix failures
+            (["fix", "fail", "--tier", "opus"], "needs-input"),
+            (["fix", "pass", "--tier", "fable"], "done"),
+            (["fix", "fail", "--tier", "fable"], "retry"),
+            (["fix", "fail", "--tier", "fable"], "needs-input"),
+        ]
+        for argv, expected in sequence:
+            with self.subTest(argv=argv):
+                self.assertEqual(self.ok("attempt", "12", *argv).stdout.strip(), expected)
+        attempts = self.read_json(self.cache_path())["attempts"]
+        self.assertEqual(len(attempts), len(sequence))
+        self.assertEqual(set(attempts[0]), {"stage", "tier", "result", "at"})
+        self.assertEqual([a["stage"] for a in attempts], ["fix"] * len(sequence))
+        self.assertEqual((attempts[0]["tier"], attempts[0]["result"]), ("sonnet", "fail"))
+        self.assertEqual((attempts[3]["tier"], attempts[3]["result"]), ("sonnet", "pass"))
+        self.assertEqual((attempts[5]["tier"], attempts[5]["result"]), ("opus", "fail"))
+        self.assertEqual((attempts[-1]["tier"], attempts[-1]["result"]), ("fable", "fail"))
+
+        # --json on a fresh run: the tier never moves and no next tier is named
+        write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
+        for failures, action in ((1, "retry"), (2, "needs-input"), (3, "needs-input")):
+            with self.subTest(json_failures=failures):
+                data = self.ok_json("attempt", "12", "fix", "fail", "--json")
+                self.assertEqual((data["stage"], data["action"], data["failures"], data["tier"], data["next_tier"]),
+                                 ("fix", action, failures, "sonnet", None))
+        data = self.ok_json("attempt", "12", "fix", "pass", "--json")
+        self.assertEqual((data["action"], data["failures"], data["next_tier"]), ("done", 0, None))
+        for failures, action in ((1, "retry"), (2, "needs-input")):
+            with self.subTest(json_opus_failures=failures):
+                data = self.ok_json("attempt", "12", "fix", "fail", "--tier", "opus", "--json")
+                self.assertEqual((data["action"], data["failures"], data["tier"], data["next_tier"]),
+                                 (action, failures, "opus", None))
+
+    def test_fix_and_review_failures_count_apart(self):
+        write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
+        sequence = [
+            (["review", "fail", "--tier", "opus"], "retry"),
+            (["fix", "fail"], "retry"),                      # review's failure is not fix's
+            (["review", "fail", "--tier", "opus"], "escalate fable"),   # fix's failure did not reset review
+            (["fix", "fail"], "needs-input"),                # review's failures did not advance or reset fix
+            (["code", "fail"], "retry"),                     # nor does either count for code
+            (["review", "fail", "--tier", "fable"], "needs-input"),
+            (["fix", "pass"], "done"),
+            (["review", "fail", "--tier", "fable"], "needs-input"),     # a fix pass does not end review's run
+            (["fix", "fail", "--tier", "opus"], "retry"),
+            (["review", "pass", "--tier", "fable"], "done"),
+            (["fix", "fail", "--tier", "opus"], "needs-input"),         # a review pass does not end fix's run
+            (["review", "fail", "--tier", "opus"], "retry"),
+        ]
+        for argv, expected in sequence:
+            with self.subTest(argv=argv):
+                self.assertEqual(self.ok("attempt", "12", *argv).stdout.strip(), expected)
+        attempts = self.read_json(self.cache_path())["attempts"]
+        self.assertEqual([(a["stage"], a["result"]) for a in attempts], [(argv[0], argv[1]) for argv, _ in sequence])
+
+    def test_an_unknown_stage_is_refused(self):
+        attempts = [{"stage": "code", "tier": "sonnet", "result": "fail", "at": "2026-10-01T00:00:00Z"}]
+        write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": attempts}))
+        for stage in ("deploy", "fixes", "Fix"):
+            with self.subTest(stage=stage):
+                p = self.work("attempt", "12", stage, "fail")
+                self.assertOneLineError(p, stage, "fix")     # the refusal names the bad stage and the valid ones
+                self.assertEqual(p.stdout, "")
+        self.assertEqual(self.read_json(self.cache_path())["attempts"], attempts)
+
 
 # =========================================================================== dispatch
 class Dispatch(WorkTest):
