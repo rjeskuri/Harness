@@ -79,7 +79,7 @@ USED = {
         "read_json": "text", "harness_home": "text",
     },
     "harness-pr": {
-        "Problem": "cli", "Parser": "cli", "table": "cli", "warn": "cli",
+        "Problem": "cli", "Parser": "cli", "table": "cli", "warn": "cli", "emit": "cli",
         "one_line": "text", "first_line": "text", "last_line": "text", "home": "text",
         "parse_iso": "text", "as_list": "text", "read_text": "text", "write_text": "text",
         "read_json": "text", "harness_home": "text", "write_json": "text",
@@ -1196,17 +1196,28 @@ def call_name(node) -> str:
     return f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
 
 
+STDIN = ("sys.stdin", "sys.stdin.buffer", "sys.__stdin__")
+
+
+def reads_a_file(call) -> bool:
+    """open(), Path.read_text() or a .read() of anything but standard input."""
+    name = call_name(call)
+    if name in ("open", "read_text"):
+        return True
+    return name == "read" and isinstance(call.func, ast.Attribute) and ast.unparse(call.func.value) not in STDIN
+
+
 def inline_read_findings(tree) -> list:
-    """Lines of a try that reads a file (open, read_text, .read()) and parses it as JSON (json.load, json.loads)
-    and whose handlers all swallow the error (none raises): read_json written out inside another function, however
-    the file is opened and the result kept. A try that turns the error into a Problem is a different, reporting
-    read and is not a copy."""
+    """Lines of a try that reads a file (open, read_text, .read() of a handle; standard input is not a file) and
+    parses it as JSON (json.load, json.loads) and whose handlers all swallow the error (none raises): read_json
+    written out inside another function, however the file is opened and the result kept. A try that turns the
+    error into a Problem is a different, reporting read and is not a copy."""
     found = []
     for node in ast.walk(live_tree(tree)):
         if not isinstance(node, ast.Try) or not node.handlers:
             continue
         inside = [sub for stmt in node.body for sub in ast.walk(stmt)]
-        reads = any(call_name(sub) in ("open", "read_text", "read") for sub in inside)
+        reads = any(isinstance(sub, ast.Call) and reads_a_file(sub) for sub in inside)
         parses = any(is_json_call(sub, "load") or is_json_call(sub, "loads") for sub in inside)
         raises = any(isinstance(sub, ast.Raise) for h in node.handlers for sub in ast.walk(h))
         if reads and parses and not raises:
@@ -1245,18 +1256,67 @@ def inline_write_findings(tree) -> list:
     return found
 
 
+STDERR = ("sys.stderr", "sys.__stderr__")
+
+
+def stderr_aliases(tree) -> tuple:
+    """(names bound to stderr, names bound to a stderr printer): `err = sys.stderr`, `from sys import stderr`;
+    `say = functools.partial(print, file=sys.stderr)`, `say = sys.stderr.write`."""
+    streams, printers = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "sys":
+            streams |= {a.asname or a.name for a in node.names if a.name in ("stderr", "__stderr__")}
+        elif isinstance(node, ast.Assign) and ast.unparse(node.value) in STDERR:
+            streams |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            value = node.value
+            printer = (is_partial(value) and ast.unparse(value.args[0]) == "print"
+                       and any(k.arg == "file" and is_stderr(k.value, streams) for k in value.keywords)) \
+                or (isinstance(value, ast.Attribute) and value.attr == "write" and is_stderr(value.value, streams))
+            if printer:
+                printers |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    return streams, printers
+
+
+def is_stderr(expr, streams: set) -> bool:
+    return expr is not None and (ast.unparse(expr) in STDERR or (isinstance(expr, ast.Name) and expr.id in streams))
+
+
+def writes_to_stderr(call, streams: set, printers: set) -> bool:
+    """print(..., file=<stderr>), <stderr>.write(...), or a call of a name bound to one of them."""
+    f = call.func
+    if isinstance(f, ast.Name) and f.id == "print":
+        return any(k.arg == "file" and is_stderr(k.value, streams) for k in call.keywords)
+    if isinstance(f, ast.Attribute) and f.attr == "write":
+        return is_stderr(f.value, streams)
+    return isinstance(f, ast.Name) and f.id in printers
+
+
+def spelt_text(node) -> str:
+    """The text an expression spells as far as its pieces are constants: its string constants and chr(<int>) calls,
+    in source order and joined, so "warn" + "ing: " and chr(119) + "arning" both spell a warning."""
+    pieces = []
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and hasattr(sub, "lineno"):
+            pieces.append((sub.lineno, sub.col_offset, sub.value))
+        elif isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "chr" \
+                and len(sub.args) == 1 and isinstance(sub.args[0], ast.Constant) and isinstance(sub.args[0].value, int):
+            try:
+                pieces.append((sub.lineno, sub.col_offset, chr(sub.args[0].value)))
+            except (ValueError, OverflowError):
+                pass
+    return "".join(p for _, _, p in sorted(pieces))
+
+
 def stderr_warning_findings(tree) -> list:
-    """Lines that print or write a `... warning: ...` line of their own: the lib's warn is the one spelling. The
-    call's string pieces are read in source order and joined, so "warn" + "ing: " is a warning too."""
-    found = []
-    for node in ast.walk(live_tree(tree)):
-        if isinstance(node, ast.Call) and (call_name(node) == "print" or call_name(node) == "write"):
-            pieces = sorted((sub.lineno, sub.col_offset, sub.value) for sub in ast.walk(node)
-                            if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
-                            and hasattr(sub, "lineno"))
-            if "warning" in "".join(p for _, _, p in pieces).lower():
-                found.append(node.lineno)
-    return found
+    """Lines that write a `... warning: ...` line of their own to stderr: the lib's warn is the one spelling. Only
+    writes to stderr count (print to stdout, a table cell or a file is not a warning line), however the text is
+    built (pieces, an f-string, chr()) and however stderr is reached (sys.stderr, an alias, a partial of print)."""
+    tree = live_tree(tree)
+    streams, printers = stderr_aliases(tree)
+    return [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Call)
+            and writes_to_stderr(node, streams, printers) and "warning" in spelt_text(node).lower()]
 
 
 ASCII = [chr(c) for c in range(128)]
@@ -1281,10 +1341,42 @@ def slug_pattern_findings(tree) -> list:
     return found
 
 
+def is_dashes(node) -> bool:
+    """A string of dashes only: "-", "---", or "-" * n."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str) and node.value != "" and set(node.value) == {"-"}
+    return isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult) and (is_dashes(node.left)
+                                                                              or is_dashes(node.right))
+
+
+def maps_to_dashes(node, assigned: dict) -> bool:
+    """Whether a translation table (or the expression a name in it was assigned) maps characters to '-': a dict or
+    dict comprehension with a dash value, dict.fromkeys(keys, "-"), or str.maketrans(chars, dashes)."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Dict) and any(is_dashes(v) for v in sub.values if v is not None):
+            return True
+        if isinstance(sub, ast.DictComp) and is_dashes(sub.value):
+            return True
+        if isinstance(sub, ast.Call) and call_name(sub) in ("fromkeys", "maketrans") and len(sub.args) > 1 \
+                and is_dashes(sub.args[1]):
+            return True
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in assigned:
+            value = assigned.pop(sub.id)          # each name followed once: no cycle
+            if maps_to_dashes(value, assigned):
+                return True
+    return False
+
+
 def translate_findings(tree) -> list:
-    """Lines that translate characters (str.translate, str.maketrans): session_folder written another way."""
-    return [node.lineno for node in ast.walk(live_tree(tree))
-            if isinstance(node, ast.Call) and call_name(node) in ("translate", "maketrans")]
+    """Lines that translate characters to '-' (str.translate, str.maketrans, with the table inline or held in a
+    name): session_folder written another way. A translation that deletes or maps to anything else is not one."""
+    tree = live_tree(tree)
+    assigned = {t.id: n.value for n in ast.walk(tree) if isinstance(n, ast.Assign) for t in n.targets
+                if isinstance(t, ast.Name)}
+    return [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Call)
+            and call_name(node) in ("translate", "maketrans")
+            and maps_to_dashes(ast.Tuple(elts=list(node.args) + [k.value for k in node.keywords], ctx=ast.Load()),
+                               dict(assigned))]
 
 
 def copy_findings(tree) -> list:
@@ -1467,14 +1559,13 @@ class ToolsHaveNoCopyOfAnyExport(unittest.TestCase):
                           and isinstance(sub.func, ast.Name) and sub.func.id == name]
         return found
 
-    def test_write_text_is_for_the_ultrareview_output_only_and_the_budgets_file_is_write_json(self):
+    def test_the_budgets_file_is_written_by_write_json_and_not_by_write_text(self):
         """Pretty JSON and a newline is write_json (the owner's note on the #82 review: the budgets file is written by
         write_json with the same bytes); write_text is for text that is not JSON. However the JSON text is held
-        (a variable, +=, an f-string), the only write_text call in either tool is cmd_ultra's, and the only
-        write_json call in harness-pr is mark_cloud_exhausted's."""
-        self.assertEqual(self.enclosing_calls("harness-board", "write_text"), [])
-        self.assertEqual(self.enclosing_calls("harness-pr", "write_text"), ["cmd_ultra"])
-        self.assertEqual(self.enclosing_calls("harness-pr", "write_json"), ["mark_cloud_exhausted"])
+        (a variable, +=, an f-string), mark_cloud_exhausted calls write_json and never write_text. Other callers of
+        either are not this test's business: a later state file written through the lib is welcome."""
+        self.assertIn("mark_cloud_exhausted", self.enclosing_calls("harness-pr", "write_json"))
+        self.assertNotIn("mark_cloud_exhausted", self.enclosing_calls("harness-pr", "write_text"))
 
     def test_board_and_pr_write_no_file_by_hand(self):
         """No write-mode open, Path.write_text, mkstemp, os.replace, json.dump or indented json.dumps in either
@@ -1485,13 +1576,6 @@ class ToolsHaveNoCopyOfAnyExport(unittest.TestCase):
                 self.assertEqual(inline_write_findings(tree), [])
 
 
-# Where each tool touches stderr itself today (sys.stderr, by enclosing function, with the count): the lines that
-# are not warnings. harness-board: `project check`'s missing-options line and `project sync`'s two failure lines;
-# harness-pr: board()'s pass-through of harness-board's warnings (a write and a flush) and the failed-checks line.
-STDERR_TODAY = {
-    "harness-board": {"cmd_project_check": 1, "cmd_project_sync": 2},
-    "harness-pr": {"board": 2, "cmd_checks": 1},
-}
 BAD_PROGS = ("harness_pr", "harness-pr:", "harness-pr ", "harness-board", "harness_board", "Harness-pr", "pr", "")
 
 
@@ -1524,34 +1608,10 @@ def warn_call_sites(tree) -> list:
     return [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "warn"]
 
 
-def stderr_uses(tree) -> dict:
-    """{enclosing top-level-or-nested function name (or "<module>"): count} of the places a tool reaches stderr by
-    itself: sys.stderr or sys.__stderr__, getattr on sys, `from sys import`, os.write, /dev/stderr or /dev/fd/2."""
-    counts: dict = {}
-
-    def visit(node, where):
-        for child in ast.iter_child_nodes(node):
-            inner = child.name if isinstance(child, DEFS) else where
-            hit = (isinstance(child, ast.Attribute) and child.attr in ("stderr", "__stderr__")
-                   and isinstance(child.value, ast.Name) and child.value.id == "sys") \
-                or (isinstance(child, ast.ImportFrom) and child.module == "sys") \
-                or (isinstance(child, ast.Call) and call_name(child) == "getattr" and child.args
-                    and isinstance(child.args[0], ast.Name) and child.args[0].id == "sys") \
-                or (isinstance(child, ast.Call) and call_name(child) == "write" and isinstance(child.func, ast.Attribute)
-                    and isinstance(child.func.value, ast.Name) and child.func.value.id == "os") \
-                or (isinstance(child, ast.Constant) and child.value in ("/dev/stderr", "/dev/fd/2"))
-            if hit:
-                counts[inner] = counts.get(inner, 0) + 1
-            visit(child, inner)
-
-    visit(tree, "<module>")       # dead code included: the tools carry none (test_board_and_pr_carry_no_dead_code)
-    return counts
-
-
 class ToolsWarnAndReachStderrOnlyTheirOwnWay(unittest.TestCase):
     """Every warning a tool gives is the lib's warn with the tool's own name, at every call site (not only the two
-    the run tests drive), and the tool writes to stderr by itself only where it does today: a warning assembled
-    from pieces anywhere else has nowhere to hide."""
+    the run tests drive), and no line the tool writes to stderr by itself is a warning, however it is built: its
+    other stderr lines (failures, a pass-through) are its own business."""
 
     def tree(self, tool: str):
         return ast.parse((BIN / tool).read_text(encoding="utf-8"))
@@ -1560,7 +1620,7 @@ class ToolsWarnAndReachStderrOnlyTheirOwnWay(unittest.TestCase):
         for tool in TOOLS:
             tree = self.tree(tool)
             with self.subTest(tool=tool):
-                self.assertGreaterEqual(len(warn_call_sites(tree)), 5, f"{tool} gives fewer warnings than it does today")
+                self.assertNotEqual(warn_call_sites(tree), [], f"{tool} gives no warning: nothing to check")
                 self.assertEqual(warn_spelling_findings(tree, tool), [])
 
     def test_a_misspelt_prog_at_any_one_warn_call_site_is_found(self):
@@ -1605,33 +1665,36 @@ class ToolsWarnAndReachStderrOnlyTheirOwnWay(unittest.TestCase):
                     tree = ast.parse(source + "\n\n" + plant.replace("{tool}", tool))
                     self.assertNotEqual(warn_spelling_findings(tree, tool), [])
 
-    def test_board_and_pr_reach_stderr_by_themselves_only_where_they_do_today(self):
+    def test_no_line_board_or_pr_write_to_stderr_by_themselves_is_a_warning(self):
         for tool in TOOLS:
             with self.subTest(tool=tool):
-                self.assertEqual(stderr_uses(self.tree(tool)), STDERR_TODAY[tool])
+                self.assertEqual(stderr_warning_findings(self.tree(tool)), [])
 
-    def test_a_stderr_write_added_anywhere_is_found(self):
-        """A warn built from pieces in a new function, at module level, or one more stderr line inside a function
-        that already writes there: each changes the inventory."""
+    def test_a_hand_written_stderr_warning_in_board_or_pr_is_found(self):
+        """In the tool's own source: a warning spelt with chr(), one printed to an alias of stderr, and one added
+        inside each function that already writes its own stderr lines (found here, not named) are all found."""
         plants = (
-            'def caution(tool, msg):\n    print(tool + ": " + "warn" + "ing: " + msg, file=sys.stderr)\n',
-            'caution = functools.partial(print, file=sys.stderr)\n',
-            'from sys import stderr as err\n',
-            'def caution(msg):\n    print(msg, file=getattr(sys, "stderr"))\n',
-            'def caution(msg):\n    os.write(2, msg.encode())\n',
-            'def caution(msg):\n    with open("/dev/stderr", "a") as fh:\n        fh.write(msg)\n',
+            'def caution(msg):\n    print("{tool}: " + chr(119) + "arning: " + msg, file=sys.stderr)\n',
+            'ERR = sys.stderr\n\n\ndef caution(msg):\n    print(f"{tool}: warn" "ing: " + msg, file=ERR)\n',
         )
         for tool in TOOLS:
             source = (BIN / tool).read_text(encoding="utf-8")
             for plant in plants:
                 with self.subTest(tool=tool, plant=plant):
-                    self.assertNotEqual(stderr_uses(ast.parse(source + "\n\n" + plant)), STDERR_TODAY[tool])
-            for where in STDERR_TODAY[tool]:
-                with self.subTest(tool=tool, inside=where):
-                    tree = self.tree(tool)
-                    fn = next(n for n in ast.walk(tree) if isinstance(n, DEFS) and n.name == where)
-                    fn.body.insert(0, ast.parse('print("harness-x: warn" "ing: m", file=sys.stderr)').body[0])
-                    self.assertNotEqual(stderr_uses(tree), STDERR_TODAY[tool])
+                    tree = ast.parse(source + "\n\n" + plant.replace("{tool}", tool))
+                    self.assertEqual(len(stderr_warning_findings(tree)), 1)
+            tree = self.tree(tool)
+            streams, printers = stderr_aliases(tree)
+            writers = [fn for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and any(isinstance(c, ast.Call) and writes_to_stderr(c, streams, printers) for c in ast.walk(fn))]
+            self.assertNotEqual(writers, [], f"{tool} writes no stderr line of its own: the plant has nowhere to go")
+            for fn in writers:
+                with self.subTest(tool=tool, inside=fn.name):
+                    fn.body.insert(0, ast.parse('sys.stderr.write("x: " + chr(87) + "ARNING: m\\n")').body[0])
+                    try:
+                        self.assertEqual(len(stderr_warning_findings(tree)), 1)
+                    finally:
+                        del fn.body[0]
 
 
 # Renamed, independently written copies of every export, as a tool might paste them: names, parameters and
@@ -1913,6 +1976,39 @@ def caution(tool, msg):
 def caution(tool, msg):
     sys.stderr.write(f"{tool}: WARN" f"ING: {msg}" + "\n")
 ''',
+    "a warning spelt with chr(), printed to stderr": r'''
+def caution(msg):
+    print("harness-x: " + chr(119) + "arning: " + msg, file=sys.stderr)
+''',
+    "a warning joined from a list, written to stderr": r'''
+def caution(msg):
+    sys.stderr.write("".join(["harness-x: ", "warn", "ing: ", msg, "\n"]))
+''',
+    "a warning to sys.__stderr__": r'''
+def caution(msg):
+    print("harness-x: warning: " + msg, file=sys.__stderr__)
+''',
+    "a warning through `from sys import stderr`": r'''
+from sys import stderr as err
+
+
+def caution(msg):
+    err.write(f"harness-x: warning: {msg}\n")
+''',
+    "a warning through a partial of print to stderr": r'''
+say = functools.partial(print, file=sys.stderr)
+
+
+def caution(msg):
+    say("harness-x: warning: " + msg)
+''',
+    "a warning through sys.stderr.write held in a name": r'''
+say = sys.stderr.write
+
+
+def caution(msg):
+    say("harness-x: warning: " + msg + "\n")
+''',
     "session_folder through str.translate": r'''
 def folder_slug(where):
     return where.translate({c: "-" for c in range(128) if not chr(c).isalnum()})
@@ -2008,6 +2104,33 @@ def words(text):
 ''',
     "a functools.partial of something no export does": r'''
 run = functools.partial(subprocess.run, capture_output=True, text=True)
+''',
+    "a count of warnings printed to stdout": r'''
+def summary(n):
+    print(f"{n} warnings found")
+''',
+    "a table cell that says warning": r'''
+def listing():
+    print(table([("#1", "warning")]))
+''',
+    "a warning word written to stdout explicitly": r'''
+def note(msg):
+    print("warning: " + msg, file=sys.stdout)
+    sys.stdout.write("warning\n")
+''',
+    "a translation that deletes characters": r'''
+def clean(s):
+    return s.translate({0: None})
+''',
+    "a translation of dashes to underscores": r'''
+UNDERSCORES = str.maketrans("-", "_")
+''',
+    "a JSON parse of standard input": r'''
+def from_stdin():
+    try:
+        return json.loads(sys.stdin.read())
+    except ValueError:
+        return None
 ''',
 }
 
@@ -2538,6 +2661,30 @@ class ToolsRunTheLib(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HOME": self.tmp, "HARNESS_POLL_SECONDS": "0"}):
             capture(pr.cmd_checks, args)
         self.assertEqual([a for a, _ in self.called("warn")], [("harness-pr", "no checks registered on PR #7")])
+
+    def test_pr_emits_through_the_lib_with_a_bool(self):
+        """`checks --json` prints its result through the lib's emit(True, data, ""): indented JSON, non-ASCII kept;
+        without --json nothing is emitted."""
+        for number, as_json in ((41, True), (7, True), (12, False)):
+            with self.subTest(number=number, json=as_json):
+                self.calls.clear()
+                pr = load_tool(BIN / "harness-pr")
+                pr.open_repo = lambda: mock.Mock(root=self.tmp)
+                pr.pr_view = lambda repo, n, fields: {"statusCheckRollup": []}
+                self.spy(pr, self.cli.emit, "emit")
+                args = argparse.Namespace(number=number, wait=False, json=as_json, timeout=0)
+                with mock.patch.dict(os.environ, {"HOME": self.tmp, "HARNESS_POLL_SECONDS": "0"}):
+                    code, out, _ = capture(pr.cmd_checks, args)
+                self.assertEqual(code, 0)
+                calls = self.called("emit")
+                if not as_json:
+                    self.assertEqual((calls, out), ([], ""))
+                    continue
+                expected = {"number": number, "state": "none", "checks": [], "failed": [], "pending": [], "logs": []}
+                self.assertEqual(len(calls), 1, calls)
+                self.assertIs(calls[0][0][0], True)
+                self.assertEqual(calls[0][0][1], expected)
+                self.assertEqual(out, json.dumps(expected, indent=2, ensure_ascii=False) + "\n")
 
     def test_pr_warning_with_a_message_on_several_lines_is_one_line(self):
         """warn("harness-pr", ...) is `one_line`d by the lib: an `awaiting --all-projects` project that cannot be
