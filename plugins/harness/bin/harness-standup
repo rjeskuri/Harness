@@ -24,7 +24,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -35,6 +34,8 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import canonical_path, path_key, repo_key, same_entry
+    from harness_lib.cli import Problem
+    from harness_lib.gh import GhBatch, describe_list_call, gh_binary, repo_slug
 except Exception as exc:
     sys.stderr.write(f"harness-standup: cannot load harness_lib from {_LIB}: {exc}\n")
     sys.exit(1)
@@ -50,10 +51,6 @@ NEEDS_INPUT = "**Needs your input**"
 HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
 NEXT_STEPS = re.compile(r"^(\s*)(#{1,6}\s+|[-*+]\s+)?(\*\*|__)?\s*next steps?\b\s*:?\s*(?:\*\*|__)?\s*:?\s*(.*)$", re.I)
 BOLD_LABEL = re.compile(r"^(\s*)([-*+]\s+)?(\*\*|__)\S")
-
-
-class Problem(Exception):
-    """A bad invocation or an unreadable registry (one line, exit 1), or a failed gh call (one board line)."""
 
 
 class Parser(argparse.ArgumentParser):
@@ -391,95 +388,6 @@ def parse_iso(text):
     return (when if when.tzinfo else when.astimezone()).timestamp()
 
 
-def gh_binary():
-    """The gh to run (HARNESS_GH, else gh on PATH), or None when it cannot be found."""
-    gh = os.environ.get("HARNESS_GH", "gh")
-    if os.sep in gh:
-        return gh if os.path.isfile(gh) and os.access(gh, os.X_OK) else None
-    return shutil.which(gh)
-
-
-def repo_slug(url):
-    """OWNER/REPO (HOST/OWNER/REPO off github.com) for gh -R, from an origin URL; None for a local path."""
-    url = url.strip()
-    m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]*@)?([^/:]+)(?::\d*)?/(.+)$", url)
-    if not m or url.lower().startswith("file:"):
-        m = re.match(r"^(?:[^@/:]+@)?([^/:]+):(?!/)(.+)$", url)         # scp-like: git@host:owner/repo
-    if not m:
-        return None
-    host, parts = m.group(1), [p for p in m.group(2).split("/") if p]
-    if len(parts) != 2:
-        return None
-    owner, name = parts[0], parts[1][:-4] if parts[1].endswith(".git") else parts[1]
-    if not owner or not name:
-        return None
-    return f"{owner}/{name}" if host.lower() in ("github.com", "www.github.com") else f"{host}/{owner}/{name}"
-
-
-def describe(args):
-    """`gh pr list`, `gh issue list --label status:needs-input`: the call, for an error line."""
-    words = "gh " + " ".join(args[:2])
-    if "--label" in args[:-1]:
-        words += " --label " + args[args.index("--label") + 1]
-    return words
-
-
-class GhBatch:
-    """gh calls started side by side; results() waits for each until the shared deadline."""
-
-    def __init__(self, gh, calls, cwd, deadline):
-        self.calls, self.deadline, self.procs = calls, deadline, []
-        env = dict(os.environ, GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", NO_COLOR="1")
-        try:
-            for args in calls:
-                self.procs.append(subprocess.Popen([gh] + args, cwd=cwd, stdin=subprocess.DEVNULL,
-                                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-                                                   start_new_session=True))
-        except OSError as err:
-            self.close()
-            raise Problem(f"cannot run gh ({gh}): {err.strerror or err}") from None
-
-    def results(self):
-        """One list of objects per call, in order; Problem naming the first call that failed."""
-        out = []
-        for args, proc in zip(self.calls, self.procs):
-            try:
-                stdout, stderr = proc.communicate(timeout=max(0.1, self.deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                raise Problem(f"{describe(args)} timed out after {GH_BUDGET} s") from None
-            text = stdout.decode("utf-8", "replace")
-            if proc.returncode != 0:
-                why = first_line(stderr.decode("utf-8", "replace")) or f"exit {proc.returncode}"
-                raise Problem(f"{describe(args)} failed: {why}")
-            try:
-                data = json.loads(text)
-            except ValueError:
-                raise Problem(f"{describe(args)} printed something other than JSON: {first_line(text)[:80]}") from None
-            if not isinstance(data, list):
-                raise Problem(f"{describe(args)} did not print a JSON list")
-            out.append([x for x in data if isinstance(x, dict)])
-        return out
-
-    def close(self):
-        """Stop every call still running and release the pipes."""
-        for proc in self.procs:
-            if proc.poll() is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-            for pipe in (proc.stdout, proc.stderr):
-                try:
-                    if pipe:
-                        pipe.close()
-                except OSError:
-                    pass
-            try:
-                proc.wait(timeout=1)
-            except (OSError, subprocess.SubprocessError):
-                pass
-
-
 def question(comments):
     """The first line after **Needs your input** in the newest comment that asks, or None."""
     asking = [c for c in comments if isinstance(c, dict) and NEEDS_INPUT in str(c.get("body") or "")]
@@ -556,7 +464,7 @@ def board_report(project, now):
                              ["issue", "list", "--state", "open", "--label", "status:needs-input", "--json",
                               "number,title,url,comments", "--limit", "100"] + flag,
                              ["pr", "list", "--state", "open", "--json", "headRefName", "--limit", "200"] + flag],
-                        path, deadline)
+                        path, deadline, budget_seconds=GH_BUDGET)
         try:
             old = old_worktrees(path, now, deadline)
             issues, mine, asking, open_prs = batch.results()
