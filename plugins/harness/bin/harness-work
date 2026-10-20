@@ -1000,7 +1000,7 @@ def cmd_start(repo, args):
     elif ticket["answers"]:
         bodies = [str(a.get("body") or "").strip() if isinstance(a, dict) else str(a) for a in ticket["answers"]]
         text += "\n\n## Answers\n\n" + "\n\n".join(b for b in bodies if b)
-    emit(wants_json(args),data, text)
+    emit(wants_json(args), data, text)
 
 
 def cmd_attempt(repo, args):
@@ -1027,7 +1027,7 @@ def cmd_attempt(repo, args):
         action, next_tier = "escalate", NEXT_TIER[tier]
     else:
         action = "needs-input"
-    emit(wants_json(args),{"number": n, "stage": args.stage, "result": args.result, "tier": tier, "failures": failures,
+    emit(wants_json(args), {"number": n, "stage": args.stage, "result": args.result, "tier": tier, "failures": failures,
                 "action": action, "next_tier": next_tier},
          f"{action} {next_tier}" if next_tier else action)
 
@@ -1077,21 +1077,21 @@ def cmd_dispatch(repo, args):
         lines += [f"skip #{s['number']}: {s['why']}" for s in skipped]
         if not candidates:
             lines.append("No ready tickets.")
-        emit(wants_json(args),{"venue": venue, "dry_run": True, "live": [r["id"] for r in live.values()],
+        emit(wants_json(args), {"venue": venue, "dry_run": True, "live": [r["id"] for r in live.values()],
                     "plan": plan, "skipped": skipped}, "\n".join(lines))
         return
     if not args.json:
         for s in capped:
             print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
-        emit(wants_json(args),{"venue": venue, "launched": [], "failed": [], "skipped": skipped}, "No ready tickets.")
+        emit(wants_json(args), {"venue": venue, "launched": [], "failed": [], "skipped": skipped}, "No ready tickets.")
         return
     if slots <= 0:
-        emit(wants_json(args),{"venue": venue, "launched": [], "failed": [], "skipped": skipped},
+        emit(wants_json(args), {"venue": venue, "launched": [], "failed": [], "skipped": skipped},
              f"{len(live)} live runs; --max {args.max} reached, nothing launched.")
         return
     if not plan:
-        emit(wants_json(args),{"venue": venue, "launched": [], "failed": [], "skipped": skipped},
+        emit(wants_json(args), {"venue": venue, "launched": [], "failed": [], "skipped": skipped},
              "Nothing to launch: " + "; ".join(f"#{s['number']} has a {s['why']}" for s in skipped
                                                if s not in capped) + ".")
         return
@@ -1117,7 +1117,7 @@ def cmd_dispatch(repo, args):
             where = f"pid {record['pid']}, log {record['log']}" if venue == "headless" else f"id {record['bg_id']}"
             print(f"#{n} {venue} on {record['branch']} ({where})", flush=True)
     if args.json:
-        emit(wants_json(args),{"venue": venue, "launched": launched, "failed": failures, "skipped": skipped}, "")
+        emit(wants_json(args), {"venue": venue, "launched": launched, "failed": failures, "skipped": skipped}, "")
     if failures:
         sys.exit(1)
 
@@ -1144,7 +1144,7 @@ def cmd_runs(args):
             shown.append(row)
     shown.sort(key=lambda r: str(r.get("started_at")))
     if args.json:
-        emit(wants_json(args),shown, "")
+        emit(wants_json(args), shown, "")
     elif not shown:
         print("No runs." if args.all else "No runs alive or ended in the last 24 h (--all lists every run).")
     else:
@@ -1175,7 +1175,7 @@ def cmd_budget(args):
     data = {name: {"exhausted_until": budgets[name].get("exhausted_until"),
                    "reason": budgets[name].get("reason") or "",
                    "exhausted": exhausted_until(budgets[name]) is not None} for name in names}
-    emit(wants_json(args),data, "\n".join(budget_line(name, budgets[name]) for name in names))
+    emit(wants_json(args), data, "\n".join(budget_line(name, budgets[name]) for name in names))
 
 
 def cmd_worktrees(repo, args):
@@ -1215,7 +1215,7 @@ def cmd_worktrees(repo, args):
                      "age_days": round(age_days, 2) if age_days is not None else None, "pr": pr,
                      "dirty": dirty, "missing": not os.path.isdir(path), "stale": stale})
     if args.json:
-        emit(wants_json(args),rows, "")
+        emit(wants_json(args), rows, "")
         return
     if not rows:
         print("No ticket worktrees.")
