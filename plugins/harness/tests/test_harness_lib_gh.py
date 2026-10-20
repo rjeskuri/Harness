@@ -528,6 +528,10 @@ class ToolsUseTheLibTests(unittest.TestCase):
                 with self.subTest(tool=path.name, name=attr):
                     self.assertIs(getattr(tool, attr, None), getattr(gh, attr))
 
+    def project(self):
+        """The registry Project harness-standup's board_report takes (harness-digest still takes the entry dict)."""
+        return lib("registry").Project(path=self.repo, name="repo")
+
     def slug_recorder(self, value):
         seen = []
 
@@ -544,7 +548,7 @@ class ToolsUseTheLibTests(unittest.TestCase):
                 urls, tool.repo_slug = self.slug_recorder(slug)
                 tool.GhBatch, tool.GH_BUDGET = rec, budget
                 tool.gh_binary = lambda: "/recorded/gh"
-                out = tool.board_report({"name": "repo", "path": self.repo}, time.time())
+                out = tool.board_report(self.project(), time.time())
                 self.assertIsNone(out["board_error"], out)
                 self.assertEqual(len(rec.made), 1)
                 made = rec.made[0]
@@ -575,7 +579,7 @@ class ToolsUseTheLibTests(unittest.TestCase):
                 standup = load(STANDUP, "harness_standup_gh_problem")
                 standup.GhBatch = Recorder([], error=cli.Problem(message))
                 standup.gh_binary = lambda: "/recorded/gh"
-                out = standup.board_report({"name": "repo", "path": self.repo}, time.time())
+                out = standup.board_report(self.project(), time.time())
                 self.assertEqual(out["board_error"], message)
                 digest = load(DIGEST, "harness_digest_gh_problem")
                 digest.GhBatch = Recorder([], error=cli.Problem(message))
