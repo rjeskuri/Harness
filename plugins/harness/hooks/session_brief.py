@@ -432,7 +432,7 @@ def repo_state_dir(root: Path, cwd: Path) -> Path | None:
     there first. None without the lib: the key is harness_lib's alone."""
     if LIB_PROBLEM:
         return None
-    main = main_checkout(str(root))
+    main = main_checkout(str(root), timeout=EXTRA_GIT_TIMEOUT)
     if main is None:
         return None
     repos = harness_home() / "repos"

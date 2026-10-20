@@ -77,13 +77,28 @@ LOCALTIME = "/etc/localtime"
 GITHUB = "GitHub"     # the committer of merges made on github.com: UTC, not evidence of the Mac's zone
 
 
+def in_linked_worktree(path):
+    """Whether `path` is inside a linked git worktree: git's own test, a `commondir` file in its git dir."""
+    try:
+        out = subprocess.run(["git", "-C", path, "rev-parse", "--absolute-git-dir"], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    git_dir = out.stdout.strip()
+    return out.returncode == 0 and bool(git_dir) and os.path.isfile(os.path.join(git_dir, "commondir"))
+
+
 def find_repo(given=None):
-    """The repo: `given` (--repo), else $CLAUDE_PROJECT_DIR, else the current directory; inside a git
-    repository its main checkout (main_checkout: a subdirectory or a linked worktree stands for it, the
-    log and the session folders are the repo's, not a ticket branch's), outside one the path itself."""
+    """The repo: `given` (--repo), else $CLAUDE_PROJECT_DIR, kept as spelled (the session folders are
+    named after that spelling) unless it is inside a linked worktree, which stands for its main checkout
+    (the log and the session folders are the repo's, not a ticket branch's); else the current directory's
+    repository's main checkout (main_checkout), else the current directory."""
     path = given or os.environ.get("CLAUDE_PROJECT_DIR")
-    path = os.path.abspath(os.path.expanduser(path)) if path else os.getcwd()
-    return main_checkout(path) or path
+    if path:
+        path = os.path.abspath(os.path.expanduser(path))
+        return (in_linked_worktree(path) and main_checkout(path)) or path
+    here = os.getcwd()
+    return main_checkout(here) or here
 
 
 def use_repo(repo):

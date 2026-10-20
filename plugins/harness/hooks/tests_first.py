@@ -186,7 +186,7 @@ def repo_facts(directory: str) -> dict | None:
     top = out.stdout.strip()
     if out.returncode != 0 or not top:
         return None
-    main = main_checkout(directory)
+    main = main_checkout(directory, timeout=GIT_TIMEOUT)
     if main is None:
         return None
     head = git(directory, "symbolic-ref", "--short", "-q", "HEAD")

@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 
 from harness_lib.paths import adopt_old_state, canonical_path
 
-GIT_TIMEOUT = 5
+TIMEOUT = 10  # seconds main_checkout's whole lookup (both git calls) may take by default
 
 
 class RepoError(Exception):
@@ -52,16 +53,22 @@ def repo_facts(path, git, pick_line):
     return root, common_dir, main, adopt_old_state(repos, main, reported, path)
 
 
-def _git(path, *args):
-    return subprocess.run(["git", "-C", path, *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                          encoding="utf-8", errors="surrogateescape", timeout=GIT_TIMEOUT)
-
-
-def main_checkout(path):
+def main_checkout(path, timeout=TIMEOUT):
     """The canonical spelling of the main working tree of the repository holding `path` (from a
     subdirectory or a linked worktree too), with state under an earlier spelling's key moved to
-    its key as repo_facts does; None outside a repository, without git, or when git fails."""
+    its key as repo_facts does; None outside a repository, without git, when git fails, or when
+    the whole lookup (both git calls, one deadline) takes longer than `timeout` seconds. A hook
+    passes its own git budget, which sits inside the timeout hooks.json gives it."""
+    deadline = time.monotonic() + timeout
+
+    def git(cwd, *args):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(["git", "-C", cwd, *args], timeout)
+        return subprocess.run(["git", "-C", cwd, *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              encoding="utf-8", errors="surrogateescape", timeout=left)
+
     try:
-        return repo_facts(path, _git, str.strip)[2]
+        return repo_facts(path, git, str.strip)[2]
     except (RepoError, OSError, subprocess.SubprocessError):
         return None

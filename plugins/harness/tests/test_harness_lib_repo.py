@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 import uuid
@@ -284,7 +285,13 @@ class ModuleTests(unittest.TestCase):
             self.assertTrue(callable(getattr(lib, name, None)), name)
         params = list(inspect.signature(lib.repo_facts).parameters)
         self.assertEqual(params[:3], ["path", "git", "pick_line"])
-        self.assertEqual(len(inspect.signature(lib.main_checkout).parameters), 1)
+        params = inspect.signature(lib.main_checkout).parameters
+        self.assertEqual(list(params)[0], "path")
+        self.assertIn("timeout", params, "main_checkout takes no timeout (finding 2 of PR #126)")
+        self.assertIn(params["timeout"].kind,
+                      (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD))
+        for name, param in list(params.items())[1:]:
+            self.assertIsNot(param.default, inspect.Parameter.empty, f"main_checkout(path) needs {name}")
 
     def test_repo_py_is_standard_library_only_and_39_compatible(self):
         self.assertTrue(REPO_PY.is_file(), f"{REPO_PY} does not exist")
@@ -653,7 +660,7 @@ class CallersBuildOnTheLibTests(RepoCase):
         for n in range(2):
             target = self.other_main(f"brief-target-{n}-{self.token}")
             calls = []
-            with mock.patch.object(mod, "main_checkout", lambda p, _t=target, _c=calls: _c.append(p) or _t):
+            with mock.patch.object(mod, "main_checkout", lambda p, _t=target, _c=calls, **_kw: _c.append(p) or _t):
                 state = mod.repo_state_dir(Path(repo), Path(repo, "src"))
             with self.subTest(n=n):
                 self.assertTrue(calls)
@@ -667,7 +674,7 @@ class CallersBuildOnTheLibTests(RepoCase):
         for n in range(2):
             target = self.other_main(f"tf-target-{n}-{self.token}")
             calls = []
-            with mock.patch.object(mod, "main_checkout", lambda p, _t=target, _c=calls: _c.append(p) or _t):
+            with mock.patch.object(mod, "main_checkout", lambda p, _t=target, _c=calls, **_kw: _c.append(p) or _t):
                 facts = mod.repo_facts(os.path.join(wt, "src"))
             with self.subTest(n=n):
                 self.assertTrue(calls)
@@ -676,14 +683,21 @@ class CallersBuildOnTheLibTests(RepoCase):
                 self.assertEqual(facts["branch"], BRANCH)
 
     def test_worklog_finds_the_repo_with_main_checkout(self):
+        """Inside a linked worktree the main tree is main_checkout's (a stand-in decides it); a
+        plain subdirectory of the main checkout is kept as given, as before the refactor."""
         repo = self.make_repo("logged")
+        wt = self.add_worktree(repo, os.path.join(self.tmp, "logged-wt"), "t/6-logged")
         mod = load_with_loader(BIN / "harness-worklog")
         self.assertTrue(is_from_lib(getattr(mod, "main_checkout", None)), "harness-worklog binds no lib main_checkout")
         for n in range(2):
             target = self.other_main(f"wl-target-{n}-{self.token}")
-            with mock.patch.object(mod, "main_checkout", lambda p, _t=target: _t):
-                with self.subTest(n=n):
-                    self.assertEqual(os.fspath(mod.find_repo(repo)), target)
+            for start in (wt, os.path.join(wt, "src")):
+                with mock.patch.object(mod, "main_checkout", lambda p, _t=target, **_kw: _t):
+                    with self.subTest(n=n, start=start):
+                        self.assertEqual(os.fspath(mod.find_repo(start)), target)
+        for start in (os.path.join(repo, "src"), os.path.join(repo, "src", "deep")):
+            with self.subTest(start=start):
+                self.assertEqual(os.fspath(mod.find_repo(start)), start)
 
 
 # ================================================================ the tools, kept as they are
@@ -779,6 +793,258 @@ exec '{GIT}' "$@"
                 self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
                 self.assertIn("Total", p.stdout)
+
+
+# ================================================================ worklog: the repo it works on (PR #126 finding 1)
+
+
+def encoded(path: str) -> str:
+    """Claude Code's session-folder name for a project path: every non-alphanumeric as '-'."""
+    return "".join(c if ("a" <= c <= "z" or "A" <= c <= "Z" or "0" <= c <= "9") else "-" for c in path)
+
+
+@unittest.skipUnless(GIT, "git is not installed")
+class WorklogRepoTests(RepoCase):
+    """harness-worklog keeps the path it is given (--repo, $CLAUDE_PROJECT_DIR) unless that path is
+    inside a linked worktree, which stands for its main checkout; with neither, the current
+    directory's repository is its main checkout. As before the refactor (main's own main_checkout
+    in harness-worklog)."""
+
+    def worklog_add(self, description: str, cwd: str, repo_arg: str = "", project_dir: str = ""):
+        env = dict(self.env)
+        if project_dir:
+            env["CLAUDE_PROJECT_DIR"] = project_dir
+        args = (["--repo", repo_arg] if repo_arg else []) + [
+            "add", "--date", "2026-09-03", "--hours", "1.5", "--description", description]
+        p = subprocess.run([sys.executable, str(BIN / "harness-worklog"), *args], capture_output=True, text=True,
+                           env=env, cwd=cwd, stdin=subprocess.DEVNULL, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return p
+
+    def logs_holding(self, description: str, under: str) -> list:
+        """Every worklog/worklog.csv below `under` whose rows carry `description`."""
+        found = []
+        for dirpath, dirnames, filenames in os.walk(under):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            if os.path.basename(dirpath) == "worklog" and "worklog.csv" in filenames:
+                path = os.path.join(dirpath, "worklog.csv")
+                with open(path, encoding="utf-8") as fh:
+                    if description in fh.read():
+                        found.append(os.path.realpath(path))
+        return found
+
+    def test_the_log_is_written_in_the_given_path_unless_it_is_in_a_linked_worktree(self):
+        repo = self.make_repo("billed")
+        inside = self.add_worktree(repo, os.path.join(repo, ".claude", "worktrees", "t-3-b"), "t/3-b")
+        beside = self.add_worktree(repo, os.path.join(self.tmp, "billed-side"), "t/4-b")
+        log_of = lambda d: os.path.realpath(os.path.join(d, "worklog", "worklog.csv"))  # noqa: E731
+        cases = []
+        for given, owner in ((os.path.join(repo, "src"), os.path.join(repo, "src")),
+                             (os.path.join(repo, "src", "deep"), os.path.join(repo, "src", "deep")),
+                             (os.path.join(repo, "tests"), os.path.join(repo, "tests")),
+                             (repo, repo),
+                             (inside, repo), (os.path.join(inside, "src"), repo),
+                             (beside, repo), (os.path.join(beside, "src", "deep"), repo)):
+            cases.append(("--repo", given, owner))
+            cases.append(("CLAUDE_PROJECT_DIR", given, owner))
+        # Neither: the current directory's repository, its main checkout (git's top level before).
+        for cwd in (os.path.join(repo, "src"), os.path.join(repo, "tests"), os.path.join(beside, "src")):
+            cases.append(("cwd", cwd, repo))
+        for n, (source, given, owner) in enumerate(cases):
+            description = f"row {n} {uuid.uuid4().hex[:8]}"
+            with self.subTest(source=source, given=given):
+                if source == "--repo":
+                    self.worklog_add(description, cwd=self.tmp, repo_arg=given)
+                elif source == "CLAUDE_PROJECT_DIR":
+                    self.worklog_add(description, cwd=self.tmp, project_dir=given)
+                else:
+                    self.worklog_add(description, cwd=given)
+                self.assertEqual(self.logs_holding(description, self.tmp), [log_of(owner)])
+
+    def test_find_repo_keeps_the_spelling_given_outside_a_linked_worktree(self):
+        """The session folders Claude Code keeps are named after the spelling of the project path,
+        so a path outside a linked worktree is kept as given (made absolute, `~` expanded), not
+        resolved; a linked worktree under any spelling gives the canonical main checkout."""
+        repo = self.make_repo("Spelled")
+        wt = self.add_worktree(repo, os.path.join(self.tmp, "spelled-wt"), "t/9-sp")
+        link = os.path.join(self.tmp, "spelled-link")
+        os.symlink(repo, link)
+        wlink = os.path.join(self.tmp, "spelled-wt-link")
+        os.symlink(wt, wlink)
+        os.rename(self.make_repo("homed"), os.path.join(self.home, "homed"))
+        homed = os.path.join(self.home, "homed")
+        mod = load_with_loader(BIN / "harness-worklog")
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        os.chdir(repo)
+        cases = [
+            (os.path.join(link, "src"), os.path.join(link, "src")),
+            (link, link),
+            (os.path.join(repo, "src", "deep"), os.path.join(repo, "src", "deep")),
+            ("src", os.path.join(repo, "src")),
+            (os.path.join("src", "deep"), os.path.join(repo, "src", "deep")),
+            ("~/homed/tests", os.path.join(homed, "tests")),
+            (wlink, repo),
+            (os.path.join(wlink, "src"), repo),
+            (os.path.join(wt, "tests"), repo),
+        ]
+        if self.case_insensitive():
+            cases += [(os.path.join(self.tmp, "SPELLED", "Src"), os.path.join(self.tmp, "SPELLED", "Src")),
+                      (os.path.join(self.tmp, "Spelled-WT", "src"), repo)]
+        projects = os.path.join(self.home, ".claude", "projects")
+        for given, expected in cases:
+            with self.subTest(given=given):
+                found = os.fspath(mod.find_repo(given))
+                self.assertEqual(found, expected)
+                self.assertEqual(mod.transcripts_dirs(found)[0], os.path.join(projects, encoded(expected)))
+
+
+# ================================================================ timeouts sized to the hooks (PR #126 finding 2)
+
+
+SLACK = 0.6  # seconds a lookup may run past its timeout: process start-up and the kill
+
+
+def hooks_json_timeout(hook: str) -> float:
+    """The timeout hooks.json gives the hook whose command runs `hook`."""
+    data = json.loads((HOOKS / "hooks.json").read_text(encoding="utf-8"))
+    found = [h["timeout"] for groups in data["hooks"].values() for group in groups for h in group["hooks"]
+             if any(hook in str(a) for a in [h.get("command", "")] + list(h.get("args", [])))]
+    if not found:
+        raise AssertionError(f"hooks.json runs no {hook}")
+    return float(min(found))
+
+
+class SlowGitMixin:
+    def slow_git(self, top: float = 0.0, common: float = 0.0, other: float = 0.0) -> str:
+        """A directory holding a `git` that sleeps (seconds) before running the real git:
+        `common` for rev-parse --git-common-dir, else `top` for rev-parse --show-toplevel, else
+        `other`. One process (it execs git), so a timeout's kill stops it."""
+        d = os.path.join(self.tmp, "slowbin-" + uuid.uuid4().hex[:6])
+        os.makedirs(d)
+        script = os.path.join(d, "git")
+        with open(script, "w") as fh:
+            fh.write(f"""#!{sys.executable}
+import os, sys, time
+args = sys.argv[1:]
+if "--git-common-dir" in args:
+    time.sleep({common!r})
+elif "--show-toplevel" in args:
+    time.sleep({top!r})
+else:
+    time.sleep({other!r})
+os.execv({GIT!r}, [{GIT!r}] + args)
+""")
+        os.chmod(script, 0o755)
+        return d
+
+    def on_path(self, directory: str):
+        patcher = mock.patch.dict(os.environ, {"PATH": f"{directory}:{os.environ['PATH']}"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+@unittest.skipUnless(GIT, "git is not installed")
+class MainCheckoutTimeoutTests(SlowGitMixin, LibCase):
+    def test_a_git_slower_than_the_timeout_makes_it_return_within_the_timeout(self):
+        """The whole lookup, both git calls, is held to `timeout`: a fast-enough first call
+        followed by a hung one returns at about `timeout`, not one timeout per call."""
+        repo = self.make_repo("slowpoke")
+        start = os.path.join(repo, "src")
+        for t in (1.5, 3.0):
+            with self.subTest(timeout=t):
+                fake = self.slow_git(top=0.8 * t, common=60.0)
+                with mock.patch.dict(os.environ, {"PATH": f"{fake}:{os.environ['PATH']}"}):
+                    began = time.monotonic()
+                    result = self.lib.main_checkout(start, timeout=t)
+                    took = time.monotonic() - began
+                self.assertTrue(result is None or os.fspath(result) == start, result)
+                self.assertLess(took, t + SLACK, f"main_checkout(timeout={t}) took {took:.2f} s")
+
+    def test_a_hung_git_from_the_first_call_returns_within_the_timeout(self):
+        repo = self.make_repo("hung")
+        wt = self.add_worktree(repo, os.path.join(self.tmp, "hung-wt"), "t/5-hung")
+        fake = self.slow_git(top=60.0, common=60.0, other=60.0)
+        self.on_path(fake)
+        for t, start in ((1.0, repo), (2.0, os.path.join(wt, "src"))):
+            with self.subTest(timeout=t, start=start):
+                began = time.monotonic()
+                result = self.lib.main_checkout(start, timeout=t)
+                took = time.monotonic() - began
+                self.assertTrue(result is None or os.fspath(result) == start, result)
+                self.assertLess(took, t + SLACK, f"main_checkout(timeout={t}) took {took:.2f} s")
+
+    def test_a_generous_timeout_lets_a_slow_git_answer(self):
+        """The timeout is the caller's: a git taking 1.5 s a call still answers within 6 s."""
+        repo = self.make_repo("patient")
+        wt = self.add_worktree(repo, os.path.join(self.tmp, "patient-wt"), "t/6-patient")
+        self.on_path(self.slow_git(top=1.5, common=1.5, other=1.5))
+        for start in (os.path.join(repo, "src"), os.path.join(wt, "tests")):
+            with self.subTest(start=start):
+                result = self.lib.main_checkout(start, timeout=6)
+                self.assertIsNotNone(result, start)
+                self.assertEqual(os.fspath(result), repo)
+
+
+@unittest.skipUnless(GIT, "git is not installed")
+class HookTimeoutTests(SlowGitMixin, RepoCase):
+    """session_brief.py and tests_first.py hold the main-checkout lookup to their own git
+    timeouts (session_brief its EXTRA_GIT_TIMEOUT, the old single rev-parse's; tests_first its
+    GIT_TIMEOUT), inside the timeout hooks.json gives each hook."""
+
+    def recorder(self, target: str, calls: list):
+        def stand_in(path, *args, **kwargs):
+            calls.append((path, args, kwargs))
+            return target
+        return stand_in
+
+    def test_session_brief_passes_its_own_timeout_to_main_checkout(self):
+        repo = self.make_repo("brief-t")
+        mod = load_with_loader(HOOKS / "session_brief.py")
+        self.assertEqual(mod.LIB_PROBLEM, "")
+        expected = mod.EXTRA_GIT_TIMEOUT
+        self.assertLess(expected, hooks_json_timeout("session_brief.py"))
+        calls = []
+        with mock.patch.object(mod, "main_checkout", self.recorder(repo, calls)):
+            mod.repo_state_dir(Path(repo), Path(repo, "src"))
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("timeout", calls[0][2], f"session_brief calls main_checkout without a timeout: {calls}")
+        self.assertEqual(calls[0][2]["timeout"], expected)
+
+    def test_tests_first_passes_its_own_timeout_to_main_checkout(self):
+        repo = self.make_repo("guard-t")
+        wt = self.add_worktree(repo, os.path.join(self.tmp, "guard-t-wt"), BRANCH)
+        mod = load_with_loader(HOOKS / "tests_first.py")
+        expected = mod.GIT_TIMEOUT
+        self.assertLess(expected, hooks_json_timeout("tests_first.py"))
+        calls = []
+        with mock.patch.object(mod, "main_checkout", self.recorder(repo, calls)):
+            mod.repo_facts(os.path.join(wt, "src"))
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("timeout", calls[0][2], f"tests_first calls main_checkout without a timeout: {calls}")
+        self.assertEqual(calls[0][2]["timeout"], expected)
+
+    def test_a_hung_common_dir_holds_each_hook_to_its_own_timeout(self):
+        """With the lib's real main_checkout and a git whose --git-common-dir hangs, the lookup
+        each hook makes gives up after the hook's own timeout (the old single call's)."""
+        repo = self.make_repo("hang-hooks")
+        wt = self.add_worktree(repo, os.path.join(self.tmp, "hang-hooks-wt"), BRANCH)
+        self.on_path(self.slow_git(common=60.0))
+        brief = load_with_loader(HOOKS / "session_brief.py")
+        guard = load_with_loader(HOOKS / "tests_first.py")
+        runs = (
+            ("session_brief.py", brief.EXTRA_GIT_TIMEOUT,
+             lambda: brief.repo_state_dir(Path(repo), Path(repo, "src"))),
+            ("tests_first.py", guard.GIT_TIMEOUT, lambda: guard.repo_facts(os.path.join(wt, "src"))),
+        )
+        for hook, own, lookup in runs:
+            with self.subTest(hook=hook):
+                began = time.monotonic()
+                result = lookup()
+                took = time.monotonic() - began
+                self.assertIsNone(result)
+                self.assertLess(took, min(own + SLACK, hooks_json_timeout(hook)),
+                                f"{hook}'s main-checkout lookup took {took:.2f} s against its {own} s")
 
 
 # ================================================================ without the lib's repo.py
