@@ -5,7 +5,7 @@ of a headless or background session per ready ticket, the run records, the budge
 
 Usage:
     harness-work start N [--venue interactive|headless|bg]
-    harness-work attempt N tests|breaker|code|review|ci pass|fail [--tier sonnet|opus|fable]
+    harness-work attempt N tests|breaker|code|review|fix|ci pass|fail [--tier sonnet|opus|fable]
     harness-work dispatch [--max 3] [--venue headless|bg | --api] [--dry-run]
     harness-work runs [--sweep] [--all]
     harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
@@ -75,7 +75,7 @@ except Exception as exc:  # no state key can be guessed without the lib: one lin
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-STAGES = ("tests", "breaker", "code", "review", "ci")
+STAGES = ("tests", "breaker", "code", "review", "fix", "ci")
 TIERS = ("sonnet", "opus", "fable")
 NEXT_TIER = {"sonnet": "opus", "opus": "fable", "fable": "fable"}
 DEFAULT_TIER = "opus"
@@ -1085,6 +1085,8 @@ def cmd_attempt(repo, args):
         action = "done"
     elif failures == 1:
         action = "retry"
+    elif args.stage == "fix":                       # at most two fix rounds, and fix never escalates
+        action = "needs-input"
     elif failures == 2:
         action, next_tier = "escalate", NEXT_TIER[tier]
     else:
@@ -1347,7 +1349,8 @@ def parser():
                        help="named in the start comment (dispatch passes its own)")
 
     attempt = sub.add_parser("attempt", parents=[with_repo, with_json],
-                             help="record a stage's result; prints done, retry, escalate <tier> or needs-input")
+                             help="record a stage's result; prints done, retry, escalate <tier> or needs-input "
+                                  "(fix: retry, then needs-input; it never escalates)")
     attempt.add_argument("number", type=issue_number, metavar="N")
     attempt.add_argument("stage", choices=STAGES)
     attempt.add_argument("result", choices=("pass", "fail"))
