@@ -35,6 +35,7 @@ import importlib.util
 import inspect
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1209,6 +1210,174 @@ class HookTimeoutTests(SlowGitMixin, RepoCase):
                 self.assertTrue(decision["permissionDecisionReason"].startswith("Tests first on t/12"),
                                 decision["permissionDecisionReason"])
                 self.assertLess(took, bound)
+
+
+# ================================================================ tests_first's branch name
+
+
+# A ticket branch as tests_first.py guards it, restated here so the expected decision does not
+# come from the hook under test.
+TICKET_SHAPE = r"^t/(\d+)-"
+
+
+@unittest.skipUnless(GIT, "git is not installed")
+class TestsFirstBranchNameTests(RepoCase):
+    """PR #126 review (tests_first.py lines 197 and 199). On main tests_first named HEAD's branch
+    with `git symbolic-ref --short HEAD`, as harness-red still does: when another ref shares the
+    branch's name (a tag t/12-x, or refs/t/12-x) git spells the branch heads/t/12-x, which is not
+    a ticket branch, so main left the edit alone; and an unborn ticket branch (no commit yet) was
+    guarded. The expected name below is what `symbolic-ref --short` prints in the fixture, and
+    the expected decision follows from it: guarded (a tests-first denial with no red run) exactly
+    when that name is ticket-shaped."""
+
+    def short_branch(self, cwd: str) -> str:
+        return self.git(cwd, "symbolic-ref", "--short", "HEAD")
+
+    def edit(self, where: str):
+        """tests_first.py as Claude Code runs it, on an Edit of `where`/src/app.py."""
+        payload = {
+            "session_id": "sess-1", "transcript_path": "/dev/null", "cwd": where, "permission_mode": "default",
+            "hook_event_name": "PreToolUse", "tool_name": "Edit", "tool_use_id": "toolu_01",
+            "tool_input": {"file_path": os.path.join(where, "src", "app.py"), "old_string": "a", "new_string": "b"},
+        }
+        r = subprocess.run([sys.executable, str(HOOKS / "tests_first.py")], input=json.dumps(payload),
+                           capture_output=True, text=True, env=self.env, cwd=where, timeout=120)
+        self.assertEqual((r.returncode, r.stderr), (0, ""), r.stdout)
+        return r.stdout.strip()
+
+    def assert_decision(self, out: str, short: str, label: str) -> None:
+        """No red run is recorded: a ticket-shaped `short` is denied as tests first on its
+        ticket; any other name is left alone (no decision)."""
+        m = re.match(TICKET_SHAPE, short)
+        if m is None:
+            self.assertEqual(out, "", f"{label}: HEAD is {short!r} to `symbolic-ref --short`, not a ticket "
+                                      f"branch, so main's hook allowed the edit; this one decided {out}")
+            return
+        self.assertTrue(out, f"{label}: HEAD is ticket branch {short!r}, yet the source edit was allowed")
+        decision = json.loads(out)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny", decision)
+        prefix = f"Tests first on t/{int(m.group(1))}: "
+        self.assertTrue(decision["permissionDecisionReason"].startswith(prefix),
+                        f"{label}: {decision['permissionDecisionReason']!r} does not start with {prefix!r}")
+
+    def red_repo(self, where: str):
+        """harness-red's Repo for `where`: the branch name it records the red run under."""
+        return load_with_loader(BIN / "harness-red").Repo(where)
+
+    def clash(self, repo: str, name: str, how: str) -> None:
+        if how == "tag":
+            self.git(repo, "tag", name, "main")
+        elif how == "ref":
+            self.git(repo, "update-ref", f"refs/{name}", "main")
+        else:
+            self.assertEqual(how, "none")
+
+    # ---- review finding 1: a branch whose name another ref shares
+
+    def test_a_ticket_branch_sharing_its_name_with_another_ref_is_named_as_symbolic_ref_short_names_it(self):
+        """repo_facts' branch is `symbolic-ref --short`'s name, for linked worktrees on several
+        ticket branches, each with a tag, a refs/<name> ref or nothing of the same name."""
+        cases = (("t/12-fix-login", "tag"), ("t/7-a", "ref"), ("t/305-long-slug-here", "tag"),
+                 ("t/8-plain", "none"), ("t/41-nested/part", "tag"))
+        for i, (branch, how) in enumerate(cases):
+            with self.subTest(branch=branch, clash=how):
+                repo = self.make_repo(f"named-{i}")
+                wt = self.add_worktree(repo, os.path.join(self.tmp, f"named-{i}-wt"), branch)
+                self.clash(repo, branch, how)
+                short = self.short_branch(wt)
+                if how != "none":
+                    self.assertEqual(short, "heads/" + branch, "git no longer disambiguates this way")
+                guard = load_with_loader(HOOKS / "tests_first.py")
+                for start in (wt, os.path.join(wt, "src")):
+                    facts = guard.repo_facts(start)
+                    self.assertIsNotNone(facts, start)
+                    self.assertEqual(facts["branch"], short, start)
+
+    def test_a_ticket_branch_sharing_its_name_with_a_tag_gets_mains_decision(self):
+        """Through the hook: the edit is left alone when a tag or refs/<name> shares the branch's
+        name (main's decision, as `symbolic-ref --short` names it heads/...), and still denied on
+        the same branch without the clash and on another ticket branch in the same repository."""
+        cases = (("t/12-fix-login", "tag"), ("t/7-a", "ref"), ("t/99-other", "tag"))
+        for i, (branch, how) in enumerate(cases):
+            with self.subTest(branch=branch, clash=how):
+                repo = self.make_repo(f"clash-{i}")
+                wt = self.add_worktree(repo, os.path.join(self.tmp, f"clash-{i}-wt"), branch)
+                other = self.add_worktree(repo, os.path.join(self.tmp, f"clash-{i}-other"), f"t/{50 + i}-other")
+                self.assert_decision(self.edit(wt), self.short_branch(wt), "before the clash")
+                self.clash(repo, branch, how)
+                short = self.short_branch(wt)
+                self.assertNotEqual(short, branch)
+                self.assert_decision(self.edit(wt), short, f"with a {how} named {branch}")
+                self.assert_decision(self.edit(other), self.short_branch(other), "the other ticket branch")
+
+    def test_the_hooks_branch_is_the_one_harness_red_records_under(self):
+        """harness-red names the branch with `symbolic-ref --short` and writes red/<name with / as
+        ->.json; the hook's branch is the same name, with or without a clash."""
+        for i, (branch, how) in enumerate((("t/12-fix-login", "tag"), ("t/7-a", "ref"), ("t/8-plain", "none"))):
+            with self.subTest(branch=branch, clash=how):
+                repo = self.make_repo(f"agree-{i}")
+                wt = self.add_worktree(repo, os.path.join(self.tmp, f"agree-{i}-wt"), branch)
+                self.clash(repo, branch, how)
+                red = self.red_repo(wt)
+                self.assertEqual(red.branch, self.short_branch(wt))
+                facts = load_with_loader(HOOKS / "tests_first.py").repo_facts(os.path.join(wt, "src"))
+                self.assertEqual(facts["branch"], red.branch)
+                self.assertEqual(os.path.basename(red.record_path), facts["branch"].replace("/", "-") + ".json")
+
+    def test_a_red_run_recorded_by_harness_red_under_a_clashing_name_is_not_overruled(self):
+        """A red record where harness-red writes it on the clashing branch (red/heads-t-...json):
+        the edit is allowed, as on main; the hook must not deny for want of red/t-...json."""
+        repo = self.make_repo("clash-red")
+        wt = self.add_worktree(repo, os.path.join(self.tmp, "clash-red-wt"), BRANCH)
+        self.clash(repo, BRANCH, "tag")
+        red = self.red_repo(wt)
+        files = ["tests/test_app.py"]
+        h = hashlib.sha256()
+        for name in files:
+            h.update(name.encode("utf-8") + b"\n")
+            h.update(Path(wt, name).read_bytes())
+        os.makedirs(os.path.dirname(red.record_path), exist_ok=True)
+        with open(red.record_path, "w", encoding="utf-8") as fh:
+            json.dump({"kind": "assertion", "test_files": files, "test_hash": h.hexdigest(),
+                       "branch": red.branch}, fh)
+        self.assertEqual(self.edit(wt), "", f"red run recorded at {red.record_path}")
+
+    # ---- review finding 2: an unborn branch
+
+    def unborn(self, layout: str) -> tuple:
+        """(where, short name) for an unborn branch: a fresh `init -b` with files but no commit,
+        or `checkout --orphan` in a repository with history (optionally sharing a tag's name)."""
+        if layout.startswith("init:"):
+            branch = layout[len("init:"):]
+            where = os.path.join(self.tmp, "unborn-" + uuid.uuid4().hex[:6])
+            os.makedirs(os.path.join(where, "src"))
+            os.makedirs(os.path.join(where, "tests"))
+            self.git(self.tmp, "init", "-q", "-b", branch, where)
+            Path(where, "src", "app.py").write_text("def login():\n    return None\n", encoding="utf-8")
+            Path(where, "tests", "test_app.py").write_text("def test_login():\n    assert False\n", encoding="utf-8")
+        else:
+            kind, branch = layout.split(":", 1)
+            where = self.make_repo("orphan-" + uuid.uuid4().hex[:6])
+            if kind == "orphan-tagged":
+                self.git(where, "tag", branch, "main")
+            self.git(where, "checkout", "-q", "--orphan", branch)
+        self.assertNotEqual(subprocess.run(["git", "-C", where, "rev-parse", "--verify", "-q", "HEAD"],
+                                           capture_output=True, env=self.env).returncode, 0, "HEAD has a commit")
+        return where, self.short_branch(where)
+
+    def test_an_unborn_ticket_branch_is_still_guarded(self):
+        """With no commit on the branch, a source edit with no red run is denied on a ticket
+        branch and left alone otherwise, as `symbolic-ref --short` names HEAD; repo_facts gives
+        that name too."""
+        layouts = ("init:t/12-fix-login", "init:t/3-first", "orphan:t/14-fresh-start", "init:main",
+                   "orphan:feature/x", "orphan-tagged:t/15-tagged")
+        for layout in layouts:
+            with self.subTest(layout=layout):
+                where, short = self.unborn(layout)
+                facts = load_with_loader(HOOKS / "tests_first.py").repo_facts(os.path.join(where, "src"))
+                self.assertIsNotNone(facts, where)
+                self.assertEqual(facts["branch"], short)
+                self.assert_decision(self.edit(where), short, layout)
 
 
 # ================================================================ without the lib's repo.py

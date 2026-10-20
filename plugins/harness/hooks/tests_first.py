@@ -181,10 +181,13 @@ def repo_facts(directory: str) -> dict | None:
     """top (the worktree's top-level) and main (the main working tree, main_checkout's,
     which moves state kept under the spelling git reports), both canonical paths, branch
     (None when detached) and spelled (`directory`, for adopt_old_state); None outside a
-    repo. One git call gives top and HEAD's ref, main_checkout's lookup is held to one more
+    repo. One git call gives top and HEAD's branch, main_checkout's lookup is held to one more
     GIT_TIMEOUT: at worst 2 x GIT_TIMEOUT, as on main. Only an unborn branch (that call exits
-    1 with the top alone) costs a third, symbolic-ref, call."""
-    out = git(directory, "rev-parse", "--show-toplevel", "--symbolic-full-name", "--verify", "-q", "HEAD")
+    1 with the top alone) costs a third, symbolic-ref, call. The branch is spelled as
+    `symbolic-ref --short HEAD` (harness-red's name) spells it: `--abbrev-ref=loose` shortens
+    the same way, heads/<branch> when a tag or refs/<branch> shares the name; plain
+    `--abbrev-ref` is strict, and also says heads/ for a clash with refs/remotes/<branch>."""
+    out = git(directory, "rev-parse", "--show-toplevel", "--abbrev-ref=loose", "--verify", "-q", "HEAD")
     lines = [ln.strip() for ln in out.stdout.splitlines()]
     if out.returncode not in (0, 1) or not lines or not lines[0]:
         return None
@@ -192,9 +195,9 @@ def repo_facts(directory: str) -> dict | None:
     main = main_checkout(directory, timeout=GIT_TIMEOUT)
     if main is None:
         return None
-    if out.returncode == 0:  # refs/heads/<branch>, or HEAD when detached
+    if out.returncode == 0:  # the short branch name, or HEAD when detached
         ref = lines[1] if len(lines) > 1 else ""
-        branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ""
+        branch = "" if ref == "HEAD" else ref
     else:  # an unborn branch: HEAD names a branch with no commit yet
         head = git(directory, "symbolic-ref", "--short", "-q", "HEAD")
         branch = head.stdout.strip() if head.returncode == 0 else ""
