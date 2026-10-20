@@ -46,7 +46,6 @@ PATH, else from this script's folder. `gh` is os.environ.get("HARNESS_GH", "gh")
 """
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import fnmatch
 import json
@@ -59,6 +58,15 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.cli import Parser, Problem, run_main
+    from harness_lib.text import last_line, one_line
+except Exception as exc:  # one line, exit 1, like run_main
+    sys.exit(f"harness-scaffold: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 HERE = Path(__file__).resolve().parent
@@ -131,25 +139,13 @@ RULESET = {
 }
 
 
-class Problem(Exception):
-    """A bad invocation or a failed precondition: printed as one line, exit 1."""
-
-
-class Parser(argparse.ArgumentParser):
-    """argparse that reports a bad invocation in one line and exits 1."""
-
-    def error(self, message):
-        sys.exit(f"{self.prog}: error: {message}")
-
-
 def say(text=""):
     print(text, flush=True)
 
 
-def one_line(text):
+def last_line_collapsed(text):
     """The last non-empty line of a command's output, whitespace collapsed."""
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    return " ".join(lines[-1].split()) if lines else ""
+    return one_line(last_line(text))
 
 
 # --------------------------------------------------------------- processes
@@ -163,7 +159,7 @@ def run(cmd, cwd=None, check=True, input=None, env=None, timeout=300):
     except subprocess.TimeoutExpired:
         raise Problem(f"{' '.join(cmd[:3])} timed out after {timeout} s")
     if check and p.returncode != 0:
-        why = one_line(p.stderr) or one_line(p.stdout) or f"exit {p.returncode}"
+        why = last_line_collapsed(p.stderr) or last_line_collapsed(p.stdout) or f"exit {p.returncode}"
         raise Problem(f"{' '.join(cmd[:3])} failed: {why}")
     return p
 
@@ -192,7 +188,7 @@ def call(name, *args, cwd, project):
     env = dict(os.environ, CLAUDE_PROJECT_DIR=str(project))
     p = run([sibling(name)] + list(args), cwd=cwd, env=env, check=False, timeout=TOOL_TIMEOUT)
     if p.returncode != 0:
-        why = one_line(p.stderr) or one_line(p.stdout) or f"exit {p.returncode}"
+        why = last_line_collapsed(p.stderr) or last_line_collapsed(p.stdout) or f"exit {p.returncode}"
         raise Problem(f"{name} {' '.join(args[:2])} failed: {why}")
     return p.stdout
 
@@ -715,7 +711,7 @@ def lock(root, stack, written, dry):
     try:
         p = run(cmd, cwd=root, check=False, timeout=600)
         why = None if p.returncode == 0 and (root / lockfile).exists() else \
-            one_line(p.stderr) or one_line(p.stdout) or f"exit {p.returncode}"
+            last_line_collapsed(p.stderr) or last_line_collapsed(p.stdout) or f"exit {p.returncode}"
     except Problem as err:                          # a timeout: the scaffold goes on without the lock
         why = str(err)
     if why:
@@ -776,7 +772,7 @@ def github(root, name, create, push, dry):
     elif "403" in p.stderr or "Upgrade to GitHub Pro" in p.stderr:
         say(NO_RULESET)
     else:
-        say(f"warning: ruleset not created on {repo}: {one_line(p.stderr) or one_line(p.stdout)}")
+        say(f"warning: ruleset not created on {repo}: {last_line_collapsed(p.stderr) or last_line_collapsed(p.stdout)}")
 
 
 def adopt_body(name, stack, values, statuses):
@@ -811,7 +807,7 @@ def ticket_number(out):
         pass
     m = re.search(r"#(\d+)", out) or re.search(r"/issues/(\d+)", out)
     if not m:
-        raise Problem(f"harness-board task create printed no issue number: {one_line(out)!r}")
+        raise Problem(f"harness-board task create printed no issue number: {last_line_collapsed(out)!r}")
     return int(m.group(1))
 
 
@@ -821,7 +817,7 @@ def json_out(name, out):
     except ValueError:
         data = None
     if not isinstance(data, dict):
-        raise Problem(f"{name} printed no JSON object: {one_line(out)!r}")
+        raise Problem(f"{name} printed no JSON object: {last_line_collapsed(out)!r}")
     return data
 
 
@@ -880,7 +876,7 @@ def register(root, name, billable, client, dry):
     elif "already registered" in p.stderr:
         say(f"kept registry entry for {root}")
     else:
-        raise Problem(f"harness-projects add failed: {one_line(p.stderr) or one_line(p.stdout)}")
+        raise Problem(f"harness-projects add failed: {last_line_collapsed(p.stderr) or last_line_collapsed(p.stdout)}")
 
 
 # --------------------------------------------------------------- commands
@@ -1007,12 +1003,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except BrokenPipeError:                      # the reader went away (| head): stop quietly
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        sys.exit(1)
-    except Exception as err:                     # never a traceback: one line, exit 1
-        sys.exit(f"harness-scaffold: {type(err).__name__}: {' '.join(str(err).split())}")
+    run_main("harness-scaffold", main)

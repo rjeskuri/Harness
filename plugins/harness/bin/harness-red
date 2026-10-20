@@ -37,7 +37,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 if _LIB not in sys.path:
@@ -45,6 +44,8 @@ if _LIB not in sys.path:
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, repo_key
     from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
+    from harness_lib.cli import Parser, Problem, run_main  # Problem also caught by tests/test_red.py
+    from harness_lib.text import write_json
 except Exception as exc:  # one line, exit 1, like the __main__ wrapper below
     sys.exit(f"harness-red: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -69,17 +70,6 @@ NO_TESTS, NOT_LOADED = "no tests ran", "tests failed to load"
 GREEN = "Tests pass before the implementation; they do not test this change."
 RUNNABLE = ("test_*.py", "*_test.py", "*.test.js", "*_test.js", "*.test.ts", "*_test.ts", "*.test.mjs",
             "*.spec.js", "*.spec.ts")      # basenames passed as {files}; other test files are hashed, not run
-
-
-class Problem(Exception):
-    """A bad invocation or a failed precondition: printed as one line, exit 1."""
-
-
-class Parser(argparse.ArgumentParser):
-    """argparse that reports a bad invocation in one line and exits 1."""
-
-    def error(self, message):
-        sys.exit(f"{self.prog}: error: {message}")
 
 
 # --------------------------------------------------------------- globs and settings
@@ -255,24 +245,6 @@ def load_record(repo):
     return record
 
 
-def save_record(path, record):
-    """A temporary file in the same folder, renamed over the old one."""
-    folder = os.path.dirname(path)
-    os.makedirs(folder, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".red-", suffix=".json", dir=folder)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(record, fh, indent=2, ensure_ascii=False)
-            fh.write("\n")
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 # --------------------------------------------------------------- running tests
 def kill_group(proc):
     try:
@@ -420,7 +392,7 @@ def cmd_check(repo, args):
     record = {"branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
               "test_hash": digest, "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),
               "at": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
-    save_record(repo.record_path, record)
+    write_json(repo.record_path, record, prefix=".red-")
     if args.json:
         print(json.dumps(record, indent=2, ensure_ascii=False))
     elif kind == "green":
@@ -547,12 +519,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except BrokenPipeError:                      # the reader went away (| head): stop quietly
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        sys.exit(1)
-    except Exception as err:                     # never a traceback: one line, exit 1
-        sys.exit(f"harness-red: {type(err).__name__}: {' '.join(str(err).split())}")
+    run_main("harness-red", main)
