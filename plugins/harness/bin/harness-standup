@@ -716,11 +716,8 @@ def main():
     args = ap.parse_args()
     now = time.time()
     deadline = time.monotonic() + BUDGET
-    try:
-        registered = load_projects()
-        projects = [pick(registered, args.project)] if args.project else registered
-    except Problem as err:
-        sys.exit(f"harness-standup: {err}")
+    registered = load_projects()
+    projects = [pick(registered, args.project)] if args.project else registered
     box = {}
     reader = threading.Thread(target=read_fleet_into, args=(box,), daemon=True)
     reader.start()

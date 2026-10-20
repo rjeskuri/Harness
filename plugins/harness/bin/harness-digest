@@ -529,19 +529,16 @@ def main():
     job.add_argument("--install-launchd", action="store_true", help="run the digest daily at 08:30 (a LaunchAgent)")
     job.add_argument("--uninstall-launchd", action="store_true", help="remove the LaunchAgent")
     args = ap.parse_args()
-    try:
-        if args.install_launchd:
-            install_launchd()
-        elif args.uninstall_launchd:
-            uninstall_launchd()
+    if args.install_launchd:
+        install_launchd()
+    elif args.uninstall_launchd:
+        uninstall_launchd()
+    else:
+        data, text = digest(time.time())
+        if args.json:
+            print(json.dumps(data, indent=2, ensure_ascii=False))
         else:
-            data, text = digest(time.time())
-            if args.json:
-                print(json.dumps(data, indent=2, ensure_ascii=False))
-            else:
-                sys.stdout.write(text)
-    except Problem as err:
-        sys.exit(f"harness-digest: {err}")
+            sys.stdout.write(text)
 
 
 if __name__ == "__main__":
