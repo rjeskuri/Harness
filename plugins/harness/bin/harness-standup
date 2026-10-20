@@ -38,9 +38,8 @@ try:
     from harness_lib.cli import Problem
     from harness_lib.paths import canonical_path, path_key, repo_key, same_entry
     from harness_lib.registry import find_project, load_registry
-except Exception as exc:
-    sys.stderr.write(f"harness-standup: cannot load harness_lib from {_LIB}: {exc}\n")
-    sys.exit(1)
+except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
+    sys.exit(f"harness-standup: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 BUDGET = 4            # seconds for the projects' git calls (they run side by side)
 FLEET_TIMEOUT = 4     # seconds for `claude agents --json`, started before the projects and read after
