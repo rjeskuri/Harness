@@ -632,16 +632,33 @@ class ProjectsRunTheLib(Spying):
         self.projects = base.load_tool(BIN / "harness-projects")
 
     def test_find_matches_a_path_through_the_lib_same_path(self):
+        # Since #91 a project is found by the lib's registry.find_project, which compares paths with the
+        # registry module's binding of text.same_path; harness-projects' own binding serves add's duplicate check.
+        registry = base.lib_module("registry")
+        self.assertIs(self.projects.find_project, registry.find_project,
+                      "harness-projects does not find projects through the lib's find_project")
+        self.assertIs(registry.same_path, self.text.same_path, "the registry does not use the lib's same_path")
         self.spy(self.projects, self.text, "same_path")
+        patcher = mock.patch.object(registry, "same_path", self.text.same_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         real = os.path.join(self.tmp, "Work", "alpha")
         os.makedirs(real)
         link = os.path.join(self.tmp, "alias")
         os.symlink(real, link)
-        projects = [{"name": "beta", "path": os.path.join(self.tmp, "beta")}, {"name": "alpha", "path": real}]
-        self.assertEqual(self.projects.find(projects, link), 1)
-        self.assertTrue(self.called("same_path"), "find does not compare paths through the lib")
+        projects = [registry.Project(os.path.join(self.tmp, "beta"), "beta"), registry.Project(real, "alpha")]
+        self.assertIs(self.projects.find_project(projects, link), projects[1])
+        self.assertTrue(self.called("same_path"), "find_project does not compare paths through the lib")
         with self.assertRaises(self.cli.Problem):
-            self.projects.find(projects, os.path.join(self.tmp, "nowhere"))
+            self.projects.find_project(projects, os.path.join(self.tmp, "nowhere"))
+        # add's duplicate check: the symlinked path is the registered alpha, by the tool's binding of same_path.
+        self.calls.clear()
+        add = argparse.Namespace(path=link, name="other", billable=False, client=None, notes=None, json=False)
+        with self.assertRaises(self.cli.Problem) as raised:
+            self.projects.cmd_add(projects, add)
+        self.assertIn("'alpha'", str(raised.exception))
+        self.assertEqual(len(projects), 2)
+        self.assertTrue(self.called("same_path"), "add does not compare paths through the lib")
 
     def test_recover_encodes_entries_through_the_lib_session_folder(self):
         self.spy(self.projects, self.text, "session_folder")
@@ -665,7 +682,7 @@ class ProjectsRunTheLib(Spying):
             fh.write("{}\n")
         then = time.time() - 3 * 3600 - 30
         os.utime(transcript, (then, then))
-        _, out, _ = capture(self.projects.cmd_discover, {"version": 1, "projects": []},
+        _, out, _ = capture(self.projects.cmd_discover, [],
                             argparse.Namespace(json=False))
         self.assertIn(project, out)
         self.assertIn("(3h ago)", out)
