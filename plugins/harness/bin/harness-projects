@@ -20,7 +20,6 @@ import glob
 import json
 import os
 import sys
-import tempfile
 import time
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
@@ -28,9 +27,10 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.cli import Parser, Problem, run_main, table
+    from harness_lib.registry import Project, find_project, load_registry, save_registry
     from harness_lib.text import age_text, same_path, session_folder
     from harness_lib.text import session_folder as encode  # noqa: F401  the old name, read by tests/test_tools.py
-except Exception as exc:  # one line, exit 1, like run_main
+except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
     sys.exit(f"harness-projects: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 VERSION = 1
@@ -38,8 +38,6 @@ WORKTREES = "-claude-worktrees-"   # the session folder of a worktree Claude Cod
 MAX_FITS = 20                      # paths kept per folder name while recovering it
 
 
-def registry_path():
-    return os.path.join(os.path.expanduser("~"), ".claude", "harness", "projects.json")
 
 
 def sessions_root():
@@ -56,77 +54,12 @@ def is_project(path):
 
 
 # --------------------------------------------------------------- registry
-def entry(p):
-    """A registry entry with every field of the schema (unknown fields are kept)."""
-    out = dict(p)
-    out["name"] = str(p.get("name") or os.path.basename(p["path"].rstrip("/")) or p["path"])
-    out["billable"] = bool(p.get("billable", False))
-    out["client"] = str(p.get("client") or "")
-    out["notes"] = str(p.get("notes") or "")
-    return out
-
-
-def load(path=None):
-    """The registry, {"version": 1, "projects": [...]}; an empty one when the file does not exist."""
-    path = path or registry_path()
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return {"version": VERSION, "projects": []}
-    except ValueError as err:
-        raise Problem(f"{path} is not valid JSON ({err}); fix it or remove it")
-    except OSError as err:
-        raise Problem(f"cannot read {path}: {err.strerror or err}")
-    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
-        raise Problem(f'{path}: expected {{"version": 1, "projects": [...]}}')
-    if data.get("version", VERSION) != VERSION:
-        raise Problem(f"{path} is version {data.get('version')!r}; this tool reads version {VERSION}")
-    projects = []
-    for n, p in enumerate(data["projects"], start=1):
-        if not isinstance(p, dict) or not isinstance(p.get("path"), str) or not p["path"].strip():
-            raise Problem(f"{path}: project {n} has no path")
-        projects.append(entry(p))
-    return {"version": VERSION, "projects": projects}
-
-
-def save(reg, path=None):
-    """Write the registry: a temporary file in the same folder, renamed over the old one."""
-    path = path or registry_path()
-    folder = os.path.dirname(path)
-    os.makedirs(folder, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".projects-", suffix=".json", dir=folder)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"version": VERSION, "projects": reg["projects"]}, fh, indent=2)
-            fh.write("\n")
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def find(projects, key):
-    """The index of the project named `key` (in any case) or registered at the path `key`."""
-    for match in (lambda p: p["name"] == key, lambda p: p["name"].casefold() == key.casefold(),
-                  lambda p: same_path(p["path"], key)):
-        hits = [i for i, p in enumerate(projects) if match(p)]
-        if len(hits) == 1:
-            return hits[0]
-        if hits:
-            raise Problem(f"{key!r} matches {len(hits)} projects; give its path instead")
-    raise Problem(f"no registered project named or at {key!r} (harness-projects list shows them)")
-
-
 def check_name(projects, name, skip=None):
     if not name:
         raise Problem("the name is empty")
-    for i, p in enumerate(projects):
-        if i != skip and p["name"].casefold() == name.casefold():
-            raise Problem(f"the name {p['name']!r} is taken by {p['path']}; pass --name")
+    for p in projects:
+        if p is not skip and p.name.casefold() == name.casefold():
+            raise Problem(f"the name {p.name!r} is taken by {p.path}; pass --name")
 
 
 # --------------------------------------------------------------- discover
@@ -182,7 +115,7 @@ def newest_transcript(folder):
     return max(stamps) if stamps else None
 
 
-def candidates(reg):
+def candidates(projects):
     """Projects Claude Code has session folders for that exist, have a .git or a CLAUDE.md and are not
     registered: [{"path", "name", "folder", "last_session"}], newest session first."""
     root = sessions_root()
@@ -197,7 +130,7 @@ def candidates(reg):
         path = recover(folder, cache=cache)
         if not path or path in seen or not is_project(path):
             continue
-        if any(same_path(p["path"], path) for p in reg["projects"]):
+        if any(same_path(p.path, path) for p in projects):
             continue
         seen.add(path)
         out.append({"path": path, "name": os.path.basename(path), "folder": folder,
@@ -208,8 +141,8 @@ def candidates(reg):
 
 # --------------------------------------------------------------- output
 def summary(verb, p):
-    terms = "billable" + (f", client {p['client']}" if p["client"] else "") if p["billable"] else "not billable"
-    return f"{verb} {p['name']}: {p['path']} ({terms})"
+    terms = "billable" + (f", client {p.client}" if p.client else "") if p.billable else "not billable"
+    return f"{verb} {p.name}: {p.path} ({terms})"
 
 
 def emit(as_json, data, text):
@@ -217,58 +150,57 @@ def emit(as_json, data, text):
 
 
 # --------------------------------------------------------------- commands
-def cmd_list(reg, args):
-    if args.json or not reg["projects"]:
-        emit(args.json, reg, "No projects registered. `harness-projects discover` lists candidates; "
-                             "`harness-projects add <path>` registers one.")
+def cmd_list(projects, args):
+    if args.json or not projects:
+        emit(args.json, {"version": VERSION, "projects": [p.to_entry() for p in projects]},
+             "No projects registered. `harness-projects discover` lists candidates; "
+             "`harness-projects add <path>` registers one.")
         return
     rows = [("NAME", "PATH", "BILLABLE", "CLIENT")]
-    rows += [(p["name"], p["path"], "yes" if p["billable"] else "no", p["client"]) for p in reg["projects"]]
+    rows += [(p.name, p.path, "yes" if p.billable else "no", p.client) for p in projects]
     print(table(rows))
 
 
-def cmd_add(reg, args):
+def cmd_add(projects, args):
     path = absolute(args.path)
     if not os.path.isdir(path):
         raise Problem(f"not a directory: {path}")
-    for p in reg["projects"]:
-        if same_path(p["path"], path):
-            raise Problem(f"{path} is already registered as {p['name']!r}")
+    for p in projects:
+        if same_path(p.path, path):
+            raise Problem(f"{path} is already registered as {p.name!r}")
     name = (os.path.basename(path) if args.name is None else args.name).strip()
-    check_name(reg["projects"], name)
-    new = {"path": path, "name": name, "billable": args.billable, "client": args.client or "",
-           "notes": args.notes or ""}
-    reg["projects"].append(new)
-    save(reg)
-    emit(args.json, new, summary("added", new))
+    check_name(projects, name)
+    new = Project(path, name, args.billable, args.client or "", args.notes or "")
+    projects.append(new)
+    save_registry(projects)
+    emit(args.json, new.to_entry(), summary("added", new))
 
 
-def cmd_set(reg, args):
+def cmd_set(projects, args):
     if args.billable is None and args.client is None and args.notes is None and args.name is None:
         raise Problem("nothing to change: give --billable, --no-billable, --client, --notes or --name")
-    i = find(reg["projects"], args.project)
-    p = reg["projects"][i]
+    p = find_project(projects, args.project)
     if args.name is not None:
-        check_name(reg["projects"], args.name.strip(), skip=i)
-        p["name"] = args.name.strip()
+        check_name(projects, args.name.strip(), skip=p)
+        p.name = args.name.strip()
     if args.billable is not None:
-        p["billable"] = args.billable
+        p.billable = args.billable
     if args.client is not None:
-        p["client"] = args.client
+        p.client = args.client
     if args.notes is not None:
-        p["notes"] = args.notes
-    save(reg)
-    emit(args.json, p, summary("updated", p))
+        p.notes = args.notes
+    save_registry(projects)
+    emit(args.json, p.to_entry(), summary("updated", p))
 
 
-def cmd_remove(reg, args):
-    p = reg["projects"].pop(find(reg["projects"], args.project))
-    save(reg)
-    emit(args.json, p, f"removed {p['name']}: {p['path']}")
+def cmd_remove(projects, args):
+    p = find_project(projects, args.project)
+    save_registry([q for q in projects if q is not p])
+    emit(args.json, p.to_entry(), f"removed {p.name}: {p.path}")
 
 
-def cmd_discover(reg, args):
-    found = candidates(reg)
+def cmd_discover(projects, args):
+    found = candidates(projects)
     now = time.time()
     if args.json:
         for c in found:
@@ -321,7 +253,7 @@ def main():
     args = parser().parse_args()
     commands = {"list": cmd_list, "add": cmd_add, "set": cmd_set, "remove": cmd_remove, "discover": cmd_discover}
     try:
-        commands[args.cmd or "list"](load(), args)
+        commands[args.cmd or "list"](load_registry(strict=True), args)
     except Problem as err:
         sys.exit(f"harness-projects: {err}")
 
