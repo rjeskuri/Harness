@@ -14,6 +14,8 @@ harness-work, ticket #80) are not covered here.
 - Missing or broken lib: a tool prints one line `<tool>: cannot load harness_lib from <lib>: <error>`
   to stderr and exits 1 (docs/design.md: "A bin tool that imports the lib will print one line and
   exit 1 the same way"), whatever it was asked to do.
+- Multi-line error (ticket #103): a message with every kind of whitespace in it, line breaks
+  included, still gives exactly one stderr line, its words joined by single spaces.
 - Static backstops: the tools define none of the five helpers, carry no renamed copy, compute no
   sha1 key, and bind the names they use in their own namespace from harness_lib.paths. Against a
   copy kept as dead code or split across defs: every def in a tool is live, no def cuts a path on
@@ -32,6 +34,7 @@ import importlib
 import inspect
 import json
 import os
+import random
 import re
 import shutil
 import stat
@@ -443,6 +446,86 @@ class LibFailureTests(ToolCase):
                 self.assert_one_line_exit_1(r, tool, "missing", root)
         self.assertEqual(self.state_dirs(), [])
         self.assertFalse((self.home / ".claude" / "harness" / "digest").exists())
+
+
+# Every character str.split() treats as a blank, which is every one str.isspace() admits: the
+# ASCII blanks and newlines, the \x1c-\x1f separators, NEL, no-break space, the Unicode spaces
+# and the line and paragraph separators (29 of them). Enumerated, not listed, so the tools must
+# collapse the set itself, not a spelling of it copied from here.
+WHITESPACE = [chr(i) for i in range(sys.maxunicode + 1) if chr(i).isspace()]
+
+
+@unittest.skipUnless(GIT, "git is not installed")
+class MultiLineLibErrorTests(ToolCase):
+    """Ticket #103: an import that raises with line breaks in its message still gives exactly one
+    stderr line, `<tool>: cannot load harness_lib from <lib>: <the message's words>`, and exit 1
+    (docs/design.md: "A bin tool that imports the lib will print one line and exit 1")."""
+
+    def multiline_message(self, tag: str) -> tuple[str, list]:
+        """(a message, its words): the words w0-<tag>, w1-<tag>, ... with every whitespace
+        character between two of them, each alone once and then in mixed runs, in an order drawn
+        from the tag (so it differs run to run); a run before the first word and after the last."""
+        rng = random.Random(tag)
+        seps = rng.sample(WHITESPACE, len(WHITESPACE))
+        seps += ["".join(rng.choices(WHITESPACE, k=k)) for k in (2, 3, 5, 8)]
+        words = [f"w{i}-{tag}" for i in range(len(seps) + 1)]
+        message = "".join(rng.choices(WHITESPACE, k=3))
+        for word, sep in zip(words, seps + ["".join(rng.choices(WHITESPACE, k=2))]):
+            message += word + sep
+        return message, words
+
+    def multiline_plugin(self, where: str, exc: str, message: str) -> Path:
+        """A plugin tree whose lib raises exc(message) at import, from __init__.py or from
+        paths.py."""
+        root = self.tmp / f"plugin-multiline-{where}-{exc}"
+        shutil.copytree(PLUGIN, root, ignore=shutil.ignore_patterns("__pycache__", "tests", "lib"))
+        raiser = f"raise {exc}({message!r})\n"
+        if where == "init":
+            files = {"__init__.py": raiser, "paths.py": ""}
+        else:
+            # the real lib's other modules (a tool may import one before paths), paths.py raising
+            real = {
+                p.name: p.read_text(encoding="utf-8")
+                for p in sorted((thl.LIB / "harness_lib").glob("*.py"))
+                if p.name not in ("__init__.py", "paths.py")
+            }
+            files = {**real, "__init__.py": "from __future__ import annotations\n", "paths.py": raiser}
+        self.write_lib(root, files)
+        return root
+
+    def test_a_multi_line_import_error_prints_one_line_and_exits_1(self):
+        # the enumeration found the set (not a narrowed build): the breaks and blanks a message
+        # is likeliest to carry are in it
+        self.assertGreaterEqual(len(WHITESPACE), 25)
+        named = set("\t\n\v\f\r \x1c\x1d\x1e\x1f\x85\xa0") | {chr(0x2028), chr(0x2029), chr(0x3000)}
+        self.assertLessEqual(named, set(WHITESPACE))
+        cases = (
+            ("init", "ImportError"),
+            ("paths", "ImportError"),
+            ("init", "RuntimeError"),
+            ("paths", "ValueError"),
+        )
+        for where, exc in cases:
+            tag = uuid.uuid4().hex[:6]
+            message, words = self.multiline_message(tag)
+            expected = " ".join(words)  # from the fixture's words, not from any tool
+            root = self.multiline_plugin(where, exc, message)
+            lib = root / "lib"
+            for tool in TOOL_NAMES:
+                for args in (("--help",), ("--json",) if tool != "harness-red" else ("check",)):
+                    with self.subTest(where=where, exc=exc, tool=tool, args=args, tag=tag):
+                        r = self.run_tool(root / "bin" / tool, *args)
+                        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                        self.assertEqual(r.stdout, "")
+                        self.assertNotIn("Traceback", r.stderr)
+                        # exactly one line by every line-break rule, newline-terminated
+                        self.assertEqual(len(r.stderr.splitlines()), 1, repr(r.stderr))
+                        self.assertTrue(r.stderr.endswith("\n"), repr(r.stderr))
+                        prefix = f"{tool}: cannot load harness_lib from {lib}: "
+                        self.assertTrue(r.stderr.startswith(prefix), repr(r.stderr))
+                        # every word, in order, each run of blanks one space, nothing before
+                        # the first word or after the last
+                        self.assertEqual(r.stderr[len(prefix):], expected + "\n", repr(r.stderr))
 
 
 # ================================================================ the tools import, not copy

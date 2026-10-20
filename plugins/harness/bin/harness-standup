@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import dataclasses
 import datetime as dt
 import glob
 import json
@@ -33,12 +34,12 @@ _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
-    from harness_lib.paths import canonical_path, path_key, repo_key, same_entry
     from harness_lib.cli import Problem
+    from harness_lib.paths import canonical_path, path_key, repo_key, same_entry
     from harness_lib.gh import GhBatch, describe_list_call, gh_binary, repo_slug
-except Exception as exc:
-    sys.stderr.write(f"harness-standup: cannot load harness_lib from {_LIB}: {exc}\n")
-    sys.exit(1)
+    from harness_lib.registry import find_project, load_registry
+except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
+    sys.exit(f"harness-standup: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 BUDGET = 4            # seconds for the projects' git calls (they run side by side)
 FLEET_TIMEOUT = 4     # seconds for `claude agents --json`, started before the projects and read after
@@ -51,6 +52,7 @@ NEEDS_INPUT = "**Needs your input**"
 HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
 NEXT_STEPS = re.compile(r"^(\s*)(#{1,6}\s+|[-*+]\s+)?(\*\*|__)?\s*next steps?\b\s*:?\s*(?:\*\*|__)?\s*:?\s*(.*)$", re.I)
 BOLD_LABEL = re.compile(r"^(\s*)([-*+]\s+)?(\*\*|__)\S")
+REPORTED = ("name", "path", "billable", "client")   # the registry fields a project's report carries
 
 
 class Parser(argparse.ArgumentParser):
@@ -104,43 +106,6 @@ def stamp(then, now):
 def clip(line):
     line = " ".join(line.split())
     return line if len(line) <= WIDTH else line[:WIDTH - 1].rstrip() + "…"
-
-
-# --------------------------------------------------------------- registry
-def load_projects():
-    """The registered projects in registry order; Problem when the registry cannot be read."""
-    path = home(".claude", "harness", "projects.json")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return []
-    except ValueError as err:
-        raise Problem(f"{path} is not valid JSON ({err}); fix it or remove it")
-    except OSError as err:
-        raise Problem(f"cannot read {path}: {err.strerror or err}")
-    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
-        raise Problem(f'{path}: expected {{"version": 1, "projects": [...]}}')
-    if data.get("version", 1) != 1:
-        raise Problem(f"{path} is version {data.get('version')!r}; this tool reads version 1")
-    out = []
-    for p in data["projects"]:
-        if isinstance(p, dict) and isinstance(p.get("path"), str) and p["path"].strip():
-            out.append({"name": str(p.get("name") or os.path.basename(p["path"].rstrip("/")) or p["path"]),
-                        "path": p["path"], "billable": bool(p.get("billable")), "client": str(p.get("client") or "")})
-    return out
-
-
-def pick(projects, key):
-    """The project named `key` (in any case) or registered at the path `key`."""
-    for match in (lambda p: p["name"] == key, lambda p: p["name"].casefold() == key.casefold(),
-                  lambda p: same_path(p["path"], key)):
-        hits = [p for p in projects if match(p)]
-        if len(hits) == 1:
-            return hits[0]
-        if hits:
-            raise Problem(f"{key!r} matches {len(hits)} projects; give its path instead")
-    raise Problem(f"no registered project named or at {key!r} (harness-projects list shows them)")
 
 
 # --------------------------------------------------------------- one project
@@ -299,10 +264,11 @@ def hours_this_month(path, today):
 
 def report(project, deadline, now):
     """Everything the standup says about one project; one error line when it cannot be read."""
-    out = dict(project, error=None, git=None, last_session=None, next=[], latest_spec=None,
-               hours_this_month=None, sessions=None)
+    fields = dataclasses.asdict(project)
+    out = dict({k: fields[k] for k in REPORTED}, error=None, git=None, last_session=None, next=[],
+               latest_spec=None, hours_this_month=None, sessions=None)
     try:
-        path = project["path"]
+        path = project.path
         if not os.path.isdir(path):
             out["error"] = "path not found"
             return out
@@ -311,7 +277,7 @@ def report(project, deadline, now):
         out["last_session"] = stamp(newest, now) if newest else None
         out["next"] = next_steps(path)
         out["latest_spec"] = latest_spec(path)
-        if project["billable"]:
+        if project.billable:
             out["hours_this_month"] = hours_this_month(path, dt.date.fromtimestamp(now))
     except Exception as err:      # one project never stops the others
         out["error"] = f"could not read it: {type(err).__name__}: {' '.join(str(err).split())}"
@@ -450,7 +416,7 @@ def board_report(project, now):
     out = {"board": None, "prs_awaiting": None, "needs_input": None, "stale_worktrees": None, "board_error": None}
     deadline = time.monotonic() + GH_BUDGET
     try:
-        path, gh = project["path"], gh_binary()
+        path, gh = project.path, gh_binary()
         if gh is None or not os.path.isdir(path):
             return out
         remote = git(path, ["remote", "get-url", "origin"], deadline)
@@ -522,12 +488,12 @@ def run_project(record, filename, projects):
     """The registered project a run belongs to (by its repo field, else its file's key), else a short name."""
     repo = record.get("repo") if isinstance(record.get("repo"), str) else ""
     for p in projects:
-        if repo and (p["name"] == repo or same_path(p["path"], repo) or repo_key(p["path"]) == repo_key(repo)):
-            return p["name"]
+        if repo and (p.name == repo or same_path(p.path, repo) or repo_key(p.path) == repo_key(repo)):
+            return p.name
     key = os.path.basename(filename)[:12]
     for p in projects:                  # the canonical key, or the old key of the registered spelling
-        if key in (repo_key(p["path"]), path_key(os.path.realpath(p["path"]))):
-            return p["name"]
+        if key in (repo_key(p.path), path_key(os.path.realpath(p.path))):
+            return p.name
     return (os.path.basename(repo.rstrip("/")) or repo) if repo else key
 
 
@@ -684,8 +650,8 @@ def main():
     now = time.time()
     deadline = time.monotonic() + BUDGET
     try:
-        registered = load_projects()
-        projects = [pick(registered, args.project)] if args.project else registered
+        registered = load_registry()
+        projects = [find_project(registered, args.project)] if args.project else registered
     except Problem as err:
         sys.exit(f"harness-standup: {err}")
     box = {}
