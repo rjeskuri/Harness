@@ -28,7 +28,7 @@ Harness/
                branch_guard.py tests_first.py
     bin/       harness-board harness-work harness-red harness-pr harness-scaffold harness-digest
                harness-projects harness-standup harness-worklog        (python3, mode 755, on the Bash PATH)
-    lib/       harness_lib/__init__.py paths.py settings.py hookio.py notify.py sessionstate.py shellwalk.py cli.py text.py registry.py   (the shared code, imported in place)
+    lib/       harness_lib/__init__.py paths.py settings.py hookio.py notify.py sessionstate.py shellwalk.py cli.py text.py registry.py transcripts.py   (the shared code, imported in place)
     templates/ scaffold templates (see harness-scaffold)
     tests/     test_*.py, fakegh.py       python3 -m unittest discover -s plugins/harness/tests
   user/CLAUDE.md                        copied to ~/.claude/CLAUDE.md
