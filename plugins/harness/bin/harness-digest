@@ -36,8 +36,10 @@ _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
+    from harness_lib.cli import Problem
     from harness_lib.notify import notify
     from harness_lib.paths import canonical_path, path_key, repo_key, same_entry
+    from harness_lib.registry import load_registry
 except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
     sys.exit(f"harness-digest: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -50,10 +52,6 @@ NEEDS_INPUT = "**Needs your input**"
 FAILED = ("billing", "auth", "error", "early")   # early: ended ok, the ticket still in progress with no PR
 LABEL = "com.ryaneskuri.harness-digest"
 DIGEST_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
-
-
-class Problem(Exception):
-    """A bad invocation, an unreadable registry or a failed call: printed as one line."""
 
 
 class Parser(argparse.ArgumentParser):
@@ -125,24 +123,8 @@ def read_json(path):
 
 # --------------------------------------------------------------- registry
 def load_projects():
-    """The registered projects in registry order; Problem when the registry cannot be read."""
-    path = harness_home("projects.json")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return []
-    except ValueError as err:
-        raise Problem(f"{path} is not valid JSON ({err}); fix it or remove it")
-    except OSError as err:
-        raise Problem(f"cannot read {path}: {err.strerror or err}")
-    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
-        raise Problem(f'{path}: expected {{"version": 1, "projects": [...]}}')
-    if data.get("version", 1) != 1:
-        raise Problem(f"{path} is version {data.get('version')!r}; this tool reads version 1")
-    return [{"name": str(p.get("name") or os.path.basename(p["path"].rstrip("/")) or p["path"]), "path": p["path"]}
-            for p in data["projects"]
-            if isinstance(p, dict) and isinstance(p.get("path"), str) and p["path"].strip()]
+    """The registered projects' names and paths, in registry order; Problem when the registry cannot be read."""
+    return [{"name": p.name, "path": p.path} for p in load_registry()]
 
 
 # --------------------------------------------------------------- git and gh
