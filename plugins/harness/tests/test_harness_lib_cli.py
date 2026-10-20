@@ -1293,9 +1293,12 @@ def writes_to_stderr(call, streams: set, printers: set) -> bool:
     return isinstance(f, ast.Name) and f.id in printers
 
 
-def spelt_text(node) -> str:
-    """The text an expression spells as far as its pieces are constants: its string constants and chr(<int>) calls,
-    in source order and joined, so "warn" + "ing: " and chr(119) + "arning" both spell a warning."""
+def spelt_text(node, names: dict = None, seen: frozenset = frozenset()) -> str:
+    """The text an expression spells as far as its pieces are known: its string constants and chr(<int>) calls, in
+    source order and joined, so "warn" + "ing: " and chr(119) + "arning" both spell a warning. A name in it (an
+    argument, an f-string field, an item of a join or a + chain) is followed to what `names` says it was assigned
+    (every value, in order, each name once), and that text stands where the name stands."""
+    names = names or {}
     pieces = []
     for sub in ast.walk(node):
         if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and hasattr(sub, "lineno"):
@@ -1306,17 +1309,68 @@ def spelt_text(node) -> str:
                 pieces.append((sub.lineno, sub.col_offset, chr(sub.args[0].value)))
             except (ValueError, OverflowError):
                 pass
+        elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in names and sub.id not in seen:
+            text = "".join(spelt_text(value, names, seen | {sub.id}) for value in names[sub.id])
+            pieces.append((sub.lineno, sub.col_offset, text))
     return "".join(p for _, _, p in sorted(pieces))
+
+
+def scope_assignments(scope) -> dict:
+    """{name: [values]} of the plain, annotated and augmented (+=) assignments made directly in a module or function
+    body, nested defs and lambdas left to their own scope."""
+    found: dict = {}
+
+    def visit(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, DEFS + (ast.Lambda,)):
+                continue
+            if isinstance(child, ast.Assign):
+                targets = child.targets
+            elif isinstance(child, (ast.AnnAssign, ast.AugAssign)) and child.value is not None:
+                targets = [child.target]
+            else:
+                targets = []
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    found.setdefault(target.id, []).append(child.value)
+            visit(child)
+
+    visit(scope)
+    return found
 
 
 def stderr_warning_findings(tree) -> list:
     """Lines that write a `... warning: ...` line of their own to stderr: the lib's warn is the one spelling. Only
-    writes to stderr count (print to stdout, a table cell or a file is not a warning line), however the text is
-    built (pieces, an f-string, chr()) and however stderr is reached (sys.stderr, an alias, a partial of print)."""
+    writes to stderr count (print to stdout, a table cell or a file is not a warning line). Stderr is sys.stderr,
+    sys.__stderr__, a name bound to either, or a partial of print or a bound .write on it. The text is what
+    spelt_text reads from the call: string constants and chr(<int>) pieces, and the names in it followed to their
+    assignments in the enclosing functions and at module level. Not covered: text built by a method call on a name
+    (parts.append(...), str.format on a variable template), a loop variable, or a function's return value."""
     tree = live_tree(tree)
     streams, printers = stderr_aliases(tree)
-    return [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Call)
-            and writes_to_stderr(node, streams, printers) and "warning" in spelt_text(node).lower()]
+    found = []
+
+    def visit(scope, chain: list):
+        inner = chain + [scope_assignments(scope)]
+        names: dict = {}
+        for level in inner:                                         # outer scopes first; every value counts
+            for name, values in level.items():
+                names.setdefault(name, []).extend(values)
+
+        def calls(node):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, DEFS):
+                    visit(child, inner)
+                    continue
+                if isinstance(child, ast.Call) and writes_to_stderr(child, streams, printers) \
+                        and "warning" in spelt_text(child, names).lower():
+                    found.append(child.lineno)
+                calls(child)
+
+        calls(scope)
+
+    visit(tree, [])
+    return sorted(found)
 
 
 ASCII = [chr(c) for c in range(128)]
@@ -1676,6 +1730,8 @@ class ToolsWarnAndReachStderrOnlyTheirOwnWay(unittest.TestCase):
         plants = (
             'def caution(msg):\n    print("{tool}: " + chr(119) + "arning: " + msg, file=sys.stderr)\n',
             'ERR = sys.stderr\n\n\ndef caution(msg):\n    print(f"{tool}: warn" "ing: " + msg, file=ERR)\n',
+            'def caution(m):\n    msg = "{tool}: warning: " + m\n    print(msg, file=sys.stderr)\n',
+            'CAUTION = "{tool}: warning:"\n\n\ndef caution(m):\n    sys.stderr.write(f"{CAUTION} {m}\\n")\n',
         )
         for tool in TOOLS:
             source = (BIN / tool).read_text(encoding="utf-8")
@@ -2009,6 +2065,38 @@ say = sys.stderr.write
 def caution(msg):
     say("harness-x: warning: " + msg + "\n")
 ''',
+    "a warning held in a local variable, then printed to stderr": r'''
+def caution(m):
+    msg = "harness-x: warning: " + m
+    print(msg, file=sys.stderr)
+''',
+    "a warning built up with += in a variable, then written to stderr": r'''
+def caution(m):
+    msg = "harness-x: "
+    msg += "warn" "ing: " + m + "\n"
+    sys.stderr.write(msg)
+''',
+    "a warning prefix in a module-level constant, in an f-string to stderr": r'''
+PREFIX = "harness-x: warning:"
+
+
+def caution(m):
+    print(f"{PREFIX} {m}", file=sys.stderr)
+''',
+    "a warning through two variables and a join": r'''
+def caution(m):
+    head = "warn"
+    line = " ".join([head + "ing:", m])
+    print(line, file=sys.stderr)
+''',
+    "a warning in an outer function's variable, printed by a nested one": r'''
+def outer(m):
+    label = "harness-x: warning: "
+
+    def inner():
+        sys.stderr.write(label + m + "\n")
+    inner()
+''',
     "session_folder through str.translate": r'''
 def folder_slug(where):
     return where.translate({c: "-" for c in range(128) if not chr(c).isalnum()})
@@ -2117,6 +2205,26 @@ def listing():
 def note(msg):
     print("warning: " + msg, file=sys.stdout)
     sys.stdout.write("warning\n")
+''',
+    "a variable named for warnings, holding a count, on stderr": r'''
+def report(errors):
+    warnings = len(errors)
+    print(f"harness-x: {warnings} checks failed", file=sys.stderr)
+''',
+    "a warning text in another function's variable, not this one's": r'''
+def a():
+    msg = "harness-x: warning: unrelated"
+    return len(msg)
+
+
+def b(m):
+    msg = "harness-x: " + m
+    print(msg, file=sys.stderr)
+''',
+    "a warning text in a variable printed to stdout": r'''
+def note(m):
+    msg = "warning: " + m
+    print(msg)
 ''',
     "a translation that deletes characters": r'''
 def clean(s):
