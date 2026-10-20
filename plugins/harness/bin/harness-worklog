@@ -43,6 +43,8 @@ Usage:
     harness-worklog export --month 2026-09 --rate 60 --out invoice-2026-09.csv
     harness-worklog --repo ~/code/other update               # a repo other than the current one
 """
+from __future__ import annotations
+
 import argparse
 import csv
 import datetime as dt
@@ -54,6 +56,15 @@ import re
 import shlex
 import subprocess
 import sys
+
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.cli import Parser, run_main
+    from harness_lib.text import session_folder
+except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
+    sys.exit(f"harness-worklog: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 REPO = os.curdir            # the current directory until main() calls use_repo(find_repo(--repo))
 LOG = os.path.join(REPO, "worklog", "worklog.csv")
@@ -111,18 +122,13 @@ def rel(path):
     return os.path.relpath(path, REPO)
 
 
-def encode_path(path):
-    """Claude Code names a project's session folder after its path, every non-alphanumeric as '-'."""
-    return re.sub(r"[^A-Za-z0-9]", "-", path)
-
-
 def transcripts_dirs(repo=None):
     """The repo's session folders: its own, then one per ticket worktree (<repo>/.claude/worktrees/<name>),
     found by listing ~/.claude/projects since a removed worktree keeps its transcripts."""
     repo = repo or REPO
     projects = os.path.join(os.path.expanduser("~"), ".claude", "projects")
-    dirs = [os.path.join(projects, encode_path(repo))]
-    prefix = encode_path(os.path.join(repo, ".claude", "worktrees")) + "-"
+    dirs = [os.path.join(projects, session_folder(repo))]
+    prefix = session_folder(os.path.join(repo, ".claude", "worktrees")) + "-"
     try:
         names = sorted(os.listdir(projects))
     except OSError:
@@ -722,13 +728,6 @@ def describe_rows(rows, day, text, blocks=None):
     return rows, created
 
 
-class Parser(argparse.ArgumentParser):
-    """argparse that reports a bad invocation in one line and exits 1."""
-
-    def error(self, message):
-        sys.exit(f"{self.prog}: error: {message}")
-
-
 def main():
     global TOOL
     repo_help = ("the repo (default: $CLAUDE_PROJECT_DIR, else the git top level of the current directory, "
@@ -912,12 +911,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except BrokenPipeError:                      # the reader went away (| head): stop quietly
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        sys.exit(1)
-    except Exception as err:                     # never a traceback: one line, exit 1
-        sys.exit(f"harness-worklog: {type(err).__name__}: {' '.join(str(err).split())}")
+    run_main("harness-worklog", main)

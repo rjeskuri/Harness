@@ -15,7 +15,6 @@ Usage:
 """
 from __future__ import annotations
 
-import argparse
 import concurrent.futures
 import csv
 import datetime as dt
@@ -35,6 +34,9 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import canonical_path, path_key, repo_key, same_entry
+    from harness_lib.cli import Parser, Problem, run_main
+    from harness_lib.text import (age_text, first_line, home, parse_iso_seconds, read_json, same_path,
+                                  session_folder)
 except Exception as exc:
     sys.stderr.write(f"harness-standup: cannot load harness_lib from {_LIB}: {exc}\n")
     sys.exit(1)
@@ -52,30 +54,6 @@ NEXT_STEPS = re.compile(r"^(\s*)(#{1,6}\s+|[-*+]\s+)?(\*\*|__)?\s*next steps?\b\
 BOLD_LABEL = re.compile(r"^(\s*)([-*+]\s+)?(\*\*|__)\S")
 
 
-class Problem(Exception):
-    """A bad invocation or an unreadable registry (one line, exit 1), or a failed gh call (one board line)."""
-
-
-class Parser(argparse.ArgumentParser):
-    """argparse that reports a bad invocation in one line and exits 1."""
-
-    def error(self, message):
-        sys.exit(f"{self.prog}: error: {message}")
-
-
-def home(*parts):
-    return os.path.join(os.path.expanduser("~"), *parts)
-
-
-def encode(path):
-    """Claude Code's folder name for a project: its path with every non-alphanumeric as '-'."""
-    return re.sub(r"[^A-Za-z0-9]", "-", path)
-
-
-def same_path(a, b):
-    return os.path.realpath(os.path.abspath(os.path.expanduser(a))) == os.path.realpath(os.path.abspath(os.path.expanduser(b)))
-
-
 def under(cwd, path):
     """Whether the directory `cwd` is `path` or inside it."""
     if not isinstance(cwd, str) or not cwd:
@@ -84,24 +62,9 @@ def under(cwd, path):
     return cwd == path or cwd.startswith(path.rstrip(os.sep) + os.sep)
 
 
-def age(then, now):
-    """'just now', '5m ago', '3h ago', '2d ago', '4mo ago' or '2y ago'."""
-    s = max(0, now - then)
-    if s < 60:
-        return "just now"
-    if s < 3600:
-        return f"{int(s // 60)}m ago"
-    if s < 86400:
-        return f"{int(s // 3600)}h ago"
-    if s < 86400 * 60:
-        return f"{int(s // 86400)}d ago"
-    if s < 86400 * 730:
-        return f"{int(s // (86400 * 30))}mo ago"
-    return f"{int(s // (86400 * 365))}y ago"
-
-
 def stamp(then, now):
-    return {"time": dt.datetime.fromtimestamp(then).astimezone().isoformat(timespec="seconds"), "age": age(then, now)}
+    return {"time": dt.datetime.fromtimestamp(then).astimezone().isoformat(timespec="seconds"),
+            "age": age_text(then, now)}
 
 
 def clip(line):
@@ -199,7 +162,7 @@ def git_state(path, deadline, now):
 def last_session(path):
     """The newest mtime among the project's Claude Code transcripts, or None."""
     stamps = []
-    for name in glob.glob(os.path.join(glob.escape(home(".claude", "projects", encode(path))), "*.jsonl")):
+    for name in glob.glob(os.path.join(glob.escape(home(".claude", "projects", session_folder(path))), "*.jsonl")):
         try:
             stamps.append(os.path.getmtime(name))
         except OSError:
@@ -376,21 +339,6 @@ def fleet_text(e):
 
 
 # --------------------------------------------------------------- board (gh)
-def first_line(text):
-    return next((line.strip() for line in (text or "").splitlines() if line.strip()), "")
-
-
-def parse_iso(text):
-    """Seconds since the epoch for an ISO-8601 time (Z allowed; naive means local), or None."""
-    if not isinstance(text, str) or not text.strip():
-        return None
-    try:
-        when = dt.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return (when if when.tzinfo else when.astimezone()).timestamp()
-
-
 def gh_binary():
     """The gh to run (HARNESS_GH, else gh on PATH), or None when it cannot be found."""
     gh = os.environ.get("HARNESS_GH", "gh")
@@ -572,10 +520,10 @@ def board_report(project, now):
         prs = []
         for pr in mine:
             if pr.get("isDraft") is False:
-                created = parse_iso(pr.get("createdAt"))
+                created = parse_iso_seconds(pr.get("createdAt"))
                 prs.append({"number": pr.get("number"), "title": clip(pr.get("title") or ""), "url": pr.get("url"),
                             "branch": pr.get("headRefName"), "created_at": pr.get("createdAt"),
-                            "age": age(created, now) if created is not None else None})
+                            "age": age_text(created, now) if created is not None else None})
         needs = [{"number": i.get("number"), "title": clip(i.get("title") or ""), "url": i.get("url"),
                   "question": question(i.get("comments") if isinstance(i.get("comments"), list) else [])}
                  for i in asking]
@@ -590,21 +538,13 @@ def board_report(project, now):
 
 
 # --------------------------------------------------------------- budgets and runs
-def read_json(path):
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return None
-
-
 def exhausted_budgets(now):
     """[{"name", "until", "reason"}] for each budget budgets.json marks exhausted until a time ahead."""
     data = read_json(home(".claude", "harness", "budgets.json"))
     out = []
     for name, entry in (data.items() if isinstance(data, dict) else []):
         until = entry.get("exhausted_until") if isinstance(entry, dict) else None
-        when = parse_iso(until)
+        when = parse_iso_seconds(until)
         if when is not None and when > now:
             out.append({"name": name, "until": until.strip(), "reason": " ".join(str(entry.get("reason") or "").split())})
     return out
@@ -643,7 +583,8 @@ def recent_runs(projects, now):
         record = read_json(name)
         if not isinstance(record, dict):
             continue
-        started, ended, pid = parse_iso(record.get("started_at")), parse_iso(record.get("ended_at")), record.get("pid")
+        started, ended = parse_iso_seconds(record.get("started_at")), parse_iso_seconds(record.get("ended_at"))
+        pid = record.get("pid")
         if ended is None and not record.get("outcome"):
             if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and not pid_alive(pid):
                 state = "exited"                       # gone, not swept yet: when its log last changed
@@ -668,7 +609,7 @@ def recent_runs(projects, now):
                      "ticket": record.get("ticket"), "venue": record.get("venue"), "state": state,
                      "exit": record.get("exit"), "started_at": record.get("started_at"),
                      "ended_at": record.get("ended_at"), "log": record.get("log"),
-                     "age": age(when, now) if when is not None else None}))
+                     "age": age_text(when, now) if when is not None else None}))
     out.sort(key=lambda pair: pair[0])
     return [run for _, run in out]
 
@@ -808,12 +749,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except BrokenPipeError:                      # the reader went away (| head): stop quietly
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        sys.exit(1)
-    except Exception as err:                     # never a traceback: one line, exit 1
-        sys.exit(f"harness-standup: {type(err).__name__}: {' '.join(str(err).split())}")
+    run_main("harness-standup", main)

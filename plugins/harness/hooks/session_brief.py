@@ -51,6 +51,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.hookio import emit, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
+    from harness_lib.text import one_line, read_json
 
     LIB_PROBLEM = ""
 except Exception as exc:  # fail open: the brief goes on without ticket state and says why
@@ -58,7 +59,17 @@ except Exception as exc:  # fail open: the brief goes on without ticket state an
     sys.stderr.write(f"session_brief.py: {LIB_PROBLEM}\n")
 
     # The brief must still reach the session without the lib (the guards are off then),
-    # so only here does this hook keep its own copy of the hook I/O it needs.
+    # so only here does this hook keep its own copy of the hook I/O and text helpers it needs.
+    def read_json(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    def one_line(text) -> str:
+        return " ".join(str(text).split())
+
     def read_input() -> dict:
         try:
             data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
@@ -353,7 +364,7 @@ def describe(item: dict) -> str:
             and not isinstance(value, bool)
             and str(value).strip()
         ):
-            return " ".join(str(value).split())
+            return one_line(value)
     rest = {k: v for k, v in item.items() if k != "passes"}
     return json.dumps(rest, ensure_ascii=False)
 
@@ -439,17 +450,6 @@ def repo_state_dir(root: Path, cwd: Path) -> Path | None:
     repos = harness_home() / "repos"
     key = adopt_old_state(str(repos), canonical_path(reported), reported, str(cwd))
     return repos / key
-
-
-def read_json(path: Path):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-
-
-def one_line(value) -> str:
-    return " ".join(str(value).split())
 
 
 def dod_line(item) -> str:
