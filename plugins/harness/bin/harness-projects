@@ -19,25 +19,23 @@ import datetime as dt
 import glob
 import json
 import os
-import re
 import sys
 import tempfile
 import time
 
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.cli import Parser, Problem, run_main, table
+    from harness_lib.text import age_text, same_path, session_folder
+    from harness_lib.text import session_folder as encode  # noqa: F401  the old name, read by tests/test_tools.py
+except Exception as exc:  # one line, exit 1, like run_main
+    sys.exit(f"harness-projects: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
+
 VERSION = 1
 WORKTREES = "-claude-worktrees-"   # the session folder of a worktree Claude Code made, not a project of its own
 MAX_FITS = 20                      # paths kept per folder name while recovering it
-
-
-class Problem(Exception):
-    """A bad invocation or an unreadable registry: printed as one line, exit 1."""
-
-
-class Parser(argparse.ArgumentParser):
-    """argparse that reports a bad invocation in one line and exits 1."""
-
-    def error(self, message):
-        sys.exit(f"{self.prog}: error: {message}")
 
 
 def registry_path():
@@ -49,17 +47,8 @@ def sessions_root():
     return os.path.join(os.path.expanduser("~"), ".claude", "projects")
 
 
-def encode(path):
-    """Claude Code's folder name for a project: its path with every non-alphanumeric as '-'."""
-    return re.sub(r"[^A-Za-z0-9]", "-", path)
-
-
 def absolute(path):
     return os.path.abspath(os.path.expanduser(path))
-
-
-def same_path(a, b):
-    return os.path.realpath(absolute(a)) == os.path.realpath(absolute(b))
 
 
 def is_project(path):
@@ -168,7 +157,7 @@ def recover(name, root=os.sep, cache=None):
             chunks = rest[1:].split("-")
             names = ["-".join(chunks[:k]) for k in range(1, len(chunks) + 1)]
         for entry_name in names:
-            part = "-" + encode(entry_name)
+            part = "-" + session_folder(entry_name)
             if entry_name and (rest == part or rest.startswith(part + "-")):
                 path = os.path.join(folder, entry_name)
                 if os.path.isdir(path):
@@ -191,22 +180,6 @@ def newest_transcript(folder):
         except OSError:
             pass
     return max(stamps) if stamps else None
-
-
-def age(then, now):
-    """'just now', '5m ago', '3h ago', '2d ago', '4mo ago' or '2y ago'."""
-    s = max(0, now - then)
-    if s < 60:
-        return "just now"
-    if s < 3600:
-        return f"{int(s // 60)}m ago"
-    if s < 86400:
-        return f"{int(s // 3600)}h ago"
-    if s < 86400 * 60:
-        return f"{int(s // 86400)}d ago"
-    if s < 86400 * 730:
-        return f"{int(s // (86400 * 30))}mo ago"
-    return f"{int(s // (86400 * 365))}y ago"
 
 
 def candidates(reg):
@@ -234,12 +207,6 @@ def candidates(reg):
 
 
 # --------------------------------------------------------------- output
-def table(rows):
-    """Left-aligned columns, two spaces apart."""
-    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
-    return "\n".join("  ".join([c.ljust(w) for c, w in zip(r, widths)] + [r[-1]]).rstrip() for r in rows)
-
-
 def summary(verb, p):
     terms = "billable" + (f", client {p['client']}" if p["client"] else "") if p["billable"] else "not billable"
     return f"{verb} {p['name']}: {p['path']} ({terms})"
@@ -316,7 +283,7 @@ def cmd_discover(reg, args):
     rows = [("PATH", "LAST SESSION")]
     for c in found:
         when = c["last_session"]
-        rows.append((c["path"], f"{dt.datetime.fromtimestamp(when):%Y-%m-%d %H:%M} ({age(when, now)})"
+        rows.append((c["path"], f"{dt.datetime.fromtimestamp(when):%Y-%m-%d %H:%M} ({age_text(when, now)})"
                      if when else "no transcripts"))
     print(table(rows))
     print("Register one with: harness-projects add <path> [--billable --client NAME]")
@@ -360,12 +327,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except BrokenPipeError:                      # the reader went away (| head): stop quietly
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        sys.exit(1)
-    except Exception as err:                     # never a traceback: one line, exit 1
-        sys.exit(f"harness-projects: {type(err).__name__}: {' '.join(str(err).split())}")
+    run_main("harness-projects", main)

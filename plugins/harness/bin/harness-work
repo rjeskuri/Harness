@@ -63,7 +63,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 if _LIB not in sys.path:
@@ -71,6 +70,9 @@ if _LIB not in sys.path:
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.settings import setting, settings_env
+    from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
+    from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
+    from harness_lib.text import write_json as _write_json
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -131,32 +133,8 @@ SESSION_ENV = ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CL
 CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
 
 
-class Problem(Exception):
-    """A bad invocation, a failed precondition or a failed call: printed as one line, exit 1."""
-
-
-class Parser(argparse.ArgumentParser):
-    """argparse that reports a bad invocation in one line and exits 1."""
-
-    def error(self, message):
-        sys.exit(f"{self.prog}: error: {message}")
-
-
-def one_line(text):
-    return " ".join(str(text).split())
-
-
-def last_line(text):
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    return lines[-1] if lines else ""
-
-
 def warn(text):
     print(f"harness-work: {one_line(text)}", file=sys.stderr, flush=True)
-
-
-def home(*parts):
-    return os.path.join(os.path.expanduser("~"), ".claude", "harness", *parts)
 
 
 def now():
@@ -165,20 +143,6 @@ def now():
 
 def iso(when):
     return when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def parse_iso(text):
-    """A timezone-aware datetime from ISO-8601 (a trailing Z and a naive time both mean UTC), or None."""
-    if not isinstance(text, str) or not text.strip():
-        return None
-    text = text.strip()
-    if text.endswith(("Z", "z")):
-        text = text[:-1] + "+00:00"
-    try:
-        when = dt.datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)
 
 
 def age_text(seconds):
@@ -190,43 +154,17 @@ def age_text(seconds):
     return f"{seconds // 60}m"
 
 
-def read_json(path):
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return None
-
-
 def write_json(path, data):
-    """Write JSON through a temporary file in the same folder, renamed over the old one."""
-    folder = os.path.dirname(path)
+    """The lib's atomic JSON writer; a file-system failure is Problem("cannot write <path>: <reason>")."""
     try:
-        os.makedirs(folder, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".harness-work-", suffix=".json", dir=folder)
+        _write_json(path, data, prefix=".harness-work-")
     except OSError as err:
         raise Problem(f"cannot write {path}: {err.strerror or err}") from None
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
-            fh.write("\n")
-        os.replace(tmp, path)
-    except OSError as err:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise Problem(f"cannot write {path}: {err.strerror or err}") from None
 
 
-def emit(args, data, text):
-    print(json.dumps(data, indent=2, ensure_ascii=False) if getattr(args, "json", False) else text)
-
-
-def table(rows):
-    """Left-aligned columns, two spaces apart."""
-    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
-    return "\n".join("  ".join([c.ljust(w) for c, w in zip(r, widths)] + [r[-1]]).rstrip() for r in rows)
+def wants_json(args):
+    """Whether --json was given: a subcommand without the flag has no attribute for it."""
+    return bool(getattr(args, "json", False))
 
 
 # --------------------------------------------------------------- processes
@@ -295,12 +233,12 @@ class Repo:
         self.common_dir = os.path.normpath(os.path.join(self.root, common.stdout.strip()))
         reported = os.path.realpath(os.path.dirname(self.common_dir))
         self.main = canonical_path(reported)
-        self.key = adopt_old_state(home("repos"), self.main, reported, path)
+        self.key = adopt_old_state(harness_home("repos"), self.main, reported, path)
         self.name = os.path.basename(self.main)
         self.worktrees_dir = os.path.join(self.main, ".claude", "worktrees")
 
     def ticket_path(self, number):
-        return home("repos", self.key, "tickets", f"{number}.json")
+        return harness_home("repos", self.key, "tickets", f"{number}.json")
 
 
 def open_repo(path):
@@ -583,7 +521,7 @@ def start_ticket(repo, number, venue, draft_pr=None):
 
 # --------------------------------------------------------------- budgets
 def budgets_path():
-    return home("budgets.json")
+    return harness_home("budgets.json")
 
 
 def load_budgets():
@@ -616,7 +554,7 @@ def budget_line(name, entry):
 
 # --------------------------------------------------------------- runs
 def runs_dir():
-    return home("runs")
+    return harness_home("runs")
 
 
 def load_runs():
@@ -1062,7 +1000,7 @@ def cmd_start(repo, args):
     elif ticket["answers"]:
         bodies = [str(a.get("body") or "").strip() if isinstance(a, dict) else str(a) for a in ticket["answers"]]
         text += "\n\n## Answers\n\n" + "\n\n".join(b for b in bodies if b)
-    emit(args, data, text)
+    emit(wants_json(args),data, text)
 
 
 def cmd_attempt(repo, args):
@@ -1089,7 +1027,7 @@ def cmd_attempt(repo, args):
         action, next_tier = "escalate", NEXT_TIER[tier]
     else:
         action = "needs-input"
-    emit(args, {"number": n, "stage": args.stage, "result": args.result, "tier": tier, "failures": failures,
+    emit(wants_json(args),{"number": n, "stage": args.stage, "result": args.result, "tier": tier, "failures": failures,
                 "action": action, "next_tier": next_tier},
          f"{action} {next_tier}" if next_tier else action)
 
@@ -1139,21 +1077,21 @@ def cmd_dispatch(repo, args):
         lines += [f"skip #{s['number']}: {s['why']}" for s in skipped]
         if not candidates:
             lines.append("No ready tickets.")
-        emit(args, {"venue": venue, "dry_run": True, "live": [r["id"] for r in live.values()],
+        emit(wants_json(args),{"venue": venue, "dry_run": True, "live": [r["id"] for r in live.values()],
                     "plan": plan, "skipped": skipped}, "\n".join(lines))
         return
     if not args.json:
         for s in capped:
             print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
-        emit(args, {"venue": venue, "launched": [], "failed": [], "skipped": skipped}, "No ready tickets.")
+        emit(wants_json(args),{"venue": venue, "launched": [], "failed": [], "skipped": skipped}, "No ready tickets.")
         return
     if slots <= 0:
-        emit(args, {"venue": venue, "launched": [], "failed": [], "skipped": skipped},
+        emit(wants_json(args),{"venue": venue, "launched": [], "failed": [], "skipped": skipped},
              f"{len(live)} live runs; --max {args.max} reached, nothing launched.")
         return
     if not plan:
-        emit(args, {"venue": venue, "launched": [], "failed": [], "skipped": skipped},
+        emit(wants_json(args),{"venue": venue, "launched": [], "failed": [], "skipped": skipped},
              "Nothing to launch: " + "; ".join(f"#{s['number']} has a {s['why']}" for s in skipped
                                                if s not in capped) + ".")
         return
@@ -1179,7 +1117,7 @@ def cmd_dispatch(repo, args):
             where = f"pid {record['pid']}, log {record['log']}" if venue == "headless" else f"id {record['bg_id']}"
             print(f"#{n} {venue} on {record['branch']} ({where})", flush=True)
     if args.json:
-        emit(args, {"venue": venue, "launched": launched, "failed": failures, "skipped": skipped}, "")
+        emit(wants_json(args),{"venue": venue, "launched": launched, "failed": failures, "skipped": skipped}, "")
     if failures:
         sys.exit(1)
 
@@ -1206,7 +1144,7 @@ def cmd_runs(args):
             shown.append(row)
     shown.sort(key=lambda r: str(r.get("started_at")))
     if args.json:
-        emit(args, shown, "")
+        emit(wants_json(args),shown, "")
     elif not shown:
         print("No runs." if args.all else "No runs alive or ended in the last 24 h (--all lists every run).")
     else:
@@ -1237,7 +1175,7 @@ def cmd_budget(args):
     data = {name: {"exhausted_until": budgets[name].get("exhausted_until"),
                    "reason": budgets[name].get("reason") or "",
                    "exhausted": exhausted_until(budgets[name]) is not None} for name in names}
-    emit(args, data, "\n".join(budget_line(name, budgets[name]) for name in names))
+    emit(wants_json(args),data, "\n".join(budget_line(name, budgets[name]) for name in names))
 
 
 def cmd_worktrees(repo, args):
@@ -1277,7 +1215,7 @@ def cmd_worktrees(repo, args):
                      "age_days": round(age_days, 2) if age_days is not None else None, "pr": pr,
                      "dirty": dirty, "missing": not os.path.isdir(path), "stale": stale})
     if args.json:
-        emit(args, rows, "")
+        emit(wants_json(args),rows, "")
         return
     if not rows:
         print("No ticket worktrees.")
@@ -1321,13 +1259,6 @@ def cmd_worktree_remove(repo, args):
 
 
 # --------------------------------------------------------------- arguments
-def issue_number(text):
-    digits = text.lstrip("#")
-    if not digits.isdigit() or int(digits) <= 0:
-        raise argparse.ArgumentTypeError(f"not an issue number: {text!r}")
-    return int(digits)
-
-
 def parser():
     repo_help = "the project (default: CLAUDE_PROJECT_DIR, else the cwd's repository)"
     with_repo = argparse.ArgumentParser(add_help=False)
@@ -1411,12 +1342,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except BrokenPipeError:                      # the reader went away (| head): stop quietly
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        sys.exit(1)
-    except Exception as err:                     # never a traceback: one line, exit 1
-        sys.exit(f"harness-work: {type(err).__name__}: {one_line(err)}")
+    run_main("harness-work", main)
