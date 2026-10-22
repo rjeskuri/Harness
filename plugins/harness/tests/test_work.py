@@ -2950,6 +2950,66 @@ class StopFinishedSessions(WorkTest):
                 self.work("runs", "--sweep", env=env)
                 self.assertEqual(self.stops(), {bg_id: 1 for bg_id in finished})
 
+    def issue_views(self, n):
+        """How many times gh was asked for `issue view n`."""
+        return sum(1 for argv in self.gh_calls() if argv[:3] == ["issue", "view", str(n)])
+
+    # ---- review of the fix: a stopped session, an unreadable done one, one issue read per command
+    def test_a_stopped_session_is_never_stopped_again_and_its_ticket_is_not_read(self):
+        # `claude agents` says #200's session is already `stopped`: the sweep closes its record as `stopped` without a
+        # `claude stop`, a report or a read of its ticket, though the ticket is in review. Beside it, #201's blocked
+        # session of an in-review ticket is stopped as usual (its ticket read once).
+        agents = self.bg_sessions({200: ("s-st0", "stopped"), 201: ("s-bl1", "blocked")})
+        self.board_scenario({200: (IN_REVIEW, "OPEN", ready_pr(200)), 201: (IN_REVIEW, "OPEN", ready_pr(201))})
+        p = self.work("runs", "--sweep", env=self.env(FAKECLAUDE_AGENTS=agents))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.stops(), {"s-bl1": 1})
+        self.assertEqual(self.reported(p), ["s-bl1"])
+        self.assertEqual(self.issue_views(200), 0, self.gh_calls())
+        self.assertEqual(self.issue_views(201), 1, self.gh_calls())
+        saved = self.records()
+        self.assertTrue(saved[200]["ended_at"])
+        self.assertEqual(saved[200]["outcome"], "stopped")
+        self.assertTrue(saved[201]["ended_at"])
+
+    def test_a_done_session_whose_ticket_cannot_be_read_closes_ok_with_one_warning(self):
+        # gh issue view fails for #210: its `done` session is not stopped, its record closes `ok` (not `early`: the
+        # early check needs the same unreadable issue and is skipped), and the command warns exactly once, naming it.
+        for labels in (IN_PROGRESS, IN_REVIEW):
+            with self.subTest(labels=labels):
+                self.fresh()
+                agents = self.bg_sessions({210: ("s-dn0", "done")})
+                self.board_scenario({210: (labels, "OPEN", [])}, failing={210})
+                p = self.work("runs", "--sweep", env=self.env(FAKECLAUDE_AGENTS=agents))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(self.stops(), {})
+                self.assertEqual(self.reported(p), [])
+                warnings = self.warnings(p)
+                self.assertEqual(len(warnings), 1, p.stderr)
+                self.assertIn("#210", warnings[0])
+                saved = self.records()[210]
+                self.assertTrue(saved["ended_at"], saved)
+                self.assertEqual(saved["outcome"], "ok", saved)
+                self.assertIsNone(saved.get("draft_pr"), saved)
+
+    def test_one_issue_read_per_ticket_per_command_for_the_finished_and_early_checks(self):
+        # Done sessions of in-progress tickets go through both the finished check and the early check (#220 ends
+        # early, #221 has a ready PR and ends ok); #222's blocked in-progress session through the finished check only.
+        # Each command reads each issue once.
+        cases = {220: ("s-on0", "done", []), 221: ("s-on1", "done", ready_pr(221)), 222: ("s-on2", "blocked", [])}
+        for command in (("runs", "--sweep"), ("dispatch", "--dry-run"), ("dispatch", "--dry-run", "--json")):
+            with self.subTest(command=command):
+                self.fresh()
+                agents = self.bg_sessions({n: c[:2] for n, c in cases.items()})
+                self.board_scenario({n: (IN_PROGRESS, "OPEN", c[2]) for n, c in cases.items()},
+                                    ready=[ready_row(230, "Ready 230")])
+                p = self.work(*command, env=self.env(FAKECLAUDE_AGENTS=agents))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual({n: self.issue_views(n) for n in cases}, {n: 1 for n in cases}, self.gh_calls())
+                self.assertEqual(self.stops(), {})
+                outcomes = {n: r["outcome"] for n, r in self.records().items()}
+                self.assertEqual(outcomes, {220: "early", 221: "ok", 222: None})
+
     # ---- the four cases the ticket names
     def test_a_blocked_session_of_an_in_review_ticket_is_stopped_once_and_frees_its_dispatch_slot(self):
         # runs --sweep alone: one `claude stop <id>`, reported, and the record closed.
