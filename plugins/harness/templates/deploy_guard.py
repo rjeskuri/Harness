@@ -7,12 +7,14 @@ Runs in the project checkout (the cwd: on main, full history), from the deploy w
 
     python3 scripts/deploy_guard.py revert --sha "$GITHUB_SHA" [--smoke-log smoke.log]
 
-1. Revert: unless origin/main already has a commit saying `This reverts commit SHA`, `git revert --no-edit SHA` on
-   top of origin/main as github-actions[bot] and `git push origin HEAD:main`. Then scripts/deploy.sh (when present)
-   and scripts/smoke.sh run again, the smoke bounded by DEPLOY_GUARD_SMOKE_TIMEOUT seconds (default 600).
+1. Revert: fetch and check out (detached) origin/main; unless it already has a commit saying
+   `This reverts commit SHA`, `git revert --no-edit SHA` on top of it as github-actions[bot] and
+   `git push origin HEAD:main`. Then scripts/deploy.sh (when present) and scripts/smoke.sh run again from that
+   checkout, the smoke bounded by DEPLOY_GUARD_SMOKE_TIMEOUT seconds (default 600).
 2. Incident: unless an open `incident` issue's body has the line `Merge commit: SHA`, open
    `Incident: <PR title> reverted` (no PR: the commit's subject), labelled `incident` and assigned to the repository
    owner, naming the merge commit, PR, ticket and revert commit, with the last 60 lines of the --smoke-log fenced.
+   Each label is made sure of first with `gh label create` (no --force; its failure, an existing label, is ignored).
 3. Ticket (the issue the merge's pull request closes): reopen it, replace its status:* labels with
    status:needs-input and ask in a harness needs-input comment, unless that identical comment is already there.
 A conflicting revert, a rejected push, a failed redeploy or a failing second smoke freezes deploys: the incident is
@@ -37,6 +39,8 @@ BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com"
 SMOKE_TIMEOUT = 600.0
 TAIL_LINES = 60
 INCIDENT, FROZEN, NEEDS_INPUT_LABEL = "incident", "deploy-frozen", "status:needs-input"
+LABELS = {INCIDENT: ("b60205", "A merge failed the live smoke check and was reverted"),
+          FROZEN: ("000000", "The deploy guard could not restore main; deploys are frozen")}
 NEEDS_INPUT = "**Needs your input**"
 MARKER = "<!-- harness -->"     # the last line of every harness comment
 
@@ -111,13 +115,13 @@ def revert_on_main(sha):
     code, _, err = git("fetch", "--quiet", "origin", "main")
     if code:
         return None, f"git fetch origin main failed: {one_line(err)}"
+    code, _, err = git("checkout", "--quiet", "--detach", "origin/main")
+    if code:
+        return None, f"cannot check out origin/main: {one_line(err)}"
     found = existing_revert(sha)
     if found:
         say(f"origin/main already reverts {sha[:7]} in {found[:7]}; not reverting again")
         return found, None
-    code, _, err = git("checkout", "--quiet", "--detach", "origin/main")
-    if code:
-        return None, f"cannot check out origin/main: {one_line(err)}"
     bot = dict(os.environ, GIT_AUTHOR_NAME=BOT_NAME, GIT_AUTHOR_EMAIL=BOT_EMAIL, GIT_COMMITTER_NAME=BOT_NAME,
                GIT_COMMITTER_EMAIL=BOT_EMAIL)
     code, out, err = git("-c", "commit.gpgsign=false", "revert", "--no-edit", sha, env=bot)
@@ -268,8 +272,20 @@ def incident_body(sha, pr, revert_sha, failure, smoke_log):
     return "\n".join(lines) + "\n"
 
 
+def ensure_labels(slug, *names):
+    """Create each label unless it exists; a failure here is ignored, the call that uses the label reports it."""
+    for name in names:
+        color, description = LABELS[name]
+        try:
+            gh("label", "create", name, "--repo", slug, "--color", color, "--description", description)
+        except GhError:
+            pass
+
+
 def create_incident(slug, title, body, frozen):
-    labels = f"{INCIDENT},{FROZEN}" if frozen else INCIDENT
+    names = (INCIDENT, FROZEN) if frozen else (INCIDENT,)
+    ensure_labels(slug, *names)
+    labels = ",".join(names)
     out = gh("issue", "create", "--repo", slug, "--title", title, "--label", labels, "--assignee",
              slug.split("/")[0], "--body-file", "-", stdin=body)
     found = re.search(r"/issues/(\d+)", out)
@@ -318,6 +334,7 @@ def report(sha, revert_sha, failure, smoke_log):
         if incident:
             say(f"incident #{incident} is already open for {sha[:7]}")
             if failure:
+                ensure_labels(slug, FROZEN)
                 gh("issue", "edit", str(incident), "--repo", slug, "--add-label", FROZEN)
         else:
             heading = f"Incident: {title}: revert failed, deploys frozen" if failure else f"Incident: {title} reverted"

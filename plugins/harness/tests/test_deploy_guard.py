@@ -255,11 +255,13 @@ class GuardTest(unittest.TestCase):
 
     def scenario(self, w=None, *, incidents=(), ticket_labels=("task", "status:in-review", "status:blocked",
                                                                 "size:M", "risk:low"),
-                 ticket_comments=(), ticket_state="CLOSED"):
+                 ticket_comments=(), ticket_state="CLOSED", label_create_fails=False):
         w = w or self.w
         owner, repo_name = w.slug.split("/")
         pulls = [self.pr_api(w)] if w.pr else []
-        calls = [{"contains": [f"repos/{w.slug}/commits/{w.sha}/pulls"], "stdout_json": pulls},
+        calls = [{"contains": ["label", "create"], "stderr": "label with name already exists; use `--force`\n",
+                  "exit": 1}] if label_create_fails else []
+        calls += [{"contains": [f"repos/{w.slug}/commits/{w.sha}/pulls"], "stdout_json": pulls},
                  {"contains": [f"/repos/{w.slug}/commits/{w.sha}/pulls"], "stdout_json": pulls}]
         if w.pr:
             closing = [{"number": w.ticket, "url": f"https://github.com/{w.slug}/issues/{w.ticket}",
@@ -481,8 +483,11 @@ class Revert(GuardTest):
         w.work = self.clone(w, "work-again")
         w.home = os.path.join(w.base, "home-again")
         os.makedirs(w.home)
+        os.unlink(w.run_log)
 
         p = self.guard()
+        self.assertEqual(self.ran(), [f"deploy {tip_after_first} version: 1", f"smoke {tip_after_first}"],
+                         "the second run redeploys the reverted code")
 
         self.assertExit(p, 0)
         self.assertEqual(self.origin_tip(), tip_after_first, "no second revert")
@@ -590,6 +595,98 @@ class Revert(GuardTest):
         self.assertEqual([c["body"] for c in json.loads(q.stdout)], ["Retry with a smaller batch."])
 
     # ============================================================= specific cases
+    def test_rerun_from_a_checkout_at_the_bad_merge_deploys_the_revert(self):
+        # GitHub's "re-run job": the checkout is GITHUB_SHA (the bad merge, detached) and main already holds the
+        # revert; the guard must not redeploy the merge's code
+        w = self.make_world(slug="initrode/tps", title="Reformat the reports", pr=77, ticket=39, incident=402,
+                            reverted=True)
+        self.setup_git(w.work, "checkout", "-q", "--detach", w.sha)
+        existing = {"number": w.incident, "title": f"Incident: {w.title} reverted", "state": "OPEN",
+                    "labels": [{"name": "incident"}], "url": f"https://github.com/{w.slug}/issues/{w.incident}",
+                    "body": f"Merge commit: {w.sha}\nPR: #{w.pr} {w.pr_url}\nTicket: #{w.ticket}\n"}
+        self.scenario(incidents=[existing])
+        before = (self.origin_tip(), self.origin_count())
+        self.assertEqual(before[0], w.revert_sha)
+
+        p = self.guard()
+
+        self.assertExit(p, 0)
+        self.assertEqual((self.origin_tip(), self.origin_count()), before, "no new commit on origin/main")
+        self.assertEqual(self.ran(), [f"deploy {w.revert_sha} version: 1", f"smoke {w.revert_sha}"])
+
+    def label_creates(self, w=None):
+        """(index in the gh log, label name, argv) of each `gh label create NAME ...`."""
+        valued = {"--color", "-c", "--description", "-d", "--repo", "-R"}
+        out = []
+        for i, call in enumerate(self.gh_calls(w)):
+            argv = call["argv"]
+            if argv[:2] != ["label", "create"]:
+                continue
+            j, name = 2, None
+            while j < len(argv):
+                if argv[j] in valued:
+                    j += 2
+                    continue
+                if not argv[j].startswith("-"):
+                    name = argv[j]
+                    break
+                j += 1
+            out.append((i, name, argv))
+        return out
+
+    def index_of(self, verb, w=None):
+        found = [i for i, c in enumerate(self.gh_calls(w)) if c["argv"][:2] == ["issue", verb]]
+        self.assertTrue(found, f"no gh issue {verb} in {[c['argv'] for c in self.gh_calls(w)]}")
+        return found[0]
+
+    def test_labels_are_made_sure_of_before_they_are_used(self):
+        cases = [  # (name, world options, guard env, labels needed before the call, the call)
+            ("healthy", {}, {}, {"incident"}, "create"),
+            ("frozen", {"later": "conflict"}, {}, {"incident", "deploy-frozen"}, "create"),
+            ("frozen, incident open", {}, {"FAKE_SMOKE_EXIT": "1"}, {"deploy-frozen"}, "edit")]
+        for name, opts, env, needed, verb in cases:
+            with self.subTest(name):
+                w = self.make_world(re.sub(r"\W+", "-", name), slug="vandelay/imports", title="Import the latex",
+                                    pr=91, ticket=45, incident=318, **opts)
+                incidents = []
+                if verb == "edit":
+                    incidents = [{"number": 250, "title": f"Incident: {w.title} reverted", "state": "OPEN",
+                                  "labels": [{"name": "incident"}], "url": f"https://github.com/{w.slug}/issues/250",
+                                  "body": f"Merge commit: {w.sha}\nPR: #{w.pr} {w.pr_url}\nTicket: #{w.ticket}\n"}]
+                self.scenario(w, incidents=incidents)
+
+                p = self.guard(w, **env)
+
+                self.assertExit(p, 0 if name == "healthy" else 1)
+                if verb == "edit":
+                    edits = [i for i, c in enumerate(self.gh_calls(w)) if c["argv"][:2] == ["issue", "edit"]
+                             and targets(c["argv"], 250) and "deploy-frozen" in split(flag_values(c["argv"],
+                                                                                                    "--add-label"))]
+                    self.assertTrue(edits, [c["argv"] for c in self.gh_calls(w)])
+                    at = edits[0]
+                else:
+                    at = self.index_of("create", w)
+                made = {label for i, label, _ in self.label_creates(w) if i < at}
+                self.assertTrue(needed <= made, f"labels created before gh issue {verb}: {made}")
+                for _, label, argv in self.label_creates(w):
+                    self.assertFalse({"--force", "-f"} & set(argv), f"a customised {label} label stays as it is")
+
+    def test_a_failing_label_create_does_not_stop_the_incident(self):
+        w = self.make_world(slug="pendant/publishing", title="Print the catalog", pr=26, ticket=11, incident=97)
+        self.scenario(label_create_fails=True)
+        before_tip, before_count = self.origin_tip(), self.origin_count()
+
+        p = self.guard()
+
+        self.assertExit(p, 0)
+        revert_sha = self.assertOneRevertPushed(w, before_tip, before_count)
+        self.assertTrue(any(label == "incident" for _, label, _ in self.label_creates()), "the label was tried")
+        creates = self.creates()
+        self.assertEqual([self.title(c) for c in creates], [f"Incident: {w.title} reverted"])
+        self.assertIn("incident", self.labels(creates[0]))
+        comments = self.comments_on(w.ticket)
+        self.assertEqual([self.body(c).rstrip("\n") for c in comments], [self.expected_comment(w, revert_sha)])
+
     def test_revert_already_pushed_still_opens_the_incident_and_asks(self):
         # a first run died after its push: the revert is on origin/main, but no incident and no comment exist
         w = self.make_world(slug="stark/forge", title="Retune the furnace", pr=71, ticket=26, incident=133,
