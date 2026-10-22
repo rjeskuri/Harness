@@ -18,7 +18,6 @@ gh is HARNESS_GH when set, else `gh` on PATH; launchctl is HARNESS_LAUNCHCTL whe
 """
 from __future__ import annotations
 
-import argparse
 import concurrent.futures
 import datetime as dt
 import glob
@@ -27,7 +26,6 @@ import os
 import plistlib
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -36,8 +34,13 @@ _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
+    from harness_lib.cli import Parser, Problem, run_main
+    from harness_lib.gh import GhBatch, describe_list_call, gh_binary, gh_exe, repo_slug
     from harness_lib.notify import notify
     from harness_lib.paths import canonical_path, path_key, repo_key, same_entry
+    from harness_lib.registry import load_registry
+    from harness_lib.text import (age_text, first_line, harness_home, home, parse_iso_seconds, read_json,
+                                  same_path)
 except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
     sys.exit(f"harness-digest: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -52,97 +55,19 @@ LABEL = "com.ryaneskuri.harness-digest"
 DIGEST_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
 
 
-class Problem(Exception):
-    """A bad invocation, an unreadable registry or a failed call: printed as one line."""
-
-
-class Parser(argparse.ArgumentParser):
-    """argparse that reports a bad invocation in one line and exits 1."""
-
-    def error(self, message):
-        sys.exit(f"{self.prog}: error: {message}")
-
-
-def home(*parts):
-    return os.path.join(os.path.expanduser("~"), *parts)
-
-
-def harness_home(*parts):
-    return home(".claude", "harness", *parts)
-
-
-def first_line(text):
-    return next((line.strip() for line in (text or "").splitlines() if line.strip()), "")
-
-
 def clip(text):
     text = " ".join(str(text).split())
     return text if len(text) <= WIDTH else text[:WIDTH - 1].rstrip() + "…"
-
-
-def same_path(a, b):
-    return os.path.realpath(os.path.abspath(os.path.expanduser(a))) == os.path.realpath(os.path.abspath(os.path.expanduser(b)))
-
-
-def age(then, now):
-    """'just now', '5m ago', '3h ago', '2d ago', '4mo ago' or '2y ago'."""
-    s = max(0, now - then)
-    if s < 60:
-        return "just now"
-    if s < 3600:
-        return f"{int(s // 60)}m ago"
-    if s < 86400:
-        return f"{int(s // 3600)}h ago"
-    if s < 86400 * 60:
-        return f"{int(s // 86400)}d ago"
-    if s < 86400 * 730:
-        return f"{int(s // (86400 * 30))}mo ago"
-    return f"{int(s // (86400 * 365))}y ago"
 
 
 def iso(then):
     return dt.datetime.fromtimestamp(then).astimezone().isoformat(timespec="seconds")
 
 
-def parse_iso(text):
-    """Seconds since the epoch for an ISO-8601 time (Z allowed; naive means local), or None."""
-    if not isinstance(text, str) or not text.strip():
-        return None
-    try:
-        when = dt.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return (when if when.tzinfo else when.astimezone()).timestamp()
-
-
-def read_json(path):
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return None
-
-
 # --------------------------------------------------------------- registry
 def load_projects():
-    """The registered projects in registry order; Problem when the registry cannot be read."""
-    path = harness_home("projects.json")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return []
-    except ValueError as err:
-        raise Problem(f"{path} is not valid JSON ({err}); fix it or remove it")
-    except OSError as err:
-        raise Problem(f"cannot read {path}: {err.strerror or err}")
-    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
-        raise Problem(f'{path}: expected {{"version": 1, "projects": [...]}}')
-    if data.get("version", 1) != 1:
-        raise Problem(f"{path} is version {data.get('version')!r}; this tool reads version 1")
-    return [{"name": str(p.get("name") or os.path.basename(p["path"].rstrip("/")) or p["path"]), "path": p["path"]}
-            for p in data["projects"]
-            if isinstance(p, dict) and isinstance(p.get("path"), str) and p["path"].strip()]
+    """The registered projects' names and paths, in registry order; Problem when the registry cannot be read."""
+    return [{"name": p.name, "path": p.path} for p in load_registry()]
 
 
 # --------------------------------------------------------------- git and gh
@@ -161,95 +86,6 @@ def git(path, args, deadline):
 def origin_url(path, deadline):
     out = git(path, ["remote", "get-url", "origin"], deadline)
     return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
-
-
-def repo_slug(url):
-    """OWNER/REPO (HOST/OWNER/REPO off github.com) for gh -R, from an origin URL; None for a local path."""
-    url = url.strip()
-    m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]*@)?([^/:]+)(?::\d*)?/(.+)$", url)
-    if not m or url.lower().startswith("file:"):
-        m = re.match(r"^(?:[^@/:]+@)?([^/:]+):(?!/)(.+)$", url)         # scp-like: git@host:owner/repo
-    if not m:
-        return None
-    host, parts = m.group(1), [p for p in m.group(2).split("/") if p]
-    if len(parts) != 2:
-        return None
-    owner, name = parts[0], parts[1][:-4] if parts[1].endswith(".git") else parts[1]
-    if not owner or not name:
-        return None
-    return f"{owner}/{name}" if host.lower() in ("github.com", "www.github.com") else f"{host}/{owner}/{name}"
-
-
-def gh_binary():
-    """The gh to run (HARNESS_GH, else gh on PATH), or None when it cannot be found."""
-    gh = os.environ.get("HARNESS_GH", "gh")
-    if os.sep in gh:
-        return gh if os.path.isfile(gh) and os.access(gh, os.X_OK) else None
-    return shutil.which(gh)
-
-
-def describe(args):
-    """`gh pr list`, `gh issue list --label status:needs-input`: the call, for an error line."""
-    words = "gh " + " ".join(args[:2])
-    if "--label" in args[:-1]:
-        words += " --label " + args[args.index("--label") + 1]
-    return words
-
-
-class GhBatch:
-    """gh calls started side by side; results() waits for each until the shared deadline."""
-
-    def __init__(self, gh, calls, cwd, deadline):
-        self.calls, self.deadline, self.procs = calls, deadline, []
-        env = dict(os.environ, GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", NO_COLOR="1")
-        try:
-            for args in calls:
-                self.procs.append(subprocess.Popen([gh] + args, cwd=cwd, stdin=subprocess.DEVNULL,
-                                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-                                                   start_new_session=True))
-        except OSError as err:
-            self.close()
-            raise Problem(f"cannot run gh ({gh}): {err.strerror or err}") from None
-
-    def results(self):
-        """One list of objects per call, in order; Problem naming the first call that failed."""
-        out = []
-        for args, proc in zip(self.calls, self.procs):
-            try:
-                stdout, stderr = proc.communicate(timeout=max(0.1, self.deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                raise Problem(f"{describe(args)} timed out after {GH_BUDGET} s") from None
-            text = stdout.decode("utf-8", "replace")
-            if proc.returncode != 0:
-                why = first_line(stderr.decode("utf-8", "replace")) or f"exit {proc.returncode}"
-                raise Problem(f"{describe(args)} failed: {why}")
-            try:
-                data = json.loads(text)
-            except ValueError:
-                raise Problem(f"{describe(args)} printed something other than JSON: {first_line(text)[:80]}") from None
-            if not isinstance(data, list):
-                raise Problem(f"{describe(args)} did not print a JSON list")
-            out.append([x for x in data if isinstance(x, dict)])
-        return out
-
-    def close(self):
-        """Stop every call still running and release the pipes."""
-        for proc in self.procs:
-            if proc.poll() is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-            for pipe in (proc.stdout, proc.stderr):
-                try:
-                    if pipe:
-                        pipe.close()
-                except OSError:
-                    pass
-            try:
-                proc.wait(timeout=1)
-            except (OSError, subprocess.SubprocessError):
-                pass
 
 
 # --------------------------------------------------------------- one project
@@ -298,7 +134,7 @@ def old_worktrees(path, now, deadline):
             continue
         if now - int(when) > STALE_DAYS * 86400:
             out.append({"path": w["path"], "relative": os.path.relpath(w["path"], found[0]["path"]),
-                        "branch": w["branch"], "last_commit": {"time": iso(int(when)), "age": age(int(when), now)}})
+                        "branch": w["branch"], "last_commit": {"time": iso(int(when)), "age": age_text(int(when), now)}})
     return out
 
 
@@ -314,8 +150,8 @@ def gh_calls(slug):
 
 
 def opened(item, now):
-    created = parse_iso(item.get("createdAt"))
-    return created, (age(created, now) if created is not None else "at an unknown time")
+    created = parse_iso_seconds(item.get("createdAt"))
+    return created, (age_text(created, now) if created is not None else "at an unknown time")
 
 
 def project_digest(project, gh, now):
@@ -335,8 +171,8 @@ def project_digest(project, gh, now):
             return out
         out["repo"] = repo_slug(url)
         if gh is None:
-            raise Problem(f"gh not found ({os.environ.get('HARNESS_GH', 'gh')}); install it with `brew install gh`")
-        batch = GhBatch(gh, gh_calls(out["repo"]), path, deadline)
+            raise Problem(f"gh not found ({gh_exe()}); install it with `brew install gh`")
+        batch = GhBatch(gh, gh_calls(out["repo"]), path, deadline, budget_seconds=GH_BUDGET)
         try:
             old = old_worktrees(path, now, deadline)
             mine, asking, started, open_prs = batch.results()
@@ -376,7 +212,7 @@ def exhausted_budgets(now):
     out = []
     for name, entry in (data.items() if isinstance(data, dict) else []):
         until = entry.get("exhausted_until") if isinstance(entry, dict) else None
-        when = parse_iso(until)
+        when = parse_iso_seconds(until)
         if when is not None and when > now:
             out.append({"name": name, "until": until.strip(), "reason": " ".join(str(entry.get("reason") or "").split())})
     return out
@@ -402,7 +238,7 @@ def failed_runs(projects, since, now):
         record = read_json(name)
         if not isinstance(record, dict) or record.get("outcome") not in FAILED:
             continue
-        ended = parse_iso(record.get("ended_at"))
+        ended = parse_iso_seconds(record.get("ended_at"))
         if ended is None:
             try:
                 ended = os.path.getmtime(name)
@@ -413,7 +249,7 @@ def failed_runs(projects, since, now):
         out.append((ended, {"id": record.get("id") or os.path.basename(name)[:-5],
                             "project": run_project(record, name, projects), "ticket": record.get("ticket"),
                             "venue": record.get("venue"), "outcome": record["outcome"], "exit": record.get("exit"),
-                            "ended_at": record.get("ended_at") or iso(ended), "age": age(ended, now),
+                            "ended_at": record.get("ended_at") or iso(ended), "age": age_text(ended, now),
                             "log": record.get("log")}))
     out.sort(key=lambda pair: pair[0], reverse=True)
     return [run for _, run in out]
@@ -589,28 +425,17 @@ def main():
     job.add_argument("--install-launchd", action="store_true", help="run the digest daily at 08:30 (a LaunchAgent)")
     job.add_argument("--uninstall-launchd", action="store_true", help="remove the LaunchAgent")
     args = ap.parse_args()
-    try:
-        if args.install_launchd:
-            install_launchd()
-        elif args.uninstall_launchd:
-            uninstall_launchd()
+    if args.install_launchd:
+        install_launchd()
+    elif args.uninstall_launchd:
+        uninstall_launchd()
+    else:
+        data, text = digest(time.time())
+        if args.json:
+            print(json.dumps(data, indent=2, ensure_ascii=False))
         else:
-            data, text = digest(time.time())
-            if args.json:
-                print(json.dumps(data, indent=2, ensure_ascii=False))
-            else:
-                sys.stdout.write(text)
-    except Problem as err:
-        sys.exit(f"harness-digest: {err}")
+            sys.stdout.write(text)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except BrokenPipeError:                      # the reader went away (| head): stop quietly
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        sys.exit(1)
-    except Exception as err:                     # never a traceback: one line, exit 1
-        sys.exit(f"harness-digest: {type(err).__name__}: {' '.join(str(err).split())}")
+    run_main("harness-digest", main)

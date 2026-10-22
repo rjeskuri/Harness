@@ -54,7 +54,6 @@ Standard library only; works with the python3 from Xcode's command line tools (3
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import subprocess
@@ -69,6 +68,7 @@ try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.repo import main_checkout
     from harness_lib.settings import glob_match, patterns, setting, settings_env
+    from harness_lib.text import read_json
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
     sys.stderr.write(f"tests_first.py: cannot load harness_lib from {_LIB}: {exc}\n")
     sys.exit(0)
@@ -125,14 +125,6 @@ FIND_OPTIONS = {"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"}
 # writers, since what their program writes cannot be seen.
 INTERPRETERS = {"perl", "ruby", "php", "awk", "gawk", "lua", "Rscript", "osascript"}
 INLINE = "Write files with Edit or Write so the tests-first rules can see the path."
-
-
-def read_json(path: Path) -> dict | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
 
 
 # ---------- globs ----------
@@ -278,6 +270,8 @@ def source_refusal(facts: dict, number: str) -> str | None:
     state = repos / adopt_old_state(str(repos), str(facts["main"]), *facts["spelled"])
     branch = facts["branch"]
     ticket = read_json(state / "tickets" / f"{number}.json")
+    if not isinstance(ticket, dict):  # valid JSON that is not an object counts as absent
+        ticket = None
     flags = []
     if ticket:
         for key in ("flags", "labels"):
@@ -286,6 +280,8 @@ def source_refusal(facts: dict, number: str) -> str | None:
     if "no-tests" in flags:
         return None
     record = read_json(state / "red" / f"{branch.replace('/', '-')}.json")
+    if not isinstance(record, dict):  # likewise: a red record that is not an object is no red run
+        record = None
     if record is None:
         reason = (
             f"Tests first on t/{number}: write the tests, then run harness-red check. "

@@ -46,7 +46,7 @@ try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.cli import Parser, Problem, emit, run_main, table, warn
     from harness_lib.text import (as_list, first_line, harness_home, home, last_line, one_line, parse_iso, read_json,
-                                  read_text, write_text)
+                                  read_text, write_json, write_text)
     from harness_lib.notify import notify
     from harness_lib.repo import RepoError, repo_facts
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
@@ -1090,7 +1090,7 @@ def mark_cloud_exhausted(reason):
     data = data if isinstance(data, dict) else {}
     until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=EXHAUSTED_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     data["cloud"] = {"exhausted_until": until, "reason": reason}
-    write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", prefix=".harness-pr-")
+    write_json(path, data, prefix=".harness-pr-")
     return until
 
 

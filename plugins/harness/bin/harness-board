@@ -61,6 +61,7 @@ try:
                                   read_text, write_json)
     from harness_lib.notify import notify
     from harness_lib.repo import RepoError, repo_facts
+    from harness_lib.registry import load_registry
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-board: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -916,22 +917,7 @@ def cmd_project_check(args):
 
 def load_projects():
     """The registered project paths, in registry order (the registry harness-standup and harness-digest read)."""
-    path = harness_home("projects.json")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return []
-    except ValueError as err:
-        raise Problem(f"{path} is not valid JSON ({err}); fix it or remove it") from None
-    except OSError as err:
-        raise Problem(f"cannot read {path}: {err.strerror or err}") from None
-    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
-        raise Problem(f'{path}: expected {{"version": 1, "projects": [...]}}')
-    if data.get("version", 1) != 1:
-        raise Problem(f"{path} is version {data.get('version')!r}; this tool reads version 1")
-    return [p["path"] for p in data["projects"] if isinstance(p, dict) and isinstance(p.get("path"), str)
-            and p["path"].strip()]
+    return [p.path for p in load_registry(path=harness_home("projects.json"))]
 
 
 def label_status(url, names):

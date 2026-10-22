@@ -15,16 +15,15 @@ Usage:
 """
 from __future__ import annotations
 
-import argparse
 import concurrent.futures
 import csv
+import dataclasses
 import datetime as dt
 import glob
 import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -34,10 +33,14 @@ _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
+    from harness_lib.cli import Parser, Problem, run_main
+    from harness_lib.gh import GhBatch, describe_list_call, gh_binary, repo_slug
     from harness_lib.paths import canonical_path, path_key, repo_key, same_entry
-except Exception as exc:
-    sys.stderr.write(f"harness-standup: cannot load harness_lib from {_LIB}: {exc}\n")
-    sys.exit(1)
+    from harness_lib.registry import find_project, load_registry
+    from harness_lib.text import (age_text, first_line, home, parse_iso_seconds, read_json, same_path,
+                                  session_folder)
+except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
+    sys.exit(f"harness-standup: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 BUDGET = 4            # seconds for the projects' git calls (they run side by side)
 FLEET_TIMEOUT = 4     # seconds for `claude agents --json`, started before the projects and read after
@@ -50,30 +53,7 @@ NEEDS_INPUT = "**Needs your input**"
 HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
 NEXT_STEPS = re.compile(r"^(\s*)(#{1,6}\s+|[-*+]\s+)?(\*\*|__)?\s*next steps?\b\s*:?\s*(?:\*\*|__)?\s*:?\s*(.*)$", re.I)
 BOLD_LABEL = re.compile(r"^(\s*)([-*+]\s+)?(\*\*|__)\S")
-
-
-class Problem(Exception):
-    """A bad invocation or an unreadable registry (one line, exit 1), or a failed gh call (one board line)."""
-
-
-class Parser(argparse.ArgumentParser):
-    """argparse that reports a bad invocation in one line and exits 1."""
-
-    def error(self, message):
-        sys.exit(f"{self.prog}: error: {message}")
-
-
-def home(*parts):
-    return os.path.join(os.path.expanduser("~"), *parts)
-
-
-def encode(path):
-    """Claude Code's folder name for a project: its path with every non-alphanumeric as '-'."""
-    return re.sub(r"[^A-Za-z0-9]", "-", path)
-
-
-def same_path(a, b):
-    return os.path.realpath(os.path.abspath(os.path.expanduser(a))) == os.path.realpath(os.path.abspath(os.path.expanduser(b)))
+REPORTED = ("name", "path", "billable", "client")   # the registry fields a project's report carries
 
 
 def under(cwd, path):
@@ -84,66 +64,14 @@ def under(cwd, path):
     return cwd == path or cwd.startswith(path.rstrip(os.sep) + os.sep)
 
 
-def age(then, now):
-    """'just now', '5m ago', '3h ago', '2d ago', '4mo ago' or '2y ago'."""
-    s = max(0, now - then)
-    if s < 60:
-        return "just now"
-    if s < 3600:
-        return f"{int(s // 60)}m ago"
-    if s < 86400:
-        return f"{int(s // 3600)}h ago"
-    if s < 86400 * 60:
-        return f"{int(s // 86400)}d ago"
-    if s < 86400 * 730:
-        return f"{int(s // (86400 * 30))}mo ago"
-    return f"{int(s // (86400 * 365))}y ago"
-
-
 def stamp(then, now):
-    return {"time": dt.datetime.fromtimestamp(then).astimezone().isoformat(timespec="seconds"), "age": age(then, now)}
+    return {"time": dt.datetime.fromtimestamp(then).astimezone().isoformat(timespec="seconds"),
+            "age": age_text(then, now)}
 
 
 def clip(line):
     line = " ".join(line.split())
     return line if len(line) <= WIDTH else line[:WIDTH - 1].rstrip() + "…"
-
-
-# --------------------------------------------------------------- registry
-def load_projects():
-    """The registered projects in registry order; Problem when the registry cannot be read."""
-    path = home(".claude", "harness", "projects.json")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return []
-    except ValueError as err:
-        raise Problem(f"{path} is not valid JSON ({err}); fix it or remove it")
-    except OSError as err:
-        raise Problem(f"cannot read {path}: {err.strerror or err}")
-    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
-        raise Problem(f'{path}: expected {{"version": 1, "projects": [...]}}')
-    if data.get("version", 1) != 1:
-        raise Problem(f"{path} is version {data.get('version')!r}; this tool reads version 1")
-    out = []
-    for p in data["projects"]:
-        if isinstance(p, dict) and isinstance(p.get("path"), str) and p["path"].strip():
-            out.append({"name": str(p.get("name") or os.path.basename(p["path"].rstrip("/")) or p["path"]),
-                        "path": p["path"], "billable": bool(p.get("billable")), "client": str(p.get("client") or "")})
-    return out
-
-
-def pick(projects, key):
-    """The project named `key` (in any case) or registered at the path `key`."""
-    for match in (lambda p: p["name"] == key, lambda p: p["name"].casefold() == key.casefold(),
-                  lambda p: same_path(p["path"], key)):
-        hits = [p for p in projects if match(p)]
-        if len(hits) == 1:
-            return hits[0]
-        if hits:
-            raise Problem(f"{key!r} matches {len(hits)} projects; give its path instead")
-    raise Problem(f"no registered project named or at {key!r} (harness-projects list shows them)")
 
 
 # --------------------------------------------------------------- one project
@@ -199,7 +127,7 @@ def git_state(path, deadline, now):
 def last_session(path):
     """The newest mtime among the project's Claude Code transcripts, or None."""
     stamps = []
-    for name in glob.glob(os.path.join(glob.escape(home(".claude", "projects", encode(path))), "*.jsonl")):
+    for name in glob.glob(os.path.join(glob.escape(home(".claude", "projects", session_folder(path))), "*.jsonl")):
         try:
             stamps.append(os.path.getmtime(name))
         except OSError:
@@ -302,10 +230,11 @@ def hours_this_month(path, today):
 
 def report(project, deadline, now):
     """Everything the standup says about one project; one error line when it cannot be read."""
-    out = dict(project, error=None, git=None, last_session=None, next=[], latest_spec=None,
-               hours_this_month=None, sessions=None)
+    fields = dataclasses.asdict(project)
+    out = dict({k: fields[k] for k in REPORTED}, error=None, git=None, last_session=None, next=[],
+               latest_spec=None, hours_this_month=None, sessions=None)
     try:
-        path = project["path"]
+        path = project.path
         if not os.path.isdir(path):
             out["error"] = "path not found"
             return out
@@ -314,7 +243,7 @@ def report(project, deadline, now):
         out["last_session"] = stamp(newest, now) if newest else None
         out["next"] = next_steps(path)
         out["latest_spec"] = latest_spec(path)
-        if project["billable"]:
+        if project.billable:
             out["hours_this_month"] = hours_this_month(path, dt.date.fromtimestamp(now))
     except Exception as err:      # one project never stops the others
         out["error"] = f"could not read it: {type(err).__name__}: {' '.join(str(err).split())}"
@@ -376,110 +305,6 @@ def fleet_text(e):
 
 
 # --------------------------------------------------------------- board (gh)
-def first_line(text):
-    return next((line.strip() for line in (text or "").splitlines() if line.strip()), "")
-
-
-def parse_iso(text):
-    """Seconds since the epoch for an ISO-8601 time (Z allowed; naive means local), or None."""
-    if not isinstance(text, str) or not text.strip():
-        return None
-    try:
-        when = dt.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return (when if when.tzinfo else when.astimezone()).timestamp()
-
-
-def gh_binary():
-    """The gh to run (HARNESS_GH, else gh on PATH), or None when it cannot be found."""
-    gh = os.environ.get("HARNESS_GH", "gh")
-    if os.sep in gh:
-        return gh if os.path.isfile(gh) and os.access(gh, os.X_OK) else None
-    return shutil.which(gh)
-
-
-def repo_slug(url):
-    """OWNER/REPO (HOST/OWNER/REPO off github.com) for gh -R, from an origin URL; None for a local path."""
-    url = url.strip()
-    m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]*@)?([^/:]+)(?::\d*)?/(.+)$", url)
-    if not m or url.lower().startswith("file:"):
-        m = re.match(r"^(?:[^@/:]+@)?([^/:]+):(?!/)(.+)$", url)         # scp-like: git@host:owner/repo
-    if not m:
-        return None
-    host, parts = m.group(1), [p for p in m.group(2).split("/") if p]
-    if len(parts) != 2:
-        return None
-    owner, name = parts[0], parts[1][:-4] if parts[1].endswith(".git") else parts[1]
-    if not owner or not name:
-        return None
-    return f"{owner}/{name}" if host.lower() in ("github.com", "www.github.com") else f"{host}/{owner}/{name}"
-
-
-def describe(args):
-    """`gh pr list`, `gh issue list --label status:needs-input`: the call, for an error line."""
-    words = "gh " + " ".join(args[:2])
-    if "--label" in args[:-1]:
-        words += " --label " + args[args.index("--label") + 1]
-    return words
-
-
-class GhBatch:
-    """gh calls started side by side; results() waits for each until the shared deadline."""
-
-    def __init__(self, gh, calls, cwd, deadline):
-        self.calls, self.deadline, self.procs = calls, deadline, []
-        env = dict(os.environ, GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", NO_COLOR="1")
-        try:
-            for args in calls:
-                self.procs.append(subprocess.Popen([gh] + args, cwd=cwd, stdin=subprocess.DEVNULL,
-                                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-                                                   start_new_session=True))
-        except OSError as err:
-            self.close()
-            raise Problem(f"cannot run gh ({gh}): {err.strerror or err}") from None
-
-    def results(self):
-        """One list of objects per call, in order; Problem naming the first call that failed."""
-        out = []
-        for args, proc in zip(self.calls, self.procs):
-            try:
-                stdout, stderr = proc.communicate(timeout=max(0.1, self.deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                raise Problem(f"{describe(args)} timed out after {GH_BUDGET} s") from None
-            text = stdout.decode("utf-8", "replace")
-            if proc.returncode != 0:
-                why = first_line(stderr.decode("utf-8", "replace")) or f"exit {proc.returncode}"
-                raise Problem(f"{describe(args)} failed: {why}")
-            try:
-                data = json.loads(text)
-            except ValueError:
-                raise Problem(f"{describe(args)} printed something other than JSON: {first_line(text)[:80]}") from None
-            if not isinstance(data, list):
-                raise Problem(f"{describe(args)} did not print a JSON list")
-            out.append([x for x in data if isinstance(x, dict)])
-        return out
-
-    def close(self):
-        """Stop every call still running and release the pipes."""
-        for proc in self.procs:
-            if proc.poll() is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-            for pipe in (proc.stdout, proc.stderr):
-                try:
-                    if pipe:
-                        pipe.close()
-                except OSError:
-                    pass
-            try:
-                proc.wait(timeout=1)
-            except (OSError, subprocess.SubprocessError):
-                pass
-
-
 def question(comments):
     """The first line after **Needs your input** in the newest comment that asks, or None."""
     asking = [c for c in comments if isinstance(c, dict) and NEEDS_INPUT in str(c.get("body") or "")]
@@ -542,7 +367,7 @@ def board_report(project, now):
     out = {"board": None, "prs_awaiting": None, "needs_input": None, "stale_worktrees": None, "board_error": None}
     deadline = time.monotonic() + GH_BUDGET
     try:
-        path, gh = project["path"], gh_binary()
+        path, gh = project.path, gh_binary()
         if gh is None or not os.path.isdir(path):
             return out
         remote = git(path, ["remote", "get-url", "origin"], deadline)
@@ -556,7 +381,7 @@ def board_report(project, now):
                              ["issue", "list", "--state", "open", "--label", "status:needs-input", "--json",
                               "number,title,url,comments", "--limit", "100"] + flag,
                              ["pr", "list", "--state", "open", "--json", "headRefName", "--limit", "200"] + flag],
-                        path, deadline)
+                        path, deadline, budget_seconds=GH_BUDGET)
         try:
             old = old_worktrees(path, now, deadline)
             issues, mine, asking, open_prs = batch.results()
@@ -572,10 +397,10 @@ def board_report(project, now):
         prs = []
         for pr in mine:
             if pr.get("isDraft") is False:
-                created = parse_iso(pr.get("createdAt"))
+                created = parse_iso_seconds(pr.get("createdAt"))
                 prs.append({"number": pr.get("number"), "title": clip(pr.get("title") or ""), "url": pr.get("url"),
                             "branch": pr.get("headRefName"), "created_at": pr.get("createdAt"),
-                            "age": age(created, now) if created is not None else None})
+                            "age": age_text(created, now) if created is not None else None})
         needs = [{"number": i.get("number"), "title": clip(i.get("title") or ""), "url": i.get("url"),
                   "question": question(i.get("comments") if isinstance(i.get("comments"), list) else [])}
                  for i in asking]
@@ -590,21 +415,13 @@ def board_report(project, now):
 
 
 # --------------------------------------------------------------- budgets and runs
-def read_json(path):
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return None
-
-
 def exhausted_budgets(now):
     """[{"name", "until", "reason"}] for each budget budgets.json marks exhausted until a time ahead."""
     data = read_json(home(".claude", "harness", "budgets.json"))
     out = []
     for name, entry in (data.items() if isinstance(data, dict) else []):
         until = entry.get("exhausted_until") if isinstance(entry, dict) else None
-        when = parse_iso(until)
+        when = parse_iso_seconds(until)
         if when is not None and when > now:
             out.append({"name": name, "until": until.strip(), "reason": " ".join(str(entry.get("reason") or "").split())})
     return out
@@ -614,12 +431,12 @@ def run_project(record, filename, projects):
     """The registered project a run belongs to (by its repo field, else its file's key), else a short name."""
     repo = record.get("repo") if isinstance(record.get("repo"), str) else ""
     for p in projects:
-        if repo and (p["name"] == repo or same_path(p["path"], repo) or repo_key(p["path"]) == repo_key(repo)):
-            return p["name"]
+        if repo and (p.name == repo or same_path(p.path, repo) or repo_key(p.path) == repo_key(repo)):
+            return p.name
     key = os.path.basename(filename)[:12]
     for p in projects:                  # the canonical key, or the old key of the registered spelling
-        if key in (repo_key(p["path"]), path_key(os.path.realpath(p["path"]))):
-            return p["name"]
+        if key in (repo_key(p.path), path_key(os.path.realpath(p.path))):
+            return p.name
     return (os.path.basename(repo.rstrip("/")) or repo) if repo else key
 
 
@@ -643,7 +460,8 @@ def recent_runs(projects, now):
         record = read_json(name)
         if not isinstance(record, dict):
             continue
-        started, ended, pid = parse_iso(record.get("started_at")), parse_iso(record.get("ended_at")), record.get("pid")
+        started, ended = parse_iso_seconds(record.get("started_at")), parse_iso_seconds(record.get("ended_at"))
+        pid = record.get("pid")
         if ended is None and not record.get("outcome"):
             if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and not pid_alive(pid):
                 state = "exited"                       # gone, not swept yet: when its log last changed
@@ -668,7 +486,7 @@ def recent_runs(projects, now):
                      "ticket": record.get("ticket"), "venue": record.get("venue"), "state": state,
                      "exit": record.get("exit"), "started_at": record.get("started_at"),
                      "ended_at": record.get("ended_at"), "log": record.get("log"),
-                     "age": age(when, now) if when is not None else None}))
+                     "age": age_text(when, now) if when is not None else None}))
     out.sort(key=lambda pair: pair[0])
     return [run for _, run in out]
 
@@ -775,11 +593,8 @@ def main():
     args = ap.parse_args()
     now = time.time()
     deadline = time.monotonic() + BUDGET
-    try:
-        registered = load_projects()
-        projects = [pick(registered, args.project)] if args.project else registered
-    except Problem as err:
-        sys.exit(f"harness-standup: {err}")
+    registered = load_registry()
+    projects = [find_project(registered, args.project)] if args.project else registered
     box = {}
     reader = threading.Thread(target=read_fleet_into, args=(box,), daemon=True)
     reader.start()
@@ -808,12 +623,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except BrokenPipeError:                      # the reader went away (| head): stop quietly
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        sys.exit(1)
-    except Exception as err:                     # never a traceback: one line, exit 1
-        sys.exit(f"harness-standup: {type(err).__name__}: {' '.join(str(err).split())}")
+    run_main("harness-standup", main)
