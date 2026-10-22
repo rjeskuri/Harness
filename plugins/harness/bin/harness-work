@@ -69,6 +69,7 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
+    from harness_lib.repo import RepoError, repo_facts
     from harness_lib.settings import setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
     from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
@@ -220,20 +221,10 @@ class Repo:
     """The project: its toplevel, its main working tree and its state key."""
 
     def __init__(self, path):
-        path = os.path.abspath(os.path.expanduser(path))
-        if not os.path.isdir(path):
-            raise Problem(f"not a directory: {path}")
-        top = git(path, "rev-parse", "--show-toplevel")
-        if top.returncode != 0 or not top.stdout.strip():
-            raise Problem(f"not a git repository: {path}")
-        self.root = top.stdout.strip()
-        common = git(self.root, "rev-parse", "--git-common-dir")
-        if common.returncode != 0 or not common.stdout.strip():
-            raise Problem(f"git rev-parse --git-common-dir failed in {self.root}: {last_line(common.stderr)}")
-        self.common_dir = os.path.normpath(os.path.join(self.root, common.stdout.strip()))
-        reported = os.path.realpath(os.path.dirname(self.common_dir))
-        self.main = canonical_path(reported)
-        self.key = adopt_old_state(harness_home("repos"), self.main, reported, path)
+        try:
+            self.root, self.common_dir, self.main, self.key = repo_facts(path, git, last_line)
+        except RepoError as exc:
+            raise Problem(str(exc)) from None
         self.name = os.path.basename(self.main)
         self.worktrees_dir = os.path.join(self.main, ".claude", "worktrees")
 

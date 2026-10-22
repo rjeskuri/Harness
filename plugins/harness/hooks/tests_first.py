@@ -66,6 +66,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.hookio import deny, edited_path, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
+    from harness_lib.repo import main_checkout
     from harness_lib.settings import glob_match, patterns, setting, settings_env
     from harness_lib.text import read_json
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
@@ -169,21 +170,34 @@ def existing_dir(path: str) -> str:
 
 
 def repo_facts(directory: str) -> dict | None:
-    """top (the worktree's top-level) and main (the main working tree), both canonical
-    paths, branch (None when detached) and spelled (the main tree as git reported it and
-    `directory`, for adopt_old_state); None outside a repo."""
-    out = git(directory, "rev-parse", "--show-toplevel", "--git-common-dir")
+    """top (the worktree's top-level) and main (the main working tree, main_checkout's,
+    which moves state kept under the spelling git reports), both canonical paths, branch
+    (None when detached) and spelled (`directory`, for adopt_old_state); None outside a
+    repo. One git call gives top and HEAD's branch, main_checkout's lookup is held to one more
+    GIT_TIMEOUT: at worst 2 x GIT_TIMEOUT, as on main. Only an unborn branch (that call exits
+    1 with the top alone) costs a third, symbolic-ref, call. The branch is spelled as
+    `symbolic-ref --short HEAD` (harness-red's name) spells it: `--abbrev-ref=loose` shortens
+    the same way, heads/<branch> when a tag or refs/<branch> shares the name; plain
+    `--abbrev-ref` is strict, and also says heads/ for a clash with refs/remotes/<branch>."""
+    out = git(directory, "rev-parse", "--show-toplevel", "--abbrev-ref=loose", "--verify", "-q", "HEAD")
     lines = [ln.strip() for ln in out.stdout.splitlines()]
-    if out.returncode != 0 or len(lines) < 2 or not all(lines[:2]):
+    if out.returncode not in (0, 1) or not lines or not lines[0]:
         return None
-    reported = os.path.dirname(os.path.realpath(os.path.join(directory, lines[1])))
-    head = git(directory, "symbolic-ref", "--short", "-q", "HEAD")
-    branch = head.stdout.strip() if head.returncode == 0 else ""
+    top = lines[0]
+    main = main_checkout(directory, timeout=GIT_TIMEOUT)
+    if main is None:
+        return None
+    if out.returncode == 0:  # the short branch name, or HEAD when detached
+        ref = lines[1] if len(lines) > 1 else ""
+        branch = "" if ref == "HEAD" else ref
+    else:  # an unborn branch: HEAD names a branch with no commit yet
+        head = git(directory, "symbolic-ref", "--short", "-q", "HEAD")
+        branch = head.stdout.strip() if head.returncode == 0 else ""
     return {
-        "top": Path(canonical_path(lines[0])),
-        "main": Path(canonical_path(reported)),
+        "top": Path(canonical_path(top)),
+        "main": Path(main),
         "branch": branch or None,
-        "spelled": (reported, directory),
+        "spelled": (directory,),
     }
 
 

@@ -48,6 +48,7 @@ try:
     from harness_lib.text import (as_list, first_line, harness_home, home, last_line, one_line, parse_iso, read_json,
                                   read_text, write_json, write_text)
     from harness_lib.notify import notify
+    from harness_lib.repo import RepoError, repo_facts
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -235,20 +236,10 @@ class Repo:
     shared by both, and (on demand) OWNER/REPO."""
 
     def __init__(self, path):
-        path = os.path.abspath(os.path.expanduser(path))
-        if not os.path.isdir(path):
-            raise Problem(f"not a directory: {path}")
-        top = git(path, "rev-parse", "--show-toplevel")
-        if top.returncode != 0 or not top.stdout.strip():
-            raise Problem(f"not a git repository: {path}")
-        self.root = top.stdout.strip()
-        common = git(self.root, "rev-parse", "--git-common-dir")
-        if common.returncode != 0 or not common.stdout.strip():
-            raise Problem(f"git rev-parse --git-common-dir failed in {self.root}: {first_line(common.stderr)}")
-        common_dir = os.path.normpath(os.path.join(self.root, common.stdout.strip()))
-        reported = os.path.realpath(os.path.dirname(common_dir))
-        self.main = canonical_path(reported)
-        self.key = adopt_old_state(harness_home("repos"), self.main, reported, path)
+        try:
+            self.root, _common_dir, self.main, self.key = repo_facts(path, git, first_line)
+        except RepoError as exc:
+            raise Problem(str(exc)) from None
         self.name = os.path.basename(self.main)
         self._slug = None
 

@@ -62,6 +62,7 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.cli import Parser, run_main
+    from harness_lib.repo import main_checkout
     from harness_lib.text import session_folder
 except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
     sys.exit(f"harness-worklog: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
@@ -80,34 +81,49 @@ LOCALTIME = "/etc/localtime"
 GITHUB = "GitHub"     # the committer of merges made on github.com: UTC, not evidence of the Mac's zone
 
 
-def main_checkout(path):
-    """`path`, or when it is a linked git worktree the main checkout it belongs to (the parent of git's
-    common dir): the log and the session folders are the repo's, not a ticket branch's."""
+def git_facts(path, *flags):
+    """The lines `git rev-parse <flags> --absolute-git-dir` prints for `path`, the git dir last;
+    None when git fails or is missing."""
     try:
-        out = subprocess.run(["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-dir",
-                              "--git-common-dir"], capture_output=True, text=True, check=True,
-                             timeout=10).stdout.split("\n")
+        out = subprocess.run(["git", "-C", path, "rev-parse", *flags, "--absolute-git-dir"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        return path
-    if len(out) >= 2 and out[0] and out[0] != out[1] and os.path.basename(out[1]) == ".git":
-        return os.path.dirname(out[1])
-    return path
+        return None
+    lines = out.stdout.splitlines()
+    if out.returncode != 0 or len(lines) != len(flags) + 1 or not all(lines):
+        return None
+    return lines
+
+
+def linked_to_dot_git(git_dir):
+    """Whether `git_dir` belongs to a linked worktree (it has a `commondir` file, git's own test) whose
+    common dir is named `.git`: a linked worktree of an ordinary repository. A submodule, a linked
+    worktree of a bare repository or of a submodule, and a separate git dir are not."""
+    try:
+        with open(os.path.join(git_dir, "commondir"), encoding="utf-8") as fh:
+            common = fh.read().strip()
+    except OSError:
+        return False
+    if not common:
+        return False
+    common = os.path.normpath(os.path.join(git_dir, common))
+    return common != os.path.normpath(git_dir) and os.path.basename(common) == ".git"
 
 
 def find_repo(given=None):
-    """The repo: `given` (--repo), else $CLAUDE_PROJECT_DIR, else the git top level of the current
-    directory, else the current directory; a linked worktree stands for its main checkout."""
-    for path in (given, os.environ.get("CLAUDE_PROJECT_DIR")):
-        if path:
-            return main_checkout(os.path.abspath(os.path.expanduser(path)))
-    try:
-        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
-                             check=True, timeout=10).stdout.strip()
-        if top:
-            return main_checkout(top)
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return os.getcwd()
+    """The repo: `given` (--repo), else $CLAUDE_PROJECT_DIR, kept as spelled (the session folders are
+    named after that spelling), else the git top level of the current directory, else the current
+    directory. Any of them inside a linked worktree of an ordinary repository (linked_to_dot_git) stands
+    for its main checkout (main_checkout): the log and the session folders are the repo's, not a ticket
+    branch's."""
+    path = given or os.environ.get("CLAUDE_PROJECT_DIR")
+    if path:
+        path = os.path.abspath(os.path.expanduser(path))
+        facts = git_facts(path)
+    else:
+        facts = git_facts(os.getcwd(), "--show-toplevel")
+        path = facts[0] if facts else os.getcwd()
+    return (facts and linked_to_dot_git(facts[-1]) and main_checkout(path)) or path
 
 
 def use_repo(repo):
