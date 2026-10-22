@@ -4,12 +4,16 @@ auto-land gate's ten rules over gathered facts, and the settings it reads.
 - evaluate(facts, settings) -> {verdict, code, reason, rule}: rules 1 to 10 in order, the
   first failing rule decides; all passing gives land/land (rule 10) naming the head sha7.
   Verdict, code and rule are asserted exactly; reasons loosely (the incident number, the
-  sha7s, counts, names), so the wording stays the coder's.
+  sha7s, counts, names, a word that tells one condition of a rule from another, and words
+  that belong to a sibling condition and must be absent), so the wording stays the coder's.
+  Inside a rule the first failing condition, in the rule table's order, decides. Rule 4
+  passes only on `risk:low`.
 - gate_settings(main, ref="origin/main") -> {autoland, sizes, manual_paths, smoke_local}, read
   only from `git show <ref>:.claude/settings.json` in temp repositories: the process
   environment, the working tree and settings.local.json never count. HARNESS_MANUAL_PATHS
   extends DEFAULT_MANUAL_PATHS (defaults first, de-duplicated); HARNESS_AUTOLAND_SIZES
-  defaults to S,M and a value holding anything but S, M or L is ignored.
+  defaults to S,M and a value holding anything but S, M or L is ignored. Committed values
+  follow settings.setting(): a string or a number (never a bool), stripped.
 - settings.committed_env(main, ref="origin/main"): the committed `env` object, {} when the
   file is missing, not JSON or not an object.
 - autoland.py imports only the standard library and harness_lib.
@@ -152,30 +156,74 @@ def add_files(*paths):
     return apply
 
 
+class Not(str):
+    """In a row's reason checks: this text (any case) must NOT be in the reason."""
+
+
+class Any(tuple):
+    """In a row's reason checks: at least one of these texts (any case) must be in the reason."""
+
+    def __new__(cls, *texts):
+        return super().__new__(cls, texts)
+
+
+BRANCH = "t/140-add-harness-lib-autoland"  # base_facts' head_ref
+IN_FLIGHT = Any("flight", "progress", "running", "queued", "pending", "underway")
+NOT_IN_FLIGHT = [Not("flight"), Not("progress"), Not("running")]
+NOT_FAILED = [Not("fail")]
+# rule 2's conditions told apart: each reason names its own problem and not a sibling's
+NOT_AUTHOR = [Not("rjeskuri"), Not("mallory")]
+NOT_DRAFT = [Not("draft")]
+
+
 # One row per failing condition of the rule table:
-# (label, mutation, verdict, code, rule, substrings the reason must hold)
+# (label, mutation, verdict, code, rule, reason checks: a str must be in the reason exactly,
+#  Any(...) one of its texts in any case, Not(...) absent in any case)
 ROWS = [
     ("autoland off", set_settings(autoland=False), "manual", "off", 1, []),
-    ("state MERGED", set_(state="MERGED"), "manual", "pr", 2, []),
-    ("state CLOSED", set_(state="CLOSED"), "manual", "pr", 2, []),
-    ("draft", set_(draft=True), "manual", "pr", 2, ["draft"]),
-    ("head not a ticket branch", set_(head_ref="feature/140-autoland"), "manual", "pr", 2, []),
-    ("head is main", set_(head_ref="main"), "manual", "pr", 2, []),
-    ("head t/ without a number", set_(head_ref="t/abc-autoland"), "manual", "pr", 2, []),
-    ("head of another ticket", set_(head_ref="t/141-other-thing"), "manual", "pr", 2, []),
-    ("author not login", set_(author="mallory"), "manual", "pr", 2, ["mallory", "rjeskuri"]),
-    ("closes nothing", set_(closing=[]), "manual", "pr", 2, ["140"]),
-    ("closes another issue", set_(closing=[141]), "manual", "pr", 2, ["140"]),
-    ("closes two issues", set_(closing=[140, 141]), "manual", "pr", 2, ["140"]),
+    ("state MERGED", set_(state="MERGED"), "manual", "pr", 2,
+     [Any("merged"), *NOT_DRAFT, *NOT_AUTHOR, Not(BRANCH)]),
+    ("state CLOSED", set_(state="CLOSED"), "manual", "pr", 2,
+     [Any("closed"), *NOT_DRAFT, *NOT_AUTHOR, Not(BRANCH)]),
+    ("draft", set_(draft=True), "manual", "pr", 2, ["draft", *NOT_AUTHOR, Not(BRANCH), Not("#140")]),
+    ("head not a ticket branch", set_(head_ref="feature/140-autoland"), "manual", "pr", 2,
+     ["feature/140-autoland", *NOT_DRAFT, *NOT_AUTHOR]),
+    ("head is main", set_(head_ref="main"), "manual", "pr", 2, ["main", *NOT_DRAFT, *NOT_AUTHOR]),
+    ("head t/ without a number", set_(head_ref="t/abc-autoland"), "manual", "pr", 2,
+     ["t/abc-autoland", *NOT_DRAFT, *NOT_AUTHOR]),
+    ("head of another ticket", set_(head_ref="t/141-other-thing"), "manual", "pr", 2,
+     ["t/141-other-thing", *NOT_DRAFT, *NOT_AUTHOR]),
+    ("author not login", set_(author="mallory"), "manual", "pr", 2,
+     ["mallory", "rjeskuri", *NOT_DRAFT, Not(BRANCH), Not("#140")]),
+    ("author octo not login", set_(author="octo"), "manual", "pr", 2,
+     ["octo", "rjeskuri", *NOT_DRAFT, Not("mallory"), Not(BRANCH)]),
+    ("login differs from author", set_(login="someone-else"), "manual", "pr", 2,
+     ["rjeskuri", "someone-else", *NOT_DRAFT, Not(BRANCH)]),
+    ("closes nothing", set_(closing=[]), "manual", "pr", 2, ["#140", *NOT_DRAFT, *NOT_AUTHOR, Not(BRANCH)]),
+    ("closes another issue", set_(closing=[141]), "manual", "pr", 2,
+     ["#140", *NOT_DRAFT, *NOT_AUTHOR, Not(BRANCH)]),
+    ("closes two issues", set_(closing=[140, 141]), "manual", "pr", 2,
+     ["#140", *NOT_DRAFT, *NOT_AUTHOR, Not(BRANCH)]),
     ("open incident #40", set_(incidents=[{"number": 40, "title": "prod down"}]), "wait", "incident", 3, ["40"]),
     ("open incident #57", set_(incidents=[{"number": 57, "title": "queue stuck"}]), "wait", "incident", 3, ["57"]),
-    ("deploy in progress", set_(deploy={"status": "in_progress", "conclusion": None}), "wait", "deploy", 3, []),
-    ("deploy queued", set_(deploy={"status": "queued", "conclusion": None}), "wait", "deploy", 3, []),
-    ("deploy failed", set_(deploy={"status": "completed", "conclusion": "failure"}), "wait", "deploy", 3, []),
-    ("deploy cancelled", set_(deploy={"status": "completed", "conclusion": "cancelled"}), "wait", "deploy", 3, []),
+    ("deploy in progress", set_(deploy={"status": "in_progress", "conclusion": None}), "wait", "deploy", 3,
+     [IN_FLIGHT, *NOT_FAILED]),
+    ("deploy queued", set_(deploy={"status": "queued", "conclusion": None}), "wait", "deploy", 3,
+     [IN_FLIGHT, *NOT_FAILED]),
+    # an unfinished run is in flight whatever its conclusion field says
+    ("deploy in progress, conclusion success", set_(deploy={"status": "in_progress", "conclusion": "success"}),
+     "wait", "deploy", 3, [IN_FLIGHT, *NOT_FAILED]),
+    ("deploy queued, conclusion success", set_(deploy={"status": "queued", "conclusion": "success"}),
+     "wait", "deploy", 3, [IN_FLIGHT, *NOT_FAILED]),
+    ("deploy failed", set_(deploy={"status": "completed", "conclusion": "failure"}), "wait", "deploy", 3,
+     [Any("fail"), *NOT_IN_FLIGHT]),
+    ("deploy cancelled", set_(deploy={"status": "completed", "conclusion": "cancelled"}), "wait", "deploy", 3,
+     [Any("fail", "cancel"), *NOT_IN_FLIGHT]),
     ("ticket closed", ticket(state="CLOSED"), "manual", "ticket", 4, []),
     ("no risk label", ticket_labels(drop=["risk:low"]), "manual", "risk", 4, []),
     ("risk:high", ticket_labels(add=["risk:high"], drop=["risk:low"]), "manual", "risk", 4, []),
+    ("risk:medium", ticket_labels(add=["risk:medium"], drop=["risk:low"]), "manual", "risk", 4, []),
+    ("unknown risk:foo", ticket_labels(add=["risk:foo"], drop=["risk:low"]), "manual", "risk", 4, []),
     ("no size label", ticket_labels(drop=["size:M"]), "manual", "size", 4, []),
     ("size:L not in default sizes", ticket_labels(add=["size:L"], drop=["size:M"]), "manual", "size", 4, []),
     ("size:M not in sizes S", set_settings(sizes=["S"]), "manual", "size", 4, []),
@@ -225,8 +273,14 @@ class Evaluate(unittest.TestCase):
 
     def check(self, out, verdict, code, rule, *in_reason):
         self.assertEqual((out["verdict"], out["code"], out["rule"]), (verdict, code, rule), out)
+        low = out["reason"].lower()
         for text in in_reason:
-            self.assertIn(text, out["reason"], out)
+            if isinstance(text, Not):
+                self.assertNotIn(text.lower(), low, out)
+            elif isinstance(text, Any):
+                self.assertTrue(any(t.lower() in low for t in text), (text, out))
+            else:
+                self.assertIn(text, out["reason"], out)
 
     def mutated(self, *mutations):
         f, s = base_facts(), base_settings()
@@ -282,6 +336,54 @@ class Evaluate(unittest.TestCase):
                 f, s = self.mutated(*(ONE_PER_RULE[r][0] for r in sorted(ONE_PER_RULE) if r >= n))
                 _, verdict, code = ONE_PER_RULE[n]
                 self.check(self.run_gate(f, s), verdict, code, n)
+
+    def test_first_failing_condition_inside_a_rule_decides(self):
+        cases = [  # (label, mutations, verdict, code, rule, reason checks)
+            ("ticket closed before risk:high", [ticket(state="CLOSED"),
+                                                ticket_labels(add=["risk:high"], drop=["risk:low"])],
+             "manual", "ticket", 4, []),
+            ("risk missing before a bad size", [ticket_labels(add=["size:L"], drop=["risk:low", "size:M"])],
+             "manual", "risk", 4, []),
+            ("risk:medium before no size", [ticket_labels(add=["risk:medium"], drop=["risk:low", "size:M"])],
+             "manual", "risk", 4, []),
+            ("bad size before manual-land", [ticket_labels(add=["size:L"], drop=["size:M"]),
+                                             set_(pr_labels=["manual-land"])],
+             "manual", "size", 4, []),
+            ("no size before manual-land on the ticket", [ticket_labels(add=["manual-land"], drop=["size:M"])],
+             "manual", "size", 4, []),
+            ("incident before a failed deploy", [set_(incidents=[{"number": 57, "title": "queue stuck"}],
+                                                      deploy={"status": "completed", "conclusion": "failure"})],
+             "wait", "incident", 3, ["57"]),
+            ("incident before a deploy in flight", [set_(incidents=[{"number": 40, "title": "prod down"}],
+                                                         deploy={"status": "in_progress", "conclusion": None})],
+             "wait", "incident", 3, ["40"]),
+            ("protected path before too large", [add_files(".github/workflows/ci.yml"),
+                                                 set_(nontest_files=20, nontest_lines=5000)],
+             "manual", "path", 5, [".github/workflows/ci.yml"]),
+            ("review not at head before high findings", [review(commit_id=OLD, at_head=False, high=3, medium=2)],
+             "wait", "re-check", 6, [OLD[:7], HEAD[:7]]),
+            ("conflicting before behind", [set_(mergeable="CONFLICTING", behind_by=3)], "fix", "conflict", 8, []),
+        ]
+        for label, mutations, verdict, code, rule, in_reason in cases:
+            with self.subTest(label):
+                f, s = self.mutated(*mutations)
+                self.check(self.run_gate(f, s), verdict, code, rule, *in_reason)
+
+    def test_only_risk_low_passes_rule_4(self):
+        for risk in ("risk:high", "risk:medium", "risk:foo", "risk:", "low"):
+            with self.subTest(risk=risk):
+                f, s = self.mutated(ticket_labels(add=[risk], drop=["risk:low"]))
+                self.check(self.run_gate(f, s), "manual", "risk", 4)
+        for others in ([], ["bug"], ["enhancement", "status:in-review"]):
+            with self.subTest(others=others):
+                f = base_facts(ticket={"number": 140, "state": "OPEN", "labels": ["size:S", "risk:low", *others]})
+                self.check(self.run_gate(f, base_settings()), "land", "land", 10)
+
+    def test_deploy_completed_success_or_absent_passes_rule_3(self):
+        for deploy in ({"status": "completed", "conclusion": "success"}, None):
+            with self.subTest(deploy=deploy):
+                f, s = self.mutated(set_(deploy=deploy))
+                self.check(self.run_gate(f, s), "land", "land", 10, HEAD[:7])
 
     def test_low_findings_at_head_land_medium_is_fix(self):
         for low in (1, 3, 12):
@@ -531,6 +633,29 @@ class GateSettings(GitCase):
                 out = self.gate(repo)
                 self.assertIsInstance(out["sizes"], list, out)
                 self.assertEqual(sorted(out["sizes"]), expected, out)
+
+    def test_committed_values_follow_setting_semantics(self):
+        cases = [  # (committed HARNESS_AUTOLAND, autoland): a string or number, never a bool, stripped
+            (1, True),
+            ("1", True),
+            (" 1 ", True),
+            ("1\n", True),
+            (True, False),
+            (False, False),
+            ("0", False),
+            (0, False),
+            (" ", False),
+            ("true", False),
+            (None, False),
+        ]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                out = self.gate(self.committed_settings({"HARNESS_AUTOLAND": value}))
+                self.assertIs(out["autoland"], expected, out)
+        for value, expected in ((1, True), (" 1 ", True), (True, False), ("0", False)):
+            with self.subTest(smoke_local=value):
+                out = self.gate(self.committed_settings({"HARNESS_SMOKE_LOCAL": value}))
+                self.assertIs(out["smoke_local"], expected, out)
 
     def test_missing_or_invalid_settings_mean_off(self):
         cases = {}
