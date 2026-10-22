@@ -69,7 +69,7 @@ try:
     from harness_lib.settings import glob_match, patterns, setting, settings_env
     from harness_lib.text import read_json
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
-    sys.stderr.write(f"tests_first.py: cannot load harness_lib from {_LIB}: {exc}\n")
+    sys.stderr.write(f"tests_first.py: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}\n")
     sys.exit(0)
 
 GIT_TIMEOUT = 3

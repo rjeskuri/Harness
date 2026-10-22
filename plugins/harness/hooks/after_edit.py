@@ -43,7 +43,7 @@ try:
     from harness_lib.hookio import edited_path, hook_cwd, read_input, run_fail_open
     from harness_lib.sessionstate import SessionState, porcelain_status, status_paths
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
-    sys.stderr.write(f"after_edit.py: cannot load harness_lib from {_LIB}: {exc}\n")
+    sys.stderr.write(f"after_edit.py: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}\n")
     sys.exit(0)
 
 MAX_SCAN_BYTES = 2 * 1024 * 1024

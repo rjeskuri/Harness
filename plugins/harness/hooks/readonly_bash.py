@@ -65,7 +65,7 @@ try:
     )
     from harness_lib.hookio import deny, read_input, run_fail_open
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
-    sys.stderr.write(f"readonly_bash.py: cannot load harness_lib from {_LIB}: {exc}\n")
+    sys.stderr.write(f"readonly_bash.py: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}\n")
     sys.exit(0)
 
 GUARDED = {
