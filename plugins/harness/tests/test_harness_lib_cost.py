@@ -903,6 +903,110 @@ class TicketUsage(Base):
                                turns([Msg("msg_wb8", T("14:01:00.000"), T("14:01:02.000"), (1, 2, 3, 4))], B13))])
         self.check(self.usage_of(12, [d]), sort_rows(rows), {sid(91): (False, None)})
 
+    def test_speed_rules_skip_transcripts_that_cannot_count(self):
+        """Ticket Context, Speed: a main transcript whose text has no `t/12-` is never parsed (its
+        subagents are still considered); a subagent is parsed only when its description starts
+        `#12`, or starts with no `#<digits>` and its first branch is t/12-. Proven through which
+        paths reach transcripts.read_transcript, with the result still right."""
+        d = Path(self.folder("speed"))
+        parsed, allowed, forbidden = [], set(), {}
+        mid = iter(range(1000))
+
+        def one(clock, branch=None, model=OPUS):
+            n = next(mid)
+            return [Msg(f"msg_sp{n}", T(clock), T(clock[:6] + "%02d.%03d" % (n % 50 + 1, n)),
+                        (n + 1, 10 * n + 3, 100 * n, 1000 * n + 7), model, branch)]
+
+        def main_path(s):
+            return str(d / f"{sid(s)}.jsonl")
+
+        def agent_path(s, aid):
+            return str(d / sid(s) / "subagents" / f"agent-{aid}.jsonl")
+
+        # S1, on main with no t/12- anywhere: never parsed, but its #12 subagent and its unnamed
+        # subagent on t/12- still count; #13, #120 and unnamed ones on main or t/13- are not parsed
+        s1_code, s1_explore = one("08:00:00.000"), one("08:05:00.000")
+        write_session(d, sid(130), turns(one("07:59:00.000"), "main"), agents=[
+            ("a0000000000000001", meta("harness:coder", "#12 code"), turns(s1_code, "main")),
+            ("a0000000000000002", meta("harness:reviewer", "#13 review"), turns(one("08:01:00.000"), "main")),
+            ("a0000000000000003", meta("Explore", "Explore the board"), turns(one("08:02:00.000"), "main")),
+            ("a0000000000000004", meta("Explore", "Explore the board"), turns(s1_explore, B12)),
+            ("a0000000000000005", meta("harness:test-author", "#120 tests"), turns(one("08:03:00.000"), "main")),
+            ("a0000000000000006", meta("Explore", None), turns(one("08:04:00.000"), B13)),
+        ])
+        forbidden[main_path(130)] = "S1 main: no t/12- in its text"
+        for aid, why in (("a0000000000000002", "#13"), ("a0000000000000003", "unnamed on main"),
+                         ("a0000000000000005", "#120"), ("a0000000000000006", "unnamed on t/13-")):
+            forbidden[agent_path(130, aid)] = "S1 subagent " + why
+        allowed |= {agent_path(130, "a0000000000000001"), agent_path(130, "a0000000000000004")}
+
+        # S2, ticket 13's own session: its main is never parsed for 12; its #12 subagent counts
+        s2_tests = one("09:00:00.000", model=SONNET)
+        write_session(d, sid(131), turns(one("08:59:00.000"), B13), agents=[
+            ("b0000000000000001", meta("harness:test-author", "#12 tests"), turns(s2_tests, B13)),
+            ("b0000000000000002", meta("harness:coder", "#13 code"), turns(one("09:01:00.000"), B13)),
+            ("b0000000000000003", meta("harness:coder", "Implement it"), turns(one("09:02:00.000"), B13)),
+        ])
+        forbidden[main_path(131)] = "S2 main: on t/13-"
+        forbidden[agent_path(131, "b0000000000000002")] = "S2 subagent #13"
+        forbidden[agent_path(131, "b0000000000000003")] = "S2 subagent unnamed on t/13-"
+        allowed.add(agent_path(131, "b0000000000000001"))
+
+        # S3, the prefix lookalike t/120-: its text has no t/12-, so it is never parsed
+        write_session(d, sid(132), turns(one("10:00:00.000"), B120), agents=[
+            ("c0000000000000001", meta("harness:coder", "Implement it"), turns(one("10:01:00.000"), B120))])
+        forbidden[main_path(132)] = "S3 main: on t/120-"
+        forbidden[agent_path(132, "c0000000000000001")] = "S3 subagent unnamed on t/120-"
+
+        # S4, 12's own session: main parsed; unnamed and #12 subagents count, #13 is never parsed
+        s4_orch, s4_coder, s4_fix = one("11:00:00.000"), one("11:01:00.000"), one("11:02:00.000", model=FABLE)
+        write_session(d, sid(133), turns(s4_orch, B12), agents=[
+            ("d0000000000000001", meta("harness:coder", "Implement it"), turns(s4_coder, B12)),
+            ("d0000000000000002", meta("harness:reviewer", "#13 review"), turns(one("11:03:00.000"), B12)),
+            ("d0000000000000003", meta("harness:reviewer", "#12 fix"), turns(s4_fix, B12)),
+        ])
+        forbidden[agent_path(133, "d0000000000000002")] = "S4 subagent #13 in 12's own session"
+        allowed |= {main_path(133), agent_path(133, "d0000000000000001"), agent_path(133, "d0000000000000003")}
+
+        # S5, on main with one message on t/12-: main parsed; its unnamed subagent on main and its
+        # #13 subagent are not
+        s5_12 = one("12:01:00.000", B12)
+        write_session(d, sid(134), turns(one("12:00:00.000") + s5_12, "main"), agents=[
+            ("e0000000000000001", meta("Explore", "Look around"), turns(one("12:02:00.000"), "main")),
+            ("e0000000000000002", meta("harness:coder", " #13 code"), turns(one("12:03:00.000"), "main")),
+        ])
+        forbidden[agent_path(134, "e0000000000000001")] = "S5 subagent unnamed on main"
+        forbidden[agent_path(134, "e0000000000000002")] = "S5 subagent #13"
+        allowed.add(main_path(134))
+
+        for path in list(forbidden) + sorted(allowed):
+            self.assertTrue(os.path.isfile(path), path)   # the fixture paths are the real ones
+
+        transcripts = sys.modules["harness_lib.transcripts"]
+        real = transcripts.read_transcript
+
+        def spy(path):
+            parsed.append(os.path.realpath(str(path)))
+            return real(path)
+
+        with mock.patch.object(transcripts, "read_transcript", spy):
+            got = self.usage_of(12, [str(d)])
+
+        short = lambda paths: sorted(os.path.relpath(p, str(d)) for p in paths)
+        self.assertEqual(sorted({forbidden[p] for p in parsed if p in forbidden}), [],
+                         "parsed a transcript that cannot count for 12")
+        self.assertEqual(short(set(parsed) - allowed), [], "parsed a transcript outside the expected set")
+        self.assertEqual(short(allowed - set(parsed)), [], "a transcript that counts for 12 was not parsed")
+
+        # two coders in the code stage: S1's (08:00) is round 1, S4's (11:01) round 2
+        self.check(got, [row("tests", 1, "harness:test-author", SONNET, s2_tests),
+                         row("code", 1, "harness:coder", OPUS, s1_code),
+                         row("code", 2, "harness:coder", OPUS, s4_coder),
+                         row("fix", 1, "harness:reviewer", FABLE, s4_fix),
+                         row("other", 1, "Explore", OPUS, s1_explore),
+                         row("orchestrator", 1, "main", OPUS, s4_orch + s5_12)],
+                   {sid(130): (False, None), sid(131): (False, None), sid(133): (True, False), sid(134): (False, None)})
+
     def test_default_dirs_are_the_repositorys_session_folders(self):
         main = str(self.tmp / "client_repo.v2")
         projects = self.home / ".claude" / "projects"
