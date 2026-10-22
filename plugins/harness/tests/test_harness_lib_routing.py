@@ -26,6 +26,7 @@ import importlib.util
 import itertools
 import json
 import os
+import re
 import shutil
 import sys
 import sysconfig
@@ -745,11 +746,35 @@ class Module(RoutingCase):
                 self.assertNotIn("site-packages", str(origin))
 
     def test_design_md_lists_the_five_settings(self):
-        design = (PLUGIN.parent.parent / "docs" / "design.md").read_text(encoding="utf-8")
+        text = (PLUGIN.parent.parent / "docs" / "design.md").read_text(encoding="utf-8")
+        design = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)  # a comment documents nothing
+        lines = design.splitlines()
+        # the words each setting's "values" cell must list (from the ticket's allowed values)
+        words = {
+            "HARNESS_CODE_TIER": TIERS,
+            "HARNESS_CODE_EFFORT": EFFORTS,
+            "HARNESS_REVIEW_TIER": TIERS,
+            "HARNESS_ULTRAREVIEW": ("on", "off"),
+            "HARNESS_WAVE_REVIEW": TIERS + ("off",),
+        }
         for key in KEYS:
-            with self.subTest(key=key):
-                self.assertIn(key, design)
-        self.assertIn("routing.py", design)
+            with self.subTest(setting=key):
+                rows = [ln for ln in lines if ln.lstrip().startswith("| `%s` |" % key)]
+                self.assertEqual(len(rows), 1, "want one Settings-table row for %s, found %d" % (key, len(rows)))
+                cells = [c.strip() for c in rows[0].strip().strip("|").split("|")]
+                self.assertEqual(len(cells), 3, rows[0])  # setting | values | default
+                self.assertEqual(cells[0], "`%s`" % key)
+                self.assertTrue(cells[1], "empty allowed-values cell for %s" % key)
+                self.assertTrue(cells[2], "empty default cell for %s" % key)
+                for word in words[key]:
+                    self.assertRegex(cells[1], r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(word))
+        # routing.py in the Layout block's lib list, and in the harness_lib paragraph
+        lib_lines = [ln for ln in lines if ln.strip().startswith("lib/") and "harness_lib/__init__.py" in ln]
+        self.assertEqual(len(lib_lines), 1, "want one lib/ line in the Layout block")
+        self.assertIn("routing.py", lib_lines[0].split())
+        paragraphs = [ln for ln in lines if ln.startswith("Code shared between files lives in")]
+        self.assertEqual(len(paragraphs), 1)
+        self.assertIn("`routing.py`", paragraphs[0])
 
     def test_future_annotations_is_enabled(self):
         text = ROUTING_PY.read_text(encoding="utf-8")
