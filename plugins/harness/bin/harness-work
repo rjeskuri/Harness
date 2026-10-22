@@ -6,7 +6,7 @@ of a headless or background session per ready ticket, the run records, the budge
 Usage:
     harness-work start N [--venue interactive|headless|bg]
     harness-work attempt N tests|breaker|code|review|fix|ci pass|fail [--tier sonnet|opus|fable]
-    harness-work dispatch [--max 3] [--venue headless|bg | --api] [--dry-run]
+    harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]
     harness-work runs [--sweep] [--all]
     harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
     harness-work worktrees [--stale DAYS]
@@ -1280,7 +1280,7 @@ def parser():
 
     dispatch = sub.add_parser("dispatch", parents=[with_repo, with_json],
                               help="start and launch a session per ready ticket")
-    dispatch.add_argument("--max", type=int, default=3, help="live runs at most (default 3)")
+    dispatch.add_argument("--max", type=int, default=10, help="live runs at most (default 10)")
     dispatch.add_argument("--venue", choices=VENUES,
                           help="default: bg (the subscription); headless bills the API key and is refused while the "
                                "api budget is exhausted")
