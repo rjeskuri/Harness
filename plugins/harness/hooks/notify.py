@@ -43,7 +43,7 @@ try:
     from harness_lib.hookio import emit, read_input, run_fail_open
     from harness_lib.notify import notify
 except Exception as exc:  # fail open: one line, and the bell, since this stderr reaches no one
-    sys.stderr.write(f"notify.py: cannot load harness_lib from {_LIB}: {exc}\n")
+    sys.stderr.write(f"notify.py: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}\n")
     sys.stdout.write(json.dumps({"terminalSequence": "\u0007"}))
     sys.stdout.flush()
     sys.exit(0)
