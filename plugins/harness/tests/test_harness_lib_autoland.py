@@ -6,8 +6,12 @@ auto-land gate's ten rules over gathered facts, and the settings it reads.
   Verdict, code and rule are asserted exactly; reasons loosely (the incident number, the
   sha7s, counts, names, a word that tells one condition of a rule from another, and words
   that belong to a sibling condition and must be absent), so the wording stays the coder's.
-  Inside a rule the first failing condition, in the rule table's order, decides. Rule 4
-  passes only on `risk:low`.
+  Inside a rule the first failing condition, in the rule table's order, decides. The checks
+  are not allowlists: rule 2 fails on any state but OPEN; rule 3 on any deploy that is not
+  completed (in flight) or completed with any conclusion but success (failed), naming every
+  open incident; rule 4 on any risk labels but exactly `risk:low`, and on a size label outside
+  sizes even next to an allowed one; rule 9 on any checks value but success, pending or
+  failure (manual/checks), `"SUCCESS"`, `""` and None included.
 - gate_settings(main, ref="origin/main") -> {autoland, sizes, manual_paths, smoke_local}, read
   only from `git show <ref>:.claude/settings.json` in temp repositories: the process
   environment, the working tree and settings.local.json never count. HARNESS_MANUAL_PATHS
@@ -168,9 +172,12 @@ class Any(tuple):
 
 
 BRANCH = "t/140-add-harness-lib-autoland"  # base_facts' head_ref
-IN_FLIGHT = Any("flight", "progress", "running", "queued", "pending", "underway")
+IN_FLIGHT = Any("flight", "progress", "running", "queued", "pending", "underway", "waiting", "requested",
+                "unfinished", "not complete", "not finished", "incomplete")
 NOT_IN_FLIGHT = [Not("flight"), Not("progress"), Not("running")]
 NOT_FAILED = [Not("fail")]
+FAILED = Any("fail", "unsuccessful", "not succe", "did not succeed", "not pass")
+NOT_OPEN = Any("open", "state")  # a reason about the PR's state names the state or says not open
 # rule 2's conditions told apart: each reason names its own problem and not a sibling's
 NOT_AUTHOR = [Not("rjeskuri"), Not("mallory")]
 NOT_DRAFT = [Not("draft")]
@@ -185,6 +192,10 @@ ROWS = [
      [Any("merged"), *NOT_DRAFT, *NOT_AUTHOR, Not(BRANCH)]),
     ("state CLOSED", set_(state="CLOSED"), "manual", "pr", 2,
      [Any("closed"), *NOT_DRAFT, *NOT_AUTHOR, Not(BRANCH)]),
+    # any state but OPEN fails, not only the two the API documents
+    ("state LOCKED", set_(state="LOCKED"), "manual", "pr", 2,
+     [Any("locked", *NOT_OPEN), *NOT_DRAFT, *NOT_AUTHOR, Not(BRANCH)]),
+    ("state empty", set_(state=""), "manual", "pr", 2, [NOT_OPEN, *NOT_DRAFT, *NOT_AUTHOR, Not(BRANCH)]),
     ("draft", set_(draft=True), "manual", "pr", 2, ["draft", *NOT_AUTHOR, Not(BRANCH), Not("#140")]),
     ("head not a ticket branch", set_(head_ref="feature/140-autoland"), "manual", "pr", 2,
      ["feature/140-autoland", *NOT_DRAFT, *NOT_AUTHOR]),
@@ -206,9 +217,24 @@ ROWS = [
      ["#140", *NOT_DRAFT, *NOT_AUTHOR, Not(BRANCH)]),
     ("open incident #40", set_(incidents=[{"number": 40, "title": "prod down"}]), "wait", "incident", 3, ["40"]),
     ("open incident #57", set_(incidents=[{"number": 57, "title": "queue stuck"}]), "wait", "incident", 3, ["57"]),
+    # several open incidents: the reason names every one, not only the first or the last
+    ("open incidents #40 and #57", set_(incidents=[{"number": 40, "title": "prod down"},
+                                                    {"number": 57, "title": "queue stuck"}]),
+     "wait", "incident", 3, ["40", "57"]),
+    ("open incidents #57, #40 and #63", set_(incidents=[{"number": 57, "title": "queue stuck"},
+                                                         {"number": 40, "title": "prod down"},
+                                                         {"number": 63, "title": "disk full"}]),
+     "wait", "incident", 3, ["40", "57", "63"]),
     ("deploy in progress", set_(deploy={"status": "in_progress", "conclusion": None}), "wait", "deploy", 3,
      [IN_FLIGHT, *NOT_FAILED]),
     ("deploy queued", set_(deploy={"status": "queued", "conclusion": None}), "wait", "deploy", 3,
+     [IN_FLIGHT, *NOT_FAILED]),
+    # not completed is in flight whatever the status word: no allowlist of statuses
+    ("deploy waiting", set_(deploy={"status": "waiting", "conclusion": None}), "wait", "deploy", 3,
+     [IN_FLIGHT, *NOT_FAILED]),
+    ("deploy requested", set_(deploy={"status": "requested", "conclusion": None}), "wait", "deploy", 3,
+     [IN_FLIGHT, *NOT_FAILED]),
+    ("deploy pending", set_(deploy={"status": "pending", "conclusion": None}), "wait", "deploy", 3,
      [IN_FLIGHT, *NOT_FAILED]),
     # an unfinished run is in flight whatever its conclusion field says
     ("deploy in progress, conclusion success", set_(deploy={"status": "in_progress", "conclusion": "success"}),
@@ -219,14 +245,35 @@ ROWS = [
      [Any("fail"), *NOT_IN_FLIGHT]),
     ("deploy cancelled", set_(deploy={"status": "completed", "conclusion": "cancelled"}), "wait", "deploy", 3,
      [Any("fail", "cancel"), *NOT_IN_FLIGHT]),
+    # completed with anything but success is a failed deploy: no allowlist of conclusions
+    ("deploy timed out", set_(deploy={"status": "completed", "conclusion": "timed_out"}), "wait", "deploy", 3,
+     [FAILED, *NOT_IN_FLIGHT]),
+    ("deploy startup failure", set_(deploy={"status": "completed", "conclusion": "startup_failure"}),
+     "wait", "deploy", 3, [FAILED, *NOT_IN_FLIGHT]),
+    ("deploy action required", set_(deploy={"status": "completed", "conclusion": "action_required"}),
+     "wait", "deploy", 3, [FAILED, *NOT_IN_FLIGHT]),
+    ("deploy neutral", set_(deploy={"status": "completed", "conclusion": "neutral"}), "wait", "deploy", 3,
+     [FAILED, *NOT_IN_FLIGHT]),
+    ("deploy skipped", set_(deploy={"status": "completed", "conclusion": "skipped"}), "wait", "deploy", 3,
+     [FAILED, *NOT_IN_FLIGHT]),
     ("ticket closed", ticket(state="CLOSED"), "manual", "ticket", 4, []),
+    # any ticket state but OPEN fails
+    ("ticket MERGED", ticket(state="MERGED"), "manual", "ticket", 4, []),
+    ("ticket state empty", ticket(state=""), "manual", "ticket", 4, []),
     ("no risk label", ticket_labels(drop=["risk:low"]), "manual", "risk", 4, []),
     ("risk:high", ticket_labels(add=["risk:high"], drop=["risk:low"]), "manual", "risk", 4, []),
     ("risk:medium", ticket_labels(add=["risk:medium"], drop=["risk:low"]), "manual", "risk", 4, []),
     ("unknown risk:foo", ticket_labels(add=["risk:foo"], drop=["risk:low"]), "manual", "risk", 4, []),
+    # more than one risk label is not low risk, whichever comes first
+    ("risk:low and risk:high", ticket_labels(add=["risk:high"]), "manual", "risk", 4, []),
+    ("risk:high before risk:low", ticket(labels=["task", "size:M", "risk:high", "risk:low"]), "manual", "risk", 4, []),
+    ("risk:low and risk:medium", ticket_labels(add=["risk:medium"]), "manual", "risk", 4, []),
     ("no size label", ticket_labels(drop=["size:M"]), "manual", "size", 4, []),
     ("size:L not in default sizes", ticket_labels(add=["size:L"], drop=["size:M"]), "manual", "size", 4, []),
     ("size:M not in sizes S", set_settings(sizes=["S"]), "manual", "size", 4, []),
+    # a size label outside sizes fails even next to an allowed one, whichever comes first
+    ("size:S and size:L", ticket(labels=["task", "risk:low", "size:S", "size:L"]), "manual", "size", 4, []),
+    ("size:L before size:S", ticket(labels=["task", "risk:low", "size:L", "size:S"]), "manual", "size", 4, []),
     ("manual-land on the PR", set_(pr_labels=["manual-land"]), "manual", "label", 4, []),
     ("manual-land on the ticket", ticket_labels(add=["manual-land"]), "manual", "label", 4, []),
     ("protected path", add_files(".github/workflows/ci.yml"), "manual", "path", 5, [".github/workflows/ci.yml"]),
@@ -246,6 +293,11 @@ ROWS = [
     ("checks failed", set_(checks="failure", failed_checks=["verify", "lint-py"]), "fix", "ci", 9, ["verify", "lint-py"]),
     ("checks failed other", set_(checks="failure", failed_checks=["deploy-stub"]), "fix", "ci", 9, ["deploy-stub"]),
     ("no checks", set_(checks="none"), "manual", "checks", 9, []),
+    # only exactly `success` lands; a value that is not success, pending or failure is manual/checks
+    ("checks error", set_(checks="error"), "manual", "checks", 9, []),
+    ("checks empty string", set_(checks=""), "manual", "checks", 9, []),
+    ("checks None", set_(checks=None), "manual", "checks", 9, []),
+    ("checks SUCCESS in upper case", set_(checks="SUCCESS"), "manual", "checks", 9, []),
 ]
 
 # One failing mutation per rule 1-9, on disjoint keys, for the pairwise ordering test.
@@ -374,6 +426,12 @@ class Evaluate(unittest.TestCase):
             with self.subTest(risk=risk):
                 f, s = self.mutated(ticket_labels(add=[risk], drop=["risk:low"]))
                 self.check(self.run_gate(f, s), "manual", "risk", 4)
+        # risk:low next to another risk label is not low risk, in either order
+        for other in ("risk:high", "risk:medium", "risk:foo"):
+            for risks in ((["risk:low", other]), ([other, "risk:low"])):
+                with self.subTest(risks=risks):
+                    f = base_facts(ticket={"number": 140, "state": "OPEN", "labels": ["task", "size:S", *risks]})
+                    self.check(self.run_gate(f, base_settings()), "manual", "risk", 4)
         for others in ([], ["bug"], ["enhancement", "status:in-review"]):
             with self.subTest(others=others):
                 f = base_facts(ticket={"number": 140, "state": "OPEN", "labels": ["size:S", "risk:low", *others]})
