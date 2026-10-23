@@ -1,7 +1,7 @@
 """Settings and globs every harness tool and hook reads: the `env` object of a project's
-.claude settings files, one setting from the environment or that object, a comma-separated
-pattern list, and the repo-relative glob matcher behind HARNESS_TEST_PATTERNS and
-HARNESS_SOURCE_EXEMPT. See docs/design.md (harness_lib).
+.claude settings files (or of the settings.json committed at a ref), one setting from the
+environment or that object, a comma-separated pattern list, and the repo-relative glob matcher
+behind HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT. See docs/design.md (harness_lib).
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -11,6 +11,9 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import subprocess
+
+GIT_TIMEOUT = 10  # seconds committed_env's git show may take
 
 
 def settings_env(root, names=("settings.json", "settings.local.json")):
@@ -28,6 +31,21 @@ def settings_env(root, names=("settings.json", "settings.local.json")):
         if isinstance(env, dict):
             merged.update(env)
     return merged
+
+
+def committed_env(main, ref="origin/main"):
+    """`env` from the .claude/settings.json committed at `ref` in the repository at `main`
+    (`git show`), so neither the working tree nor settings.local.json counts. A missing file
+    or ref, a failing git, a file that is not JSON or not an object, or an `env` that is not
+    an object gives {}."""
+    try:
+        out = subprocess.run(["git", "-C", main, "show", f"{ref}:.claude/settings.json"], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=GIT_TIMEOUT)
+        data = json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+    env = data.get("env") if isinstance(data, dict) else None
+    return env if isinstance(env, dict) else {}
 
 
 def setting(name, file_env):
