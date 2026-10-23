@@ -100,6 +100,7 @@ PRESERVED = (("branch", None), ("worktree", None), ("started_at", None), ("attem
 NEEDS_INPUT = "**Needs your input**"
 RESOLUTION = "**Resolution**"   # the comment `harness-pr land` posts on a ticket it lands
 MARKER = "<!-- harness -->"     # the last line of every comment posted here
+BOT_LOGINS = ("github-actions[bot]", "github-actions")   # the deploy guard's author (REST, GraphQL), casefolded
 # the harness's own comments from before the marker, as their bodies start
 HARNESS_PREFIXES = (NEEDS_INPUT, "Started on ", "PR #", "Landed in ")
 EPIC_DONE = "All tasks landed."
@@ -778,7 +779,8 @@ def cmd_needs_input(repo, args):
 
 def cmd_answers(repo, args):
     """The owner's comments after `since`, without the harness's own (posted under the same login). `since`:
-    --since, else the newest needs-input question, else the cache's fetched_at, else no lower bound."""
+    --since, else the newest needs-input question, else the cache's fetched_at, else no lower bound. A question
+    is the owner's own or the deploy guard's (github-actions, marker required); the bot's are never answers."""
     since = None
     if args.since is not None:
         since = parse_iso(args.since)
@@ -788,13 +790,18 @@ def cmd_answers(repo, args):
     if not login:
         raise Problem("gh api user printed no login")
     data = gh_json(repo, ["issue", "view", str(args.number), "--json", "comments"])
-    mine = []
+    mine, asked = [], []
     for c in as_list(data.get("comments") if isinstance(data, dict) else None):
         author = (c.get("author") or {}).get("login") if isinstance(c.get("author"), dict) else None
+        body, when = c.get("body") or "", parse_iso(c.get("createdAt"))
+        question = when is not None and body.lstrip().startswith(NEEDS_INPUT)
         if author and author.casefold() == login.casefold():
-            mine.append((author, c, c.get("body") or "", parse_iso(c.get("createdAt"))))
+            mine.append((author, c, body, when))
+            if question:
+                asked.append(when)
+        elif author and author.casefold() in BOT_LOGINS and question and MARKER in body:
+            asked.append(when)
     if args.since is None:
-        asked = [when for _, _, body, when in mine if when is not None and body.lstrip().startswith(NEEDS_INPUT)]
         since = max(asked) if asked else parse_iso((read_cache(repo, args.number) or {}).get("fetched_at"))
     out = []
     for author, c, body, when in mine:
