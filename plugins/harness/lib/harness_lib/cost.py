@@ -63,9 +63,10 @@ def _mentions(path, needle):
 
 
 def _message(m):
-    """A transcript message with its times parsed: {"id", "model", "start", "end", "usage"}."""
-    return {"id": m["id"], "model": m["model"] or "unknown", "start": parse_iso(m["start"]),
-            "end": parse_iso(m["end"]), "usage": dict(m["usage"])}
+    """A transcript message with its times parsed: {"id", "model", "segment", "start", "end",
+    "usage"}."""
+    return {"id": m["id"], "model": m["model"] or "unknown", "segment": m["segment"],
+            "start": parse_iso(m["start"]), "end": parse_iso(m["end"]), "usage": dict(m["usage"])}
 
 
 def _merge(kept, other):
@@ -81,15 +82,16 @@ def _merge(kept, other):
 def _attribute(number, found):
     """The ticket, stage and round decision, in one place: which of `found`'s sessions (from
     transcripts.sessions) are N's own, which orchestrator messages and subagents count for N,
-    each one's stage and round. Returns (entries, sessions): entries [(stage, round, agent,
-    message)] with each message id once, and {session id: {"own", "cost_state", "cost"}} for
-    each session that is N's own or holds a message counted for N (cost: an own session's
-    cost-state, else None).
+    each one's stage and round. A continued subagent is split at the coordinator's entries into
+    segments and each segment is a round of its own (see fix and rounds below). Returns
+    (entries, sessions): entries [(stage, round, agent, message)] with each message id once, and
+    {session id: {"own", "cost_state", "cost"}} for each session that is N's own or holds a
+    message counted for N (cost: an own session's cost-state, else None).
 
     Speed: a main transcript whose text has no `t/N-` is not parsed (it can be neither N's own
     nor hold N's orchestrator messages), and a subagent is parsed only when it counts for N."""
     pattern = re.compile(rf"t/{number}-")
-    units = []         # [session id, key, stage, agent, messages]; key None for the orchestrator
+    units = []         # [session id, key, stage, agent, messages, named]; key None: orchestrator
     info = {}
     for s in found:
         own, cost, orchestrator, before = False, None, [], len(units)
@@ -101,7 +103,7 @@ def _attribute(number, found):
             orchestrator = [_message(m) for m in main["messages"]
                             if own or (m["branch"] is not None and pattern.match(m["branch"]))]
         if orchestrator:
-            units.append([s["id"], None, "orchestrator", "main", orchestrator])
+            units.append([s["id"], None, "orchestrator", "main", orchestrator, False])
         for a in s["agents"]:
             ticket, word = _description(a["meta"])
             if ticket is None:
@@ -114,7 +116,7 @@ def _attribute(number, found):
             agent = a["meta"].get("agentType")
             agent = agent if isinstance(agent, str) and agent else "unknown"
             stage = word if word in STAGE_WORDS else TYPE_STAGES.get(agent.rsplit(":", 1)[-1], "other")
-            units.append([s["id"], a["path"], stage, agent, messages])
+            units.append([s["id"], a["path"], stage, agent, messages, word in STAGE_WORDS])
         if own or len(units) > before:
             known = info.setdefault(s["id"], {"own": False, "cost_state": None, "cost": None})
             if own and not known["own"]:      # a session id in two folders is listed once
@@ -133,17 +135,43 @@ def _attribute(number, found):
         unit[4] = kept
     units = [u for u in units if u[4]]
 
-    # rounds: one per subagent, numbered within its stage by first start; the orchestrator's is 1
-    def first_start(unit):
-        starts = [m["start"] for m in unit[4] if m["start"] is not None]
-        return (min(starts).timestamp() if starts else float("inf"), unit[0], unit[1])
+    # segments: a subagent's messages split at the coordinator's entries, one part each:
+    # [session id, key, stage, agent, messages, named, segment number, agent's first segment]
+    parts = []
+    for u in units:
+        if u[1] is None:
+            parts.append(u + [0, True])
+            continue
+        by_segment = {}
+        for m in u[4]:
+            by_segment.setdefault(m["segment"], []).append(m)
+        for seg in sorted(by_segment):
+            parts.append(u[:4] + [by_segment[seg], u[5], seg, seg == 1])
 
+    def first_start(part):
+        starts = [m["start"] for m in part[4] if m["start"] is not None]
+        return (min(starts).timestamp() if starts else float("inf"), part[0], part[1] or "", part[6])
+
+    # fix: the ticket's first review is its earliest-starting review segment, in any session.
+    # Every code or review segment starting strictly after that review's last end is a fix
+    # round, except the first segment of an agent whose description names its stage. Tests,
+    # breaker and other segments are never fix, and without a review nothing is.
+    reviews = sorted((p for p in parts if p[2] == "review"), key=first_start)
+    ends = [m["end"] for m in reviews[0][4] if m["end"] is not None] if reviews else []
+    for part in parts:
+        starts = [m["start"] for m in part[4] if m["start"] is not None]
+        if (part[2] in ("code", "review") and starts and ends and min(starts) > max(ends)
+                and not (part[5] and part[7])):
+            part[2] = "fix"
+
+    # rounds: one per segment, numbered within its stage by first start (fix: one sequence across
+    # coder and reviewer); the orchestrator's is 1
     rounds = {}
     for stage in STAGES:
-        agents = sorted((u for u in units if u[2] == stage and u[1] is not None), key=first_start)
-        for n, u in enumerate(agents, 1):
-            rounds[u[1]] = n
-    entries = [(u[2], rounds.get(u[1], 1), u[3], m) for u in units for m in u[4]]
+        segments = sorted((p for p in parts if p[2] == stage and p[1] is not None), key=first_start)
+        for n, p in enumerate(segments, 1):
+            rounds[(p[1], p[6])] = n
+    entries = [(p[2], rounds.get((p[1], p[6]), 1), p[3], m) for p in parts for m in p[4]]
     return entries, info
 
 
