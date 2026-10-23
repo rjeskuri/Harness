@@ -476,8 +476,7 @@ class BranchGuardBashTests(GuardTestCase):
 
     def assertRefusedOnMain(self, reason, part: str, why: str, name="proj") -> None:
         self.assertEqual(
-            reason,
-            f'On main in {name}. Refused "{as_shown(part)}": {why}. {ADVICE}',
+            reason, f'On main in {name}. Refused "{part}": {why}. {ADVICE}'
         )
 
     def test_denies_commands_that_change_main(self):
@@ -2012,7 +2011,7 @@ class TestsFirstTests(GuardTestCase):
 
     def assertRefusedAs(self, reason, part: str, why: str) -> None:
         self.assertIsNotNone(reason, f"{part!r} was allowed")
-        self.assertTrue(reason.startswith(f'Refused "{as_shown(part)}": '), reason)
+        self.assertTrue(reason.startswith(f'Refused "{part}": '), reason)
         self.assertIn(why, reason)
 
     def test_bulk_git_forms_are_refused_to_the_coder_and_breaker(self):
