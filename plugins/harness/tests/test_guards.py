@@ -1617,6 +1617,62 @@ class BranchGuardBashExemptions(GuardTestCase):
             )
         )
 
+    # ---- fix round 2: expanding sources into a directory, run-time joins
+
+    def test_expanding_sources_copied_into_a_directory_refused(self):
+        """Into a directory, each source word names a file there by its basename; a brace,
+        glob or bracket source is expanded by the shell first, so `{keep,x}.log` reaches the
+        tracked keep.log though git calls the literal name ignored."""
+        outside = self.outside
+        for name in ("keep.log", "x.log", "a.log", "b.log", "xa.log"):
+            self.write(outside / name, "from outside\n")
+        for command in (
+            f"cp {outside}/{{keep,x}}.log .",
+            f"cp {outside}/{{keep,x}}.log ./",
+            f"mv {outside}/{{keep,x}}.log .",
+            f"cp {outside}/x[ab].log .",
+            f"cp {outside}/*.log cache/",
+            f"install {outside}/{{a,b}}.log .",
+            f"ln -s {outside}/{{keep,x}}.log .",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        # one plain source into an ignored directory, or onto an ignored name, stays free
+        self.assertAllowed(
+            (
+                f"cp {outside}/notes.md cache/",
+                f"cp {outside}/x.log data/",
+                f"cp {outside}/x.log .",
+            )
+        )
+
+    def test_literal_joined_at_run_time_through_join_or_concat_refused(self):
+        """`.join(` and `.concat(` build a path at run time as `+` does: a literal beside a
+        run-time value in them does not say where the program writes."""
+        repo = self.repo
+        part = "python3 - <<'PY'"
+        for program in (
+            "import os\nopen(''.join([os.getcwd(), '/out.json']), 'w')",
+            # 'out.json' is a bare name and resolves into the repo on its own as well
+            "import os\nopen('/'.join([os.getcwd(), 'out.json']), 'w')",
+        ):
+            with self.subTest(program=program):
+                self.assertRefusedPart(self.bash(heredoc(program), cwd=repo), part)
+        command = (
+            """node -e "require('fs').writeFileSync(process.cwd().concat('/out.json'), 'x')\""""
+        )
+        self.assertRefusedPart(self.bash(command), command)
+        # joins of literals only, and joins that build no path, stay allowed
+        self.assertAllowed(
+            (
+                heredoc("open(''.join(['/private/tmp/x', '/out.json']), 'w')"),
+                heredoc(
+                    "import sys\nnames = sys.argv[1:]\nprint(', '.join(names))\n"
+                    f"open('{OUTSIDE_JSON}', 'w').write('x')"
+                ),
+            )
+        )
+
 
 TEMP_ROOT = os.path.realpath(tempfile.gettempdir())
 

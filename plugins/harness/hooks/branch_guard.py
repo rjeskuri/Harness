@@ -24,7 +24,9 @@ the chain), restored after a subshell or a child shell, and moved for git by -C,
     rule exempts (under docs/agent/, or one git ignores) is allowed for every form, rm,
     truncate and both sides of mv included; a directory holding a tracked file is not
     ignored. The exemption judges what the write reaches: never for a word with an
-    unquoted glob (*, ?, [) or brace expansion, nor for a path whose first component in
+    unquoted glob (*, ?, [) or brace expansion (for cp, mv, ln or install into a
+    directory, the source word that names the file there included), nor for a path
+    whose first component in
     the repo is .git, nor for a spelling that differs in case from a tracked file it
     names (git ls-files with :(icase) says); a symlink is exempt only when the file it
     resolves to is exempt or lies outside every protected main working tree. The
@@ -40,9 +42,12 @@ the chain), restored after a subshell or a child shell, and moved for git by -C,
     with /, ~/, ./ or ../, holding a /, or a bare name with an extension) and every one,
     resolved against the part's directory with ~ expanded, lies outside every protected
     main working tree. A literal joined to a value known only at run time does not
-    count as outside: after + or += with a non-literal before it, an argument of
-    os.path.join or path.join with a non-literal before it, or an f-string or template
-    literal with an interpolation before a /;
+    count as outside: after + or += with a non-literal before it, an argument of any
+    .join( or .concat( call (os.path.join, path.join, str.join, String.concat) with a
+    non-literal argument before it or, for .concat(, a non-literal receiver, or an
+    f-string or template literal with an interpolation before a /. The literal check
+    is a heuristic: a path built at run time in a form it does not recognise is not
+    seen;
   - in every repo, on every branch: a force push (--force, -f, --force-with-lease or a
     +refspec), and a push that names main or master as the destination (main,
     HEAD:main, refs/heads/main, :main), --mirror, --all, or a matching (:) or wildcard
@@ -190,11 +195,12 @@ JS_WRITERS = re.compile(
 # starts with /, ~/, ./ or ../, holds a /, or is a bare file name with an extension.
 STRING_LITERAL = re.compile(r"""(["'`])((?:\\.|(?!\1)[^\\\n])*)\1""")
 BARE_FILE = re.compile(r"[A-Za-z0-9_.-]+[.][A-Za-z0-9]{1,8}$")
-# A path literal joined at run time: after + or +=, an argument of os.path.join or
-# path.join, or an f-string or template literal with an interpolation before a /.
+# A path literal joined at run time: after + or +=, an argument of a .join( or
+# .concat( call, or an f-string or template literal with an interpolation before a /.
 STRING_PREFIX = re.compile(r"(?<![A-Za-z0-9_])[rRbBuUfF]{1,2}$")
-JOIN_CALL = re.compile(r"\b(?:os\.)?path\.join\s*\(")
+JOIN_CALL = re.compile(r"\.(join|concat)\s*\(")
 INTERPOLATION = re.compile(r"\{[^{}]*\}")
+LIST_PUNCTUATION = str.maketrans("", "", ",[]")
 INTERPOLATION_BEFORE_SLASH = re.compile(r"\{[^{}]*\}.*/")
 # What the shell expands in an unquoted word: a glob or a brace expansion. In the
 # unquoted spelling of a word, each quoted or escaped character is a NUL.
@@ -914,8 +920,9 @@ def patch_args(args: list[str]) -> tuple[str | None, str | None, list[str], bool
 
 
 def copy_writes(name: str, args: list[str], cwd: str | None, options: set) -> list:
-    """(destination as written, path written) for cp, install, ln and mv: the
-    destination, or the name each source gets inside it when it is a directory."""
+    """(words as written, path written) for cp, install, ln and mv: the destination,
+    or the name each source gets inside it when it is a directory, with that source
+    word beside the destination, since the name comes from it."""
     target = option_value(args, ("-t", "--target-directory"))
     plain = plain_args(args, options)
     if target is not None:
@@ -933,9 +940,9 @@ def copy_writes(name: str, args: list[str], cwd: str | None, options: set) -> li
     else:
         return []
     if not into:
-        return [(dest, dest)]
+        return [((dest,), dest)]
     return [
-        (dest, os.path.join(dest, os.path.basename(s.rstrip("/")) or s))
+        ((dest, s), os.path.join(dest, os.path.basename(s.rstrip("/")) or s))
         for s in sources
     ]
 
@@ -974,7 +981,9 @@ def edits_in_place(name: str, args: list[str]) -> bool:
 
 def file_writes(name: str, args: list[str], cwd: str | None) -> list:
     """(as written, path, why, exact) for each file `name args` creates, changes or
-    removes; `exact` is False when the path is only the directory the files are in."""
+    removes; `exact` is False when the path is only the directory the files are in.
+    As written is the word, or for cp, mv, ln and install the tuple of words the path
+    comes from."""
 
     def changes(paths: list[str]) -> list:
         return [(p, p, f"{name} changes {p} inside the repo", True) for p in paths]
@@ -1016,8 +1025,9 @@ def file_writes(name: str, args: list[str], cwd: str | None) -> list:
             target = option_value(args, ("-t", "--target-directory"))
             moved = plain if target is not None else plain[:-1]
             found.extend(changes(moved))
-        for dest, path in copy_writes(name, args, cwd, options):
-            found.append((dest, path, f"{name} changes {dest} inside the repo", True))
+        for words, path in copy_writes(name, args, cwd, options):
+            why = f"{name} changes {words[0]} inside the repo"
+            found.append((words, path, why, True))
         return found
     if name == "patch":
         directory, out, files, dry = patch_args(args)
@@ -1187,10 +1197,12 @@ def globbing_words(text: str) -> set[str]:
     return found
 
 
-def expanded(text: str, globbing: set[str]) -> bool:
-    """True when the write target `text` comes from one of the `globbing` words (the
-    word itself, or its end, as in dd's of=)."""
-    return bool(text) and any(word.endswith(text) for word in globbing)
+def expanded(text: str | tuple, globbing: set[str]) -> bool:
+    """True when the write target `text`, a word or the tuple of words it comes from,
+    comes from one of the `globbing` words (the word itself, or its end, as in dd's
+    of=)."""
+    texts = (text,) if isinstance(text, str) else text
+    return any(t and any(word.endswith(t) for word in globbing) for t in texts)
 
 
 def written_exempt(state: dict, path: str, top: Path) -> bool:
@@ -1243,8 +1255,10 @@ def fixed(span: tuple[int, int, str, bool]) -> bool:
 
 def joined_at_run_time(code: str, spans: list, k: int) -> bool:
     """True when the string spans[k] of `code` is joined to a value known only at run
-    time: + or += with a non-literal before it, os.path.join or path.join with a
-    non-literal argument before it, or a template interpolation before a /."""
+    time: + or += with a non-literal before it, an argument of a .join( or .concat(
+    call with a non-literal argument before it or, for .concat(, a non-literal
+    receiver, or a template interpolation before a /. A heuristic: a path built at
+    run time in another form is not seen."""
     start, _, text, template = spans[k]
     if template and INTERPOLATION_BEFORE_SLASH.search(text):
         return True
@@ -1262,6 +1276,10 @@ def joined_at_run_time(code: str, spans: list, k: int) -> bool:
         opened = m.end() - 1
         if not opened < start < closing(code, opened):
             continue
+        if m.group(1) == "concat":
+            receiver = ending.get(len(code[: m.start()].rstrip()))
+            if receiver is None or not fixed(receiver):
+                return True
         rest, j = "", opened + 1
         for span in spans:
             if opened < span[0] < start:
@@ -1270,7 +1288,7 @@ def joined_at_run_time(code: str, spans: list, k: int) -> bool:
                 rest += code[j : span[0]]
                 j = span[1]
         rest += code[j:start]
-        if rest.replace(",", "").strip():
+        if rest.translate(LIST_PUNCTUATION).strip():  # a list of literals is fixed
             return True
     return False
 
