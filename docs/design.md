@@ -138,6 +138,7 @@ Labels (name, color, meaning), created idempotently by `harness-board labels ens
 | size | `size:S` C5DEF5 (one sitting, one or two files), `size:M` BFDADC, `size:L` F9D0C4 (the cap: about 5 files or 300 lines; anything bigger is split) |
 | risk | `risk:low` E6E6E6, `risk:high` B60205 (data loss, money, live systems, security, minors' data) |
 | flags | `no-tests` EDEDED (docs or config only; exempt from tests-first), `needs-local` FEF2C0 (needs this Mac's files or credentials), `priority:high` FF7F0E |
+| autoland | `manual-land` D93F0B (land by hand: autoland skips it), `incident` B60205 (a live check failed; autoland is paused in this repo), `degraded` FBCA04 (a live check is degraded; nothing was reverted), `deploy-frozen` 000000 (deploys are stopped until you clear this) |
 
 Tier rubric, implemented once in `harness-board tier`: `size:S` and `risk:low` and type not `bug` gives `sonnet`; `size:L` or `risk:high` gives `fable`; everything else gives `opus`. Escalation order is sonnet, opus, fable. The review stage has its own rule, `harness-board tier N --stage review`: `fable` for `risk:high`, `opus` for everything else.
 
