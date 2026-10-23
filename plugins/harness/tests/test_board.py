@@ -2322,6 +2322,69 @@ class Answers(BoardTest):
                     comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
         self.assertEqual(self.answers(comments), ["Retry."])
 
+    # The deploy guard's wording is not what anchors: any bot comment that starts with **Needs your input** and carries
+    # the marker does, so these questions share nothing with GUARD beyond the heading.
+    BOT_QUESTIONS = (
+        "**Needs your input**\n\nWhich region should the deploy of #99 target?",
+        "**Needs your input**\n\nrollback finished at 14:02 UTC; keep the old schema or migrate?\n\nReply in a comment.",
+        "**Needs your input**",
+        "**Needs your input**\nok?",
+        "  \n\t**Needs your input**\n\nShould #7 wait for the nightly build?",        # leading whitespace, as the owner path
+        "\n**Needs your input**\n\n¿Qué hacemos con el despliegue?",
+    )
+
+    def test_a_bot_question_anchors_whatever_it_says(self):
+        for question in self.BOT_QUESTIONS:
+            for marker in (MARK, "\n" + MARK.strip(), "\n\n" + MARK.strip() + "\n"):
+                with self.subTest(question=question, marker=marker):
+                    comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                                comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                                comment(self.BOT, "2026-10-13T11:00:00Z", question + marker),
+                                comment("rjeskuri", "2026-10-13T12:00:00Z", "Eu-west."),
+                                comment(self.BOT, "2026-10-13T12:30:00Z", "Deploy finished."),
+                                comment("rjeskuri", "2026-10-13T13:00:00Z", "Then the nightly.")]
+                    self.assertEqual(self.answers(comments), ["Eu-west.", "Then the nightly."])
+
+    def test_the_bot_question_moves_the_anchor_to_its_own_time(self):
+        # the same wording at different times anchors at each time (a constant or the first match cannot pass)
+        question = "**Needs your input**\n\nWhich region should the deploy of #99 target?" + MARK
+        replies = [comment("rjeskuri", f"2026-10-13T{h:02d}:30:00Z", f"reply {h}") for h in (10, 12, 14, 16)]
+        for hour, expected in ((9, ["reply 10", "reply 12", "reply 14", "reply 16"]),
+                               (11, ["reply 12", "reply 14", "reply 16"]), (13, ["reply 14", "reply 16"]),
+                               (15, ["reply 16"]), (17, [])):
+            with self.subTest(hour=hour):
+                comments = replies + [comment(self.BOT, f"2026-10-13T{hour:02d}:00:00Z", question)]
+                self.assertEqual(self.answers(comments), expected)
+
+    def test_the_bot_login_is_compared_case_insensitively(self):
+        for login in ("GitHub-Actions[bot]", "GITHUB-ACTIONS[BOT]", "Github-Actions[Bot]", "GITHUB-ACTIONS",
+                      "GitHub-Actions"):
+            question = f"**Needs your input**\n\nWhich region should {login} deploy to?" + MARK
+            with self.subTest(login=login):
+                comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                            comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                            comment(login, "2026-10-13T11:00:00Z", question),
+                            comment(login, "2026-10-13T11:30:00Z", "Deploy finished."),
+                            comment("rjeskuri", "2026-10-13T12:00:00Z", "Eu-west.")]
+                self.assertEqual(self.answers(comments), ["Eu-west."])
+
+    def test_a_bot_question_without_a_timestamp_does_not_anchor(self):
+        # like an owner question without one: it cannot bound anything
+        question = "**Needs your input**\n\nWhich region should the deploy of #99 target?" + MARK
+        for login in (self.BOT, "github-actions", "GitHub-Actions[bot]"):
+            for missing in ("null", "absent", "empty"):
+                with self.subTest(login=login, createdAt=missing):
+                    bot = comment(login, None, question)
+                    if missing == "absent":
+                        del bot["createdAt"]
+                    elif missing == "empty":
+                        bot["createdAt"] = ""
+                    comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                                comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                                bot,
+                                comment("rjeskuri", "2026-10-13T12:00:00Z", "Eu-west.")]
+                    self.assertEqual(self.answers(comments), ["Use develop.", "Eu-west."])
+
 
 class EpicCheck(BoardTest):
     def check(self, total, completed, state="OPEN"):
