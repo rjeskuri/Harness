@@ -832,6 +832,480 @@ class BranchGuardBashTests(GuardTestCase):
                 self.assertIsNone(self.bash(command))
 
 
+# Ignore rules committed in BranchGuardBashExemptions' repo.
+EXEMPT_GITIGNORE = ".env.local\n.venv\n*.log\ndata/\ncache/\n"
+OUTSIDE_JSON = "/private/tmp/x/out.json"
+
+
+def heredoc(program: str, interpreter: str = "python3 -", tag: str = "PY") -> str:
+    """`interpreter <<'TAG'` reading `program` from a heredoc."""
+    return f"{interpreter} <<'{tag}'\n{program}\n{tag}"
+
+
+class BranchGuardBashExemptions(GuardTestCase):
+    """Bash writes on main are allowed where an Edit would be: under docs/agent/ and on
+    paths git ignores. Inline python and node programs that write are allowed when every
+    path literal in them lies outside every protected main working tree."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # under HOME, so ~/proj/... names the repo
+        self.repo = self.make_repo("home/proj")
+        repo = self.repo
+        self.write(repo / ".gitignore", EXEMPT_GITIGNORE)
+        self.write(repo / "docs/agent/handoff.md", "# Handoff\n")
+        self.write(repo / "docs/design.md", "# Design\n")
+        self.write(repo / "keep.log", "tracked although *.log is ignored\n")
+        self.git(repo, "add", ".gitignore", "docs")
+        self.git(repo, "add", "-f", "keep.log")
+        self.git(repo, "commit", "-q", "-m", "Ignore local files, add notes")
+        # ignored and untracked, as they sit in a working checkout
+        self.write(repo / "data/a.csv", "a,b\n1,2\n")
+        self.write(repo / "cache/blob", "x\n")
+        self.write(repo / ".env.local", "TOKEN_FILE=x\n")
+        self.write(repo / "build.log", "ok\n")
+        (self.home / ".venv").mkdir()
+        self.outside = self.tmp / "outside"
+        self.outside.mkdir()
+        self.write(self.outside / "notes.md", "notes\n")
+        self.write(self.outside / "fix.diff", "")
+        # the tree is still clean apart from ignored files
+        self.assertEqual(self.git(repo, "status", "--porcelain"), "")
+
+    def bash(self, command: str, cwd: Path | None = None, env=None) -> str | None:
+        tool_input = {"command": command, "description": "Run it"}
+        payload = self.payload("Bash", tool_input, cwd or self.repo)
+        return self.decision(self.run_hook("branch_guard.py", payload, env))
+
+    def assertAllowed(self, commands, cwd: Path | None = None) -> None:
+        for command in commands:
+            with self.subTest(command=command, cwd=str(cwd or self.repo)):
+                self.assertIsNone(self.bash(command, cwd=cwd))
+
+    def assertRefusedOnMain(self, reason, part: str, why: str) -> None:
+        self.assertEqual(
+            reason, f'On main in proj. Refused "{part}": {why}. {ADVICE}'
+        )
+
+    def assertRefusedPart(self, reason, part: str) -> None:
+        """Refused on main for `part`, whatever the stated reason."""
+        self.assertIsNotNone(reason)
+        prefix = f'On main in proj. Refused "{part}": '
+        self.assertTrue(reason.startswith(prefix), reason)
+        self.assertTrue(reason.endswith(f". {ADVICE}"), reason)
+
+    # ---- broad: the ticket's cases through the hook
+
+    def test_copy_into_docs_agent_allowed(self):
+        repo, outside = self.repo, self.outside
+        self.assertAllowed(
+            (
+                "cp notes.md docs/agent/handoff.md",
+                f"cp {outside}/notes.md docs/agent/handoff.md",
+                f"cp {outside}/notes.md docs/agent/",
+                f"cp {outside}/notes.md docs/agent/specs/2026-10-23-x.md",
+                f"cp -R {outside} docs/agent/imported",
+                f"cp {outside}/notes.md docs/agent/a.md && cp {outside}/notes.md docs/agent/b.md",
+            )
+        )
+        self.assertAllowed(
+            (
+                f"cp notes.md {repo}/docs/agent/handoff.md",
+                f"cd {repo} && cp {outside}/notes.md docs/agent/handoff.md",
+            ),
+            cwd=outside,
+        )
+        # the same copy anywhere else in the repo stays refused
+        for command, part, why in (
+            (
+                "cp notes.md docs/design.md",
+                "cp notes.md docs/design.md",
+                "cp changes docs/design.md inside the repo",
+            ),
+            (
+                "cp notes.md docs/agentx.md",
+                "cp notes.md docs/agentx.md",
+                "cp changes docs/agentx.md inside the repo",
+            ),
+            (
+                "cp notes.md docs/",
+                "cp notes.md docs/",
+                "cp changes docs/ inside the repo",
+            ),
+            (
+                "cp notes.md docs/agent/a.md && cp notes.md src/app.py",
+                "cp notes.md src/app.py",
+                "cp changes src/app.py inside the repo",
+            ),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(self.bash(command), part, why)
+
+    def test_symlink_onto_ignored_path_allowed(self):
+        self.assertAllowed(
+            (
+                "ln -sfn ../.venv .venv",
+                f"ln -s {self.home}/.venv .venv",
+                f"ln -sf {self.outside}/notes.md build.log",
+                f"ln -s {self.outside}/notes.md docs/agent/linked.md",
+            )
+        )
+        for command, part, why in (
+            (
+                "ln -sfn ../.venv venv",
+                "ln -sfn ../.venv venv",
+                "ln changes venv inside the repo",
+            ),
+            (
+                f"ln -sf {self.outside}/notes.md src/app.py",
+                f"ln -sf {self.outside}/notes.md src/app.py",
+                "ln changes src/app.py inside the repo",
+            ),
+            (
+                f"ln -sf {self.outside}/notes.md keep.log",
+                f"ln -sf {self.outside}/notes.md keep.log",
+                "ln changes keep.log inside the repo",
+            ),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(self.bash(command), part, why)
+
+    def test_redirect_into_ignored_file_allowed(self):
+        self.assertAllowed(
+            (
+                "echo x > .env.local",
+                "echo x >> .env.local",
+                "make check > build.log 2>&1",
+                "make check > logs/today.log",
+                "printf 'a,b\\n' > data/out.csv",
+                "echo note >> docs/agent/handoff.md",
+                "cd src && echo x > ../.env.local",
+            )
+        )
+        self.assertAllowed(
+            (
+                f"echo x > {self.repo}/.env.local",
+                f"echo x > {self.repo}/docs/agent/handoff.md",
+            ),
+            cwd=self.outside,
+        )
+        for command, target in (
+            ("echo x > .env.example", ".env.example"),
+            ("echo x > env.local", "env.local"),
+            ("echo x > docs/design.md", "docs/design.md"),
+            ("echo x > datafile.csv", "datafile.csv"),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(
+                    self.bash(command),
+                    command,
+                    f"it writes to {target} through a redirection",
+                )
+
+    def test_heredoc_writing_only_outside_repos_allowed(self):
+        repo, outside = self.repo, self.outside
+        nested = repo / ".claude/worktrees/t-13-x"
+        self.git(repo, "worktree", "add", "-q", "-b", "t/13-x", str(nested))
+        self.assertAllowed(
+            (
+                # the ticket's case
+                heredoc(
+                    "import json\n"
+                    f"with open('{OUTSIDE_JSON}', 'w') as f:\n"
+                    "    json.dump({'ok': True}, f)"
+                ),
+                heredoc(f"open('{outside}/out.json', 'w').write('x')", "python3"),
+                heredoc(
+                    "from pathlib import Path\n"
+                    f"Path('{outside}/report.txt').write_text('x')"
+                ),
+                # several literals, all outside: one read, two written
+                heredoc(
+                    f"src = open('{outside}/notes.md').read()\n"
+                    f"open('{OUTSIDE_JSON}', 'w').write(src)\n"
+                    f"open('{outside}/copy.md', 'a').write(src)"
+                ),
+                heredoc(
+                    "import shutil\n"
+                    f"shutil.copy('{outside}/notes.md', '/private/tmp/x/notes.md')"
+                ),
+                # ~ and ../ resolve outside the repo
+                heredoc(
+                    "import os\n"
+                    "open(os.path.expanduser('~/elsewhere/out.json'), 'w')"
+                ),
+                heredoc("open('../../outside/rel.json', 'w')"),
+                # a ticket worktree is judged by its own branch
+                heredoc(f"open('{nested}/out.json', 'w').write('x')"),
+            )
+        )
+
+    def test_inline_python_and_node_programs_writing_outside_allowed(self):
+        outside = self.outside
+        self.assertAllowed(
+            (
+                f"""python3 -c "open('{OUTSIDE_JSON}','w').write('x')\"""",
+                f"""python3 -c "open('{outside}/a.txt', 'w')\"""",
+                f"""python3 -c "import shutil; shutil.copy('{outside}/notes.md', '{outside}/b.md')\"""",
+                f"""node -e "require('fs').writeFileSync('{OUTSIDE_JSON}', 'x')\"""",
+                f"""node --eval="require('fs').writeFileSync('{outside}/o.txt', 'x')\"""",
+                heredoc(
+                    f"require('fs').writeFileSync('{OUTSIDE_JSON}', 'x')", "node", "JS"
+                ),
+            )
+        )
+        for command in (
+            """python3 -c "open('./src/app.py','w').write('x')\"""",
+            f"""python3 -c "open('{OUTSIDE_JSON}','w'); open('./src/app.py','w')\"""",
+            """node -e "require('fs').writeFileSync('./src/app.js', 'x')\"""",
+            f"""node -e "require('fs').writeFileSync('{OUTSIDE_JSON}', 'x'); require('fs').writeFileSync('app.js', 'x')\"""",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+
+    def test_deleting_or_moving_ignored_paths_allowed(self):
+        self.assertAllowed(
+            (
+                "rm -rf data",
+                "rm data/a.csv",
+                "mv data/a.csv data/b.csv",
+                "rm -f .env.local build.log",
+                "rm -rf cache .venv",
+                "truncate -s 0 build.log",
+                f"mv .env.local {self.outside}/",
+                f"mv {self.outside}/notes.md data/notes.md",
+                # docs/agent/, tracked or not
+                "rm docs/agent/handoff.md",
+                "rm -rf docs/agent/specs",
+                "mv docs/agent/handoff.md docs/agent/2026-10-23-handoff.md",
+                "mv data/a.csv docs/agent/a.csv",
+            )
+        )
+        for command, why in (
+            ("rm README.md", "rm changes README.md inside the repo"),
+            ("rm -rf src", "rm changes src inside the repo"),
+            ("rm keep.log", "rm changes keep.log inside the repo"),
+            ("rm data/a.csv src/app.py", "rm changes src/app.py inside the repo"),
+            ("rm -f docs/design.md", "rm changes docs/design.md inside the repo"),
+            ("truncate -s 0 keep.log", "truncate changes keep.log inside the repo"),
+            ("mv data/a.csv src/a.csv", "mv changes src/a.csv inside the repo"),
+            ("mv README.md data/", "mv changes README.md inside the repo"),
+            ("mv src/app.py docs/agent/", "mv changes src/app.py inside the repo"),
+            (
+                f"mv docs/design.md {self.outside}/",
+                "mv changes docs/design.md inside the repo",
+            ),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(self.bash(command), command, why)
+
+    def test_heredoc_without_path_literal_still_refused(self):
+        for command, part, why in (
+            (
+                heredoc("import sys\nopen(sys.argv[1], 'w').write('x')"),
+                "python3 - <<'PY'",
+                "python opens a file for writing",
+            ),
+            # the path given on the command line is not a literal in the program
+            (
+                heredoc(
+                    "import sys\nopen(sys.argv[1], 'w').write('x')",
+                    f"python3 - {OUTSIDE_JSON}",
+                ),
+                f"python3 - {OUTSIDE_JSON} <<'PY'",
+                "python opens a file for writing",
+            ),
+            (
+                heredoc("name = 'report'\nopen(name, 'w')"),
+                "python3 - <<'PY'",
+                "python opens a file for writing",
+            ),
+            (
+                heredoc("import os\nos.remove(os.environ['TARGET'])"),
+                "python3 - <<'PY'",
+                "python writes, moves or deletes files",
+            ),
+            (
+                f"""python3 -c "import sys; open(sys.argv[1], 'w')" {OUTSIDE_JSON}""",
+                f"""python3 -c "import sys; open(sys.argv[1], 'w')" {OUTSIDE_JSON}""",
+                "python opens a file for writing",
+            ),
+            (
+                """node -e "require('fs').writeFileSync(process.argv[1], 'x')\"""",
+                """node -e "require('fs').writeFileSync(process.argv[1], 'x')\"""",
+                "node writes, moves or deletes files",
+            ),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(self.bash(command), part, why)
+
+    def test_heredoc_with_a_path_inside_the_repo_refused(self):
+        repo = self.repo
+        part = "python3 - <<'PY'"
+        for program, cwd in (
+            # the ticket's case: one literal outside, one in the repo
+            ("open('/tmp/x', 'w').write('a')\nopen('src/app.py', 'w').write('b')", repo),
+            ("open('/tmp/x', 'w').write('a')\nopen('./src/app.py', 'w').write('b')", repo),
+            (f"open('{OUTSIDE_JSON}', 'w')\nopen('{repo}/src/app.py', 'w')", repo),
+            # relative literals resolve against the directory the part runs in
+            ("open('out.json', 'w')", repo),
+            ("open('out.json', 'w')", repo / "src"),
+            ("open('../app.json', 'w')", repo / "src"),
+            # ~ and ../ that lead back into the repo
+            (
+                f"open('{OUTSIDE_JSON}', 'w')\n"
+                "import os\nopen(os.path.expanduser('~/proj/src/app.py'), 'w')",
+                repo,
+            ),
+            (f"open('{OUTSIDE_JSON}', 'w')\nopen('../proj/src/app.py', 'w')", repo),
+        ):
+            with self.subTest(program=program, cwd=str(cwd)):
+                self.assertRefusedPart(self.bash(heredoc(program), cwd=cwd), part)
+        # the part runs in the repo after cd, though the session is elsewhere
+        command = f"cd {repo} && " + heredoc("open('out.json', 'w').write('x')")
+        self.assertRefusedPart(self.bash(command, cwd=self.outside), part)
+
+    def test_tracked_file_redirect_still_refused(self):
+        for command, part, target in (
+            ("echo x > README.md", "echo x > README.md", "README.md"),
+            ("echo x >> keep.log", "echo x >> keep.log", "keep.log"),
+            ("echo x > .gitignore", "echo x > .gitignore", ".gitignore"),
+            ("echo x > src/app.py", "echo x > src/app.py", "src/app.py"),
+            (
+                "echo x > .env.local && echo y > src/app.py",
+                "echo y > src/app.py",
+                "src/app.py",
+            ),
+            (
+                "echo x > docs/agent/handoff.md; echo y >> README.md",
+                "echo y >> README.md",
+                "README.md",
+            ),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(
+                    self.bash(command),
+                    part,
+                    f"it writes to {target} through a redirection",
+                )
+        target = f"{self.repo}/README.md"
+        self.assertRefusedOnMain(
+            self.bash(f"echo x > {target}", cwd=self.outside),
+            f"echo x > {target}",
+            f"it writes to {target} through a redirection",
+        )
+
+    # ---- specific: each write form, exempt target against tracked target
+
+    def test_each_write_form_follows_the_exemptions(self):
+        outside = self.outside
+        for allowed, refused, part, why in (
+            (
+                "ls | tee build.log",
+                "ls | tee README.md",
+                "tee README.md",
+                "tee changes README.md inside the repo",
+            ),
+            (
+                "ls | tee -a docs/agent/handoff.md",
+                "ls | tee -a src/app.py",
+                "tee -a src/app.py",
+                "tee changes src/app.py inside the repo",
+            ),
+            (
+                f"install -m 644 {outside}/notes.md docs/agent/notes.md",
+                f"install -m 644 {outside}/notes.md src/app.py",
+                f"install -m 644 {outside}/notes.md src/app.py",
+                "install changes src/app.py inside the repo",
+            ),
+            (
+                f"rsync -a {outside}/ cache/",
+                f"rsync -a {outside}/ src/",
+                f"rsync -a {outside}/ src/",
+                "rsync changes src/ inside the repo",
+            ),
+            (
+                "dd if=/dev/zero of=data/blob.bin count=1",
+                "dd if=/dev/zero of=README.md count=1",
+                "dd if=/dev/zero of=README.md count=1",
+                "dd changes README.md inside the repo",
+            ),
+            (
+                "touch .env.local docs/agent/new.md",
+                "touch .env.local src/new.py",
+                "touch .env.local src/new.py",
+                "touch changes src/new.py inside the repo",
+            ),
+            (
+                "chmod 600 .env.local",
+                "chmod 600 src/app.py",
+                "chmod 600 src/app.py",
+                "chmod changes src/app.py inside the repo",
+            ),
+            (
+                "sed -i '' 's/x/y/' .env.local",
+                "sed -i '' 's/x/y/' README.md",
+                "sed -i '' 's/x/y/' README.md",
+                "sed -i edits files in place",
+            ),
+            (
+                "perl -pi -e 's/x/y/' docs/agent/handoff.md",
+                "perl -pi -e 's/x/y/' docs/design.md",
+                "perl -pi -e 's/x/y/' docs/design.md",
+                "perl -i edits files in place",
+            ),
+            (
+                "awk -i inplace 1 build.log",
+                "awk -i inplace 1 keep.log",
+                "awk -i inplace 1 keep.log",
+                "awk -i inplace edits files in place",
+            ),
+            (
+                "printf '1d\\nw\\n' | ed -s docs/agent/handoff.md",
+                "printf '1d\\nw\\n' | ed -s README.md",
+                "ed -s README.md",
+                "ed changes README.md inside the repo",
+            ),
+            (
+                f"patch docs/agent/handoff.md {outside}/fix.diff",
+                f"patch src/app.py {outside}/fix.diff",
+                f"patch src/app.py {outside}/fix.diff",
+                "patch changes src/app.py inside the repo",
+            ),
+            (
+                f"cp {outside}/notes.md data/",
+                f"cp {outside}/notes.md src/",
+                f"cp {outside}/notes.md src/",
+                "cp changes src/ inside the repo",
+            ),
+        ):
+            with self.subTest(command=allowed):
+                self.assertIsNone(self.bash(allowed))
+            with self.subTest(command=refused):
+                self.assertRefusedOnMain(self.bash(refused), part, why)
+
+    def test_exempt_writes_do_not_cover_git_on_main(self):
+        for command, part, why in (
+            (
+                "echo x > .env.local && git commit -am x",
+                "git commit -am x",
+                "git commit changes main",
+            ),
+            (
+                "cp notes.md docs/agent/handoff.md && git push",
+                "git push",
+                "git push without a refspec pushes main",
+            ),
+            (
+                "rm -rf data && git reset --hard HEAD~1",
+                "git reset --hard HEAD~1",
+                "git reset changes main",
+            ),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(self.bash(command), part, why)
+
+
 TEMP_ROOT = os.path.realpath(tempfile.gettempdir())
 
 
