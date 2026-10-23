@@ -39,6 +39,7 @@ try:
     from harness_lib.notify import notify
     from harness_lib.paths import canonical_path, path_key, repo_key, same_entry
     from harness_lib.registry import load_registry
+    from harness_lib.repo import worktree_entries
     from harness_lib.text import (age_text, first_line, harness_home, home, parse_iso_seconds, read_json,
                                   same_path)
 except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
@@ -100,32 +101,20 @@ def question(comments):
     return next((clip(line.strip()) for line in rest.splitlines() if line.strip()), None)
 
 
-def worktrees(path, deadline):
-    """[{"path", "branch", "head"}] from `git worktree list --porcelain`; the main working tree first."""
-    out = git(path, ["worktree", "list", "--porcelain"], deadline)
-    if out.returncode != 0:
-        raise Problem(f"git worktree list failed: {first_line(out.stderr) or f'exit {out.returncode}'}")
-    found, current = [], None
-    for line in out.stdout.splitlines():
-        if line.startswith("worktree "):
-            current = {"path": line[len("worktree "):], "branch": None, "head": None}
-            found.append(current)
-        elif current is not None and line.startswith("HEAD "):
-            current["head"] = line[len("HEAD "):].strip()
-        elif current is not None and line.startswith("branch "):
-            ref = line[len("branch "):].strip()
-            current["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
-    return found
-
-
 def old_worktrees(path, now, deadline):
     """Worktrees under .claude/worktrees/ whose last commit is older than STALE_DAYS (open PRs not checked)."""
-    found = worktrees(path, deadline)
+    def listing(cwd, *args):
+        done = git(cwd, list(args), deadline)
+        if done.returncode != 0:
+            raise Problem(f"git worktree list failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
+        return done.stdout
+
+    found = worktree_entries(path, listing)
     out = []
     for w in found[1:]:
-        if "/.claude/worktrees/" not in w["path"].replace(os.sep, "/"):
+        if "/.claude/worktrees/" not in w.path.replace(os.sep, "/"):
             continue
-        ref = w["head"] or w["branch"]
+        ref = w.head or w.branch
         if not ref:
             continue
         log = git(path, ["log", "-1", "--format=%ct", ref], deadline)
@@ -133,8 +122,8 @@ def old_worktrees(path, now, deadline):
         if log.returncode != 0 or not when.isdigit():
             continue
         if now - int(when) > STALE_DAYS * 86400:
-            out.append({"path": w["path"], "relative": os.path.relpath(w["path"], found[0]["path"]),
-                        "branch": w["branch"], "last_commit": {"time": iso(int(when)), "age": age_text(int(when), now)}})
+            out.append({"path": w.path, "relative": os.path.relpath(w.path, found[0].path),
+                        "branch": w.branch, "last_commit": {"time": iso(int(when)), "age": age_text(int(when), now)}})
     return out
 
 
