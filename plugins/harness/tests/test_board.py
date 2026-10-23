@@ -2304,14 +2304,68 @@ class Answers(BoardTest):
                             comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
                 self.assertEqual(self.answers(comments), ["Use develop.", "Retry."])
 
+    # Only the Actions app may anchor: exactly `github-actions` (GraphQL) or `github-actions[bot]` (REST), any case.
+    # Each near miss below posts a marked, well-formed, timestamped question and must leave the owner's anchor alone;
+    # a prefix, split-on-"[" or "starts with github-actions[" match lets several of them through.
+    NEAR_MISS_LOGINS = (
+        "someone", "dependabot[bot]", "github-actions-fake[bot]", "not-github-actions[bot]",
+        "github-actions[app]", "GitHub-Actions[App]", "github-actions[x]", "github-actions[evil", "github-actions[bot",
+        "github-actions[bot]x", "github-actions[bot][bot]", "github-actions[bot]]", "github-actions bot",
+        "github-actions[]", "github-actions[", "github-actionsbot", "github-actions-bot", "xgithub-actions",
+        "xgithub-actions[bot]", "github-actionsx", "github-action", "github-action[bot]", "github", "actions[bot]",
+        "[bot]", "bot", "github-actions[bot] [bot]", "github_actions[bot]", "github-actions[[bot]]",
+    )
+
     def test_a_third_party_question_does_not_anchor(self):
-        for login in ("someone", "dependabot[bot]", "github-actions-fake[bot]", "not-github-actions[bot]"):
+        for login in self.NEAR_MISS_LOGINS:
+            question = f"**Needs your input**\n\nWhich region should {login} deploy to?" + MARK
             with self.subTest(login=login):
                 comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
                             comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
                             comment(login, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                            comment(login, "2026-10-13T11:15:00Z", question),
                             comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
                 self.assertEqual(self.answers(comments), ["Use develop.", "Retry."])
+
+    def test_a_near_miss_login_cannot_anchor_even_as_the_only_question(self):
+        # no owner question to fall back on: the cache bounds it, else nothing does
+        for login in self.NEAR_MISS_LOGINS:
+            with self.subTest(login=login):
+                comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", "early thought"),
+                            comment(login, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                            comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+                self.assertEqual(self.answers(comments), ["early thought", "Retry."])
+
+    # "Carries the marker" is `<!-- harness -->` anywhere in the body, as by_harness() reads it, not only as the last
+    # line; the heading must still open the body.
+    def test_a_bot_question_with_the_marker_anywhere_anchors(self):
+        for body in ("**Needs your input** <!-- harness -->\n\nWhich region should the deploy of #99 target?",
+                     "**Needs your input**<!-- harness -->",
+                     "**Needs your input**\n<!-- harness -->\nWhich region should the deploy of #99 target?",
+                     "**Needs your input**\n\nWhich region <!-- harness --> should the deploy of #99 target?",
+                     "**Needs your input**\n\nWhich region?\n\n<!-- harness -->\n\nReply in a comment.",
+                     "**Needs your input**\n\nWhich region?<!-- harness -->",
+                     "**Needs your input**\n\nWhich region?\n\n<!-- harness -->\n<!-- harness -->"):
+            for login in (self.BOT, "github-actions"):
+                with self.subTest(body=body, login=login):
+                    comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                                comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                                comment(login, "2026-10-13T11:00:00Z", body),
+                                comment("rjeskuri", "2026-10-13T12:00:00Z", "Eu-west.")]
+                    self.assertEqual(self.answers(comments), ["Eu-west."])
+
+    def test_a_bot_question_with_a_near_miss_marker_does_not_anchor(self):
+        for marker in ("<!--harness-->", "<!-- harness-review -->", "<!-- Harness -->", "<!-- HARNESS -->",
+                       "<!--  harness  -->", "<!-- harness- -->", "<!-- harness", "harness -->", "<! -- harness -->",
+                       "&lt;!-- harness --&gt;", "<!-- harness --", "!-- harness -->", "<-- harness -->", "harness"):
+            self.assertNotIn("<!-- harness -->", marker)                 # a near miss, not the marker inside
+            for body in (self.GUARD + "\n\n" + marker, "**Needs your input** " + marker + "\n\nWhich region?"):
+                with self.subTest(body=body):
+                    comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                                comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                                comment(self.BOT, "2026-10-13T11:00:00Z", body),
+                                comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+                    self.assertEqual(self.answers(comments), ["Use develop.", "Retry."])
 
     def test_gh_graphql_reports_the_app_as_github_actions_without_the_suffix(self):
         # `gh issue view --json comments` is GraphQL, whose login for the Actions app has no [bot] suffix
