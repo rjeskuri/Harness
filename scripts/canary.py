@@ -261,16 +261,22 @@ def hook_cases(repo: str) -> list:
 # ---------- the checks ----------
 
 
+def bin_tools(plugin: str) -> list:
+    """The regular files in bin/; a dotfile (a Finder .DS_Store, an AppleDouble ._ file) is not a tool."""
+    bin_dir = os.path.join(plugin, "bin")
+    return [os.path.join(bin_dir, name) for name in sorted(os.listdir(bin_dir))
+            if not name.startswith(".") and os.path.isfile(os.path.join(bin_dir, name))]
+
+
 def plugin_files(plugin: str) -> list:
-    """Every .py under hooks/ and lib/ and every file in bin/, relative to the plugin."""
+    """Every .py under hooks/ and lib/ and every file in bin/, relative to the plugin, dotfiles skipped."""
     found = []
     for top in ("hooks", "lib"):
         for folder, dirs, files in os.walk(os.path.join(plugin, top)):
-            dirs[:] = sorted(d for d in dirs if d != "__pycache__")
-            found += [os.path.join(folder, name) for name in sorted(files) if name.endswith(".py")]
-    bin_dir = os.path.join(plugin, "bin")
-    found += [os.path.join(bin_dir, name) for name in sorted(os.listdir(bin_dir))
-              if os.path.isfile(os.path.join(bin_dir, name))]
+            dirs[:] = sorted(d for d in dirs if d != "__pycache__" and not d.startswith("."))
+            found += [os.path.join(folder, name) for name in sorted(files)
+                      if name.endswith(".py") and not name.startswith(".")]
+    found += bin_tools(plugin)
     return [os.path.relpath(path, plugin) for path in found]
 
 
@@ -317,11 +323,8 @@ def check_hooks(report: Report, box: Sandbox, plugin: str) -> None:
 
 
 def check_tools(report: Report, box: Sandbox, plugin: str) -> None:
-    bin_dir = os.path.join(plugin, "bin")
-    for name in sorted(os.listdir(bin_dir)):
-        path = os.path.join(bin_dir, name)
-        if not os.path.isfile(path):
-            continue
+    for path in bin_tools(plugin):
+        name = os.path.basename(path)
         code, out, err = run([box.python, path, "--help"], box.work, box.env(), TOOL_TIMEOUT)
         if code is None:
             why = f"timed out after {TOOL_TIMEOUT} s"

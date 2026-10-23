@@ -22,9 +22,9 @@ break uses (the module, the function, the word it compares) is spelled by an exp
 and key, exit codes and sleeps are random, and several breaks leave the hook or tool file untouched (hookio.py's
 deny becomes a no-op, gh.py exits when run as a harness-* tool, readonly_bash's guarded agent set loses the
 reviewer). The copy with harmless edits carries the same shapes with the opposite outcome (the same guard behind
-a condition that is true, the same exit behind one that is false, a 7-8 s sleep inside the 10 s a hook gets) and
+a condition that is true, the same exit behind one that is false, a 6-7 s sleep inside the 10 s a hook gets) and
 the literal text of earlier fixtures in dead code, so matching text fails that copy. A hook that sleeps 11-12 s
-must time out: with the 7-8 s sleep passing, the limit is 10 s, not 5 or 15. When /usr/bin/python3 is older than
+must time out: with the 6-7 s sleep passing, the limit is 10 s, not 5 or 15. When /usr/bin/python3 is older than
 3.10, a lib module with a `match` statement must fail the compile (the 3.9 floor), although the python3 on PATH
 may accept it.
 
@@ -48,6 +48,12 @@ in parallel. Each test asserts on its scenario's result.
 
 The temp HOME and TMPDIR the ticket gives the hooks show in one place: after_edit writes its session state under
 $TMPDIR/claude-harness/, so that directory must not appear at the top of the TMPDIR the canary itself was given.
+The canary's own temporary directory goes under that TMPDIR too, and it removes it: the TMPDIR is empty again
+after every run.
+
+Files the Mac leaves in a plugin are not part of it: a copy with a Finder .DS_Store and AppleDouble ._ files
+(binary, null bytes, which python3 refuses to compile or run) in bin/, hooks/ and lib/ passes the same checks as
+the checkout.
 """
 from __future__ import annotations
 
@@ -355,12 +361,19 @@ def run_canary(plugin=None, watch_repo=False):
 
 
 def plugin_copy(edits):
-    """A copy of plugins/harness with `edits` applied: {relative path: edit or [edits]}, where an edit is
-    (old text, new text) replacing the one occurrence of old, or ("", text) appending text."""
+    """A copy of plugins/harness with `edits` applied: {relative path: edit or [edits] or bytes}, where an edit
+    is (old text, new text) replacing the one occurrence of old, or ("", text) appending text, and bytes are the
+    whole content of a new file."""
     root = os.path.join(scratch("canary-plugin-"), "harness")
     shutil.copytree(PLUGIN, root, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"), symlinks=True)
     for rel, change in edits.items():
         path = os.path.join(root, rel)
+        if isinstance(change, bytes):
+            if os.path.exists(path):
+                raise AssertionError(f"test fixture: {rel} already exists")
+            with open(path, "wb") as fh:
+                fh.write(change)
+            continue
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
         for old, new in change if isinstance(change, list) else [change]:
@@ -392,6 +405,26 @@ def system_python_below_310():
 
 
 FLOOR_APPLIES = system_python_below_310()
+
+
+def finder_file(magic):
+    """Binary content as the Finder writes it: its magic header, null bytes, random bytes."""
+    return magic + b"\x00" * _RNG.randint(8, 64) + os.urandom(_RNG.randint(64, 512)) + b"\x00\x00"
+
+
+DS_STORE = b"\x00\x00\x00\x01Bud1"
+APPLE_DOUBLE = b"\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        "
+# A .DS_Store in each folder the canary walks, and the AppleDouble ._ companion of a tool, a hook and a lib
+# module (the hook's and the module's names end in .py).
+FINDER_FILES = {
+    "bin/.DS_Store": finder_file(DS_STORE),
+    "bin/._harness-pr": finder_file(APPLE_DOUBLE),
+    "hooks/.DS_Store": finder_file(DS_STORE),
+    "hooks/._branch_guard.py": finder_file(APPLE_DOUBLE),
+    "lib/.DS_Store": finder_file(DS_STORE),
+    "lib/harness_lib/.DS_Store": finder_file(DS_STORE),
+    "lib/harness_lib/._cli.py": finder_file(APPLE_DOUBLE),
+}
 EDIT_CHECK = "        check_edit(data, cwd)\n"
 BASH_BRANCH = '    elif tool == "Bash":\n'
 
@@ -498,7 +531,7 @@ SCENARIOS = {
         ],
         "hooks/after_edit.py": [
             # inside the 10 s a hook gets, and over a 5 s limit
-            first_in_main(f"    {call('time', 'sleep', round(_RNG.uniform(7, 8), 1))}\n"),
+            first_in_main(f"    {call('time', 'sleep', round(_RNG.uniform(6, 7), 1))}\n"),
             before_dunder_main(DEAD_LITERALS),
         ],
         "hooks/verify_on_stop.py": [
@@ -521,6 +554,8 @@ SCENARIOS = {
         "bin/harness-pr": (FUTURE, FUTURE + f"if {falsy()}:\n    {call('sys', 'exit', exit_code())}\n"),
         "lib/harness_lib/cli.py": ("", COMMENT + "_CANARY = 'not broken at import'\n"),
     },
+    # Files the Mac leaves behind, binary with null bytes: not part of the plugin, nothing changes.
+    "Finder files": dict(FINDER_FILES),
     "syntax error in a hook and a lib module": {
         "hooks/after_edit.py": ("", SYNTAX_ERROR),
         "lib/harness_lib/registry.py": ("", SYNTAX_ERROR),
@@ -666,6 +701,16 @@ class Canary(unittest.TestCase):
         self.assert_passes_everything(run)
         self.assertEqual(len(run.ok_lines()), len(self.result("checkout").ok_lines()), run.describe())
 
+    def test_files_the_finder_leaves_are_not_checked(self):
+        # A .DS_Store and AppleDouble ._ files, null bytes in each, in bin/, hooks/ and lib/: not plugin files, so
+        # nothing compiles or runs them, and the copy passes the same checks as the checkout.
+        run = self.result("Finder files")
+        self.assert_passes_everything(run)
+        self.assertEqual(len(run.ok_lines()), len(self.result("checkout").ok_lines()), run.describe())
+        for rel in FINDER_FILES:
+            with self.subTest(file=rel):
+                self.assertNotIn(os.path.basename(rel), run.output, f"the canary looked at {rel}\n{run.describe()}")
+
     def test_writes_nothing_outside_its_temp_directories(self):
         for name, run in _RESULTS.items():
             # only a run that got as far as its checks proves anything about what it writes
@@ -682,6 +727,11 @@ class Canary(unittest.TestCase):
                 self.assertFalse(
                     os.path.exists(os.path.join(run.tmp, "claude-harness")),
                     f"the hooks wrote into the canary's TMPDIR: they did not get a temp TMPDIR\n{run.describe()}",
+                )
+            # the canary's own temporary directory lives under the TMPDIR it was given, and is removed
+            with self.subTest(scenario=name, emptied="TMPDIR"):
+                self.assertEqual(
+                    sorted(os.listdir(run.tmp)), [], f"the canary left files in its TMPDIR\n{run.describe()}"
                 )
 
     def test_a_missing_plugin_is_a_big_failure(self):
@@ -762,7 +812,7 @@ class Canary(unittest.TestCase):
             self.assertTrue(names(ok, tool), f"{tool} should still pass\n{run.describe()}")
 
     def test_hook_timeout_is_the_ten_seconds_hooks_get(self):
-        # after_edit sleeping 11-12 s fails its case (hooks broken at runtime); sleeping 7-8 s passes (harmless
+        # after_edit sleeping 11-12 s fails its case (hooks broken at runtime); sleeping 6-7 s passes (harmless
         # edits, which pass every check): a limit of 5 s fails the second, one of 15 s passes the first. The
         # timed-out run still ends well inside the module's own limit.
         self.assert_fewer_ok(self.result("hooks broken at runtime"), "after_edit", 1)
