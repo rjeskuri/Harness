@@ -3,14 +3,16 @@ exclude line, the worktree setup, .worktreeinclude copies, refusals), attempt's 
 needs-input sequence, dispatch (dry-run plan, bg on the subscription by default whatever the api budget says,
 --venue headless billed through apiKeyHelper and refused while the api budget is exhausted, re-dispatch of a run
 that ended without a PR), runs --sweep's outcome
-classification and the budget it marks, budget status, exhaust and reset, worktrees and worktree remove.
+classification and the budget it marks, the sweep stopping the bg session of a ticket that is in review, needs input or
+closed (#123), budget status, exhaust and reset, worktrees and worktree remove.
 
     python3 -m unittest discover -s plugins/harness/tests -v
 
 Each test has a temporary HOME, a bare `origin` and a clone of it (`proj`, the main checkout) made with
 real git. A `fakebin` folder holds `gh` (a wrapper around fakegh.py) and `claude` (a fake that logs its
 argv, cwd and environment, answers `agents --json` from $FAKECLAUDE_AGENTS, prints `backgrounded · abc123`
-for --bg, and for -p sleeps briefly, then prints a canned JSON result). harness-board is the real one,
+for --bg, answers `stop <id>` with exit 0, or exit 1 for an id listed in $FAKECLAUDE_STOP_FAIL (comma-separated),
+and for -p sleeps briefly, then prints a canned JSON result). harness-board is the real one,
 found next to harness-work. The fake executables are written once for the module: macOS checks a new
 executable on its first run, which costs about half a second each time.
 """
@@ -75,6 +77,17 @@ if log:
         fh.write(json.dumps({{"argv": argv, "cwd": os.getcwd(), "env": dict(os.environ)}}) + "\\n")
 if argv[:1] == ["agents"]:
     sys.stdout.write(os.environ.get("FAKECLAUDE_AGENTS", "[]"))
+    sys.exit(0)
+if argv[:1] == ["stop"]:
+    failing = [x for x in os.environ.get("FAKECLAUDE_STOP_FAIL", "").split(",") if x]
+    named = [a for a in argv[1:] if not a.startswith("-")]
+    if not named:
+        sys.stderr.write("error: missing session id\\n")
+        sys.exit(2)
+    if any(a in failing for a in named):
+        sys.stderr.write("Error: could not stop background session " + named[0] + ": supervisor not reachable\\n")
+        sys.exit(1)
+    print("Stopped " + named[0])
     sys.exit(0)
 if "--bg" in argv:
     print("backgrounded \\u00b7 " + os.environ.get("FAKECLAUDE_BG_ID", "abc123") + " \\u00b7 " + argv[argv.index("-n") + 1])
@@ -1241,6 +1254,229 @@ class Dispatch(WorkTest):
 
 
 IN_PROGRESS = ("task", "status:in-progress", "size:S", "risk:low")
+
+
+class DispatchDefaultMax(WorkTest):
+    """Ticket #130: `harness-work dispatch` without `--max` allows ten live runs at once (it was three)."""
+
+    def board(self, count):
+        numbers = list(range(12, 12 + count))
+        self.scenario(issues=[issue(n, title=f"Ticket {n}") for n in numbers],
+                      ready=[ready_row(n, f"Ticket {n}") for n in numbers])
+        return numbers
+
+    def sleeper(self, ticket):
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"/harness:work {ticket}"])
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        return live.pid
+
+    def test_dry_run_without_max_plans_ten_and_skips_the_rest_over_max_ten(self):
+        for count in (12, 15):
+            with self.subTest(ready=count):
+                numbers = self.board(count)
+                p = self.ok("dispatch", "--dry-run")
+                self.assertIn("Dry run: venue bg, 0 live, 10 of 10 slots free.", p.stdout)
+                starts = [ln for ln in p.stdout.splitlines() if ln.startswith("would start #")]
+                self.assertEqual(len(starts), 10, p.stdout)
+                for n in numbers[:10]:
+                    self.assertIn(f"would start #{n} Ticket {n} (tier sonnet) and launch bg", p.stdout.splitlines())
+                for n in numbers[10:]:
+                    self.assertIn(f"skip #{n}: over --max 10", p.stdout.splitlines())
+                data = self.ok_json("dispatch", "--dry-run", "--json")
+                self.assertEqual([row["number"] for row in data["plan"]], numbers[:10])
+                self.assertEqual([(s["number"], s["why"]) for s in data["skipped"]],
+                                 [(n, "over --max 10") for n in numbers[10:]])
+                self.assertEqual(self.claude_calls(), [])
+
+    def test_dry_run_with_ten_or_fewer_ready_tickets_plans_them_all_with_nothing_skipped(self):
+        for count in (4, 10):                       # four is past the old default of three
+            with self.subTest(ready=count):
+                numbers = self.board(count)
+                data = self.ok_json("dispatch", "--dry-run", "--json")
+                self.assertEqual([row["number"] for row in data["plan"]], numbers)
+                self.assertEqual(data["skipped"], [])
+                self.assertNotIn("skip #", self.ok("dispatch", "--dry-run").stdout)
+
+    def test_the_free_slots_are_ten_minus_the_live_runs(self):
+        for live_count in (1, 4):
+            with self.subTest(live=live_count):
+                if os.path.isdir(self.runs_dir()):
+                    shutil.rmtree(self.runs_dir())
+                live_numbers = list(range(40, 40 + live_count))
+                for n in live_numbers:
+                    self.write_run(n, pid=self.sleeper(n))
+                numbers = list(range(12, 24))
+                self.scenario(issues=[issue(n, title=f"Ticket {n}") for n in numbers + live_numbers],
+                              ready=[ready_row(n, f"Ticket {n}") for n in numbers])
+                free = 10 - live_count
+                p = self.ok("dispatch", "--dry-run")
+                self.assertIn(f"Dry run: venue bg, {live_count} live, {free} of 10 slots free.", p.stdout)
+                starts = [ln for ln in p.stdout.splitlines() if ln.startswith("would start #")]
+                self.assertEqual(len(starts), free, p.stdout)
+                data = self.ok_json("dispatch", "--dry-run", "--json")
+                self.assertEqual([row["number"] for row in data["plan"]], numbers[:free])
+                self.assertEqual([s["number"] for s in data["skipped"]], numbers[free:])
+                self.assertTrue(all(s["why"] == "over --max 10" for s in data["skipped"]))
+
+    def test_ten_live_runs_fill_the_default_cap(self):
+        for n in range(40, 50):
+            self.write_run(n, pid=self.sleeper(n))
+        self.scenario(issues=[issue(12), issue(13)], ready=[ready_row(12), ready_row(13, "Second")])
+        p = self.ok("dispatch")
+        self.assertIn("10 live runs; --max 10 reached, nothing launched.", p.stdout)
+        self.assertEqual(self.claude_calls(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+
+    def test_a_real_dispatch_without_max_launches_ten_of_twelve(self):
+        numbers = self.board(12)
+        p = self.ok("dispatch", env=self.env(FAKECLAUDE_BG_ID="ten123", **CREDENTIALS))
+        for n in numbers[:10]:
+            self.assertRegex(p.stdout, rf"(?m)^#{n} bg on t/{n}-\S+ \(id ten123\)$")
+        for n in numbers[10:]:
+            self.assertNotRegex(p.stdout, rf"(?m)^#{n} bg on")
+        self.assertEqual(sorted(c["argv"][-1] for c in self.claude_calls()),
+                         sorted(f"/harness:work {n}" for n in numbers[:10]))
+        self.assertEqual(len([r for r in self.run_records() if r["venue"] == "bg"]), 10)
+
+    def test_a_real_dispatch_without_max_and_four_live_runs_launches_six(self):
+        for n in range(40, 44):
+            self.write_run(n, pid=self.sleeper(n))
+        numbers = list(range(12, 24))
+        self.scenario(issues=[issue(n, title=f"Ticket {n}") for n in numbers],
+                      ready=[ready_row(n, f"Ticket {n}") for n in numbers])
+        self.ok("dispatch", env=self.env(**CREDENTIALS))
+        self.assertEqual(sorted(c["argv"][-1] for c in self.claude_calls()),
+                         sorted(f"/harness:work {n}" for n in numbers[:6]))
+
+    def test_an_explicit_max_still_overrides_the_default(self):
+        # 3 is the old default and 10 the new one: an explicit value equal to either must be honored as given.
+        for most in (2, 3, 5, 10, 12):
+            with self.subTest(max=most):
+                numbers = self.board(12)
+                p = self.ok("dispatch", "--dry-run", "--max", str(most))
+                self.assertIn(f"Dry run: venue bg, 0 live, {most} of {most} slots free.", p.stdout)
+                starts = [ln for ln in p.stdout.splitlines() if ln.startswith("would start #")]
+                self.assertEqual(len(starts), most, p.stdout)
+                for n in numbers[most:]:
+                    self.assertIn(f"skip #{n}: over --max {most}", p.stdout.splitlines())
+                data = self.ok_json("dispatch", "--dry-run", "--max", str(most), "--json")
+                self.assertEqual([row["number"] for row in data["plan"]], numbers[:most])
+                self.assertEqual([s["why"] for s in data["skipped"]], [f"over --max {most}"] * (12 - most))
+
+    def test_an_explicit_max_in_the_equals_form_or_abbreviated_is_honored(self):
+        # `--max=3`, `--max=5` and the argparse abbreviation `--ma 3` are explicit too; none may fall back to 10.
+        for spelling, most in ((("--max=3",), 3), (("--max=5",), 5), (("--max=10",), 10), (("--ma", "3"), 3),
+                               (("--ma=5",), 5)):
+            with self.subTest(args=" ".join(spelling)):
+                numbers = self.board(12)
+                p = self.ok("dispatch", "--dry-run", *spelling)
+                self.assertIn(f"Dry run: venue bg, 0 live, {most} of {most} slots free.", p.stdout)
+                starts = [ln for ln in p.stdout.splitlines() if ln.startswith("would start #")]
+                self.assertEqual(len(starts), most, p.stdout)
+                for n in numbers[most:]:
+                    self.assertIn(f"skip #{n}: over --max {most}", p.stdout.splitlines())
+                data = self.ok_json("dispatch", "--dry-run", "--json", *spelling)
+                self.assertEqual([row["number"] for row in data["plan"]], numbers[:most])
+                self.assertEqual([s["why"] for s in data["skipped"]], [f"over --max {most}"] * (12 - most))
+
+    def test_a_real_dispatch_with_max_equals_three_launches_exactly_three(self):
+        numbers = self.board(12)
+        self.ok("dispatch", "--max=3", env=self.env(**CREDENTIALS))
+        self.assertEqual(sorted(c["argv"][-1] for c in self.claude_calls()),
+                         sorted(f"/harness:work {n}" for n in numbers[:3]))
+
+    def test_a_real_dispatch_with_an_explicit_max_of_three_launches_exactly_three(self):
+        numbers = self.board(12)
+        self.ok("dispatch", "--max", "3", env=self.env(**CREDENTIALS))
+        self.assertEqual(sorted(c["argv"][-1] for c in self.claude_calls()),
+                         sorted(f"/harness:work {n}" for n in numbers[:3]))
+        self.assertEqual(len(self.run_records()), 3)
+
+    def test_a_real_dispatch_with_an_explicit_max_of_three_and_one_live_run_launches_two(self):
+        self.write_run(40, pid=self.sleeper(40))
+        numbers = list(range(12, 24))
+        self.scenario(issues=[issue(n, title=f"Ticket {n}") for n in numbers],
+                      ready=[ready_row(n, f"Ticket {n}") for n in numbers])
+        self.ok("dispatch", "--max", "3", env=self.env(**CREDENTIALS))
+        self.assertEqual(sorted(c["argv"][-1] for c in self.claude_calls()),
+                         sorted(f"/harness:work {n}" for n in numbers[:2]))
+
+    def test_a_real_dispatch_with_an_explicit_max_of_ten_and_three_live_runs_launches_seven(self):
+        for n in range(40, 43):
+            self.write_run(n, pid=self.sleeper(n))
+        numbers = list(range(12, 24))
+        self.scenario(issues=[issue(n, title=f"Ticket {n}") for n in numbers],
+                      ready=[ready_row(n, f"Ticket {n}") for n in numbers])
+        self.ok("dispatch", "--max", "10", env=self.env(**CREDENTIALS))
+        self.assertEqual(sorted(c["argv"][-1] for c in self.claude_calls()),
+                         sorted(f"/harness:work {n}" for n in numbers[:7]))
+
+
+class DispatchDefaultMaxDocs(unittest.TestCase):
+    """Ticket #130: the help text, the usage line and every doc state the default as ten."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+
+    # Failures here print only short snippets, never a whole file: harness-red reads "no tests ran" in output as an
+    # empty run, and docs/design.md contains that phrase.
+    def doc(self, *parts):
+        return read_text(os.path.join(self.ROOT, *parts))
+
+    def snippet(self, text, pattern):
+        """The first match of pattern in text, cut to 100 characters, or None."""
+        m = re.search(pattern, text)
+        return m.group(0)[:100] if m else None
+
+    def test_dispatch_help_says_default_ten(self):
+        p = subprocess.run([sys.executable, TOOL, "dispatch", "--help"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr[:200])
+        text = " ".join(p.stdout.split())
+        m = re.search(r"--max MAX (.*?)(?= --venue)", text)
+        self.assertIsNotNone(m, "no --max entry in dispatch --help")
+        entry = m.group(1)[:100]
+        self.assertTrue("(default 10)" in m.group(1), f"the --max help does not say (default 10): {entry!r}")
+        self.assertIsNone(re.search(r"default 3\b", m.group(1)), f"the --max help still says default 3: {entry!r}")
+
+    def test_the_usage_docstring_shows_max_ten(self):
+        head = read_text(TOOL).split('"""', 2)[1]
+        line = "harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]"
+        self.assertTrue(line in head, "the harness-work usage docstring has no `dispatch [--max 10] ...` line: "
+                        + repr(self.snippet(head, r"harness-work dispatch [^\n]*")))
+        self.assertTrue("[--max 3]" not in head, "the harness-work usage docstring still says [--max 3]")
+
+    def test_design_md_dispatch_line_shows_max_ten(self):
+        design = self.doc("docs", "design.md")
+        line = "- `dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]`:"
+        self.assertTrue(line in design, "docs/design.md has no `dispatch [--max 10] ...` bullet; it has: "
+                        + repr(self.snippet(design, r"- `dispatch \[[^\n]*")))
+        self.assertTrue("[--max 3]" not in design, "docs/design.md still says [--max 3]")
+
+    def test_the_work_skill_dry_run_threshold_is_ten_ready_tickets(self):
+        body = skill_body()
+        self.assertTrue(re.search(r"more than (ten|10) ready tickets and no `--max`", body) is not None,
+                        "the work skill's dry-run rule does not say more than ten ready tickets and no `--max`; "
+                        "it says: " + repr(self.snippet(body, r"more than \w+ ready tickets[^\n]{0,30}")))
+        self.assertTrue(re.search(r"(?i)more than (three|3) ready tickets", body) is None,
+                        "the work skill still says more than three ready tickets")
+
+    def test_no_doc_states_three_as_the_dispatch_max_default(self):
+        docs = [os.path.join(self.ROOT, "README.md"), os.path.join(self.ROOT, "docs", "design.md"),
+                os.path.join(self.ROOT, "docs", "guide.md")]
+        for folder in (os.path.join(self.ROOT, "user"), os.path.join(self.ROOT, "plugins", "harness", "skills"),
+                       os.path.join(self.ROOT, "plugins", "harness", "agents")):
+            for base, _dirs, names in os.walk(folder):
+                docs += [os.path.join(base, n) for n in names if n.endswith(".md")]
+        for path in docs:
+            with self.subTest(doc=os.path.relpath(path, self.ROOT)):
+                text = read_text(path)
+                for pattern in (r"\[--max 3\]",
+                                r"(?i)--max[^\n]{0,60}\bdefault(?:s| is| of)? (?:3|three)\b",
+                                r"(?i)\bdefault(?:s| is| of)? (?:3|three)\b[^\n]{0,60}--max",
+                                r"(?i)\b(?:up to|at most|no more than) (?:3|three)\b(?! chars)",
+                                r"(?i)\b(?:3|three) (?:at a time|at once|live|concurrent|parallel)\b"):
+                    found = self.snippet(text, pattern)
+                    self.assertTrue(found is None, f"still states 3 as the --max default: {found!r}")
 
 
 class RedispatchCap(WorkTest):
@@ -2744,6 +2980,381 @@ def draft(number):
 def ready_pr(number):
     """`pr list` rows: one open pull request marked ready for review."""
     return [{"number": number, "state": "OPEN", "isDraft": False}]
+
+
+# =========================================================================== #123: stop the session of a finished ticket
+# The bg supervisor marks a finished session `blocked` (not `done`) when its summary of the final reply suggests a next
+# step for the user (`/harness:land 121`), so the `claude agents` state cannot tell a finished run from a live one. The
+# ticket decides: a session whose ticket is status:in-review, status:needs-input or closed has ended, whatever its
+# state; the sweep closes its record and runs `claude stop <id>`. A session whose ticket is status:in-progress is never
+# stopped, and a live-state one stays live.
+IN_REVIEW = ("task", "status:in-review", "size:S", "risk:low")
+NEEDS_INPUT = ("task", "status:needs-input", "size:S", "risk:low")
+NO_STATUS = ("task", "size:S", "risk:low")
+READY = ("task", "status:ready", "size:S", "risk:low")
+BLOCKED_STATUS = ("task", "status:blocked", "size:S", "risk:low")
+MERGED = [{"number": 140, "state": "MERGED", "isDraft": False}]
+STOPPED_RE = re.compile(r"stopped session ([A-Za-z0-9_-]+)")
+
+
+class StopFinishedSessions(WorkTest):
+    def board_scenario(self, tickets, ready=(), failing=()):
+        """tickets: {n: (labels, issue state, PRs of its branch t/<n>-x)}; `ready` the rows of `harness-board ready`.
+        For a ticket in `failing`, `gh issue view n` exits 1 with a message on stderr, as gh does when the network or
+        the token is gone."""
+        gone = {"stderr": "HTTP 502: Bad gateway (https://api.github.com/graphql)\n", "exit": 1}
+        calls = [dict(gone, match=["issue", "view", str(n)]) if n in failing else
+                 {"match": ["issue", "view", str(n)], "stdout_json": issue(n, labels=labels, state=state)}
+                 for n, (labels, state, _prs) in tickets.items()]
+        for n, (_labels, _state, prs) in tickets.items():
+            open_prs = [pr for pr in prs if pr["state"] == "OPEN"]
+            calls.append({"contains": ["pr", "list", "--head", f"t/{n}-x", "--state", "all"], "stdout_json": prs})
+            calls.append({"contains": ["pr", "list", "--head", f"t/{n}-x"], "stdout_json": open_prs})
+        calls += [
+            {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}},
+            {"match": ["issue", "list"], "stdout_json": list(ready)},
+            {"match": ["pr", "list"], "stdout_json": []},
+            {"match": ["api", "user"], "stdout": "rjeskuri\n"},
+        ]
+        write(self.scenario_path, json.dumps({"calls": calls}))
+        state = self.scenario_path + ".state.json"
+        if os.path.exists(state):
+            os.unlink(state)
+
+    def bg_sessions(self, cases):
+        """cases: {n: (bg id, `claude agents` state)}. Writes an unended bg run record per ticket and returns the
+        FAKECLAUDE_AGENTS listing that reports each state."""
+        for n, (bg_id, _state) in cases.items():
+            self.write_run(n, venue="bg", bg_id=bg_id, log=None)
+        return json.dumps([{"id": bg_id, "kind": "background", "state": state, "cwd": self.repo,
+                            "name": f"proj #{n} {TITLE}"} for n, (bg_id, state) in cases.items()])
+
+    def stops(self):
+        """{session id: how many times `claude stop` was called with it}."""
+        counts = {}
+        for call in self.claude_calls():
+            argv = call["argv"]
+            if argv[:1] == ["stop"]:
+                for arg in argv[1:]:
+                    if not arg.startswith("-"):
+                        counts[arg] = counts.get(arg, 0) + 1
+        return counts
+
+    def fresh(self):
+        """Forget every run record, claude call and gh call, for the next pass of a test."""
+        shutil.rmtree(self.runs_dir(), True)
+        for path in (self.claude_log, self.gh_log):
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def records(self):
+        return {r["ticket"]: r for r in self.run_records()}
+
+    def reported(self, p):
+        """The session ids named on a `stopped session <id>` line of the command's output."""
+        return sorted(re.findall(STOPPED_RE, p.stdout + p.stderr))
+
+    def warnings(self, p):
+        """The command's stderr lines other than a `stopped session <id>` report."""
+        return [line for line in p.stderr.splitlines() if line.strip() and not re.search(STOPPED_RE, line)]
+
+    # ---- broad: the ticket's status decides, across agents states, statuses and PR states
+    def test_sweep_stops_the_session_of_every_finished_ticket_and_of_no_in_progress_one(self):
+        cases = {   # n: (bg id, agents state, labels, issue state, PRs, stopped, record closed, outcome)
+            70: ("s-a11", "blocked", IN_REVIEW, "OPEN", ready_pr(120), True, True, None),
+            71: ("s-b22", "blocked", NEEDS_INPUT, "OPEN", [], True, True, None),
+            72: ("s-c33", "blocked", IN_REVIEW, "CLOSED", MERGED, True, True, None),
+            73: ("s-d44", "done", IN_REVIEW, "OPEN", ready_pr(121), True, True, "ok"),
+            74: ("s-e55", "done", NEEDS_INPUT, "OPEN", draft(122), True, True, "ok"),
+            75: ("s-f66", "done", NO_STATUS, "CLOSED", MERGED, True, True, "ok"),
+            76: ("s-g77", "idle", NEEDS_INPUT, "OPEN", [], True, True, None),
+            77: ("s-h88", "blocked", IN_PROGRESS, "OPEN", [], False, False, None),
+            78: ("s-i99", "blocked", IN_PROGRESS, "OPEN", ready_pr(123), False, False, None),
+            79: ("s-j10", "idle", IN_PROGRESS, "OPEN", draft(124), False, False, None),
+            80: ("s-k20", "running", IN_PROGRESS, "OPEN", [], False, False, None),
+            81: ("s-l30", "done", IN_PROGRESS, "OPEN", ready_pr(125), False, True, "ok"),
+            82: ("s-m40", "done", IN_PROGRESS, "OPEN", [], False, True, "early"),
+        }
+        agents = self.bg_sessions({n: c[:2] for n, c in cases.items()})
+        self.board_scenario({n: c[2:5] for n, c in cases.items()})
+
+        p = self.work("runs", "--sweep", env=self.env(FAKECLAUDE_AGENTS=agents))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        stopped = sorted(c[0] for c in cases.values() if c[5])
+        self.assertEqual(self.stops(), {bg_id: 1 for bg_id in stopped}, p.stdout + p.stderr)
+        self.assertEqual(self.reported(p), stopped, p.stdout + p.stderr)
+
+        saved = self.records()
+        for n, c in cases.items():
+            with self.subTest(ticket=n, state=c[1], labels=c[2], issue=c[3]):
+                self.assertEqual(bool(saved[n]["ended_at"]), c[6], saved[n])
+                if not c[6]:
+                    self.assertIsNone(saved[n]["outcome"], saved[n])
+                if c[7] is not None:
+                    self.assertEqual(saved[n]["outcome"], c[7], saved[n])
+
+    def test_the_board_decides_the_stop_never_the_ticket_number_or_the_session_id(self):
+        # Each ticket keeps its session id while its status rotates; every session reports `blocked` throughout. Only
+        # the ticket's status and state can tell which sessions to stop and which records to close.
+        statuses = [   # (labels, issue state, PRs, stop and close)
+            (IN_REVIEW, "OPEN", ready_pr(150), True),
+            (IN_PROGRESS, "OPEN", [], False),
+            (NEEDS_INPUT, "OPEN", draft(151), True),
+            (IN_PROGRESS, "OPEN", ready_pr(152), False),
+            (IN_REVIEW, "CLOSED", MERGED, True),
+            (READY, "OPEN", [], False),
+            (IN_PROGRESS, "CLOSED", MERGED, True),          # closed wins over a leftover in-progress label
+            (BLOCKED_STATUS, "OPEN", draft(153), False),
+        ]
+        tickets = {9: "s-x1", 23: "s-k4", 58: "s-q7", 104: "s-m2", 311: "s-z9", 412: "s-p3", 77: "s-w8"}
+        for k in range(len(statuses)):
+            self.fresh()
+            plan = {n: statuses[(j + k) % len(statuses)] for j, n in enumerate(tickets)}
+            agents = self.bg_sessions({n: (bg_id, "blocked") for n, bg_id in tickets.items()})
+            self.board_scenario({n: s[:3] for n, s in plan.items()})
+            p = self.work("runs", "--sweep", env=self.env(FAKECLAUDE_AGENTS=agents))
+            with self.subTest(rotation=k):
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                expected = sorted(tickets[n] for n, s in plan.items() if s[3])
+                self.assertEqual(self.stops(), {bg_id: 1 for bg_id in expected}, p.stdout + p.stderr)
+                self.assertEqual(self.reported(p), expected, p.stdout + p.stderr)
+                self.assertEqual({n: bool(r["ended_at"]) for n, r in self.records().items()},
+                                 {n: s[3] for n, s in plan.items()})
+
+    def test_only_in_review_needs_input_or_closed_end_a_session_and_an_unreadable_ticket_stays_live(self):
+        # The finished set is exactly status:in-review, status:needs-input or a CLOSED issue (closed wins over any
+        # leftover label, status:in-progress included). An OPEN ticket with status:ready, status:blocked or no status
+        # label is not finished: its live session is never stopped and holds a slot. Nor is a ticket gh cannot read.
+        cases = {   # n: (bg id, agents state, labels, issue state, PRs, finished)
+            120: ("s-rd0", "blocked", READY, "OPEN", [], False),
+            121: ("s-bk1", "blocked", BLOCKED_STATUS, "OPEN", draft(190), False),
+            122: ("s-ns2", "blocked", NO_STATUS, "OPEN", [], False),
+            123: ("s-ci3", "blocked", IN_PROGRESS, "CLOSED", MERGED, True),
+            124: ("s-gf4", "blocked", IN_REVIEW, "OPEN", ready_pr(191), False),     # gh issue view fails (below)
+            125: ("s-ci5", "done", IN_PROGRESS, "CLOSED", MERGED, True),
+            126: ("s-rv6", "blocked", IN_REVIEW, "OPEN", ready_pr(192), True),
+            127: ("s-rd7", "idle", READY, "OPEN", [], False),
+        }
+        failing = {124}
+        finished = sorted(c[0] for c in cases.values() if c[5])
+        ready = [ready_row(n, f"Ready {n}") for n in range(140, 150)]
+
+        # runs --sweep
+        agents = self.bg_sessions({n: c[:2] for n, c in cases.items()})
+        self.board_scenario({n: c[2:5] for n, c in cases.items()}, failing=failing)
+        p = self.work("runs", "--sweep", env=self.env(FAKECLAUDE_AGENTS=agents))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.stops(), {bg_id: 1 for bg_id in finished}, p.stdout + p.stderr)
+        self.assertEqual(self.reported(p), finished, p.stdout + p.stderr)
+        saved = self.records()
+        for n, c in cases.items():
+            with self.subTest(ticket=n, labels=c[2], issue=c[3], gh_fails=n in failing):
+                self.assertEqual(bool(saved[n]["ended_at"]), c[5], saved[n])
+                if not c[5]:
+                    self.assertIsNone(saved[n]["outcome"], saved[n])
+        self.assertEqual(saved[125]["outcome"], "ok")
+        shown = {r["ticket"]: r["state"] for r in self.ok_json("runs", "--json", env=self.env(FAKECLAUDE_AGENTS=agents))}
+        self.assertEqual({n: shown[n] for n, c in cases.items() if not c[5]},
+                         {n: c[1] for n, c in cases.items() if not c[5]})
+
+        # dispatch: the unfinished sessions are the live runs and each holds a slot; the finished ones hold none.
+        live_tickets = sorted(n for n, c in cases.items() if not c[5])
+        for most in (len(live_tickets), len(live_tickets) + 1, len(live_tickets) + 3):
+            with self.subTest(max=most):
+                self.fresh()
+                agents = self.bg_sessions({n: c[:2] for n, c in cases.items()})
+                ids = self.records()
+                self.board_scenario({n: c[2:5] for n, c in cases.items()}, ready=ready, failing=failing)
+                env = self.env(FAKECLAUDE_AGENTS=agents)
+                data = self.ok_json("dispatch", "--dry-run", "--max", str(most), "--json", env=env)
+                self.assertEqual(sorted(data["live"]), sorted(ids[n]["id"] for n in live_tickets), data)
+                self.assertEqual(len(data["plan"]), most - len(live_tickets), data)
+                self.assertTrue({row["number"] for row in data["plan"]} <= set(range(140, 150)), data)
+                self.work("runs", "--sweep", env=env)
+                self.assertEqual(self.stops(), {bg_id: 1 for bg_id in finished})
+
+    def issue_views(self, n):
+        """How many times gh was asked for `issue view n`."""
+        return sum(1 for argv in self.gh_calls() if argv[:3] == ["issue", "view", str(n)])
+
+    # ---- review of the fix: a stopped session, an unreadable done one, one issue read per command
+    def test_a_stopped_session_is_never_stopped_again_and_its_ticket_is_not_read(self):
+        # `claude agents` says #200's session is already `stopped`: the sweep closes its record as `stopped` without a
+        # `claude stop`, a report or a read of its ticket, though the ticket is in review. Beside it, #201's blocked
+        # session of an in-review ticket is stopped as usual (its ticket read once).
+        agents = self.bg_sessions({200: ("s-st0", "stopped"), 201: ("s-bl1", "blocked")})
+        self.board_scenario({200: (IN_REVIEW, "OPEN", ready_pr(200)), 201: (IN_REVIEW, "OPEN", ready_pr(201))})
+        p = self.work("runs", "--sweep", env=self.env(FAKECLAUDE_AGENTS=agents))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.stops(), {"s-bl1": 1})
+        self.assertEqual(self.reported(p), ["s-bl1"])
+        self.assertEqual(self.issue_views(200), 0, self.gh_calls())
+        self.assertEqual(self.issue_views(201), 1, self.gh_calls())
+        saved = self.records()
+        self.assertTrue(saved[200]["ended_at"])
+        self.assertEqual(saved[200]["outcome"], "stopped")
+        self.assertTrue(saved[201]["ended_at"])
+
+    def test_a_done_session_whose_ticket_cannot_be_read_closes_ok_with_one_warning(self):
+        # gh issue view fails for #210: its `done` session is not stopped, its record closes `ok` (not `early`: the
+        # early check needs the same unreadable issue and is skipped), and the command warns exactly once, naming it.
+        for labels in (IN_PROGRESS, IN_REVIEW):
+            with self.subTest(labels=labels):
+                self.fresh()
+                agents = self.bg_sessions({210: ("s-dn0", "done")})
+                self.board_scenario({210: (labels, "OPEN", [])}, failing={210})
+                p = self.work("runs", "--sweep", env=self.env(FAKECLAUDE_AGENTS=agents))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(self.stops(), {})
+                self.assertEqual(self.reported(p), [])
+                warnings = self.warnings(p)
+                self.assertEqual(len(warnings), 1, p.stderr)
+                self.assertIn("#210", warnings[0])
+                saved = self.records()[210]
+                self.assertTrue(saved["ended_at"], saved)
+                self.assertEqual(saved["outcome"], "ok", saved)
+                self.assertIsNone(saved.get("draft_pr"), saved)
+
+    def test_one_issue_read_per_ticket_per_command_for_the_finished_and_early_checks(self):
+        # Done sessions of in-progress tickets go through both the finished check and the early check (#220 ends
+        # early, #221 has a ready PR and ends ok); #222's blocked in-progress session through the finished check only.
+        # Each command reads each issue once.
+        cases = {220: ("s-on0", "done", []), 221: ("s-on1", "done", ready_pr(221)), 222: ("s-on2", "blocked", [])}
+        for command in (("runs", "--sweep"), ("dispatch", "--dry-run"), ("dispatch", "--dry-run", "--json")):
+            with self.subTest(command=command):
+                self.fresh()
+                agents = self.bg_sessions({n: c[:2] for n, c in cases.items()})
+                self.board_scenario({n: (IN_PROGRESS, "OPEN", c[2]) for n, c in cases.items()},
+                                    ready=[ready_row(230, "Ready 230")])
+                p = self.work(*command, env=self.env(FAKECLAUDE_AGENTS=agents))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual({n: self.issue_views(n) for n in cases}, {n: 1 for n in cases}, self.gh_calls())
+                self.assertEqual(self.stops(), {})
+                outcomes = {n: r["outcome"] for n, r in self.records().items()}
+                self.assertEqual(outcomes, {220: "early", 221: "ok", 222: None})
+
+    # ---- the four cases the ticket names
+    def test_a_blocked_session_of_an_in_review_ticket_is_stopped_once_and_frees_its_dispatch_slot(self):
+        # runs --sweep alone: one `claude stop <id>`, reported, and the record closed.
+        agents = self.bg_sessions({90: ("s-rev1", "blocked")})
+        self.board_scenario({90: (IN_REVIEW, "OPEN", ready_pr(160))})
+        p = self.work("runs", "--sweep", env=self.env(FAKECLAUDE_AGENTS=agents))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.stops(), {"s-rev1": 1})
+        self.assertIn("stopped session s-rev1", p.stdout + p.stderr)
+        self.assertTrue(self.records()[90]["ended_at"])
+
+        # dispatch: the session does not hold a slot, so --max N plans N launches, for each finished status. Whichever
+        # command stops the session, it is stopped once in all.
+        ready = [ready_row(n, f"Ready {n}") for n in (91, 92, 93, 94)]
+        for labels, state in ((IN_REVIEW, "OPEN"), (NEEDS_INPUT, "OPEN"), (IN_REVIEW, "CLOSED")):
+            for most in (1, 2, 3):
+                with self.subTest(labels=labels, state=state, max=most):
+                    self.fresh()
+                    agents = self.bg_sessions({90: ("s-rev1", "blocked")})
+                    self.board_scenario({90: (labels, state, ready_pr(160))}, ready=ready)
+                    env = self.env(FAKECLAUDE_AGENTS=agents)
+                    data = self.ok_json("dispatch", "--dry-run", "--max", str(most), "--json", env=env)
+                    self.assertEqual(data["live"], [])
+                    self.assertEqual(len(data["plan"]), most, data)
+                    self.assertTrue({row["number"] for row in data["plan"]} <= {91, 92, 93, 94}, data)
+                    p = self.work("runs", "--sweep", env=env)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertEqual(self.stops(), {"s-rev1": 1})
+                    self.assertTrue(self.records()[90]["ended_at"])
+
+        # The dry-run text says the same.
+        self.fresh()
+        agents = self.bg_sessions({90: ("s-rev1", "blocked")})
+        self.board_scenario({90: (IN_REVIEW, "OPEN", ready_pr(160))}, ready=ready)
+        p = self.ok("dispatch", "--dry-run", "--max", "2", env=self.env(FAKECLAUDE_AGENTS=agents))
+        self.assertIn("Dry run: venue bg, 0 live, 2 of 2 slots free.", p.stdout)
+        self.assertEqual(len(re.findall(r"^would start #", p.stdout, re.M)), 2, p.stdout)
+
+    def test_a_done_session_of_a_closed_ticket_is_stopped_by_the_first_sweep_only(self):
+        agents = self.bg_sessions({95: ("s-cl5", "done")})
+        # A record a sweep closed before (#103's case: outcome ok, its session still listed): never stopped again.
+        self.write_run(96, id=f"{self.key}-96-20261012120000", venue="bg", bg_id="s-old6", log=None,
+                       ended_at=iso_ago(hours=2), outcome="ok")
+        listing = json.loads(agents) + [{"id": "s-old6", "kind": "background", "state": "done", "cwd": self.repo,
+                                         "name": f"proj #96 {TITLE}"}]
+        env = self.env(FAKECLAUDE_AGENTS=json.dumps(listing))
+        self.board_scenario({95: (IN_REVIEW, "CLOSED", MERGED), 96: (IN_REVIEW, "OPEN", ready_pr(161))})
+
+        first = self.work("runs", "--sweep", env=env)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(self.stops(), {"s-cl5": 1})
+        self.assertEqual(self.reported(first), ["s-cl5"])
+        saved = self.records()
+        self.assertTrue(saved[95]["ended_at"])
+        self.assertEqual(saved[95]["outcome"], "ok")
+
+        # The listing still shows the session (as when a stop has not taken effect yet): the closed record is skipped.
+        second = self.work("runs", "--sweep", env=env)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(self.stops(), {"s-cl5": 1})
+        self.assertEqual(self.reported(second), [])
+        self.ok("dispatch", "--dry-run", env=env)
+        self.assertEqual(self.stops(), {"s-cl5": 1})
+
+    def test_a_blocked_session_of_an_in_progress_ticket_stays_live_and_counts_toward_max(self):
+        # Beside it, a blocked session of an in-review ticket (#99), which holds no slot: --max N plans N - 1 launches,
+        # the in-progress session is the one live run, and only #99's session is ever stopped, whatever #100's PRs.
+        ready = [ready_row(n, f"Ready {n}") for n in (101, 102, 103, 104)]
+        for prs in ([], draft(170), ready_pr(171)):
+            for most in (1, 2, 3, 4):
+                with self.subTest(prs=prs, max=most):
+                    self.fresh()
+                    agents = self.bg_sessions({100: ("s-ip0", "blocked"), 99: ("s-rv9", "blocked")})
+                    rid = self.records()[100]["id"]
+                    self.board_scenario({100: (IN_PROGRESS, "OPEN", prs), 99: (IN_REVIEW, "OPEN", ready_pr(172))},
+                                        ready=ready)
+                    env = self.env(FAKECLAUDE_AGENTS=agents)
+                    data = self.ok_json("dispatch", "--dry-run", "--max", str(most), "--json", env=env)
+                    self.assertEqual(data["live"], [rid])
+                    self.assertEqual(len(data["plan"]), most - 1, data)
+                    p = self.work("runs", "--sweep", env=env)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertEqual(self.stops(), {"s-rv9": 1})
+                    self.assertNotIn("s-ip0", self.reported(p))
+                    saved = self.records()[100]
+                    self.assertIsNone(saved["ended_at"], saved)
+                    self.assertIsNone(saved["outcome"], saved)
+                    self.assertTrue(self.records()[99]["ended_at"])
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--json", env=env)}
+        self.assertEqual(rows[100]["state"], "blocked")
+
+    def test_a_failed_stop_is_one_warning_leaves_exit_0_and_still_closes_the_record(self):
+        agents = self.bg_sessions({110: ("s-bad0", "blocked"), 111: ("s-ok11", "done")})
+        self.board_scenario({110: (IN_REVIEW, "OPEN", ready_pr(180)), 111: (NEEDS_INPUT, "OPEN", [])})
+        env = self.env(FAKECLAUDE_AGENTS=agents, FAKECLAUDE_STOP_FAIL="s-bad0")
+
+        p = self.work("runs", "--sweep", env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.stops(), {"s-bad0": 1, "s-ok11": 1})
+        warnings = self.warnings(p)
+        self.assertEqual(len(warnings), 1, p.stderr)
+        self.assertIn("s-bad0", warnings[0])
+        self.assertTrue(warnings[0].startswith("harness-work: "), warnings[0])
+        self.assertEqual(self.reported(p), ["s-ok11"])
+        saved = self.records()
+        self.assertTrue(saved[110]["ended_at"], saved[110])
+        self.assertTrue(saved[111]["ended_at"], saved[111])
+
+        # The same with --json: the JSON on stdout is whole, the one warning on stderr.
+        self.fresh()
+        agents = self.bg_sessions({110: ("s-bad0", "blocked")})
+        self.board_scenario({110: (IN_REVIEW, "OPEN", ready_pr(180))})
+        env = self.env(FAKECLAUDE_AGENTS=agents, FAKECLAUDE_STOP_FAIL="s-bad0")
+        p = self.work("runs", "--sweep", "--json", env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rows = {r["ticket"]: r for r in json.loads(p.stdout)}
+        self.assertTrue(rows[110]["ended_at"], rows[110])
+        warnings = self.warnings(p)
+        self.assertEqual(len(warnings), 1, p.stderr)
+        self.assertIn("s-bad0", warnings[0])
+        self.assertEqual(self.stops(), {"s-bad0": 1})
+        self.assertTrue(self.records()[110]["ended_at"])
 
 
 # =========================================================================== #42: redispatch of a draft-PR run

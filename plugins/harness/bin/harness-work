@@ -6,7 +6,7 @@ of a headless or background session per ready ticket, the run records, the budge
 Usage:
     harness-work start N [--venue interactive|headless|bg]
     harness-work attempt N tests|breaker|code|review|fix|ci pass|fail [--tier sonnet|opus|fable]
-    harness-work dispatch [--max 3] [--venue headless|bg | --api] [--dry-run]
+    harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]
     harness-work runs [--sweep] [--all]
     harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
     harness-work worktrees [--stale DAYS]
@@ -69,11 +69,12 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
-    from harness_lib.repo import RepoError, repo_facts
+    from harness_lib.repo import RepoError, repo_facts, worktree_entries
     from harness_lib.settings import setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
     from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
     from harness_lib.text import write_json as _write_json
+    from harness_lib import gh as ghlib
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -101,6 +102,7 @@ TOOL_TIMEOUT = 300            # a harness-board call
 SETUP_TIMEOUT = 1500          # uv sync, npm ci
 LAUNCH_TIMEOUT = 120          # claude --bg returns once the session is handed to the supervisor
 AGENTS_TIMEOUT = 30
+STOP_TIMEOUT = 30             # claude stop <id> of a finished ticket's session
 GH_TIMEOUT = 60
 BILLING_RE = re.compile(r"credit balance|insufficient.*credit|billing_error|payment required|\b402\b", re.I)
 AUTH_RE = re.compile(r"invalid.*api.key|authentication_error|\b401\b", re.I)
@@ -125,6 +127,9 @@ BG_ID_RE = re.compile(r"backgrounded\s+(?:·|-)\s+(\S+)")
 # 2026-10-13: `blocked` for a background session; interactive sessions carry no `state` (a `status` instead).
 LIVE_STATES = ("running", "working", "blocked", "idle", "busy", "waiting", "starting")
 ENDED_STATES = {"done": "ok", "failed": "error", "stopped": "stopped"}   # outcome; another ended state is kept as is
+# A ticket whose turn is over: its issue CLOSED, or OPEN with one of these. The bg supervisor marks a finished session
+# `blocked` when its summary of the final reply suggests a next step for the user (#123), so the ticket decides.
+FINISHED_STATUSES = ("status:in-review", "status:needs-input")
 PID_SLACK = 120               # seconds: a process younger than its run record by more is a recycled pid
 # The dispatching session's own identity, which a detached run must not inherit.
 SESSION_ENV = ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION",
@@ -263,15 +268,20 @@ def board_json(repo, *args):
         raise Problem(f"harness-board {' '.join(str(a) for a in args[:2])} printed no JSON") from None
 
 
+# harness-work's own wording for a gh call (`call` is its first two arguments), as its generic run() words it
+WORK_GH_TEXTS = {
+    "not_found": "{exe} not found",
+    "cannot_run": "cannot run {exe}: {why}",
+    "timed_out": "{exe} {call} timed out after {timeout} s",
+    "failed": "gh {call} failed: {why}",
+    "not_json": "gh {call} printed something other than JSON",
+}
+
+
 def gh_json(repo, args):
-    exe = os.environ.get("HARNESS_GH", "gh")
-    done = run([exe] + args, cwd=repo.main, env=dict(os.environ, GH_PROMPT_DISABLED="1"), timeout=GH_TIMEOUT)
-    if done.returncode != 0:
-        raise Problem(f"gh {' '.join(args[:2])} failed: {last_line(done.stderr) or f'exit {done.returncode}'}")
-    try:
-        return json.loads(done.stdout or "null")
-    except ValueError:
-        raise Problem(f"gh {' '.join(args[:2])} printed something other than JSON") from None
+    """gh's JSON output (None when it printed nothing), run in the main checkout; Problem with gh's last stderr line."""
+    return ghlib.gh_json(args, repo.main, pick=last_line, empty_ok=True, errors="surrogateescape", timeout=GH_TIMEOUT,
+                         describe=lambda a: " ".join(a[:2]), texts=WORK_GH_TEXTS)
 
 
 def api_key_cmd():
@@ -308,27 +318,6 @@ def refusal(record):
     if blockers:
         return f"#{n} is blocked by open {', '.join(blockers)}"
     return None
-
-
-def worktree_entries(repo):
-    """`git worktree list --porcelain` as dicts: path, head, branch (short name) and the flags."""
-    entries, current = [], None
-    for line in git_ok(repo.main, "worktree", "list", "--porcelain").splitlines():
-        if not line.strip():
-            current = None
-            continue
-        key, _, value = line.partition(" ")
-        if key == "worktree":
-            current = {"path": value, "branch": None}
-            entries.append(current)
-        elif current is not None:
-            if key == "branch":
-                current["branch"] = value[len("refs/heads/"):] if value.startswith("refs/heads/") else value
-            elif key == "HEAD":
-                current["head"] = value
-            else:
-                current[key] = value or True
-    return entries
 
 
 def branch_refs(repo, prefix):
@@ -380,9 +369,9 @@ def make_worktree(repo, number, title):
     """(branch, worktree, created): an existing worktree on t/N-*, else a new one on the right branch."""
     pattern = re.compile(rf"^t/{number}-.")
     git(repo.main, "worktree", "prune")                    # entries whose folder is gone would block the add
-    for entry in worktree_entries(repo):
-        if entry.get("branch") and pattern.match(entry["branch"]) and os.path.isdir(entry["path"]):
-            return entry["branch"], os.path.realpath(entry["path"]), False
+    for entry in worktree_entries(repo.main, git_ok):
+        if entry.branch and pattern.match(entry.branch) and os.path.isdir(entry.path):
+            return entry.branch, os.path.realpath(entry.path), False
     remote = [b for b in branch_refs(repo, "refs/remotes/origin/t/") if pattern.match(b)]
     local = [b for b in branch_refs(repo, "refs/heads/t/") if pattern.match(b)]
     branch = (remote or local or [f"t/{number}-{slugify(title)}"])[0]
@@ -748,22 +737,31 @@ def mtime_iso(path):
         return iso(now())
 
 
-def sweep(records, agents):
-    """Close the records whose run has ended; a billing or auth failure marks the api budget. Saves."""
+def sweep(records, agents, as_json=False):
+    """Close the records whose run has ended; a billing or auth failure marks the api budget. A listed bg session
+    whose ticket is finished has ended whatever its state says: it is stopped and its record closed. Saves."""
     repos = {}
     for record in records:
         if record.get("ended_at"):
             continue
+        finished = False                    # None: the ticket could not be read, warned once
         if is_bg(record):
             listing = agents.get(include_done=True)
             if listing is None:
                 continue
             entry = listing.get(str(record.get("bg_id")))
             state = entry.get("state") if entry else None
-            if entry is not None and not state_ended(state):
+            if entry is not None and state != "stopped":
+                finished = ticket_finished(record, repos)
+            if entry is not None and not state_ended(state) and not finished:
                 continue
+            if finished:
+                stop_session(record, as_json)
             record["ended_at"] = iso(now())
-            outcome = ENDED_STATES.get(state, str(state)) if entry is not None else "unknown"
+            if finished and not state_ended(state):
+                outcome = "ok"              # a live state of a finished turn: the ticket says it is over
+            else:
+                outcome = ENDED_STATES.get(state, str(state)) if entry is not None else "unknown"
             code = entry.get("exitCode", entry.get("exit")) if entry is not None else None
             if isinstance(code, int) and not isinstance(code, bool):
                 record["exit"] = code               # only when the listing gives one; headless runs keep null
@@ -773,8 +771,9 @@ def sweep(records, agents):
                 continue
             record["ended_at"] = mtime_iso(record.get("log"))
             outcome, reason = classify(log_tail(record.get("log")))
-        # a bg `done` is judged like a headless `ok`; failed, stopped and the rest never become early
-        early = ended_early(record, repos) if outcome == "ok" else None
+        # a bg `done` is judged like a headless `ok`; failed, stopped and the rest never become early, nor does a run
+        # whose ticket is finished (never in progress) or could not be read (warned already)
+        early = ended_early(record, repos) if outcome == "ok" and finished is False else None
         if early is not None:
             outcome = "early"
             if early.get("draft_pr"):
@@ -792,17 +791,61 @@ def ended_early(record, repos):
     n = record.get("ticket")
     if not isinstance(n, int):
         return None
-    path = str(record.get("repo") or "")
-    if not path:                    # never the cwd's repository: its issue n may be another ticket
-        warn(f"#{n}: cannot check whether its run ended early: the run record names no repository")
-        return None
     try:
-        if path not in repos:
-            repos[path] = Repo(path)
-        return without_pr(repos[path], n, record.get("branch"))
+        return without_pr(record_repo(record, repos), n, record.get("branch"))
     except Problem as err:
         warn(f"#{n}: cannot check whether its run ended early: {err}")
         return None
+
+
+def record_repo(record, repos):
+    """The Repo a run record names, cached in `repos` by path; a Problem when it names none or it cannot be opened.
+    Never the cwd's repository: its issue n may be another ticket."""
+    path = str(record.get("repo") or "")
+    if not path:
+        raise Problem("the run record names no repository")
+    if path not in repos:
+        repos[path] = Repo(path)
+    return repos[path]
+
+
+def issue_finished(issue):
+    """Whether a ticket's turn is over: its issue CLOSED (whatever labels it kept), or OPEN with status:in-review or
+    status:needs-input. In progress, ready, blocked or without a status, it is not."""
+    if not isinstance(issue, dict):
+        return False
+    state = str(issue.get("state", "")).upper()
+    labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
+    return state == "CLOSED" or (state == "OPEN" and any(lb in FINISHED_STATUSES for lb in labels))
+
+
+def ticket_finished(record, repos):
+    """Whether the ticket of a run is finished (issue_finished); None, with a warning, when the repository or gh
+    cannot tell, so the session is neither stopped nor counted ended."""
+    n = record.get("ticket")
+    if not isinstance(n, int):
+        return None
+    try:
+        return issue_finished(ticket_issue(record_repo(record, repos), n))
+    except Problem as err:
+        warn(f"#{n}: cannot tell whether its ticket is finished: {err}")
+        return None
+
+
+def stop_session(record, as_json):
+    """`claude stop <id>` for the bg session of a finished ticket (its conversation is kept): `stopped session <id>`
+    on stdout (stderr under --json, which keeps stdout whole), or one warning when it fails."""
+    bg_id = str(record.get("bg_id"))
+    try:
+        done = run([claude_exe(), "stop", bg_id], env=child_env(), timeout=STOP_TIMEOUT)
+        why = None if done.returncode == 0 else (last_line(done.stderr) or last_line(done.stdout)
+                                                 or f"exit {done.returncode}")
+    except Problem as err:
+        why = str(err)
+    if why is not None:
+        warn(f"#{record.get('ticket')}: cannot stop session {bg_id}: {why}")
+        return
+    print(f"stopped session {bg_id}", file=sys.stderr if as_json else sys.stdout, flush=True)
 
 
 def run_state(record, agents):
@@ -887,8 +930,24 @@ def failed(record, why):
     raise Problem(why)
 
 
+ISSUES = {}         # (main checkout, ticket): the issue or the Problem, read once per command
 WITHOUT_PR = {}     # (main checkout, ticket, branch): the issue, None or the Problem, asked once per command
 PR_ROWS = 100       # pull requests of a branch read by ask_without_pr
+
+
+def ticket_issue(repo, n):
+    """Ticket n's issue (number, title, state, labels); a failing gh call raises Problem. One command reads each issue
+    once: the sweep's finished and early checks and dispatch's redispatch share it, a failure included."""
+    key = (repo.main, n)
+    if key not in ISSUES:
+        try:
+            ISSUES[key] = gh_json(repo, ["issue", "view", str(n), "--json", "number,title,state,labels"])
+        except Problem as err:
+            ISSUES[key] = err
+    found = ISSUES[key]
+    if isinstance(found, Problem):
+        raise found
+    return found
 
 
 def without_pr(repo, n, branch):
@@ -909,7 +968,7 @@ def without_pr(repo, n, branch):
 
 
 def ask_without_pr(repo, n, branch):
-    issue = gh_json(repo, ["issue", "view", str(n), "--json", "number,title,state,labels"])
+    issue = ticket_issue(repo, n)
     if not isinstance(issue, dict) or str(issue.get("state", "")).upper() != "OPEN":
         return None
     labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
@@ -1030,7 +1089,7 @@ def cmd_dispatch(repo, args):
         raise Problem("--max must be at least 1")
     agents = Agents()
     records = load_runs()
-    sweep(records, agents)
+    sweep(records, agents, wants_json(args))
     mine = [r for r in records if of_repo(r, repo)]
     api_until = exhausted_until(load_budgets()["api"])    # after the sweep, which can be what exhausts it
     if args.venue == "headless" and api_until:
@@ -1119,7 +1178,7 @@ def cmd_runs(args):
     agents = Agents()
     records = load_runs()
     if args.sweep:
-        sweep(records, agents)
+        sweep(records, agents, wants_json(args))
     cutoff = now() - RECENT
     try:                    # the tickets dispatch would skip for the cap, in the repository of the cwd
         repo = open_repo(None)
@@ -1177,9 +1236,9 @@ def cmd_worktrees(repo, args):
     base = os.path.realpath(repo.worktrees_dir) + os.sep
     rows, gh_failed = [], None
     current = now()
-    for entry in worktree_entries(repo):
-        path = os.path.realpath(entry["path"])
-        if not path.startswith(base) or entry.get("bare"):
+    for entry in worktree_entries(repo.main, git_ok):
+        path = os.path.realpath(entry.path)
+        if not path.startswith(base) or entry.bare:
             continue
         when = None
         if os.path.isdir(path):
@@ -1191,7 +1250,7 @@ def cmd_worktrees(repo, args):
         else:
             dirty = False
         pr = None
-        branch = entry.get("branch")
+        branch = entry.branch
         if branch and gh_failed is None:
             try:
                 found = gh_json(repo, ["pr", "list", "--head", branch, "--state", "all", "--json",
@@ -1228,13 +1287,13 @@ def cmd_worktree_remove(repo, args):
     if branch in ("main", "master"):
         raise Problem(f"refusing to remove {branch}")
     git(repo.main, "worktree", "prune")
-    entry = next((e for e in worktree_entries(repo) if e.get("branch") == branch), None)
+    entry = next((e for e in worktree_entries(repo.main, git_ok) if e.branch == branch), None)
     has_branch = ref_exists(repo, f"refs/heads/{branch}")
     if entry is None and not has_branch:
         raise Problem(f"no worktree and no local branch {branch}")
     done = []
     if entry is not None:
-        path = os.path.realpath(entry["path"])
+        path = os.path.realpath(entry.path)
         if path == repo.main:
             raise Problem(f"{branch} is checked out in the main checkout {repo.main}; switch it to main first")
         status = git_ok(path, "status", "--porcelain")
@@ -1280,7 +1339,7 @@ def parser():
 
     dispatch = sub.add_parser("dispatch", parents=[with_repo, with_json],
                               help="start and launch a session per ready ticket")
-    dispatch.add_argument("--max", type=int, default=3, help="live runs at most (default 3)")
+    dispatch.add_argument("--max", type=int, default=10, help="live runs at most (default 10)")
     dispatch.add_argument("--venue", choices=VENUES,
                           help="default: bg (the subscription); headless bills the API key and is refused while the "
                                "api budget is exhausted")

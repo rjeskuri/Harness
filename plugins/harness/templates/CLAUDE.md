@@ -27,7 +27,7 @@ from the code. When Claude makes the same mistake twice, add one line here.
   `t/<issue#>-<slug>` and its worktree. Never on main; a hook blocks edits and commits there.
 - Tests first: write the tests the ticket names, prove them red with `harness-red check`, then
   change the source. Never loosen a test to make it pass.
-- Land through a pull request (`harness-pr open`); the user merges.
+- Land through a pull request (`harness-pr open`): eligible PRs are merged by `harness-pr autoland`, the user lands the rest.
 
 ## Done means
 - The ticket's definition of done holds and `{{verify_cmd}}` passes. Show the command and its output.
