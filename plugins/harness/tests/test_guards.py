@@ -1061,6 +1061,12 @@ class BranchGuardBashExemptions(GuardTestCase):
             f"""python3 -c "open('{OUTSIDE_JSON}','w'); open('./src/app.py','w')\"""",
             """node -e "require('fs').writeFileSync('./src/app.js', 'x')\"""",
             f"""node -e "require('fs').writeFileSync('{OUTSIDE_JSON}', 'x'); require('fs').writeFileSync('app.js', 'x')\"""",
+            # the repo literal first, the outside one last
+            f"""python3 -c "open('./src/app.py','w'); open('{OUTSIDE_JSON}','w')\"""",
+            f"""node -e "require('fs').writeFileSync('./README.md', 'x'); require('fs').writeFileSync('{OUTSIDE_JSON}', 'x')\"""",
+            # and between two outside literals
+            f"""python3 -c "open('{OUTSIDE_JSON}','w'); open('./src/app.py','w'); open('{outside}/c.txt','w')\"""",
+            f"""node -e "require('fs').writeFileSync('{OUTSIDE_JSON}', 'x'); require('fs').writeFileSync('./README.md', 'x'); require('fs').writeFileSync('{outside}/c.txt', 'x')\"""",
         ):
             with self.subTest(command=command):
                 self.assertRefusedPart(self.bash(command), command)
@@ -1100,6 +1106,22 @@ class BranchGuardBashExemptions(GuardTestCase):
         ):
             with self.subTest(command=command):
                 self.assertRefusedOnMain(self.bash(command), command, why)
+        # An ignored directory that holds a force-added tracked file: deleting or moving
+        # the directory deletes the tracked file, so it is refused; the untracked,
+        # ignored file beside it is still free.
+        repo = self.repo
+        self.write(repo / "data/tracked.csv", "t\n")
+        self.git(repo, "add", "-f", "data/tracked.csv")
+        self.git(repo, "commit", "-q", "-m", "Track one file under data/")
+        self.assertAllowed(("rm data/a.csv", "mv data/a.csv data/b.csv"))
+        for command in (
+            "rm -rf data",
+            f"mv data {self.outside}/",
+            "rm data/tracked.csv",
+            "mv data/tracked.csv data/b.csv",
+        ):
+            with self.subTest(command=command, fixture="data/tracked.csv tracked"):
+                self.assertRefusedPart(self.bash(command), command)
 
     def test_heredoc_without_path_literal_still_refused(self):
         for command, part, why in (
@@ -1160,6 +1182,17 @@ class BranchGuardBashExemptions(GuardTestCase):
                 repo,
             ),
             (f"open('{OUTSIDE_JSON}', 'w')\nopen('../proj/src/app.py', 'w')", repo),
+            # the repo literal first, the outside one last
+            ("open('src/app.py', 'w')\nopen('/private/tmp/x/out.json', 'w')", repo),
+            (f"open('{repo}/src/app.py', 'w')\nopen('{OUTSIDE_JSON}', 'w')", repo),
+            ("open('../app.json', 'w')\nopen('/private/tmp/x/out.json', 'w')", repo / "src"),
+            # and between two outside literals
+            (
+                f"open('{OUTSIDE_JSON}', 'w')\n"
+                "open('./README.md', 'w')\n"
+                f"open('{self.outside}/c.txt', 'w')",
+                repo,
+            ),
         ):
             with self.subTest(program=program, cwd=str(cwd)):
                 self.assertRefusedPart(self.bash(heredoc(program), cwd=cwd), part)
@@ -1404,9 +1437,15 @@ class BranchGuardBashExemptions(GuardTestCase):
         elsewhere = self.tmp / ("w" + uuid.uuid4().hex[:8])
         elsewhere.mkdir()
         other = self.make_repo("home/other")
+        # a repo whose main checkout is on another branch is not protected
+        feature = self.make_repo("home/feat")
+        self.git(feature, "switch", "-q", "-c", "feature")
         self.assertAllowed(
             (
                 heredoc(f"open('{tmp_out}/out.json', 'w').write('x')"),
+                heredoc(f"open('{feature}/notes.txt', 'w').write('x')"),
+                heredoc(f"open('{tmp_out}/a.json', 'w')\nopen('{feature}/src/new.py', 'w')"),
+                f"""python3 -c "open('{feature}/README.md','w').write('x')\"""",
                 heredoc(
                     "import shutil\n"
                     f"shutil.copy('{tmp_out}/a.md', '{home_dir}/b.md')"
@@ -1430,6 +1469,11 @@ class BranchGuardBashExemptions(GuardTestCase):
             (f"open('{OUTSIDE_JSON}', 'w')\nopen('{other}/src/new.py', 'w')", repo),
             (f"open('{tmp_out}/a.json', 'w')\nopen('{other}/notes.txt', 'w')", repo),
             (f"open('{tmp_out}/a.json', 'w')\nopen('{repo}/README.md', 'w')", other),
+            # the protected literal first, the outside one last
+            (f"open('{other}/notes.txt', 'w')\nopen('{tmp_out}/a.json', 'w')", repo),
+            (f"open('{repo}/README.md', 'w')\nopen('{home_dir}/b.md', 'w')", other),
+            # and the feature-branch repo beside a protected one does not excuse it
+            (f"open('{feature}/notes.txt', 'w')\nopen('{other}/notes.txt', 'w')", repo),
             # a directory named outside inside the repo is still the repo
             (f"open('{repo}/outside/x.json', 'w')", repo),
             # repo targets of every literal form, each beside an allowed literal
