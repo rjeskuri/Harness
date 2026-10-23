@@ -6,17 +6,25 @@ of a headless or background session per ready ticket, the run records, the budge
 Usage:
     harness-work start N [--venue interactive|headless|bg]
     harness-work attempt N tests|breaker|code|review|fix|ci pass|fail [--tier sonnet|opus|fable]
+    harness-work cost N [--pr P] [--json | --markdown]
     harness-work dispatch [--max 3] [--venue headless|bg | --api] [--dry-run]
     harness-work runs [--sweep] [--all]
     harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
     harness-work worktrees [--stale DAYS]
     harness-work worktree remove BRANCH [--discard]
-    start, attempt, dispatch, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR, else the
+    start, attempt, cost, dispatch, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR, else the
     cwd's repository); every subcommand except worktree remove takes --json.
 
 State, under ~/.claude/harness: repos/<repo-key>/tickets/<N>.json (the ticket cache that `harness-board show`
-writes; start adds branch, worktree and started_at, attempt adds to attempts), runs/<repo-key>-<N>-<stamp>.json
-and .log (one dispatched run), budgets.json ({"api"|"cloud": {"exhausted_until", "reason"}}).
+writes; start adds branch, worktree and started_at, attempt adds to attempts), repos/<repo-key>/cost/<N>.json (the
+record `cost` writes), runs/<repo-key>-<N>-<stamp>.json and .log (one dispatched run), budgets.json
+({"api"|"cloud": {"exhausted_until", "reason"}}).
+
+cost: ticket N's tokens and model time per stage and model from the repository's transcripts (harness_lib/cost.py's
+ticket_usage), its labels and rounds from the ticket cache (the attempts replayed with attempt's rule; null without
+a cache). Prints the stage x model table, the total, Claude Code's session total for N's own sessions, the rounds,
+the shared sessions whose orchestrator is not counted, the lower-bound note and the saved path; --json prints the
+record, --markdown the Cost block of the Resolution. Tokens and time only, no dollar figure.
 
 start: refuses an epic, a closed issue, status:blocked and open blockers; fetches origin; reuses a worktree
 already on t/N-*, else a branch origin/t/N-*, else a local t/N-*, else creates t/N-<slug> from origin/main
@@ -72,6 +80,7 @@ try:
     from harness_lib.repo import RepoError, repo_facts
     from harness_lib.settings import setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
+    from harness_lib import cost
     from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
     from harness_lib.text import write_json as _write_json
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
@@ -234,6 +243,9 @@ class Repo:
 
     def ticket_path(self, number):
         return harness_home("repos", self.key, "tickets", f"{number}.json")
+
+    def cost_path(self, number):
+        return harness_home("repos", self.key, "cost", f"{number}.json")
 
 
 def open_repo(path):
@@ -1083,20 +1095,25 @@ def cmd_attempt(repo, args):
         if entry.get("result") != "fail":
             break
         failures += 1
-    next_tier = None
-    if args.result == "pass":
-        action = "done"
-    elif failures == 1:
-        action = "retry"
-    elif args.stage == "fix":                       # at most two fix rounds, and fix never escalates
-        action = "needs-input"
-    elif failures == 2:
-        action, next_tier = "escalate", NEXT_TIER[tier]
-    else:
-        action = "needs-input"
+    action = cost.attempt_action(args.stage, args.result, failures)     # fix: at most two rounds, never escalates
+    next_tier = NEXT_TIER[tier] if action == "escalate" else None
     emit(wants_json(args), {"number": n, "stage": args.stage, "result": args.result, "tier": tier, "failures": failures,
                 "action": action, "next_tier": next_tier},
          f"{action} {next_tier}" if next_tier else action)
+
+
+def cmd_cost(repo, args):
+    """Ticket N's tokens and model time per stage and model, from the transcripts and the ticket cache:
+    saved as cost/<N>.json (replacing an earlier record), printed as text, --json or --markdown."""
+    n = args.number
+    usage = cost.ticket_usage(repo.main, n)
+    record = cost.build_record(n, repo.main, usage, read_cache(repo, n), args.pr, iso(now()))
+    path = repo.cost_path(n)
+    write_json(path, record)
+    if args.markdown:
+        print(cost.render_markdown(record))
+    else:
+        emit(wants_json(args), record, f"{cost.render_text(record)}\nSaved {path}")
 
 
 def cmd_dispatch(repo, args):
@@ -1335,7 +1352,7 @@ def parser():
     nested_json = argparse.ArgumentParser(add_help=False)     # never resets a --json given before the action
     nested_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
     ap = Parser(prog="harness-work", description="Ticket worktrees, attempts, dispatch, runs and budgets.")
-    sub = ap.add_subparsers(dest="cmd", metavar="{start,attempt,dispatch,runs,budget,worktrees,worktree}")
+    sub = ap.add_subparsers(dest="cmd", metavar="{start,attempt,cost,dispatch,runs,budget,worktrees,worktree}")
     sub.required = True
 
     start = sub.add_parser("start", parents=[with_repo, with_json],
@@ -1351,6 +1368,15 @@ def parser():
     attempt.add_argument("stage", choices=STAGES)
     attempt.add_argument("result", choices=("pass", "fail"))
     attempt.add_argument("--tier", choices=TIERS, help="the tier this attempt ran at (default: the ticket's)")
+
+    cost_ = sub.add_parser("cost", parents=[with_repo],
+                           help="a ticket's tokens and model time per stage and model, with its rounds; "
+                                "saves cost/<N>.json")
+    cost_.add_argument("number", type=issue_number, metavar="N")
+    cost_.add_argument("--pr", type=issue_number, metavar="P", help="the pull request, kept in the record")
+    output = cost_.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", help="print the record")
+    output.add_argument("--markdown", action="store_true", help="print the Cost block of the Resolution")
 
     dispatch = sub.add_parser("dispatch", parents=[with_repo, with_json],
                               help="start and launch a session per ready ticket")
@@ -1402,7 +1428,7 @@ def main():
         elif args.cmd == "budget":
             cmd_budget(args)
         else:
-            command = {"start": cmd_start, "attempt": cmd_attempt, "dispatch": cmd_dispatch,
+            command = {"start": cmd_start, "attempt": cmd_attempt, "cost": cmd_cost, "dispatch": cmd_dispatch,
                        "worktrees": cmd_worktrees, "worktree": cmd_worktree_remove}[args.cmd]
             command(open_repo(args.repo), args)
     except Problem as err:
