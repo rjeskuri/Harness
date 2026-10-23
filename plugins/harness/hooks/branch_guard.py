@@ -20,7 +20,10 @@ the chain), restored after a subshell or a child shell, and moved for git by -C,
     redirection or tee to it, cp, mv, install, ln, rsync or dd into it, mv, rm, touch,
     truncate or chmod of it, and in-place edits (sed or gsed -i, perl -i, awk -i inplace,
     ed, patch). A path under <top>/.claude/worktrees/ or in a linked worktree belongs to
-    that worktree, and a path outside any repo is never refused;
+    that worktree, and a path outside any repo is never refused. A named path the Edit
+    rule exempts (under docs/agent/, or one git ignores) is allowed for every form, rm,
+    truncate and both sides of mv included; a directory holding a tracked file is not
+    ignored. The refusal names the first target that is not exempt;
   - when the repo git runs in is on main or master with a commit: git commit, merge
     (except --ff-only), rebase, cherry-pick, revert, am, apply, reset, rm, mv, clean,
     restore, stash pop|apply, checkout of paths or -B main, switch -C main, branch -f, -m
@@ -28,7 +31,10 @@ the chain), restored after a subshell or a child shell, and moved for git by -C,
     push with no refspec, of HEAD, or deleting a remote branch. Aliases given with
     -c alias.<name>= are expanded first;
   - when the part runs in such a repo: python -c, node -e, or a program either reads from
-    a heredoc, that writes files;
+    a heredoc, that writes files, unless it has a path literal (a quoted string starting
+    with /, ~/, ./ or ../, holding a /, or a bare name with an extension) and every one,
+    resolved against the part's directory with ~ expanded, lies outside every protected
+    main working tree;
   - in every repo, on every branch: a force push (--force, -f, --force-with-lease or a
     +refspec), and a push that names main or master as the destination (main,
     HEAD:main, refs/heads/main, :main), --mirror, --all, or a matching (:) or wildcard
@@ -172,6 +178,10 @@ JS_WRITERS = re.compile(
     r"|truncateSync|symlink|symlinkSync)\s*\("
     r"|\bBun\.write\s*\("
 )
+# Path literals in an inline program: a quoted string (backslash escapes kept) that
+# starts with /, ~/, ./ or ../, holds a /, or is a bare file name with an extension.
+STRING_LITERAL = re.compile(r"""(["'`])((?:\\.|(?!\1)[^\\\n])*)\1""")
+BARE_FILE = re.compile(r"[A-Za-z0-9_.-]+[.][A-Za-z0-9]{1,8}$")
 
 
 def shown(text: str) -> str:
@@ -1059,15 +1069,19 @@ def inline_programs(name: str, args: list[str], part: Part) -> list[str]:
     return programs
 
 
+def program_writes(name: str, code: str) -> str | None:
+    """Why the python or node program `code` writes files, or None."""
+    if PYTHON.match(name):
+        return python_writes(code)
+    if JS_WRITERS.search(code):
+        return "node writes, moves or deletes files"
+    return None
+
+
 def code_writes(name: str, args: list[str], part: Part) -> str | None:
     """Why the python or node program `part` runs inline writes files, or None."""
     for code in inline_programs(name, args, part):
-        if PYTHON.match(name):
-            why = python_writes(code)
-        else:
-            why = None
-            if JS_WRITERS.search(code):
-                why = "node writes, moves or deletes files"
+        why = program_writes(name, code)
         if why:
             return why
     return None
@@ -1107,6 +1121,42 @@ def holder(state: dict, path: str | None) -> tuple[Path, str] | None:
     return found
 
 
+def path_literals(code: str) -> list[str]:
+    """The quoted strings in `code` that look like paths: starting with /, ~/, ./ or ../,
+    holding a / anywhere (which covers those), or a bare file name with an extension."""
+    found = []
+    for m in STRING_LITERAL.finditer(code):
+        text = m.group(2)
+        if "/" in text or BARE_FILE.match(text):
+            found.append(text)
+    return found
+
+
+def outside_only(state: dict, code: str, cwd: str) -> bool:
+    """True when `code` has a path literal and every one, resolved against `cwd` (~
+    expanded), lies outside every protected main working tree."""
+    literals = path_literals(code)
+    if not literals:
+        return False
+    for text in literals:
+        path = os.path.expanduser(text) if text.startswith("~/") else text
+        if holder(state, os.path.normpath(os.path.join(cwd, path))) is not None:
+            return False
+    return True
+
+
+def program_refusal(
+    state: dict, name: str, args: list[str], part: Part, cwd: str
+) -> str | None:
+    """Why an inline python or node program `part` runs writes files, unless every path
+    literal in it lies outside the protected repos; None when none must be refused."""
+    for code in inline_programs(name, args, part):
+        why = program_writes(name, code)
+        if why and not outside_only(state, code, cwd):
+            return why
+    return None
+
+
 def part_refusal(state: dict, part: Part, name: str, args: list[str]) -> tuple | None:
     """(text, why, top, branch, advice) when `part` must not run; branch is None for the
     rules that hold on every branch."""
@@ -1115,9 +1165,9 @@ def part_refusal(state: dict, part: Part, name: str, args: list[str]) -> tuple |
     if name == "git" and is_force_push(sub, rest):
         why = "a force push rewrites history"
         return part.text, why, toplevel(where), None, FORCE_ADVICE
-    for _, path, why, _ in writes(part, name, args, cwd):
+    for _, path, why, exact in writes(part, name, args, cwd):
         found = holder(state, path)
-        if found is not None:
+        if found is not None and not (exact and notes_or_ignored(path, found[0])):
             return part.text, why, found[0], found[1], ADVICE
     if name == "git":
         there = repo_at(state, where)
@@ -1131,7 +1181,7 @@ def part_refusal(state: dict, part: Part, name: str, args: list[str]) -> tuple |
                 return part.text, why, toplevel(where), None, PUSH_ADVICE
     here = repo_at(state, cwd)
     if here is not None:
-        why = code_writes(name, args, part)
+        why = program_refusal(state, name, args, part, cwd)
         if why:
             return part.text, why, here[0], here[1], ADVICE
     return None
