@@ -1509,6 +1509,114 @@ class BranchGuardBashExemptions(GuardTestCase):
         )
         self.assertRefusedIn(self.bash(command), command)
 
+    # ---- fix round 1: what a write word reaches, not how it is spelled
+
+    def test_glob_words_are_never_exempt(self):
+        """The shell expands a glob before the command runs, so the word git is asked
+        about is not the file written: `*.log` reaches the tracked keep.log."""
+        for command in (
+            "rm -f *.log",
+            "truncate -s 0 *.log",
+            "rm -rf cach?",
+            "rm -rf data/[ab].csv",
+            "rm -f {build,keep}.log",
+            "echo x > *.log",
+            "rm -f build.log *.log",
+            "touch .env.local data/*.csv",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        # the same targets spelled out stay free
+        self.assertAllowed(("rm -f build.log", "rm -rf cache", "rm -rf data/a.csv"))
+
+    def test_dot_git_is_never_exempt(self):
+        """A broad rule such as `.*` matches `.git` itself; writes under .git stay refused."""
+        repo = self.repo
+        self.write(repo / ".gitignore", ".*\n!.gitignore\n")
+        for command in (
+            "echo x > .git/HEAD",
+            "rm -rf .git",
+            "touch .git/info/x",
+            "rm -rf .git/hooks",
+            "echo x > .env.local && rm -rf .git",
+        ):
+            with self.subTest(command=command):
+                reason = self.bash(command)
+                self.assertIsNotNone(reason)
+                self.assertTrue(reason.startswith("On main in proj. Refused "), reason)
+                self.assertTrue(reason.endswith(f". {ADVICE}"), reason)
+                self.assertIn(".git", reason)
+        self.assertAllowed(
+            ("echo x > .env.local", "echo x > .other-local", "rm -f .env.local")
+        )
+
+    def test_ignored_symlink_to_a_tracked_file_is_not_exempt(self):
+        """The write lands where the symlink points: an ignored or docs/agent/ name that
+        links to a tracked file is judged by that file."""
+        repo = self.repo
+        (repo / ".env.local").unlink()
+        os.symlink("README.md", repo / ".env.local")
+        os.symlink("../../README.md", repo / "docs/agent/x.md")
+        os.symlink("../src/app.py", repo / "cache/app")
+        os.symlink("keep.log", repo / "other.log")  # keep.log is ignored by name, tracked
+        os.symlink("build.log", repo / "alias.log")  # an ignored, untracked target
+        os.symlink(str(self.home / ".venv"), repo / ".venv")  # points outside the repo
+        for command in (
+            "echo x >> .env.local",
+            "echo x > .env.local",
+            "echo x > docs/agent/x.md",
+            "echo x >> cache/app",
+            f"cp {self.outside}/notes.md cache/app",
+            "truncate -s 0 other.log",
+            "echo x > other.log",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        self.assertAllowed(
+            (
+                "echo x > alias.log",
+                "rm .venv",
+                "ln -sfn ../.venv .venv",
+                "echo note >> docs/agent/handoff.md",
+            )
+        )
+
+    def test_other_case_spelling_of_a_tracked_file_is_not_exempt(self):
+        repo = self.repo
+        spelled = repo / "KEEP.LOG"
+        if not (spelled.exists() and os.path.samefile(spelled, repo / "keep.log")):
+            self.skipTest("another spelling of one name needs a case-insensitive file system")
+        for command in ("rm KEEP.LOG", "truncate -s 0 Keep.Log", "echo x > KEEP.log"):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        # an ignored, untracked file in another spelling is still only that file
+        self.assertAllowed(("rm BUILD.LOG", "echo x > Build.Log"))
+
+    def test_literal_joined_to_a_run_time_path_refused(self):
+        """A literal concatenated with a value known only at run time does not say where
+        the program writes, however absolute the literal looks."""
+        repo = self.repo
+        part = "python3 - <<'PY'"
+        for program, cwd in (
+            ("import os\nopen(os.getcwd() + '/out.json', 'w')", repo),
+            ("import os\nopen(os.path.join(os.getcwd(), '/out.json'), 'w')", repo),
+            ('import os\nopen(os.getcwd() + "/src/app.py", "w").write("x")', repo / "src"),
+            ("import os\nopen(f'{os.getcwd()}/notes.txt', 'w')", repo),
+            ("import os\nbase = os.getcwd()\nopen(base + '/README.md', 'w')", repo),
+        ):
+            with self.subTest(program=program, cwd=str(cwd)):
+                self.assertRefusedPart(self.bash(heredoc(program), cwd=cwd), part)
+        command = """node -e "require('fs').writeFileSync(process.cwd() + '/out.json', 'x')\""""
+        self.assertRefusedPart(self.bash(command), command)
+        # plain outside literals stay allowed, beside run-time values that build no path
+        self.assertAllowed(
+            (
+                heredoc(f"import os\nopen('{OUTSIDE_JSON}', 'w')\nprint(os.getcwd())"),
+                heredoc(f"n = 1 + 2\nopen('{OUTSIDE_JSON}', 'w').write(str(n))"),
+                heredoc(f"open('{self.outside}/a.txt', 'w').write('x' + 'y')"),
+            )
+        )
+
 
 TEMP_ROOT = os.path.realpath(tempfile.gettempdir())
 

@@ -23,7 +23,12 @@ the chain), restored after a subshell or a child shell, and moved for git by -C,
     that worktree, and a path outside any repo is never refused. A named path the Edit
     rule exempts (under docs/agent/, or one git ignores) is allowed for every form, rm,
     truncate and both sides of mv included; a directory holding a tracked file is not
-    ignored. The refusal names the first target that is not exempt;
+    ignored. The exemption judges what the write reaches: never for a word with an
+    unquoted glob (*, ?, [) or brace expansion, nor for a path whose first component in
+    the repo is .git, nor for a spelling that differs in case from a tracked file it
+    names (git ls-files with :(icase) says); a symlink is exempt only when the file it
+    resolves to is exempt or lies outside every protected main working tree. The
+    refusal names the first target that is not exempt;
   - when the repo git runs in is on main or master with a commit: git commit, merge
     (except --ff-only), rebase, cherry-pick, revert, am, apply, reset, rm, mv, clean,
     restore, stash pop|apply, checkout of paths or -B main, switch -C main, branch -f, -m
@@ -34,7 +39,10 @@ the chain), restored after a subshell or a child shell, and moved for git by -C,
     a heredoc, that writes files, unless it has a path literal (a quoted string starting
     with /, ~/, ./ or ../, holding a /, or a bare name with an extension) and every one,
     resolved against the part's directory with ~ expanded, lies outside every protected
-    main working tree;
+    main working tree. A literal joined to a value known only at run time does not
+    count as outside: after + or += with a non-literal before it, an argument of
+    os.path.join or path.join with a non-literal before it, or an f-string or template
+    literal with an interpolation before a /;
   - in every repo, on every branch: a force push (--force, -f, --force-with-lease or a
     +refspec), and a push that names main or master as the destination (main,
     HEAD:main, refs/heads/main, :main), --mirror, --all, or a matching (:) or wildcard
@@ -182,6 +190,16 @@ JS_WRITERS = re.compile(
 # starts with /, ~/, ./ or ../, holds a /, or is a bare file name with an extension.
 STRING_LITERAL = re.compile(r"""(["'`])((?:\\.|(?!\1)[^\\\n])*)\1""")
 BARE_FILE = re.compile(r"[A-Za-z0-9_.-]+[.][A-Za-z0-9]{1,8}$")
+# A path literal joined at run time: after + or +=, an argument of os.path.join or
+# path.join, or an f-string or template literal with an interpolation before a /.
+STRING_PREFIX = re.compile(r"(?<![A-Za-z0-9_])[rRbBuUfF]{1,2}$")
+JOIN_CALL = re.compile(r"\b(?:os\.)?path\.join\s*\(")
+INTERPOLATION = re.compile(r"\{[^{}]*\}")
+INTERPOLATION_BEFORE_SLASH = re.compile(r"\{[^{}]*\}.*/")
+# What the shell expands in an unquoted word: a glob or a brace expansion. In the
+# unquoted spelling of a word, each quoted or escaped character is a NUL.
+SHELL_EXPANSION = re.compile(r"[*?[]|\{[^{}]*(?:,|\.\.)[^{}]*\}")
+WORD_BREAKS = " \t\r\n;|&()<>"
 
 
 def shown(text: str) -> str:
@@ -291,6 +309,18 @@ def notes_or_ignored(path: str, top: Path) -> bool:
     if rel.startswith(NOTES_DIR):
         return True
     return git(str(top), "check-ignore", "-q", "--", rel).returncode == 0
+
+
+def tracked_otherwise_spelled(path: str, top: Path, rel: str) -> bool:
+    """True when git tracks `path` (or a file under it) by a spelling of `rel` that
+    differs in case and names the same file: another spelling of a tracked file on a
+    case-insensitive file system, which check-ignore may report as ignored."""
+    listed = git(str(top), "ls-files", "-z", "--", f":(icase,literal){rel}").stdout
+    for entry in listed.split("\0"):
+        spelling = entry[: len(rel)]
+        if entry and spelling != rel and same_entry(os.path.join(str(top), spelling), path):
+            return True
+    return False
 
 
 def check_edit(data: dict, cwd: str) -> None:
@@ -1121,24 +1151,142 @@ def holder(state: dict, path: str | None) -> tuple[Path, str] | None:
     return found
 
 
-def path_literals(code: str) -> list[str]:
-    """The quoted strings in `code` that look like paths: starting with /, ~/, ./ or ../,
-    holding a / anywhere (which covers those), or a bare file name with an extension."""
-    found = []
-    for m in STRING_LITERAL.finditer(code):
-        text = m.group(2)
-        if "/" in text or BARE_FILE.match(text):
-            found.append(text)
+def globbing_words(text: str) -> set[str]:
+    """The words of the shell text `text`, quotes removed, that hold an unquoted glob
+    (*, ?, [) or brace expansion ({a,b}, {a..b}): the shell expands them, so they do not
+    name the files a command writes."""
+    found: set[str] = set()
+    word = raw = quote = ""
+    started = False
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if (quote == "'" and c != "'") or (quote == '"' and c not in '"\\'):
+            word, raw = word + c, raw + "\0"
+        elif quote and c == quote:
+            quote = ""
+        elif quote == '"':  # a backslash inside double quotes
+            if text[i + 1 : i + 2] in ('"', "\\", "$", "`"):
+                i += 1
+            word, raw = word + text[i : i + 1], raw + "\0"
+        elif c in WORD_BREAKS:
+            if started and SHELL_EXPANSION.search(raw):
+                found.add(word)
+            word = raw = ""
+            started = False
+        elif c == "\\":
+            i += 1
+            word, raw, started = word + text[i : i + 1], raw + "\0", True
+        elif c in "'\"":
+            quote, started = c, True
+        else:
+            word, raw, started = word + c, raw + c, True
+        i += 1
+    if started and SHELL_EXPANSION.search(raw):
+        found.add(word)
     return found
 
 
+def expanded(text: str, globbing: set[str]) -> bool:
+    """True when the write target `text` comes from one of the `globbing` words (the
+    word itself, or its end, as in dd's of=)."""
+    return bool(text) and any(word.endswith(text) for word in globbing)
+
+
+def written_exempt(state: dict, path: str, top: Path) -> bool:
+    """True when a Bash write to the absolute `path` in the protected repo `top` gets the
+    Edit exemption: the name is under docs/agent/ or ignored, is not under .git and is
+    not another case spelling of a tracked file; and when it is a symlink, the file it
+    reaches is exempt as well or lies outside every protected main working tree."""
+    if not name_exempt(path, top):
+        return False
+    if not os.path.islink(path):
+        return True
+    target = os.path.realpath(path)
+    found = holder(state, target)
+    if found is None:
+        return True
+    return not os.path.islink(target) and name_exempt(target, found[0])
+
+
+def name_exempt(path: str, top: Path) -> bool:
+    """The name checks of written_exempt for the absolute `path` in the repo `top`."""
+    rel = repo_relative(path, top)
+    if rel is None or rel.split("/")[0] == ".git" or not notes_or_ignored(path, top):
+        return False
+    return not tracked_otherwise_spelled(path, top, rel)
+
+
+def literal_spans(code: str) -> list[tuple[int, int, str, bool]]:
+    """(start, end, text, template) for each quoted string in `code`: start includes a
+    string prefix such as f or r, and template is True for an f-string or a backtick
+    template literal."""
+    spans = []
+    for m in STRING_LITERAL.finditer(code):
+        prefix = STRING_PREFIX.search(code, 0, m.start())
+        start = prefix.start() if prefix else m.start()
+        template = m.group(1) == "`" or bool(prefix and "f" in prefix.group(0).lower())
+        spans.append((start, m.end(), m.group(2), template))
+    return spans
+
+
+def is_path_literal(text: str) -> bool:
+    """A string that looks like a path: starting with /, ~/, ./ or ../, holding a /
+    anywhere (which covers those), or a bare file name with an extension."""
+    return "/" in text or bool(BARE_FILE.match(text))
+
+
+def fixed(span: tuple[int, int, str, bool]) -> bool:
+    """True for a string whose value is in the program: not a template that interpolates."""
+    return not (span[3] and INTERPOLATION.search(span[2]))
+
+
+def joined_at_run_time(code: str, spans: list, k: int) -> bool:
+    """True when the string spans[k] of `code` is joined to a value known only at run
+    time: + or += with a non-literal before it, os.path.join or path.join with a
+    non-literal argument before it, or a template interpolation before a /."""
+    start, _, text, template = spans[k]
+    if template and INTERPOLATION_BEFORE_SLASH.search(text):
+        return True
+    ending = {span[1]: span for span in spans}
+    before = code[:start].rstrip()
+    while before.endswith(("+", "+=")):
+        if before.endswith(("+=", "++")):
+            return True
+        before = before[:-1].rstrip()
+        span = ending.get(len(before))
+        if span is None or not fixed(span):
+            return True
+        before = code[: span[0]].rstrip()
+    for m in JOIN_CALL.finditer(code):
+        opened = m.end() - 1
+        if not opened < start < closing(code, opened):
+            continue
+        rest, j = "", opened + 1
+        for span in spans:
+            if opened < span[0] < start:
+                if not fixed(span):
+                    return True
+                rest += code[j : span[0]]
+                j = span[1]
+        rest += code[j:start]
+        if rest.replace(",", "").strip():
+            return True
+    return False
+
+
 def outside_only(state: dict, code: str, cwd: str) -> bool:
-    """True when `code` has a path literal and every one, resolved against `cwd` (~
-    expanded), lies outside every protected main working tree."""
-    literals = path_literals(code)
+    """True when `code` has a path literal, none is joined to a value known only at run
+    time, and every one, resolved against `cwd` (~ expanded), lies outside every
+    protected main working tree."""
+    spans = literal_spans(code)
+    literals = [k for k, span in enumerate(spans) if is_path_literal(span[2])]
     if not literals:
         return False
-    for text in literals:
+    for k in literals:
+        if joined_at_run_time(code, spans, k):
+            return False
+        text = spans[k][2]
         path = os.path.expanduser(text) if text.startswith("~/") else text
         if holder(state, os.path.normpath(os.path.join(cwd, path))) is not None:
             return False
@@ -1165,9 +1313,18 @@ def part_refusal(state: dict, part: Part, name: str, args: list[str]) -> tuple |
     if name == "git" and is_force_push(sub, rest):
         why = "a force push rewrites history"
         return part.text, why, toplevel(where), None, FORCE_ADVICE
-    for _, path, why, exact in writes(part, name, args, cwd):
+    globbing = None
+    for text, path, why, exact in writes(part, name, args, cwd):
         found = holder(state, path)
-        if found is not None and not (exact and notes_or_ignored(path, found[0])):
+        if found is None:
+            continue
+        if exact and globbing is None:
+            globbing = globbing_words(part.text)
+        if not (
+            exact
+            and not expanded(text, globbing)
+            and written_exempt(state, path, found[0])
+        ):
             return part.text, why, found[0], found[1], ADVICE
     if name == "git":
         there = repo_at(state, where)
