@@ -15,12 +15,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import types
 import unittest
+import uuid
 from pathlib import Path
 
 HOOKS = Path(__file__).resolve().parent.parent / "hooks"
@@ -1305,8 +1307,154 @@ class BranchGuardBashExemptions(GuardTestCase):
             with self.subTest(command=command):
                 self.assertRefusedOnMain(self.bash(command), part, why)
 
+    # ---- ignore rules are git's own, docs/agent/ stands alone
 
-TEMP_ROOT = os.path.realpath(tempfile.gettempdir())
+    def test_ignore_rules_are_gits_own(self):
+        """Globs, negations, a nested .gitignore and .git/info/exclude, as git reads them;
+        names the setUp rules ignored are refused once no rule ignores them."""
+        repo = self.repo
+        self.write(
+            repo / ".gitignore", "secrets/*.pem\ndata/*\n!data/keep.csv\n/top-only.txt\n"
+        )
+        self.write(repo / "sub/.gitignore", "*.tmp\n")
+        git_dir = Path(self.git(repo, "rev-parse", "--absolute-git-dir"))
+        self.write(git_dir / "info/exclude", "scratch-*.txt\n")
+        self.write(repo / "data/keep.csv", "k\n")
+        self.assertAllowed(
+            (
+                "echo x > secrets/k.pem",
+                f"cp {self.outside}/notes.md secrets/deploy.pem",
+                "echo x > data/x.csv",
+                "rm data/a.csv",
+                "echo x > sub/a.tmp",
+                "echo x > sub/deep/b.tmp",
+                "echo x > scratch-1.txt",
+                "touch scratch-2.txt",
+                "echo x > top-only.txt",
+            )
+        )
+        for command, target in (
+            ("echo x > .env.local", ".env.local"),
+            ("echo x > build.log", "build.log"),
+            ("echo x > cache/blob", "cache/blob"),
+            ("echo x > secrets/k.txt", "secrets/k.txt"),
+            ("echo x > secrets/sub/k.pem", "secrets/sub/k.pem"),
+            ("echo x > data/keep.csv", "data/keep.csv"),
+            ("echo x > a.tmp", "a.tmp"),
+            ("echo x > scratch.txt", "scratch.txt"),
+            ("echo x > sub/top-only.txt", "sub/top-only.txt"),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(
+                    self.bash(command),
+                    command,
+                    f"it writes to {target} through a redirection",
+                )
+        for command, why in (
+            ("rm data/keep.csv", "rm changes data/keep.csv inside the repo"),
+            ("ln -sfn ../.venv .venv", "ln changes .venv inside the repo"),
+            ("rm -rf cache", "rm changes cache inside the repo"),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(self.bash(command), command, why)
+
+    def test_docs_agent_allowed_without_any_ignore_rules(self):
+        repo, outside = self.repo, self.outside
+        (repo / ".gitignore").unlink()
+        git_dir = Path(self.git(repo, "rev-parse", "--absolute-git-dir"))
+        self.write(git_dir / "info/exclude", "")
+        self.assertAllowed(
+            (
+                "cp notes.md docs/agent/handoff.md",
+                "echo x >> docs/agent/new.md",
+                "touch docs/agent/specs/a.md",
+                "rm docs/agent/handoff.md",
+                f"mv {outside}/notes.md docs/agent/n.md",
+            )
+        )
+        for command, why in (
+            ("echo x > .env.local", "it writes to .env.local through a redirection"),
+            ("echo x > build.log", "it writes to build.log through a redirection"),
+            ("rm -rf data", "rm changes data inside the repo"),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedOnMain(self.bash(command), command, why)
+
+    # ---- inline programs: every literal, every protected main tree
+
+    def assertRefusedIn(self, reason, part: str, names=("proj",)) -> None:
+        """Refused on main for `part`, in one of the repos `names`, whatever the reason."""
+        self.assertIsNotNone(reason)
+        alternatives = "|".join(re.escape(n) for n in names)
+        pattern = (
+            f"On main in ({alternatives})\\. Refused \"{re.escape(part)}\": "
+            f".+\\. {re.escape(ADVICE)}"
+        )
+        self.assertRegex(reason, re.compile(f"^{pattern}$", re.S))
+
+    def test_outside_literals_vary_and_every_protected_tree_counts(self):
+        repo = self.repo
+        tmp_out = Path(
+            tempfile.mkdtemp(prefix=f"hg{uuid.uuid4().hex[:6]}-", dir="/tmp")
+        )
+        self.addCleanup(shutil.rmtree, tmp_out, True)
+        name = "d" + uuid.uuid4().hex[:8]
+        home_dir = self.home / name
+        home_dir.mkdir()
+        elsewhere = self.tmp / ("w" + uuid.uuid4().hex[:8])
+        elsewhere.mkdir()
+        other = self.make_repo("home/other")
+        self.assertAllowed(
+            (
+                heredoc(f"open('{tmp_out}/out.json', 'w').write('x')"),
+                heredoc(
+                    "import shutil\n"
+                    f"shutil.copy('{tmp_out}/a.md', '{home_dir}/b.md')"
+                ),
+                heredoc(
+                    "import os\n"
+                    f"open(os.path.expanduser('~/{name}/c.json'), 'w').write('x')"
+                ),
+                heredoc(f"open('../{name}/f.json', 'w').write('x')"),
+                f"""python3 -c "open('{home_dir}/d.txt','w').write('x')\"""",
+                f"""node -e "require('fs').writeFileSync('{tmp_out}/e.txt', 'x')\"""",
+            )
+        )
+        # a bare name with an extension, run outside every repo
+        self.assertAllowed(
+            (heredoc("open('report.csv', 'w').write('x')"),), cwd=elsewhere
+        )
+        part = "python3 - <<'PY'"
+        for program, cwd in (
+            # a second protected repo on main counts as much as the one the part runs in
+            (f"open('{OUTSIDE_JSON}', 'w')\nopen('{other}/src/new.py', 'w')", repo),
+            (f"open('{tmp_out}/a.json', 'w')\nopen('{other}/notes.txt', 'w')", repo),
+            (f"open('{tmp_out}/a.json', 'w')\nopen('{repo}/README.md', 'w')", other),
+            # a directory named outside inside the repo is still the repo
+            (f"open('{repo}/outside/x.json', 'w')", repo),
+            # repo targets of every literal form, each beside an allowed literal
+            (f"open('{OUTSIDE_JSON}', 'w')\nopen('./README.md', 'w')", repo),
+            (f"open('{OUTSIDE_JSON}', 'w')\nopen('{repo}/notes.txt', 'w')", repo),
+            (f"open('{OUTSIDE_JSON}', 'w')\nopen('docs/x.md', 'w')", repo),
+            (f"open('{tmp_out}/a.json', 'w')\nopen('notes.txt', 'w')", repo),
+            (
+                f"open('{home_dir}/a.json', 'w')\n"
+                "import os\nopen(os.path.expanduser('~/proj/notes.txt'), 'w')",
+                repo,
+            ),
+        ):
+            with self.subTest(program=program, cwd=str(cwd)):
+                self.assertRefusedIn(
+                    self.bash(heredoc(program), cwd=cwd), part, ("proj", "other")
+                )
+        command = (
+            f"""node -e "require('fs').writeFileSync('{OUTSIDE_JSON}', 'x'); """
+            """require('fs').writeFileSync('./README.md', 'x')\""""
+        )
+        self.assertRefusedIn(self.bash(command), command)
+
+
+TEMP_ROOT =os.path.realpath(tempfile.gettempdir())
 
 
 def swapped_below(path: Path, base: str = TEMP_ROOT) -> Path:
