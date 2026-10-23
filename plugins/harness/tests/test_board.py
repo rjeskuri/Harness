@@ -36,6 +36,14 @@ SPEC_COLORS = {
     "size:S": "C5DEF5", "size:M": "BFDADC", "size:L": "F9D0C4",
     "risk:low": "E6E6E6", "risk:high": "B60205",
     "no-tests": "EDEDED", "needs-local": "FEF2C0", "priority:high": "FF7F0E",
+    "manual-land": "D93F0B", "incident": "B60205", "degraded": "FBCA04", "deploy-frozen": "000000",
+}
+# The autoland group's descriptions, exact (#149).
+AUTOLAND_DESCRIPTIONS = {
+    "manual-land": "Land by hand: autoland skips it",
+    "incident": "A live check failed; autoland is paused in this repo",
+    "degraded": "A live check is degraded; nothing was reverted",
+    "deploy-frozen": "Deploys are stopped until you clear this",
 }
 
 TASK_BODY = """## Request
@@ -274,7 +282,7 @@ class Labels(BoardTest):
         p = self.ok("labels", "ensure")
         calls = self.calls()
         self.assertEqual(len(calls), len(SPEC_COLORS))
-        seen = {}
+        seen, descriptions = {}, {}
         for argv in calls:
             self.assertEqual(argv[:2], ["label", "create"])
             self.assertEqual(argv[3], "--color")
@@ -283,8 +291,32 @@ class Labels(BoardTest):
             self.assertLessEqual(len(argv[6]), 100, argv)           # GitHub's limit for a description
             self.assertEqual(argv[7:], ["--force"])
             seen[argv[2]] = argv[4]
+            descriptions[argv[2]] = argv[6]
         self.assertEqual(seen, SPEC_COLORS)
+        self.assertEqual(len(SPEC_COLORS), 22)                      # the 18 existing labels plus the four new
         self.assertIn(f"{len(SPEC_COLORS)} labels created or updated", p.stdout)
+        self.assertIn("22 labels created or updated", p.stdout)
+        for name, text in AUTOLAND_DESCRIPTIONS.items():
+            self.assertEqual(descriptions.get(name), text, name)
+
+    def test_design_md_label_table_lists_exactly_the_spec_labels_and_colors(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "docs", "design.md")
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("Labels (name, color, meaning)"))
+        rows = []
+        for line in lines[start + 1:]:
+            if line.startswith("|"):
+                rows.append(line)
+            elif rows:                                              # the first non-table line after the table
+                break
+        self.assertGreaterEqual(len(rows), 3, rows)                 # header, separator and at least one group
+        documented = {}
+        for row in rows[2:]:
+            for name, color in re.findall(r"`([^`\s]+)` ([0-9A-Fa-f]{6})\b", row):
+                self.assertNotIn(name, documented, f"{name} is listed twice in design.md")
+                documented[name] = color.upper()
+        self.assertEqual(documented, SPEC_COLORS)
 
     def test_a_failed_create_is_one_line_with_ghs_error(self):
         self.scenario([{"match": ["label", "create"], "stderr": "HTTP 403: Resource not accessible\nmore\n",
