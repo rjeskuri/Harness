@@ -7,7 +7,7 @@ Usage:
     harness-work start N [--venue interactive|headless|bg]
     harness-work attempt N tests|breaker|code|review|fix|ci pass|fail [--tier sonnet|opus|fable]
     harness-work cost N [--pr P] [--json | --markdown]
-    harness-work dispatch [--max 3] [--venue headless|bg | --api] [--dry-run]
+    harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]
     harness-work runs [--sweep] [--all]
     harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
     harness-work worktrees [--stale DAYS]
@@ -77,12 +77,13 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
-    from harness_lib.repo import RepoError, repo_facts
+    from harness_lib.repo import RepoError, repo_facts, worktree_entries
     from harness_lib.settings import setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
     from harness_lib import cost
     from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
     from harness_lib.text import write_json as _write_json
+    from harness_lib import gh as ghlib
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -279,15 +280,20 @@ def board_json(repo, *args):
         raise Problem(f"harness-board {' '.join(str(a) for a in args[:2])} printed no JSON") from None
 
 
+# harness-work's own wording for a gh call (`call` is its first two arguments), as its generic run() words it
+WORK_GH_TEXTS = {
+    "not_found": "{exe} not found",
+    "cannot_run": "cannot run {exe}: {why}",
+    "timed_out": "{exe} {call} timed out after {timeout} s",
+    "failed": "gh {call} failed: {why}",
+    "not_json": "gh {call} printed something other than JSON",
+}
+
+
 def gh_json(repo, args):
-    exe = os.environ.get("HARNESS_GH", "gh")
-    done = run([exe] + args, cwd=repo.main, env=dict(os.environ, GH_PROMPT_DISABLED="1"), timeout=GH_TIMEOUT)
-    if done.returncode != 0:
-        raise Problem(f"gh {' '.join(args[:2])} failed: {last_line(done.stderr) or f'exit {done.returncode}'}")
-    try:
-        return json.loads(done.stdout or "null")
-    except ValueError:
-        raise Problem(f"gh {' '.join(args[:2])} printed something other than JSON") from None
+    """gh's JSON output (None when it printed nothing), run in the main checkout; Problem with gh's last stderr line."""
+    return ghlib.gh_json(args, repo.main, pick=last_line, empty_ok=True, errors="surrogateescape", timeout=GH_TIMEOUT,
+                         describe=lambda a: " ".join(a[:2]), texts=WORK_GH_TEXTS)
 
 
 def api_key_cmd():
@@ -324,27 +330,6 @@ def refusal(record):
     if blockers:
         return f"#{n} is blocked by open {', '.join(blockers)}"
     return None
-
-
-def worktree_entries(repo):
-    """`git worktree list --porcelain` as dicts: path, head, branch (short name) and the flags."""
-    entries, current = [], None
-    for line in git_ok(repo.main, "worktree", "list", "--porcelain").splitlines():
-        if not line.strip():
-            current = None
-            continue
-        key, _, value = line.partition(" ")
-        if key == "worktree":
-            current = {"path": value, "branch": None}
-            entries.append(current)
-        elif current is not None:
-            if key == "branch":
-                current["branch"] = value[len("refs/heads/"):] if value.startswith("refs/heads/") else value
-            elif key == "HEAD":
-                current["head"] = value
-            else:
-                current[key] = value or True
-    return entries
 
 
 def branch_refs(repo, prefix):
@@ -396,9 +381,9 @@ def make_worktree(repo, number, title):
     """(branch, worktree, created): an existing worktree on t/N-*, else a new one on the right branch."""
     pattern = re.compile(rf"^t/{number}-.")
     git(repo.main, "worktree", "prune")                    # entries whose folder is gone would block the add
-    for entry in worktree_entries(repo):
-        if entry.get("branch") and pattern.match(entry["branch"]) and os.path.isdir(entry["path"]):
-            return entry["branch"], os.path.realpath(entry["path"]), False
+    for entry in worktree_entries(repo.main, git_ok):
+        if entry.branch and pattern.match(entry.branch) and os.path.isdir(entry.path):
+            return entry.branch, os.path.realpath(entry.path), False
     remote = [b for b in branch_refs(repo, "refs/remotes/origin/t/") if pattern.match(b)]
     local = [b for b in branch_refs(repo, "refs/heads/t/") if pattern.match(b)]
     branch = (remote or local or [f"t/{number}-{slugify(title)}"])[0]
@@ -1268,9 +1253,9 @@ def cmd_worktrees(repo, args):
     base = os.path.realpath(repo.worktrees_dir) + os.sep
     rows, gh_failed = [], None
     current = now()
-    for entry in worktree_entries(repo):
-        path = os.path.realpath(entry["path"])
-        if not path.startswith(base) or entry.get("bare"):
+    for entry in worktree_entries(repo.main, git_ok):
+        path = os.path.realpath(entry.path)
+        if not path.startswith(base) or entry.bare:
             continue
         when = None
         if os.path.isdir(path):
@@ -1282,7 +1267,7 @@ def cmd_worktrees(repo, args):
         else:
             dirty = False
         pr = None
-        branch = entry.get("branch")
+        branch = entry.branch
         if branch and gh_failed is None:
             try:
                 found = gh_json(repo, ["pr", "list", "--head", branch, "--state", "all", "--json",
@@ -1319,13 +1304,13 @@ def cmd_worktree_remove(repo, args):
     if branch in ("main", "master"):
         raise Problem(f"refusing to remove {branch}")
     git(repo.main, "worktree", "prune")
-    entry = next((e for e in worktree_entries(repo) if e.get("branch") == branch), None)
+    entry = next((e for e in worktree_entries(repo.main, git_ok) if e.branch == branch), None)
     has_branch = ref_exists(repo, f"refs/heads/{branch}")
     if entry is None and not has_branch:
         raise Problem(f"no worktree and no local branch {branch}")
     done = []
     if entry is not None:
-        path = os.path.realpath(entry["path"])
+        path = os.path.realpath(entry.path)
         if path == repo.main:
             raise Problem(f"{branch} is checked out in the main checkout {repo.main}; switch it to main first")
         status = git_ok(path, "status", "--porcelain")
@@ -1380,7 +1365,7 @@ def parser():
 
     dispatch = sub.add_parser("dispatch", parents=[with_repo, with_json],
                               help="start and launch a session per ready ticket")
-    dispatch.add_argument("--max", type=int, default=3, help="live runs at most (default 3)")
+    dispatch.add_argument("--max", type=int, default=10, help="live runs at most (default 10)")
     dispatch.add_argument("--venue", choices=VENUES,
                           help="default: bg (the subscription); headless bills the API key and is refused while the "
                                "api budget is exhausted")
