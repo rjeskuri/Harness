@@ -15,6 +15,11 @@ ticket_usage(main, number, dirs=None) -> {"rows", "totals", "by_model", "session
   model; total = input + output + cache_write + cache_read; model_ms the sum of each message's
   end minus start (never negative); wall_ms the row's latest end minus earliest start, None on
   orchestrator rows.
+- A continued agent's transcript is split into segments at each coordinator `user` entry (ticket #111):
+  the ticket's first review segment is the earliest-starting segment whose stage is review, its end the
+  latest end among its messages; every code or review segment starting after that end is fix, except
+  segment 1 of an agent whose description names its stage; rounds number a stage's segments by start;
+  each segment's model_ms and wall_ms leave out the wait before the next continuation.
 - One message id across files counts once: each usage field the largest, the earliest start,
   the latest end.
 - session_totals sums the cost-state of N's own sessions that have one; None when none has.
@@ -271,7 +276,7 @@ class Generated:
         others = (n * 10 + r.randint(0, 9), n + r.randint(1, 50))
         self.clock = dt.datetime(2026, r.randint(1, 12), r.randint(1, 28), r.randint(0, 23), r.randint(0, 59))
         self.dirs = [str(root / "gen-a"), str(root / "gen-b")]
-        counted = []                      # (agent key, stage, agent, Msg)
+        counted = []                      # (agent key, stage, agent, Msg, description names the stage)
         self.sessions = {}                # id -> (own, cost_state flag or None)
         totals = None
         for _ in range(r.randint(2, 5)):
@@ -312,7 +317,7 @@ class Generated:
                         resumed.append(copy)
                         msg = Msg(msg.mid, min(msg.start, copy.start, key=parse), max(msg.end, copy.end, key=parse),
                                   tuple(max(a, c) for a, c in zip(msg.use, copy.use)), msg.model, b)
-                    counted.append(("main", "orchestrator", "main", msg))
+                    counted.append(("main", "orchestrator", "main", msg, False))
                     contributed = True
             if resumed:
                 copy_id = self.session_id()
@@ -345,7 +350,7 @@ class Generated:
                 agents.append((aid, value, turns(msgs, branch)))
                 if ticket == n:
                     stage = word if word in STAGE_WORDS else TYPE_STAGE.get((atype or "").rsplit(":", 1)[-1], "other")
-                    counted += [((session, aid), stage, atype or "unknown", x) for x in msgs]
+                    counted += [((session, aid), stage, atype or "unknown", x, word in STAGE_WORDS) for x in msgs]
                     contributed = True
             cost, models = None, {}
             if r.random() < 0.5:
@@ -383,18 +388,34 @@ class Generated:
 
     @staticmethod
     def expected_rows(counted):
-        first = {}
-        for key, stage, _, m in counted:
+        """Each generated agent is one segment (no continuations), so its first segment is named
+        exactly when its description names a stage."""
+        first, last, named, stage_of = {}, {}, {}, {}
+        for key, stage, _, m, is_named in counted:
             if key != "main":
-                first[key] = min(first.get(key, m.start), m.start)
+                first[key] = min(first.get(key, m.start), m.start, key=parse)
+                last[key] = max(last.get(key, m.end), m.end, key=parse)
+                named[key] = is_named
+                stage_of[key] = stage
+        # the ticket's first review: the earliest-starting review agent, in any session; every
+        # unnamed code or review agent starting after its last end is a fix round
+        reviews = [k for k, s in stage_of.items() if s == "review"]
+        if reviews:
+            end = parse(last[min(reviews, key=lambda k: parse(first[k]))])
+            for k, s in list(stage_of.items()):
+                if s in ("code", "review") and not named[k] and parse(first[k]) > end:
+                    stage_of[k] = "fix"
         rounds = {}
         for stage in STAGES:
-            keys = sorted({k for k, s, _, _ in counted if s == stage and k != "main"}, key=lambda k: first[k])
+            keys = sorted((k for k, s in stage_of.items() if s == stage), key=lambda k: parse(first[k]))
             for i, k in enumerate(keys, 1):
                 rounds[k] = i
         groups = {}
-        for key, stage, agent, m in counted:
-            rnd = 1 if key == "main" else rounds[key]
+        for key, stage, agent, m, _ in counted:
+            if key == "main":
+                rnd = 1
+            else:
+                stage, rnd = stage_of[key], rounds[key]
             groups.setdefault((stage, rnd, agent, m.model), []).append(m)
         return sort_rows([row(s, rnd, a, mod, msgs) for (s, rnd, a, mod), msgs in groups.items()])
 
@@ -474,8 +495,9 @@ class TicketUsage(Base):
             ("a1b2c3d4e5f600003", meta("harness:reviewer", "#13 review"), turns(review13, B12)),
         ])
         # ticket 13's own session and a prefix lookalike's (t/120-)
-        orch13 = [Msg("msg_x13", T("12:00:00.000"), T("12:00:02.000"), (9, 900, 90, 9000))]
-        coder13 = [Msg("msg_y13", T("12:10:00.000"), T("12:10:04.000"), (8, 800, 80, 8000), HAIKU)]
+        # (13's coder starts before its review ends at 10:40:09, so it stays code, not fix)
+        orch13 = [Msg("msg_x13", T("10:30:00.000"), T("10:30:02.000"), (9, 900, 90, 9000))]
+        coder13 = [Msg("msg_y13", T("10:35:00.000"), T("10:35:04.000"), (8, 800, 80, 8000), HAIKU)]
         write_session(d, sid(2), turns(orch13, B13), agents=[
             ("b0000000000000001", meta("harness:coder", "Implement it"), turns(coder13, B13))])
         orch120 = [Msg("msg_x120", T("13:00:00.000"), T("13:00:05.000"), (7, 700, 70, 7000))]
@@ -610,7 +632,8 @@ class TicketUsage(Base):
                       agents=agents)
         # an own session: the word wins there too
         fix_own = [Msg("msg_w_own", T("16:00:00.000"), T("16:00:03.000"), (11, 111, 1111, 11111))]
-        code_own = [Msg("msg_w_own2", T("15:58:00.000"), T("15:58:02.000"), (12, 122, 1222, 12222))]
+        # starts before the first review (the 15:40 one) ends, so it is code, not fix
+        code_own = [Msg("msg_w_own2", T("15:38:00.000"), T("15:38:02.000"), (12, 122, 1222, 12222))]
         orch_own = [Msg("msg_w_own3", T("15:57:00.000"), T("15:57:01.000"), (13, 133, 1333, 13333))]
         write_session(d, sid(31), turns(orch_own, B12), agents=[
             ("2100000000000000b", meta("harness:reviewer", "#12 fix"), turns(fix_own, B12)),
@@ -1054,6 +1077,310 @@ class TicketUsage(Base):
         self.assertEqual(set(got["session_totals"]), {"models", "api_ms", "sessions"})
         for per in got["session_totals"]["models"].values():
             self.assertEqual(set(per), {"input", "output", "thinking", "cache_read", "cache_write"})
+
+
+# ------------------------------------------------------------------ fix rounds (ticket #111)
+def coordinator_entry(ts, branch):
+    """A continuation: the coordinator's message to a running or resumed agent."""
+    return {"type": "user", "timestamp": ts, "gitBranch": branch, "origin": {"kind": "coordinator"},
+            "message": {"content": "The coordinator sent a message while you were working: please go on"}}
+
+
+def segmented(segments, branch):
+    """One agent transcript from message lists, a continuation before every list but the first."""
+    out = []
+    for i, seg in enumerate(segments):
+        if i:
+            out.append(coordinator_entry(shift(seg[0].start, -500), branch))
+        out += turns(seg, branch)
+    return out
+
+
+def mk(n, start, end, model=OPUS):
+    """A message with a unique id and usage figures that differ per n."""
+    return Msg(f"msg_fr{n}", start, end, (n, n * 100 + 7, n * 10, n * 1000 + 3), model)
+
+
+class FixRounds(Base):
+    """A continued agent's segments, and the first review deciding which are fix rounds."""
+
+    ORCH = Msg("msg_fr_orch", T("09:00:00.000"), T("09:00:02.000"), (1, 10, 100, 0))
+    CODER, REVIEWER, AUTHOR, BREAKER = ("harness:coder", "harness:reviewer", "harness:test-author",
+                                        "harness:test-breaker")
+
+    def expect(self, agents, rows):
+        """Write N's own session with the orchestrator message and `agents` [(aid, meta,
+        [segment message lists])], and check the result is exactly `rows` plus the orchestrator's."""
+        d = self.folder("fix")
+        write_session(d, sid(1), turns([self.ORCH], B12),
+                      agents=[(aid, mt, segmented(segs, B12)) for aid, mt, segs in agents])
+        got = self.usage_of(12, [d])
+        self.check(got, sort_rows(rows + [row("orchestrator", 1, "main", OPUS, [self.ORCH])]),
+                   {sid(1): (True, False)})
+        return got
+
+    # ---------------------------------------------------------- broad: the named rules
+    def test_continued_coder_after_the_first_review_is_a_fix_round(self):
+        author = [mk(1, T("10:00:00.000"), T("10:00:05.000"))]
+        code1 = [mk(2, T("10:10:00.000"), T("10:10:20.000")), mk(3, T("10:10:30.000"), T("10:10:40.000"))]
+        review = [mk(4, T("10:20:00.000"), T("10:20:30.000")), mk(5, T("10:20:40.000"), T("10:21:00.000"))]
+        code2 = [mk(6, T("10:30:00.000"), T("10:30:15.000")), mk(7, T("10:30:20.000"), T("10:30:25.000"), SONNET)]
+        code3 = [mk(8, T("10:40:00.000"), T("10:40:30.000")), mk(9, T("10:41:00.000"), T("10:41:02.000"))]
+        self.expect([
+            ("a0000000000000001", meta(self.AUTHOR, "Write the tests"), [author]),
+            ("a0000000000000002", meta(self.CODER, "Implement it"), [code1, code2, code3]),
+            ("a0000000000000003", meta(self.REVIEWER, "Review the change"), [review]),
+        ], [
+            row("tests", 1, self.AUTHOR, OPUS, author),
+            row("code", 1, self.CODER, OPUS, code1),
+            row("review", 1, self.REVIEWER, OPUS, review),
+            row("fix", 1, self.CODER, OPUS, code2[:1]),
+            row("fix", 1, self.CODER, SONNET, code2[1:]),
+            row("fix", 2, self.CODER, OPUS, code3),
+        ])
+
+    def test_reviewer_recheck_is_fix_and_the_first_review_stays_review(self):
+        code = [mk(1, T("10:10:00.000"), T("10:10:20.000"))]
+        review = [mk(2, T("10:20:00.000"), T("10:20:30.000")), mk(3, T("10:20:40.000"), T("10:21:00.000"))]
+        recheck = [mk(4, T("10:40:00.000"), T("10:40:45.000"))]
+        recheck2 = [mk(5, T("11:20:00.000"), T("11:20:10.000"), FABLE)]
+        got = self.expect([
+            ("b0000000000000001", meta(self.CODER, "Implement it"), [code]),
+            ("b0000000000000002", meta(self.REVIEWER, "Review the change"), [review, recheck, recheck2]),
+        ], [
+            row("code", 1, self.CODER, OPUS, code),
+            row("review", 1, self.REVIEWER, OPUS, review),
+            row("fix", 1, self.REVIEWER, OPUS, recheck),
+            row("fix", 2, self.REVIEWER, FABLE, recheck2),
+        ])
+        self.assertEqual([x["round"] for x in got["rows"] if x["stage"] == "review"], [1])
+
+    def test_unnamed_coder_after_the_first_review_is_fix(self):
+        before = [mk(1, T("10:10:00.000"), T("10:10:20.000"))]
+        review = [mk(2, T("10:20:00.000"), T("10:20:30.000")), mk(3, T("10:20:40.000"), T("10:21:00.000"))]
+        during = [mk(4, T("10:20:10.000"), T("10:20:50.000"))]       # starts before the review ends
+        named = [mk(5, T("10:35:00.000"), T("10:35:10.000"))]        # names its stage: stays code
+        late_coder = [mk(6, T("10:40:00.000"), T("10:40:10.000"))]
+        explorer = [mk(7, T("10:45:00.000"), T("10:45:05.000"))]     # neither code nor review
+        late_reviewer = [mk(8, T("10:50:00.000"), T("10:50:30.000"))]
+        self.expect([
+            ("c0000000000000001", meta(self.CODER, "Implement it"), [before]),
+            ("c0000000000000002", meta(self.REVIEWER, "Review the change"), [review]),
+            ("c0000000000000003", meta(self.CODER, "Implement the rest"), [during]),
+            ("c0000000000000004", meta(self.CODER, "#12 code"), [named]),
+            ("c0000000000000005", meta(self.CODER, "Fix the findings"), [late_coder]),
+            ("c0000000000000006", meta("Explore", "Look around"), [explorer]),
+            ("c0000000000000007", meta(self.REVIEWER, "Check it again"), [late_reviewer]),
+        ], [
+            row("code", 1, self.CODER, OPUS, before),
+            row("code", 2, self.CODER, OPUS, during),
+            row("code", 3, self.CODER, OPUS, named),
+            row("review", 1, self.REVIEWER, OPUS, review),
+            row("fix", 1, self.CODER, OPUS, late_coder),
+            row("fix", 2, self.REVIEWER, OPUS, late_reviewer),
+            row("other", 1, "Explore", OPUS, explorer),
+        ])
+
+    def test_continued_test_author_gives_a_second_tests_round(self):
+        first = [mk(1, T("10:00:00.000"), T("10:00:30.000")), mk(2, T("10:01:00.000"), T("10:01:20.000"))]
+        breaker = [mk(3, T("10:10:00.000"), T("10:10:40.000"))]
+        second = [mk(4, T("10:30:00.000"), T("10:30:50.000")), mk(5, T("10:31:00.000"), T("10:31:09.000"), SONNET)]
+        review = [mk(6, T("10:40:00.000"), T("10:41:00.000"))]
+        third = [mk(7, T("11:00:00.000"), T("11:00:12.000"))]        # tests are never fix
+        self.expect([
+            ("d0000000000000001", meta(self.AUTHOR, "Write the tests"), [first, second, third]),
+            ("d0000000000000002", meta(self.BREAKER, "Break the tests"), [breaker]),
+            ("d0000000000000003", meta(self.REVIEWER, "Review the change"), [review]),
+        ], [
+            row("tests", 1, self.AUTHOR, OPUS, first),
+            row("tests", 2, self.AUTHOR, OPUS, second[:1]),
+            row("tests", 2, self.AUTHOR, SONNET, second[1:]),
+            row("tests", 3, self.AUTHOR, OPUS, third),
+            row("breaker", 1, self.BREAKER, OPUS, breaker),
+            row("review", 1, self.REVIEWER, OPUS, review),
+        ])
+
+    def test_named_first_segment_keeps_its_stage(self):
+        review = [mk(1, T("10:20:00.000"), T("10:20:30.000"))]
+        coder1 = [mk(2, T("10:30:00.000"), T("10:30:20.000"))]
+        coder2 = [mk(3, T("11:00:00.000"), T("11:00:25.000"))]
+        named_review1 = [mk(4, T("10:40:00.000"), T("10:40:20.000"))]
+        named_review2 = [mk(5, T("11:10:00.000"), T("11:10:15.000"))]
+        self.expect([
+            ("e0000000000000001", meta(self.REVIEWER, "Review the change"), [review]),
+            ("e0000000000000002", meta(self.CODER, "#12 code"), [coder1, coder2]),
+            ("e0000000000000003", meta(self.REVIEWER, "#12 review"), [named_review1, named_review2]),
+        ], [
+            row("code", 1, self.CODER, OPUS, coder1),
+            row("review", 1, self.REVIEWER, OPUS, review),
+            row("review", 2, self.REVIEWER, OPUS, named_review1),
+            row("fix", 1, self.CODER, OPUS, coder2),
+            row("fix", 2, self.REVIEWER, OPUS, named_review2),
+        ])
+
+    def test_segments_are_timed_apart(self):
+        review = [mk(1, T("10:20:00.000"), T("10:20:30.000"))]
+        first = [mk(2, T("10:00:00.000"), T("10:00:04.000")), mk(3, T("10:00:05.000"), T("10:00:10.000"))]
+        # the first segment starts before the review ends (code); then four hours of waiting and
+        # the continuation, which starts after it (fix)
+        second = [mk(4, T("14:00:00.000"), T("14:00:06.000")), mk(5, T("14:00:08.000"), T("14:00:20.000"))]
+        got = self.expect([
+            ("f0000000000000001", meta(self.REVIEWER, "Review the change"), [review]),
+            ("f0000000000000002", meta(self.CODER, "Implement it"), [first, second]),
+        ], [
+            row("code", 1, self.CODER, OPUS, first),
+            row("review", 1, self.REVIEWER, OPUS, review),
+            row("fix", 1, self.CODER, OPUS, second),
+        ])
+        by_stage = {x["stage"]: x for x in got["rows"]}
+        self.assertEqual((by_stage["code"]["model_ms"], by_stage["code"]["wall_ms"]), (9000, 10000))
+        self.assertEqual((by_stage["fix"]["model_ms"], by_stage["fix"]["wall_ms"]), (18000, 20000))
+
+    # ---------------------------------------------------------- the coordinator entry is the boundary
+    def test_only_a_coordinator_entry_splits_a_segment(self):
+        review = [mk(1, T("10:05:00.000"), T("10:05:30.000"))]
+        # one segment, its messages eight minutes apart (a long tool call): it stays one code segment
+        first = [mk(2, T("10:00:00.000"), T("10:00:10.000")), mk(3, T("10:08:00.000"), T("10:08:20.000"))]
+        # the continuation's first message starts 1.5 s after the last one ended: still a new segment
+        second = [mk(4, T("10:08:21.500"), T("10:08:30.000")), mk(5, T("10:08:35.000"), T("10:08:50.000"))]
+        got = self.expect([
+            ("h0000000000000001", meta(self.REVIEWER, "Review the change"), [review]),
+            ("h0000000000000002", meta(self.CODER, "Implement it"), [first, second]),
+        ], [
+            row("code", 1, self.CODER, OPUS, first),
+            row("review", 1, self.REVIEWER, OPUS, review),
+            row("fix", 1, self.CODER, OPUS, second),
+        ])
+        by_stage = {x["stage"]: x for x in got["rows"]}
+        self.assertEqual((by_stage["code"]["messages"], by_stage["code"]["wall_ms"]), (2, 500000))   # 10:00:00 to 10:08:20
+        self.assertEqual((by_stage["fix"]["messages"], by_stage["fix"]["wall_ms"]), (2, 28500))
+
+    def test_continued_coder_segment_starting_before_the_review_ends_stays_code(self):
+        code1 = [mk(1, T("10:10:00.000"), T("10:10:20.000"))]
+        review = [mk(2, T("10:20:00.000"), T("10:20:30.000")), mk(3, T("10:20:40.000"), T("10:21:00.000"))]
+        code2 = [mk(4, T("10:20:30.000"), T("10:20:50.000"))]      # before 10:21:00: still code
+        code3 = [mk(5, T("10:30:00.000"), T("10:30:10.000"))]      # after: fix
+        self.expect([
+            ("i0000000000000001", meta(self.CODER, "Implement it"), [code1, code2, code3]),
+            ("i0000000000000002", meta(self.REVIEWER, "Review the change"), [review]),
+        ], [
+            row("code", 1, self.CODER, OPUS, code1),
+            row("code", 2, self.CODER, OPUS, code2),
+            row("review", 1, self.REVIEWER, OPUS, review),
+            row("fix", 1, self.CODER, OPUS, code3),
+        ])
+
+    def test_named_coder_continued_before_the_review_ends_stays_code(self):
+        review = [mk(1, T("10:20:00.000"), T("10:20:30.000")), mk(2, T("10:20:40.000"), T("10:21:00.000"))]
+        code1 = [mk(3, T("10:12:00.000"), T("10:12:20.000"))]
+        code2 = [mk(4, T("10:20:45.000"), T("10:20:55.000"))]      # before the review ends
+        code3 = [mk(5, T("10:40:00.000"), T("10:40:10.000"))]      # after it
+        self.expect([
+            ("j0000000000000001", meta(self.CODER, "#12 code"), [code1, code2, code3]),
+            ("j0000000000000002", meta(self.REVIEWER, "Review the change"), [review]),
+        ], [
+            row("code", 1, self.CODER, OPUS, code1),
+            row("code", 2, self.CODER, OPUS, code2),
+            row("review", 1, self.REVIEWER, OPUS, review),
+            row("fix", 1, self.CODER, OPUS, code3),
+        ])
+
+    def test_a_segment_starting_exactly_when_the_review_ends_is_not_fix(self):
+        code1 = [mk(1, T("10:10:00.000"), T("10:10:20.000"))]
+        review = [mk(2, T("10:20:00.000"), T("10:20:30.000")), mk(3, T("10:20:40.000"), T("10:21:00.000"))]
+        at_end = [mk(4, T("10:21:00.000"), T("10:21:10.000"))]     # exactly the review's end
+        just_after = [mk(5, T("10:21:00.001"), T("10:21:10.000"))]  # one millisecond later
+        self.expect([
+            ("k0000000000000001", meta(self.CODER, "Implement it"), [code1, at_end]),
+            ("k0000000000000002", meta(self.REVIEWER, "Review the change"), [review]),
+            ("k0000000000000003", meta(self.CODER, "Implement more"), [just_after]),
+        ], [
+            row("code", 1, self.CODER, OPUS, code1),
+            row("code", 2, self.CODER, OPUS, at_end),
+            row("review", 1, self.REVIEWER, OPUS, review),
+            row("fix", 1, self.CODER, OPUS, just_after),
+        ])
+
+    def test_fix_rounds_share_one_sequence_by_start(self):
+        code1 = [mk(1, T("10:10:00.000"), T("10:10:20.000"))]
+        review1 = [mk(2, T("10:20:00.000"), T("10:21:00.000"))]
+        recheck1 = [mk(3, T("10:30:00.000"), T("10:30:30.000"))]   # first fix, a reviewer's
+        code2 = [mk(4, T("10:40:00.000"), T("10:40:20.000"))]      # second fix, the coder's
+        recheck2 = [mk(5, T("10:50:00.000"), T("10:50:05.000"))]   # third, the reviewer's again
+        self.expect([
+            ("l0000000000000001", meta(self.CODER, "Implement it"), [code1, code2]),
+            ("l0000000000000002", meta(self.REVIEWER, "Review the change"), [review1, recheck1, recheck2]),
+        ], [
+            row("code", 1, self.CODER, OPUS, code1),
+            row("review", 1, self.REVIEWER, OPUS, review1),
+            row("fix", 1, self.REVIEWER, OPUS, recheck1),
+            row("fix", 2, self.CODER, OPUS, code2),
+            row("fix", 3, self.REVIEWER, OPUS, recheck2),
+        ])
+
+    def test_a_named_review_agent_is_the_first_review(self):
+        # the only review is named `#12 review` (and is no reviewer by type): it sets the first review's end
+        before = [mk(1, T("10:10:00.000"), T("10:10:20.000"))]
+        review = [mk(2, T("10:20:00.000"), T("10:20:30.000")), mk(3, T("10:20:40.000"), T("10:21:00.000"))]
+        recheck = [mk(4, T("10:45:00.000"), T("10:45:10.000"))]
+        after = [mk(5, T("10:30:00.000"), T("10:30:10.000"))]
+        self.expect([
+            ("m0000000000000001", meta(self.CODER, "Implement it"), [before]),
+            ("m0000000000000002", meta("general-purpose", "#12 review"), [review, recheck]),
+            ("m0000000000000003", meta(self.CODER, "Implement more"), [after]),
+        ], [
+            row("code", 1, self.CODER, OPUS, before),
+            row("review", 1, "general-purpose", OPUS, review),
+            row("fix", 1, self.CODER, OPUS, after),
+            row("fix", 2, "general-purpose", OPUS, recheck),
+        ])
+
+    def test_fix_rule_spans_sessions(self):
+        # the first review is the ticket's, whichever session holds it: a coder in session 2 that
+        # starts after the review (session 1) ended is fix; one that started before it ended is code
+        review = [mk(1, T("10:20:00.000"), T("10:20:30.000")), mk(2, T("10:20:40.000"), T("10:21:00.000"))]
+        orch2 = Msg("msg_fr_orch2", T("10:00:00.000"), T("10:00:01.000"), (2, 20, 200, 0))
+        early = [mk(3, T("10:20:50.000"), T("10:21:30.000"))]      # starts before 10:21:00
+        late = [mk(4, T("10:40:00.000"), T("10:40:20.000")), mk(5, T("10:40:30.000"), T("10:40:35.000"))]
+        late_review = [mk(6, T("10:50:00.000"), T("10:50:10.000"))]  # a second review: fix too
+        d = self.folder("fix2")
+        write_session(d, sid(1), turns([self.ORCH], B12), agents=[
+            ("n0000000000000001", meta(self.REVIEWER, "Review the change"), segmented([review], B12))])
+        write_session(d, sid(2), turns([orch2], B12), agents=[
+            ("n0000000000000002", meta(self.CODER, "Implement it"), segmented([early], B12)),
+            ("n0000000000000003", meta(self.CODER, "Fix the findings"), segmented([late], B12)),
+            ("n0000000000000004", meta(self.REVIEWER, "Check it again"), segmented([late_review], B12))])
+        got = self.usage_of(12, [d])
+        self.check(got, sort_rows([
+            row("code", 1, self.CODER, OPUS, early),
+            row("review", 1, self.REVIEWER, OPUS, review),
+            row("fix", 1, self.CODER, OPUS, late),
+            row("fix", 2, self.REVIEWER, OPUS, late_review),
+            row("orchestrator", 1, "main", OPUS, [self.ORCH, orch2]),
+        ]), {sid(1): (True, False), sid(2): (True, False)})
+
+    def test_no_review_means_no_fix(self):
+        author = [mk(1, T("10:00:00.000"), T("10:00:05.000"))]
+        breaker = [mk(2, T("10:05:00.000"), T("10:05:30.000"))]
+        code1 = [mk(3, T("10:10:00.000"), T("10:10:20.000"))]
+        code2 = [mk(4, T("10:30:00.000"), T("10:30:15.000"))]
+        late_coder = [mk(5, T("10:50:00.000"), T("10:50:10.000"))]
+        explorer = [mk(6, T("11:00:00.000"), T("11:00:05.000"))]
+        got = self.expect([
+            ("g0000000000000001", meta(self.AUTHOR, "Write the tests"), [author]),
+            ("g0000000000000002", meta(self.BREAKER, "Break the tests"), [breaker]),
+            ("g0000000000000003", meta(self.CODER, "Implement it"), [code1, code2]),
+            ("g0000000000000004", meta(self.CODER, "Implement more"), [late_coder]),
+            ("g0000000000000005", meta("Explore", "Look around"), [explorer]),
+        ], [
+            row("tests", 1, self.AUTHOR, OPUS, author),
+            row("breaker", 1, self.BREAKER, OPUS, breaker),
+            row("code", 1, self.CODER, OPUS, code1),
+            row("code", 2, self.CODER, OPUS, code2),
+            row("code", 3, self.CODER, OPUS, late_coder),
+            row("other", 1, "Explore", OPUS, explorer),
+        ])
+        self.assertNotIn("fix", {x["stage"] for x in got["rows"]})
 
 
 if __name__ == "__main__":
