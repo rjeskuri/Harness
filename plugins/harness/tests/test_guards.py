@@ -1510,7 +1510,7 @@ class BranchGuardBashExemptions(GuardTestCase):
         self.assertRefusedIn(self.bash(command), command)
 
 
-TEMP_ROOT =os.path.realpath(tempfile.gettempdir())
+TEMP_ROOT = os.path.realpath(tempfile.gettempdir())
 
 
 def swapped_below(path: Path, base: str = TEMP_ROOT) -> Path:
