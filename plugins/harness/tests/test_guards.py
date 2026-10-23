@@ -26,6 +26,17 @@ import uuid
 from pathlib import Path
 
 HOOKS = Path(__file__).resolve().parent.parent / "hooks"
+SHOWN_LIMIT = 160  # a refused part is displayed cut to 160 characters
+
+
+def as_shown(part: str) -> str:
+    """The refused part as a denial displays it: up to SHOWN_LIMIT characters,
+    a longer part cut to SHOWN_LIMIT - 1 characters plus an ellipsis."""
+    if len(part) <= SHOWN_LIMIT:
+        return part
+    return part[: SHOWN_LIMIT - 1] + "…"
+
+
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 GIT_IDENTITY = {
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -465,7 +476,8 @@ class BranchGuardBashTests(GuardTestCase):
 
     def assertRefusedOnMain(self, reason, part: str, why: str, name="proj") -> None:
         self.assertEqual(
-            reason, f'On main in {name}. Refused "{part}": {why}. {ADVICE}'
+            reason,
+            f'On main in {name}. Refused "{as_shown(part)}": {why}. {ADVICE}',
         )
 
     def test_denies_commands_that_change_main(self):
@@ -886,13 +898,14 @@ class BranchGuardBashExemptions(GuardTestCase):
 
     def assertRefusedOnMain(self, reason, part: str, why: str) -> None:
         self.assertEqual(
-            reason, f'On main in proj. Refused "{part}": {why}. {ADVICE}'
+            reason,
+            f'On main in proj. Refused "{as_shown(part)}": {why}. {ADVICE}',
         )
 
     def assertRefusedPart(self, reason, part: str) -> None:
         """Refused on main for `part`, whatever the stated reason."""
         self.assertIsNotNone(reason)
-        prefix = f'On main in proj. Refused "{part}": '
+        prefix = f'On main in proj. Refused "{as_shown(part)}": '
         self.assertTrue(reason.startswith(prefix), reason)
         self.assertTrue(reason.endswith(f". {ADVICE}"), reason)
 
@@ -1420,7 +1433,7 @@ class BranchGuardBashExemptions(GuardTestCase):
         self.assertIsNotNone(reason)
         alternatives = "|".join(re.escape(n) for n in names)
         pattern = (
-            f"On main in ({alternatives})\\. Refused \"{re.escape(part)}\": "
+            f"On main in ({alternatives})\\. Refused \"{re.escape(as_shown(part))}\": "
             f".+\\. {re.escape(ADVICE)}"
         )
         self.assertRegex(reason, re.compile(f"^{pattern}$", re.S))
@@ -1999,7 +2012,7 @@ class TestsFirstTests(GuardTestCase):
 
     def assertRefusedAs(self, reason, part: str, why: str) -> None:
         self.assertIsNotNone(reason, f"{part!r} was allowed")
-        self.assertTrue(reason.startswith(f'Refused "{part}": '), reason)
+        self.assertTrue(reason.startswith(f'Refused "{as_shown(part)}": '), reason)
         self.assertIn(why, reason)
 
     def test_bulk_git_forms_are_refused_to_the_coder_and_breaker(self):
