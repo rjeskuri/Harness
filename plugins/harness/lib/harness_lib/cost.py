@@ -145,8 +145,8 @@ def _attribute(number, found):
         by_segment = {}
         for m in u[4]:
             by_segment.setdefault(m["segment"], []).append(m)
-        for i, seg in enumerate(sorted(by_segment)):
-            parts.append(u[:4] + [by_segment[seg], u[5], seg, i == 0])
+        for seg in sorted(by_segment):
+            parts.append(u[:4] + [by_segment[seg], u[5], seg, seg == 1])
 
     def first_start(part):
         starts = [m["start"] for m in part[4] if m["start"] is not None]

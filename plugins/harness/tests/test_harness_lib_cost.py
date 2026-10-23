@@ -276,7 +276,8 @@ class Generated:
         others = (n * 10 + r.randint(0, 9), n + r.randint(1, 50))
         self.clock = dt.datetime(2026, r.randint(1, 12), r.randint(1, 28), r.randint(0, 23), r.randint(0, 59))
         self.dirs = [str(root / "gen-a"), str(root / "gen-b")]
-        counted = []                      # (agent key, stage, agent, Msg, description names the stage)
+        # (agent key, stage, agent, Msg, description names the stage, segment number; 0: orchestrator)
+        counted = []
         self.sessions = {}                # id -> (own, cost_state flag or None)
         totals = None
         for _ in range(r.randint(2, 5)):
@@ -317,7 +318,7 @@ class Generated:
                         resumed.append(copy)
                         msg = Msg(msg.mid, min(msg.start, copy.start, key=parse), max(msg.end, copy.end, key=parse),
                                   tuple(max(a, c) for a, c in zip(msg.use, copy.use)), msg.model, b)
-                    counted.append(("main", "orchestrator", "main", msg, False))
+                    counted.append(("main", "orchestrator", "main", msg, False, 0))
                     contributed = True
             if resumed:
                 copy_id = self.session_id()
@@ -346,11 +347,21 @@ class Generated:
                 value = meta(atype, desc)
                 if desc is None and atype is None and r.random() < 0.5:
                     value = None
-                msgs = [self.msg(f"msg_{aid}_{k}", None) for k in range(r.randint(1, 3))]
-                agents.append((aid, value, turns(msgs, branch)))
+                # a continued agent: a coordinator entry between some of its messages starts a new
+                # segment; seg_of[k] is message k's segment number (1 for an agent never continued)
+                msgs = [self.msg(f"msg_{aid}_{k}", None) for k in range(r.randint(1, 4))]
+                seg_of, agent_entries, seg = [], [], 1
+                for k, x in enumerate(msgs):
+                    if k and r.random() < 0.4:
+                        agent_entries.append(coordinator_entry(shift(x.start, -1), branch))
+                        seg += 1
+                    seg_of.append(seg)
+                    agent_entries += turns([x], branch)
+                agents.append((aid, value, agent_entries))
                 if ticket == n:
                     stage = word if word in STAGE_WORDS else TYPE_STAGE.get((atype or "").rsplit(":", 1)[-1], "other")
-                    counted += [((session, aid), stage, atype or "unknown", x, word in STAGE_WORDS) for x in msgs]
+                    counted += [((session, aid), stage, atype or "unknown", x, word in STAGE_WORDS, g)
+                                for x, g in zip(msgs, seg_of)]
                     contributed = True
             cost, models = None, {}
             if r.random() < 0.5:
@@ -388,34 +399,35 @@ class Generated:
 
     @staticmethod
     def expected_rows(counted):
-        """Each generated agent is one segment (no continuations), so its first segment is named
-        exactly when its description names a stage."""
+        """A continued agent is split at its coordinator entries into segments, each a unit of its
+        own: the ticket's first review is the earliest-starting review segment; every code or
+        review segment starting after its last end is a fix round, except segment 1 of an agent
+        whose description names its stage; a stage's rounds number its segments by first start."""
         first, last, named, stage_of = {}, {}, {}, {}
-        for key, stage, _, m, is_named in counted:
+        for key, stage, _, m, is_named, seg in counted:
             if key != "main":
-                first[key] = min(first.get(key, m.start), m.start, key=parse)
-                last[key] = max(last.get(key, m.end), m.end, key=parse)
-                named[key] = is_named
-                stage_of[key] = stage
-        # the ticket's first review: the earliest-starting review agent, in any session; every
-        # unnamed code or review agent starting after its last end is a fix round
-        reviews = [k for k, s in stage_of.items() if s == "review"]
+                unit = (key, seg)
+                first[unit] = min(first.get(unit, m.start), m.start, key=parse)
+                last[unit] = max(last.get(unit, m.end), m.end, key=parse)
+                named[unit] = is_named
+                stage_of[unit] = stage
+        reviews = [u for u, s in stage_of.items() if s == "review"]
         if reviews:
-            end = parse(last[min(reviews, key=lambda k: parse(first[k]))])
-            for k, s in list(stage_of.items()):
-                if s in ("code", "review") and not named[k] and parse(first[k]) > end:
-                    stage_of[k] = "fix"
+            end = parse(last[min(reviews, key=lambda u: parse(first[u]))])
+            for u, s in list(stage_of.items()):
+                if s in ("code", "review") and not (named[u] and u[1] == 1) and parse(first[u]) > end:
+                    stage_of[u] = "fix"
         rounds = {}
         for stage in STAGES:
-            keys = sorted((k for k, s in stage_of.items() if s == stage), key=lambda k: parse(first[k]))
-            for i, k in enumerate(keys, 1):
-                rounds[k] = i
+            units = sorted((u for u, s in stage_of.items() if s == stage), key=lambda u: parse(first[u]))
+            for i, u in enumerate(units, 1):
+                rounds[u] = i
         groups = {}
-        for key, stage, agent, m, _ in counted:
+        for key, stage, agent, m, _, seg in counted:
             if key == "main":
                 rnd = 1
             else:
-                stage, rnd = stage_of[key], rounds[key]
+                stage, rnd = stage_of[(key, seg)], rounds[(key, seg)]
             groups.setdefault((stage, rnd, agent, m.model), []).append(m)
         return sort_rows([row(s, rnd, a, mod, msgs) for (s, rnd, a, mod), msgs in groups.items()])
 
@@ -1381,6 +1393,95 @@ class FixRounds(Base):
             row("other", 1, "Explore", OPUS, explorer),
         ])
         self.assertNotIn("fix", {x["stage"] for x in got["rows"]})
+
+    # ---------------------------------------------------------- segments after cross-file dedup
+    def test_dedup_of_a_resumed_copy_does_not_change_which_segment_is_the_first(self):
+        # `#12 code` in two files: the short copy holds segment 1, the resumed copy (another
+        # folder) holds segments 1-2. Segment 1's message is counted once, in whichever file
+        # comes first; segment 2 is not segment 1 of the named agent, so it is fix, in either
+        # order of the folders.
+        review = [mk(1, T("10:20:00.000"), T("10:21:00.000"))]
+        seg1 = [mk(2, T("10:10:00.000"), T("10:10:20.000"))]
+        seg2 = [mk(3, T("10:30:00.000"), T("10:30:20.000"))]
+        short, long = self.folder("short-copy"), self.folder("resumed-copy")
+        main = [user_entry(T("09:00:00.000"), B12)]
+        write_session(short, sid(1), main, agents=[
+            ("r0000000000000001", meta(self.REVIEWER, "Review the change"), segmented([review], B12)),
+            ("r0000000000000002", meta(self.CODER, "#12 code"), segmented([seg1], B12))])
+        write_session(long, sid(2), main, agents=[
+            ("r0000000000000003", meta(self.CODER, "#12 code"), segmented([seg1, seg2], B12))])
+        rows = sort_rows([row("code", 1, self.CODER, OPUS, seg1),
+                          row("review", 1, self.REVIEWER, OPUS, review),
+                          row("fix", 1, self.CODER, OPUS, seg2)])
+        sessions = {sid(1): (True, False), sid(2): (True, False)}
+        for dirs in ([short, long], [long, short]):
+            with self.subTest(dirs=[Path(x).name for x in dirs]):
+                self.check(self.usage_of(12, dirs), rows, sessions)
+
+    # ---------------------------------------------------------- min and max, not listed order
+    def test_review_end_is_the_latest_end_when_a_copy_stretches_the_first_message(self):
+        # the first review's earlier-listed message r1 ends last, through a copy of it (same id)
+        # in another folder that ends at 10:25:00; r2, listed last, ends at 10:21:00
+        r1 = mk(1, T("10:20:00.000"), T("10:20:30.000"))
+        r2 = mk(2, T("10:20:40.000"), T("10:21:00.000"))
+        stretched = r1._replace(end=T("10:25:00.000"))
+        code = [mk(3, T("10:10:00.000"), T("10:10:20.000"))]
+        between = [mk(4, T("10:23:00.000"), T("10:23:30.000"))]   # after r2's end, before r1's: code
+        after = [mk(5, T("10:26:00.000"), T("10:26:10.000"))]     # after every end: fix
+        first, second = self.folder("review"), self.folder("review-copy")
+        main = [user_entry(T("09:00:00.000"), B12)]
+        write_session(first, sid(1), main, agents=[
+            ("s0000000000000001", meta(self.REVIEWER, "Review the change"), segmented([[r1, r2]], B12))])
+        write_session(second, sid(2), main, agents=[
+            ("s0000000000000002", meta(self.REVIEWER, "Review the change"), segmented([[stretched]], B12)),
+            ("s0000000000000003", meta(self.CODER, "Implement it"), segmented([code], B12)),
+            ("s0000000000000004", meta(self.CODER, "Implement more"), segmented([between], B12)),
+            ("s0000000000000005", meta(self.CODER, "Fix the findings"), segmented([after], B12))])
+        got = self.usage_of(12, [first, second])
+        self.check(got, sort_rows([
+            row("code", 1, self.CODER, OPUS, code),
+            row("code", 2, self.CODER, OPUS, between),
+            row("review", 1, self.REVIEWER, OPUS, [stretched, r2]),
+            row("fix", 1, self.CODER, OPUS, after),
+        ]), {sid(1): (True, False), sid(2): (True, False)})
+
+    def test_review_end_is_the_latest_end_even_when_listed_first(self):
+        # r1, listed first, ends at 10:25:00; r2, listed last, ends at 10:21:00
+        r1 = mk(1, T("10:20:00.000"), T("10:25:00.000"))
+        r2 = mk(2, T("10:20:40.000"), T("10:21:00.000"))
+        code = [mk(3, T("10:10:00.000"), T("10:10:20.000"))]
+        between = [mk(4, T("10:23:00.000"), T("10:23:30.000"))]
+        after = [mk(5, T("10:26:00.000"), T("10:26:10.000"))]
+        self.expect([
+            ("t0000000000000001", meta(self.REVIEWER, "Review the change"), [[r1, r2]]),
+            ("t0000000000000002", meta(self.CODER, "Implement it"), [code]),
+            ("t0000000000000003", meta(self.CODER, "Implement more"), [between]),
+            ("t0000000000000004", meta(self.CODER, "Fix the findings"), [after]),
+        ], [
+            row("code", 1, self.CODER, OPUS, code),
+            row("code", 2, self.CODER, OPUS, between),
+            row("review", 1, self.REVIEWER, OPUS, [r1, r2]),
+            row("fix", 1, self.CODER, OPUS, after),
+        ])
+
+    def test_segment_start_is_its_earliest_start_whatever_the_listed_order(self):
+        # the review ends at 10:20:00. Each coder segment has one message before that and one
+        # after, so its true start (the earliest) is before the end: code, in either listed order
+        review = [mk(1, T("10:10:00.000"), T("10:20:00.000"))]
+        late_first = [mk(2, T("10:30:00.000"), T("10:30:10.000")), mk(3, T("10:15:00.000"), T("10:15:10.000"))]
+        early_first = [mk(4, T("10:16:00.000"), T("10:16:10.000")), mk(5, T("10:30:00.000"), T("10:30:10.000"))]
+        control = [mk(6, T("10:40:00.000"), T("10:40:10.000")), mk(7, T("10:41:00.000"), T("10:41:10.000"))]
+        self.expect([
+            ("u0000000000000001", meta(self.REVIEWER, "Review the change"), [review]),
+            ("u0000000000000002", meta(self.CODER, "Implement it"), [late_first]),
+            ("u0000000000000003", meta(self.CODER, "Implement more"), [early_first]),
+            ("u0000000000000004", meta(self.CODER, "Fix the findings"), [control]),
+        ], [
+            row("code", 1, self.CODER, OPUS, late_first),
+            row("code", 2, self.CODER, OPUS, early_first),
+            row("review", 1, self.REVIEWER, OPUS, review),
+            row("fix", 1, self.CODER, OPUS, control),
+        ])
 
 
 if __name__ == "__main__":
