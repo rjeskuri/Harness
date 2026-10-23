@@ -1,7 +1,9 @@
 """The repository core harness-board, harness-pr, harness-work and harness-red build their Repo on
-(repo_facts), and the main-checkout lookup of harness-worklog and the hooks session_brief.py and
-tests_first.py (main_checkout). The main working tree is the parent of git's common dir, so a
-linked worktree and its main checkout share one state key. See docs/design.md (repo-key).
+(repo_facts), the main-checkout lookup of harness-worklog and the hooks session_brief.py and
+tests_first.py (main_checkout), and the one `git worktree list --porcelain` parser harness-work,
+harness-pr, harness-digest and harness-standup share (worktree_entries). The main working tree is
+the parent of git's common dir, so a linked worktree and its main checkout share one state key.
+See docs/design.md (repo-key).
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -11,6 +13,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+from typing import NamedTuple, Optional
 
 from harness_lib.paths import adopt_old_state, canonical_path
 
@@ -51,6 +54,47 @@ def repo_facts(path, git, pick_line):
     main = canonical_path(reported)
     repos = os.path.join(os.path.expanduser("~"), ".claude", "harness", "repos")
     return root, common_dir, main, adopt_old_state(repos, main, reported, path)
+
+
+class Worktree(NamedTuple):
+    """One entry of `git worktree list --porcelain`: the folder, the branch's short name (None when
+    detached or bare), the head commit (None for a bare repository) and the bare, locked and prunable
+    flags (a lock's or a prune's reason is not kept)."""
+
+    path: str
+    branch: Optional[str]
+    head: Optional[str]
+    bare: bool
+    locked: bool
+    prunable: bool
+
+
+def worktree_entries(main, git):
+    """The worktrees of the repository holding `main` as Worktree entries, the main working tree
+    first. `git(main, "worktree", "list", "--porcelain")` runs git for the caller and returns the
+    output text, or an object carrying it as .stdout; the caller's own failures (a non-zero exit, a
+    timeout, git missing) stay its own: whatever its git raises reaches it untouched."""
+    out = git(main, "worktree", "list", "--porcelain")
+    text = out if isinstance(out, str) else out.stdout
+    entries, current = [], None
+    for line in text.splitlines():
+        if not line.strip():
+            current = None
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            current = {"path": value, "branch": None, "head": None, "bare": False, "locked": False,
+                       "prunable": False}
+            entries.append(current)
+        elif current is None:
+            continue
+        elif key == "branch":
+            current["branch"] = value[len("refs/heads/"):] if value.startswith("refs/heads/") else value
+        elif key == "HEAD":
+            current["head"] = value
+        elif key in ("bare", "locked", "prunable"):
+            current[key] = True
+    return [Worktree(**entry) for entry in entries]
 
 
 def main_checkout(path, timeout=TIMEOUT):

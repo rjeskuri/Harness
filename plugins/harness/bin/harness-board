@@ -85,6 +85,10 @@ LABELS = [
     ("no-tests", "EDEDED", "Docs or config only; exempt from tests-first"),
     ("needs-local", "FEF2C0", "Needs this Mac's files or credentials"),
     ("priority:high", "FF7F0E", "Dispatched first"),
+    ("manual-land", "D93F0B", "Land by hand: autoland skips it"),
+    ("incident", "B60205", "A live check failed; autoland is paused in this repo"),
+    ("degraded", "FBCA04", "A live check is degraded; nothing was reverted"),
+    ("deploy-frozen", "000000", "Deploys are stopped until you clear this"),
 ]
 TYPES = ("epic", "bug", "refactor", "chore", "task")          # the first present wins
 TASK_TYPES = ("task", "bug", "chore", "refactor")

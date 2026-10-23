@@ -49,7 +49,7 @@ try:
                                   read_text, write_json, write_text)
     from harness_lib.notify import notify
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
-    from harness_lib.repo import RepoError, repo_facts
+    from harness_lib.repo import RepoError, repo_facts, worktree_entries
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -1110,17 +1110,7 @@ def cmd_ultra(args):
 # --------------------------------------------------------------- land
 def worktree_for(main, branch):
     """The path of the worktree that has `branch` checked out, or None."""
-    out = git_ok(main, "worktree", "list", "--porcelain")
-    for block in out.split("\n\n"):
-        path, ref = None, None
-        for line in block.splitlines():
-            if line.startswith("worktree "):
-                path = line[len("worktree "):]
-            elif line.startswith("branch "):
-                ref = line[len("branch "):]
-        if path and ref == f"refs/heads/{branch}":
-            return path
-    return None
+    return next((w.path for w in worktree_entries(main, git_ok) if w.branch == branch), None)
 
 
 def ticket_parent(repo, number):
