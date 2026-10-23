@@ -74,6 +74,7 @@ try:
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
     from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
     from harness_lib.text import write_json as _write_json
+    from harness_lib import gh as ghlib
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -267,15 +268,20 @@ def board_json(repo, *args):
         raise Problem(f"harness-board {' '.join(str(a) for a in args[:2])} printed no JSON") from None
 
 
+# harness-work's own wording for a gh call (`call` is its first two arguments), as its generic run() words it
+WORK_GH_TEXTS = {
+    "not_found": "{exe} not found",
+    "cannot_run": "cannot run {exe}: {why}",
+    "timed_out": "{exe} {call} timed out after {timeout} s",
+    "failed": "gh {call} failed: {why}",
+    "not_json": "gh {call} printed something other than JSON",
+}
+
+
 def gh_json(repo, args):
-    exe = os.environ.get("HARNESS_GH", "gh")
-    done = run([exe] + args, cwd=repo.main, env=dict(os.environ, GH_PROMPT_DISABLED="1"), timeout=GH_TIMEOUT)
-    if done.returncode != 0:
-        raise Problem(f"gh {' '.join(args[:2])} failed: {last_line(done.stderr) or f'exit {done.returncode}'}")
-    try:
-        return json.loads(done.stdout or "null")
-    except ValueError:
-        raise Problem(f"gh {' '.join(args[:2])} printed something other than JSON") from None
+    """gh's JSON output (None when it printed nothing), run in the main checkout; Problem with gh's last stderr line."""
+    return ghlib.gh_json(args, repo.main, pick=last_line, empty_ok=True, errors="surrogateescape", timeout=GH_TIMEOUT,
+                         describe=lambda a: " ".join(a[:2]), texts=WORK_GH_TEXTS)
 
 
 def api_key_cmd():
