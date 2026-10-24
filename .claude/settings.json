@@ -17,7 +17,15 @@
       "Bash(gh issue:*)",
       "Bash(gh pr:*)",
       "Bash(gh api:*)",
-      "Bash(harness-*:*)"
+      "Bash(harness-pr:*)",
+      "Bash(harness-board:*)",
+      "Bash(harness-work:*)",
+      "Bash(harness-red:*)",
+      "Bash(harness-scaffold:*)",
+      "Bash(harness-digest:*)",
+      "Bash(harness-standup:*)",
+      "Bash(harness-projects:*)",
+      "Bash(harness-worklog:*)"
     ]
   }
 }

@@ -44,7 +44,6 @@ gh is HARNESS_GH when set, else `gh` on PATH.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import subprocess
@@ -62,6 +61,7 @@ try:
     from harness_lib.notify import notify
     from harness_lib.repo import RepoError, repo_facts
     from harness_lib.registry import load_registry
+    from harness_lib.gh import describe, gh as lib_gh, gh_json as lib_gh_json
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-board: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -85,6 +85,10 @@ LABELS = [
     ("no-tests", "EDEDED", "Docs or config only; exempt from tests-first"),
     ("needs-local", "FEF2C0", "Needs this Mac's files or credentials"),
     ("priority:high", "FF7F0E", "Dispatched first"),
+    ("manual-land", "D93F0B", "Land by hand: autoland skips it"),
+    ("incident", "B60205", "A live check failed; autoland is paused in this repo"),
+    ("degraded", "FBCA04", "A live check is degraded; nothing was reverted"),
+    ("deploy-frozen", "000000", "Deploys are stopped until you clear this"),
 ]
 TYPES = ("epic", "bug", "refactor", "chore", "task")          # the first present wins
 TASK_TYPES = ("task", "bug", "chore", "refactor")
@@ -167,44 +171,15 @@ def open_repo(path):
 
 
 # --------------------------------------------------------------- gh
-def describe(args):
-    """`gh issue view 12`, `gh api repos/o/r/issues/3/sub_issues`: the call, for an error line."""
-    if args and args[0] == "api":
-        return "gh api " + next((a for a in args[1:] if "/" in a and not a.startswith("-")), "")
-    words = []
-    for arg in args:
-        if arg.startswith("-") or len(words) == 3:
-            break
-        words.append(arg)
-    return "gh " + " ".join(words)
-
-
 def gh(repo, args, stdin=None):
-    """Run gh in the repository (None: the cwd); its stdout, or Problem naming the call and gh's first stderr
-    line."""
-    exe = os.environ.get("HARNESS_GH", "gh")
-    io = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
-    try:
-        done = subprocess.run([exe] + list(args), cwd=repo.root if repo else None, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=GH_TIMEOUT,
-                              env=dict(os.environ, GH_PROMPT_DISABLED="1"), **io)
-    except FileNotFoundError:
-        raise Problem(f"gh not found ({exe}); install it with `brew install gh`, then `gh auth login`") from None
-    except OSError as err:
-        raise Problem(f"cannot run gh ({exe}): {err.strerror or err}") from None
-    except subprocess.TimeoutExpired:
-        raise Problem(f"{describe(args)} timed out after {GH_TIMEOUT} s") from None
-    if done.returncode != 0:
-        raise Problem(f"{describe(args)} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
-    return done.stdout
+    """Run gh in the repository (None: the cwd), through harness_lib.gh; its stdout, or Problem naming the call and
+    gh's first stderr line."""
+    return lib_gh(args, repo.root if repo else None, stdin, GH_TIMEOUT, pick=first_line)
 
 
 def gh_json(repo, args):
-    out = gh(repo, args)
-    try:
-        return json.loads(out)
-    except ValueError:
-        raise Problem(f"{describe(args)} printed something other than JSON: {first_line(out)[:80]}") from None
+    """gh's output decoded as JSON (through this module's gh); Problem when it is not JSON."""
+    return lib_gh_json(args, repo.root if repo else None, pick=first_line, via=lambda a, c: gh(repo, a))
 
 
 def created_issue(out):
