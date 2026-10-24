@@ -11,12 +11,14 @@ Usage:
     harness-pr ready P [--ticket N]
     harness-pr comments P [--since ISO] [--unresolved] [--json]
     harness-pr awaiting [--all-projects] [--json]
-    harness-pr ultra P [--post]
+    harness-pr ultra P [--post] [--force]
     harness-pr land P [--yes] [--discard] [--accept-findings]
 
 ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has
 findings and no commit newer than it, naming the findings, and refuse when gh cannot tell. --accept-findings on
 land is the only override; ready has none. land on a PR that is already merged skips the check.
+
+ultra runs nothing (one line, exit 0) when the project's HARNESS_ULTRAREVIEW is off, unless --force; see cmd_ultra.
 
 The repository is the cwd's (open: --worktree, else the cwd), else CLAUDE_PROJECT_DIR. gh is HARNESS_GH when
 set, else `gh`; claude is HARNESS_CLAUDE, else `claude`; harness-board and harness-red are found on PATH, else
@@ -48,7 +50,9 @@ try:
     from harness_lib.text import (as_list, first_line, harness_home, home, last_line, one_line, parse_iso, read_json,
                                   read_text, write_json, write_text)
     from harness_lib.notify import notify
-    from harness_lib.repo import RepoError, repo_facts
+    from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
+    from harness_lib.repo import RepoError, repo_facts, worktree_entries
+    from harness_lib.routing import load_routing
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -271,46 +275,14 @@ def open_repo(path=None):
 
 
 # --------------------------------------------------------------- gh, claude and the sibling tools
-def describe(args):
-    """`gh pr view 12`, `gh api repos/o/r/pulls/3/reviews`: the call, for an error line."""
-    if args and args[0] == "api":
-        return "gh api " + next((a for a in args[1:] if "/" in a or a == "graphql"), "")
-    words = []
-    for arg in args:
-        if arg.startswith("-") or len(words) == 3:
-            break
-        words.append(arg)
-    return "gh " + " ".join(words)
-
-
-def gh_run(args, cwd, stdin=None, timeout=GH_TIMEOUT):
-    exe = os.environ.get("HARNESS_GH", "gh")
-    io = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
-    try:
-        return subprocess.run([exe] + list(args), cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout, env=dict(os.environ, GH_PROMPT_DISABLED="1"), **io)
-    except FileNotFoundError:
-        raise Problem(f"gh not found ({exe}); install it with `brew install gh`, then `gh auth login`") from None
-    except OSError as err:
-        raise Problem(f"cannot run gh ({exe}): {err.strerror or err}") from None
-    except subprocess.TimeoutExpired:
-        raise Problem(f"{describe(args)} timed out after {timeout} s") from None
-
-
 def gh(args, cwd, stdin=None, timeout=GH_TIMEOUT):
-    """gh's stdout, or Problem naming the call and gh's first stderr line."""
-    done = gh_run(args, cwd, stdin, timeout)
-    if done.returncode != 0:
-        raise Problem(f"{describe(args)} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
-    return done.stdout
+    """gh's stdout (through this module's gh_run), or Problem naming the call and gh's first stderr line."""
+    return lib_gh(args, cwd, stdin, timeout, pick=first_line, run=gh_run)
 
 
 def gh_json(args, cwd):
-    out = gh(args, cwd)
-    try:
-        return json.loads(out)
-    except ValueError:
-        raise Problem(f"{describe(args)} printed something other than JSON: {first_line(out)[:80]}") from None
+    """gh's output decoded as JSON (through this module's gh); Problem when it is not JSON."""
+    return lib_gh_json(args, cwd, pick=first_line, via=gh)
 
 
 def sibling(name):
@@ -1095,8 +1067,17 @@ def mark_cloud_exhausted(reason):
 
 
 def cmd_ultra(args):
+    """Run `claude ultrareview`, unless the project's HARNESS_ULTRAREVIEW is off (the environment, else the main
+    checkout's settings.json): then one line saying so and nothing run, unless --force. Each problem load_routing
+    finds is one `harness-pr: warning:` line, with --force too; an invalid HARNESS_ULTRAREVIEW is ignored."""
     repo = open_repo()
     number = args.number
+    routing = load_routing(repo.main)
+    for problem in routing["problems"]:
+        warn("harness-pr", problem)
+    if not routing["ultrareview"] and not args.force:
+        print(f"ultrareview PR #{number}: off for this project (HARNESS_ULTRAREVIEW=off); nothing run")
+        return 0
     exe = os.environ.get("HARNESS_CLAUDE", "claude")
     cmd = [exe, "ultrareview", str(number), "--json", "--timeout", str(ULTRA_MINUTES)]
     cmd += ["--post"] if args.post else []
@@ -1141,17 +1122,7 @@ def cmd_ultra(args):
 # --------------------------------------------------------------- land
 def worktree_for(main, branch):
     """The path of the worktree that has `branch` checked out, or None."""
-    out = git_ok(main, "worktree", "list", "--porcelain")
-    for block in out.split("\n\n"):
-        path, ref = None, None
-        for line in block.splitlines():
-            if line.startswith("worktree "):
-                path = line[len("worktree "):]
-            elif line.startswith("branch "):
-                ref = line[len("branch "):]
-        if path and ref == f"refs/heads/{branch}":
-            return path
-    return None
+    return next((w.path for w in worktree_entries(main, git_ok) if w.branch == branch), None)
 
 
 def ticket_parent(repo, number):
@@ -1604,6 +1575,7 @@ def parser():
     ul = sub.add_parser("ultra", help="claude ultrareview (bills usage credits)")
     ul.add_argument("number", type=number_arg, metavar="P")
     ul.add_argument("--post", action="store_true", help="post the findings to the PR")
+    ul.add_argument("--force", action="store_true", help="run even when the project's HARNESS_ULTRAREVIEW is off")
 
     ld = sub.add_parser("land", help="squash-merge, remove the worktree and branch, update main, close the ticket")
     ld.add_argument("number", type=number_arg, metavar="P")

@@ -1,6 +1,7 @@
-"""The gh helpers harness-standup and harness-digest share (and session_brief's gh lookup and
-environment): which gh to run, the environment it runs in, an origin URL as a `gh -R` slug, and
-GhBatch, the gh calls started side by side under one deadline.
+"""The gh helpers the bin tools share (and session_brief's gh lookup and environment): which gh to
+run, the environment it runs in, an origin URL as a `gh -R` slug, the sequential wrappers
+harness-board, harness-pr and harness-work run gh through (describe, gh_run, gh, gh_json), and
+GhBatch, the gh calls harness-standup and harness-digest start side by side under one deadline.
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -57,6 +58,85 @@ def describe_list_call(args):
     if "--label" in args[:-1]:
         words += " --label " + args[args.index("--label") + 1]
     return words
+
+
+# --------------------------------------------------------------- one gh call at a time
+# What a failed call reports, as str.format templates. Fields: exe (gh_exe()), call (describe(args)), args (the
+# list), timeout, why (the OS error, or the picked stderr line or `exit N`) and excerpt (the output's picked line,
+# by default its first, cut at 80). A caller's `texts` replace only the keys it gives.
+GH_TEXTS = {
+    "not_found": "gh not found ({exe}); install it with `brew install gh`, then `gh auth login`",
+    "cannot_run": "cannot run gh ({exe}): {why}",
+    "timed_out": "{call} timed out after {timeout} s",
+    "failed": "{call} failed: {why}",
+    "not_json": "{call} printed something other than JSON: {excerpt}",
+}
+
+
+def describe(args):
+    """`gh issue view 12`, `gh api repos/o/r/issues/3/sub_issues`, `gh api graphql`: the call, for an error line.
+    For api the first argument that is graphql or a path (holds "/", not a flag); else up to three words before
+    the first flag."""
+    if args and args[0] == "api":
+        return "gh api " + next((a for a in args[1:] if a == "graphql" or ("/" in a and not a.startswith("-"))), "")
+    words = []
+    for arg in args:
+        if arg.startswith("-") or len(words) == 3:
+            break
+        words.append(arg)
+    return "gh " + " ".join(words)
+
+
+def _text(texts, key, args, describe, exe, **fields):
+    """The `key` text for the call: the caller's template if it gave one, else GH_TEXTS'."""
+    template = (texts or {}).get(key, GH_TEXTS[key])
+    values = dict({"timeout": "", "why": "", "excerpt": ""}, **fields)
+    return template.format(exe=exe, call=describe(args), args=args, **values)
+
+
+def gh_run(args, cwd, stdin=None, timeout=60, *, errors="replace", env=None, describe=describe, texts=None):
+    """Run gh_exe() with `args` in `cwd` (None: the current directory), `stdin` as its input (None: /dev/null), in
+    os.environ plus `env` (None: prompts disabled). The CompletedProcess, output decoded as utf-8 with `errors`,
+    whatever the exit; Problem when gh is missing, cannot start or runs past `timeout` seconds."""
+    exe = gh_exe()
+    io = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
+    extra = env if env is not None else {"GH_PROMPT_DISABLED": "1"}
+    try:
+        return subprocess.run([exe] + list(args), cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+                              errors=errors, timeout=timeout, env=dict(os.environ, **extra), **io)
+    except FileNotFoundError:
+        raise Problem(_text(texts, "not_found", args, describe, exe)) from None
+    except OSError as err:
+        raise Problem(_text(texts, "cannot_run", args, describe, exe, why=err.strerror or err)) from None
+    except subprocess.TimeoutExpired:
+        raise Problem(_text(texts, "timed_out", args, describe, exe, timeout=timeout)) from None
+
+
+def gh(args, cwd, stdin=None, timeout=60, *, pick=first_line, errors="replace", env=None, describe=describe,
+       texts=None, run=None):
+    """gh_run's stdout (or, with `run`, that of run(args, cwd, stdin, timeout), so a tool's adapter can name its
+    own gh_run); on a non-zero exit Problem naming the call and pick(stderr), else `exit N`."""
+    if run is None:
+        done = gh_run(args, cwd, stdin, timeout, errors=errors, env=env, describe=describe, texts=texts)
+    else:
+        done = run(args, cwd, stdin, timeout)
+    if done.returncode != 0:
+        why = pick(done.stderr) or f"exit {done.returncode}"
+        raise Problem(_text(texts, "failed", args, describe, gh_exe(), why=why))
+    return done.stdout
+
+
+def gh_json(args, cwd, *, pick=first_line, empty_ok=False, via=None, **kw):
+    """gh's stdout (or, with `via`, via(args, cwd), so a tool's adapter can name its own gh) decoded as JSON; None
+    for empty output when `empty_ok`; `kw` reaches gh. Problem for output that is not JSON, its excerpt picked."""
+    out = gh(args, cwd, pick=pick, **kw) if via is None else via(args, cwd)
+    if empty_ok and not out:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise Problem(_text(kw.get("texts"), "not_json", args, kw.get("describe", describe), gh_exe(),
+                            excerpt=pick(out)[:80])) from None
 
 
 class GhBatch:

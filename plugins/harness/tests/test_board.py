@@ -10,6 +10,7 @@ first run, which costs about half a second each time.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -27,6 +28,9 @@ FAKEGH = os.path.join(HERE, "fakegh.py")
 GIT = shutil.which("git")
 REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
 MARK = "\n\n<!-- harness -->"      # the last line of every comment harness-board posts
+# The five routing settings (docs/design.md, Settings): dropped from the inherited environment like HARNESS_PROJECT.
+ROUTING_KEYS = ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER", "HARNESS_ULTRAREVIEW",
+                "HARNESS_WAVE_REVIEW")
 
 # The label table from docs/design.md, the source of truth for `labels ensure`.
 SPEC_COLORS = {
@@ -36,6 +40,14 @@ SPEC_COLORS = {
     "size:S": "C5DEF5", "size:M": "BFDADC", "size:L": "F9D0C4",
     "risk:low": "E6E6E6", "risk:high": "B60205",
     "no-tests": "EDEDED", "needs-local": "FEF2C0", "priority:high": "FF7F0E",
+    "manual-land": "D93F0B", "incident": "B60205", "degraded": "FBCA04", "deploy-frozen": "000000",
+}
+# The autoland group's descriptions, exact (#149).
+AUTOLAND_DESCRIPTIONS = {
+    "manual-land": "Land by hand: autoland skips it",
+    "incident": "A live check failed; autoland is paused in this repo",
+    "degraded": "A live check is degraded; nothing was reverted",
+    "deploy-frozen": "Deploys are stopped until you clear this",
 }
 
 TASK_BODY = """## Request
@@ -204,7 +216,7 @@ class BoardTest(unittest.TestCase):
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items()
                if k not in ("CLAUDE_PROJECT_DIR", "HARNESS_GH", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
-                            "HARNESS_NOTIFY_APP", "HARNESS_NOTIFY_SOUND", "HARNESS_PROJECT")}
+                            "HARNESS_NOTIFY_APP", "HARNESS_NOTIFY_SOUND", "HARNESS_PROJECT") + ROUTING_KEYS}
         paths = [self.fakebin] + ([os.path.dirname(GIT)] if GIT else []) + ["/usr/bin", "/bin"]
         env.update(HOME=self.home, PATH=os.pathsep.join(paths), GIT_CEILING_DIRECTORIES=self.tmp,
                    GIT_CONFIG_NOSYSTEM="1", FAKEGH_SCENARIO=self.scenario_path, FAKEGH_LOG=self.log,
@@ -274,7 +286,7 @@ class Labels(BoardTest):
         p = self.ok("labels", "ensure")
         calls = self.calls()
         self.assertEqual(len(calls), len(SPEC_COLORS))
-        seen = {}
+        seen, descriptions = {}, {}
         for argv in calls:
             self.assertEqual(argv[:2], ["label", "create"])
             self.assertEqual(argv[3], "--color")
@@ -283,8 +295,32 @@ class Labels(BoardTest):
             self.assertLessEqual(len(argv[6]), 100, argv)           # GitHub's limit for a description
             self.assertEqual(argv[7:], ["--force"])
             seen[argv[2]] = argv[4]
+            descriptions[argv[2]] = argv[6]
         self.assertEqual(seen, SPEC_COLORS)
+        self.assertEqual(len(SPEC_COLORS), 22)                      # the 18 existing labels plus the four new
         self.assertIn(f"{len(SPEC_COLORS)} labels created or updated", p.stdout)
+        self.assertIn("22 labels created or updated", p.stdout)
+        for name, text in AUTOLAND_DESCRIPTIONS.items():
+            self.assertEqual(descriptions.get(name), text, name)
+
+    def test_design_md_label_table_lists_exactly_the_spec_labels_and_colors(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "docs", "design.md")
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("Labels (name, color, meaning)"))
+        rows = []
+        for line in lines[start + 1:]:
+            if line.startswith("|"):
+                rows.append(line)
+            elif rows:                                              # the first non-table line after the table
+                break
+        self.assertGreaterEqual(len(rows), 3, rows)                 # header, separator and at least one group
+        documented = {}
+        for row in rows[2:]:
+            for name, color in re.findall(r"`([^`\s]+)` ([0-9A-Fa-f]{6})\b", row):
+                self.assertNotIn(name, documented, f"{name} is listed twice in design.md")
+                documented[name] = color.upper()
+        self.assertEqual(documented, SPEC_COLORS)
 
     def test_a_failed_create_is_one_line_with_ghs_error(self):
         self.scenario([{"match": ["label", "create"], "stderr": "HTTP 403: Resource not accessible\nmore\n",
@@ -2288,7 +2324,8 @@ class Tier(BoardTest):
         self.scenario([{"match": ["issue", "view", "12", "--json", "labels"],
                         "stdout_json": {"labels": [{"name": "refactor"}, {"name": "size:S"}, {"name": "risk:low"}]}}])
         p = self.ok("tier", "12", "--json")
-        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "sonnet", "source": "github"})
+        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "sonnet", "source": "github", "stage": "code",
+                                                "from": "labels", "labels_tier": "sonnet", "effort": None})
 
 
 # Ticket #67: reviews run on Opus 5.5; `tier N --stage review` gives fable only for a risk:high ticket, whatever the
@@ -2358,10 +2395,12 @@ class TierReviewStage(BoardTest):
         self.assertEqual(self.ok("tier", "12", "--stage", "review").stdout.strip(), "opus")
         self.assertEqual(len(self.calls()), 1)
         p = self.ok("tier", "12", "--stage", "review", "--json")
-        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "opus", "source": "github"})
+        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "opus", "source": "github", "stage": "review",
+                                                "from": "labels", "labels_tier": "opus", "effort": None})
         before = len(self.calls())
         p = self.ok("tier", "12", "--json")
-        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "fable", "source": "cache"})
+        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "fable", "source": "cache", "stage": "code",
+                                                "from": "labels", "labels_tier": "fable", "effort": None})
         self.assertEqual(len(self.calls()), before)                 # plain tier made no gh call
 
     def test_plain_tier_is_unchanged_for_every_combination(self):
@@ -2378,6 +2417,410 @@ class TierReviewStage(BoardTest):
                         expected = "opus"
                     with self.subTest(kind=kind, size=size, risk=risk):
                         self.assertEqual(self.tier([kind, "size:" + size, "risk:" + risk]), expected)
+
+
+# ======================================================================= tier: the project's routing settings
+# Ticket #175 (epic #172): harness-board takes its tiers from harness_lib.routing. HARNESS_CODE_TIER (the environment
+# when not blank, else `env` in the main checkout's .claude/settings.json; settings.local.json is never read) replaces
+# the label rubric for the code tier that `tier`, `show`, the cache, `ready` and an epic's task rows carry;
+# HARNESS_REVIEW_TIER replaces the review rule; `tier --json` says where the tier came from. Every expected tier here
+# is derived from docs/design.md's rubric sentence, never from the tool or the lib.
+ROUTING_TYPES = ("task", "bug", "chore", "refactor")
+TIER_KEYS = ["number", "tier", "source", "stage", "from", "labels_tier", "effort"]
+SHOW_KEYS = {"number", "title", "url", "type", "status", "size", "risk", "flags", "labels", "tier", "parent",
+             "blocked_by", "body", "sections", "comments", "fetched_at", "branch", "worktree", "started_at", "attempts"}
+
+
+def rubric(kind, size, risk):
+    """docs/design.md: size:S and risk:low and type not bug gives sonnet; size:L or risk:high gives fable; else opus."""
+    if size == "L" or risk == "high":
+        return "fable"
+    if size == "S" and risk == "low" and kind != "bug":
+        return "sonnet"
+    return "opus"
+
+
+def review_rubric(risk):
+    """docs/design.md: the review stage is fable for risk:high and opus for everything else."""
+    return "fable" if risk == "high" else "opus"
+
+
+def ticket_labels(kind, size, risk, *extra):
+    return [kind] + list(extra) + (["size:" + size] if size else []) + (["risk:" + risk] if risk else [])
+
+
+class TierRouting(BoardTest):
+    OKINAWA = {"HARNESS_CODE_TIER": "opus", "HARNESS_CODE_EFFORT": "xhigh", "HARNESS_REVIEW_TIER": "opus"}
+    SPREAD = [("task", "S", "low"), ("bug", "S", "low"), ("chore", "M", "low"), ("refactor", "L", "low"),
+              ("task", "S", "high"), ("bug", "M", "high"), ("task", None, None), ("chore", "S", None)]
+
+    def settings(self, env, name="settings.json", root=None):
+        write(os.path.join(root or self.repo, ".claude", name), json.dumps({"env": env}))
+
+    def tier_out(self, number, *extra, **env):
+        """`tier N` stdout, with nothing on stderr."""
+        p = self.ok("tier", str(number), *extra, **env)
+        self.assertEqual(p.stderr, "", p.stderr)
+        return p.stdout
+
+    def tier_json(self, number, *extra, **env):
+        p = self.ok("tier", str(number), "--json", *extra, **env)
+        self.assertEqual(p.stderr, "", p.stderr)
+        return json.loads(p.stdout)
+
+    def code(self, number, tier, labels_tier, source="cache", frm="labels", effort=None):
+        return {"number": number, "tier": tier, "source": source, "stage": "code", "from": frm,
+                "labels_tier": labels_tier, "effort": effort}
+
+    def review(self, number, tier, labels_tier, source="cache", frm="labels", effort=None):
+        return {"number": number, "tier": tier, "source": source, "stage": "review", "from": frm,
+                "labels_tier": labels_tier, "effort": effort}
+
+    def warnings(self, p):
+        return [line for line in p.stderr.splitlines() if line.strip()]
+
+    def epic_scenario(self, subs):
+        epic = issue(number=3, title="Board v2", labels=("epic", "status:ready"), body=EPIC_BODY)
+        self.scenario([REPO_VIEW, {"match": ["issue", "view", "3"], "stdout_json": epic},
+                       {"match": ["api", "repos/o/r/issues/3/sub_issues?per_page=100"], "stdout_json": subs}])
+
+    def sub(self, number, title, labels):
+        return {"number": number, "title": title, "state": "open", "labels": [{"name": n} for n in labels]}
+
+    # ----------------------------------------------------------- broad: the public interface
+    def test_code_tier_setting_decides_every_label_combination(self):
+        # DoD: HARNESS_CODE_TIER=opus in the main checkout's settings.json gives opus for every type, size and risk
+        # (none included), from the cache, with no gh call.
+        self.settings({"HARNESS_CODE_TIER": "opus"})
+        for kind in ROUTING_TYPES:
+            for size in ("S", "M", "L", None):
+                for risk in ("low", "high", None):
+                    with self.subTest(setting="opus", kind=kind, size=size, risk=risk):
+                        self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk, "status:ready"),
+                                            "tier": rubric(kind, size, risk)})
+                        self.assertEqual(self.tier_out(12), "opus\n")
+        # Every tier the setting can name, spelled loosely (the value is stripped and matched in any case), decides
+        # over every rubric outcome; `from` names the setting even where it agrees with the labels.
+        for raw, tier in (("sonnet", "sonnet"), ("Fable", "fable"), (" OPUS ", "opus")):
+            self.settings({"HARNESS_CODE_TIER": raw})
+            for kind, size, risk in self.SPREAD:
+                with self.subTest(setting=raw, kind=kind, size=size, risk=risk):
+                    self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk)})
+                    self.assertEqual(self.tier_out(12), tier + "\n")
+                    self.assertEqual(self.tier_json(12),
+                                     self.code(12, tier, rubric(kind, size, risk), frm="HARNESS_CODE_TIER"))
+        self.assertEqual(self.calls(), [])
+
+    def test_okinawa_settings_json_reports_where_the_tier_came_from(self):
+        self.settings(self.OKINAWA)
+        self.put_cache(12, {"number": 12, "labels": ["task", "status:ready", "size:L", "risk:high"], "tier": "fable"})
+        p = self.ok("tier", "12", "--json")
+        self.assertEqual(p.stderr, "")
+        data = json.loads(p.stdout)
+        self.assertEqual(data, {"number": 12, "tier": "opus", "source": "cache", "stage": "code",
+                                "from": "HARNESS_CODE_TIER", "labels_tier": "fable", "effort": "xhigh"})
+        self.assertEqual(list(data), TIER_KEYS)                     # printed in this order
+        self.assertEqual(self.tier_out(12), "opus\n")               # the text stays the one word
+        # risk:high keeps its label but gets an Opus per-ticket review
+        self.assertEqual(self.tier_out(12, "--stage", "review"), "opus\n")
+        self.assertEqual(self.tier_json(12, "--stage", "review"),
+                         self.review(12, "opus", "fable", frm="HARNESS_REVIEW_TIER"))
+        # a cache without labels answers from the setting, with the cached tier as labels_tier
+        self.put_cache(13, {"number": 13, "tier": "sonnet"})
+        self.assertEqual(self.tier_json(13), self.code(13, "opus", "sonnet", frm="HARNESS_CODE_TIER", effort="xhigh"))
+        self.assertEqual(self.tier_out(13), "opus\n")
+        self.assertEqual(self.calls(), [])
+        # without a cache the labels are fetched and the setting still decides; source says github
+        self.scenario([{"match": ["issue", "view", "14", "--json", "labels"],
+                        "stdout_json": {"labels": [{"name": "bug"}, {"name": "size:L"}, {"name": "risk:high"}]}}])
+        self.assertEqual(self.tier_json(14),
+                         self.code(14, "opus", "fable", source="github", frm="HARNESS_CODE_TIER", effort="xhigh"))
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_review_tier_setting_decides_the_review_stage(self):
+        cases = [("task", "S", "low"), ("bug", "L", "high"), ("chore", "M", None), ("refactor", "S", "high")]
+        for raw, tier in (("opus", "opus"), ("fable", "fable"), ("Sonnet", "sonnet")):
+            self.settings({"HARNESS_REVIEW_TIER": raw})
+            for kind, size, risk in cases:
+                with self.subTest(setting=raw, kind=kind, size=size, risk=risk):
+                    self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk)})
+                    self.assertEqual(self.tier_out(12, "--stage", "review"), tier + "\n")
+                    self.assertEqual(self.tier_json(12, "--stage", "review"),
+                                     self.review(12, tier, review_rubric(risk), frm="HARNESS_REVIEW_TIER",
+                                                 effort="xhigh" if tier == "fable" else None))
+                    # the code stage keeps the labels
+                    labels_tier = rubric(kind, size, risk)
+                    self.assertEqual(self.tier_json(12), self.code(12, labels_tier, labels_tier))
+        # HARNESS_CODE_TIER and HARNESS_CODE_EFFORT never reach the review stage
+        self.settings({"HARNESS_CODE_TIER": "sonnet", "HARNESS_CODE_EFFORT": "low"})
+        for risk in ("high", "low"):
+            with self.subTest(code_only=True, risk=risk):
+                self.put_cache(12, {"number": 12, "labels": ticket_labels("task", "M", risk)})
+                self.assertEqual(self.tier_out(12, "--stage", "review"), review_rubric(risk) + "\n")
+                self.assertEqual(self.tier_json(12, "--stage", "review"),
+                                 self.review(12, review_rubric(risk), review_rubric(risk),
+                                             effort="xhigh" if risk == "high" else None))
+        self.assertEqual(self.calls(), [])
+
+    def test_show_ready_epic_tasks_and_cache_carry_the_effective_tier(self):
+        # The ticket's labels give opus (task, size:M, risk:low): each setting differs from it.
+        for setting in ("sonnet", "fable"):
+            with self.subTest(setting=setting):
+                self.settings({"HARNESS_CODE_TIER": setting})
+                # show: the record, the cache and the markdown Labels line
+                self.scenario([{"match": ["issue", "view", "12"],
+                                "stdout_json": issue(labels=("task", "status:ready", "size:M", "risk:low"))}])
+                record = json.loads(self.ok("show", "12").stdout)
+                self.assertEqual(record["tier"], setting)
+                self.assertEqual((record["size"], record["risk"]), ("M", "low"))
+                self.assertEqual(record["labels"], ["task", "status:ready", "size:M", "risk:low"])
+                self.assertEqual(self.cache(12)["tier"], setting)
+                md = self.ok("show", "12", "--markdown").stdout.splitlines()
+                self.assertIn(f"Labels: task, status:ready, size:M, risk:low (tier {setting} from HARNESS_CODE_TIER, "
+                              "open)", md)
+                # a status change made here refreshes the cache with the effective tier
+                self.put_cache(12, {"number": 12, "labels": ["task", "status:ready", "size:M", "risk:low"],
+                                    "tier": "opus"})
+                self.scenario([{"match": ["issue", "view", "12", "--json", "labels"],
+                                "stdout_json": {"labels": [{"name": n} for n in
+                                                           ("task", "status:ready", "size:M", "risk:low")]}},
+                               {"match": ["issue", "edit"], "stdout": ""}])
+                self.ok("status", "12", "in-progress")
+                self.assertEqual(self.cache(12)["status"], "in-progress")
+                self.assertEqual(self.cache(12)["tier"], setting)
+                # ready: every row, whatever its labels
+                items = [{"number": n, "title": f"T{n}", "labels": [{"name": x} for x in labels], "blockedBy": []}
+                         for n, labels in ((2, ("task", "status:ready", "size:S", "risk:low")),
+                                           (3, ("bug", "status:ready", "size:M", "risk:low")),
+                                           (4, ("task", "status:ready", "size:L", "risk:low")),
+                                           (5, ("chore", "status:ready", "size:S", "risk:high")))]
+                self.scenario([{"match": ["issue", "list"], "stdout_json": items}])
+                rows = json.loads(self.ok("ready", "--json").stdout)
+                self.assertEqual([(r["number"], r["size"], r["risk"], r["tier"]) for r in rows],
+                                 [(2, "S", "low", setting), (3, "M", "low", setting), (4, "L", "low", setting),
+                                  (5, "S", "high", setting)])
+                table = self.ok("ready").stdout.splitlines()
+                self.assertEqual([line.split()[5] for line in table[1:]], [setting] * 4)
+                # an epic's task rows, in the record and in the markdown
+                self.epic_scenario([self.sub(12, "Add the board tool", ("task", "status:ready", "size:S", "risk:low")),
+                                    self.sub(13, "Wire it", ("bug", "status:in-progress", "size:M", "risk:high")),
+                                    self.sub(14, "Tidy", ("refactor", "status:ready", "size:M", "risk:low"))])
+                epic = json.loads(self.ok("show", "3").stdout)
+                self.assertEqual([(t["number"], t["tier"]) for t in epic["tasks"]],
+                                 [(12, setting), (13, setting), (14, setting)])
+                self.assertEqual([t["tier"] for t in self.cache(3)["tasks"]], [setting] * 3)
+                md = self.ok("show", "3", "--markdown").stdout.splitlines()
+                self.assertIn(f"- #12 Add the board tool (ready, S, low, tier {setting})", md)
+                self.assertIn(f"- #13 Wire it (in-progress, M, high, tier {setting})", md)
+                self.assertIn(f"- #14 Tidy (ready, M, low, tier {setting})", md)
+
+    def test_environment_wins_and_settings_local_is_ignored(self):
+        self.put_cache(12, {"number": 12, "labels": ["task", "size:M", "risk:low"]})        # the labels give opus
+        # settings.local.json alone is never read: the labels decide
+        self.settings({"HARNESS_CODE_TIER": "sonnet", "HARNESS_CODE_EFFORT": "max", "HARNESS_REVIEW_TIER": "fable"},
+                      name="settings.local.json")
+        self.assertEqual(self.tier_out(12), "opus\n")
+        self.assertEqual(self.tier_json(12), self.code(12, "opus", "opus"))
+        self.assertEqual(self.tier_json(12, "--stage", "review"), self.review(12, "opus", "opus"))
+        # settings.json decides, and settings.local.json adds nothing to it
+        self.settings({"HARNESS_CODE_TIER": "fable"})
+        self.assertEqual(self.tier_out(12), "fable\n")
+        self.assertEqual(self.tier_json(12), self.code(12, "fable", "opus", frm="HARNESS_CODE_TIER"))
+        self.assertEqual(self.tier_json(12, "--stage", "review"), self.review(12, "opus", "opus"))
+        # the environment wins over settings.json; a blank environment value falls through to it
+        self.assertEqual(self.tier_out(12, HARNESS_CODE_TIER="sonnet"), "sonnet\n")
+        self.assertEqual(self.tier_json(12, HARNESS_CODE_TIER="sonnet", HARNESS_CODE_EFFORT="high"),
+                         self.code(12, "sonnet", "opus", frm="HARNESS_CODE_TIER", effort="high"))
+        self.assertEqual(self.tier_out(12, HARNESS_CODE_TIER="  "), "fable\n")
+        self.assertEqual(self.tier_json(12, "--stage", "review", HARNESS_REVIEW_TIER="sonnet"),
+                         self.review(12, "sonnet", "opus", frm="HARNESS_REVIEW_TIER"))
+        self.assertEqual(self.tier_json(12, "--stage", "review", HARNESS_REVIEW_TIER="fable"),
+                         self.review(12, "fable", "opus", frm="HARNESS_REVIEW_TIER", effort="xhigh"))
+        # the user's ~/.claude/settings.json is not the project's
+        os.unlink(os.path.join(self.repo, ".claude", "settings.json"))
+        write(os.path.join(self.home, ".claude", "settings.json"),
+              json.dumps({"env": {"HARNESS_CODE_TIER": "sonnet", "HARNESS_REVIEW_TIER": "fable"}}))
+        self.assertEqual(self.tier_json(12), self.code(12, "opus", "opus"))
+        self.assertEqual(self.calls(), [])
+
+    def test_invalid_value_warns_once_and_the_labels_decide(self):
+        warning = "harness-board: warning: HARNESS_CODE_TIER='gpt' is not one of sonnet, opus, fable; ignored"
+        self.settings({"HARNESS_CODE_TIER": "gpt"})
+        for size, risk in (("M", "low"), ("S", "low"), ("L", "low")):
+            expected = rubric("task", size, risk)
+            with self.subTest(size=size, risk=risk):
+                self.put_cache(12, {"number": 12, "labels": ticket_labels("task", size, risk)})
+                p = self.ok("tier", "12")                               # exit 0, as before
+                self.assertEqual(p.stdout, expected + "\n")
+                self.assertEqual(self.warnings(p), [warning])
+                p = self.ok("tier", "12", "--json")
+                self.assertEqual(json.loads(p.stdout), self.code(12, expected, expected))
+                self.assertEqual(self.warnings(p), [warning])
+        # once per process, however many tickets the command classifies
+        self.epic_scenario([self.sub(12, "Add the board tool", ("task", "status:ready", "size:S", "risk:low")),
+                            self.sub(13, "Wire it", ("bug", "status:ready", "size:M", "risk:high")),
+                            self.sub(14, "Tidy", ("refactor", "status:ready", "size:M", "risk:low"))])
+        p = self.ok("show", "3")
+        self.assertEqual(self.warnings(p), [warning])
+        self.assertEqual([t["tier"] for t in json.loads(p.stdout)["tasks"]], ["sonnet", "fable", "opus"])
+        p = self.ok("show", "3", "--markdown")
+        self.assertEqual(self.warnings(p), [warning])
+        self.assertIn("Labels: epic, status:ready (tier opus, open)", p.stdout.splitlines())
+        self.assertIn("- #13 Wire it (ready, M, high, tier fable)", p.stdout.splitlines())
+        items = [{"number": n, "title": f"T{n}", "labels": [{"name": x} for x in labels], "blockedBy": []}
+                 for n, labels in ((2, ("task", "status:ready", "size:S", "risk:low")),
+                                   (3, ("bug", "status:ready", "size:M", "risk:low")),
+                                   (4, ("task", "status:ready", "size:L", "risk:low")))]
+        self.scenario([{"match": ["issue", "list"], "stdout_json": items}])
+        p = self.ok("ready", "--json")
+        self.assertEqual(self.warnings(p), [warning])
+        self.assertEqual([r["tier"] for r in json.loads(p.stdout)], ["sonnet", "opus", "fable"])
+        # an invalid effort or review tier: each its own line, the rest of the routing still applies
+        self.settings({"HARNESS_CODE_TIER": "fable", "HARNESS_CODE_EFFORT": "turbo", "HARNESS_REVIEW_TIER": "haiku"})
+        expected_lines = sorted([
+            "harness-board: warning: HARNESS_CODE_EFFORT='turbo' is not one of low, medium, high, xhigh, max; ignored",
+            "harness-board: warning: HARNESS_REVIEW_TIER='haiku' is not one of sonnet, opus, fable; ignored"])
+        self.put_cache(12, {"number": 12, "labels": ticket_labels("task", "S", "low")})
+        p = self.ok("tier", "12", "--json")
+        self.assertEqual(json.loads(p.stdout), self.code(12, "fable", "sonnet", frm="HARNESS_CODE_TIER"))
+        self.assertEqual(sorted(self.warnings(p)), expected_lines)
+        self.put_cache(12, {"number": 12, "labels": ticket_labels("task", "S", "high")})
+        p = self.ok("tier", "12", "--stage", "review", "--json")
+        self.assertEqual(json.loads(p.stdout), self.review(12, "fable", "fable", effort="xhigh"))
+        self.assertEqual(sorted(self.warnings(p)), expected_lines)
+        # an invalid value in the environment warns the same way
+        self.settings({})
+        self.put_cache(12, {"number": 12, "labels": ticket_labels("task", "M", "high")})
+        p = self.ok("tier", "12", "--stage", "review", HARNESS_REVIEW_TIER="gpt5")
+        self.assertEqual(p.stdout, "fable\n")
+        self.assertEqual(self.warnings(p),
+                         ["harness-board: warning: HARNESS_REVIEW_TIER='gpt5' is not one of sonnet, opus, fable; "
+                          "ignored"])
+        # the exit code is unchanged: a failing command still fails with its own error
+        self.settings({"HARNESS_CODE_TIER": "gpt"})
+        self.scenario([{"match": ["issue", "view"], "stderr": "GraphQL: Could not resolve to an issue\n", "exit": 1}])
+        p = self.board("show", "99")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("gh issue view 99 failed", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_without_settings_text_and_records_are_unchanged(self):
+        # tier: the rubric's one word; --json adds stage, from "labels", labels_tier and effort
+        for kind, size, risk in self.SPREAD:
+            with self.subTest(kind=kind, size=size, risk=risk):
+                self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk)})
+                self.assertEqual(self.tier_out(12), rubric(kind, size, risk) + "\n")
+                self.assertEqual(self.tier_json(12), self.code(12, rubric(kind, size, risk), rubric(kind, size, risk)))
+                self.assertEqual(self.tier_out(12, "--stage", "review"), review_rubric(risk) + "\n")
+                self.assertEqual(self.tier_json(12, "--stage", "review"),
+                                 self.review(12, review_rubric(risk), review_rubric(risk),
+                                             effort="xhigh" if risk == "high" else None))
+        self.assertEqual(self.calls(), [])
+        # show: the record and the cache keep their keys and the rubric's tier; the Labels line names no setting
+        self.scenario([{"match": ["issue", "view", "12"],
+                        "stdout_json": issue(labels=("task", "status:ready", "size:L", "risk:high"))}])
+        p = self.ok("show", "12")
+        self.assertEqual(p.stderr, "")
+        record = json.loads(p.stdout)
+        self.assertEqual(set(record), SHOW_KEYS)
+        self.assertEqual(set(self.cache(12)), SHOW_KEYS)
+        self.assertEqual((record["tier"], self.cache(12)["tier"]), ("fable", "fable"))
+        p = self.ok("show", "12", "--markdown")
+        self.assertEqual(p.stderr, "")
+        self.assertIn("Labels: task, status:ready, size:L, risk:high (tier fable, open)", p.stdout.splitlines())
+        self.assertNotIn("HARNESS_", p.stdout)
+        # ready: the rows and the table as before
+        items = [{"number": n, "title": f"T{n}", "labels": [{"name": x} for x in labels], "blockedBy": []}
+                 for n, labels in ((2, ("task", "status:ready", "size:S", "risk:low")),
+                                   (3, ("bug", "status:ready", "size:M", "risk:low")),
+                                   (4, ("task", "status:ready", "size:L", "risk:low", "priority:high")))]
+        self.scenario([{"match": ["issue", "list"], "stdout_json": items}])
+        p = self.ok("ready", "--json")
+        self.assertEqual(p.stderr, "")
+        self.assertEqual(json.loads(p.stdout), [
+            {"number": 4, "title": "T4", "type": "task", "size": "L", "risk": "low", "tier": "fable",
+             "flags": ["priority:high"]},
+            {"number": 2, "title": "T2", "type": "task", "size": "S", "risk": "low", "tier": "sonnet", "flags": []},
+            {"number": 3, "title": "T3", "type": "bug", "size": "M", "risk": "low", "tier": "opus", "flags": []}])
+        p = self.ok("ready")
+        self.assertEqual(p.stderr, "")
+        self.assertEqual([line.split() for line in p.stdout.splitlines()],
+                         [["#", "TITLE", "TYPE", "SIZE", "RISK", "TIER", "FLAGS"],
+                          ["4", "T4", "task", "L", "low", "fable", "priority:high"],
+                          ["2", "T2", "task", "S", "low", "sonnet"],
+                          ["3", "T3", "bug", "M", "low", "opus"]])
+        # board: the text as before, and no warning
+        self.scenario([{"match": ["issue", "list"], "stdout_json": [
+            {"number": 4, "title": "Ticket 4", "labels": [{"name": n} for n in ("task", "status:ready", "size:S",
+                                                                                 "risk:low")]}]}])
+        p = self.ok("board")
+        self.assertEqual(p.stderr, "")
+        self.assertIn("- #4 Ticket 4 (task, S, low)", p.stdout.splitlines())
+
+    # ----------------------------------------------------------- specific
+    def test_board_defines_no_rubric_of_its_own(self):
+        with open(TOOL, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        defined = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for name in ("tier_for", "label_tier", "review_label_tier", "code_route", "review_route", "load_routing"):
+            self.assertNotIn(name, defined)
+        imported = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom) and n.module == "harness_lib.routing":
+                imported |= {a.name for a in n.names}
+        self.assertLessEqual({"label_tier", "load_routing", "code_route", "review_route"}, imported)
+        # no comparison against the rubric's own literals (size:L, size:S, risk:high) anywhere in the tool
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Compare):
+                for side in [n.left] + list(n.comparators):
+                    if isinstance(side, ast.Constant) and side.value in ("L", "S", "high"):
+                        self.fail(f"harness-board compares against {side.value!r} at line {n.lineno}")
+        # --stage still accepts only review
+        self.put_cache(12, {"number": 12, "labels": ["task", "size:L", "risk:high"]})
+        for stage in ("code", "labels"):
+            p = self.board("tier", "12", "--stage", stage)
+            self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("review", p.stderr)
+
+    def test_code_effort_rides_on_the_code_stage_only(self):
+        # HARNESS_CODE_EFFORT without HARNESS_CODE_TIER: the labels pick the tier, the setting gives the effort
+        for raw, effort in (("max", "max"), ("LOW", "low"), ("medium", "medium")):
+            self.settings({"HARNESS_CODE_EFFORT": raw})
+            for kind, size, risk in (("task", "S", "low"), ("bug", "L", "high")):
+                with self.subTest(effort=raw, kind=kind, size=size, risk=risk):
+                    self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk)})
+                    self.assertEqual(self.tier_json(12),
+                                     self.code(12, rubric(kind, size, risk), rubric(kind, size, risk), effort=effort))
+                    self.assertEqual(self.tier_json(12, "--stage", "review"),
+                                     self.review(12, review_rubric(risk), review_rubric(risk),
+                                                 effort="xhigh" if risk == "high" else None))
+        self.assertEqual(self.calls(), [])
+
+    def test_settings_come_from_the_main_checkout_not_the_worktree(self):
+        self.git("-c", "user.name=T", "-c", "user.email=t@localhost", "-c", "commit.gpgsign=false",
+                 "commit", "-q", "--allow-empty", "-m", "init")
+        worktree = os.path.join(self.tmp, "wt")
+        self.git("worktree", "add", "-q", "-b", "t/12-x", worktree)
+        self.put_cache(12, {"number": 12, "labels": ["task", "size:M", "risk:low"]})        # the labels give opus
+        self.settings({"HARNESS_CODE_TIER": "sonnet"}, root=worktree)
+        self.assertEqual(self.tier_json(12, "--repo", worktree), self.code(12, "opus", "opus"))
+        self.settings({"HARNESS_CODE_TIER": "fable"})
+        self.assertEqual(self.tier_json(12, "--repo", worktree),
+                         self.code(12, "fable", "opus", frm="HARNESS_CODE_TIER"))
+        p = self.ok("tier", "12", cwd=worktree)
+        self.assertEqual(p.stdout, "fable\n")
+
+    def test_design_md_names_the_routing_settings_in_the_tier_rubric_and_bullet(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "docs", "design.md")
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        rubric_line = next(line for line in lines if line.startswith("Tier rubric"))
+        bullet = next(line for line in lines if line.startswith("- `tier N"))
+        for needle in ("HARNESS_CODE_TIER", "HARNESS_REVIEW_TIER"):
+            self.assertIn(needle, rubric_line)
+            self.assertIn(needle, bullet)
+        for key in ("stage", "from", "labels_tier", "effort"):
+            self.assertIn(f"`{key}`", bullet)
 
 
 # ======================================================================= errors, repo resolution, help

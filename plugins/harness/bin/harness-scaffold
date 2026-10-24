@@ -33,8 +33,9 @@ Rules: an existing file is never overwritten without --force, and each path is r
 created, kept or updated. A kept .claude/settings.json is never edited, but `warn:` lines (--dry-run
 and the real run alike) name each ask or deny rule that would stop a dispatched run on a loop command
 (git, gh, harness-*, the file's own CLAUDE_VERIFY_CMD, else the rendered one), each allow entry of the
-stack's template that no allow rule covers and each env key of it that is absent, with the value to add;
-a file that is not usable settings gets one warn line.
+stack's template that no allow rule covers (an allow rule Bash(harness-*:*), a wildcard auto mode may
+drop, gets one line naming the template's harness-<tool> rules in place of theirs) and each env key of
+it that is absent, with the value to add; a file that is not usable settings gets one warn line.
 The stack skeleton (pyproject.toml, src/<pkg>/__init__.py,
 tests/test_smoke.py; package.json, tests/smoke.test.js) is written only when the project has no
 manifest of any stack, no Makefile with a test or check target and no tests (a tests/, test/ or spec/
@@ -92,6 +93,10 @@ STACK_ALLOW = {
 LOOP_COMMANDS = [["git", "add"], ["git", "commit"], ["git", "push"], ["git", "fetch"], ["git", "worktree"],
                  ["gh", "issue"], ["gh", "pr"], ["gh", "api"]]
 KEPT = ".claude/settings.json"
+# The old allow spelling for every harness tool, which auto mode may drop as a wildcarded program rule; a
+# kept file holding it is told to use the template's own harness-<tool> rules instead.
+OLD_HARNESS_RULE = "Bash(harness-*:*)"
+HARNESS_TOOL_RULE = re.compile(r"Bash\(harness-[a-z]+:\*\)")
 
 # The skeleton of each stack: (template, destination). Written only when own_layout() finds nothing.
 SKELETON = {
@@ -602,8 +607,9 @@ def read_kept_settings(path):
 def kept_settings_report(root, files):
     """The `warn:` lines for a kept .claude/settings.json (never edited): ask and deny rules that stop a
     dispatched run on a loop command or the verify command (the file's own CLAUDE_VERIFY_CMD, which is
-    what a run issues, else the rendered one), template allow entries that no allow rule covers, and
-    template env keys it lacks, each with the value to add. One line when the file is not usable settings."""
+    what a run issues, else the rendered one), template allow entries that no allow rule covers (one line
+    for the old Bash(harness-*:*) spelling in place of the harness-<tool> entries), and template env keys
+    it lacks, each with the value to add. One line when the file is not usable settings."""
     template = json.loads(dict((d, c) for d, c, _ in files)[KEPT])
     allow_wanted = template["permissions"]["allow"]
     env_wanted = template["env"]
@@ -628,9 +634,14 @@ def kept_settings_report(root, files):
                 fix = "move it to allow" if kind == "ask" else "narrow it if it does"
                 lines.append(f"warn: {KEPT} {kind} rule {r} may stop a dispatched run: it overlaps the loop "
                              f"command `{hit[1]}` ({why}); {fix}")
+    missing = [e for e in allow_wanted if not any(covers(r, e) for r in allow)]
+    if OLD_HARNESS_RULE in allow:          # one line for the old spelling, in place of one per harness tool
+        tools = [e for e in allow_wanted if HARNESS_TOOL_RULE.fullmatch(e)]
+        missing = [e for e in missing if e not in tools]
+        lines.append(f"warn: {KEPT} allow rule {OLD_HARNESS_RULE} is a wildcard auto mode may drop; replace it "
+                     f"with the nine harness-<tool> rules: {', '.join(tools)}")
     lines += [f"warn: {KEPT} allow entry {e} is missing, so a dispatched run would be stopped by a prompt "
-              "no one can answer; add it to permissions.allow"
-              for e in allow_wanted if not any(covers(r, e) for r in allow)]
+              "no one can answer; add it to permissions.allow" for e in missing]
     lines += [f"warn: {KEPT} env key {k} is not set (the template sets it); add {json.dumps({k: v})[1:-1]} "
               "to env" for k, v in env_wanted.items() if k not in env]
     return lines
