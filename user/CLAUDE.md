@@ -9,7 +9,7 @@
 ## The board is the context
 
 - Every piece of work is a GitHub issue on the project's board: an epic with task sub-issues, each with a request, an outline, a definition of done and the tests that must pass. Read the ticket (`harness-board show N --markdown`) and its epic before working. Status changes go through `harness-board`; `harness-board board` shows the whole board.
-- A question the ticket, the epic and the code cannot answer becomes `harness-board needs-input N --question ...`, never a guess. I answer on the ticket; the next `/harness:work N` reads the answer.
+- A question the ticket, the epic and the code cannot answer becomes `harness-board needs-input N --question ...` when it is about product behavior, is hard to undo, or touches security, credentials or personal data; never a guess. A reversible implementation choice they leave open is decided and recorded as a `Ruling:` line under `### Rulings` in the PR's Notes. I answer on the ticket; the next `/harness:work N` reads the answer.
 - New work: `/harness:plan <request>`. Tickets to pull requests: `/harness:work [N]`. Merging: `harness-pr autoland` for eligible PRs, `/harness:land [PR#]` for the rest. A new or existing repository joins the board with `/harness:new-project`.
 
 ## Never on main
