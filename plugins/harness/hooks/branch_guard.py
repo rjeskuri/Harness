@@ -23,11 +23,12 @@ the chain), restored after a subshell or a child shell, and moved for git by -C,
     that worktree, and a path outside any repo is never refused. A named path the Edit
     rule exempts (under docs/agent/, or one git ignores) is allowed for every form, rm,
     truncate and both sides of mv included; a directory holding a tracked file is not
-    ignored. The exemption judges what the write reaches: never for a word with an
-    unquoted glob (*, ?, [) or brace expansion (for cp, mv, ln or install into a
-    directory, the source word that names the file there included), nor for a path
-    whose first component in
-    the repo is .git, nor for a spelling that differs in case from a tracked file it
+    ignored. A cp, mv, ln, install or rsync into a directory is judged by that
+    directory alone (exempt when it is docs/agent, under it, or ignored), whatever the
+    sources are, since `cp -R src/ dest` copies the contents of src. The exemption
+    judges what the write reaches: never for a word with an unquoted glob (*, ?, [) or
+    brace expansion, nor for a path whose first component in the repo is .git, nor for
+    a spelling that differs in case from a tracked file it
     names (git ls-files with :(icase) says); a symlink is exempt only when the file it
     resolves to is exempt or lies outside every protected main working tree. The
     refusal names the first target that is not exempt;
@@ -922,7 +923,8 @@ def patch_args(args: list[str]) -> tuple[str | None, str | None, list[str], bool
 def copy_writes(name: str, args: list[str], cwd: str | None, options: set) -> list:
     """(words as written, path written) for cp, install, ln and mv: the destination,
     or the name each source gets inside it when it is a directory, with that source
-    word beside the destination, since the name comes from it."""
+    word after the destination's. branch_guard judges a copy into a directory by the
+    directory (the first word) alone; tests_first judges each path."""
     target = option_value(args, ("-t", "--target-directory"))
     plain = plain_args(args, options)
     if target is not None:
@@ -982,8 +984,8 @@ def edits_in_place(name: str, args: list[str]) -> bool:
 def file_writes(name: str, args: list[str], cwd: str | None) -> list:
     """(as written, path, why, exact) for each file `name args` creates, changes or
     removes; `exact` is False when the path is only the directory the files are in.
-    As written is the word, or for cp, mv, ln and install the tuple of words the path
-    comes from."""
+    As written is the word, or for a copy destination (cp, mv, ln, install, rsync) the
+    tuple of words the path comes from, the destination first."""
 
     def changes(paths: list[str]) -> list:
         return [(p, p, f"{name} changes {p} inside the repo", True) for p in paths]
@@ -1014,7 +1016,7 @@ def file_writes(name: str, args: list[str], cwd: str | None) -> list:
     if name == "dd":
         return changes([a[3:] for a in args if a.startswith("of=")])
     if name == "rsync":
-        return changes(rsync_dest(args))
+        return [((d,), d, why, True) for d, _, why, _ in changes(rsync_dest(args))]
     if name in ("cp", "mv", "ln", "install"):
         if name == "install" and short_flag(args, "d"):
             return []  # creates directories, as mkdir does
@@ -1197,12 +1199,10 @@ def globbing_words(text: str) -> set[str]:
     return found
 
 
-def expanded(text: str | tuple, globbing: set[str]) -> bool:
-    """True when the write target `text`, a word or the tuple of words it comes from,
-    comes from one of the `globbing` words (the word itself, or its end, as in dd's
-    of=)."""
-    texts = (text,) if isinstance(text, str) else text
-    return any(t and any(word.endswith(t) for word in globbing) for t in texts)
+def expanded(text: str, globbing: set[str]) -> bool:
+    """True when the write target `text` comes from one of the `globbing` words (the
+    word itself, or its end, as in dd's of=)."""
+    return bool(text) and any(word.endswith(text) for word in globbing)
 
 
 def written_exempt(state: dict, path: str, top: Path) -> bool:
@@ -1219,6 +1219,17 @@ def written_exempt(state: dict, path: str, top: Path) -> bool:
     if found is None:
         return True
     return not os.path.islink(target) and name_exempt(target, found[0])
+
+
+def destination_exempt(state: dict, path: str | None, top: Path) -> bool:
+    """written_exempt for the destination of a cp, mv, ln, install or rsync, a named
+    file or the directory the files go into (BSD `cp -R src/ dest` copies the contents
+    of src, so no name inside it is known): docs/agent itself counts as under it."""
+    if path is None:
+        return False
+    if repo_relative(path, top) == NOTES_DIR.rstrip("/") and not os.path.islink(path):
+        return True
+    return written_exempt(state, path, top)
 
 
 def name_exempt(path: str, top: Path) -> bool:
@@ -1336,12 +1347,15 @@ def part_refusal(state: dict, part: Part, name: str, args: list[str]) -> tuple |
         found = holder(state, path)
         if found is None:
             continue
+        exempt = written_exempt
+        if isinstance(text, tuple):  # a copy destination: a named file or a directory
+            text, path, exempt = text[0], absolute(text[0], cwd), destination_exempt
         if exact and globbing is None:
             globbing = globbing_words(part.text)
         if not (
             exact
             and not expanded(text, globbing)
-            and written_exempt(state, path, found[0])
+            and exempt(state, path, found[0])
         ):
             return part.text, why, found[0], found[1], ADVICE
     if name == "git":
