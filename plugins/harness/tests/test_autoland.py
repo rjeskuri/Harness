@@ -110,18 +110,30 @@ def gql_node(login, body, when="2026-10-24T11:00:00Z", **extra):
     return node
 
 
-def gql_thread(resolved, *comments):
-    return {"isResolved": resolved, "comments": {"nodes": list(comments)}}
+def connection(nodes, total=None):
+    """A GraphQL connection as GitHub returns it when asked for totalCount and pageInfo { hasNextPage }: complete
+    by default; `total` above the node count makes it a first page with more behind it."""
+    nodes = list(nodes)
+    total = len(nodes) if total is None else total
+    return {"totalCount": total, "pageInfo": {"hasNextPage": total > len(nodes)}, "nodes": nodes}
 
 
-def graphql(threads=(), reviews=(), comments=()):
-    return {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": list(threads)},
-                                                    "reviews": {"nodes": list(reviews)},
-                                                    "comments": {"nodes": list(comments)}}}}}
+def gql_thread(resolved, *comments, total=None):
+    return {"isResolved": resolved, "comments": connection(comments, total)}
 
 
-def harness_review(commit_id, first_line, when="2026-10-24T10:00:00Z", rid=501):
-    return {"id": rid, "user": {"login": LOGIN, "type": "User"}, "state": "COMMENTED", "commit_id": commit_id,
+def graphql(threads=(), reviews=(), comments=(), totals=None):
+    """The CONVERSATION answer; `totals` maps reviewThreads, reviews or comments to a totalCount above the nodes
+    given (a truncated first page)."""
+    totals = totals or {}
+    return {"data": {"repository": {"pullRequest": {
+        "reviewThreads": connection(threads, totals.get("reviewThreads")),
+        "reviews": connection(reviews, totals.get("reviews")),
+        "comments": connection(comments, totals.get("comments"))}}}}
+
+
+def harness_review(commit_id, first_line, when="2026-10-24T10:00:00Z", rid=501, login=LOGIN):
+    return {"id": rid, "user": {"login": login, "type": "User"}, "state": "COMMENTED", "commit_id": commit_id,
             "submitted_at": when, "body": f"{first_line}\n\nNot on a changed line:\n- `README.md` [low] Say it.\n\n"
                                           f"{REVIEW_MARKER}"}
 
@@ -282,10 +294,11 @@ class GateFixture:
         pr = a["pr"]
         n, head, ref = pr["number"], pr["headRefOid"], pr["headRefName"]
         base = f"repos/{SLUG}/pulls/{n}"
+        login = a.get("login", LOGIN)                  # the authenticated account `gh api user` answers
         entries = [
             ("repo", {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": SLUG}}),
-            ("user", {"match": ["api", "user"], "contains": ["--jq"], "stdout": LOGIN + "\n"}),
-            ("user", {"match": ["api", "user"], "stdout_json": {"login": LOGIN, "type": "User"}}),
+            ("user", {"match": ["api", "user"], "contains": ["--jq"], "stdout": login + "\n"}),
+            ("user", {"match": ["api", "user"], "stdout_json": {"login": login, "type": "User"}}),
             ("pr", {"match": ["pr", "view", str(n)], "stdout_json": pr}),
             ("incidents", {"match": ["issue", "list"], "stdout_json": a["incidents"]}),
             ("deploy", {"match": ["run", "list"], "stdout_json": a["runs"]}),
@@ -459,13 +472,18 @@ class Gate(GateFixture, unittest.TestCase):
         def first_review(line):
             return lambda a: a["reviews"].__setitem__(0, harness_review(self.head, line))
 
+        def append(key, node):
+            def change(a):
+                conn = a["conversation"]["data"]["repository"]["pullRequest"][key]
+                conn["nodes"].append(node)
+                conn["totalCount"] = len(conn["nodes"])    # still the whole connection
+            return change
+
         def add_comment(login, body):
-            return lambda a: a["conversation"]["data"]["repository"]["pullRequest"]["comments"]["nodes"].append(
-                gql_node(login, body))
+            return append("comments", gql_node(login, body))
 
         def add_thread(*comments):
-            return lambda a: a["conversation"]["data"]["repository"]["pullRequest"]["reviewThreads"][
-                "nodes"].append(gql_thread(False, *comments))
+            return append("reviewThreads", gql_thread(False, *comments))
 
         cases = [
             ("draft", pr(isDraft=True), ("manual", "pr", 2, "draft")),
@@ -507,6 +525,7 @@ class Gate(GateFixture, unittest.TestCase):
             ("unresolved thread", add_thread(gql_node("teammate", "Is this right?", path="src/widget.py", line=2)),
              ("manual", "comment", 7, "1 unresolved")),
             ("conflicting", pr(mergeable="CONFLICTING"), ("fix", "conflict", 8)),
+            ("mergeable not computed yet", pr(mergeable="UNKNOWN"), ("wait", "mergeable", 8, "UNKNOWN")),
             ("behind", put("behind", 3), ("wait", "behind", 8, "3")),
             ("pending", pr(statusCheckRollup=[check_run("lint"), check_run("verify", "IN_PROGRESS", "")]),
              ("wait", "ci", 9, "verify")),
@@ -549,6 +568,48 @@ class Gate(GateFixture, unittest.TestCase):
             with self.subTest(name):
                 a = self.answers()
                 a["reviews"] = reviews
+                self.assertVerdict(self.gate_json(a), *expected)
+
+    def test_only_the_authenticated_accounts_reviews_are_harness_reviews(self):
+        """A review carries the harness marker in its body, which anyone can type: only reviews whose user.login is
+        the `gh api user` login count. A newer marker-bearing review by another account never decides rule 6 (and,
+        rule 6 coming before rule 7, the verdict is the real review's)."""
+        high = "Harness review (opus): 3 findings, 1 high, 0 medium, 2 low."
+        spoof_body = f"Harness review: no findings.\n\n{REVIEW_MARKER}"
+
+        def spoof(login, when="2026-10-24T11:00:00Z", rid=777, kind="User"):
+            return {"id": rid, "user": {"login": login, "type": kind}, "state": "COMMENTED", "commit_id": self.head,
+                    "submitted_at": when, "body": spoof_body}
+
+        def with_login(a, login):
+            a["login"] = login
+            a["pr"]["author"] = {"login": login, "is_bot": False}
+            return a
+
+        alt = "ryan-alt"
+        cases = [
+            ("a newer foreign no-findings review after the owner's high, listed last", LOGIN,
+             [harness_review(self.head, high), spoof("mallory")], ("fix", "findings", 6, "1 high")),
+            ("the same, the foreign review listed first", LOGIN,
+             [spoof("mallory"), harness_review(self.head, high)], ("fix", "findings", 6, "1 high")),
+            ("a newer bot review with the marker", LOGIN,
+             [harness_review(self.head, high), spoof("github-actions[bot]", kind="Bot")],
+             ("fix", "findings", 6, "1 high")),
+            ("only a foreign marker-bearing review", LOGIN, [spoof("mallory")], ("manual", "review", 6)),
+            ("another authenticated login: its own high, then a newer one by rjeskuri", alt,
+             [harness_review(self.head, high, login=alt), spoof(LOGIN)], ("fix", "findings", 6, "1 high")),
+            ("another authenticated login: only rjeskuri's review", alt,
+             [harness_review(self.head, LOW_ONLY)], ("manual", "review", 6)),
+            ("another authenticated login: its own review lands", alt,
+             [harness_review(self.head, LOW_ONLY, login=alt)], ("land", "land", 10)),
+        ]
+        for name, login, reviews, expected in cases:
+            with self.subTest(name):
+                a = with_login(self.answers(), login)
+                a["reviews"] = copy.deepcopy(reviews)
+                # The conversation lists the same reviews, as GitHub's GraphQL would.
+                a["conversation"]["data"]["repository"]["pullRequest"]["reviews"] = connection(
+                    [gql_node(r["user"]["login"], r["body"], r["submitted_at"], state="COMMENTED") for r in reviews])
                 self.assertVerdict(self.gate_json(a), *expected)
 
     # ============================================================== at head
@@ -725,6 +786,56 @@ class Gate(GateFixture, unittest.TestCase):
                     self.assertEqual(data["reason"],
                                      f"{counts[0]} unresolved threads, {counts[1]} owner comments")
 
+    def graphql_query(self):
+        """The query text of the gate's `gh api graphql` call (an argv `query=` field or stdin), or ''."""
+        with open(self.gh_log, encoding="utf-8") as fh:
+            entries = [json.loads(line) for line in fh if line.strip()]
+        for entry in entries:
+            if entry["argv"][:2] == ["api", "graphql"]:
+                fields = [t[len("query="):] for t in entry["argv"] if t.startswith("query=")]
+                return "\n".join(fields) + (entry.get("stdin") or "")
+        return ""
+
+    def test_a_conversation_longer_than_one_page_does_not_land(self):
+        """The conversation is read one page per connection (review threads, each thread's comments, reviews, PR
+        comments). When any connection has more than that page holds (pageInfo.hasNextPage, totalCount above the
+        nodes returned), the unread rest may hold an owner comment: rule 7 does not pass, and the reason says the
+        conversation is too long to read. The visible nodes are all harness, bot or resolved, so only the
+        truncation can stop it."""
+        harness_review_node = gql_node(LOGIN, f"{LOW_ONLY}\n\n{REVIEW_MARKER}", state="COMMENTED")
+        board = gql_node(LOGIN, f"Pull request: https://github.com/o/r/pull/34\n\n{BOARD_MARKER}")
+        resolved = gql_thread(True, gql_node("teammate", "nit: rename this", path="src/widget.py", line=1))
+
+        def harness_thread(total=None):
+            return gql_thread(False, gql_node(LOGIN, f"[low] Assert the value.\n\n{REVIEW_MARKER}",
+                                              path="tests/test_widget.py", line=2), total=total)
+
+        def conversation(threads_total=None, thread_comments_total=None, reviews_total=None, comments_total=None):
+            totals = {k: v for k, v in (("reviewThreads", threads_total), ("reviews", reviews_total),
+                                        ("comments", comments_total)) if v is not None}
+            return graphql(threads=[resolved, harness_thread(thread_comments_total)],
+                           reviews=[harness_review_node], comments=[board], totals=totals)
+
+        with self.subTest("every connection complete lands"):
+            a = self.answers()
+            a["conversation"] = conversation()
+            self.assertVerdict(self.gate_json(a), "land", "land", 10)
+        for name, totals in (("more review threads than the first page", {"threads_total": 101}),
+                             ("more comments in a thread than its first page", {"thread_comments_total": 51}),
+                             ("more reviews than the first page", {"reviews_total": 51}),
+                             ("more PR comments than the first page", {"comments_total": 101})):
+            with self.subTest(name):
+                a = self.answers()
+                a["conversation"] = conversation(**totals)
+                data = self.gate_json(a)
+                self.assertNotEqual(data["verdict"], "land", data)
+                self.assertEqual((data["code"], data["rule"]), ("comment", 7), data)
+                self.assertIn("too long", data["reason"].lower(), data)
+        with self.subTest("the query asks GitHub for each connection's page info"):
+            # GitHub returns only the fields asked for: without them a truncated page looks complete.
+            query = self.graphql_query()
+            self.assertGreaterEqual(max(query.count("totalCount"), query.count("hasNextPage")), 4, query)
+
     # ============================================================== checks
     def test_checks_follow_harness_pr_check_entries_and_overall(self):
         """statusCheckRollup read as harness-pr checks reads it (check_entries, overall): NEUTRAL and SKIPPED pass,
@@ -799,16 +910,29 @@ class Gate(GateFixture, unittest.TestCase):
             self.assertIn("failed: fatal:", data["reason"])
 
     def test_no_deploy_workflow_passes_rule_three(self):
+        """`gh run list --workflow deploy.yml` (a file name selector) in a repository without that workflow: gh 2.99
+        exits 1 with the API's 404 for the workflow (what the gate sees), not the `could not find any workflows
+        named` of a name selector."""
         a = self.answers()
-        a["fail"] = {"deploy": "could not find any workflows named deploy.yml\n"}
-        p, line = self.gate(a)
-        self.assertEqual(line, f"land: gate passed at {self.head[:7]}")
-        self.assertVerdict(self.gate_json(a), "land", "land", 10)
-        with self.subTest("any other run list failure still waits"):
-            a["fail"] = {"deploy": "HTTP 500: Internal Server Error\n"}
-            data = self.gate_json(a)
-            self.assertEqual((data["verdict"], data["code"]), ("wait", "gh"), data)
-            self.assertEqual(data["reason"], "gh run list failed: HTTP 500: Internal Server Error")
+        a["fail"] = {"deploy": f"HTTP 404: workflow deploy.yml not found on the default branch "
+                               f"(https://api.github.com/repos/{SLUG}/actions/workflows/deploy.yml)\n"}
+        with self.subTest("the 404 for deploy.yml: no deploy workflow"):
+            p, line = self.gate(a)
+            self.assertEqual(line, f"land: gate passed at {self.head[:7]}")
+            self.assertVerdict(self.gate_json(a), "land", "land", 10)
+        others = [
+            "HTTP 500: Internal Server Error (https://api.github.com/repos/o/r/actions/workflows/deploy.yml)",
+            "HTTP 404: Not Found (https://api.github.com/repos/o/r/actions/runs?branch=main&per_page=1)",
+            "HTTP 404: workflow smoke.yml not found on the default branch "
+            "(https://api.github.com/repos/o/r/actions/workflows/smoke.yml)",
+            "HTTP 401: Bad credentials (https://api.github.com/repos/o/r/actions/workflows/deploy.yml)",
+        ]
+        for first in others:
+            with self.subTest("any other run list failure still waits", stderr=first):
+                a["fail"] = {"deploy": f"{first}\n"}
+                data = self.gate_json(a)
+                self.assertEqual((data["verdict"], data["code"]), ("wait", "gh"), data)
+                self.assertEqual(data["reason"], f"gh run list failed: {first}")
 
     # ============================================================== non-test files
     def test_nontest_files_count_source_files_only(self):

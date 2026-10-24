@@ -34,21 +34,28 @@ REVIEW_MARKER = "<!-- harness-review -->"
 BOARD_MARKER = "<!-- harness -->"
 REVIEW_COUNTS = re.compile(r"Harness review \([^)]*\): (\d+) findings?, (\d+) high, (\d+) medium, (\d+) low\.")
 NO_FINDINGS = "Harness review: no findings."
-NO_DEPLOY_WORKFLOW = re.compile(r"could not find any workflows? named", re.I)
+# gh run list --workflow deploy.yml in a repository without it: the API's 404 for that workflow file (gh 2.99), or
+# the message of a name selector. Any other failure, a 404 about another workflow included, is not this.
+NO_DEPLOY_WORKFLOW = re.compile(r"HTTP 404: workflow deploy\.yml not found\b|could not find any workflows? named "
+                                r"deploy\.yml\b", re.I)
 FAILED = ("FAILURE", "CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED", "STARTUP_FAILURE")
 PASSED = ("SUCCESS", "SKIPPED", "NEUTRAL")
 PR_FIELDS = ("number,state,isDraft,headRefName,headRefOid,author,closingIssuesReferences,labels,mergeable,"
              "statusCheckRollup")
 GIT_TIMEOUT = 120  # seconds any one git call of the gate may take
 # Review threads, reviews and PR comments; harness-pr comments reads it too. __typename tells a bot (GraphQL
-# gives a bot's login without the [bot] suffix).
+# gives a bot's login without the [bot] suffix). One page per connection: totalCount and pageInfo say when a page
+# left some out (truncated()).
 CONVERSATION = """query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) { nodes { isResolved
-        comments(first: 50) { nodes { author { login __typename } body path line createdAt url } } } }
-      reviews(first: 50) { nodes { author { login __typename } body state createdAt url } }
-      comments(first: 100) { nodes { author { login __typename } body createdAt url } }
+      reviewThreads(first: 100) { totalCount pageInfo { hasNextPage } nodes { isResolved
+        comments(first: 50) { totalCount pageInfo { hasNextPage }
+          nodes { author { login __typename } body path line createdAt url } } } }
+      reviews(first: 50) { totalCount pageInfo { hasNextPage }
+        nodes { author { login __typename } body state createdAt url } }
+      comments(first: 100) { totalCount pageInfo { hasNextPage }
+        nodes { author { login __typename } body createdAt url } }
     }
   }
 }"""
@@ -170,6 +177,9 @@ def _review(facts, settings):
 
 
 def _comments(facts, settings):
+    truncated = facts.get("conversation_truncated")
+    if truncated:
+        return "manual", "comment", f"conversation too long to read: {truncated}"
     threads, comments = facts.get("unresolved_threads") or 0, facts.get("owner_comments") or 0
     if threads > 0 or comments > 0:
         return "manual", "comment", f"{threads} unresolved threads, {comments} owner comments"
@@ -316,7 +326,7 @@ def _deploy(main):
             "status,conclusion,headSha"]
     done = gh_run(args, main)
     if done.returncode != 0:
-        if NO_DEPLOY_WORKFLOW.search(done.stderr or ""):
+        if NO_DEPLOY_WORKFLOW.match(first_line(done.stderr)):
             return None
         raise Problem(f"{describe(args)} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
     try:
@@ -351,10 +361,12 @@ def _files(main, slug, pr, tests):
     return paths, files, lines
 
 
-def latest_review(reviews):
-    """The review with the newest submitted_at whose body carries REVIEW_MARKER, or None."""
+def latest_review(reviews, login):
+    """The review by `login` (the authenticated account) with the newest submitted_at whose body carries
+    REVIEW_MARKER, or None: anyone can type the marker, so another account's review never counts."""
     found = [(parse_iso(r.get("submitted_at")), r) for r in reviews
-             if REVIEW_MARKER in (r.get("body") or "") and parse_iso(r.get("submitted_at"))]
+             if login and isinstance(r.get("user"), dict) and r["user"].get("login") == login
+             and REVIEW_MARKER in (r.get("body") or "") and parse_iso(r.get("submitted_at"))]
     return max(found, key=lambda pair: pair[0])[1] if found else None
 
 
@@ -419,8 +431,18 @@ def owner_said(node):
     return bool(body.strip()) and REVIEW_MARKER not in body and BOARD_MARKER not in body and not _is_bot(node)
 
 
+def truncated(connection):
+    """Did GitHub return only a first page of this GraphQL connection (hasNextPage, or totalCount above the nodes)?"""
+    if not isinstance(connection, dict):
+        return False
+    info = connection.get("pageInfo") if isinstance(connection.get("pageInfo"), dict) else {}
+    total = connection.get("totalCount")
+    return bool(info.get("hasNextPage")) or (isinstance(total, int) and total > len(as_list(connection)))
+
+
 def _conversation(main, slug, pr):
-    """(unresolved threads holding an owner comment, owner comments and reviews) from the GraphQL conversation."""
+    """(unresolved threads holding an owner comment, owner comments and reviews, which connections GitHub cut to
+    one page or None) from the GraphQL conversation."""
     owner, name = slug.split("/", 1)
     data = gh_json(["api", "graphql", "-f", f"query={CONVERSATION}", "-f", f"owner={owner}", "-f", f"repo={name}",
                     "-F", f"number={pr}"], main)
@@ -430,7 +452,11 @@ def _conversation(main, slug, pr):
     threads = sum(1 for t in as_list(node.get("reviewThreads"))
                   if not t.get("isResolved") and any(owner_said(c) for c in as_list(t.get("comments"))))
     said = sum(1 for n in as_list(node.get("comments")) + as_list(node.get("reviews")) if owner_said(n))
-    return threads, said
+    cut = [what for key, what in (("reviewThreads", "review threads"), ("reviews", "reviews"),
+                                  ("comments", "PR comments")) if truncated(node.get(key))]
+    if any(truncated(t.get("comments")) for t in as_list(node.get("reviewThreads"))):
+        cut.append("comments in a review thread")
+    return threads, said, (f"more {', '.join(cut)} than one page holds" if cut else None)
 
 
 def _behind(main, slug, head):
@@ -479,9 +505,10 @@ def _gather(main, slug, pr, facts):
         facts["ticket"] = {"number": number, "state": issue.get("state"), "labels": _names(issue.get("labels"))}
     tests = committed_test_patterns(main)
     facts["files"], facts["nontest_files"], facts["nontest_lines"] = _files(main, slug, pr, tests)
-    review = latest_review(_pages(["api", "--paginate", f"repos/{slug}/pulls/{pr}/reviews"], main))
+    review = latest_review(_pages(["api", "--paginate", f"repos/{slug}/pulls/{pr}/reviews"], main), facts["login"])
     commits = _pages(["api", "--paginate", f"repos/{slug}/pulls/{pr}/commits"], main)
-    facts["unresolved_threads"], facts["owner_comments"] = _conversation(main, slug, pr)
+    (facts["unresolved_threads"], facts["owner_comments"],
+     facts["conversation_truncated"]) = _conversation(main, slug, pr)
     facts["behind_by"] = _behind(main, slug, head)
     if review is None:
         facts["review"] = None
