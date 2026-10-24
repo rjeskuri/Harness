@@ -27,6 +27,7 @@ import tempfile
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 sys.dont_write_bytecode = True      # importing the bin script must not leave a __pycache__ in bin/
 
@@ -449,7 +450,9 @@ class Digest(unittest.TestCase):
         tool = load_tool()
         tool.GH_BUDGET = 1
         started = time.monotonic()
-        out = tool.project_digest({"name": "gamma", "path": W["gamma"]}, os.path.join(W["slowbin"], "gh"), time.time())
+        with mock.patch.dict(os.environ, {"HOME": self.home}):       # #187: the gh log goes to the test's HOME
+            out = tool.project_digest({"name": "gamma", "path": W["gamma"]}, os.path.join(W["slowbin"], "gh"),
+                                      time.time())
         self.assertLess(time.monotonic() - started, 4)
         self.assertEqual(out["error"], "gh pr list timed out after 1 s")
 
