@@ -734,7 +734,7 @@ def cmd_promote(repo, args):
     if str(data.get("state", "")).upper() == "CLOSED":
         raise Problem(f"#{n} is closed; only an open status:proposed ticket can be promoted")
     if "status:proposed" not in names:
-        status = classify(names)["status"]
+        status = next((s for s in STATUSES if "status:" + s in names), None)
         raise Problem(f"#{n} is {'status:' + status if status else 'without a status label'}, not status:proposed; "
                       "nothing promoted")
     tasks = []
