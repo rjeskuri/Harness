@@ -39,6 +39,18 @@ COMMON_FILES = ["CLAUDE.md", ".claude/settings.json", "scripts/verify.sh", ".git
                 ".github/ISSUE_TEMPLATE/task.md", ".github/ISSUE_TEMPLATE/epic.md", ".githooks/pre-commit",
                 ".gitignore", ".worktreeinclude"]
 
+# The allow entries every render starts with (ticket #137): the twelve git, gh and verify entries, then one
+# narrow rule per harness tool in this order. The old wildcard spelling may be dropped by auto mode.
+BASE_ALLOW = ["Bash(scripts/verify.sh)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
+              "Bash(git add:*)", "Bash(git commit:*)", "Bash(git push:*)", "Bash(git fetch:*)",
+              "Bash(git worktree:*)", "Bash(gh issue:*)", "Bash(gh pr:*)", "Bash(gh api:*)"]
+HARNESS_NINE = [f"Bash(harness-{tool}:*)" for tool in ("pr", "board", "work", "red", "scaffold", "digest",
+                                                       "standup", "projects", "worklog")]
+WILDCARD = "Bash(harness-*:*)"
+OLD_SPELLING_WARN = ("warn: .claude/settings.json allow rule Bash(harness-*:*) is a wildcard auto mode may drop; "
+                     "replace it with the nine harness-<tool> rules: " + ", ".join(HARNESS_NINE))
+REPO = os.path.dirname(os.path.dirname(PLUGIN))
+
 STUB = """#!{python}
 import json, os, sys
 argv = sys.argv[1:]
@@ -226,14 +238,41 @@ class Render(ScaffoldTest):
         self.assertEqual(settings["env"], {"CLAUDE_VERIFY_CMD": "scripts/verify.sh",
                                            "HARNESS_TEST_CMD": "uv run pytest -q {files}"})
         allow = settings["permissions"]["allow"]
-        for rule in ("Bash(scripts/verify.sh)", "Bash(git commit:*)", "Bash(git worktree:*)", "Bash(gh api:*)",
-                     "Bash(harness-*:*)", "Bash(uv run pytest:*)"):
+        for rule in ["Bash(scripts/verify.sh)", "Bash(git commit:*)", "Bash(git worktree:*)", "Bash(gh api:*)",
+                     "Bash(uv run pytest:*)"] + HARNESS_NINE:
             self.assertIn(rule, allow)
+        self.assertNotIn(WILDCARD, allow)
 
         self.assertEqual(self.git(root, "config", "--get", "core.hooksPath"), ".githooks")
         self.assertIn(".claude/worktrees/", self.read(root, ".git", "info", "exclude").splitlines())
         self.assertIn(".env", self.read(root, ".worktreeinclude").splitlines())
         self.assertIn(".claude/worktrees/", self.read(root, ".gitignore").splitlines())
+
+    def test_settings_allow_the_nine_harness_tools_not_the_wildcard(self):
+        """Every stack renders the twelve base entries, then the nine harness-<tool> rules in order, then
+        only the stack's own extras; the wildcard Bash(harness-*:*) appears nowhere (ticket #137)."""
+        extras = {"none": [], "python": ["Bash(uv run pytest:*)", "Bash(uv run ruff:*)", "Bash(python3 -m pytest:*)"],
+                  "node": ["Bash(npm test:*)", "Bash(npm run lint:*)", "Bash(node --test:*)"]}
+        for stack, own in extras.items():
+            with self.subTest(stack=stack):
+                root = os.path.join(self.tmp, f"nine-{stack}")
+                self.ok("init", root, "--name", "nine", "--stack", stack)
+                allow = self.settings(root)["permissions"]["allow"]
+                self.assertNotIn(WILDCARD, allow)
+                self.assertNotIn(WILDCARD, self.read(root, ".claude", "settings.json"))
+                self.assertEqual([r for r in allow if r.startswith("Bash(harness-")], HARNESS_NINE)
+                self.assertEqual(allow, BASE_ALLOW + HARNESS_NINE + own)
+        # the template itself, which kept-settings checks compare against, holds the same
+        template = json.loads(self.read(TEMPLATES, "settings.json"))["permissions"]["allow"]
+        self.assertEqual(template, BASE_ALLOW + HARNESS_NINE)
+
+    def test_harness_own_settings_allow_the_nine_not_the_wildcard(self):
+        """Harness's own .claude/settings.json follows the template: the nine rules, no wildcard."""
+        data = json.loads(self.read(REPO, ".claude", "settings.json"))
+        allow = data["permissions"]["allow"]
+        self.assertNotIn(WILDCARD, allow)
+        self.assertEqual(allow, BASE_ALLOW + HARNESS_NINE)
+        self.assertEqual(data["env"], {"CLAUDE_VERIFY_CMD": "python3 -m unittest discover -s plugins/harness/tests"})
 
     def test_issue_templates_carry_the_ticket_bodies(self):
         root = os.path.join(self.tmp, "demo")
@@ -1224,10 +1263,10 @@ TEMPLATE_ENV = list(_TEMPLATE_SETTINGS["env"])                          # what s
 # One rule for each command the loop needs; each is also a template allow entry.
 LOOP_RULES = ["Bash(git add:*)", "Bash(git commit:*)", "Bash(git push:*)", "Bash(git fetch:*)",
               "Bash(git worktree:*)", "Bash(gh issue:*)", "Bash(gh pr:*)", "Bash(gh api:*)",
-              "Bash(harness-*:*)", "Bash(scripts/verify.sh)"]
+              "Bash(harness-pr:*)", "Bash(scripts/verify.sh)"]
 # Rules are Bash command prefixes at word boundaries: a rule that covers a loop command, or sits inside
-# one, blocks the loop.
-BROADER_RULES = ["Bash", "Bash(*)", "Bash(git:*)", "Bash(gh:*)"]
+# one, blocks the loop. As an ask or deny, the old wildcard spelling counts for every harness tool.
+BROADER_RULES = ["Bash", "Bash(*)", "Bash(git:*)", "Bash(gh:*)", "Bash(harness-*:*)"]
 NARROWER_RULES = ["Bash(git commit -m:*)", "Bash(git push --force:*)", "Bash(git push origin main)",
                   "Bash(git worktree add:*)", "Bash(gh pr create:*)", "Bash(harness-work:*)"]
 # Share a prefix or a substring with a loop command without being one; non-Bash rules are not commands.
@@ -1430,11 +1469,11 @@ class KeptSettings(ScaffoldTest):
             for mode, p in self.both_runs("many", ask=ask, deny=deny):
                 self.assertWarns(mode, p, expected)
 
-        # the ticket's example: an ask on git commit and no harness-* allow is exactly two warnings
-        allow = [r for r in TEMPLATE_ALLOW if r != "Bash(harness-*:*)"]
+        # the ticket's example: an ask on git commit and no harness-pr allow is exactly two warnings
+        allow = [r for r in TEMPLATE_ALLOW if r != "Bash(harness-pr:*)"]
         with self.subTest(kept="jotform"):
             for mode, p in self.both_runs("jotform", ask=["Bash(git commit:*)"], allow=allow):
-                self.assertWarns(mode, p, [("Bash(git commit:*)", "ask"), ("Bash(harness-*:*)", "allow")])
+                self.assertWarns(mode, p, [("Bash(git commit:*)", "ask"), ("Bash(harness-pr:*)", "allow")])
 
         # the verify command is the project's own (the rendered CLAUDE_VERIFY_CMD), not a fixed one
         table = [("make check", ["Bash(make check:*)", "Bash(make check)", "Bash(make:*)"],
@@ -1540,8 +1579,10 @@ class KeptSettings(ScaffoldTest):
         without = lambda gone: [r for r in TEMPLATE_ALLOW if r != gone]       # noqa: E731
         table = [
             (["Bash"], []),
-            (["Bash(git:*)", "Bash(gh:*)", "Bash(harness-*:*)", "Bash(scripts/verify.sh)"], []),
-            (without("Bash(harness-*:*)") + ["Bash(harness-scaffold:*)"], ["Bash(harness-*:*)"]),
+            (["Bash(git:*)", "Bash(gh:*)"] + HARNESS_NINE + ["Bash(scripts/verify.sh)"], []),
+            (without("Bash(harness-pr:*)") + ["Bash(harness-pr open:*)", "Bash(harness-p:*)", "Bash(harness:*)",
+                                               "Bash(harness-prx:*)"], ["Bash(harness-pr:*)"]),
+            ([r for r in TEMPLATE_ALLOW if r not in HARNESS_NINE] + ["Bash(harness-board show:*)"], HARNESS_NINE),
             (without("Bash(git commit:*)") + ["Bash(git commit -m:*)"], ["Bash(git commit:*)"]),
             (without("Bash(gh api:*)") + ["Bash(gh:*)"], []),
             (["Bash(git:*)"], not_git),
@@ -1586,8 +1627,8 @@ class KeptSettings(ScaffoldTest):
         # Bash(*) covers every entry of every stack; so do one broad rule per program
         for stack in ("none", "python", "node"):
             ref_allow, _ = self.reference(stack)
-            programs = _unique(_bash(_words(r)[:1], True) for r in ref_allow if r != "Bash(harness-*:*)")
-            for label, allow in (("star", ["Bash(*)"]), ("programs", programs + ["Bash(harness-*:*)"])):
+            programs = _unique(_bash(_words(r)[:1], True) for r in ref_allow)
+            for label, allow in (("star", ["Bash(*)"]), ("programs", programs)):
                 with self.subTest(stack=stack, allow=allow):
                     for mode, p in self.both_runs(f"broad-{label}-{stack}", stack, allow=allow):
                         self.assertWarns(mode, p, [])
@@ -1672,8 +1713,8 @@ class KeptSettings(ScaffoldTest):
         odd = ('{"permissions":{"allow":%s,"ask":["Bash(rm -rf:*)"],"deny":["Bash(curl:*)"]},\n'
                '    "env":{"CLAUDE_VERIFY_CMD":"make check","HARNESS_TEST_CMD":"make test FILES={files}"}}'
                % json.dumps(python_allow + ["Bash(make check:*)"]))
-        broad = ["Bash(git:*)", "Bash(gh:*)", "Bash(harness-*:*)", "Bash(scripts/verify.sh)", "Bash(uv:*)",
-                 "Bash(python3:*)"]
+        broad = ["Bash(git:*)", "Bash(gh:*)"] + HARNESS_NINE + ["Bash(scripts/verify.sh)", "Bash(uv:*)",
+                                                                "Bash(python3:*)"]
         variants = [("none", "none", {}), ("python", "python", {}), ("node", "node", {}),
                     ("odd", "python", {"text": odd}), ("bare-bash", "python", {"allow": ["Bash"]}),
                     ("broad", "python", {"allow": broad}),
@@ -1736,9 +1777,9 @@ class KeptSettings(ScaffoldTest):
 
     # ---------------------------------------------------------------- every init path, no duplicates
     def test_each_warning_appears_once_on_every_init_path(self):
-        allow = [r for r in self.reference("python")[0] if r != "Bash(harness-*:*)"]
+        allow = [r for r in self.reference("python")[0] if r != "Bash(harness-work:*)"]
         env = {k: v for k, v in self.reference("python")[1].items() if k != "HARNESS_TEST_CMD"}
-        expected = [("Bash(git commit:*)", "ask"), ("Bash(gh api:*)", "deny"), ("Bash(harness-*:*)", "allow"),
+        expected = [("Bash(git commit:*)", "ask"), ("Bash(gh api:*)", "deny"), ("Bash(harness-work:*)", "allow"),
                     ("HARNESS_TEST_CMD", "env")]
         for path in ("fresh", "unborn", "adopt", "again"):
             with self.subTest(path=path):
@@ -1820,6 +1861,120 @@ class KeptSettings(ScaffoldTest):
                     for key, value in ref_env.items():
                         line = next(w for w in self.warns(p) if key in w)
                         self.assertIn(json.dumps({key: value})[1:-1], line, line)
+
+    # ---------------------------------------------------------------- the nine harness rules (ticket #137)
+    def no_harness(self, stack, verify=None):
+        """The stack's rendered allow list without any harness rule, wildcard or narrow."""
+        return [r for r in self.reference(stack, verify)[0] if r != WILDCARD and r not in HARNESS_NINE]
+
+    def assertOldSpellingOnly(self, mode, p, others=()):
+        """The old-spelling line exactly once, verbatim; no `allow entry Bash(harness-...) is missing` line;
+        and besides it exactly the (needle, kind) warnings in `others`."""
+        warns = self.warns(p)
+        self.assertEqual(warns.count(OLD_SPELLING_WARN), 1, f"{mode}: {warns}\n{p.stdout}")
+        self.assertEqual(len([w for w in warns if "wildcard auto mode may drop" in w]), 1, f"{mode}: {warns}")
+        self.assertEqual([w for w in warns if re.search(r"allow entry Bash\(harness-[^)]*\) is missing", w)], [],
+                         f"{mode}: {warns}")
+        rest = [w for w in warns if w != OLD_SPELLING_WARN]
+        self.assertEqual(len(rest), len(others), f"{mode}: {rest}")
+        for needle, kind in others:
+            lines = [w for w in rest if needle in w]
+            self.assertEqual(len(lines), 1, f"{mode} {needle!r}: {rest}")
+            self.assertRegex(lines[0], rf"\b{kind}\b")
+
+    def test_old_wildcard_spelling_warns_once(self):
+        """A kept allow list holding Bash(harness-*:*) gets the one old-spelling line, in init and in
+        --dry-run, in place of nine `allow entry ... is missing` lines; for every stack, wherever the
+        wildcard sits, written twice, next to some of the nine, and beside other warnings."""
+        rng = random.Random(137)
+        n = 0
+        for stack in ("none", "python", "node"):
+            base = self.no_harness(stack)
+            for where in (0, len(base) // 2, len(base)):
+                n += 1
+                allow = base[:where] + [WILDCARD] + base[where:]
+                with self.subTest(stack=stack, at=where):
+                    for mode, p in self.both_runs(f"old{n}", stack, allow=allow):
+                        self.assertOldSpellingOnly(mode, p)
+        base = self.no_harness("none")
+        cases = [("twice", base + [WILDCARD, WILDCARD], ()),
+                 ("with-three-of-nine", base + [WILDCARD] + rng.sample(HARNESS_NINE, 3), ()),
+                 ("with-other-problems", [r for r in base if r != "Bash(gh pr:*)"] + [WILDCARD],
+                  (("Bash(gh pr:*)", "allow"), ("Bash(git commit:*)", "ask")))]
+        for label, allow, others in cases:
+            with self.subTest(case=label):
+                ask = ["Bash(git commit:*)"] if others else ()
+                for mode, p in self.both_runs(f"old-{label}", allow=allow, ask=ask):
+                    self.assertOldSpellingOnly(mode, p, others)
+        # the other init paths print it the same way
+        for path in ("unborn", "again"):
+            with self.subTest(path=path):
+                for mode, p in self.both_runs(f"old-path-{path}", "python", path=path,
+                                              allow=self.no_harness("python") + [WILDCARD]):
+                    self.assertOldSpellingOnly(mode, p)
+
+    def test_nine_rules_need_no_allow_warning(self):
+        """A kept file with the nine harness-<tool> rules (and no wildcard) gets no allow warning, in any
+        order or position, for every stack; and never the old-spelling line."""
+        rng = random.Random(1370)
+        n = 0
+        for stack in ("none", "python", "node"):
+            base = self.no_harness(stack)
+            orders = [list(HARNESS_NINE), list(reversed(HARNESS_NINE)), rng.sample(HARNESS_NINE, 9)]
+            for order in orders:
+                for where in (0, len(base)):
+                    n += 1
+                    allow = base[:where] + order + base[where:]
+                    with self.subTest(stack=stack, order=order, at=where):
+                        for mode, p in self.both_runs(f"nine{n}", stack, allow=allow):
+                            self.assertWarns(mode, p, [])
+                            self.assertFalse([w for w in self.warns(p) if "wildcard" in w], p.stdout)
+        # interleaved with the other entries
+        mixed = self.no_harness("python") + list(HARNESS_NINE)
+        rng.shuffle(mixed)
+        with self.subTest(order="interleaved"):
+            for mode, p in self.both_runs("nine-mixed", "python", allow=mixed):
+                self.assertWarns(mode, p, [])
+
+    def test_one_missing_tool_rule_is_named(self):
+        """Each of the nine left out on its own gives one `allow entry <it> is missing` line naming it and
+        no other warning; a narrower rule, a shorter or longer word, or a non-Bash rule for it does not
+        count; two left out give two lines."""
+        rng = random.Random(7137)
+        base = self.no_harness("none")
+        for gone in HARNESS_NINE:
+            tool = _words(gone)[0]
+            decoys = [_bash([tool, rng.choice(["open", "show", "land", "--json"])], True), _bash([tool], False),
+                      _bash([tool[:-1]], True), _bash([tool + "x"], True), f"Read(./{tool}/**)"]
+            for label, extra in (("alone", []), ("decoys", decoys)):
+                allow = base + [r for r in HARNESS_NINE if r != gone] + extra
+                with self.subTest(missing=gone, case=label):
+                    for mode, p in self.both_runs(f"miss-{tool}-{label}", allow=allow):
+                        self.assertWarns(mode, p, [(gone, "allow")])
+                        line = next(w for w in self.warns(p) if gone in w)
+                        self.assertIn(f"allow entry {gone} is missing", line)
+                        self.assertNotIn("wildcard", line)
+        for stack in ("python", "node"):
+            gone = rng.sample(HARNESS_NINE, 2)
+            allow = self.no_harness(stack) + [r for r in HARNESS_NINE if r not in gone]
+            with self.subTest(stack=stack, missing=gone):
+                for mode, p in self.both_runs(f"miss-two-{stack}", stack, allow=allow):
+                    self.assertWarns(mode, p, [(r, "allow") for r in gone])
+                    for r in gone:
+                        self.assertTrue([w for w in self.warns(p) if f"allow entry {r} is missing" in w], p.stdout)
+
+    def test_adopt_path_prints_the_old_spelling_warning(self):
+        """A repository with commits and an origin (the adopt path, real and --dry-run) prints the same
+        old-spelling line once, for each stack, alongside its other warnings."""
+        for stack in ("none", "python"):
+            with self.subTest(stack=stack):
+                for mode, p in self.both_runs(f"adopt-old-{stack}", stack, path="adopt",
+                                              allow=self.no_harness(stack) + [WILDCARD]):
+                    self.assertOldSpellingOnly(mode, p)
+        with self.subTest(case="with an ask"):
+            for mode, p in self.both_runs("adopt-old-ask", "python", path="adopt", ask=["Bash(git push:*)"],
+                                          allow=[WILDCARD] + self.no_harness("python")):
+                self.assertOldSpellingOnly(mode, p, (("Bash(git push:*)", "ask"),))
 
 
 # =========================================================================== commit paths
