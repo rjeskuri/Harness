@@ -31,6 +31,7 @@ import importlib
 import json
 import os
 import pwd
+import random
 import re
 import shutil
 import stat
@@ -62,13 +63,16 @@ AT = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 DAY_FILE = re.compile(r"^calls-(\d{4}-\d\d-\d\d)\.jsonl$")
 MAIN_NAME, BETA_NAME = "acme-widget", "beta-tool"     # the main checkouts' folder names: the expected `repo`
 
-# The fake gh: sleeps first when its argv holds one of the comma-separated GHTEST_SLOW tokens, then becomes
-# fakegh.py (which logs to FAKEGH_LOG and answers from FAKEGH_SCENARIO).
+# The fake gh: sleeps first when its argv holds one of the comma-separated GHTEST_SLOW tokens (`token` sleeps
+# GHTEST_SLEEP seconds, `token=S` S seconds), then becomes fakegh.py (which logs to FAKEGH_LOG and answers from
+# FAKEGH_SCENARIO).
 WRAPPER = '''#!{python}
 import os, sys, time
-slow = [t for t in os.environ.get("GHTEST_SLOW", "").split(",") if t]
-if any(t in sys.argv[1:] for t in slow):
-    time.sleep(float(os.environ.get("GHTEST_SLEEP", "30")))
+for item in os.environ.get("GHTEST_SLOW", "").split(","):
+    token, _, seconds = item.partition("=")
+    if token and token in sys.argv[1:]:
+        time.sleep(float(seconds or os.environ.get("GHTEST_SLEEP", "30")))
+        break
 os.execv({python!r}, [{python!r}, {fakegh!r}] + sys.argv[1:])
 '''
 CLAUDE = '#!/bin/sh\n[ "$1 $2" = "agents --json" ] || exit 64\necho "[]"\n'
@@ -560,6 +564,26 @@ class LineFields(Case):
         for line in batch_lines:
             self.assertLine(line, tool="harness-pr", repo=MAIN_NAME, ticket=12)
 
+        # GhBatch: every call is one line even when results() stops early. The first call fails after 1 s; by then
+        # the second has finished but is never read (close() logs it with its own exit), and the third is still
+        # running (close() stops it: exit null).
+        self.scenario([{"match": ["issue", "list", "FIRSTSLOW"], "stderr": "HTTP 500\n", "exit": 4},
+                       {"match": ["label", "list"], "stderr": "nope\n", "exit": 6}], default={"stdout": "[]"})
+        with mock.patch.dict(os.environ, {"GHTEST_SLOW": "FIRSTSLOW=1.0,STUCK=30"}):
+            batch = gh.GhBatch(W["gh"], [["issue", "list", "FIRSTSLOW"], ["label", "list"], ["pr", "list", "STUCK"]],
+                               W["wt40"], time.monotonic() + 30, budget_seconds=6)
+            try:
+                with self.assertRaises(cli.Problem) as caught:
+                    batch.results()
+            finally:
+                batch.close()
+        self.assertIn("HTTP 500", str(caught.exception))
+        early_lines = self.logged(home)[5:]
+        self.assertEqual(sorted((x["cmd"], x["kind"], x["exit"] if x["exit"] is not None else -1) for x in early_lines),
+                         [("issue list", "graphql", 4), ("label list", "rest", 6), ("pr list", "graphql", -1)])
+        for line in early_lines:
+            self.assertLine(line, tool="harness-pr", repo=MAIN_NAME, ticket=40)
+
     def test_ticket_from_the_worktree_in_PWD_else_cwd(self):
         ghlimit = lib("ghlimit")
         cases = [
@@ -706,6 +730,70 @@ class Names(unittest.TestCase):
                 self.assertEqual(ghlimit.call_name(list(args)), name)
                 self.assertEqual(ghlimit.call_kind(list(args)), kind)
 
+        # rows made up now from random parts, so no lookup of known argv can pass; the seed is in each subTest
+        seed = random.randrange(1 << 30)
+        rng = random.Random(seed)
+        for args, name, kind in random_rows(rng, 200):
+            with self.subTest(seed=seed, args=args):
+                self.assertEqual(ghlimit.call_name(list(args)), name)
+                self.assertEqual(ghlimit.call_kind(list(args)), kind)
+
+
+def random_name(rng):
+    """An owner or repository name: starts with a letter, holds letters, digits, '-' and '.'."""
+    first = rng.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    return first + "".join(rng.choice("abcdefghijklmnopqrstuvwxyz0123456789-.") for _ in range(rng.randint(0, 12)))
+
+
+def random_hex(rng, length):
+    """A hex string of `length` with at least one letter (an all-digit segment is a number, not a sha)."""
+    text = [rng.choice("0123456789abcdef") for _ in range(length)]
+    text[rng.randrange(length)] = rng.choice("abcdef")
+    return "".join(text)
+
+
+def random_rows(rng, count):
+    """(args, call_name, call_kind) rows: api calls on random repositories, numbers, shas, methods and flags, and
+    other commands with random numbers. The expected name is put together from the parts, not computed."""
+    rows = []
+    for _ in range(count):
+        if rng.random() < 0.2:
+            n = str(rng.randint(1, 999999))
+            group, verb = rng.choice([("issue", "view"), ("issue", "edit"), ("pr", "view"), ("pr", "merge"),
+                                      ("pr", "checks"), ("run", "view"), ("run", "rerun"), ("label", "delete"),
+                                      ("release", "view"), ("workflow", "view"), ("project", "item-list")])
+            kind = "rest" if group in ("run", "label", "release", "workflow") else "graphql"
+            extra = rng.choice([[], ["--json", "a/b"], ["-R", "o/r"]])
+            rows.append(([group, verb, n] + extra, f"{group} {verb}", kind))
+            continue
+        owner, repo, n = random_name(rng), random_name(rng), str(rng.randint(1, 999999))
+        sha_len = rng.choice((7, 39, 40, 41, 6))
+        sha = random_hex(rng, sha_len)
+        sha_shown = ":sha" if 7 <= sha_len <= 40 else sha
+        path, shown = rng.choice([
+            (f"repos/{owner}/{repo}/issues/{n}", "repos/:owner/:repo/issues/:n"),
+            (f"repos/{owner}/{repo}/pulls/{n}/reviews", "repos/:owner/:repo/pulls/:n/reviews"),
+            (f"repos/{owner}/{repo}/pulls/{n}/files", "repos/:owner/:repo/pulls/:n/files"),
+            (f"repos/{owner}/{repo}/issues/{n}/sub_issues", "repos/:owner/:repo/issues/:n/sub_issues"),
+            (f"repos/{owner}/{repo}/issues/comments/{n}", "repos/:owner/:repo/issues/comments/:n"),
+            (f"repos/{owner}/{repo}/commits/{sha}/check-runs", f"repos/:owner/:repo/commits/{sha_shown}/check-runs"),
+            (f"repos/{owner}/{repo}/commits/{sha}/status", f"repos/:owner/:repo/commits/{sha_shown}/status"),
+            (f"repos/{owner}/{repo}/actions/runs/{n}/jobs", "repos/:owner/:repo/actions/runs/:n/jobs"),
+        ])
+        if rng.random() < 0.5:
+            path += f"?per_page={rng.randint(1, 100)}" + rng.choice(["", f"&page={rng.randint(1, 9)}"])
+        method = rng.choice(["POST", "PATCH", "DELETE", "GET", None])
+        args = ["api"]
+        if rng.random() < 0.3:
+            args.append("--paginate")
+        if method:
+            args += [rng.choice(["-X", "--method"]), method]
+        args.append(path)
+        args += rng.choice([[], ["--slurp"], ["--jq", ".[].name"], ["--input", "-"], ["-f", "body=x"]])
+        name = "api " + (f"{method} " if method and method != "GET" else "") + shown
+        rows.append((args, name, "rest"))
+    return rows
+
 
 # ==================================================================== the day files
 @unittest.skipIf(GIT is None, "git not found")
@@ -754,6 +842,23 @@ class Files(Case):
         self.assertLine(lines[0], cmd="issue view", kind="graphql", exit=0, ms=5, repo=MAIN_NAME, ticket=40)
         self.assertLine(lines[1], cmd="api repos/:owner/:repo/pulls/:n", kind="rest", exit=None, ms=1234,
                         waited_ms=250, refused=True, repo=BETA_NAME, ticket=None)
+
+        # only a new day prunes: with today's file already there, a call appends and an old file stays
+        home = self.new_home()
+        old_line = json.dumps({"at": f"{day(20)}T08:00:00Z"}) + "\n"
+        today_line = json.dumps({"at": f"{day(0)}T00:00:00Z"}) + "\n"
+        write(os.path.join(self.gh_dir(home), f"calls-{day(20)}.jsonl"), old_line)
+        write(os.path.join(self.gh_dir(home), f"calls-{day(0)}.jsonl"), today_line)
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            ghlimit.log_call(["pr", "view", "8"], cwd=W["main"], exit=0, ms=7)
+            ghlimit.log_call(["run", "view", "9"], cwd=W["main"], exit=1, ms=8)
+        self.assertEqual(remaining(home), [f"calls-{day(20)}.jsonl", f"calls-{day(0)}.jsonl"])
+        with open(os.path.join(self.gh_dir(home), f"calls-{day(20)}.jsonl"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), old_line)
+        with open(os.path.join(self.gh_dir(home), f"calls-{day(0)}.jsonl"), encoding="utf-8") as fh:
+            rows = [x for x in fh if x.strip()]
+        self.assertEqual(rows[0], today_line)
+        self.assertEqual([json.loads(x)["cmd"] for x in rows[1:]], ["pr view", "run view"])
 
         # read_calls(since): every good line with at >= since, from the day files that can hold them
         home = self.new_home()
