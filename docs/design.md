@@ -58,7 +58,7 @@ Verified 2026-10-13 from the Claude Code docs, the gh source at v2.99.0 and the 
 
 ## Settings
 
-`user/settings.snippet.json` (merged into `~/.claude/settings.json` by the installer: `model` and `effortLevel` replace, `modelSettings` is merged per model id (the snippet's entries set or override theirs, entries for other model ids stay), nothing else is touched):
+`user/settings.snippet.json` (merged into `~/.claude/settings.json` by the installer: `model` and `effortLevel` replace, `modelSettings` is merged per model id (the snippet's entries set or override theirs, entries for other model ids stay), `permissions.allow`, `permissions.ask`, `autoMode.environment` and `autoMode.allow` gain each snippet entry they lack (exact string match, appended in the snippet's order; the file's own entries stay in their order, its own duplicates included; missing objects and lists are created), `$defaults` is made the first entry of each autoMode list exactly once (moved when elsewhere or repeated, added when absent), and nothing else is touched: `permissions.deny`, `permissions.defaultMode`, `autoMode.soft_deny` and every other key stay as they are). The nine `permissions.allow` rules are the project template's harness rules in its order; the one `permissions.ask` rule keeps a raw `gh pr merge` behind a prompt; the autoMode entries tell the classifier that `harness-pr land` and `harness-pr autoland` are the reviewed-merge path. The prose entries are elided below; the file holds them in full:
 
 ```json
 {
@@ -68,6 +68,19 @@ Verified 2026-10-13 from the Claude Code docs, the gh source at v2.99.0 and the 
     "claude-opus-5-5": { "effortLevel": "high" },
     "claude-fable-5-1": { "effortLevel": "xhigh" },
     "claude-sonnet-5-5": { "effortLevel": "high" }
+  },
+  "permissions": {
+    "allow": ["Bash(harness-pr:*)", "Bash(harness-board:*)", "Bash(harness-work:*)", "Bash(harness-red:*)",
+              "Bash(harness-scaffold:*)", "Bash(harness-digest:*)", "Bash(harness-standup:*)",
+              "Bash(harness-projects:*)", "Bash(harness-worklog:*)"],
+    "ask": ["Bash(gh pr merge *)"]
+  },
+  "autoMode": {
+    "environment": ["$defaults", "Organization: ...", "Source control: ...", "CI/CD deploy targets: ...",
+                    "Review convention: ...", "Key internal services: ...",
+                    "Sensitive data locations & audiences: ...", "Sensitive remote targets: ..."],
+    "allow": ["$defaults", "Landing a pull request with `harness-pr land <P>` or `harness-pr autoland` is allowed: ...",
+              "Writing or loading a com.ryaneskuri.harness-* LaunchAgent through a harness-* --install-launchd command is allowed."]
   }
 }
 ```
@@ -440,7 +453,7 @@ Rewritten around the loop. Sections: how I work (unchanged lines), **Routing** (
 
 ## Install
 
-`scripts/install.sh`: marketplace add, plugin install (harness only), `~/.claude/CLAUDE.md` with a dated backup, settings merge (python3: load `~/.claude/settings.json`, set `model` and `effortLevel` and merge `modelSettings` per model id from the snippet, drop `enabledPlugins["companion@ryan"]`, write back with a dated backup; a settings file it cannot read is left unchanged, the remaining steps run, and the installer exits non-zero), `harness-digest --install-launchd`, and a reminder to store the API key once: `security add-generic-password -a "$USER" -s harness-anthropic -w` (interactive prompt; the key never touches a command line), and to run `harness-projects discover`.
+`scripts/install.sh`: marketplace add, plugin install (harness only), `~/.claude/CLAUDE.md` with a dated backup, settings merge (python3: load `~/.claude/settings.json`, set `model` and `effortLevel` and merge `modelSettings` per model id from the snippet, merge `permissions.allow`, `permissions.ask`, `autoMode.environment` and `autoMode.allow` as Settings describes, drop `enabledPlugins["companion@ryan"]`, write back in place (a symlinked settings.json stays a symlink) with a dated backup; one line names what changed, e.g. `added 9 permissions.allow, 1 permissions.ask, 7 autoMode.environment, 2 autoMode.allow`: the counts leave out `$defaults`, a list that gained nothing is not named, and a list where only `$defaults` changed is named in `put $defaults first in <list>`; when nothing changes the line says `already up to date (...)` and the file is neither written nor backed up, so a second run leaves it byte-identical; a settings file it cannot read, that is not a JSON object, whose `permissions` or `autoMode` is not an object, or whose four lists are not lists of strings, is left unchanged with a `left unchanged ...; merge user/settings.snippet.json by hand` line naming the problem, the remaining steps run, and the installer exits non-zero), `harness-digest --install-launchd`, and a reminder to store the API key once: `security add-generic-password -a "$USER" -s harness-anthropic -w` (interactive prompt; the key never touches a command line), and to run `harness-projects discover`.
 
 ## Tests (plugins/harness/tests)
 
