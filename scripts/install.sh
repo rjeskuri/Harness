@@ -89,8 +89,9 @@ DEFAULTS = "$defaults"
 for obj, key in LISTS:                      # checked before anything changes: a wrong type is the user's to fix
     if obj in settings and not isinstance(settings[obj], dict):
         sys.exit(f"{name}: left unchanged, {obj} is not a JSON object; merge user/settings.snippet.json by hand")
-    entries = settings.get(obj, {}).get(key)
-    if entries is not None and not (isinstance(entries, list) and all(isinstance(e, str) for e in entries)):
+    current = settings.get(obj, {})         # an explicit null is a wrong type, only an absent key is fine
+    entries = current.get(key)
+    if key in current and not (isinstance(entries, list) and all(isinstance(e, str) for e in entries)):
         sys.exit(f"{name}: left unchanged, {obj}.{key} is not a list of strings; "
                  "merge user/settings.snippet.json by hand")
 added, sentinel = [], []
