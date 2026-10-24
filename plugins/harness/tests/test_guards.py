@@ -1620,9 +1620,10 @@ class BranchGuardBashExemptions(GuardTestCase):
     # ---- fix round 2: expanding sources into a directory, run-time joins
 
     def test_expanding_sources_copied_into_a_directory_refused(self):
-        """Into a directory, each source word names a file there by its basename; a brace,
-        glob or bracket source is expanded by the shell first, so `{keep,x}.log` reaches the
-        tracked keep.log though git calls the literal name ignored."""
+        """A brace, glob or bracket source is expanded by the shell first, so
+        `{keep,x}.log .` reaches the tracked keep.log; into a directory that is not itself
+        exempt it is refused. Into an exempt directory every copy lands there, so the
+        directory decides (ruling 2026-10-24)."""
         outside = self.outside
         for name in ("keep.log", "x.log", "a.log", "b.log", "xa.log"):
             self.write(outside / name, "from outside\n")
@@ -1631,18 +1632,95 @@ class BranchGuardBashExemptions(GuardTestCase):
             f"cp {outside}/{{keep,x}}.log ./",
             f"mv {outside}/{{keep,x}}.log .",
             f"cp {outside}/x[ab].log .",
-            f"cp {outside}/*.log cache/",
             f"install {outside}/{{a,b}}.log .",
             f"ln -s {outside}/{{keep,x}}.log .",
+            # the repo root is not exempt, whatever the basename of the source
+            f"cp {outside}/x.log .",
         ):
             with self.subTest(command=command):
                 self.assertRefusedPart(self.bash(command), command)
-        # one plain source into an ignored directory, or onto an ignored name, stays free
+        # into an ignored directory, plain or expanding sources stay free
         self.assertAllowed(
             (
                 f"cp {outside}/notes.md cache/",
                 f"cp {outside}/x.log data/",
-                f"cp {outside}/x.log .",
+                f"cp {outside}/*.log cache/",
+            )
+        )
+
+    # ---- fix round 3: a copy into a directory is judged by that directory
+
+    def test_copy_into_a_directory_is_judged_by_the_directory(self):
+        """BSD `cp -R src/ dest` copies the contents of src into dest, so `dest/src` is not
+        what is written. Ruling 2026-10-24: a cp, rsync, install or ln into a directory is
+        exempt only when that directory itself is under docs/agent/ or ignored by git; the
+        basename of the source no longer counts."""
+        repo, outside = self.repo, self.outside
+        # the scenario is real: data/ and .venv/ hold a README.md that would land on the
+        # tracked README.md at the repo root
+        self.write(outside / "data/README.md", "clobbered\n")
+        self.write(outside / ".venv/README.md", "clobbered\n")
+        self.write(outside / "x.log", "from outside\n")
+        self.write(outside / ".env.local", "from outside\n")
+        for name in ("a.log", "b.log"):
+            self.write(outside / name, "from outside\n")
+        for command in (
+            f"cp -R {outside}/data/ .",
+            f"cp -R {outside}/.venv/ .",
+            f"rsync -a {outside}/data/ .",
+            f"cp {outside}/x.log .",
+            f"cp {outside}/x.log ./",
+            f"install {outside}/x.log .",
+            f"ln -s {outside}/x.log .",
+            f"cp {outside}/notes.md src/",
+            # the source basename is ignored at the destination (*.log, data/, .env.local),
+            # but the destination directory is tracked
+            f"cp {outside}/x.log src/",
+            f"cp {outside}/x.log src",
+            f"cp {outside}/.env.local .",
+            f"cp -R {outside}/data/ docs/",
+            f"cp -R {outside}/data .",
+            f"rsync -a {outside}/data/ src/",
+            f"install -m 644 {outside}/x.log docs/",
+            f"ln -sf {outside}/x.log tests/",
+            f"cp {outside}/{{a,b}}.log .",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        # an exempt copy beside one into the root: the root copy is the part refused
+        self.assertRefusedPart(
+            self.bash(f"cp {outside}/x.log data/ && cp {outside}/x.log ."),
+            f"cp {outside}/x.log .",
+        )
+        # the repo root named absolutely, from outside the repo
+        for command in (f"cp -R {outside}/data/ {repo}", f"cp {outside}/x.log {repo}/"):
+            with self.subTest(command=command, cwd=str(outside)):
+                self.assertRefusedPart(self.bash(command, cwd=outside), command)
+        # the destination directory itself is exempt: every copy lands inside it
+        self.assertAllowed(
+            (
+                f"cp {outside}/notes.md docs/agent/",
+                f"cp -R {outside}/data/ cache/",
+                f"rsync -a {outside}/ cache/",
+                f"cp {outside}/x.log data/",
+                f"cp {outside}/{{a,b}}.log cache/",
+                f"cp -R {outside}/data/ docs/agent/",
+                f"cp {outside}/x.log data",
+                f"install {outside}/x.log cache/",
+                f"ln -s {outside}/x.log data/",
+                f"rsync -a {outside}/data/ docs/agent/",
+            )
+        )
+        self.assertAllowed(
+            (f"cp -R {outside}/data/ {repo}/cache/", f"cp {outside}/x.log {repo}/data"),
+            cwd=outside,
+        )
+        # named file destinations are judged by the name, as before
+        self.assertAllowed(
+            (
+                "cp notes.md docs/agent/handoff.md",
+                "ln -sfn ../.venv .venv",
+                f"cp {outside}/x.log build.log",
             )
         )
 
