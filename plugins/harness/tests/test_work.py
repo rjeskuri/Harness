@@ -654,6 +654,25 @@ class Attempt(WorkTest):
         data = self.ok_json("attempt", "12", "breaker", "fail", "--json")
         self.assertEqual((data["action"], data["failures"], data["tier"]), ("retry", 1, "sonnet"))
 
+    def test_escalation_starts_from_the_overridden_tier(self):
+        """#175: HARNESS_CODE_TIER in the main checkout's .claude/settings.json is the tier `start` reports and the
+        cache holds, and `attempt` escalates one tier up from it, not from the labels' tier (fable here)."""
+        hard = ("task", "status:ready", "size:L", "risk:high")
+        self.scenario(issues=[issue(labels=hard), issue(number=13, labels=hard)])
+        settings = os.path.join(self.repo, ".claude", "settings.json")
+        for number, setting, escalated in ((12, "opus", "fable"), (13, "sonnet", "opus")):
+            with self.subTest(setting=setting):
+                write(settings, json.dumps({"env": {"HARNESS_CODE_TIER": setting}}))
+                data = self.ok_json("start", str(number), "--json")
+                self.assertEqual(data["tier"], setting)
+                self.assertEqual(self.read_json(self.cache_path(number))["tier"], setting)
+                self.assertEqual(self.ok("attempt", str(number), "code", "fail").stdout.strip(), "retry")
+                self.assertEqual(self.ok("attempt", str(number), "code", "fail").stdout.strip(),
+                                 f"escalate {escalated}")
+                attempts = self.read_json(self.cache_path(number))["attempts"]
+                self.assertEqual([(a["stage"], a["tier"], a["result"]) for a in attempts],
+                                 [("code", setting, "fail")] * 2)
+
     def test_attempt_without_a_cache_says_to_start(self):
         self.assertOneLineError(self.work("attempt", "12", "code", "fail"), "harness-work start 12")
 
