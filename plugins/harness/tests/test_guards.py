@@ -1266,7 +1266,7 @@ class BranchGuardBashExemptions(GuardTestCase):
                 "install changes src/app.py inside the repo",
             ),
             (
-                f"rsync -a {outside}/ cache/",
+                f"rsync -a {outside}/ docs/agent/",
                 f"rsync -a {outside}/ src/",
                 f"rsync -a {outside}/ src/",
                 "rsync changes src/ inside the repo",
@@ -1700,8 +1700,8 @@ class BranchGuardBashExemptions(GuardTestCase):
         self.assertAllowed(
             (
                 f"cp {outside}/notes.md docs/agent/",
-                f"cp -R {outside}/data/ cache/",
-                f"rsync -a {outside}/ cache/",
+                f"cp -R {outside}/data/ docs/agent/specs/",
+                f"rsync -a {outside}/ docs/agent/imported/",
                 f"cp {outside}/x.log data/",
                 f"cp {outside}/{{a,b}}.log cache/",
                 f"cp -R {outside}/data/ docs/agent/",
@@ -1712,7 +1712,7 @@ class BranchGuardBashExemptions(GuardTestCase):
             )
         )
         self.assertAllowed(
-            (f"cp -R {outside}/data/ {repo}/cache/", f"cp {outside}/x.log {repo}/data"),
+            (f"cp -R {outside}/data/ {repo}/docs/agent/", f"cp {outside}/x.log {repo}/data"),
             cwd=outside,
         )
         # named file destinations are judged by the name, as before
@@ -1723,6 +1723,284 @@ class BranchGuardBashExemptions(GuardTestCase):
                 f"cp {outside}/x.log build.log",
             )
         )
+
+    # ---- fix round 4: recursive copies into exempt directories, the destination's repo
+
+    def workspace_fixture(self) -> Path:
+        """node_modules/ ignored, holding @scope/pkg: a workspace symlink to the tracked
+        packages/pkg. Returns a restore tree outside the repo shaped like node_modules/."""
+        repo = self.repo
+        self.write(repo / ".gitignore", EXEMPT_GITIGNORE + "node_modules/\n")
+        self.write(repo / "packages/pkg/index.js", "module.exports = 1;\n")
+        self.git(repo, "add", ".gitignore", "packages")
+        self.git(repo, "commit", "-q", "-m", "A workspace package")
+        (repo / "node_modules/@scope").mkdir(parents=True)
+        os.symlink("../../packages/pkg", repo / "node_modules/@scope/pkg")
+        self.assertEqual(
+            os.path.realpath(repo / "node_modules/@scope/pkg/index.js"),
+            str(repo / "packages/pkg/index.js"),
+        )
+        self.assertEqual(self.git(repo, "status", "--porcelain"), "")
+        restore = self.outside / "restore"
+        self.write(restore / "node_modules/@scope/pkg/index.js", "clobbered\n")
+        self.write(self.outside / "data/README.md", "from outside\n")
+        self.write(self.outside / "x.log", "from outside\n")
+        for name in ("a.log", "b.log"):
+            self.write(self.outside / name, "from outside\n")
+        return restore
+
+    def test_recursive_copy_into_an_ignored_directory_refused(self):
+        """Ruling 2026-10-24: a recursive copy (cp -R/-r/-a, rsync -r/-a and their
+        combined and long forms) into an exempt directory is refused unless the directory
+        is under docs/agent/: an ignored directory may hold a symlink into tracked files
+        (rsync -aK writes through node_modules/@scope/pkg into packages/pkg)."""
+        repo, outside = self.repo, self.outside
+        restore = self.workspace_fixture()
+        nm = f"{restore}/node_modules/"
+        for command in (
+            f"cp -R {nm} node_modules/",
+            f"cp -r {nm} node_modules/",
+            f"cp -a {nm} node_modules/",
+            f"cp -Rf {nm} node_modules/",
+            f"cp -av {nm} node_modules/",
+            f"cp -pR {nm} node_modules/",
+            f"cp -f -R {nm} node_modules/",
+            f"cp -v -a {nm} node_modules/",
+            f"cp -R {nm} node_modules",
+            f"cp -R {restore}/node_modules/@scope/ node_modules/@scope/",
+            f"rsync -a {nm} node_modules/",
+            f"rsync -r {nm} node_modules/",
+            f"rsync -avz {nm} node_modules/",
+            f"rsync -aK {nm} node_modules/",
+            f"rsync -rlt {nm} node_modules/",
+            f"rsync --archive {nm} node_modules/",
+            f"rsync --recursive {nm} node_modules/",
+            f"rsync -v --archive --delete {nm} node_modules/",
+            # an ignored directory without a symlink in it today: the rule is the same
+            f"cp -R {outside}/data/ cache/",
+            f"cp -R {outside}/data cache",
+            f"cp -a {outside}/data/ data/",
+            f"rsync -a {outside}/ cache/",
+            f"rsync -r {outside}/data/ data",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        # beside an allowed write, the recursive copy is the part refused
+        for command, part in (
+            (
+                f"echo x > .env.local && cp -R {nm} node_modules/",
+                f"cp -R {nm} node_modules/",
+            ),
+            (
+                f"cp {outside}/x.log data/; rsync -a {nm} node_modules/",
+                f"rsync -a {nm} node_modules/",
+            ),
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), part)
+        # the ignored directory named absolutely, or reached by cd, from outside
+        for command, part in (
+            (f"cp -R {nm} {repo}/node_modules/", f"cp -R {nm} {repo}/node_modules/"),
+            (f"rsync -a {outside}/ {repo}/cache/", f"rsync -a {outside}/ {repo}/cache/"),
+            (f"cp -R {outside}/data/ {repo}/cache/", f"cp -R {outside}/data/ {repo}/cache/"),
+            (f"cd {repo} && cp -a {nm} node_modules/", f"cp -a {nm} node_modules/"),
+        ):
+            with self.subTest(command=command, cwd=str(outside)):
+                self.assertRefusedPart(self.bash(command, cwd=outside), part)
+
+    def test_non_recursive_and_docs_agent_copies_stay_allowed(self):
+        """Non-recursive copies into an ignored directory and recursive copies into
+        docs/agent/ stay free; so does a recursive copy wholly outside the repo."""
+        repo, outside = self.repo, self.outside
+        restore = self.workspace_fixture()
+        self.assertAllowed(
+            (
+                # not recursive: options other than -R/-r/-a, into ignored directories
+                f"cp {outside}/x.log data/",
+                f"cp -f {outside}/x.log cache/",
+                f"cp -pv {outside}/x.log cache/",
+                f"cp {outside}/notes.md node_modules/",
+                f"cp {outside}/{{a,b}}.log cache/",
+                f"install {outside}/x.log cache/",
+                f"install -m 644 {outside}/x.log data/",
+                f"ln -s {outside}/x.log data/",
+                f"ln -sf {outside}/x.log cache/",
+                f"rsync -t {outside}/x.log cache/",
+                f"rsync -v {outside}/x.log data/",
+                # recursive, into docs/agent/
+                f"cp -R {outside}/data/ docs/agent/",
+                f"cp -a {outside}/data/ docs/agent/imported/",
+                f"cp -Rf {outside}/data docs/agent/",
+                f"cp -R {restore}/node_modules/ docs/agent/",
+                f"rsync -a {outside}/data/ docs/agent/",
+                f"rsync --recursive {outside}/data/ docs/agent/specs/",
+                f"rsync -avz {outside}/ docs/agent/",
+                # recursive, wholly outside the repo
+                f"cp -R {restore}/node_modules/ {outside}/nm-copy/",
+                f"rsync -a {repo}/src/ {outside}/backup/",
+            )
+        )
+        self.assertAllowed(
+            (
+                f"cp -R {outside}/data/ {repo}/docs/agent/",
+                f"rsync -a {outside}/data/ {repo}/docs/agent/",
+                f"cp -v {outside}/x.log {repo}/cache/",
+            ),
+            cwd=outside,
+        )
+
+    def test_copy_into_a_directory_lands_in_the_destination_directorys_repo(self):
+        """Ruling 2026-10-24: the repo a copy into a directory lands in is judged by the
+        destination directory, not by dest/<basename of the source>. `cp -R w/worktrees/
+        .claude/` writes .claude/ of the main checkout; `cp -R x/link/ .` writes the repo
+        root though the tracked `link` points outside every repo."""
+        repo, outside = self.repo, self.outside
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        self.write(repo / ".claude/settings.json", "{}\n")
+        self.write(repo / ".gitignore", EXEMPT_GITIGNORE + ".claude/worktrees/\n")
+        os.symlink(str(elsewhere), repo / "link")
+        self.git(repo, "add", ".claude", ".gitignore", "link")
+        self.git(repo, "commit", "-q", "-m", "Settings and a link outside")
+        nested = repo / ".claude/worktrees/t-13-x"
+        self.git(repo, "worktree", "add", "-q", "-b", "t/13-x", str(nested))
+        linked = self.worktree(repo, "t/14-y", "wt14")
+        self.assertEqual(self.git(repo, "status", "--porcelain"), "")
+        # the sources really would clobber tracked files at the destination
+        self.write(outside / "worktrees/settings.json", '{"clobbered": true}\n')
+        self.write(outside / "link/README.md", "clobbered\n")
+        self.write(outside / "stuff/README.md", "from outside\n")
+        self.write(outside / "t-13-x/README.md", "from outside\n")
+        for command in (
+            # the contents land in .claude/worktrees/ of the main checkout, not in the
+            # ticket worktree t-13-x that dest/<basename> names
+            f"cp -R {outside}/t-13-x/ .claude/worktrees/",
+            f"cp -a {outside}/t-13-x/ {repo}/.claude/worktrees/",
+            f"cp -R {outside}/worktrees/ .claude/",
+            f"cp -a {outside}/worktrees/ .claude/",
+            f"cp -R {outside}/worktrees/ .claude",
+            f"cp -R {outside}/worktrees .claude/",
+            f"cp -Rf {outside}/worktrees/ ./.claude/",
+            f"cp -R {outside}/link/ .",
+            f"cp -R {outside}/link/ ./",
+            f"cp -a {outside}/link .",
+            f"cp -R {outside}/link/ {repo}",
+            f"ln -sf {outside}/link .",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        for command in (
+            f"cp -R {outside}/worktrees/ {repo}/.claude/",
+            f"cp -R {outside}/link/ {repo}",
+            f"cp -a {outside}/link/ {repo}/",
+        ):
+            with self.subTest(command=command, cwd=str(outside)):
+                self.assertRefusedPart(self.bash(command, cwd=outside), command)
+        command = f"cd {repo} && cp -R {outside}/worktrees/ .claude/"
+        self.assertRefusedPart(
+            self.bash(command, cwd=outside), f"cp -R {outside}/worktrees/ .claude/"
+        )
+        # the destination directory really is a ticket worktree or outside every repo
+        self.assertAllowed(
+            (
+                f"cp -R {outside}/worktrees/ .claude/worktrees/t-13-x/",
+                f"cp -R {outside}/stuff/ .claude/worktrees/t-13-x/docs/",
+                f"cp -R {outside}/stuff/ {linked}/",
+                f"rsync -a {outside}/stuff/ {linked}/src/",
+                f"cp -R {outside}/stuff/ link/",
+                f"cp -R {outside}/link/ {outside}/copy/",
+                f"cp -R {outside}/link/ {elsewhere}/",
+            )
+        )
+        self.assertAllowed(
+            (
+                f"cp -R {outside}/link/ {linked}/",
+                f"cp -R {outside}/worktrees/ {nested}/",
+                f"cp -R {outside}/stuff/ {elsewhere}/",
+            ),
+            cwd=outside,
+        )
+
+    def test_copy_into_an_exempt_directory_onto_a_symlink_out_of_it_refused(self):
+        """Ruling 2026-10-24: a cp, install, ln, rsync or mv into an exempt directory is
+        refused when dest/<basename of a source> already exists and resolves outside the
+        exemption (BSD cp writes through the ignored cache/app.py into the tracked
+        src/app.py). A name that does not exist yet, or a plain file inside the exempt
+        directory, keeps the directory rule."""
+        repo, outside = self.repo, self.outside
+        os.symlink("../src/app.py", repo / "cache/app.py")
+        os.symlink("../README.md", repo / "data/README.md")
+        os.symlink("../keep.log", repo / "data/keep.log")  # tracked, ignored by name
+        os.symlink("../../README.md", repo / "docs/agent/x.md")
+        os.symlink("../build.log", repo / "cache/alias.log")  # ignored and untracked
+        self.assertEqual(
+            os.path.realpath(repo / "cache/app.py"), str(repo / "src/app.py")
+        )
+        for name in (
+            "app.py", "README.md", "keep.log", "x.md", "x.log",
+            "new.py", "blob", "a.csv", "alias.log", "handoff.md",
+        ):
+            self.write(outside / name, "from outside\n")
+        for command in (
+            f"cp {outside}/app.py cache/",
+            f"cp -f {outside}/app.py cache",
+            f"install {outside}/app.py cache/",
+            f"install -m 644 {outside}/README.md data/",
+            f"ln -sf {outside}/app.py cache/",
+            f"rsync -t {outside}/app.py cache/",
+            f"mv {outside}/app.py cache/",
+            f"cp {outside}/keep.log data/",
+            # one source of several reaches a tracked file
+            f"cp {outside}/x.log {outside}/README.md data/",
+            f"cp {outside}/blob {outside}/app.py cache/",
+            # docs/agent/ is exempt, but x.md in it leads to the tracked README.md
+            f"cp {outside}/x.md docs/agent/",
+            f"mv {outside}/x.md docs/agent/",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        for command in (
+            f"cp {outside}/app.py {repo}/cache/",
+            f"install {outside}/README.md {repo}/data/",
+        ):
+            with self.subTest(command=command, cwd=str(outside)):
+                self.assertRefusedPart(self.bash(command, cwd=outside), command)
+        # absent names, plain files in the directory, links that stay inside it
+        self.assertAllowed(
+            (
+                f"cp {outside}/new.py cache/",
+                f"cp {outside}/blob cache/",
+                f"cp -f {outside}/a.csv data/",
+                f"cp {outside}/blob {outside}/new.py cache/",
+                f"install {outside}/blob cache/",
+                f"ln -sf {outside}/blob cache/",
+                f"rsync -t {outside}/a.csv data/",
+                f"mv {outside}/new.py data/",
+                f"cp {outside}/alias.log cache/",
+                f"cp {outside}/handoff.md docs/agent/",
+                f"cp {outside}/new.py docs/agent/",
+            )
+        )
+        self.assertAllowed(
+            (f"cp {outside}/blob {repo}/cache/", f"cp {outside}/new.py {repo}/data/"),
+            cwd=outside,
+        )
+
+    def test_recursive_copy_to_a_new_name_keeps_the_named_rule(self):
+        """A recursive copy to a name that does not exist yet creates it; it is a named
+        destination, not a copy into a directory, and keeps the name's rule."""
+        outside = self.outside
+        self.write(outside / "data/README.md", "from outside\n")
+        self.assertFalse((self.repo / "cache/restored").exists())
+        self.assertAllowed(
+            (
+                f"cp -R {outside}/data cache/restored",
+                f"cp -a {outside}/data data/copy",
+            )
+        )
+        for command in (f"cp -R {outside}/data src/restored", f"cp -a {outside}/data newdir"):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
 
     def test_literal_joined_at_run_time_through_join_or_concat_refused(self):
         """`.join(` and `.concat(` build a path at run time as `+` does: a literal beside a
