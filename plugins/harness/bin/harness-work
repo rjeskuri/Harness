@@ -42,12 +42,19 @@ a billing or auth run not counting) that has no live run, up to --max minus the 
 open draft PR, the prompt and the start comment name it and say the worktree may hold uncommitted work from the
 previous run. Launched sessions get neither
 the dispatching session's identity nor ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN. bg, the
-default whatever the budgets say, runs on the subscription: `claude --bg -n "<repo> #N <title>" "/harness:work N"`.
+default whatever the budgets say, runs on the subscription: `claude --bg -n "<repo> #N <title>" --permission-mode
+auto "/harness:work N"`.
 headless, only with --venue headless or its alias --api (--api with --venue bg is an error): `claude -p
 "/harness:work N"` billed to the API key through {"apiKeyHelper": HARNESS_API_KEY_CMD} (the key itself never
 reaches a command line or the environment). headless while the api budget is exhausted (judged after the sweep,
 which can be what exhausts it) is refused, --dry-run too: nothing starts, the exit is non-zero and the message
 names the time and `harness-work budget reset api`.
+Effort: dispatch reads HARNESS_CODE_EFFORT once per command through harness_lib.routing.load_routing (environment,
+else the main checkout's .claude/settings.json) and launches every session, redispatched ones too, with `--effort
+<level>` (bg: before the prompt; headless: last), writing `effort` to the run record. Unset, nothing changes: no flag,
+no key. An invalid value is one `harness-work:` warning on stderr per command (a dry run and an empty board too) and
+launches without the flag. The dispatcher's own CLAUDE_EFFORT is never inherited. --dry-run's first line names the
+effort when set (`Dry run: venue bg, effort xhigh, ...`); every --json result has a top-level `effort` (null when unset).
 
 runs --sweep: closes the records of runs that ended and classifies each (ok, error, billing, auth; a bg run by its
 `claude agents` state, done being ok). An `ok` run, headless or bg, whose issue is OPEN and still status:in-progress
@@ -78,6 +85,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
+    from harness_lib.routing import load_routing
     from harness_lib.settings import setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
     from harness_lib import cost
@@ -887,8 +895,9 @@ def of_repo(record, repo):
 
 
 # --------------------------------------------------------------- launching
-def launch(repo, ticket, venue):
-    """Start one session for a started ticket and write its run record."""
+def launch(repo, ticket, venue, effort=None):
+    """Start one session for a started ticket and write its run record. `effort` (a level or None) goes to the
+    session as --effort and into the record; unset, the session gets no --effort and the record no effort key."""
     n = ticket["number"]
     started = now()
     rid = f"{repo.key}-{n}-{started.strftime('%Y%m%d%H%M%S')}"
@@ -897,6 +906,8 @@ def launch(repo, ticket, venue):
     record = {"id": rid, "ticket": n, "repo": repo.main, "worktree": ticket["worktree"], "branch": ticket["branch"],
               "venue": venue, "log": log, "started_at": iso(started), "ended_at": None, "exit": None,
               "outcome": None}
+    if effort:
+        record["effort"] = effort
     prompt = f"/harness:work {n}"
     if ticket.get("draft_pr"):
         prompt += (f"\n\nThe previous run ended early: draft PR #{ticket['draft_pr']} is open and the worktree may "
@@ -906,6 +917,8 @@ def launch(repo, ticket, venue):
         settings = json.dumps({"apiKeyHelper": api_key_cmd()})
         argv = [claude_exe(), "-p", prompt, "--permission-mode", "auto", "--output-format", "json",
                 "--settings", settings]
+        if effort:
+            argv += ["--effort", effort]
         try:
             with open(log, "ab") as out:
                 proc = subprocess.Popen(argv, cwd=ticket["worktree"], start_new_session=True, stdout=out,
@@ -915,7 +928,10 @@ def launch(repo, ticket, venue):
         record["pid"] = proc.pid
     else:
         name = f"{repo.name} #{n} {ticket.get('title') or ''}".strip()
-        argv = [claude_exe(), "--bg", "-n", name, "--permission-mode", "auto", prompt]
+        argv = [claude_exe(), "--bg", "-n", name, "--permission-mode", "auto"]
+        if effort:
+            argv += ["--effort", effort]
+        argv.append(prompt)
         try:
             done = subprocess.run(argv, cwd=ticket["worktree"], capture_output=True, text=True, errors="replace",
                                   stdin=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT, env=child_env())
@@ -1104,6 +1120,10 @@ def cmd_cost(repo, args):
 def cmd_dispatch(repo, args):
     if args.max < 1:
         raise Problem("--max must be at least 1")
+    routing = load_routing(repo.main)       # once per dispatch, whatever the run does next
+    for problem in routing["problems"]:
+        warn(problem)
+    effort = routing["code_effort"]
     agents = Agents()
     records = load_runs()
     sweep(records, agents, wants_json(args))
@@ -1141,26 +1161,27 @@ def cmd_dispatch(repo, args):
         return f"#{row['number']} {row.get('title') or ''} ({detail})"
 
     if args.dry_run:
-        lines = [f"Dry run: venue {venue}, {len(live)} live, {max(0, slots)} of {args.max} slots free."]
+        shown = f"effort {effort}, " if effort else ""
+        lines = [f"Dry run: venue {venue}, {shown}{len(live)} live, {max(0, slots)} of {args.max} slots free."]
         lines += [f"would start {describe(row)} and launch {venue}" for row in plan]
         lines += [f"skip #{s['number']}: {s['why']}" for s in skipped]
         if not candidates:
             lines.append("No ready tickets.")
-        emit(wants_json(args), {"venue": venue, "dry_run": True, "live": [r["id"] for r in live.values()],
+        emit(wants_json(args), {"venue": venue, "effort": effort, "dry_run": True, "live": [r["id"] for r in live.values()],
                     "plan": plan, "skipped": skipped}, "\n".join(lines))
         return
     if not args.json:
         for s in capped:
             print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
-        emit(wants_json(args), {"venue": venue, "launched": [], "failed": [], "skipped": skipped}, "No ready tickets.")
+        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped}, "No ready tickets.")
         return
     if slots <= 0:
-        emit(wants_json(args), {"venue": venue, "launched": [], "failed": [], "skipped": skipped},
+        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped},
              f"{len(live)} live runs; --max {args.max} reached, nothing launched.")
         return
     if not plan:
-        emit(wants_json(args), {"venue": venue, "launched": [], "failed": [], "skipped": skipped},
+        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped},
              "Nothing to launch: " + "; ".join(f"#{s['number']} has a {s['why']}" for s in skipped
                                                if s not in capped) + ".")
         return
@@ -1175,7 +1196,7 @@ def cmd_dispatch(repo, args):
             ticket = start_ticket(repo, n, venue, row.get("draft_pr"))
             if not ticket["title"]:
                 ticket["title"] = row.get("title") or ""
-            record = launch(repo, ticket, venue)
+            record = launch(repo, ticket, venue, effort)
         except Problem as err:
             failures.append({"number": n, "error": one_line(err)})
             if not args.json:
@@ -1186,7 +1207,8 @@ def cmd_dispatch(repo, args):
             where = f"pid {record['pid']}, log {record['log']}" if venue == "headless" else f"id {record['bg_id']}"
             print(f"#{n} {venue} on {record['branch']} ({where})", flush=True)
     if args.json:
-        emit(wants_json(args), {"venue": venue, "launched": launched, "failed": failures, "skipped": skipped}, "")
+        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": launched, "failed": failures,
+                                "skipped": skipped}, "")
     if failures:
         sys.exit(1)
 
