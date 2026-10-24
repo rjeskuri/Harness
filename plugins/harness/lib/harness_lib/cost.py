@@ -9,6 +9,9 @@ an orchestrator message counts when its own branch is t/N-..., and a subagent wh
 description starts `#N`, or names no ticket and its first branch is t/N-.... One message id
 found in several files counts once.
 
+The record `harness-work cost N` saves (build_record, with the attempt store replayed by rounds) and its
+text and markdown renderings live here too, with the number formats, so every caller shows the same.
+
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
 
@@ -17,6 +20,7 @@ from __future__ import annotations
 import re
 
 from harness_lib import transcripts
+from harness_lib.cli import table
 from harness_lib.text import parse_iso
 
 # stage order of the rows; the first five are the words of the `#N <stage>` convention
@@ -63,9 +67,10 @@ def _mentions(path, needle):
 
 
 def _message(m):
-    """A transcript message with its times parsed: {"id", "model", "start", "end", "usage"}."""
-    return {"id": m["id"], "model": m["model"] or "unknown", "start": parse_iso(m["start"]),
-            "end": parse_iso(m["end"]), "usage": dict(m["usage"])}
+    """A transcript message with its times parsed: {"id", "model", "segment", "start", "end",
+    "usage"}."""
+    return {"id": m["id"], "model": m["model"] or "unknown", "segment": m["segment"],
+            "start": parse_iso(m["start"]), "end": parse_iso(m["end"]), "usage": dict(m["usage"])}
 
 
 def _merge(kept, other):
@@ -81,15 +86,16 @@ def _merge(kept, other):
 def _attribute(number, found):
     """The ticket, stage and round decision, in one place: which of `found`'s sessions (from
     transcripts.sessions) are N's own, which orchestrator messages and subagents count for N,
-    each one's stage and round. Returns (entries, sessions): entries [(stage, round, agent,
-    message)] with each message id once, and {session id: {"own", "cost_state", "cost"}} for
-    each session that is N's own or holds a message counted for N (cost: an own session's
-    cost-state, else None).
+    each one's stage and round. A continued subagent is split at the coordinator's entries into
+    segments and each segment is a round of its own (see fix and rounds below). Returns
+    (entries, sessions): entries [(stage, round, agent, message)] with each message id once, and
+    {session id: {"own", "cost_state", "cost"}} for each session that is N's own or holds a
+    message counted for N (cost: an own session's cost-state, else None).
 
     Speed: a main transcript whose text has no `t/N-` is not parsed (it can be neither N's own
     nor hold N's orchestrator messages), and a subagent is parsed only when it counts for N."""
     pattern = re.compile(rf"t/{number}-")
-    units = []         # [session id, key, stage, agent, messages]; key None for the orchestrator
+    units = []         # [session id, key, stage, agent, messages, named]; key None: orchestrator
     info = {}
     for s in found:
         own, cost, orchestrator, before = False, None, [], len(units)
@@ -101,7 +107,7 @@ def _attribute(number, found):
             orchestrator = [_message(m) for m in main["messages"]
                             if own or (m["branch"] is not None and pattern.match(m["branch"]))]
         if orchestrator:
-            units.append([s["id"], None, "orchestrator", "main", orchestrator])
+            units.append([s["id"], None, "orchestrator", "main", orchestrator, False])
         for a in s["agents"]:
             ticket, word = _description(a["meta"])
             if ticket is None:
@@ -114,7 +120,7 @@ def _attribute(number, found):
             agent = a["meta"].get("agentType")
             agent = agent if isinstance(agent, str) and agent else "unknown"
             stage = word if word in STAGE_WORDS else TYPE_STAGES.get(agent.rsplit(":", 1)[-1], "other")
-            units.append([s["id"], a["path"], stage, agent, messages])
+            units.append([s["id"], a["path"], stage, agent, messages, word in STAGE_WORDS])
         if own or len(units) > before:
             known = info.setdefault(s["id"], {"own": False, "cost_state": None, "cost": None})
             if own and not known["own"]:      # a session id in two folders is listed once
@@ -133,17 +139,43 @@ def _attribute(number, found):
         unit[4] = kept
     units = [u for u in units if u[4]]
 
-    # rounds: one per subagent, numbered within its stage by first start; the orchestrator's is 1
-    def first_start(unit):
-        starts = [m["start"] for m in unit[4] if m["start"] is not None]
-        return (min(starts).timestamp() if starts else float("inf"), unit[0], unit[1])
+    # segments: a subagent's messages split at the coordinator's entries, one part each:
+    # [session id, key, stage, agent, messages, named, segment number, agent's first segment]
+    parts = []
+    for u in units:
+        if u[1] is None:
+            parts.append(u + [0, True])
+            continue
+        by_segment = {}
+        for m in u[4]:
+            by_segment.setdefault(m["segment"], []).append(m)
+        for seg in sorted(by_segment):
+            parts.append(u[:4] + [by_segment[seg], u[5], seg, seg == 1])
 
+    def first_start(part):
+        starts = [m["start"] for m in part[4] if m["start"] is not None]
+        return (min(starts).timestamp() if starts else float("inf"), part[0], part[1] or "", part[6])
+
+    # fix: the ticket's first review is its earliest-starting review segment, in any session.
+    # Every code or review segment starting strictly after that review's last end is a fix
+    # round, except the first segment of an agent whose description names its stage. Tests,
+    # breaker and other segments are never fix, and without a review nothing is.
+    reviews = sorted((p for p in parts if p[2] == "review"), key=first_start)
+    ends = [m["end"] for m in reviews[0][4] if m["end"] is not None] if reviews else []
+    for part in parts:
+        starts = [m["start"] for m in part[4] if m["start"] is not None]
+        if (part[2] in ("code", "review") and starts and ends and min(starts) > max(ends)
+                and not (part[5] and part[7])):
+            part[2] = "fix"
+
+    # rounds: one per segment, numbered within its stage by first start (fix: one sequence across
+    # coder and reviewer); the orchestrator's is 1
     rounds = {}
     for stage in STAGES:
-        agents = sorted((u for u in units if u[2] == stage and u[1] is not None), key=first_start)
-        for n, u in enumerate(agents, 1):
-            rounds[u[1]] = n
-    entries = [(u[2], rounds.get(u[1], 1), u[3], m) for u in units for m in u[4]]
+        segments = sorted((p for p in parts if p[2] == stage and p[1] is not None), key=first_start)
+        for n, p in enumerate(segments, 1):
+            rounds[(p[1], p[6])] = n
+    entries = [(p[2], rounds.get((p[1], p[6]), 1), p[3], m) for p in parts for m in p[4]]
     return entries, info
 
 
@@ -208,3 +240,167 @@ def ticket_usage(main: str, number: int, dirs: list[str] | None = None) -> dict:
                 for sid, known in info.items()]
     return {"rows": rows, "totals": totals, "by_model": by_model,
             "session_totals": session_totals, "sessions": sessions}
+
+
+# --------------------------------------------------------------- the record and its renderings
+# The record's coverage note, printed under the table: what the figures leave out.
+COVERAGE = ("A lower bound: only the transcripts on this Mac are read, and the orchestrator turns of shared "
+            "sessions are left out")
+HEADER = "**Cost** (tokens and model time from the transcripts, a lower bound)"
+TABLE_HEAD = ("Stage", "Model", "Rounds", "Tokens", "Output", "Model time", "Agent time")
+ROUND_KEYS = {"retry": "retry", "escalate": "escalate", "needs-input": "needs_input"}
+
+
+def attempt_action(stage, result, failures):
+    """What `harness-work attempt` answers for a stage's attempt, `failures` being that stage's run of
+    consecutive fails ending with it: done on a pass, then retry, escalate, needs-input (fix: retry, then
+    needs-input; it never escalates). The tier of an escalation is the caller's."""
+    if result == "pass":
+        return "done"
+    if failures == 1:
+        return "retry"
+    if stage != "fix" and failures == 2:
+        return "escalate"
+    return "needs-input"
+
+
+def rounds(attempts):
+    """The attempt store replayed: {"stages": {stage: {"runs", "fails", "retry", "escalate", "needs_input"}},
+    "breaker_rerounds", "fix_rounds"}, each stage counted on its own as `harness-work attempt` answered;
+    stages never attempted are absent. Breaker re-rounds are breaker fails, fix rounds fix attempts."""
+    stages, run = {}, {}
+    for entry in attempts or []:
+        stage = entry.get("stage") if isinstance(entry, dict) else None
+        if not isinstance(stage, str):
+            continue
+        counts = stages.setdefault(stage, {"runs": 0, "fails": 0, "retry": 0, "escalate": 0, "needs_input": 0})
+        counts["runs"] += 1
+        failed = entry.get("result") == "fail"
+        counts["fails"] += failed
+        run[stage] = run.get(stage, 0) + 1 if failed else 0
+        key = ROUND_KEYS.get(attempt_action(stage, entry.get("result"), run[stage]))
+        if key:
+            counts[key] += 1
+    return {"stages": stages, "breaker_rerounds": stages.get("breaker", {}).get("fails", 0),
+            "fix_rounds": stages.get("fix", {}).get("runs", 0)}
+
+
+def build_record(number: int, main: str, usage: dict, cache: dict | None, pr: int | None,
+                 computed_at: str) -> dict:
+    """The cost/<N>.json record: ticket_usage's `usage`, the ticket cache's title, labels, tier and rounds
+    (all None without a cache), `pr` and the coverage note. needs_input, lines, elapsed, ci and landed_at
+    stay None here."""
+    cache = cache if isinstance(cache, dict) else None
+    field = (lambda key: cache.get(key)) if cache else (lambda key: None)
+    attempts = cache.get("attempts") if cache and isinstance(cache.get("attempts"), list) else []
+    return {"ticket": number, "title": field("title"), "repo": main, "computed_at": computed_at,
+            "type": field("type"), "size": field("size"), "risk": field("risk"), "tier": field("tier"), "pr": pr,
+            "rows": usage["rows"], "totals": usage["totals"], "by_model": usage["by_model"],
+            "session_totals": usage["session_totals"], "sessions": usage["sessions"],
+            "rounds": rounds(attempts) if cache else None,
+            "needs_input": None, "lines": None, "elapsed": None, "ci": None, "landed_at": None,
+            "coverage": COVERAGE}
+
+
+def tokens_text(count):
+    """999, 12.3k, 12.3M."""
+    if count < 1000:
+        return str(count)
+    if round(count / 1000, 1) < 1000:
+        return f"{count / 1000:.1f}k"
+    return f"{count / 1000000:.1f}M"
+
+
+def duration_text(millis):
+    """45s, 12m, 1h05m (whole units, rounded down)."""
+    seconds = max(0, int(millis)) // 1000
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
+def model_text(name):
+    """A model name without its leading `claude-`."""
+    return name[len("claude-"):] if name.startswith("claude-") else name
+
+
+def stage_rows(rows):
+    """The rows aggregated by stage and model, in the rows' order: (stage, model, rounds, tokens, output,
+    model time, agent time) as text; agent time is empty where no row has one (the orchestrator)."""
+    groups = {}
+    for x in rows:
+        g = groups.setdefault((x["stage"], x["model"]), {"rounds": set(), "total": 0, "output": 0, "model_ms": 0,
+                                                         "wall_ms": None})
+        g["rounds"].add(x["round"])
+        for key in ("total", "output", "model_ms"):
+            g[key] += x[key]
+        if x["wall_ms"] is not None:
+            g["wall_ms"] = (g["wall_ms"] or 0) + x["wall_ms"]
+    return [(stage, model_text(model), str(len(g["rounds"])), tokens_text(g["total"]), tokens_text(g["output"]),
+             duration_text(g["model_ms"]), "" if g["wall_ms"] is None else duration_text(g["wall_ms"]))
+            for (stage, model), g in groups.items()]
+
+
+def total_row(record):
+    totals = record["totals"]
+    return ("total", "", "", tokens_text(totals["total"]), tokens_text(totals["output"]),
+            duration_text(totals["model_ms"]), "")
+
+
+def notes(record):
+    """The lines under the table that have data: the session total, the rounds, the shared sessions left out."""
+    lines = []
+    st = record["session_totals"]
+    if st:
+        models = st["models"].values()
+        tokens = sum(m.get(k, 0) for m in models for k in ("input", "output", "cache_read", "cache_write"))
+        lines.append(f"Session total (Claude Code's count): {tokens_text(tokens)} tokens, "
+                     f"{tokens_text(sum(m.get('output', 0) for m in models))} output, "
+                     f"{tokens_text(sum(m.get('thinking', 0) for m in models))} thinking, "
+                     f"{duration_text(st['api_ms'])} API time")
+    r = record["rounds"]
+    if r and r["stages"]:
+        tally = {key: sum(s[key] for s in r["stages"].values()) for key in ROUND_KEYS.values()}
+        lines.append(f"Rounds: breaker re-rounds {r['breaker_rerounds']}, fix rounds {r['fix_rounds']}; "
+                     f"retries {tally['retry']}, escalations {tally['escalate']}, "
+                     f"needs-input {tally['needs_input']}")
+    shared = [s["id"][:8] for s in record["sessions"] if not s["own"]]
+    if shared:
+        what = "the orchestrator of shared session" if len(shared) == 1 else "the orchestrators of shared sessions"
+        lines.append(f"Not counted: {what} {', '.join(shared)}")
+    return lines
+
+
+def render_text(record: dict) -> str:
+    """The command's text output: the ticket, the stage x model table and its total (or that no transcripts
+    were found), the notes and the coverage note."""
+    n = record["ticket"]
+    labels = [record["type"]] + [f"{k} {record[k]}" for k in ("size", "risk", "tier") if record[k]]
+    head = f"#{n}" + (f" {record['title']}" if record["title"] else "")
+    if record["type"]:
+        head += f" ({', '.join(labels)})"
+    out = [head, ""]
+    if record["rows"]:
+        out.append(table([tuple(h.upper() for h in TABLE_HEAD)] + stage_rows(record["rows"]) + [total_row(record)]))
+    else:
+        out.append(f"No transcripts of #{n} were found.")
+    out += [""] + notes(record) + [record["coverage"]]
+    return "\n".join(out)
+
+
+def render_markdown(record: dict) -> str:
+    """The Cost block of a ticket's Resolution: the stage x model table, its total and the notes with data."""
+    def line(cells):
+        return "|" + "|".join(f" {c} " if c else " " for c in cells) + "|"
+
+    out = [HEADER, ""]
+    if record["rows"]:
+        out += [line(TABLE_HEAD), "|---|---|---:|---:|---:|---:|---:|"]
+        out += [line(r) for r in stage_rows(record["rows"])] + [line(total_row(record))]
+    else:
+        out.append("No transcripts of this ticket were found.")
+    extra = notes(record)
+    return "\n".join(out + ([""] + extra if extra else []))
