@@ -2263,6 +2263,218 @@ class Answers(BoardTest):
         p = self.board("answers", "12", "--since", "yesterday")
         self.assertOneLineError(p, "--since: not an ISO-8601 time")
 
+    # Ticket #167: the deploy guard (scripts/deploy_guard.py) posts its needs-input question from the deploy workflow,
+    # so on GitHub it is authored by github-actions[bot], not the owner. It must anchor `answers`; only the owner's
+    # replies after it come back, and no bot comment is ever an answer.
+    BOT = "github-actions[bot]"
+    GUARD = ("**Needs your input**\n\nThe deploy of #12 failed its live check and was reverted. "
+             "Retry, or change the approach?\n\nReply in a comment; /harness:work 12 picks it up.")
+
+    def test_a_bot_question_anchors_and_only_the_later_owner_replies_come_back(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                    comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                    comment("rjeskuri", "2026-10-13T10:30:00Z", "Actually, ship it behind a flag."),
+                    comment(self.BOT, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry, the outage was upstream.")]
+        self.assertEqual(self.answers(comments), ["Retry, the outage was upstream."])
+
+    def test_the_bot_question_anchors_when_it_is_the_only_question_or_the_cache_is_newer(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", "early thought"),
+                    comment(self.BOT, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry."),
+                    comment("rjeskuri", "2026-10-13T13:00:00Z", "And bump the timeout.")]
+        self.assertEqual(self.answers(comments), ["Retry.", "And bump the timeout."])
+        self.put_cache(12, {"number": 12, "fetched_at": "2026-10-13T14:00:00Z"})       # newer than every comment
+        self.assertEqual(self.answers(comments), ["Retry.", "And bump the timeout."])
+
+    def test_the_newest_question_wins_whoever_asked_it(self):
+        comments = [comment(self.BOT, "2026-10-13T09:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T10:00:00Z", "Retry."),
+                    comment("rjeskuri", "2026-10-13T11:00:00Z", "**Needs your input**\n\nAnd the name?" + MARK),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Call it export."),
+                    comment(self.BOT, "2026-10-13T13:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T14:00:00Z", "Give up on it."),
+                    comment(self.BOT, "2026-10-13T15:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T16:00:00Z", "Try once more.")]
+        self.assertEqual(self.answers(comments), ["Try once more."])
+        self.assertEqual(self.answers(comments[:6]), ["Give up on it."])
+        self.assertEqual(self.answers(comments[:4]), ["Call it export."])
+
+    def test_bot_comments_are_never_returned_as_answers(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                    comment(self.BOT, "2026-10-13T10:00:00Z", self.GUARD + MARK),
+                    comment(self.BOT, "2026-10-13T10:30:00Z", "Deploy finished: all checks passed."),
+                    comment(self.BOT, "2026-10-13T10:45:00Z", "Reverted by the deploy guard." + MARK),
+                    comment(self.BOT, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry."),
+                    comment(self.BOT, "2026-10-13T13:00:00Z", "Deploy finished: all checks passed."),
+                    comment(self.BOT, "2026-10-13T14:00:00Z", "Plain bot chatter, no marker."),
+                    comment("rjeskuri", "2026-10-13T15:00:00Z", "Thanks.")]
+        # with the anchor and with an explicit --since that reaches back before it
+        self.assertEqual(self.answers(comments), ["Retry.", "Thanks."])
+        self.assertEqual(self.answers(comments, "--since", "2026-10-13T08:00:00Z"), ["Retry.", "Thanks."])
+
+    def test_since_still_overrides_a_bot_question(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", "old answer"),
+                    comment(self.BOT, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+        self.assertEqual(self.answers(comments, "--since", "2026-10-13T08:00:00Z"), ["old answer", "Retry."])
+        self.assertEqual(self.answers(comments, "--since", "2026-10-13T11:30:00Z"), ["Retry."])
+
+    def test_a_bot_comment_without_the_marker_does_not_anchor(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                    comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                    comment(self.BOT, "2026-10-13T11:00:00Z", self.GUARD),            # no <!-- harness --> marker
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+        self.assertEqual(self.answers(comments), ["Use develop.", "Retry."])          # still the owner's question
+
+    def test_a_marked_bot_comment_that_is_not_a_question_does_not_anchor(self):
+        for body in ("Deploy of #12 reverted." + MARK,
+                     "Started on t/12-x (ci, headless)" + MARK,
+                     "see below **Needs your input** is what we asked" + MARK,        # not at the start
+                     "Landed in abc1234" + MARK):
+            with self.subTest(body=body):
+                comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                            comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                            comment(self.BOT, "2026-10-13T11:00:00Z", body),
+                            comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+                self.assertEqual(self.answers(comments), ["Use develop.", "Retry."])
+
+    # Only the Actions app may anchor: exactly `github-actions` (GraphQL) or `github-actions[bot]` (REST), any case.
+    # Each near miss below posts a marked, well-formed, timestamped question and must leave the owner's anchor alone;
+    # a prefix, split-on-"[" or "starts with github-actions[" match lets several of them through.
+    NEAR_MISS_LOGINS = (
+        "someone", "dependabot[bot]", "github-actions-fake[bot]", "not-github-actions[bot]",
+        "github-actions[app]", "GitHub-Actions[App]", "github-actions[x]", "github-actions[evil", "github-actions[bot",
+        "github-actions[bot]x", "github-actions[bot][bot]", "github-actions[bot]]", "github-actions bot",
+        "github-actions[]", "github-actions[", "github-actionsbot", "github-actions-bot", "xgithub-actions",
+        "xgithub-actions[bot]", "github-actionsx", "github-action", "github-action[bot]", "github", "actions[bot]",
+        "[bot]", "bot", "github-actions[bot] [bot]", "github_actions[bot]", "github-actions[[bot]]",
+    )
+
+    def test_a_third_party_question_does_not_anchor(self):
+        for login in self.NEAR_MISS_LOGINS:
+            question = f"**Needs your input**\n\nWhich region should {login} deploy to?" + MARK
+            with self.subTest(login=login):
+                comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                            comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                            comment(login, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                            comment(login, "2026-10-13T11:15:00Z", question),
+                            comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+                self.assertEqual(self.answers(comments), ["Use develop.", "Retry."])
+
+    def test_a_near_miss_login_cannot_anchor_even_as_the_only_question(self):
+        # no owner question to fall back on: the cache bounds it, else nothing does
+        for login in self.NEAR_MISS_LOGINS:
+            with self.subTest(login=login):
+                comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", "early thought"),
+                            comment(login, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                            comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+                self.assertEqual(self.answers(comments), ["early thought", "Retry."])
+
+    # "Carries the marker" is `<!-- harness -->` anywhere in the body, as by_harness() reads it, not only as the last
+    # line; the heading must still open the body.
+    def test_a_bot_question_with_the_marker_anywhere_anchors(self):
+        for body in ("**Needs your input** <!-- harness -->\n\nWhich region should the deploy of #99 target?",
+                     "**Needs your input**<!-- harness -->",
+                     "**Needs your input**\n<!-- harness -->\nWhich region should the deploy of #99 target?",
+                     "**Needs your input**\n\nWhich region <!-- harness --> should the deploy of #99 target?",
+                     "**Needs your input**\n\nWhich region?\n\n<!-- harness -->\n\nReply in a comment.",
+                     "**Needs your input**\n\nWhich region?<!-- harness -->",
+                     "**Needs your input**\n\nWhich region?\n\n<!-- harness -->\n<!-- harness -->"):
+            for login in (self.BOT, "github-actions"):
+                with self.subTest(body=body, login=login):
+                    comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                                comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                                comment(login, "2026-10-13T11:00:00Z", body),
+                                comment("rjeskuri", "2026-10-13T12:00:00Z", "Eu-west.")]
+                    self.assertEqual(self.answers(comments), ["Eu-west."])
+
+    def test_a_bot_question_with_a_near_miss_marker_does_not_anchor(self):
+        for marker in ("<!--harness-->", "<!-- harness-review -->", "<!-- Harness -->", "<!-- HARNESS -->",
+                       "<!--  harness  -->", "<!-- harness- -->", "<!-- harness", "harness -->", "<! -- harness -->",
+                       "&lt;!-- harness --&gt;", "<!-- harness --", "!-- harness -->", "<-- harness -->", "harness"):
+            self.assertNotIn("<!-- harness -->", marker)                 # a near miss, not the marker inside
+            for body in (self.GUARD + "\n\n" + marker, "**Needs your input** " + marker + "\n\nWhich region?"):
+                with self.subTest(body=body):
+                    comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                                comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                                comment(self.BOT, "2026-10-13T11:00:00Z", body),
+                                comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+                    self.assertEqual(self.answers(comments), ["Use develop.", "Retry."])
+
+    def test_gh_graphql_reports_the_app_as_github_actions_without_the_suffix(self):
+        # `gh issue view --json comments` is GraphQL, whose login for the Actions app has no [bot] suffix
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                    comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                    comment("github-actions", "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                    comment("github-actions", "2026-10-13T11:30:00Z", "Deploy finished."),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+        self.assertEqual(self.answers(comments), ["Retry."])
+
+    # The deploy guard's wording is not what anchors: any bot comment that starts with **Needs your input** and carries
+    # the marker does, so these questions share nothing with GUARD beyond the heading.
+    BOT_QUESTIONS = (
+        "**Needs your input**\n\nWhich region should the deploy of #99 target?",
+        "**Needs your input**\n\nrollback finished at 14:02 UTC; keep the old schema or migrate?\n\nReply in a comment.",
+        "**Needs your input**",
+        "**Needs your input**\nok?",
+        "  \n\t**Needs your input**\n\nShould #7 wait for the nightly build?",        # leading whitespace, as the owner path
+        "\n**Needs your input**\n\n¿Qué hacemos con el despliegue?",
+    )
+
+    def test_a_bot_question_anchors_whatever_it_says(self):
+        for question in self.BOT_QUESTIONS:
+            for marker in (MARK, "\n" + MARK.strip(), "\n\n" + MARK.strip() + "\n"):
+                with self.subTest(question=question, marker=marker):
+                    comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                                comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                                comment(self.BOT, "2026-10-13T11:00:00Z", question + marker),
+                                comment("rjeskuri", "2026-10-13T12:00:00Z", "Eu-west."),
+                                comment(self.BOT, "2026-10-13T12:30:00Z", "Deploy finished."),
+                                comment("rjeskuri", "2026-10-13T13:00:00Z", "Then the nightly.")]
+                    self.assertEqual(self.answers(comments), ["Eu-west.", "Then the nightly."])
+
+    def test_the_bot_question_moves_the_anchor_to_its_own_time(self):
+        # the same wording at different times anchors at each time (a constant or the first match cannot pass)
+        question = "**Needs your input**\n\nWhich region should the deploy of #99 target?" + MARK
+        replies = [comment("rjeskuri", f"2026-10-13T{h:02d}:30:00Z", f"reply {h}") for h in (10, 12, 14, 16)]
+        for hour, expected in ((9, ["reply 10", "reply 12", "reply 14", "reply 16"]),
+                               (11, ["reply 12", "reply 14", "reply 16"]), (13, ["reply 14", "reply 16"]),
+                               (15, ["reply 16"]), (17, [])):
+            with self.subTest(hour=hour):
+                comments = replies + [comment(self.BOT, f"2026-10-13T{hour:02d}:00:00Z", question)]
+                self.assertEqual(self.answers(comments), expected)
+
+    def test_the_bot_login_is_compared_case_insensitively(self):
+        for login in ("GitHub-Actions[bot]", "GITHUB-ACTIONS[BOT]", "Github-Actions[Bot]", "GITHUB-ACTIONS",
+                      "GitHub-Actions"):
+            question = f"**Needs your input**\n\nWhich region should {login} deploy to?" + MARK
+            with self.subTest(login=login):
+                comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                            comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                            comment(login, "2026-10-13T11:00:00Z", question),
+                            comment(login, "2026-10-13T11:30:00Z", "Deploy finished."),
+                            comment("rjeskuri", "2026-10-13T12:00:00Z", "Eu-west.")]
+                self.assertEqual(self.answers(comments), ["Eu-west."])
+
+    def test_a_bot_question_without_a_timestamp_does_not_anchor(self):
+        # like an owner question without one: it cannot bound anything
+        question = "**Needs your input**\n\nWhich region should the deploy of #99 target?" + MARK
+        for login in (self.BOT, "github-actions", "GitHub-Actions[bot]"):
+            for missing in ("null", "absent", "empty"):
+                with self.subTest(login=login, createdAt=missing):
+                    bot = comment(login, None, question)
+                    if missing == "absent":
+                        del bot["createdAt"]
+                    elif missing == "empty":
+                        bot["createdAt"] = ""
+                    comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                                comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                                bot,
+                                comment("rjeskuri", "2026-10-13T12:00:00Z", "Eu-west.")]
+                    self.assertEqual(self.answers(comments), ["Use develop.", "Eu-west."])
+
 
 class EpicCheck(BoardTest):
     def check(self, total, completed, state="OPEN"):
