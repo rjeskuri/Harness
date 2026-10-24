@@ -62,6 +62,7 @@ try:
     from harness_lib.repo import RepoError, repo_facts
     from harness_lib.registry import load_registry
     from harness_lib.gh import describe, gh as lib_gh, gh_json as lib_gh_json
+    from harness_lib.routing import code_route, label_tier, load_routing, review_route
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-board: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -138,7 +139,8 @@ def git(path, *args):
 
 
 class Repo:
-    """The project: its toplevel, its main working tree, its state key and (on demand) OWNER/REPO."""
+    """The project: its toplevel, its main working tree, its state key and (on demand) OWNER/REPO and the routing
+    settings."""
 
     def __init__(self, path):
         try:
@@ -151,6 +153,7 @@ class Repo:
             raise Problem(f"{self.main} has no git remote; the board lives in the project's GitHub repository "
                           "(gh repo create, or git remote add origin <url>)")
         self._slug = None
+        self._routing = None
 
     def slug(self):
         """OWNER/REPO, from gh repo view (once)."""
@@ -161,6 +164,15 @@ class Repo:
                 raise Problem("gh repo view did not name the repository (nameWithOwner missing)")
             self._slug = slug
         return self._slug
+
+    def routing(self):
+        """The routing settings (harness_lib.routing) of the main checkout, loaded once; each invalid value is one
+        warning, printed then."""
+        if self._routing is None:
+            self._routing = load_routing(self.main)
+            for problem in self._routing["problems"]:
+                warn("harness-board", problem)
+        return self._routing
 
     def ticket_path(self, number):
         return harness_home("repos", self.key, "tickets", f"{number}.json")
@@ -285,24 +297,26 @@ def label_names(labels):
     return names
 
 
-def tier_for(kind, size, risk):
-    """The rubric: size:L or risk:high gives fable; size:S, risk:low and not a bug gives sonnet; else opus."""
-    if size == "L" or risk == "high":
-        return "fable"
-    if size == "S" and risk == "low" and kind != "bug":
-        return "sonnet"
-    return "opus"
-
-
-def classify(names, closed=False):
-    """type, status, size, risk, flags and tier from label names."""
+def label_kind(names, closed=False):
+    """type, status, size, risk and flags from label names."""
     present = set(names)
     kind = next((t for t in TYPES if t in present), "task")
     status = "closed" if closed else next((s for s in STATUSES if "status:" + s in present), None)
     size = next((s for s in ("L", "M", "S") if "size:" + s in present), None)
     risk = "high" if "risk:high" in present else "low" if "risk:low" in present else None
-    return {"type": kind, "status": status, "size": size, "risk": risk,
-            "flags": [f for f in FLAGS if f in present], "tier": tier_for(kind, size, risk)}
+    return {"type": kind, "status": status, "size": size, "risk": risk, "flags": [f for f in FLAGS if f in present]}
+
+
+def routing_for(repo):
+    """The repository's routing settings (Repo.routing); with no repository (None, as for gh: the cwd), the cwd's."""
+    return repo.routing() if repo is not None else load_routing(os.getcwd())
+
+
+def classify(repo, names, closed=False):
+    """label_kind plus `tier`, the effective code tier: HARNESS_CODE_TIER when set, else the labels' tier."""
+    kind = label_kind(names, closed)
+    kind["tier"] = routing_for(repo)["code_tier"] or label_tier(kind["type"], kind["size"], kind["risk"])
+    return kind
 
 
 def read_cache(repo, number):
@@ -317,7 +331,7 @@ def refresh_cache(repo, number, labels=None, status=None):
         return
     if labels is not None:
         record["labels"] = labels
-        record.update(classify(labels, closed=record.get("status") == "closed"))
+        record.update(classify(repo, labels, closed=record.get("status") == "closed"))
     if status is not None:
         record["status"] = status
     try:
@@ -372,7 +386,7 @@ def fetch_record(repo, number):
         raise Problem(f"gh issue view {number} printed no issue")
     names = label_names(data.get("labels"))
     closed = str(data.get("state", "")).upper() == "CLOSED"
-    kind = classify(names, closed)
+    kind = classify(repo, names, closed)
     record = {"number": int(data.get("number") or number), "title": data.get("title") or "",
               "url": data.get("url") or "", "type": kind["type"], "status": kind["status"],
               "size": kind["size"], "risk": kind["risk"], "flags": kind["flags"], "labels": names,
@@ -395,13 +409,13 @@ def fetch_record(repo, number):
     if record["type"] == "epic":
         record["goal"] = first_paragraph(split_sections(record["body"]).get("goal", ""))
         subs = gh_json(repo, ["api", f"repos/{repo.slug()}/issues/{number}/sub_issues?per_page=100"])
-        record["tasks"] = [task_entry(s) for s in (subs if isinstance(subs, list) else []) if isinstance(s, dict)]
+        record["tasks"] = [task_entry(repo, s) for s in (subs if isinstance(subs, list) else []) if isinstance(s, dict)]
     return record
 
 
-def task_entry(sub):
+def task_entry(repo, sub):
     closed = str(sub.get("state", "")).upper() == "CLOSED"
-    kind = classify(label_names(sub.get("labels")), closed)
+    kind = classify(repo, label_names(sub.get("labels")), closed)
     return {"number": sub.get("number"), "title": sub.get("title") or "", "state": "CLOSED" if closed else "OPEN",
             "type": kind["type"], "status": kind["status"], "size": kind["size"], "risk": kind["risk"],
             "tier": kind["tier"]}
@@ -481,14 +495,16 @@ def fitted_resolutions(entries, room, newest=0):
     return out
 
 
-def context_markdown(record, resolutions=None):
+def context_markdown(record, resolutions=None, tier_from=None):
     """The ticket context: header, epic and blockers, the task list and the closed tasks' Resolutions
-    (`resolutions`), the sections, a closed ticket's own Resolutions, then the newest comments that fit."""
+    (`resolutions`), the sections, a closed ticket's own Resolutions, then the newest comments that fit. `tier_from`
+    names the setting that decided the tier, when one did."""
     n = record["number"]
     raw = split_sections(record.get("body"))
     state = "closed" if record.get("status") == "closed" else "open"
+    origin = f" from {tier_from}" if tier_from else ""
     lines = [f"# #{n} {record['title']}",
-             f"Labels: {', '.join(record['labels']) or 'none'} (tier {record['tier']}, {state})"]
+             f"Labels: {', '.join(record['labels']) or 'none'} (tier {record['tier']}{origin}, {state})"]
     if record.get("url"):
         lines.append(record["url"])
     if record.get("goal"):
@@ -651,7 +667,8 @@ def cmd_show(repo, args):
     record = fetch_record(repo, args.number)
     save_record(repo, record)
     if args.markdown:
-        print(context_markdown(record, task_resolutions(repo, record.get("tasks") or [])))
+        tier_from = "HARNESS_CODE_TIER" if routing_for(repo)["code_tier"] else None
+        print(context_markdown(record, task_resolutions(repo, record.get("tasks") or []), tier_from))
     else:
         emit(True, record, "")
 
@@ -668,7 +685,7 @@ def cmd_ready(repo, args):
             continue
         if any(str(b.get("state", "")).upper() != "CLOSED" for b in as_list(item.get("blockedBy"))):
             continue
-        kind = classify(names)
+        kind = classify(repo, names)
         rows.append({"number": item.get("number"), "title": item.get("title") or "", "type": kind["type"],
                      "size": kind["size"], "risk": kind["risk"], "tier": kind["tier"], "flags": kind["flags"]})
     rows.sort(key=lambda r: ("priority:high" not in r["flags"], r["number"] or 0))
@@ -811,7 +828,7 @@ def cmd_board(repo, args):
     groups["no-status"] = []
     for item in sorted((i for i in (items if isinstance(items, list) else []) if isinstance(i, dict)),
                        key=lambda i: i.get("number") or 0):
-        kind = classify(label_names(item.get("labels")))
+        kind = label_kind(label_names(item.get("labels")))
         entry = {"number": item.get("number"), "title": item.get("title") or "", "type": kind["type"],
                  "size": kind["size"], "risk": kind["risk"]}
         if kind["type"] == "epic":
@@ -838,21 +855,30 @@ def cmd_board(repo, args):
 
 
 def cmd_tier(repo, args):
-    def pick(info):
-        # the review stage runs on Opus 5.5; fable only for a risk:high ticket
+    routing = routing_for(repo)
+
+    def route(names):
+        # harness_lib.routing: the labels decide unless HARNESS_CODE_TIER (code) or HARNESS_REVIEW_TIER (review) is set
+        kind = label_kind(names)
         if args.stage == "review":
-            return "fable" if info["risk"] == "high" else "opus"
-        return info["tier"]
+            return review_route(kind["risk"], routing)
+        return code_route(kind["type"], kind["size"], kind["risk"], routing)
 
     cached = read_cache(repo, args.number)
     if cached and isinstance(cached.get("labels"), list):
-        tier, source = pick(classify(label_names(cached["labels"]))), "cache"
+        found, source = route(label_names(cached["labels"])), "cache"
     elif cached and cached.get("tier") in TIERS and not args.stage:
-        tier, source = cached["tier"], "cache"
+        # no labels to route: the cached tier stands in for the labels' tier, and the setting still decides
+        override = routing["code_tier"]
+        found = {"tier": override or cached["tier"], "effort": routing["code_effort"],
+                 "from": "HARNESS_CODE_TIER" if override else "labels", "labels_tier": cached["tier"]}
+        source = "cache"
     else:
         data = gh_json(repo, ["issue", "view", str(args.number), "--json", "labels"])
-        tier, source = pick(classify(label_names(data.get("labels") if isinstance(data, dict) else None))), "github"
-    emit(args.json, {"number": args.number, "tier": tier, "source": source}, tier)
+        found, source = route(label_names(data.get("labels") if isinstance(data, dict) else None)), "github"
+    emit(args.json, {"number": args.number, "tier": found["tier"], "source": source, "stage": args.stage or "code",
+                     "from": found["from"], "labels_tier": found["labels_tier"], "effort": found["effort"]},
+         found["tier"])
 
 
 # --------------------------------------------------------------- project check, project sync
@@ -1097,9 +1123,11 @@ def parser():
 
     sub.add_parser("board", parents=[common], help="open issues by status")
 
-    tier = sub.add_parser("tier", parents=[common], help="sonnet, opus or fable from the ticket's labels")
+    tier = sub.add_parser("tier", parents=[common],
+                          help="sonnet, opus or fable: HARNESS_CODE_TIER when set, else from the ticket's labels")
     tier.add_argument("number", type=issue_number, metavar="N")
-    tier.add_argument("--stage", choices=("review",), help="the review stage: fable for a risk:high ticket, else opus")
+    tier.add_argument("--stage", choices=("review",),
+                      help="the review stage: HARNESS_REVIEW_TIER when set, else fable for a risk:high ticket and opus")
 
     project = sub.add_parser("project", help=f"the Projects board named by {PROJECT_SETTING}")
     project_sub = project.add_subparsers(dest="action", metavar="{check,sync}")
