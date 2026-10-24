@@ -13,6 +13,7 @@ Usage:
     harness-pr awaiting [--all-projects] [--json]
     harness-pr ultra P [--post]
     harness-pr land P [--yes] [--discard] [--accept-findings]
+    harness-pr gate P [--json]
 
 ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has
 findings and no commit newer than it, naming the findings, and refuse when gh cannot tell. --accept-findings on
@@ -22,6 +23,9 @@ The repository is the cwd's (open: --worktree, else the cwd), else CLAUDE_PROJEC
 set, else `gh`; claude is HARNESS_CLAUDE, else `claude`; harness-board and harness-red are found on PATH, else
 next to this script. A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through
 to stderr, in order; its other stderr stays hidden. HARNESS_POLL_SECONDS replaces the 20 s poll interval (tests).
+
+gate prints the auto-land verdict (harness_lib/autoland.py) and exits 0 whatever it is; a gh or git call that
+fails gives `wait: <call> failed: <first stderr line>`.
 
 Exit status: 0 done; 1 a bad invocation, a failed precondition or call (one line on stderr), failed checks, or
 a land whose cleanup stopped; 8 checks still pending (as gh pr checks).
@@ -50,6 +54,8 @@ try:
     from harness_lib.notify import notify
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
+    from harness_lib.autoland import (CONVERSATION, check_entries as lib_check_entries, evaluate, fetch_origin,
+                                      gate_settings, gather_facts, overall)
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -67,8 +73,6 @@ SEVERITIES = ("high", "medium", "low")
 SEVERITY_ALIASES = {"critical": "high", "blocker": "high", "major": "medium", "minor": "low", "nit": "low",
                     "info": "low"}
 SEVERITY_RANK = ("critical", "high", "medium", "low", "info")
-FAILED = ("FAILURE", "CANCELLED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED", "STARTUP_FAILURE")
-PASSED = ("SUCCESS", "SKIPPED", "NEUTRAL")
 BILLING = re.compile(r"credit|billing|balance", re.I)
 RUN_URL = re.compile(r"/actions/runs/(\d+)")
 PR_URL = re.compile(r"https?://\S+/pull/(\d+)")
@@ -94,16 +98,6 @@ EXHAUSTED_HOURS = 24
 DEFAULT_CHECKED = "the diff against the ticket's definition of done"
 LAND_FIELDS = "isDraft,mergeable,headRefName,closingIssuesReferences,statusCheckRollup,title,url,state"
 AWAIT_FIELDS = "number,title,isDraft,createdAt,url,headRefName,closingIssuesReferences,statusCheckRollup"
-CONVERSATION = """query($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      reviewThreads(first: 100) { nodes { isResolved
-        comments(first: 50) { nodes { author { login } body path line createdAt url } } } }
-      reviews(first: 50) { nodes { author { login } body state createdAt url } }
-      comments(first: 100) { nodes { author { login } body createdAt url } }
-    }
-  }
-}"""
 
 
 def plural(n, word):
@@ -641,37 +635,8 @@ def cmd_review(args):
 
 # --------------------------------------------------------------- checks
 def check_entries(rollup):
-    """[{"name", "state", "bucket": pass|fail|pending, "url"}] from a statusCheckRollup (CheckRun or StatusContext)."""
-    out = []
-    for e in as_list(rollup):
-        kind = e.get("__typename")
-        if kind == "StatusContext" or (kind != "CheckRun" and "state" in e and "status" not in e):
-            state = str(e.get("state") or "").upper()
-            bucket = ("pending" if state in ("PENDING", "EXPECTED") else "fail" if state in FAILED
-                      else "pass" if state in PASSED else "pending")
-            name, url = e.get("context") or e.get("name") or "status", e.get("targetUrl") or e.get("detailsUrl") or ""
-        else:
-            status = str(e.get("status") or "").upper()
-            conclusion = str(e.get("conclusion") or "").upper()
-            if status != "COMPLETED":
-                state, bucket = status or "PENDING", "pending"
-            else:
-                state = conclusion
-                bucket = "fail" if conclusion in FAILED else "pass" if conclusion in PASSED else "pending"
-            name, url = e.get("name") or e.get("context") or "check", e.get("detailsUrl") or e.get("targetUrl") or ""
-        out.append({"name": str(name), "state": state, "bucket": bucket, "url": str(url)})
-    return out
-
-
-def overall(entries):
-    """none, failure, pending or success: a failure wins over pending (gh pr checks does the same)."""
-    if not entries:
-        return "none"
-    if any(e["bucket"] == "fail" for e in entries):
-        return "failure"
-    if any(e["bucket"] == "pending" for e in entries):
-        return "pending"
-    return "success"
+    """The lib's check_entries (so checks, land and the gate agree) over the rollup read through as_list."""
+    return lib_check_entries(as_list(rollup))
 
 
 def failed_logs(repo, failed):
@@ -1502,6 +1467,27 @@ def cmd_land(args):
     return 0
 
 
+# --------------------------------------------------------------- gate
+def cmd_gate(args):
+    """The auto-land verdict for PR P: `<verdict>: <reason>`, or with --json {pr, verdict, code, reason, rule, head,
+    ticket}; exit 0 whatever the verdict. A gh or git call that fails gives wait/gh naming it (fail closed)."""
+    repo = open_repo()
+    number, facts = args.number, {}
+    try:
+        fetch_origin(repo.main)
+        settings = gate_settings(repo.main)
+        if settings["autoland"]:
+            facts = gather_facts(repo.main, repo.slug(), number)
+        result = evaluate(facts, settings)
+    except Problem as err:
+        facts = getattr(err, "facts", None) or facts
+        result = {"verdict": "wait", "code": "gh", "reason": one_line(err), "rule": None}
+    out = dict({"pr": number}, **result, head=facts.get("head_sha"),
+               ticket=(facts.get("ticket") or {}).get("number"))
+    emit(args.json, out, f"{out['verdict']}: {out['reason']}")
+    return 0
+
+
 # --------------------------------------------------------------- arguments
 def number_arg(text):
     digits = text.lstrip("#")
@@ -1522,8 +1508,8 @@ def seconds_arg(text):
 
 def parser():
     ap = Parser(prog="harness-pr", description="Pull requests for tickets: open, review, checks, ready, comments, "
-                                               "awaiting, ultra, land.")
-    sub = ap.add_subparsers(dest="cmd", metavar="{open,review,checks,ready,comments,awaiting,ultra,land}")
+                                               "awaiting, ultra, land, gate.")
+    sub = ap.add_subparsers(dest="cmd", metavar="{open,review,checks,ready,comments,awaiting,ultra,land,gate}")
     sub.required = True
 
     op = sub.add_parser("open", help="push the ticket branch and open (or update) its draft PR")
@@ -1570,11 +1556,17 @@ def parser():
     ld.add_argument("--discard", action="store_true", help="remove the worktree even with uncommitted changes")
     ld.add_argument("--accept-findings", action="store_true",
                     help="land even though the latest harness review has findings and no newer commit")
+
+    gt = sub.add_parser("gate", help="the auto-land verdict: land, wait, fix or manual, and why")
+    gt.add_argument("number", type=number_arg, metavar="P")
+    gt.add_argument("--json", action="store_true", help='print {"pr", "verdict", "code", "reason", "rule", '
+                                                        '"head", "ticket"}')
     return ap
 
 
 COMMANDS = {"open": cmd_open, "review": cmd_review, "checks": cmd_checks, "ready": cmd_ready,
-            "comments": cmd_comments, "awaiting": cmd_awaiting, "ultra": cmd_ultra, "land": cmd_land}
+            "comments": cmd_comments, "awaiting": cmd_awaiting, "ultra": cmd_ultra, "land": cmd_land,
+            "gate": cmd_gate}
 
 
 def main():
