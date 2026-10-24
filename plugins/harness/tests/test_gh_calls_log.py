@@ -19,7 +19,7 @@ Tools run as subprocesses with a temporary HOME, HARNESS_GH pointing at a wrappe
 first when its argv holds a token named in GHTEST_SLOW), FAKEGH_SCENARIO/FAKEGH_LOG, and no PWD unless a test
 sets one (the runner's own PWD may be a ticket worktree). The in-process tests patch HOME, PWD and sys.argv.
 Expected values are written out here, never computed by the code under test. The fake executables and the git
-repositories are made once for the module. No test sleeps; the deadline tests wait well under 2 s.
+repositories are made once for the module. No test sleeps; a deadline test waits at most about 3 s.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_gh_calls_log.py" -v
 """
@@ -462,12 +462,14 @@ class ToolCallsAreLogged(Case):
                 for line in mine:
                     self.assertLine(line, started, ended, kind="graphql", exit=0, ticket=None)
 
-        # the deadline: harness-digest's batch for one project, its last two calls still running when the time is up
+        # the deadline: harness-digest's batch for one project, its last two calls still running when the time is up.
+        # The 3 s budget also covers the git calls and the two calls that are not slowed (two Pythons each), so a
+        # loaded machine still finishes those inside it; the slowed ones sleep 30 s, far past it.
         home = self.new_home()
         self.in_process("/opt/harness/bin/harness-digest", home=home,
                         GHTEST_SLOW="status:in-progress,headRefName", GHTEST_SLEEP="30")
         digest = load_tool(DIGEST, "harness_digest_gh_calls_log")
-        digest.GH_BUDGET = 1.0
+        digest.GH_BUDGET = 3.0
         out = digest.project_digest({"name": "w", "path": W["wt40"]}, W["gh"], time.time())
         self.assertIn("timed out", out["error"] or "", out)
         lines = self.logged(home)
@@ -479,12 +481,13 @@ class ToolCallsAreLogged(Case):
         self.assertEqual(sorted(x["exit"] for x in lines if x["exit"] is not None), [0, 0])
         for line in lines:
             if line["exit"] is None:
-                self.assertGreaterEqual(line["ms"], 500, line)   # it ran until the 1 s deadline stopped it
+                self.assertGreaterEqual(line["ms"], 2000, line)   # it ran until the 3 s deadline stopped it
 
     def test_session_brief_board_calls_are_logged(self):
         """The session brief's two board calls (made off a ticket branch) are two lines with tool
         session_brief.py: from the main checkout (no ticket, or PWD's), and from a worktree folder t-77-... of
-        another project (ticket from the cwd)."""
+        another project (ticket from the cwd). When the first call fails while the second is stuck, the brief
+        stops the second: still two lines, the failed one with its exit, the stopped one with exit null."""
         self.scenario([{"match": ["issue", "list"], "stdout_json": [{"labels": [{"name": "status:ready"}]}]},
                        {"match": ["pr", "list"], "stdout_json": []}])
         for cwd, pwd_value, repo, ticket in ((W["main"], None, MAIN_NAME, None), (W["main"], W["wt40"], MAIN_NAME, 40),
@@ -506,6 +509,30 @@ class ToolCallsAreLogged(Case):
                 for line in lines:
                     self.assertLine(line, started, ended, tool="session_brief.py", kind="graphql", exit=0,
                                     repo=repo, ticket=ticket)
+
+        # the stop path: the issue list (read first) fails at once while the pr list is stuck, so the brief stops
+        # waiting without spending its 3 s: the failed call logs its own exit, the stopped one exit null
+        for code in (2, 5):
+            with self.subTest(stopped_after_exit=code):
+                home = self.new_home()
+                self.scenario([{"match": ["issue", "list"], "stderr": "HTTP 502\n", "exit": code},
+                               {"match": ["pr", "list"], "stdout_json": []}])
+                payload = {"session_id": "sess-1", "transcript_path": "/dev/null", "cwd": W["main"],
+                           "permission_mode": "default", "hook_event_name": "SessionStart", "source": "startup"}
+                started = self.window()
+                p = subprocess.run([sys.executable, SESSION_BRIEF], input=json.dumps(payload), capture_output=True,
+                                   text=True, env=self.env(home, GHTEST_SLOW="pr", GHTEST_SLEEP="30"), cwd=self.tmp,
+                                   timeout=60)
+                ended = self.window()
+                self.assertEqual((p.returncode, p.stderr), (0, ""))
+                self.assertNotIn("Board:", p.stdout)
+                lines = self.logged(home)
+                self.assertEqual(len(lines), 2, lines)
+                self.assertEqual(sorted((x["cmd"], x["exit"] if x["exit"] is not None else -1) for x in lines),
+                                 [("issue list", code), ("pr list", -1)])
+                for line in lines:
+                    self.assertLine(line, started, ended, tool="session_brief.py", kind="graphql", repo=MAIN_NAME,
+                                    ticket=None)
 
 
 # ==================================================================== the fields of a line
