@@ -22,9 +22,12 @@ record `cost` writes), runs/<repo-key>-<N>-<stamp>.json and .log (one dispatched
 
 cost: ticket N's tokens and model time per stage and model from the repository's transcripts (harness_lib/cost.py's
 ticket_usage), its labels and rounds from the ticket cache (the attempts replayed with attempt's rule; null without
-a cache). Prints the stage x model table, the total, Claude Code's session total for N's own sessions, the rounds,
-the shared sessions whose orchestrator is not counted, the lower-bound note and the saved path; --json prints the
-record, --markdown the Cost block of the Resolution. Tokens and time only, no dollar figure.
+a cache). From gh: the PR (--pr, else the cache branch's, a merged one first), its test/source/other lines, the CI runs
+of its head branch, the needs-input count, the start-to-ready and start-to-land times, and the labels the cache
+lacks; a failed gh call leaves its part null with one stderr line. Prints the stage x model table, the total, Claude
+Code's session total for N's own sessions, the rounds, the Lines, Elapsed, CI and Needs input lines, the shared
+sessions whose orchestrator is not counted, the lower-bound note and the saved path; --json prints the record,
+--markdown the Cost block of the Resolution. Tokens and time only, no dollar figure.
 
 start: refuses an epic, a closed issue, status:blocked and open blockers; fetches origin; reuses a worktree
 already on t/N-*, else a branch origin/t/N-*, else a local t/N-*, else creates t/N-<slug> from origin/main
@@ -78,7 +81,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
-    from harness_lib.settings import setting, settings_env
+    from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, patterns, setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
     from harness_lib import cost
     from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
@@ -1087,12 +1090,76 @@ def cmd_attempt(repo, args):
          f"{action} {next_tier}" if next_tier else action)
 
 
+PR_FIELDS = "number,url,createdAt,mergedAt,headRefName"
+RUN_FIELDS = "databaseId,status,conclusion,createdAt,startedAt,updatedAt"
+
+
+def gh_part(repo, args, shape):
+    """gh's JSON for one part of the cost record, or None with one warning line naming the call when gh fails or
+    prints something other than a `shape`."""
+    try:
+        data = gh_json(repo, args)
+    except Problem as err:
+        warn(str(err))
+        return None
+    if not isinstance(data, shape):
+        warn(f"gh {' '.join(args[:2])} printed no {'list' if shape is list else 'object'}")
+        return None
+    return data
+
+
+def cost_extras(repo, record, cache):
+    """Fill the record's gh-backed parts in place: the PR (--pr, else the branch's), its lines, its CI runs, the
+    ticket's needs-input count, the elapsed times and the labels the cache lacks. A failed call leaves its part
+    null."""
+    n, pr = record["ticket"], record["pr"]
+    branch = cache.get("branch") if cache and isinstance(cache.get("branch"), str) else None
+    info = None
+    if pr is not None:
+        info = gh_part(repo, ["pr", "view", str(pr), "--json", PR_FIELDS], dict)
+    elif branch:
+        found = gh_part(repo, ["pr", "list", "--head", branch, "--state", "all", "--json", PR_FIELDS,
+                               "--limit", "10"], list)
+        info = cost.pick_pr(found)
+        pr = record["pr"] = info["number"] if info else None
+    info = info or {}
+    if pr is not None:
+        file_env = settings_env(repo.main, ("settings.json",))
+        globs = [patterns(setting(name, file_env) or default) for name, default in
+                 (("HARNESS_TEST_PATTERNS", DEFAULT_TEST_PATTERNS), ("HARNESS_SOURCE_EXEMPT", DEFAULT_SOURCE_EXEMPT))]
+        pages = gh_part(repo, ["api", f"repos/{{owner}}/{{repo}}/pulls/{pr}/files?per_page=100", "--paginate",
+                               "--slurp"], list)
+        if pages is not None:
+            record["lines"] = cost.line_counts(pages, *globs)
+        head = info.get("headRefName") if isinstance(info.get("headRefName"), str) else branch
+        if head:
+            runs = gh_part(repo, ["run", "list", "--branch", head, "--json", RUN_FIELDS, "--limit", "100"], list)
+            if runs is not None:
+                record["ci"] = cost.ci_summary(runs)
+    issue = gh_part(repo, ["issue", "view", str(n), "--json", "comments,labels"], dict)
+    comments = issue.get("comments") if issue and isinstance(issue.get("comments"), list) else None
+    if issue is not None:
+        record["needs_input"] = cost.needs_input_count(comments)
+        labels = issue.get("labels") if isinstance(issue.get("labels"), list) else []
+        names = [x.get("name") if isinstance(x, dict) else x for x in labels]
+        for key, value in cost.label_fields([x for x in names if isinstance(x, str)]).items():
+            if record[key] is None:
+                record[key] = value
+    started = (cache.get("started_at") if cache else None) or cost.started_from_comments(comments)
+    ready = cost.ready_from_comments(comments, pr) if pr is not None else None
+    landed = info.get("mergedAt") or None
+    record["elapsed"] = cost.elapsed(started, info.get("createdAt") or None, ready, landed)
+    record["landed_at"] = landed
+
+
 def cmd_cost(repo, args):
     """Ticket N's tokens and model time per stage and model, from the transcripts and the ticket cache:
     saved as cost/<N>.json (replacing an earlier record), printed as text, --json or --markdown."""
     n = args.number
     usage = cost.ticket_usage(repo.main, n)
-    record = cost.build_record(n, repo.main, usage, read_cache(repo, n), args.pr, iso(now()))
+    cache = read_cache(repo, n)
+    record = cost.build_record(n, repo.main, usage, cache, args.pr, iso(now()))
+    cost_extras(repo, record, cache)
     path = repo.cost_path(n)
     write_json(path, record)
     if args.markdown:
