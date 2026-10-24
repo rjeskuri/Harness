@@ -2546,13 +2546,24 @@ class Proposed(BoardTest):
                 self.assertFalse([a for a in self.calls() if a[:2] == ["issue", "close"]])
 
     def test_promote_json(self):
-        tasks = [(31, ["task", "status:proposed"], "OPEN"), (32, ["task", "status:ready"], "OPEN")]
-        self.promote_world(30, ["epic", "status:proposed"], subs=tasks, kind_title="Epic")
-        data = json.loads(self.ok("promote", "30", "--json").stdout)
-        text = json.dumps(data)
-        self.assertIn("30", text)
-        self.assertIn("31", text)
-        self.assertEqual(set(label_edits(self.calls())), {30, 31})
+        # the documented shape, exactly: {"number": N, "tasks": [the promoted task numbers]}
+        cases = [
+            (30, ["epic", "status:proposed"], "Epic",
+             [(31, ["task", "status:proposed"], "OPEN"), (32, ["task", "status:ready"], "OPEN")], [31]),
+            (50, ["epic", "status:proposed"], "Epic",
+             [(58, ["bug", "status:proposed"], "OPEN"), (52, ["task", "status:in-progress"], "OPEN"),
+              (51, ["task", "status:proposed"], "OPEN"), (55, ["task", "status:proposed"], "CLOSED")], [51, 58]),
+            (60, ["epic", "status:proposed"], "Epic", [(61, ["task", "status:blocked"], "OPEN")], []),
+            (77, ["task", "status:proposed", "size:S"], "Task", [], []),
+            (8, ["bug", "status:proposed"], "Task", [], []),
+        ]
+        for number, labels, kind_title, subs, promoted in cases:
+            with self.subTest(number=number, promoted=promoted):
+                self.promote_world(number, labels, subs=subs, kind_title=kind_title)
+                data = json.loads(self.ok("promote", str(number), "--json").stdout)
+                self.assertEqual(data, {"number": number, "tasks": promoted})
+                self.assertNotIn(number, data["tasks"], "the promoted ticket itself is not one of its tasks")
+                self.assertEqual(set(label_edits(self.calls())), {number, *promoted})
 
     def test_promote_a_task_alone(self):
         cases = [(12, "task", ["size:S", "risk:low"]), (47, "bug", ["priority:high"]),
