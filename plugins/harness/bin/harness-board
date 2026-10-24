@@ -7,13 +7,14 @@ labels. `show` keeps a local cache of each ticket at
 
 Usage:
     harness-board labels ensure
-    harness-board epic create --title T --body-file F [--size S|M|L] [--risk low|high]
+    harness-board epic create --title T --body-file F [--size S|M|L] [--risk low|high] [--proposed]
     harness-board task create --title T --body-file F [--parent N] [--type task|bug|chore|refactor]
                               [--size S|M|L] [--risk low|high] [--blocked-by N[,N]]
-                              [--no-tests] [--needs-local] [--priority]
+                              [--no-tests] [--needs-local] [--priority] [--proposed]
     harness-board show N [--markdown]
     harness-board ready
-    harness-board status N ready|in-progress|in-review|blocked|needs-input [--comment TEXT]
+    harness-board status N ready|in-progress|in-review|blocked|needs-input|proposed [--comment TEXT]
+    harness-board promote N    # a proposed epic and its open proposed tasks, or a proposed task, to ready
     harness-board comment N (--body TEXT | --body-file F)
     harness-board needs-input N --question TEXT [--evidence-file F]
     harness-board answers N [--since ISO]   # the owner's replies since the last needs-input question
@@ -32,6 +33,8 @@ harness's own comments, posted under the owner's account, from the owner's repli
 With HARNESS_PROJECT=OWNER/NUMBER (the environment first, where an empty value means off; else `env` in
 ~/.claude/settings.json), `epic create` and `task create` add the issue to that GitHub Projects board with
 Status Ready (and Priority High for `task create --priority`), and every status change sets the item's Status.
+`status:proposed` has no Status on the board: a `--proposed` create only adds the item, `status N proposed` writes
+no Status, and `project sync` leaves a proposed issue's Status as it is.
 The labels stay the source of truth: a failed project call is one warning on stderr and never fails the command.
 `project check` (gh project field-list) names each Status or Priority option the board lacks and exits 1 if any.
 `project sync` reads the board (gh project item-list) and the open issues of the repository, or of every project
@@ -77,6 +80,7 @@ LABELS = [
     ("status:in-review", "D4C5F9", "A pull request awaits your review"),
     ("status:blocked", "B60205", "Cannot proceed; see the comments"),
     ("status:needs-input", "E99695", "Waiting for your answer in a comment"),
+    ("status:proposed", "BFE5BF", "A plan waiting for you to promote it"),
     ("size:S", "C5DEF5", "One sitting, one or two files"),
     ("size:M", "BFDADC", "A few files, under the size cap"),
     ("size:L", "F9D0C4", "The cap: about 5 files or 300 lines; anything bigger is split"),
@@ -92,9 +96,10 @@ LABELS = [
 ]
 TYPES = ("epic", "bug", "refactor", "chore", "task")          # the first present wins
 TASK_TYPES = ("task", "bug", "chore", "refactor")
-STATUSES = ("ready", "in-progress", "in-review", "blocked", "needs-input")
+STATUSES = ("ready", "in-progress", "in-review", "blocked", "needs-input", "proposed")
 STATUS_TITLES = {"ready": "Ready", "in-progress": "In progress", "in-review": "In review", "blocked": "Blocked",
-                 "needs-input": "Needs input"}
+                 "needs-input": "Needs input", "proposed": "Proposed"}
+MIRRORED = tuple(s for s in STATUSES if s != "proposed")   # the statuses with a Status option on the Projects board
 FLAGS = ("no-tests", "needs-local", "priority:high")
 TIERS = ("sonnet", "opus", "fable")
 SECTIONS = [("Request", "request"), ("Outline", "outline"), ("Definition of done", "definition_of_done"),
@@ -116,7 +121,7 @@ GH_TIMEOUT = 60         # seconds per gh call
 LINK_RETRY_DELAY = 1.0  # seconds before the one retry of a sub-issue link
 PROJECT_SETTING = "HARNESS_PROJECT"   # OWNER/NUMBER of the Projects board the status is mirrored to
 PROJECT_VALUE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[1-9][0-9]*")
-PROJECT_FIELDS = (("Status", [STATUS_TITLES[s] for s in STATUSES] + ["Done"]), ("Priority", ["High", "Normal"]))
+PROJECT_FIELDS = (("Status", [STATUS_TITLES[s] for s in MIRRORED] + ["Done"]), ("Priority", ["High", "Normal"]))
 FIELD_LIMIT = "100"     # a project holds at most 50 fields
 ITEM_LIMIT = "1000"     # the board items project sync reads
 ISSUE_LIMIT = "1000"    # the open issues per repository project sync reads
@@ -269,10 +274,12 @@ def mirror(repo, project, url, fields, add=False):
             return
 
 
-def mirror_created(repo, url, priority=False):
+def mirror_created(repo, url, priority=False, proposed=False):
+    """Add a new issue to the board with Status Ready; a proposed one gets no Status."""
     project = project_setting()
     if project:
-        mirror(repo, project, url, [("Status", "Ready")] + ([("Priority", "High")] if priority else []), add=True)
+        mirror(repo, project, url, ([] if proposed else [("Status", "Ready")])
+               + ([("Priority", "High")] if priority else []), add=True)
 
 
 # --------------------------------------------------------------- labels, tiers, the cache
@@ -568,13 +575,17 @@ def cmd_labels_ensure(repo, args):
          f"{len(LABELS)} labels created or updated.")
 
 
+def initial_status(args):
+    return "status:proposed" if args.proposed else "status:ready"
+
+
 def cmd_epic_create(repo, args):
     path, stdin = body_file(args.body_file)
-    labels = ["epic", "status:ready"] + ([f"size:{args.size}"] if args.size else []) \
+    labels = ["epic", initial_status(args)] + ([f"size:{args.size}"] if args.size else []) \
         + ([f"risk:{args.risk}"] if args.risk else [])
     out = gh(repo, ["issue", "create", "--title", args.title, "--body-file", path] + label_args(labels), stdin)
     number, url = created_issue(out)
-    mirror_created(repo, url)
+    mirror_created(repo, url, proposed=args.proposed)
     emit(args.json, {"number": number, "url": url}, f"#{number} {url}")
 
 
@@ -617,12 +628,12 @@ def cmd_task_create(repo, args):
     blockers = blocker_numbers(args.blocked_by)
     if args.parent:
         repo.slug()                    # fails before anything is created when gh cannot see the repository
-    labels = [args.type, "status:ready"] + ([f"size:{args.size}"] if args.size else []) \
+    labels = [args.type, initial_status(args)] + ([f"size:{args.size}"] if args.size else []) \
         + ([f"risk:{args.risk}"] if args.risk else []) + (["no-tests"] if args.no_tests else []) \
         + (["needs-local"] if args.needs_local else []) + (["priority:high"] if args.priority else [])
     out = gh(repo, ["issue", "create", "--title", args.title, "--body-file", path] + label_args(labels), stdin)
     number, url = created_issue(out)
-    mirror_created(repo, url, args.priority)
+    mirror_created(repo, url, args.priority, args.proposed)
     result = {"number": number, "url": url, "parent": args.parent, "linked": None, "blocked_by": []}
 
     def fail(message):
@@ -664,7 +675,7 @@ def cmd_ready(repo, args):
         if not isinstance(item, dict):
             continue
         names = label_names(item.get("labels"))
-        if "epic" in names:
+        if "epic" in names or "status:proposed" in names:
             continue
         if any(str(b.get("state", "")).upper() != "CLOSED" for b in as_list(item.get("blockedBy"))):
             continue
@@ -684,8 +695,8 @@ def cmd_ready(repo, args):
 
 def set_status(repo, number, status, comment=None):
     """Swap the status label (remove every other status:*, add the new one), mirror it to the Projects board when
-    one is configured, comment when asked."""
-    project = project_setting()
+    one is configured (proposed has no Status there), comment when asked."""
+    project = project_setting() if status in MIRRORED else None
     data = gh_json(repo, ["issue", "view", str(number), "--json", "labels,url" if project else "labels"])
     names = label_names(data.get("labels") if isinstance(data, dict) else None)
     new = "status:" + status
@@ -712,6 +723,37 @@ def cmd_status(repo, args):
     removed = set_status(repo, args.number, args.status, args.comment)
     emit(args.json, {"number": args.number, "status": args.status, "removed": removed},
          f"#{args.number} status:{args.status}")
+
+
+def cmd_promote(repo, args):
+    """A proposed ticket to ready through set_status: an epic's open proposed sub-issues first, then the epic."""
+    n = args.number
+    data = gh_json(repo, ["issue", "view", str(n), "--json", "labels,state"])
+    data = data if isinstance(data, dict) else {}
+    names = label_names(data.get("labels"))
+    if str(data.get("state", "")).upper() == "CLOSED":
+        raise Problem(f"#{n} is closed; only an open status:proposed ticket can be promoted")
+    if "status:proposed" not in names:
+        status = classify(names)["status"]
+        raise Problem(f"#{n} is {'status:' + status if status else 'without a status label'}, not status:proposed; "
+                      "nothing promoted")
+    tasks = []
+    if "epic" in names:
+        subs = gh_json(repo, ["api", f"repos/{repo.slug()}/issues/{n}/sub_issues?per_page=100"])
+        tasks = sorted(int(s["number"]) for s in (subs if isinstance(subs, list) else [])
+                       if isinstance(s, dict) and s.get("number") and str(s.get("state", "")).upper() != "CLOSED"
+                       and "status:proposed" in label_names(s.get("labels")))
+    done = []
+    for number in tasks + [n]:
+        try:
+            set_status(repo, number, "ready")
+        except Problem as err:
+            so_far = f" (promoted so far: {', '.join(f'#{x}' for x in done)})" if done else ""
+            raise Problem(f"#{number} was not promoted: {err}{so_far}; run promote {n} again") from None
+        done.append(number)
+    k = len(tasks)
+    text = f"promoted #{n} and {k} task{'' if k == 1 else 's'}" if "epic" in names else f"promoted #{n}"
+    emit(args.json, {"number": n, "tasks": tasks}, text)
 
 
 def cmd_comment(repo, args):
@@ -829,6 +871,8 @@ def cmd_board(repo, args):
         lines += [f"- #{e['number']} {e['title']} ({e['completed']} of {e['total']} tasks closed)"
                   for e in groups["epics"]]
     for status in STATUSES:
+        if status == "proposed" and not groups[status]:
+            continue
         lines += ["", f"## {STATUS_TITLES[status]} ({len(groups[status])})"]
         lines += ["- " + issue_line(e) for e in groups[status]]
     if groups["no-status"]:
@@ -897,11 +941,11 @@ def load_projects():
 
 def label_status(url, names):
     """The Status option an issue's labels give, or None: no status label means no Status write, and an unknown
-    or doubled one is one warning naming the issue and no Status write."""
+    or doubled one is one warning naming the issue and no Status write; status:proposed has no Status: None."""
     found = [name for name in names if name.startswith("status:")]
-    if not found:
+    if not found or found == ["status:proposed"]:
         return None
-    if len(found) == 1 and found[0][len("status:"):] in STATUS_TITLES:
+    if len(found) == 1 and found[0][len("status:"):] in MIRRORED:
         return STATUS_TITLES[found[0][len("status:"):]]
     what = f"the status labels {', '.join(found)}" if len(found) > 1 else f"{found[0]}, not a harness status,"
     warn("harness-board", f"{url} has {what} so its Status on the board is left as it is")
@@ -1027,8 +1071,8 @@ def parser():
     ap = Parser(prog="harness-board", description="The board: GitHub Issues as tickets (epics, tasks, status labels).")
     ap.add_argument("--repo", metavar="PATH", help=repo_help)
     ap.add_argument("--json", action="store_true", help="print JSON")
-    sub = ap.add_subparsers(dest="cmd", metavar="{labels,epic,task,show,ready,status,comment,needs-input,answers,"
-                                               "close,epic-check,board,tier,project}")
+    sub = ap.add_subparsers(dest="cmd", metavar="{labels,epic,task,show,ready,status,promote,comment,needs-input,"
+                                               "answers,close,epic-check,board,tier,project}")
     sub.required = True
 
     labels = sub.add_parser("labels", help="the board's label set")
@@ -1039,11 +1083,13 @@ def parser():
     epic = sub.add_parser("epic", help="epics")
     epic_sub = epic.add_subparsers(dest="action", metavar="{create}")
     epic_sub.required = True
-    ec = epic_sub.add_parser("create", parents=[common], help="create an epic (labels epic, status:ready)")
+    ec = epic_sub.add_parser("create", parents=[common],
+                             help="create an epic (labels epic, status:ready or with --proposed status:proposed)")
     ec.add_argument("--title", required=True)
     ec.add_argument("--body-file", required=True, metavar="F", help="the body (- for stdin)")
     ec.add_argument("--size", choices=("S", "M", "L"))
     ec.add_argument("--risk", choices=("low", "high"))
+    ec.add_argument("--proposed", action="store_true", help="label status:proposed in place of status:ready")
 
     task = sub.add_parser("task", help="tasks")
     task_sub = task.add_subparsers(dest="action", metavar="{create}")
@@ -1059,6 +1105,7 @@ def parser():
     tc.add_argument("--no-tests", action="store_true", help="docs or config only; exempt from tests-first")
     tc.add_argument("--needs-local", action="store_true", help="needs this Mac's files or credentials")
     tc.add_argument("--priority", action="store_true", help="label priority:high (and Priority High on the board)")
+    tc.add_argument("--proposed", action="store_true", help="label status:proposed in place of status:ready")
 
     show = sub.add_parser("show", parents=[common], help="fetch a ticket, write its cache, print it")
     show.add_argument("number", type=issue_number, metavar="N")
@@ -1070,6 +1117,10 @@ def parser():
     status.add_argument("number", type=issue_number, metavar="N")
     status.add_argument("status", choices=STATUSES)
     status.add_argument("--comment", metavar="TEXT")
+
+    promote = sub.add_parser("promote", parents=[common],
+                             help="a proposed epic and its open proposed tasks, or a proposed task, to ready")
+    promote.add_argument("number", type=issue_number, metavar="N")
 
     comment = sub.add_parser("comment", parents=[common], help="comment on a ticket")
     comment.add_argument("number", type=issue_number, metavar="N")
@@ -1115,7 +1166,8 @@ def parser():
 
 
 COMMANDS = {"labels ensure": cmd_labels_ensure, "epic create": cmd_epic_create, "task create": cmd_task_create,
-            "show": cmd_show, "ready": cmd_ready, "status": cmd_status, "comment": cmd_comment,
+            "show": cmd_show, "ready": cmd_ready, "status": cmd_status, "promote": cmd_promote,
+            "comment": cmd_comment,
             "needs-input": cmd_needs_input, "answers": cmd_answers, "close": cmd_close,
             "epic-check": cmd_epic_check, "board": cmd_board, "tier": cmd_tier}
 PROJECT_COMMANDS = {"project check": cmd_project_check, "project sync": cmd_project_sync}   # open their own repos
