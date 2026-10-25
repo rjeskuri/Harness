@@ -2616,7 +2616,7 @@ class ToolsRunTheLib(unittest.TestCase):
         board = load_tool(BIN / "harness-board")
         self.spy(board, self.text.first_line, "first_line")
         fake = self.fake_exe("gh", "printf '\\n  HTTP 502: bad gateway\\nretry later\\n' >&2\nexit 1\n")
-        with mock.patch.dict(os.environ, {"HARNESS_GH": fake}):
+        with mock.patch.dict(os.environ, {"HARNESS_GH": fake, "HOME": self.tmp}):   # #187: the gh log stays in tmp
             with self.assertRaises(self.cli.Problem) as ctx:
                 board.gh(None, ["issue", "view", "7", "--json", "labels"])
         self.assertEqual(str(ctx.exception), "gh issue view 7 failed: HTTP 502: bad gateway")
