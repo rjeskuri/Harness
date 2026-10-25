@@ -10,7 +10,10 @@ per-repository state entry its own line, so parallel tickets stop conflicting on
   cut into sentences, each with its owner: each module's sentences move to its bullet (terms,
   closing words, word count: moved, not rewritten), the opening ones stay in the intro, the
   `Fail open:` ones become their own paragraph, and no other Layout prose names a module file.
-  Modules the old paragraph never described name a public name and an importer.
+  Nothing is padded or borrowed: an entry ends no sentence another owner owns and is no longer
+  than its own sentences allow, and so for the intro and the Fail open paragraph. Modules the old
+  paragraph never described get one short line in their docstring's words naming one of their own
+  public names (none of another such module's) and an importer.
 - StateEntries: the `~/.claude/harness/repos/<repo-key>/` State bullet lists each entry as a
   nested bullet, sorted, with the old line 119's words.
 
@@ -355,6 +358,13 @@ OLD_LINE_LENGTH = 17050  # characters in the old line 41, without its newline
 
 END_WORDS = 6  # the last words of each piece still close it, in order, wherever it moved
 KEEP_SHARE = 0.9  # a module's entry keeps at least this share of its single-owner pieces' words
+# Moved, not padded: an entry (or the intro, or the Fail open paragraph) has at most this many
+# times the words of every piece it owns (a two-owner piece counted in full for both), plus
+# ADD_WORDS for the `` - `<module>.py`: `` lead and joins.
+MAX_SHARE = 1.15
+ADD_WORDS = 4
+FRESH_MAX_WORDS = 80  # an entry for a module the old paragraph never described is one short line
+DOC_WORDS = 3  # ... that shares at least this many words with its module docstring's first paragraph
 FAIL_OPEN_START = "Fail open: "
 
 # The entries of the State `repos/<repo-key>/` bullet, sorted, each with the words that followed it
@@ -433,6 +443,35 @@ def contains_run(haystack: list, run: list) -> bool:
 def owned_pieces(owner: str) -> list:
     """The old pieces whose only owner is `owner`."""
     return [text for owners, text in OLD_PIECES if owners == (owner,)]
+
+
+def all_pieces(owner: str) -> list:
+    """The old pieces `owner` owns, alone or with another owner."""
+    return [text for owners, text in OLD_PIECES if owner in owners]
+
+
+def word_cap(owner: str) -> float:
+    return MAX_SHARE * sum(len(words(text)) for text in all_pieces(owner)) + ADD_WORDS
+
+
+def foreign_tails(owner: str) -> list:
+    """The closing END_WORDS words of every old piece `owner` does not own, except a run that also
+    occurs in one of its own pieces (two pieces end `import them and keep no copy`)."""
+    own = [words(text) for text in all_pieces(owner)]
+    out = []
+    for owners, text in OLD_PIECES:
+        tail = words(text)[-END_WORDS:]
+        if owner in owners or any(contains_run(w, tail) for w in own):
+            continue
+        out.append((owners, tail))
+    return out
+
+
+def docstring_head(module: Path) -> str:
+    """The first paragraph of a module's docstring."""
+    import ast
+    doc = ast.get_docstring(ast.parse(module.read_text(encoding="utf-8"))) or ""
+    return doc.split("\n\n", 1)[0]
 
 
 def fenced_ranges(lines: list, start: int, end: int) -> set:
@@ -571,6 +610,25 @@ class LibEntries(unittest.TestCase):
                 self.assertGreaterEqual(got, KEEP_SHARE * want,
                                         f"{name}'s entry has {got} words; its old sentences had {want}")
 
+    def test_entries_carry_only_their_own_text(self):
+        """Each entry stands for its own module only: it does not end any old sentence another
+        module (or the intro, or Fail open) owns, and a described module's entry is no longer than
+        its own sentences allow (MAX_SHARE of their words plus ADD_WORDS)."""
+        self.assert_old_pieces_are_the_old_paragraph()
+        entries = self.entries()
+        described = {o for owners, _ in OLD_PIECES for o in owners}
+        for name, line in sorted(entries.items()):
+            with self.subTest(module=name):
+                got = words(line)
+                borrowed = [f"{'/'.join(owners)}: {' '.join(tail)!r}" for owners, tail in foreign_tails(name)
+                            if contains_run(got, tail)]
+                self.assertEqual(borrowed, [], f"{name}'s entry carries sentences other entries own")
+                if name in described:
+                    cap = word_cap(name)
+                    self.assertLessEqual(len(got), cap,
+                                         f"{name}'s entry has {len(got)} words; its own old sentences "
+                                         f"allow {cap:.0f}")
+
     def test_intro_and_fail_open_keep_their_text(self):
         """The intro keeps the old opening sentences (standard library, prologue, never
         CLAUDE_PLUGIN_ROOT); the closing `Fail open: ...` sentences are a paragraph of their own in
@@ -580,6 +638,8 @@ class LibEntries(unittest.TestCase):
         self.assertEqual(len(intro), 1, f"want one line starting {INTRO_START!r}")
         for piece in owned_pieces("intro"):
             self.assert_piece_kept(piece, {"intro": intro[0]}, "the intro paragraph")
+        self.assertLessEqual(len(words(intro[0])), word_cap("intro"),
+                             "the intro paragraph carries more than the old opening sentences")
         start, end = section(self.lines, "## Layout", 2)
         mstart, mend = section(self.lines, HEADING, 6)
         fenced = fenced_ranges(self.lines, start, end)
@@ -590,6 +650,8 @@ class LibEntries(unittest.TestCase):
         self.assertFalse(self.lines[fail_open[0]].startswith(INTRO_START))
         for piece in owned_pieces("failopen"):
             self.assert_piece_kept(piece, {"failopen": self.lines[fail_open[0]]}, "the Fail open paragraph")
+        self.assertLessEqual(len(words(self.lines[fail_open[0]])), word_cap("failopen"),
+                             "the Fail open paragraph carries more than the old Fail open sentences")
 
     def test_no_layout_prose_outside_the_entries_names_a_module(self):
         """The module text lives only in the entries: no other prose line of ## Layout (the code block
@@ -611,9 +673,12 @@ class LibEntries(unittest.TestCase):
                                         f"{ln[:120]!r}")
 
     def test_new_modules_name_what_they_hold_and_who_imports_them(self):
-        """A module the old paragraph never described (cost.py, repo.py, transcripts.py) gets an entry
-        naming something it holds (a backticked public name parsed from the module) and, when any
-        plugin file imports it, one of those importers."""
+        """A module the old paragraph never described (cost.py, repo.py, transcripts.py) gets one
+        short line (at most FRESH_MAX_WORDS words) from its module docstring: it names something
+        the module holds (a backticked public name parsed from the module) and no backticked public
+        name of another such module, says what it holds in the docstring's words (at least
+        DOC_WORDS words of the docstring's first paragraph outside the backticked names and the
+        importers), and, when any plugin file imports it, names one of those importers."""
         entries = self.entries()
         described = {o for owners, _ in OLD_PIECES for o in owners}
         fresh = [m for m in lib_modules() if m not in described]
@@ -622,15 +687,28 @@ class LibEntries(unittest.TestCase):
             with self.subTest(module=name):
                 self.assertIn(name, entries, f"no entry for {name}")
                 line = entries[name]
+                self.assertLessEqual(len(words(line)), FRESH_MAX_WORDS, f"{name}'s entry is not one short line")
                 names = public_names(LIB_PKG / name)
                 self.assertTrue(names, f"{name} has no public names to describe it by")
                 held = [n for n in names if re.search(r"`%s[`(.]" % re.escape(n), line)]
                 self.assertTrue(held, f"{name}'s entry names none of {names} (backticked)")
+                quoted = backticked(line)
+                others = sorted({n for m in fresh if m != name for n in public_names(LIB_PKG / m)
+                                 if n not in names and any(re.match(r"%s(\(|$)" % re.escape(n), q) for q in quoted)})
+                self.assertEqual(others, [], f"{name}'s entry names what other modules hold")
                 users = importers(name[:-3])
                 if users:
                     hit = [u for u in users
                            if re.search(r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])" % re.escape(u), line)]
                     self.assertTrue(hit, f"{name}'s entry names none of its importers {users}")
+                prose = re.sub(r"`[^`]*`", " ", line.split(":", 1)[1])
+                for u in users:
+                    prose = re.sub(r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])" % re.escape(u), " ", prose)
+                doc = {w.lower() for w in words(docstring_head(LIB_PKG / name)) if len(w) >= 5}
+                shared = sorted({w.lower() for w in words(prose)} & doc - {"harness", name[:-3]})
+                self.assertGreaterEqual(len(shared), DOC_WORDS,
+                                        f"{name}'s entry does not say what the module holds in its "
+                                        f"docstring's words (shares only {shared})")
 
     def test_intro_and_layout_line_name_no_module(self):
         modules = lib_modules()
