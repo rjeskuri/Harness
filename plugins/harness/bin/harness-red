@@ -45,13 +45,12 @@ try:
     from harness_lib.paths import adopt_old_state, canonical_path, repo_key
     from harness_lib.repo import NotARepository, RepoError, repo_facts
     from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
+    from harness_lib.settings import DEFAULT_TEST_PATTERNS as TEST_PATTERNS  # also read by tests/test_red.py
     from harness_lib.cli import Parser, Problem, run_main  # Problem also caught by tests/test_red.py
     from harness_lib.text import last_line, write_json
 except Exception as exc:  # one line, exit 1, like the __main__ wrapper below
     sys.exit(f"harness-red: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
-TEST_PATTERNS = ("tests/**,test/**,**/test_*.py,**/*_test.py,**/conftest.py,**/*_test.js,**/*.test.js,"
-                 "**/*.test.ts,**/*_test.ts,spec/**")
 SOURCE_EXEMPT = ("docs/**,**/*.md,.claude/**,.github/**,.githooks/**,**/*.toml,**/*.cfg,**/*.ini,**/*.json,"
                  "**/*.yaml,**/*.yml,**/*.txt,**/*.lock,.gitignore,.worktreeinclude,LICENSE*")
 DEFAULT_TIMEOUT = 300.0
