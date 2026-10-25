@@ -7,6 +7,9 @@ Runs in a ticket worktree (the cwd, or --worktree PATH). The record is written t
 {"branch", "base_sha", "test_files", "run_files", "test_hash", "cmd", "exit", "kind", "tail", "at"}.
 `test_files` (hashed into `test_hash`) is every changed file matching HARNESS_TEST_PATTERNS, fixtures and
 conftest.py included; `run_files`, the ones the command runs, are those whose basename names a test module.
+The files' bytes go to the side file red-files/<branch-slug>.json beside red/, so the record stays current
+across a merge of main that only brings in main's edits to those files (harness_lib/redproof.py); a test
+change of the branch's own makes it stale.
 
 Usage:
     harness-red check [--base origin/main]   # run the branch's changed tests; red exits 0, anything else 1
@@ -28,7 +31,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fnmatch
-import hashlib
 import json
 import os
 import re
@@ -43,6 +45,7 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, repo_key
+    from harness_lib.redproof import read_files, record_current, save_red_files, tests_hash
     from harness_lib.repo import NotARepository, RepoError, repo_facts
     from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
     from harness_lib.settings import DEFAULT_TEST_PATTERNS as TEST_PATTERNS  # also read by tests/test_red.py
@@ -211,21 +214,9 @@ def runnable(files):
     return run
 
 
-def test_hash(root, files):
-    """sha256 over, for each file in sorted path order, the path, a newline and its bytes. Raises OSError."""
-    h = hashlib.sha256()
-    for f in sorted(files):
-        h.update(f.encode("utf-8", "surrogateescape") + b"\n")
-        with open(os.path.join(root, f), "rb") as fh:
-            h.update(fh.read())
-    return h.hexdigest()
-
-
-def current(root, record):
-    try:
-        return test_hash(root, record["test_files"]) == record.get("test_hash")
-    except OSError:
-        return False
+def current(repo, record):
+    """The files hash to test_hash, or are the red-time files with main's merged changes (redproof.py)."""
+    return record_current(repo.top, record, repo.record_path)
 
 
 # --------------------------------------------------------------- records
@@ -370,7 +361,8 @@ def cmd_check(repo, args):
         raise Problem(f"Source already changed before the red run: {', '.join(sources)}. "
                       "Revert them or move them to the coder step.")
     run_files = runnable(tests)
-    digest = test_hash(repo.top, tests)
+    contents = read_files(repo.top, tests)         # the bytes the run proves, hashed and kept beside the record
+    digest = tests_hash(contents)
     cmd, code, output, timed_out = run_tests(repo, run_files, repo.top)
     if timed_out:
         raise Problem(f"{cmd} timed out after {timed_out:g}s and was stopped; no red run recorded. "
@@ -390,6 +382,7 @@ def cmd_check(repo, args):
     record = {"branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
               "test_hash": digest, "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),
               "at": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
+    save_red_files(repo.record_path, contents)       # first: a record never names files the side file lacks
     write_json(repo.record_path, record, prefix=".red-")
     if args.json:
         print(json.dumps(record, indent=2, ensure_ascii=False))
@@ -410,7 +403,7 @@ def cmd_status(repo, args):
         print_no_tests(note, args.json)
         return 0
     record = load_record(repo)
-    fresh = current(repo.top, record)
+    fresh = current(repo, record)
     if args.json:
         print(json.dumps(dict(record, current=fresh), indent=2, ensure_ascii=False))
         return 0
