@@ -4,23 +4,45 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      force:
+        description: Deploy even while an open deploy-frozen issue freezes deploys
+        type: boolean
+        default: false
 
 concurrency:
-  group: deploy-${{ github.ref }}
+  group: deploy-main
   cancel-in-progress: false
 
+# contents: the guard pushes its revert to main; issues: incidents, degraded issues, the ticket's question;
+# pull-requests: the guard reads the merge's pull request and the ticket it closes.
 permissions:
-  contents: read
+  contents: write
+  issues: write
+  pull-requests: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # worst case 80 min: deploy.sh (DEPLOY_GUARD_DEPLOY_TIMEOUT, 30 min) and smoke.sh (DEPLOY_GUARD_SMOKE_TIMEOUT,
+    # 10 min), then both again after a revert; plus 10 min for git and gh. Raise it with either timeout.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
         run: |
-          if [ -f scripts/deploy.sh ]; then
+          if [ -f scripts/deploy_guard.py ]; then
+            if [ "$FORCE" = "true" ]; then
+              python3 scripts/deploy_guard.py run --sha "$GITHUB_SHA" --force
+            else
+              python3 scripts/deploy_guard.py run --sha "$GITHUB_SHA"
+            fi
+          elif [ -f scripts/deploy.sh ]; then
             chmod +x scripts/deploy.sh
             scripts/deploy.sh
           else
