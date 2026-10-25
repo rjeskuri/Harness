@@ -122,6 +122,19 @@ def setUpModule() -> None:
         (base / folder).mkdir()
         for name in names:
             os.symlink(fake, base / folder / name)
+    # A git that works except for `rev-parse --git-common-dir`, so the main checkout
+    # cannot be found while the repository itself still answers.
+    real_git = shutil.which("git", path=SYSTEM_PATH) or "/usr/bin/git"
+    (base / "bin-git-no-common").mkdir()
+    no_common = base / "bin-git-no-common" / "git"
+    no_common.write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do\n'
+        '  if [ "$a" = "--git-common-dir" ]; then echo "fatal: simulated" >&2; exit 128; fi\n'
+        "done\n"
+        f'exec {shlex.quote(real_git)} "$@"\n'
+    )
+    no_common.chmod(0o755)
     template = base / "template"
     template.mkdir()
     env = dict(GIT_IDENTITY, HOME=str(base), PATH=SYSTEM_PATH)
@@ -1493,6 +1506,95 @@ class VerifyOnStopTests(HookTestCase):
         self.change("docs/notes.txt")
         self.assertEqual(self.stop(cmd), self.passed())
         self.assertTrue(self.marker.exists())
+
+    def test_a_staged_rename_counts_its_source(self):
+        # git status lists only the new name of a rename; the old one counts too.
+        cmd = self.touch(self.marker)
+        cases = [
+            # A test fixture moved to an exempt name: a test changed, so it runs.
+            ("tests/fixtures/expected.json", "data/expected.json", None),
+            # Source renamed to an exempt name: source changed, so it runs.
+            ("app.py", "notes.txt", None),
+            # Between two exempt paths: still docs only, both names counted.
+            ("docs/a.md", "docs/b.md", 2),
+        ]
+        for i, (old, new, n) in enumerate(cases):
+            with self.subTest(old=old, new=new):
+                self.baseline(f"rename-{i}")
+                if old != "app.py":
+                    self.write(self.repo / old, "kept\n")
+                    self.baseline()
+                self.assertIsNone(self.stop(cmd))  # the first stop records the tree
+                (self.repo / new).parent.mkdir(parents=True, exist_ok=True)
+                self.git(self.repo, "mv", old, new)
+                result = self.stop(cmd)
+                if n is None:
+                    self.assertEqual(result, self.passed())
+                    self.assertTrue(self.marker.exists())
+                else:
+                    self.assertEqual(result, self.skipped(n))
+                    self.assertFalse(self.marker.exists())
+
+    def test_an_unchanged_docs_only_turn_is_silent_after_the_first_skip(self):
+        cmd = self.touch(self.marker)
+        self.baseline()
+        self.change("docs/x.md")
+        self.assertEqual(self.stop(cmd), self.skipped(1))
+        # The next turn changes nothing (a question and its answer): no output at all.
+        self.assertIsNone(self.stop(cmd))
+        self.assertIsNone(self.stop(cmd))
+        # New content in the same file is a change: the line again, then silence.
+        self.change("docs/x.md")
+        self.assertEqual(self.stop(cmd), self.skipped(1))
+        self.assertIsNone(self.stop(cmd))
+        # Another doc, through the shell this time.
+        self.change("docs/y.md", record=False)
+        self.assertEqual(self.stop(cmd), self.skipped(2))
+        self.assertIsNone(self.stop(cmd))
+        self.assertFalse(self.marker.exists())
+        # Nothing was recorded as green along the way: a source change runs it.
+        self.change("app.py")
+        self.assertEqual(self.stop(cmd), self.passed())
+        self.assertTrue(self.marker.exists())
+
+    def test_patterns_fall_back_when_the_main_checkout_cannot_be_found(self):
+        # git answers everything except --git-common-dir, so main_checkout fails while the
+        # repo works: the project's settings.json cannot be read, and the environment and
+        # then the defaults decide. The hook still exits 0 with nothing on stderr.
+        cmd = self.touch(self.marker)
+        own = {"env": {"HARNESS_SOURCE_EXEMPT": "assets/**,**/*.md"}}
+        no_common = str(_SHARED["base"] / "bin-git-no-common") + ":" + SYSTEM_PATH
+        # (environment, changed paths, files when skipped or None when it runs)
+        cases = [
+            ({}, ("docs/notes.txt",), 1),  # the default exempts it, the project would not
+            ({}, ("assets/logo.svg",), None),  # the project exempts it, the default does not
+            ({"HARNESS_SOURCE_EXEMPT": "assets/**"}, ("assets/logo.svg",), 1),
+            ({"HARNESS_SOURCE_EXEMPT": "assets/**"}, ("docs/notes.txt",), None),
+        ]
+        payload = {
+            "session_id": "sess-1",
+            "transcript_path": "/dev/null",
+            "permission_mode": "default",
+            "hook_event_name": "Stop",
+            "stop_hook_active": False,
+        }
+        for i, (env, rels, n) in enumerate(cases):
+            with self.subTest(env=env, rels=rels):
+                self.baseline(f"no-main-{i}", settings=own)
+                self.change(*rels)
+                r = self.run_hook(
+                    "verify_on_stop.py",
+                    dict(payload, cwd=str(self.repo)),
+                    dict(env, PATH=no_common, CLAUDE_VERIFY_CMD=cmd),
+                )
+                self.assertEqual((r.returncode, r.stderr), (0, ""))
+                result = json.loads(r.stdout) if r.stdout.strip() else None
+                if n is None:
+                    self.assertEqual(result, self.passed())
+                    self.assertTrue(self.marker.exists())
+                else:
+                    self.assertEqual(result, self.skipped(n))
+                    self.assertFalse(self.marker.exists())
 
     def test_empty_dirty_set_runs_the_command_as_today(self):
         self.baseline()

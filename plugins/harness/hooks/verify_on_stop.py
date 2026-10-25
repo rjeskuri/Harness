@@ -26,18 +26,21 @@ When it runs
   checked twice.
 
   A turn that changed only docs and config skips the run: when every path in the dirty
-  list and in git status, made repo-relative, matches HARNESS_SOURCE_EXEMPT, none matches
-  HARNESS_TEST_PATTERNS and none is test configuration (harness_lib.settings.TEST_CONFIG:
-  pyproject.toml, package.json, .claude/settings.json and the like), it says
-  "only docs and config changed (<n> files); verify skipped." and records nothing as green
-  or failed, so the dirty list stands for the next stop. The two keys come from the
+  list and in git status (a rename's or copy's source included), made repo-relative,
+  matches HARNESS_SOURCE_EXEMPT, none matches HARNESS_TEST_PATTERNS and none is test
+  configuration (harness_lib.settings.TEST_CONFIG: pyproject.toml, package.json,
+  .claude/settings.json and the like), it says "only docs and config changed (<n> files);
+  verify skipped." and records nothing as green or failed, so the dirty list stands for
+  the next stop. It keeps the fingerprint it skipped, so a fresh stop with the same one
+  says nothing. The two keys come from the
   environment, then the main checkout's tracked .claude/settings.json (never
   settings.local.json, never a worktree's copy), as tests_first reads them, then the
   defaults. A path outside the repo, or no path at all, never skips.
 
 What it does
   Runs the command through the shell from the repo root, with CLAUDE_VERIFY_TIMEOUT
-  seconds (default 300, capped at 400 to stay inside the hook's own 420 s budget).
+  seconds (default 300, capped at 400 less the time this stop already spent, to stay
+  inside the hook's own 420 s budget).
   Pass: records the fingerprint, clears the dirty list, and says so in one line.
   Fail: blocks with the last 60 non-empty lines of output, at most 2 times in a row;
   after that it lets Claude stop and warns you instead.
@@ -56,6 +59,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
@@ -167,6 +171,22 @@ def fingerprint(git_root: Path | None, files: list[Path]) -> str:
     return h.hexdigest()
 
 
+def rename_sources(git_root: Path, out: bytes) -> list[Path]:
+    """The source of each rename or copy in `git status --porcelain=v1 -z` output: the
+    field after an entry with R or C in XY, which status_paths skips."""
+    sources = []
+    fields = out.split(b"\0")
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) >= 4 and (b"R" in entry[:2] or b"C" in entry[:2]):
+            if i < len(fields) and fields[i]:
+                sources.append(git_root / os.fsdecode(fields[i]))
+            i += 1
+    return sources
+
+
 def relative(git_root: Path, path: Path) -> str | None:
     """`path` relative to `git_root` with / separators, through either spelling; None
     when it is outside."""
@@ -254,6 +274,7 @@ def run_command(cmd: str, root: Path, timeout: float) -> tuple[int, str]:
 
 
 def main() -> int:
+    started = time.monotonic()
     data = read_input()
     cwd = Path(hook_cwd(data))
     git_root = repo_root(cwd)
@@ -310,13 +331,19 @@ def main() -> int:
         save()
 
     changed = sorted(set(session.dirty_files()) | set(listed))
-    n = docs_only(git_root, changed)
+    fp = fingerprint(git_root, changed)
+    # A rename's source counts for the skip, though only its new name is in `listed`.
+    moved = rename_sources(git_root, status) if git_root is not None and status else []
+    n = docs_only(git_root, sorted(set(changed) | set(moved)))
     if n:  # nothing recorded as green or attempted: the dirty list waits for a real run
+        if fresh and fp == state.get("skipped"):
+            save()  # said already for this fingerprint
+            return 0
+        state["skipped"] = fp
         save()
         emit({"systemMessage": f"verify_on_stop: only docs and config changed ({n} files); verify skipped."})
         return 0
 
-    fp = fingerprint(git_root, changed)
     if fp == state.get("green"):
         save()
         return 0
@@ -334,7 +361,9 @@ def main() -> int:
         state.update(attempted=fp, attempted_cmd=cmd)
         save()
 
-    timeout = verify_timeout(file_env)
+    # The cap counts the time this stop already spent (git, the pattern lookup), so the
+    # whole hook stays inside the 420 s hooks.json gives it.
+    timeout = min(verify_timeout(file_env), max(1.0, float(int(MAX_TIMEOUT - (time.monotonic() - started)))))
     try:
         code, output = run_command(cmd, root, timeout)
     except subprocess.TimeoutExpired:
