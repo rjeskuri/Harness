@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1655,6 +1656,571 @@ class TestsFirstTests(GuardTestCase):
         ):
             with self.subTest(stdin=stdin):
                 self.assertEqual(self.run_hook("tests_first.py", stdin).stdout, "")
+
+
+# ---------------------------------------------------------------- a merge of main (#231)
+
+RED_TOOL = HOOKS.parent / "bin" / "harness-red"
+# The test command harness-red runs: it fails as an assertion would, whatever the files.
+FAILING_RUN = "import sys; print('AssertionError: login is not built yet'); sys.exit(1)"
+# Ten small tests, three lines apart, so edits to the first, the middle and the last
+# are separate hunks that git merges cleanly.
+BASE_TESTS = "\n".join(
+    f"def test_case_{i}():\n    assert {i} + {i} == {2 * i}\n" for i in range(10)
+)
+MERGE_TEST_FILES = ("tests/test_app.py", "tests/test_util.py")
+# The branch's own test change, in the middle of each file.
+MAIN_LINE_5 = "    assert 5 + 5 == 10\n"
+BRANCH_LINE_5 = "    assert login() == 'ok'\n"
+
+
+MAIN_LINE_5_REWRITTEN = "    assert 5 * 2 == 10\n"  # main's conflicting rewrite
+RED_KINDS = ("assertion", "import", "error")
+
+
+def replaced(text: str, old: str, new: str) -> str:
+    """`text` with the one occurrence of `old` replaced; fails loudly when it is absent."""
+    assert text.count(old) == 1, (old, text)
+    return text.replace(old, new)
+
+
+def swapped(text: str, a: str, b: str) -> str:
+    """`text` with the one occurrence each of `a` and `b` swapped: same lines, new order."""
+    marker = "\0swap\0"
+    return replaced(replaced(replaced(text, a, marker), b, a), marker, b)
+
+
+def case_line(i: int) -> str:
+    """The assert line of test_case_i as main first wrote it."""
+    return f"    assert {i} + {i} == {2 * i}\n"
+
+
+def moved_to_end(text: str, block: str) -> str:
+    """`text` with `block` (a test and its blank separator) moved after the last test:
+    the same lines, in another order."""
+    return replaced(text, block + "\n", "") + "\n" + block
+
+
+def line_moved_into(text: str, line: str, anchor: str) -> str:
+    """`text` with `line` taken out of its test and put after `anchor`, in another one."""
+    return replaced(replaced(text, line, ""), anchor, anchor + line)
+
+
+# Repeated context: ten identical top-level tests with PEP 8's two blank lines between
+# them, so every gap between tests has the same surroundings, however many lines of
+# context a diff shows; only the position tells the gaps apart. The branch's own change
+# is a whole new test inserted into gap 5.
+SAME_TEST = "def test_case():\n    assert ok()"
+LOGIN_TEST = "def test_login():\n    assert login() == 'ok'"
+MAIN_LOGIN_TEST = "def test_login_main():\n    assert login() is not None"
+
+
+def pep8(tests) -> str:
+    return "\n\n\n".join(tests) + "\n"
+
+
+def pep8_tests(text: str) -> list:
+    assert text.endswith("\n") and not text.endswith("\n\n"), text
+    return text[:-1].split("\n\n\n")
+
+
+def put_at(text: str, gap: int, test: str) -> str:
+    """`text` with `test` inserted as the gap-th top-level item (0: first)."""
+    tests = pep8_tests(text)
+    tests.insert(gap, test)
+    return pep8(tests)
+
+
+def moved_to_gap(text: str, test: str, gap: int) -> str:
+    """`text` with its one `test` moved, unchanged, to another gap."""
+    tests = pep8_tests(text)
+    assert tests.count(test) == 1, text
+    tests.remove(test)
+    tests.insert(gap, test)
+    return pep8(tests)
+
+
+def with_test(text: str, index: int, test: str) -> str:
+    """`text` with its index-th top-level item replaced by `test`."""
+    tests = pep8_tests(text)
+    tests[index] = test
+    return pep8(tests)
+
+
+# A unique first item (the imports) and last test bound the repeated run: main's clean
+# edits go there, where git's alignment is unambiguous (an edit inside the identical
+# run can be aligned to another copy, and the merge then moves the branch's test).
+# Items: 0 the imports, 1-10 the repeated tests, 11 the last test; the branch's test
+# goes in as item 6, after the fifth repeated test.
+REPEATED_TESTS = pep8(["import pytest", *[SAME_TEST] * 10, "def test_last():\n    assert last()"])
+LOGIN_GAP = 6
+
+
+def content_hash(root: Path, files) -> str:
+    """The red record's test_hash, from first principles: sha256 over each file's path,
+    a newline and its bytes, in sorted path order."""
+    h = hashlib.sha256()
+    for name in sorted(files):
+        h.update(name.encode() + b"\n" + (root / name).read_bytes())
+    return h.hexdigest()
+
+
+class TestsFirstMainMergeTests(GuardTestCase):
+    """A red record survives a merge of main that edits the branch's test files in other
+    hunks; a test change the branch makes itself (an edit, a commit, or a merge
+    resolution of its own test lines) still invalidates it.
+
+    Each scenario is real git: main with two test files, the ticket branch in a linked
+    worktree, the test-author's commit editing the middle of both, the red record written
+    by harness-red check itself, the coder's source commit, then commits on main and
+    `git merge main` in the worktree."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.env["HARNESS_TEST_CMD"] = (
+            shlex.quote(sys.executable) + " -c " + shlex.quote(FAILING_RUN) + " {files}"
+        )
+
+    # ---- the scenario
+
+    def commit_all(self, root: Path, message: str) -> None:
+        self.git(root, "add", "-A")
+        self.git(root, "commit", "-q", "-m", message)
+
+    def harness_red(self, wt: Path, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(RED_TOOL), *args],
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=120,
+        )
+
+    def ticket(self, name: str, base: str = BASE_TESTS, author=None) -> tuple[Path, Path]:
+        """(main checkout, ticket worktree) after the red run and the coder's commit.
+        Main's test files hold `base`; the test-author applies `author` to each (default:
+        test_case_5's assert becomes BRANCH_LINE_5)."""
+        if author is None:
+            author = lambda t: replaced(t, MAIN_LINE_5, BRANCH_LINE_5)  # noqa: E731
+        repo = self.make_repo(name)
+        for rel in MERGE_TEST_FILES:
+            self.write(repo / rel, base)
+        self.commit_all(repo, "the tests so far")
+        key = hashlib.sha1(str(repo.resolve()).encode()).hexdigest()[:12]
+        ticket = {"number": 12, "title": "Fix login", "type": "task", "flags": []}
+        ticket["labels"] = ["task", "status:in-progress"]
+        self.write(
+            self.home / ".claude/harness/repos" / key / "tickets/12.json",
+            json.dumps(ticket),
+        )
+        wt = self.worktree(repo, name=f"{name}-wt")
+        for rel in MERGE_TEST_FILES:  # the test-author
+            path = wt / rel
+            self.write(path, author(path.read_text()))
+        self.commit_all(wt, "tests for login")
+        r = self.harness_red(wt, "check")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("red (assertion)", r.stdout)
+        self.assertIsNone(self.edit(wt, "src/app.py"))  # the record is current
+        self.write(wt / "src/app.py", "def login():\n    return 'ok'\n")  # the coder
+        self.commit_all(wt, "login")
+        self.assertIsNone(self.edit(wt, "src/app.py", "harness:coder"))
+        return repo, wt
+
+    def on_main(self, repo: Path, changes: dict, message: str = "main moves on") -> None:
+        """Commit on main: each path gets a function of its old text (None when it is
+        new) or a literal text."""
+        for rel, change in changes.items():
+            path = repo / rel
+            old = path.read_text() if path.exists() else None
+            self.write(path, change(old) if callable(change) else change)
+        self.commit_all(repo, message)
+
+    def merge_main(self, wt: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(wt), "merge", "--no-edit", "main"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+
+    def merge_cleanly(self, wt: Path) -> None:
+        r = self.merge_main(wt)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        parents = self.git(wt, "rev-list", "--parents", "-n", "1", "HEAD").split()
+        self.assertEqual(len(parents), 3, "a merge commit, not a fast-forward")
+
+    def edit(self, wt: Path, rel: str, agent=None):
+        tool_input = {"file_path": str(wt / rel), "old_string": "a", "new_string": "b"}
+        payload = self.payload("Edit", tool_input, wt, agent)
+        return self.decision(self.run_hook("tests_first.py", payload))
+
+    def bash(self, wt: Path, command: str, agent=None):
+        payload = self.payload("Bash", {"command": command}, wt, agent)
+        return self.decision(self.run_hook("tests_first.py", payload))
+
+    def assertSourceAllowed(self, wt: Path) -> None:
+        for agent in (None, "harness:coder"):
+            with self.subTest(agent=agent):
+                self.assertIsNone(self.edit(wt, "src/app.py", agent))
+                self.assertIsNone(self.edit(wt, "src/new_module.py", agent))
+        self.assertIsNone(self.bash(wt, "printf '\\n' >> src/app.py", "harness:coder"))
+
+    def assertSourceDenied(self, wt: Path) -> None:
+        for agent in (None, "harness:coder"):
+            with self.subTest(agent=agent):
+                self.assertEqual(self.edit(wt, "src/app.py", agent), CHANGED)
+                self.assertEqual(self.edit(wt, "src/new_module.py", agent), CHANGED)
+        reason = self.bash(wt, "printf '\\n' >> src/app.py", "harness:coder")
+        self.assertIsNotNone(reason)
+        self.assertIn(CHANGED, reason)
+
+    def record_file(self, repo: Path) -> Path:
+        key = hashlib.sha1(str(repo.resolve()).encode()).hexdigest()[:12]
+        return self.home / ".claude/harness/repos" / key / "red/t-12-fix-login.json"
+
+    def status(self, wt: Path) -> str:
+        r = self.harness_red(wt, "status")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r.stdout.splitlines()[-1]
+
+    def assertRecordHolds(self, repo: Path, wt: Path, before: bytes) -> None:
+        """The proof is still good: the record is the one written before, or a new red
+        record whose test_hash is the files' content now; status says current either way."""
+        now = self.record_file(repo).read_bytes()
+        if now != before:
+            record = json.loads(now)
+            self.assertIn(record.get("kind"), RED_KINDS)
+            self.assertEqual(record["test_hash"], content_hash(wt, record["test_files"]))
+        self.assertEqual(self.status(wt), "current: yes")
+
+    # ---- DoD 1: main's edits to the branch's test files keep source edits allowed
+
+    def test_a_merge_of_main_editing_the_branchs_test_files_keeps_source_allowed(self):
+        variants = {
+            # main changes the first test of one file, in place
+            "first-test": {
+                "tests/test_app.py": lambda t: replaced(
+                    t, "assert 0 + 0 == 0", "assert 0 * 0 == 0"
+                ),
+            },
+            # main inserts lines above the branch's hunk, shifting it down
+            "inserted-above": {
+                "tests/test_app.py": lambda t: "import os\n\n\n" + t,
+            },
+            # main removes the last test of one, appends to the other, and brings in
+            # source and a test file the branch never touched
+            "both-files-and-more": {
+                "tests/test_app.py": lambda t: replaced(
+                    t, "\ndef test_case_9():\n    assert 9 + 9 == 18\n", ""
+                ),
+                "tests/test_util.py": lambda t: t
+                + "\n\ndef test_case_10():\n    assert 10 + 10 == 20\n",
+                "src/other.py": "VALUE = 1\n",
+                "tests/test_other.py": "def test_other():\n    pass\n",
+            },
+        }
+        for name, changes in variants.items():
+            with self.subTest(variant=name):
+                repo, wt = self.ticket(name)
+                self.on_main(repo, changes)
+                self.merge_cleanly(wt)
+                # the merge brought main's edits in and kept the branch's own line
+                for rel in changes:
+                    expected = (repo / rel).read_text()
+                    if rel in MERGE_TEST_FILES:
+                        expected = replaced(expected, MAIN_LINE_5, BRANCH_LINE_5)
+                    self.assertEqual((wt / rel).read_text(), expected)
+                self.assertSourceAllowed(wt)
+
+    def test_repeated_merges_of_main_keep_source_allowed(self):
+        repo, wt = self.ticket("repeated")
+        self.on_main(
+            repo,
+            {"tests/test_app.py": lambda t: replaced(t, "0 + 0 == 0", "0 - 0 == 0")},
+        )
+        self.merge_cleanly(wt)
+        self.assertSourceAllowed(wt)
+        self.on_main(
+            repo,
+            {"tests/test_util.py": lambda t: replaced(t, "9 + 9 == 18", "9 * 2 == 18")},
+            "main moves again",
+        )
+        self.merge_cleanly(wt)
+        self.assertSourceAllowed(wt)
+
+    def test_harness_red_check_after_a_merge_keeps_the_proof_and_never_a_stale_one(self):
+        repo, wt = self.ticket("recheck")
+        self.on_main(repo, {"tests/test_app.py": lambda t: "# main's header\n" + t})
+        self.merge_cleanly(wt)
+        before = self.record_file(repo).read_bytes()
+        r = self.harness_red(wt, "check")
+        self.assertNotIn("Traceback", r.stderr)
+        # either the record is untouched or it is a new red one for the files as they are
+        self.assertRecordHolds(repo, wt, before)
+        self.assertSourceAllowed(wt)
+        # then a real branch-side test change, one that keeps every line: test_case_5
+        # (the branch's own test) moves to the end of the file
+        proven = self.record_file(repo).read_bytes()
+        path = wt / "tests/test_app.py"
+        self.write(path, moved_to_end(path.read_text(), "def test_case_5():\n" + BRANCH_LINE_5))
+        self.commit_all(wt, "the branch moves its test")
+        self.assertSourceDenied(wt)
+        self.assertEqual(self.status(wt), "current: no")
+        r = self.harness_red(wt, "check")
+        self.assertNotIn("Traceback", r.stderr)
+        after = self.record_file(repo).read_bytes()
+        record = json.loads(after)
+        fresh = content_hash(wt, record["test_files"])
+        if r.returncode == 0:  # a new red record, for these files: never the stale one
+            self.assertNotEqual(after, proven)
+            self.assertIn(record.get("kind"), RED_KINDS)
+            self.assertEqual(record["test_hash"], fresh)
+            self.assertEqual(self.status(wt), "current: yes")
+            self.assertSourceAllowed(wt)
+        else:  # refused, in one line that says why
+            lines = r.stderr.strip().splitlines()
+            self.assertEqual(len(lines), 1, r.stderr)
+            self.assertTrue(lines[0].startswith("harness-red: "), r.stderr)
+            if after == proven:  # the stale record is still not proof
+                self.assertEqual(self.status(wt), "current: no")
+                self.assertSourceDenied(wt)
+            else:
+                self.assertEqual(record["test_hash"], fresh)
+
+    def test_main_moving_without_a_merge_keeps_source_allowed(self):
+        # a regression guard: it passes before #231 too
+        repo, wt = self.ticket("unmerged")
+        self.on_main(
+            repo,
+            {
+                "tests/test_app.py": lambda t: replaced(t, case_line(0), "    assert 0 * 0 == 0\n"),
+                "tests/test_util.py": lambda t: t + "\n\ndef test_case_10():\n    assert 1\n",
+                "src/other.py": "VALUE = 1\n",
+            },
+        )
+        self.assertSourceAllowed(wt)
+        self.assertEqual(self.status(wt), "current: yes")
+
+    # ---- DoD 2: the branch's own test edits after the red run still deny
+
+    def test_a_branch_test_edit_after_a_merge_of_main_denies_source(self):
+        own_test = "def test_case_5():\n" + BRANCH_LINE_5
+        cases = {
+            # the branch's own line, edited again
+            "own-line": lambda t: replaced(t, BRANCH_LINE_5, "    assert login() == 'hi'\n"),
+            # a line main brought in, edited by the branch
+            "mains-line": lambda t: replaced(t, "assert 0 * 0 == 0", "assert 0 ** 2 == 0"),
+            # a new test appended by the branch
+            "appended": lambda t: t + "\n\ndef test_more():\n    assert login()\n",
+            # the same lines in another order: the branch's own test moved below test_case_9
+            "own-test-moved": lambda t: moved_to_end(t, own_test),
+            # the same lines in another order: two existing tests swap their asserts
+            "asserts-swapped": lambda t: swapped(t, case_line(1), case_line(2)),
+            # the branch's line swapped with the next test's
+            "own-line-swapped": lambda t: swapped(t, BRANCH_LINE_5, case_line(6)),
+            # the branch's own line moved from test_case_5 into test_case_6
+            "own-line-into-6": lambda t: line_moved_into(t, BRANCH_LINE_5, case_line(6)),
+        }
+        repo, wt = self.ticket("branch-edits")
+        self.on_main(
+            repo,
+            {"tests/test_app.py": lambda t: replaced(t, "assert 0 + 0 == 0", "assert 0 * 0 == 0")},
+        )
+        self.merge_cleanly(wt)
+        self.assertSourceAllowed(wt)
+        merged = self.git(wt, "rev-parse", "HEAD")
+        path = wt / "tests/test_app.py"
+        for name, change in cases.items():
+            for committed in (False, True):
+                with self.subTest(case=name, committed=committed):
+                    self.write(path, change(path.read_text()))
+                    if committed:
+                        self.commit_all(wt, "the branch edits its tests")
+                    self.assertSourceDenied(wt)
+                    self.assertEqual(self.status(wt), "current: no")
+                    # undone, the record holds again
+                    if committed:
+                        self.git(wt, "reset", "-q", "--hard", merged)
+                    else:
+                        self.git(wt, "checkout", "--", "tests/test_app.py")
+                    self.assertSourceAllowed(wt)
+
+    def test_a_branch_commit_to_a_recorded_test_main_never_touched_denies_source(self):
+        repo, wt = self.ticket("untouched")
+        self.on_main(repo, {"tests/test_app.py": lambda t: "# main's header\n" + t})
+        self.merge_cleanly(wt)
+        self.assertSourceAllowed(wt)
+        path = wt / "tests/test_util.py"  # the other recorded file, which main never touched
+        self.write(path, replaced(path.read_text(), "1 + 1 == 2", "1 + 1 == 3"))
+        self.commit_all(wt, "the branch edits its other test file")
+        self.assertSourceDenied(wt)
+
+    # ---- DoD 3: a merge resolution that changes the branch's own test lines denies
+
+    def test_a_conflict_resolution_changing_the_branchs_test_lines_denies_source(self):
+        main_line = MAIN_LINE_5_REWRITTEN
+        resolutions = {
+            # a third value for the branch's line
+            "third-value": lambda t: replaced(t, main_line, "    assert login() == 'welcome'\n"),
+            # main's side: the branch's line is gone
+            "mains-side": lambda t: t,
+            # main's line in test_case_5, the branch's line verbatim but in test_case_8
+            "branch-line-into-8": lambda t: replaced(t, case_line(8), case_line(8) + BRANCH_LINE_5),
+            # main's line in test_case_5, the branch's line verbatim but first in test_case_0
+            "branch-line-into-0": lambda t: replaced(t, case_line(0), BRANCH_LINE_5 + case_line(0)),
+            # the branch's line kept in test_case_5, main's line moved to the end of the file
+            "mains-line-moved": lambda t: replaced(t, main_line, BRANCH_LINE_5)
+            + "\n\ndef test_case_5b():\n" + main_line,
+        }
+        repo, wt = self.ticket("conflict")
+        # first a clean merge: the record holds across it
+        self.on_main(repo, {"tests/test_app.py": lambda t: "# main's header\n" + t})
+        self.merge_cleanly(wt)
+        self.assertSourceAllowed(wt)
+        before = self.git(wt, "rev-parse", "HEAD")
+        # then main rewrites the branch's own line: a conflict
+        self.on_main(
+            repo,
+            {"tests/test_app.py": lambda t: replaced(t, MAIN_LINE_5, main_line)},
+            "main rewrites test_case_5",
+        )
+        theirs = (repo / "tests/test_app.py").read_text()
+        for name, resolve in resolutions.items():
+            with self.subTest(resolution=name):
+                r = self.merge_main(wt)
+                self.assertNotEqual(r.returncode, 0, "the merge must conflict")
+                self.write(wt / "tests/test_app.py", resolve(theirs))
+                self.git(wt, "add", "tests/test_app.py")
+                self.git(wt, "commit", "-q", "--no-edit")
+                self.assertEqual(len(self.git(wt, "rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+                self.assertSourceDenied(wt)
+                self.assertEqual(self.status(wt), "current: no")
+                self.git(wt, "reset", "-q", "--hard", before)
+
+    # ---- main's edits close to the branch's hunk (DoD 1)
+    # git conflicts on an edit to the line right next to the branch's change, so the
+    # closest clean edits are two lines away.
+
+    def test_a_merge_of_main_editing_close_to_the_branchs_hunk_keeps_source_allowed(self):
+        login_in = lambda t: put_at(t, LOGIN_GAP, LOGIN_TEST)  # noqa: E731
+        variants = (
+            # (name, main's base, the test-author's change, main's change)
+            (
+                "def-two-lines-after",
+                BASE_TESTS,
+                None,
+                lambda t: replaced(t, "def test_case_6():\n", "def test_case_6_renamed():\n"),
+            ),
+            (
+                "assert-two-lines-before",
+                BASE_TESTS,
+                None,
+                lambda t: replaced(t, case_line(4), "    assert 4 * 2 == 8\n"),
+            ),
+            (
+                "repeated-assert-after-the-gap",
+                REPEATED_TESTS,
+                login_in,
+                lambda t: with_test(t, LOGIN_GAP, "def test_case():\n    assert ok(5)"),
+            ),
+            (
+                "repeated-assert-before-the-gap",
+                REPEATED_TESTS,
+                login_in,
+                lambda t: with_test(t, LOGIN_GAP - 1, "def test_case():\n    assert ok(4)"),
+            ),
+        )
+        for name, base, author, change in variants:
+            with self.subTest(variant=name):
+                repo, wt = self.ticket(f"near-{name}", base, author)
+                self.on_main(repo, {"tests/test_app.py": change})
+                self.merge_cleanly(wt)
+                main_text = (repo / "tests/test_app.py").read_text()
+                expected = (author or (lambda t: replaced(t, MAIN_LINE_5, BRANCH_LINE_5)))(main_text)
+                self.assertEqual((wt / "tests/test_app.py").read_text(), expected)
+                self.assertSourceAllowed(wt)
+                self.assertEqual(self.status(wt), "current: yes")
+
+    # ---- repeated context: the branch's test, unchanged, in another gap
+
+    def repeated_ticket(self, name: str) -> tuple[Path, Path, str]:
+        """The repeated-context ticket after a clean merge of main (which edits the imports
+        and the last test, and appends one): (main checkout, worktree, the merge commit)."""
+        repo, wt = self.ticket(name, REPEATED_TESTS, lambda t: put_at(t, LOGIN_GAP, LOGIN_TEST))
+        self.on_main(
+            repo,
+            {
+                "tests/test_app.py": lambda t: pep8(
+                    ["import os\nimport pytest", *pep8_tests(t)[1:-1],
+                     "def test_last():\n    assert last(1)", "def test_more():\n    assert ok(1)"]
+                )
+            },
+        )
+        self.merge_cleanly(wt)
+        expected = put_at((repo / "tests/test_app.py").read_text(), LOGIN_GAP, LOGIN_TEST)
+        self.assertEqual((wt / "tests/test_app.py").read_text(), expected)
+        self.assertSourceAllowed(wt)
+        self.assertEqual(self.status(wt), "current: yes")
+        return repo, wt, self.git(wt, "rev-parse", "HEAD")
+
+    def test_a_merge_of_main_keeps_source_allowed_with_repeated_context(self):
+        repo, wt, _ = self.repeated_ticket("repeated-merge")
+        self.on_main(
+            repo,
+            {"tests/test_util.py": lambda t: with_test(t, -1, "def test_last():\n    assert last(2)")},
+            "main moves again",
+        )
+        self.merge_cleanly(wt)
+        self.assertSourceAllowed(wt)
+        self.assertEqual(self.status(wt), "current: yes")
+
+    def test_a_branch_moving_its_test_to_another_gap_denies_source(self):
+        repo, wt, merged = self.repeated_ticket("repeated-move")
+        path = wt / "tests/test_app.py"
+        for gap in (9, 3, 1, LOGIN_GAP + 1, LOGIN_GAP - 1):  # never its own gap
+            for committed in (False, True):
+                with self.subTest(gap=gap, committed=committed):
+                    self.write(path, moved_to_gap(path.read_text(), LOGIN_TEST, gap))
+                    if committed:
+                        self.commit_all(wt, "the branch moves its test")
+                    self.assertSourceDenied(wt)
+                    self.assertEqual(self.status(wt), "current: no")
+                    if committed:
+                        self.git(wt, "reset", "-q", "--hard", merged)
+                    else:
+                        self.git(wt, "checkout", "--", "tests/test_app.py")
+                    self.assertSourceAllowed(wt)
+
+    def test_a_conflict_resolution_moving_the_branchs_test_to_another_gap_denies_source(self):
+        repo, wt, before = self.repeated_ticket("repeated-conflict")
+        # main adds its own test in the gap where the branch put its own: a conflict
+        self.on_main(
+            repo,
+            {"tests/test_app.py": lambda t: put_at(t, LOGIN_GAP, MAIN_LOGIN_TEST)},
+            "main adds its own login test",
+        )
+        theirs = (repo / "tests/test_app.py").read_text()
+        without_mains = pep8([t for t in pep8_tests(theirs) if t != MAIN_LOGIN_TEST])
+        for name, resolved in (
+            # main's test in that gap, the branch's test unchanged but later
+            ("branch-test-later", put_at(theirs, 10, LOGIN_TEST)),
+            # main's test in that gap, the branch's test unchanged but earlier
+            ("branch-test-earlier", put_at(theirs, 3, LOGIN_TEST)),
+            # main's test dropped, the branch's test unchanged but one gap later
+            ("mains-dropped-branch-later", put_at(without_mains, LOGIN_GAP + 1, LOGIN_TEST)),
+        ):
+            with self.subTest(resolution=name):
+                r = self.merge_main(wt)
+                self.assertNotEqual(r.returncode, 0, "the merge must conflict")
+                self.write(wt / "tests/test_app.py", resolved)
+                self.git(wt, "add", "tests/test_app.py")
+                self.git(wt, "commit", "-q", "--no-edit")
+                self.assertEqual(len(self.git(wt, "rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+                self.assertSourceDenied(wt)
+                self.assertEqual(self.status(wt), "current: no")
+                self.git(wt, "reset", "-q", "--hard", before)
 
 
 if __name__ == "__main__":

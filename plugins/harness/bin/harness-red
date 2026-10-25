@@ -7,6 +7,8 @@ Runs in a ticket worktree (the cwd, or --worktree PATH). The record is written t
 {"branch", "base_sha", "test_files", "run_files", "test_hash", "cmd", "exit", "kind", "tail", "at"}.
 `test_files` (hashed into `test_hash`) is every changed file matching HARNESS_TEST_PATTERNS, fixtures and
 conftest.py included; `run_files`, the ones the command runs, are those whose basename names a test module.
+The record stays current across a merge of main that only brings in main's edits to those files
+(harness_lib/redproof.py); a test change of the branch's own makes it stale.
 
 Usage:
     harness-red check [--base origin/main]   # run the branch's changed tests; red exits 0, anything else 1
@@ -28,7 +30,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fnmatch
-import hashlib
 import json
 import os
 import re
@@ -43,6 +44,7 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, repo_key
+    from harness_lib.redproof import read_files, record_current, tests_hash
     from harness_lib.repo import NotARepository, RepoError, repo_facts
     from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
     from harness_lib.settings import DEFAULT_TEST_PATTERNS as TEST_PATTERNS  # also read by tests/test_red.py
@@ -214,19 +216,12 @@ def runnable(files):
 
 def test_hash(root, files):
     """sha256 over, for each file in sorted path order, the path, a newline and its bytes. Raises OSError."""
-    h = hashlib.sha256()
-    for f in sorted(files):
-        h.update(f.encode("utf-8", "surrogateescape") + b"\n")
-        with open(os.path.join(root, f), "rb") as fh:
-            h.update(fh.read())
-    return h.hexdigest()
+    return tests_hash(read_files(root, files))
 
 
 def current(root, record):
-    try:
-        return test_hash(root, record["test_files"]) == record.get("test_hash")
-    except OSError:
-        return False
+    """The files hash to test_hash, or are the red-time files with main's merged changes (redproof.py)."""
+    return record_current(root, record)
 
 
 # --------------------------------------------------------------- records

@@ -12,7 +12,8 @@ conftest.py, jest.config.*, vitest.config.*, package.json) count as tests. Then:
   - a source edit, by anyone, needs a red run: ~/.claude/harness/repos/<key>/red/<slug>.json
     written by harness-red check. A ticket flagged no-tests needs none; a refactor needs a
     record of any kind; any other ticket needs a red record (kind assertion, import or
-    error) whose test files still hash to its test_hash. Without a ticket cache
+    error) whose test files still hash to its test_hash, or are those files with main's
+    changes merged in since (harness_lib/redproof.py). Without a ticket cache
     (tickets/<N>.json) the ticket counts as a task without flags;
   - test and exempt edits pass.
 Outside a repo, on a detached HEAD or on any other branch it allows everything, except
@@ -53,7 +54,6 @@ Standard library only; works with the python3 from Xcode's command line tools (3
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import subprocess
@@ -66,6 +66,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.hookio import deny, edited_path, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
+    from harness_lib.redproof import record_current
     from harness_lib.repo import main_checkout
     from harness_lib.settings import DEFAULT_TEST_PATTERNS, glob_match, patterns, setting, settings_env
     from harness_lib.text import read_json
@@ -246,20 +247,6 @@ def role_refusal(role: str, kind: str, rel: str = "") -> str | None:
     return None
 
 
-def tests_hash(top: Path, files: list[str]) -> str | None:
-    """sha256 over each file's path, a newline and its bytes, in sorted path order; None
-    when a file cannot be read."""
-    h = hashlib.sha256()
-    for name in sorted(files):
-        try:
-            content = (top / name).read_bytes()
-        except OSError:
-            return None
-        h.update(name.encode("utf-8", "surrogateescape") + b"\n")
-        h.update(content)
-    return h.hexdigest()
-
-
 def source_refusal(facts: dict, number: str) -> str | None:
     """Why a source edit on ticket `number` must wait, or None when the proof is there."""
     repos = harness_home() / "repos"
@@ -299,11 +286,8 @@ def source_refusal(facts: dict, number: str) -> str | None:
             f"The red record for t/{number} does not say how the tests failed; run "
             "harness-red check again."
         )
-    files = record.get("test_files")
-    if not isinstance(files, list) or not files:
-        return CHANGED
-    current = tests_hash(facts["top"], [str(f) for f in files])
-    return None if current and current == record.get("test_hash") else CHANGED
+    # The files hash to test_hash, or are the red-time files with main's merged changes (redproof.py).
+    return None if record_current(str(facts["top"]), record, GIT_TIMEOUT) else CHANGED
 
 
 def facts_at(directory: str, cache: dict) -> dict | None:
