@@ -1,5 +1,5 @@
 {
-  "_comment": "Merged into ~/.claude/settings.json by scripts/install.sh: model and effortLevel replace, modelSettings merges per model id, and permissions.allow, permissions.ask, autoMode.environment and autoMode.allow gain each entry they lack (their own entries stay, in order; \"$defaults\" leads each autoMode list once); nothing else is touched (permissions.deny, permissions.defaultMode and autoMode.soft_deny included). Opus 5.5 at high is the default everywhere; Fable (risk:high reviews, size:L and risk:high tiers, escalations) runs at xhigh; Sonnet (size:S risk:low tickets) at high.",
+  "_comment": "Merged into ~/.claude/settings.json by scripts/install.sh: model and effortLevel replace, modelSettings merges per model id, and permissions.allow, permissions.ask, autoMode.environment and autoMode.allow gain each entry they lack (their own entries stay, in order; \"$defaults\" leads each autoMode list once); nothing else is touched (permissions.deny, permissions.defaultMode and autoMode.soft_deny included). Opus 5.5 at high is the default everywhere; size:L and risk:high tickets, risk:high reviews and escalations run Opus at xhigh, passed on the Agent call; Fable runs at xhigh when Ryan launches it or a setting names it; Sonnet (size:S risk:low tickets) at high.",
   "model": "opus",
   "effortLevel": "high",
   "modelSettings": {

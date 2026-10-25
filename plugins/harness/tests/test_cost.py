@@ -629,7 +629,7 @@ class CostCommand(CostBase):
                 answers = [self.attempt(n, stage, result) for stage, result in seq]
                 if n == 82:
                     self.assertEqual([a for (s, _), a in zip(seq, answers) if s == "breaker"],
-                                     ["retry", "escalate fable", "needs-input"])
+                                     ["retry", "escalate opus xhigh", "needs-input"])     # #239
                 self.assertEqual(tally(seq, answers), expected, "fixture: the attempt answers")
                 record = json.loads(self.cost(n, "--json"))
                 self.assertEqual(record["rounds"], expected)
