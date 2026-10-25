@@ -165,7 +165,7 @@ Ticket cache `tickets/<N>.json`:
  "body": "...", "sections": {"request": "...", "outline": "...", "definition_of_done": ["..."], "tests": ["..."], "context": "..."},
  "comments": [{"author": "rjeskuri", "created_at": "...", "body": "..."}],
  "fetched_at": "...", "branch": "t/12-slug" | null, "worktree": "/abs/path" | null, "started_at": "..." | null,
- "attempts": [{"stage": "tests|breaker|code|review|fix|ci", "tier": "opus", "result": "pass|fail", "at": "..."}]}
+ "attempts": [{"stage": "tests|breaker|code|review|fix|ci|verify", "tier": "opus", "effort": "low|medium|high|xhigh|max" | null, "result": "pass|fail", "at": "..."}]}
 ```
 
 Red record `red/<branch-slug>.json`:
