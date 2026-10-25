@@ -114,7 +114,7 @@ DEFAULT_CHECKED = "the diff against the ticket's definition of done"
 LAND_FIELDS = "isDraft,mergeable,headRefName,closingIssuesReferences,statusCheckRollup,title,url,state"
 RULING_LINE = re.compile(r"^[ \t]*(?:- )?(Ruling:.*\S)[ \t]*$", re.M)
 OUTSIDE_NOTE = "(outside the files this ticket changed)"
-AWAIT_FIELDS ="number,title,isDraft,createdAt,url,headRefName,closingIssuesReferences,statusCheckRollup"
+AWAIT_FIELDS = "number,title,isDraft,createdAt,url,headRefName,closingIssuesReferences,statusCheckRollup"
 
 
 def plural(n, word):
