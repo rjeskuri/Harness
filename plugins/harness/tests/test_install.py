@@ -27,6 +27,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 INSTALL = os.path.join(REPO, "scripts", "install.sh")
 SNIPPET = os.path.join(REPO, "user", "settings.snippet.json")
 DIGEST = os.path.join(REPO, "plugins", "harness", "bin", "harness-digest")
+TEMPLATE = os.path.join(REPO, "plugins", "harness", "templates", "settings.json")
 LABEL = "com.ryaneskuri.harness-digest"
 W = {}
 
@@ -63,6 +64,20 @@ SETTINGS = {
 }
 
 
+# The snippet's permission and autoMode lists, pinned independently of the installer: the nine harness rules of
+# the project template, the one ask rule, and the two autoMode lists led by the "$defaults" sentinel (the prose
+# entries are pinned by their opening words, from the ticket's Context).
+ASK_RULES = ["Bash(gh pr merge *)"]
+ENVIRONMENT_OPENINGS = ["Organization:", "Source control:", "CI/CD deploy targets:", "Review convention:",
+                        "Key internal services:", "Sensitive data locations & audiences:", "Sensitive remote targets:"]
+AUTO_ALLOW_OPENINGS = ["Landing a pull request with", "Writing or loading a com.ryaneskuri.harness-* LaunchAgent"]
+DEFAULTS = "$defaults"
+LISTS = (("permissions", "allow"), ("permissions", "ask"), ("autoMode", "environment"), ("autoMode", "allow"))
+# What a merge into a file holding none of the snippet's entries reports: every entry counted, "$defaults" not.
+ADDED_ALL = (f"added 9 permissions.allow, {len(ASK_RULES)} permissions.ask, "
+             f"{len(ENVIRONMENT_OPENINGS)} autoMode.environment, {len(AUTO_ALLOW_OPENINGS)} autoMode.allow")
+
+
 def write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
@@ -79,6 +94,35 @@ def executable(path, text):
 def read_json(path):
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def snippet_lists(test):
+    """The snippet's four lists, after checking they carry what the ticket says (so no merge test can pass on
+    an empty snippet list)."""
+    snippet = read_json(SNIPPET)
+    with open(TEMPLATE, encoding="utf-8") as fh:
+        nine = [r for r in json.load(fh)["permissions"]["allow"] if r.startswith("Bash(harness-")]
+    test.assertEqual(len(nine), 9)
+    test.assertIn("permissions", snippet, "the snippet carries no permissions")
+    test.assertIn("autoMode", snippet, "the snippet carries no autoMode")
+    perms, auto = snippet["permissions"], snippet["autoMode"]
+    test.assertEqual(sorted(perms.get("allow", [])), sorted(nine))
+    test.assertEqual(perms.get("ask"), ASK_RULES)
+    test.assertEqual(set(perms), {"allow", "ask"})
+    test.assertEqual(set(auto), {"environment", "allow"})
+    for key, openings in (("environment", ENVIRONMENT_OPENINGS), ("allow", AUTO_ALLOW_OPENINGS)):
+        entries = auto[key]
+        test.assertEqual(entries[0], DEFAULTS)
+        test.assertEqual(len(entries), 1 + len(openings), entries)
+        for entry, opening in zip(entries[1:], openings):
+            test.assertTrue(entry.startswith(opening), (entry, opening))
+        test.assertEqual(len(set(entries)), len(entries))
+    return {(obj, key): list(snippet[obj][key]) for obj, key in LISTS}
+
+
+def settings_line(stdout):
+    lines = [ln for ln in stdout.splitlines() if ln.startswith("~/.claude/settings.json:")]
+    return lines[0] if len(lines) == 1 else "\n".join(lines)
 
 
 def setUpModule():
@@ -147,17 +191,28 @@ class Install(unittest.TestCase):
                          {k: snippet[k] for k in ("model", "effortLevel", "modelSettings")})
         self.assertNotIn("_comment", merged)
         self.assertEqual(merged["enabledPlugins"], {"harness@ryan": True})          # companion gone
-        for k in ("theme", "permissions", "env"):                                     # the rest untouched
+        for k in ("theme", "env"):                                                    # the rest untouched
             self.assertEqual(merged[k], SETTINGS[k])
+        wanted = snippet_lists(self)                                                  # the lists gain the snippet's
+        self.assertEqual(merged["permissions"]["deny"], [])
+        self.assertEqual(merged["permissions"]["allow"][0], "Bash(ls:*)")
+        self.assertEqual(sorted(merged["permissions"]["allow"][1:]), sorted(wanted["permissions", "allow"]))
+        self.assertEqual(merged["permissions"]["ask"], wanted["permissions", "ask"])
+        self.assertEqual(merged["autoMode"], {"environment": wanted["autoMode", "environment"],
+                                              "allow": wanted["autoMode", "allow"]})
         with open(self.settings, encoding="utf-8") as fh:
             text = fh.read()
         self.assertEqual(text, json.dumps(merged, indent=2) + "\n")
         self.assertEqual(self.backups(), [f"settings.json.bak-{today}"])
         with open(f"{self.settings}.bak-{today}", encoding="utf-8") as fh:
             self.assertEqual(fh.read(), original)
-        self.assertIn(f'~/.claude/settings.json: set model, effortLevel; set modelSettings for '
-                      f'{", ".join(snippet["modelSettings"])}; removed enabledPlugins["companion@ryan"] '
-                      f'(backup settings.json.bak-', p.stdout)
+        line = settings_line(p.stdout)                                              # one line names every change
+        for piece in ("~/.claude/settings.json: set model, effortLevel; ",
+                      f'set modelSettings for {", ".join(snippet["modelSettings"])}',
+                      'removed enabledPlugins["companion@ryan"]', ADDED_ALL,
+                      "added 9 permissions.allow, 1 permissions.ask, 7 autoMode.environment, 2 autoMode.allow",
+                      f"(backup settings.json.bak-{today})"):
+            self.assertIn(piece, line)
 
         plist = os.path.join(self.home, "Library", "LaunchAgents", f"{LABEL}.plist")
         with open(plist, "rb") as fh:
@@ -182,10 +237,19 @@ class Install(unittest.TestCase):
         p = self.install()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         snippet = read_json(SNIPPET)
-        self.assertEqual(read_json(self.settings), {k: snippet[k] for k in ("model", "effortLevel", "modelSettings")})
+        wanted = snippet_lists(self)
+        expected = {k: snippet[k] for k in ("model", "effortLevel", "modelSettings")}
+        expected["permissions"] = {"allow": wanted["permissions", "allow"], "ask": wanted["permissions", "ask"]}
+        expected["autoMode"] = {"environment": wanted["autoMode", "environment"], "allow": wanted["autoMode", "allow"]}
+        self.assertEqual(read_json(self.settings), expected)
         self.assertEqual(self.backups(), [])
-        self.assertIn(f'~/.claude/settings.json: set model, effortLevel; set modelSettings for '
-                      f'{", ".join(snippet["modelSettings"])} (created)', p.stdout)
+        line = settings_line(p.stdout)
+        for piece in ("~/.claude/settings.json: set model, effortLevel; ",
+                      f'set modelSettings for {", ".join(snippet["modelSettings"])}',
+                      ADDED_ALL,
+                      "added 9 permissions.allow, 1 permissions.ask, 7 autoMode.environment, 2 autoMode.allow"):
+            self.assertIn(piece, line)
+        self.assertTrue(line.endswith(" (created)"), line)
 
     def test_model_settings_merge_per_model_id(self):
         snippet = read_json(SNIPPET)
@@ -202,7 +266,12 @@ class Install(unittest.TestCase):
         self.assertEqual(merged["modelSettings"], dict(snippet["modelSettings"],
                                                        **{"claude-haiku-4-5": {"autoCompactWindow": 200000}}))
         self.assertEqual(merged["theme"], "dark")
-        self.assertIn(f"~/.claude/settings.json: set modelSettings for {', '.join(ids[1:])} (backup ", p.stdout)
+        line = settings_line(p.stdout)                      # model and effortLevel already matched: not named
+        self.assertTrue(line.startswith("~/.claude/settings.json: "), line)
+        self.assertNotIn("set model,", line)
+        self.assertNotIn("effortLevel", line)
+        self.assertIn(f"set modelSettings for {', '.join(ids[1:])}", line)
+        self.assertIn(" (backup ", line)
         p = self.install()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("~/.claude/settings.json: already up to date", p.stdout)
@@ -228,6 +297,278 @@ class Install(unittest.TestCase):
         self.assertIn("could not load it", p.stderr)
         self.assertIn("the LaunchAgent is not loaded", p.stdout)
         self.assertIn("security add-generic-password", p.stdout)                  # the install carried on
+
+    # The permission and autoMode merge. Expected lists are derived from the test's own fixture and the
+    # snippet's entries (checked against the ticket by snippet_lists), never from the installer.
+
+    def reset(self, settings):
+        """A fresh settings file (an object is written as JSON with indent=4, a string as is) and no backups."""
+        for name in self.backups() if os.path.isdir(os.path.dirname(self.settings)) else []:
+            os.remove(os.path.join(os.path.dirname(self.settings), name))
+        write(self.settings, settings if isinstance(settings, str) else json.dumps(settings, indent=4))
+        with open(self.settings, "rb") as fh:
+            return fh.read()
+
+    def assert_merged(self, got, own, snippet_entries, sentinel):
+        """`got` is `own` with every snippet entry it lacked appended once; with `sentinel`, "$defaults" leads
+        it exactly once and the rest keeps `own`'s order."""
+        self.assertIsInstance(got, list)
+        if sentinel:
+            self.assertEqual(got[:1], [DEFAULTS], got)
+            self.assertEqual(got.count(DEFAULTS), 1, got)
+            own = [e for e in own if e != DEFAULTS]
+            got = got[1:]
+            snippet_entries = [e for e in snippet_entries if e != DEFAULTS]
+        self.assertEqual(got[:len(own)], own, "the target's own entries changed or moved")
+        self.assertEqual(sorted(got[len(own):]), sorted(e for e in snippet_entries if e not in own))
+        for entry in snippet_entries:
+            self.assertEqual(got.count(entry), 1, entry)
+
+    def test_permissions_and_auto_mode_are_merged_once(self):
+        wanted = snippet_lists(self)
+        allow, ask = wanted["permissions", "allow"], wanted["permissions", "ask"]
+        env, auto_allow = wanted["autoMode", "environment"], wanted["autoMode", "allow"]
+        own = {
+            ("permissions", "allow"): ["Bash(ls:*)", allow[3], "Read(~/notes/**)", allow[0], "Bash(make test)"],
+            ("permissions", "ask"): ["Bash(git push --force:*)"],
+            ("autoMode", "environment"): ["My own context line.", env[2], DEFAULTS, "Another of mine."],
+            ("autoMode", "allow"): [auto_allow[2], "Running make test is allowed."],
+        }
+        mine = {"theme": "light", "model": "opus",
+                "permissions": {"allow": own["permissions", "allow"], "ask": own["permissions", "ask"],
+                                "deny": ["Bash(rm -rf:*)", "Read(./.env)"]},
+                "autoMode": {"environment": own["autoMode", "environment"], "allow": own["autoMode", "allow"],
+                             "soft_deny": ["$defaults", "Never push to main."]}}
+        self.reset(mine)
+        p = self.install()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        merged = read_json(self.settings)
+        for obj, key in LISTS:
+            with self.subTest(list=f"{obj}.{key}"):
+                self.assert_merged(merged[obj][key], own[obj, key], wanted[obj, key], sentinel=obj == "autoMode")
+        self.assertEqual(merged["permissions"]["deny"], mine["permissions"]["deny"])
+        self.assertEqual(merged["autoMode"]["soft_deny"], mine["autoMode"]["soft_deny"])
+        self.assertEqual(merged["theme"], "light")
+        line = settings_line(p.stdout)
+        # The own lists already hold env[2] (and the sentinel) and auto_allow[2]: one fewer of each is added.
+        self.assertIn(f"added {len(allow) - 2} permissions.allow, {len(ask)} permissions.ask, "
+                      f"{len(ENVIRONMENT_OPENINGS) - 1} autoMode.environment, "
+                      f"{len(AUTO_ALLOW_OPENINGS) - 1} autoMode.allow", line)
+        self.assertIn("added 7 permissions.allow, 1 permissions.ask, 6 autoMode.environment, 1 autoMode.allow", line)
+        self.assertIn(" (backup settings.json.bak-", line)
+        self.assertEqual(len(self.backups()), 1)
+
+        # A second, different file in the same place: every list already holds some snippet entries, others none.
+        own = {
+            ("permissions", "allow"): list(reversed(allow[4:])) + ["Bash(npm test)"],
+            ("permissions", "ask"): ask + ["Bash(git reset --hard:*)"],
+            ("autoMode", "environment"): list(env[3:]),
+            ("autoMode", "allow"): [],
+        }
+        self.reset({"permissions": {"allow": own["permissions", "allow"], "ask": own["permissions", "ask"]},
+                    "autoMode": {"environment": own["autoMode", "environment"], "allow": []}})
+        p = self.install()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        merged = read_json(self.settings)
+        for obj, key in LISTS:
+            with self.subTest(list=f"{obj}.{key}", file="second"):
+                self.assert_merged(merged[obj][key], own[obj, key], wanted[obj, key], sentinel=obj == "autoMode")
+        line = settings_line(p.stdout)
+        self.assertIn(f"added {len(allow[:4])} permissions.allow, {len(env[1:3])} autoMode.environment, "
+                      f"{len(AUTO_ALLOW_OPENINGS)} autoMode.allow", line)               # env[3:] held already
+        self.assertIn("added 4 permissions.allow, 2 autoMode.environment, 2 autoMode.allow", line)
+        self.assertNotIn("permissions.ask", line)                                  # nothing added there
+
+    def test_defaults_sentinel_leads_each_auto_mode_list(self):
+        wanted = snippet_lists(self)
+        env, auto_allow = wanted["autoMode", "environment"], wanted["autoMode", "allow"]
+        cases = {
+            "autoMode absent": None,
+            "lists absent": {},
+            "absent from the lists": {"environment": ["Mine A."], "allow": ["Mine B.", "Mine C."]},
+            "mid-list": {"environment": ["Mine A.", DEFAULTS, "Mine C."], "allow": ["Mine B.", DEFAULTS]},
+            "last, and first": {"environment": [env[1], env[4], DEFAULTS], "allow": [DEFAULTS, "Mine B."]},
+            "twice": {"environment": [DEFAULTS, "Mine A.", DEFAULTS], "allow": ["Mine B.", DEFAULTS, DEFAULTS]},
+            "only the sentinel out of place": {"environment": env[1:] + [DEFAULTS],
+                                               "allow": [auto_allow[2], DEFAULTS, auto_allow[1]]},
+        }
+        snippet = read_json(SNIPPET)
+        for name, auto in cases.items():
+            with self.subTest(case=name):
+                # Everything else already as the snippet has it, so autoMode is the only thing left to change.
+                mine = {k: snippet[k] for k in ("model", "effortLevel", "modelSettings")}
+                mine.update(theme="dark", permissions={k: wanted["permissions", k] for k in ("allow", "ask")})
+                if auto is not None:
+                    mine["autoMode"] = auto
+                self.reset(mine)
+                p = self.install()
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                merged = read_json(self.settings)
+                for key in ("environment", "allow"):
+                    self.assert_merged(merged["autoMode"][key], (auto or {}).get(key, []),
+                                       wanted["autoMode", key], sentinel=True)
+                self.assertNotIn("already up to date", settings_line(p.stdout))
+
+    def test_second_run_is_a_no_op(self):
+        wanted = snippet_lists(self)
+        snippet = read_json(SNIPPET)
+        # Merged by hand already, in an order and layout of its own: the first run changes nothing at all.
+        by_hand = {"permissions": {"deny": ["Bash(rm -rf:*)"],
+                                   "allow": ["Bash(ls:*)"] + list(reversed(wanted["permissions", "allow"])),
+                                   "ask": ["Bash(git push --force:*)"] + wanted["permissions", "ask"]},
+                   "autoMode": {"allow": [DEFAULTS, "Mine."] + list(reversed(wanted["autoMode", "allow"][1:])),
+                                "environment": wanted["autoMode", "environment"] + ["Mine too."]},
+                   "modelSettings": snippet["modelSettings"], "effortLevel": snippet["effortLevel"],
+                   "model": snippet["model"], "theme": "dark"}
+        before = self.reset(by_hand)
+        p = self.install()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("~/.claude/settings.json: already up to date", p.stdout)
+        with open(self.settings, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(self.backups(), [])
+
+        # Needing only the new merge (the sentinel mid-list too): the first run writes, the next change nothing.
+        own_allow, own_env = ["Bash(ls:*)", wanted["permissions", "allow"][5]], ["Mine.", DEFAULTS]
+        self.reset({"permissions": {"allow": own_allow}, "autoMode": {"environment": own_env, "soft_deny": ["Never."]},
+                    "theme": "dark", **{k: snippet[k] for k in ("model", "effortLevel", "modelSettings")}})
+        p = self.install()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("already up to date", settings_line(p.stdout))
+        merged = read_json(self.settings)
+        self.assert_merged(merged["permissions"]["allow"], own_allow, wanted["permissions", "allow"], sentinel=False)
+        self.assert_merged(merged["autoMode"]["environment"], own_env, wanted["autoMode", "environment"], sentinel=True)
+        backups = self.backups()
+        self.assertEqual(len(backups), 1)
+        with open(self.settings, "rb") as fh:
+            after_first = fh.read()
+        for second in (1, 2):
+            with self.subTest(run=second + 1):
+                p = self.install()
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("~/.claude/settings.json: already up to date", p.stdout)
+                with open(self.settings, "rb") as fh:
+                    self.assertEqual(fh.read(), after_first)
+                self.assertEqual(self.backups(), backups)
+
+    def test_deny_default_mode_and_soft_deny_untouched(self):
+        wanted = snippet_lists(self)
+        present = {"permissions": {"defaultMode": "acceptEdits", "additionalDirectories": ["/tmp/shared"],
+                                   "deny": ["Bash(rm -rf:*)", wanted["permissions", "allow"][8], "Read(./.env)"],
+                                   "allow": ["Bash(ls:*)"]},
+                   "autoMode": {"soft_deny": [DEFAULTS, wanted["autoMode", "allow"][1], "Never push to main."],
+                                "environment": ["Mine."]},
+                   "theme": "dark", "env": {"FOO": "1"}}
+        cases = {
+            "present": present,
+            "objects absent": {"theme": "dark"},
+            "keys absent": {"permissions": {"allow": ["Bash(ls:*)"]}, "autoMode": {"allow": ["Mine."]}},
+            "empty objects": {"permissions": {}, "autoMode": {}},
+        }
+        for name, mine in cases.items():
+            with self.subTest(case=name):
+                self.reset(mine)
+                p = self.install()
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                merged = read_json(self.settings)
+                for obj, merged_keys in (("permissions", {"allow", "ask"}), ("autoMode", {"environment", "allow"})):
+                    theirs = mine.get(obj, {})
+                    self.assertEqual(set(merged[obj]), set(theirs) | merged_keys)        # nothing added beside
+                    for key in set(theirs) - merged_keys:                                # deny, defaultMode, ...
+                        self.assertEqual(merged[obj][key], theirs[key], key)
+                    for key in merged_keys:                                              # and the merge did run
+                        self.assert_merged(merged[obj][key], theirs.get(key, []), wanted[obj, key],
+                                           sentinel=obj == "autoMode")
+                for key in set(mine) - {"permissions", "autoMode"}:
+                    self.assertEqual(merged[key], mine[key], key)
+
+    def test_malformed_settings_untouched_by_the_new_merge(self):
+        wanted = snippet_lists(self)
+        malformed = {"not JSON": "{not json", "truncated": '{"permissions": {"allow": ["Bash(ls:*)"]',
+                     "a list": json.dumps(["Bash(ls:*)"]), "a string": '"permissions"', "null": "null",
+                     "empty": ""}
+        for name, text in malformed.items():
+            with self.subTest(case=name):
+                before = self.reset(text)
+                p = self.install()
+                self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("~/.claude/settings.json: left unchanged", p.stderr)
+                with open(self.settings, "rb") as fh:
+                    self.assertEqual(fh.read(), before)
+                self.assertEqual(sorted(n for n in os.listdir(os.path.dirname(self.settings))
+                                        if n.startswith("settings")), ["settings.json"])      # no backup, no temp
+                self.assertIn("Done, except the settings merge, which failed", p.stdout)
+
+        with self.subTest(case="unreadable"):
+            before = self.reset({"permissions": {"allow": ["Bash(ls:*)"]}})
+            os.chmod(self.settings, 0)
+            self.addCleanup(os.chmod, self.settings, 0o600)
+            p = self.install()
+            self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("~/.claude/settings.json: left unchanged", p.stderr)
+            os.chmod(self.settings, 0o600)
+            with open(self.settings, "rb") as fh:
+                self.assertEqual(fh.read(), before)
+            self.assertEqual(self.backups(), [])
+
+        # The same place with a readable object: the merge does run there, so the cases above are not vacuous.
+        self.reset({"permissions": {"allow": ["Bash(ls:*)"]}})
+        p = self.install()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assert_merged(read_json(self.settings)["permissions"]["allow"], ["Bash(ls:*)"],
+                           wanted["permissions", "allow"], sentinel=False)
+
+    def test_wrong_types_are_refused_and_leave_the_file_alone(self):
+        # Each case would otherwise change model and drop companion@ryan, so an untouched file means the whole
+        # merge was refused, not merely the bad list skipped. An explicit null is a wrong type like any other.
+        objects = {
+            "permissions a list": {"permissions": ["Bash(ls:*)"]},
+            "permissions a string": {"permissions": "x"},
+            "permissions null": {"permissions": None},
+            "autoMode a string": {"autoMode": "x"},
+            "autoMode a list": {"autoMode": [DEFAULTS]},
+            "autoMode a number": {"autoMode": 0},
+            "autoMode null": {"autoMode": None},
+        }
+        lists = {
+            "permissions.allow of numbers": {"permissions": {"allow": [1]}},
+            "permissions.allow a string": {"permissions": {"allow": "Bash(ls:*)"}},
+            "permissions.allow with a null entry": {"permissions": {"allow": ["Bash(ls:*)", None]}},
+            "permissions.allow null": {"permissions": {"allow": None}},
+            "permissions.ask an object": {"permissions": {"ask": {"Bash(x)": True}}},
+            "permissions.ask null": {"permissions": {"ask": None, "allow": ["Bash(ls:*)"]}},
+            "autoMode.environment a string": {"autoMode": {"environment": "x"}},
+            "autoMode.environment with a nested list": {"autoMode": {"environment": [DEFAULTS, ["Mine."]]}},
+            "autoMode.environment null": {"autoMode": {"environment": None}},
+            "autoMode.allow true": {"autoMode": {"allow": True}},
+            "autoMode.allow null": {"autoMode": {"allow": None, "environment": [DEFAULTS]}},
+        }
+        cases = [(name, bad, f"{next(iter(bad))} is not a JSON object") for name, bad in objects.items()]
+        cases += [(name, bad, f"{name.split(' ')[0]} is not a list of strings") for name, bad in lists.items()]
+        for name, bad, says in cases:
+            with self.subTest(case=name):
+                before = self.reset(dict({"model": "sonnet", "theme": "dark",
+                                          "enabledPlugins": {"companion@ryan": True}}, **bad))
+                p = self.install()
+                out = p.stdout + p.stderr
+                self.assertNotEqual(p.returncode, 0, out)
+                self.assertNotIn("Traceback", out)
+                self.assertIn(f"~/.claude/settings.json: left unchanged, {says}", p.stderr)
+                with open(self.settings, "rb") as fh:
+                    self.assertEqual(fh.read(), before)
+                self.assertEqual(sorted(n for n in os.listdir(os.path.dirname(self.settings))
+                                        if n.startswith("settings")), ["settings.json"])      # no backup, no temp
+                self.assertIn("Done, except the settings merge, which failed", p.stdout)
+                self.assertNotIn("Done. Start", p.stdout)
+
+        # The same base with the lists well formed: the merge runs and writes, so the refusals above are not vacuous.
+        self.reset({"model": "sonnet", "theme": "dark", "enabledPlugins": {"companion@ryan": True},
+                    "permissions": {"allow": ["Bash(ls:*)"]}, "autoMode": {"environment": []}})
+        p = self.install()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        merged = read_json(self.settings)
+        self.assertEqual(merged["model"], "opus")
+        self.assertEqual(merged["enabledPlugins"], {})
 
 
 if __name__ == "__main__":
