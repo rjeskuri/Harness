@@ -2584,8 +2584,9 @@ class LandCost(WorktreeTest):
                   "first trouble"),
                  # nothing said at all: the reason is the exit status
                  ("exit 3 saying nothing", {"exit": 3}, "exit 3"),
-                 # only stdout said something: still a reason, and none of the stdout in the Resolution
-                 ("exit 4 with only a partial table", {"stdout": "**Cost** partial table\n", "exit": 4}, None)]
+                 # only stdout said something: stdout is not a reason, so it falls back to the exit status,
+                 # and none of the stdout reaches the warning, the stderr or the Resolution
+                 ("exit 4 with only a partial table", {"stdout": "**Cost** partial table\n", "exit": 4}, "exit 4")]
         for name, answer, reason in cases:
             with self.subTest(name):
                 self.costs({12: {"stdout": good + "\n"}, 13: answer})
@@ -2597,9 +2598,9 @@ class LandCost(WorktreeTest):
                 prefix = "harness-pr: warning: no cost block for #13: "
                 self.assertTrue(warned[0].startswith(prefix), warned[0])
                 self.assertTrue(warned[0][len(prefix):].strip(), f"the warning gives a reason: {warned[0]!r}")
-                if reason:
-                    self.assertIn(reason, warned[0], "the warning gives the reason")
+                self.assertIn(reason, warned[0], "the warning gives the reason")
                 self.assertNotIn("trace detail", p.stderr, "one line: the rest of harness-work's stderr is not shown")
+                self.assertNotIn("partial table", p.stderr, "harness-work's stdout is never the reason")
                 self.assertEqual([line for line in p.stderr.splitlines() if line not in warned],
                                  before.stderr.splitlines(), "no other stderr than a land without cost")
                 self.assertEqual(self.resolution_of(13), base, "#13's Resolution goes out without a block")
