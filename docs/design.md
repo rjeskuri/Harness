@@ -7,7 +7,7 @@ Ryan's personal Claude Code harness. One repository, one plugin, installed once 
 1. **The board is the context.** Every unit of work is a GitHub issue: an epic with sub-issue tasks, each carrying the request, an outline, a definition of done and the tests that must pass. Agents read the ticket and its epic before working and write status back. The user's job is to answer questions on tickets and review pull requests.
 2. **Tests before code, proven.** A test-author writes tests from the ticket; a tool proves they fail against the unchanged code; an adversary tries to pass them with a trivial implementation; only then does a coder touch source. A hook denies source edits until the proof exists.
 3. **Never on main.** Each ticket gets its own branch and worktree. A hook denies edits, commits and pushes on main in every repository. GitHub Free does not protect branches on private repos, so the hook is the only block; landing goes through a pull request: eligible ones are merged by `harness-pr autoland`, the user lands the rest.
-4. **Route by labels, escalate by failure.** Opus 5.5 at high effort is the default everywhere. The planner labels each task with size and risk; the labels pick the tier (Sonnet, Opus, Fable). A second failure re-runs one tier up; a third stops and asks on the ticket.
+4. **Route by labels, escalate by failure.** Opus 5.5 at high effort is the default everywhere. The planner labels each task with size and risk; the labels pick the tier (Sonnet, Opus, Fable) unless the project's `HARNESS_CODE_TIER` or `HARNESS_REVIEW_TIER` sets it for that stage, and `HARNESS_CODE_EFFORT` sets the coding stages' effort. A second failure re-runs one tier up; a third stops and asks on the ticket.
 5. **Spend the subscription first.** Interactive sessions and dispatched ticket work run on the Max subscription by default. The API key is spent only on request: `harness-work dispatch --api` (an alias for `--venue headless`) runs headless and bills it. While the `api` budget is exhausted, `--api` and `--venue headless` are refused. High-risk pull requests get ultrareview, which bills claude.ai usage credits. An exhausted budget is remembered for a day.
 6. **Additive, never invasive.** Projects keep their own `CLAUDE.md`, hooks, rules and skills. The harness adds the board, the guards and the loop beside them, in every project including jotform-glow-sync.
 7. **Deterministic where it must be, advisory where it can be.** Hooks and tools enforce; prompts advise.
@@ -233,14 +233,14 @@ Everything above the Cost block is the PR's and the same on each ticket it close
 | Agent | Model, effort | Tools | Job |
 |---|---|---|---|
 | `planner` | opus, xhigh | Read, Grep, Glob, Bash (read-only guard) | Turns an interviewed request into an epic and tasks in the templates, with sizes, risks, flags and blocked-by, under the size cap. Returns a proposal; creates nothing. |
-| `test-author` | opus (tier override per call), effort inherited | all | Writes the tests the ticket names, broad behavior first, against the public interface, and runs them to show them red. The tests-first hook denies it any source edit. |
-| `test-breaker` | opus (tier override), inherited | all | In the scratch copy, writes the cheapest implementation that could pass the new tests (constants, special-casing the fixtures) and runs them. If it passes, the tests are too narrow. Denied test edits by the hook. |
-| `coder` | opus (tier override), inherited | all | Makes the tests and the verify command green with the smallest coherent change, commits on the ticket branch, reports evidence. Denied test edits by the hook; stops and reports when the change outgrows the size cap. |
-| `reviewer` | opus (fable, xhigh, for risk:high) | Read, Grep, Glob, Bash (read-only guard) | Reviews the branch against the ticket's definition of done; returns findings as JSON lines for the PR. |
+| `test-author` | opus (tier override per call), effort inherited unless `HARNESS_CODE_EFFORT` is set or the stage escalates to Fable (xhigh) | all | Writes the tests the ticket names, broad behavior first, against the public interface, and runs them to show them red. The tests-first hook denies it any source edit. |
+| `test-breaker` | opus (tier override), inherited unless `HARNESS_CODE_EFFORT` is set or the stage escalates to Fable (xhigh) | all | In the scratch copy, writes the cheapest implementation that could pass the new tests (constants, special-casing the fixtures) and runs them. If it passes, the tests are too narrow. Denied test edits by the hook. |
+| `coder` | opus (tier override), inherited unless `HARNESS_CODE_EFFORT` is set or the stage escalates to Fable (xhigh) | all | Makes the tests and the verify command green with the smallest coherent change, commits on the ticket branch, reports evidence. Denied test edits by the hook; stops and reports when the change outgrows the size cap. |
+| `reviewer` | opus (fable, xhigh, for risk:high), unless the project sets `HARNESS_REVIEW_TIER` | Read, Grep, Glob, Bash (read-only guard) | Reviews the branch against the ticket's definition of done; returns findings as JSON lines for the PR. |
 | `researcher` | opus, inherited | WebFetch, WebSearch, Read, Grep, Glob, Bash (read-only guard) | Primary-source fact checking, as in v1. |
 | `quick` | sonnet, inherited | all | Trivial mechanical tasks outside the ticket loop, as in v1. |
 
-The orchestrator passes `model` on the Agent call from `harness-board tier` (and `effort` too once the Agent tool offers it: `high` by default, `xhigh` when escalating to Fable). The reviewer's model comes from `harness-board tier N --stage review`: `opus`, and `fable` (with `xhigh`) when the ticket is `risk:high` or when `harness-work attempt` says `escalate fable` for the review stage. The review stage is recorded with `harness-work attempt N review pass|fail --tier <the output of harness-board tier N --stage review>`, so its second failure escalates from opus to fable; without `--tier` the attempt uses the ticket's own tier, and a sonnet-tier ticket would escalate to opus. The read-only guard (`readonly_bash.py`) now covers `planner`, `reviewer` and `researcher`.
+The orchestrator passes `model` and `effort` on the Agent call from `harness-board tier N --json`: for the test-author, breaker and coder (retries and fix rounds included), its `tier` as `model` and its `effort` when that is not null. The project's `HARNESS_CODE_TIER` and `HARNESS_CODE_EFFORT` decide that tier and effort when it sets them, the labels otherwise. Escalation goes one tier up from that tier, and a stage escalated to Fable gets `model: fable` with `effort: xhigh`. The reviewer's model and effort come from `harness-board tier N --stage review --json` the same way: `HARNESS_REVIEW_TIER` when the project sets it, otherwise the labels: `opus`, and `fable` (with `xhigh`) when the ticket is `risk:high`; `fable` (with `xhigh`) also when `harness-work attempt` says `escalate fable` for the review stage. The review stage is recorded with `harness-work attempt N review pass|fail --tier <the output of harness-board tier N --stage review>`, so its second failure escalates from opus to fable; without `--tier` the attempt uses the ticket's own tier, and a sonnet-tier ticket would escalate to opus. The read-only guard (`readonly_bash.py`) now covers `planner`, `reviewer` and `researcher`.
 
 ## Skills
 
@@ -258,11 +258,15 @@ The orchestrator passes `model` on the Agent call from `harness-board tier` (and
 
 ```
 harness-work start N            ticket context, branch t/N-slug, worktree, status in-progress, tier
+harness-board tier N --json     tier and effort for the test-author, breaker and coder: HARNESS_CODE_TIER and
+                                HARNESS_CODE_EFFORT when set, else the labels; effort passed when not null
 test-author (tier)              tests only; must show them red
 harness-red check               proof: tests fail, source untouched; record written
 test-breaker (tier)             scratch copy; cheat attempt; pass means tests go back to the author (max 2 rounds)
 coder (tier)                    source only; new tests and CLAUDE_VERIFY_CMD green; commits
-reviewer (opus; fable if risk:high) findings JSON; split by the ticket's files: the rest become new tickets
+reviewer (opus; fable if risk:high) findings JSON; split by the ticket's files: the rest become new tickets;
+                                model and effort from harness-board tier N --stage review --json (HARNESS_REVIEW_TIER
+                                when set, else the labels)
 harness-pr open N [--notes F]   push, draft PR from the template (Closes #N, DoD, red proof, verify tail); --notes adds a `## Notes` section (second pass, out-of-scope file) that the Resolution repeats
 harness-pr review P --findings  inline review comments from the findings on the ticket's files
 coder (tier)                    fixes every posted finding, whatever its severity, in commits after the review;
@@ -270,7 +274,8 @@ coder (tier)                    fixes every posted finding, whatever its severit
 harness-work attempt N fix      after each fix round: pass when the re-check found nothing on the ticket's files;
                                 retry, then needs-input (max 2 rounds, no escalation)
 harness-pr checks P --wait      CI; failures go back to the coder (max 2 rounds)
-[harness-pr ultra P]            when risk:high: ultrareview, posted to the PR
+[harness-pr ultra P]            when risk:high: ultrareview, posted to the PR; with HARNESS_ULTRAREVIEW=off one line,
+                                nothing run
 harness-pr ready P              refused while the latest harness review has findings and no newer commit;
                                 ready for review, status in-review, notification
 ```
@@ -479,7 +484,7 @@ Verify:
 
 ## user/CLAUDE.md
 
-Rewritten around the loop. Sections: how I work (unchanged lines), **Routing** (Opus high default; `harness-board tier` picks the agent model from the ticket labels; pass `model`, and `effort` when the Agent tool offers it; escalate once on a second failure, needs-input on a third; reviews on Opus, Fable for risk:high reviews, for size:L and risk:high tiers, and for escalations), **The board is the context** (read the ticket and epic before any work; status changes go through `harness-board`; questions become `needs-input`, never guesses), **Never on main** (ticket branch and worktree via `harness-work start`; agents push `t/*` branches and open PRs without asking; eligible PRs are merged by `harness-pr autoland`, the user lands the rest with `/harness:land`; nobody pushes main, force-pushes or deletes a branch by hand), **Tests first** (test-author, red proof, breaker, then coder; never loosen a test), **Budgets** (dispatch runs on the subscription by default; the API key is spent only with `--api` or `--venue headless`, refused while the api budget is exhausted; ultrareview on risk:high), **Across projects** (as v1, with `/harness:plan` and `/harness:work`), **Compact instructions** (add the ticket number and branch).
+Rewritten around the loop. Sections: how I work (unchanged lines), **Routing** (Opus high default; `harness-board tier` picks the agent model from the ticket labels, or from the project's `HARNESS_CODE_TIER` and `HARNESS_REVIEW_TIER` when set; pass `model`, and the `effort` `harness-board tier N --json` prints (the project's `HARNESS_CODE_EFFORT`) when it is not null; dispatch launches sessions at `HARNESS_CODE_EFFORT` too; escalate once on a second failure, needs-input on a third; reviews on Opus and, by the labels unless `HARNESS_REVIEW_TIER` is set, on Fable for risk:high; Fable also for size:L and risk:high tiers and for escalations), **The board is the context** (read the ticket and epic before any work; status changes go through `harness-board`; questions become `needs-input`, never guesses), **Never on main** (ticket branch and worktree via `harness-work start`; agents push `t/*` branches and open PRs without asking; eligible PRs are merged by `harness-pr autoland`, the user lands the rest with `/harness:land`; nobody pushes main, force-pushes or deletes a branch by hand), **Tests first** (test-author, red proof, breaker, then coder; never loosen a test), **Budgets** (dispatch runs on the subscription by default; the API key is spent only with `--api` or `--venue headless`, refused while the api budget is exhausted; ultrareview on risk:high unless the project sets `HARNESS_ULTRAREVIEW=off`), **Across projects** (as v1, with `/harness:plan` and `/harness:work`), **Compact instructions** (add the ticket number and branch).
 
 ## Install
 
