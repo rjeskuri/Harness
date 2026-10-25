@@ -877,6 +877,10 @@ GATE_CASES = {
     "an older summary without per-severity counts": (
         [harness_review(101, at(10), inline=[FROBS], body_only=[CAP], summary="Harness review (opus): 2 findings.")],
         [pr_commit("a", at(9))], [FROBS, CAP], []),
+    # An older summary's total beyond the findings listed counts as that many more high or medium (fail closed).
+    "an older summary counting more findings than are listed": (
+        [harness_review(101, at(10), body_only=[NOTES], summary="Harness review (opus): 3 findings.")],
+        [pr_commit("a", at(9))], [], [NOTES]),
     "the summary counts no high or medium, a high and a medium listed": (
         [harness_review(101, at(10), inline=[OFF_BY_ONE], body_only=[README], summary=(2, 0, 0, 2))],
         [pr_commit("a", at(9))], [OFF_BY_ONE, README], []),
@@ -889,7 +893,22 @@ GATE_NOT_LISTED = {
     "the summary counts more high than are listed": 1,
     "only low findings listed, the summary counts a medium": 1,
     "the summary counts one high, none listed": 1,
+    "an older summary counting more findings than are listed": 2,
 }
+# Refused cases: (name, the latest harness review's submitted_at, n) where n in "has <n> high or medium finding(s)"
+# counts the high and medium findings listed plus the GATE_NOT_LISTED count.
+GATE_REFUSAL_COUNTS = [
+    ("findings and no commit since", at(10), 1),
+    ("a medium finding in the body only", at(10), 1),
+    ("an inline comment without a severity", at(10), 1),
+    ("an older clean review, the latest with findings (listed newest first)", at(12), 1),
+    ("two reviews with findings, a commit between them", at(12), 2),
+    ("the summary counts one high, none listed", at(10), 1),
+    ("only low findings listed, the summary counts a medium", at(10), 1),
+    ("the summary counts more high than are listed", at(10), 2),
+    ("an older summary without per-severity counts", at(10), 2),
+    ("an older summary counting more findings than are listed", at(10), 2),
+]
 # The proceed cases in which ready has nothing to warn about: a newer commit cleared the findings, the latest harness
 # review is clean, or there is no harness review. Ready prints nothing on stderr for them.
 GATE_QUIET = ("a commit after the findings", "only low findings, a commit after them",
@@ -1087,13 +1106,9 @@ class ReadyGate(GateAsserts, PrTest):
 
     def test_ready_refusal_counts_the_high_and_medium_findings_and_says_what_to_do(self):
         """The refusal: "PR #P: the latest harness review (<submitted_at>) has <n> high or medium findings and no
-        commit after it: <each>; fix them, push, then harness-pr ready P", n counting only high and medium."""
-        cases = [("findings and no commit since", at(10), 1),
-                 ("a medium finding in the body only", at(10), 1),
-                 ("an inline comment without a severity", at(10), 1),
-                 ("an older clean review, the latest with findings (listed newest first)", at(12), 1),
-                 ("two reviews with findings, a commit between them", at(12), 2)]
-        for name, when, n in cases:
+        commit after it: <each>; fix them, push, then harness-pr ready P", n counting only high and medium, listed or
+        counted by the summary beyond those listed."""
+        for name, when, n in GATE_REFUSAL_COUNTS:
             with self.subTest(name):
                 reviews, commits, _named, _ = GATE_CASES[name]
                 p = self.run_case(reviews, commits)
@@ -3255,6 +3270,16 @@ class LandGate(GateAsserts, WorktreeTest):
                 self.assertTrue(self.branch_exists())
                 self.assertNamesFindings(p, named, not_named)
                 self.assertNotListedCount(name, p)
+
+    def test_land_refusal_counts_the_high_and_medium_findings_listed_and_not_listed(self):
+        """land's refusal carries the same "has <n> high or medium finding(s) and no commit after it" as ready's."""
+        for name, when, n in GATE_REFUSAL_COUNTS:
+            with self.subTest(name):
+                p, _, _ = self.land_case(name)
+                self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertRegex(p.stderr, re.escape(f"PR #34: the latest harness review ({when}) has {n} high or "
+                                                     "medium finding") + r"s? and no commit after it: ")
+                self.assertIn("; fix them and push, or harness-pr land 34 --accept-findings", p.stderr)
 
     def test_land_proceeds_when_only_low_findings_are_open(self):
         """The same PR with a high finding refuses; with only low findings and no commit since, it lands."""
