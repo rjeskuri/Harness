@@ -596,6 +596,27 @@ class Revert(GuardTest):
                     self.assertIn(f"Revert commit: {revert_sha}", self.body_lines(body))
                     self.assertIn("smoke check 100 FAILED: GET /health -> 500", self.smoke_tail(body))
 
+    def test_redeploy_past_the_deploy_timeout_freezes(self):
+        # `revert` runs deploy.sh only once, after the revert, so FAKE_DEPLOY_SLEEP hangs just the redeploy
+        w = self.make_world(slug="stark/forge", title="Retune the furnace", pr=73, ticket=36, incident=118)
+        self.scenario()
+        before_tip, before_count = self.origin_tip(), self.origin_count()
+        started = time.monotonic()
+        try:
+            p = self.guard(timeout=25, DEPLOY_GUARD_DEPLOY_TIMEOUT="2", FAKE_DEPLOY_SLEEP="40")
+        except subprocess.TimeoutExpired:
+            self.fail("DEPLOY_GUARD_DEPLOY_TIMEOUT=2 did not bound the 40 s redeploy after the revert")
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 20, "DEPLOY_GUARD_DEPLOY_TIMEOUT bounds the redeploy")
+        self.assertExit(p, 1)
+        revert_sha = self.assertOneRevertPushed(w, before_tip, before_count)   # the revert stays pushed
+        self.assertEqual(self.ran(), [f"deploy {revert_sha} version: 1"], "no smoke after a timed-out redeploy")
+        call = self.assertFrozenIncident(w, revert_sha)
+        frozen = [line for line in self.body_lines(self.body(call)) if line.startswith("Deploys are frozen:")]
+        self.assertEqual(len(frozen), 1, self.body(call))
+        self.assertIn("scripts/deploy.sh", frozen[0])
+
     def test_sha_without_a_pr_names_no_ticket(self):
         # no GITHUB_REPOSITORY (gh repo view names it) and no HARNESS_GH (gh from PATH); the SHA is not the tip
         w = self.make_world(slug="zed-labs/api", title="Hotfix the importer", pr=None, incident=9, later="other")
