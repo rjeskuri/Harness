@@ -56,7 +56,7 @@ Then register your projects: `harness-projects discover`, and `harness-projects 
 | `researcher` | Opus | Answers from primary sources |
 | `quick` | Sonnet | Trivial mechanical tasks outside the ticket loop |
 
-The main session runs Opus 5.5 at high effort. `harness-board tier N` picks the tier from the ticket's labels: `size:S` and `risk:low` on a non-bug gives Sonnet; `size:L` or `risk:high` gives Fable; anything else gives Opus. Reviews run on Opus: `harness-board tier N --stage review` gives Fable only for a `risk:high` ticket, and the review stage is recorded with `harness-work attempt N review pass|fail --tier <that output>`, so its second failure re-runs the review on Fable. Escalation is by failure, recorded with `harness-work attempt`: a stage's first failure retries at the same tier, the second re-runs one tier up, the third stops and asks on the ticket.
+The main session runs Opus 5.5 at high effort. `harness-board tier N` picks the tier from the ticket's labels: `size:S` and `risk:low` on a non-bug gives Sonnet; `size:L` or `risk:high` gives Fable; anything else gives Opus. A project can replace that rubric in its `.claude/settings.json`: `HARNESS_CODE_TIER` and `HARNESS_CODE_EFFORT` set the tier and effort of the test-author, breaker and coder, and `HARNESS_REVIEW_TIER` sets the reviewer's tier; the labels decide when they are unset. `harness-board tier N --json` says which decided and prints the effort, which the work loop passes on the Agent call when it is not null. Reviews run on Opus: by the labels, `harness-board tier N --stage review` gives Fable only for a `risk:high` ticket, and the review stage is recorded with `harness-work attempt N review pass|fail --tier <that output>`, so its second failure re-runs the review on Fable. Escalation is by failure, recorded with `harness-work attempt`: a stage's first failure retries at the same tier, the second re-runs one tier up, the third stops and asks on the ticket.
 
 ## Skills
 
@@ -122,7 +122,7 @@ Machine-wide, under `env` in `~/.claude/settings.json`: `HARNESS_API_KEY_CMD` (d
 | Interactive sessions, including `/harness:work N` | The Max subscription |
 | Dispatched runs, `/harness:work` (the default) | The Max subscription |
 | Dispatched headless runs, `/harness:work --api` or `--venue headless` | The API key, read from the keychain |
-| Ultrareview on `risk:high` PRs | claude.ai usage credits, about 5 to 25 dollars a run |
+| Ultrareview on `risk:high` PRs, unless the project sets `HARNESS_ULTRAREVIEW=off` | claude.ai usage credits, about 5 to 25 dollars a run |
 
 When a headless run fails on billing or auth, the API budget is marked exhausted for 24 hours, and until then `--api` and `--venue headless` are refused; dispatch without them still runs on the subscription. A credits failure on ultrareview marks the cloud budget the same way. `harness-work budget status` shows the state; `harness-work budget reset api` clears it after a top-up.
 
