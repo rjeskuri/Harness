@@ -10,12 +10,12 @@
 
 - Every piece of work is a GitHub issue on the project's board: an epic with task sub-issues, each with a request, an outline, a definition of done and the tests that must pass. Read the ticket (`harness-board show N --markdown`) and its epic before working. Status changes go through `harness-board`; `harness-board board` shows the whole board.
 - A question the ticket, the epic and the code cannot answer becomes `harness-board needs-input N --question ...` when it is about product behavior, is hard to undo, or touches security, credentials or personal data; never a guess. A reversible implementation choice they leave open is decided and recorded as a `Ruling:` line under `### Rulings` in the PR's Notes. I answer on the ticket; the next `/harness:work N` reads the answer.
-- New work: `/harness:plan <request>`. Tickets to pull requests: `/harness:work [N]`. Merging: `harness-pr autoland` for eligible PRs, `/harness:land [PR#]` for the rest. A new or existing repository joins the board with `/harness:new-project`.
+- New work: `/harness:plan <request>`. Tickets to pull requests: `/harness:work [N]`. Landing: I land with `/harness:land [PR#]` or by approving the land prompt; `harness-pr autoland` is the epic #132 plan. A new or existing repository joins the board with `/harness:new-project`.
 
 ## Never on main
 
 - Work happens on a ticket branch `t/<issue>-<slug>` in its own worktree, created by `harness-work start N`. A hook denies edits, commits and pushes on main; do not look for a way around it.
-- Agents may push `t/*` branches and open or update pull requests without asking. Eligible pull requests (risk:low, size S or M, review and checks green at head, no protected path) are merged by `harness-pr autoland`; I land the rest with `/harness:land`. Nobody pushes main, force-pushes or deletes a branch by hand.
+- Agents may push `t/*` branches and open or update pull requests without asking; a session does not land them. I land each with `/harness:land` or by approving the land prompt; `harness-pr autoland` is the epic #132 plan. Nobody pushes main, force-pushes or deletes a branch by hand.
 
 ## Tests first
 
