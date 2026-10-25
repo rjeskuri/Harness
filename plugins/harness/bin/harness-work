@@ -6,17 +6,28 @@ of a headless or background session per ready ticket, the run records, the budge
 Usage:
     harness-work start N [--venue interactive|headless|bg]
     harness-work attempt N tests|breaker|code|review|fix|ci pass|fail [--tier sonnet|opus|fable]
-    harness-work dispatch [--max 3] [--venue headless|bg | --api] [--dry-run]
+    harness-work cost N [--pr P] [--json | --markdown]
+    harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]
     harness-work runs [--sweep] [--all]
     harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
     harness-work worktrees [--stale DAYS]
     harness-work worktree remove BRANCH [--discard]
-    start, attempt, dispatch, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR, else the
+    start, attempt, cost, dispatch, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR, else the
     cwd's repository); every subcommand except worktree remove takes --json.
 
 State, under ~/.claude/harness: repos/<repo-key>/tickets/<N>.json (the ticket cache that `harness-board show`
-writes; start adds branch, worktree and started_at, attempt adds to attempts), runs/<repo-key>-<N>-<stamp>.json
-and .log (one dispatched run), budgets.json ({"api"|"cloud": {"exhausted_until", "reason"}}).
+writes; start adds branch, worktree and started_at, attempt adds to attempts), repos/<repo-key>/cost/<N>.json (the
+record `cost` writes), runs/<repo-key>-<N>-<stamp>.json and .log (one dispatched run), budgets.json
+({"api"|"cloud": {"exhausted_until", "reason"}}).
+
+cost: ticket N's tokens and model time per stage and model from the repository's transcripts (harness_lib/cost.py's
+ticket_usage), its labels and rounds from the ticket cache (the attempts replayed with attempt's rule; null without
+a cache). From gh: the PR (--pr, else the cache branch's, a merged one first), its test/source/other lines, the CI runs
+of its head branch, the needs-input count, the start-to-ready and start-to-land times, and the labels the cache
+lacks; a failed gh call leaves its part null with one stderr line. Prints the stage x model table, the total, Claude
+Code's session total for N's own sessions, the rounds, the Lines, Elapsed, CI and Needs input lines, the shared
+sessions whose orchestrator is not counted, the lower-bound note and the saved path; --json prints the record,
+--markdown the Cost block of the Resolution. Tokens and time only, no dollar figure.
 
 start: refuses an epic, a closed issue, status:blocked and open blockers; fetches origin; reuses a worktree
 already on t/N-*, else a branch origin/t/N-*, else a local t/N-*, else creates t/N-<slug> from origin/main
@@ -34,12 +45,19 @@ a billing or auth run not counting) that has no live run, up to --max minus the 
 open draft PR, the prompt and the start comment name it and say the worktree may hold uncommitted work from the
 previous run. Launched sessions get neither
 the dispatching session's identity nor ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN. bg, the
-default whatever the budgets say, runs on the subscription: `claude --bg -n "<repo> #N <title>" "/harness:work N"`.
+default whatever the budgets say, runs on the subscription: `claude --bg -n "<repo> #N <title>" --permission-mode
+auto "/harness:work N"`.
 headless, only with --venue headless or its alias --api (--api with --venue bg is an error): `claude -p
 "/harness:work N"` billed to the API key through {"apiKeyHelper": HARNESS_API_KEY_CMD} (the key itself never
 reaches a command line or the environment). headless while the api budget is exhausted (judged after the sweep,
 which can be what exhausts it) is refused, --dry-run too: nothing starts, the exit is non-zero and the message
 names the time and `harness-work budget reset api`.
+Effort: dispatch reads HARNESS_CODE_EFFORT once per command through harness_lib.routing.load_routing (environment,
+else the main checkout's .claude/settings.json) and launches every session, redispatched ones too, with `--effort
+<level>` (bg: before the prompt; headless: last), writing `effort` to the run record. Unset, nothing changes: no flag,
+no key. An invalid value is one `harness-work:` warning on stderr per command (a dry run and an empty board too) and
+launches without the flag. The dispatcher's own CLAUDE_EFFORT is never inherited. --dry-run's first line names the
+effort when set (`Dry run: venue bg, effort xhigh, ...`); every --json result has a top-level `effort` (null when unset).
 
 runs --sweep: closes the records of runs that ended and classifies each (ok, error, billing, auth; a bg run by its
 `claude agents` state, done being ok). An `ok` run, headless or bg, whose issue is OPEN and still status:in-progress
@@ -48,8 +66,9 @@ with no ready pull request of its branch in any state (none, or only drafts) end
 A bg failed or stopped run is never early. When gh cannot tell, or the record names no repository, it stays `ok`
 with a warning. One command asks gh once per ticket and branch.
 
-A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through to stderr, in order;
-its other stderr stays hidden. Siblings (harness-board) are found on PATH, else next to this script. gh is HARNESS_GH when set, else `gh`;
+A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through to stderr, in order,
+except a routing problem dispatch already printed (those children load the same settings; REPORTED); its other
+stderr stays hidden. Siblings (harness-board) are found on PATH, else next to this script. gh is HARNESS_GH when set, else `gh`;
 claude is HARNESS_CLAUDE when set, else `claude`.
 """
 from __future__ import annotations
@@ -69,11 +88,14 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
-    from harness_lib.repo import RepoError, repo_facts
-    from harness_lib.settings import setting, settings_env
+    from harness_lib.repo import RepoError, repo_facts, worktree_entries
+    from harness_lib.routing import load_routing
+    from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, patterns, setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
+    from harness_lib import cost
     from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
     from harness_lib.text import write_json as _write_json
+    from harness_lib import gh as ghlib
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -235,17 +257,22 @@ class Repo:
     def ticket_path(self, number):
         return harness_home("repos", self.key, "tickets", f"{number}.json")
 
+    def cost_path(self, number):
+        return harness_home("repos", self.key, "cost", f"{number}.json")
+
 
 def open_repo(path):
     return Repo(path or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
 
 
 BOARD_WARNING = "harness-board: warning:"
+REPORTED = set()    # routing problems this process already printed; board() drops the same warning from its children
 
 
 def board(repo, *args):
     """harness-board in the project; its stdout, or a Problem with its error line. On success its
-    `harness-board: warning:` stderr lines go to our stderr, in order; its other stderr stays hidden."""
+    `harness-board: warning:` stderr lines go to our stderr, in order, except one already in REPORTED; its other
+    stderr stays hidden."""
     env = dict(os.environ, CLAUDE_PROJECT_DIR=repo.main)
     done = run([sibling("harness-board")] + [str(a) for a in args], cwd=repo.main, env=env, timeout=TOOL_TIMEOUT)
     if done.returncode != 0:
@@ -254,7 +281,7 @@ def board(repo, *args):
             why = why[len("harness-board: "):]
         raise Problem(f"harness-board {' '.join(str(a) for a in args[:2])}: {why}")
     for line in (done.stderr or "").splitlines():
-        if line.startswith(BOARD_WARNING):
+        if line.startswith(BOARD_WARNING) and line[len(BOARD_WARNING):].strip() not in REPORTED:
             print(line, file=sys.stderr, flush=True)
     return done.stdout
 
@@ -267,15 +294,20 @@ def board_json(repo, *args):
         raise Problem(f"harness-board {' '.join(str(a) for a in args[:2])} printed no JSON") from None
 
 
+# harness-work's own wording for a gh call (`call` is its first two arguments), as its generic run() words it
+WORK_GH_TEXTS = {
+    "not_found": "{exe} not found",
+    "cannot_run": "cannot run {exe}: {why}",
+    "timed_out": "{exe} {call} timed out after {timeout} s",
+    "failed": "gh {call} failed: {why}",
+    "not_json": "gh {call} printed something other than JSON",
+}
+
+
 def gh_json(repo, args):
-    exe = os.environ.get("HARNESS_GH", "gh")
-    done = run([exe] + args, cwd=repo.main, env=dict(os.environ, GH_PROMPT_DISABLED="1"), timeout=GH_TIMEOUT)
-    if done.returncode != 0:
-        raise Problem(f"gh {' '.join(args[:2])} failed: {last_line(done.stderr) or f'exit {done.returncode}'}")
-    try:
-        return json.loads(done.stdout or "null")
-    except ValueError:
-        raise Problem(f"gh {' '.join(args[:2])} printed something other than JSON") from None
+    """gh's JSON output (None when it printed nothing), run in the main checkout; Problem with gh's last stderr line."""
+    return ghlib.gh_json(args, repo.main, pick=last_line, empty_ok=True, errors="surrogateescape", timeout=GH_TIMEOUT,
+                         describe=lambda a: " ".join(a[:2]), texts=WORK_GH_TEXTS)
 
 
 def api_key_cmd():
@@ -312,27 +344,6 @@ def refusal(record):
     if blockers:
         return f"#{n} is blocked by open {', '.join(blockers)}"
     return None
-
-
-def worktree_entries(repo):
-    """`git worktree list --porcelain` as dicts: path, head, branch (short name) and the flags."""
-    entries, current = [], None
-    for line in git_ok(repo.main, "worktree", "list", "--porcelain").splitlines():
-        if not line.strip():
-            current = None
-            continue
-        key, _, value = line.partition(" ")
-        if key == "worktree":
-            current = {"path": value, "branch": None}
-            entries.append(current)
-        elif current is not None:
-            if key == "branch":
-                current["branch"] = value[len("refs/heads/"):] if value.startswith("refs/heads/") else value
-            elif key == "HEAD":
-                current["head"] = value
-            else:
-                current[key] = value or True
-    return entries
 
 
 def branch_refs(repo, prefix):
@@ -384,9 +395,9 @@ def make_worktree(repo, number, title):
     """(branch, worktree, created): an existing worktree on t/N-*, else a new one on the right branch."""
     pattern = re.compile(rf"^t/{number}-.")
     git(repo.main, "worktree", "prune")                    # entries whose folder is gone would block the add
-    for entry in worktree_entries(repo):
-        if entry.get("branch") and pattern.match(entry["branch"]) and os.path.isdir(entry["path"]):
-            return entry["branch"], os.path.realpath(entry["path"]), False
+    for entry in worktree_entries(repo.main, git_ok):
+        if entry.branch and pattern.match(entry.branch) and os.path.isdir(entry.path):
+            return entry.branch, os.path.realpath(entry.path), False
     remote = [b for b in branch_refs(repo, "refs/remotes/origin/t/") if pattern.match(b)]
     local = [b for b in branch_refs(repo, "refs/heads/t/") if pattern.match(b)]
     branch = (remote or local or [f"t/{number}-{slugify(title)}"])[0]
@@ -890,8 +901,9 @@ def of_repo(record, repo):
 
 
 # --------------------------------------------------------------- launching
-def launch(repo, ticket, venue):
-    """Start one session for a started ticket and write its run record."""
+def launch(repo, ticket, venue, effort=None):
+    """Start one session for a started ticket and write its run record. `effort` (a level or None) goes to the
+    session as --effort and into the record; unset, the session gets no --effort and the record no effort key."""
     n = ticket["number"]
     started = now()
     rid = f"{repo.key}-{n}-{started.strftime('%Y%m%d%H%M%S')}"
@@ -900,6 +912,8 @@ def launch(repo, ticket, venue):
     record = {"id": rid, "ticket": n, "repo": repo.main, "worktree": ticket["worktree"], "branch": ticket["branch"],
               "venue": venue, "log": log, "started_at": iso(started), "ended_at": None, "exit": None,
               "outcome": None}
+    if effort:
+        record["effort"] = effort
     prompt = f"/harness:work {n}"
     if ticket.get("draft_pr"):
         prompt += (f"\n\nThe previous run ended early: draft PR #{ticket['draft_pr']} is open and the worktree may "
@@ -909,6 +923,8 @@ def launch(repo, ticket, venue):
         settings = json.dumps({"apiKeyHelper": api_key_cmd()})
         argv = [claude_exe(), "-p", prompt, "--permission-mode", "auto", "--output-format", "json",
                 "--settings", settings]
+        if effort:
+            argv += ["--effort", effort]
         try:
             with open(log, "ab") as out:
                 proc = subprocess.Popen(argv, cwd=ticket["worktree"], start_new_session=True, stdout=out,
@@ -918,7 +934,10 @@ def launch(repo, ticket, venue):
         record["pid"] = proc.pid
     else:
         name = f"{repo.name} #{n} {ticket.get('title') or ''}".strip()
-        argv = [claude_exe(), "--bg", "-n", name, "--permission-mode", "auto", prompt]
+        argv = [claude_exe(), "--bg", "-n", name, "--permission-mode", "auto"]
+        if effort:
+            argv += ["--effort", effort]
+        argv.append(prompt)
         try:
             done = subprocess.run(argv, cwd=ticket["worktree"], capture_output=True, text=True, errors="replace",
                                   stdin=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT, env=child_env())
@@ -1083,25 +1102,99 @@ def cmd_attempt(repo, args):
         if entry.get("result") != "fail":
             break
         failures += 1
-    next_tier = None
-    if args.result == "pass":
-        action = "done"
-    elif failures == 1:
-        action = "retry"
-    elif args.stage == "fix":                       # at most two fix rounds, and fix never escalates
-        action = "needs-input"
-    elif failures == 2:
-        action, next_tier = "escalate", NEXT_TIER[tier]
-    else:
-        action = "needs-input"
+    action = cost.attempt_action(args.stage, args.result, failures)     # fix: at most two rounds, never escalates
+    next_tier = NEXT_TIER[tier] if action == "escalate" else None
     emit(wants_json(args), {"number": n, "stage": args.stage, "result": args.result, "tier": tier, "failures": failures,
                 "action": action, "next_tier": next_tier},
          f"{action} {next_tier}" if next_tier else action)
 
 
+PR_FIELDS = "number,url,createdAt,mergedAt,headRefName"
+RUN_FIELDS = "databaseId,status,conclusion,createdAt,startedAt,updatedAt"
+
+
+def gh_part(repo, args, shape):
+    """gh's JSON for one part of the cost record, or None with one warning line naming the call when gh fails or
+    prints something other than a `shape`."""
+    try:
+        data = gh_json(repo, args)
+    except Problem as err:
+        warn(str(err))
+        return None
+    if not isinstance(data, shape):
+        warn(f"gh {' '.join(args[:2])} printed no {'list' if shape is list else 'object'}")
+        return None
+    return data
+
+
+def cost_extras(repo, record, cache):
+    """Fill the record's gh-backed parts in place: the PR (--pr, else the branch's), its lines, its CI runs, the
+    ticket's needs-input count, the elapsed times and the labels the cache lacks. A failed call leaves its part
+    null."""
+    n, pr = record["ticket"], record["pr"]
+    branch = cache.get("branch") if cache and isinstance(cache.get("branch"), str) else None
+    info = None
+    if pr is not None:
+        info = gh_part(repo, ["pr", "view", str(pr), "--json", PR_FIELDS], dict)
+    elif branch:
+        found = gh_part(repo, ["pr", "list", "--head", branch, "--state", "all", "--json", PR_FIELDS,
+                               "--limit", "10"], list)
+        info = cost.pick_pr(found)
+        pr = record["pr"] = info["number"] if info else None
+    info = info or {}
+    if pr is not None:
+        file_env = settings_env(repo.main, ("settings.json",))
+        globs = [patterns(setting(name, file_env) or default) for name, default in
+                 (("HARNESS_TEST_PATTERNS", DEFAULT_TEST_PATTERNS), ("HARNESS_SOURCE_EXEMPT", DEFAULT_SOURCE_EXEMPT))]
+        pages = gh_part(repo, ["api", f"repos/{{owner}}/{{repo}}/pulls/{pr}/files?per_page=100", "--paginate",
+                               "--slurp"], list)
+        if pages is not None:
+            record["lines"] = cost.line_counts(pages, *globs)
+        head = info.get("headRefName") if isinstance(info.get("headRefName"), str) else branch
+        if head:
+            runs = gh_part(repo, ["run", "list", "--branch", head, "--json", RUN_FIELDS, "--limit", "100"], list)
+            if runs is not None:
+                record["ci"] = cost.ci_summary(runs)
+    issue = gh_part(repo, ["issue", "view", str(n), "--json", "comments,labels"], dict)
+    comments = issue.get("comments") if issue and isinstance(issue.get("comments"), list) else None
+    if issue is not None:
+        record["needs_input"] = cost.needs_input_count(comments)
+        labels = issue.get("labels") if isinstance(issue.get("labels"), list) else []
+        names = [x.get("name") if isinstance(x, dict) else x for x in labels]
+        for key, value in cost.label_fields([x for x in names if isinstance(x, str)]).items():
+            if record[key] is None:
+                record[key] = value
+    started = (cache.get("started_at") if cache else None) or cost.started_from_comments(comments)
+    ready = cost.ready_from_comments(comments, pr) if pr is not None else None
+    landed = info.get("mergedAt") or None
+    record["elapsed"] = cost.elapsed(started, info.get("createdAt") or None, ready, landed)
+    record["landed_at"] = landed
+
+
+def cmd_cost(repo, args):
+    """Ticket N's tokens and model time per stage and model, from the transcripts and the ticket cache:
+    saved as cost/<N>.json (replacing an earlier record), printed as text, --json or --markdown."""
+    n = args.number
+    usage = cost.ticket_usage(repo.main, n)
+    cache = read_cache(repo, n)
+    record = cost.build_record(n, repo.main, usage, cache, args.pr, iso(now()))
+    cost_extras(repo, record, cache)
+    path = repo.cost_path(n)
+    write_json(path, record)
+    if args.markdown:
+        print(cost.render_markdown(record))
+    else:
+        emit(wants_json(args), record, f"{cost.render_text(record)}\nSaved {path}")
+
+
 def cmd_dispatch(repo, args):
     if args.max < 1:
         raise Problem("--max must be at least 1")
+    routing = load_routing(repo.main)       # once per dispatch, whatever the run does next
+    for problem in routing["problems"]:
+        warn(problem)
+        REPORTED.add(one_line(problem))
+    effort = routing["code_effort"]
     agents = Agents()
     records = load_runs()
     sweep(records, agents, wants_json(args))
@@ -1139,26 +1232,27 @@ def cmd_dispatch(repo, args):
         return f"#{row['number']} {row.get('title') or ''} ({detail})"
 
     if args.dry_run:
-        lines = [f"Dry run: venue {venue}, {len(live)} live, {max(0, slots)} of {args.max} slots free."]
+        shown = f"effort {effort}, " if effort else ""
+        lines = [f"Dry run: venue {venue}, {shown}{len(live)} live, {max(0, slots)} of {args.max} slots free."]
         lines += [f"would start {describe(row)} and launch {venue}" for row in plan]
         lines += [f"skip #{s['number']}: {s['why']}" for s in skipped]
         if not candidates:
             lines.append("No ready tickets.")
-        emit(wants_json(args), {"venue": venue, "dry_run": True, "live": [r["id"] for r in live.values()],
+        emit(wants_json(args), {"venue": venue, "effort": effort, "dry_run": True, "live": [r["id"] for r in live.values()],
                     "plan": plan, "skipped": skipped}, "\n".join(lines))
         return
     if not args.json:
         for s in capped:
             print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
-        emit(wants_json(args), {"venue": venue, "launched": [], "failed": [], "skipped": skipped}, "No ready tickets.")
+        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped}, "No ready tickets.")
         return
     if slots <= 0:
-        emit(wants_json(args), {"venue": venue, "launched": [], "failed": [], "skipped": skipped},
+        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped},
              f"{len(live)} live runs; --max {args.max} reached, nothing launched.")
         return
     if not plan:
-        emit(wants_json(args), {"venue": venue, "launched": [], "failed": [], "skipped": skipped},
+        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped},
              "Nothing to launch: " + "; ".join(f"#{s['number']} has a {s['why']}" for s in skipped
                                                if s not in capped) + ".")
         return
@@ -1173,7 +1267,7 @@ def cmd_dispatch(repo, args):
             ticket = start_ticket(repo, n, venue, row.get("draft_pr"))
             if not ticket["title"]:
                 ticket["title"] = row.get("title") or ""
-            record = launch(repo, ticket, venue)
+            record = launch(repo, ticket, venue, effort)
         except Problem as err:
             failures.append({"number": n, "error": one_line(err)})
             if not args.json:
@@ -1184,7 +1278,8 @@ def cmd_dispatch(repo, args):
             where = f"pid {record['pid']}, log {record['log']}" if venue == "headless" else f"id {record['bg_id']}"
             print(f"#{n} {venue} on {record['branch']} ({where})", flush=True)
     if args.json:
-        emit(wants_json(args), {"venue": venue, "launched": launched, "failed": failures, "skipped": skipped}, "")
+        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": launched, "failed": failures,
+                                "skipped": skipped}, "")
     if failures:
         sys.exit(1)
 
@@ -1251,9 +1346,9 @@ def cmd_worktrees(repo, args):
     base = os.path.realpath(repo.worktrees_dir) + os.sep
     rows, gh_failed = [], None
     current = now()
-    for entry in worktree_entries(repo):
-        path = os.path.realpath(entry["path"])
-        if not path.startswith(base) or entry.get("bare"):
+    for entry in worktree_entries(repo.main, git_ok):
+        path = os.path.realpath(entry.path)
+        if not path.startswith(base) or entry.bare:
             continue
         when = None
         if os.path.isdir(path):
@@ -1265,7 +1360,7 @@ def cmd_worktrees(repo, args):
         else:
             dirty = False
         pr = None
-        branch = entry.get("branch")
+        branch = entry.branch
         if branch and gh_failed is None:
             try:
                 found = gh_json(repo, ["pr", "list", "--head", branch, "--state", "all", "--json",
@@ -1302,13 +1397,13 @@ def cmd_worktree_remove(repo, args):
     if branch in ("main", "master"):
         raise Problem(f"refusing to remove {branch}")
     git(repo.main, "worktree", "prune")
-    entry = next((e for e in worktree_entries(repo) if e.get("branch") == branch), None)
+    entry = next((e for e in worktree_entries(repo.main, git_ok) if e.branch == branch), None)
     has_branch = ref_exists(repo, f"refs/heads/{branch}")
     if entry is None and not has_branch:
         raise Problem(f"no worktree and no local branch {branch}")
     done = []
     if entry is not None:
-        path = os.path.realpath(entry["path"])
+        path = os.path.realpath(entry.path)
         if path == repo.main:
             raise Problem(f"{branch} is checked out in the main checkout {repo.main}; switch it to main first")
         status = git_ok(path, "status", "--porcelain")
@@ -1335,7 +1430,7 @@ def parser():
     nested_json = argparse.ArgumentParser(add_help=False)     # never resets a --json given before the action
     nested_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
     ap = Parser(prog="harness-work", description="Ticket worktrees, attempts, dispatch, runs and budgets.")
-    sub = ap.add_subparsers(dest="cmd", metavar="{start,attempt,dispatch,runs,budget,worktrees,worktree}")
+    sub = ap.add_subparsers(dest="cmd", metavar="{start,attempt,cost,dispatch,runs,budget,worktrees,worktree}")
     sub.required = True
 
     start = sub.add_parser("start", parents=[with_repo, with_json],
@@ -1352,9 +1447,18 @@ def parser():
     attempt.add_argument("result", choices=("pass", "fail"))
     attempt.add_argument("--tier", choices=TIERS, help="the tier this attempt ran at (default: the ticket's)")
 
+    cost_ = sub.add_parser("cost", parents=[with_repo],
+                           help="a ticket's tokens and model time per stage and model, with its rounds; "
+                                "saves cost/<N>.json")
+    cost_.add_argument("number", type=issue_number, metavar="N")
+    cost_.add_argument("--pr", type=issue_number, metavar="P", help="the pull request, kept in the record")
+    output = cost_.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", help="print the record")
+    output.add_argument("--markdown", action="store_true", help="print the Cost block of the Resolution")
+
     dispatch = sub.add_parser("dispatch", parents=[with_repo, with_json],
                               help="start and launch a session per ready ticket")
-    dispatch.add_argument("--max", type=int, default=3, help="live runs at most (default 3)")
+    dispatch.add_argument("--max", type=int, default=10, help="live runs at most (default 10)")
     dispatch.add_argument("--venue", choices=VENUES,
                           help="default: bg (the subscription); headless bills the API key and is refused while the "
                                "api budget is exhausted")
@@ -1402,7 +1506,7 @@ def main():
         elif args.cmd == "budget":
             cmd_budget(args)
         else:
-            command = {"start": cmd_start, "attempt": cmd_attempt, "dispatch": cmd_dispatch,
+            command = {"start": cmd_start, "attempt": cmd_attempt, "cost": cmd_cost, "dispatch": cmd_dispatch,
                        "worktrees": cmd_worktrees, "worktree": cmd_worktree_remove}[args.cmd]
             command(open_repo(args.repo), args)
     except Problem as err:

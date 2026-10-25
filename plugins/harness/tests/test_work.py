@@ -654,6 +654,25 @@ class Attempt(WorkTest):
         data = self.ok_json("attempt", "12", "breaker", "fail", "--json")
         self.assertEqual((data["action"], data["failures"], data["tier"]), ("retry", 1, "sonnet"))
 
+    def test_escalation_starts_from_the_overridden_tier(self):
+        """#175: HARNESS_CODE_TIER in the main checkout's .claude/settings.json is the tier `start` reports and the
+        cache holds, and `attempt` escalates one tier up from it, not from the labels' tier (fable here)."""
+        hard = ("task", "status:ready", "size:L", "risk:high")
+        self.scenario(issues=[issue(labels=hard), issue(number=13, labels=hard)])
+        settings = os.path.join(self.repo, ".claude", "settings.json")
+        for number, setting, escalated in ((12, "opus", "fable"), (13, "sonnet", "opus")):
+            with self.subTest(setting=setting):
+                write(settings, json.dumps({"env": {"HARNESS_CODE_TIER": setting}}))
+                data = self.ok_json("start", str(number), "--json")
+                self.assertEqual(data["tier"], setting)
+                self.assertEqual(self.read_json(self.cache_path(number))["tier"], setting)
+                self.assertEqual(self.ok("attempt", str(number), "code", "fail").stdout.strip(), "retry")
+                self.assertEqual(self.ok("attempt", str(number), "code", "fail").stdout.strip(),
+                                 f"escalate {escalated}")
+                attempts = self.read_json(self.cache_path(number))["attempts"]
+                self.assertEqual([(a["stage"], a["tier"], a["result"]) for a in attempts],
+                                 [("code", setting, "fail")] * 2)
+
     def test_attempt_without_a_cache_says_to_start(self):
         self.assertOneLineError(self.work("attempt", "12", "code", "fail"), "harness-work start 12")
 
@@ -1254,6 +1273,677 @@ class Dispatch(WorkTest):
 
 
 IN_PROGRESS = ("task", "status:in-progress", "size:S", "risk:low")
+
+
+class DispatchDefaultMax(WorkTest):
+    """Ticket #130: `harness-work dispatch` without `--max` allows ten live runs at once (it was three)."""
+
+    def board(self, count):
+        numbers = list(range(12, 12 + count))
+        self.scenario(issues=[issue(n, title=f"Ticket {n}") for n in numbers],
+                      ready=[ready_row(n, f"Ticket {n}") for n in numbers])
+        return numbers
+
+    def sleeper(self, ticket):
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"/harness:work {ticket}"])
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        return live.pid
+
+    def test_dry_run_without_max_plans_ten_and_skips_the_rest_over_max_ten(self):
+        for count in (12, 15):
+            with self.subTest(ready=count):
+                numbers = self.board(count)
+                p = self.ok("dispatch", "--dry-run")
+                self.assertIn("Dry run: venue bg, 0 live, 10 of 10 slots free.", p.stdout)
+                starts = [ln for ln in p.stdout.splitlines() if ln.startswith("would start #")]
+                self.assertEqual(len(starts), 10, p.stdout)
+                for n in numbers[:10]:
+                    self.assertIn(f"would start #{n} Ticket {n} (tier sonnet) and launch bg", p.stdout.splitlines())
+                for n in numbers[10:]:
+                    self.assertIn(f"skip #{n}: over --max 10", p.stdout.splitlines())
+                data = self.ok_json("dispatch", "--dry-run", "--json")
+                self.assertEqual([row["number"] for row in data["plan"]], numbers[:10])
+                self.assertEqual([(s["number"], s["why"]) for s in data["skipped"]],
+                                 [(n, "over --max 10") for n in numbers[10:]])
+                self.assertEqual(self.claude_calls(), [])
+
+    def test_dry_run_with_ten_or_fewer_ready_tickets_plans_them_all_with_nothing_skipped(self):
+        for count in (4, 10):                       # four is past the old default of three
+            with self.subTest(ready=count):
+                numbers = self.board(count)
+                data = self.ok_json("dispatch", "--dry-run", "--json")
+                self.assertEqual([row["number"] for row in data["plan"]], numbers)
+                self.assertEqual(data["skipped"], [])
+                self.assertNotIn("skip #", self.ok("dispatch", "--dry-run").stdout)
+
+    def test_the_free_slots_are_ten_minus_the_live_runs(self):
+        for live_count in (1, 4):
+            with self.subTest(live=live_count):
+                if os.path.isdir(self.runs_dir()):
+                    shutil.rmtree(self.runs_dir())
+                live_numbers = list(range(40, 40 + live_count))
+                for n in live_numbers:
+                    self.write_run(n, pid=self.sleeper(n))
+                numbers = list(range(12, 24))
+                self.scenario(issues=[issue(n, title=f"Ticket {n}") for n in numbers + live_numbers],
+                              ready=[ready_row(n, f"Ticket {n}") for n in numbers])
+                free = 10 - live_count
+                p = self.ok("dispatch", "--dry-run")
+                self.assertIn(f"Dry run: venue bg, {live_count} live, {free} of 10 slots free.", p.stdout)
+                starts = [ln for ln in p.stdout.splitlines() if ln.startswith("would start #")]
+                self.assertEqual(len(starts), free, p.stdout)
+                data = self.ok_json("dispatch", "--dry-run", "--json")
+                self.assertEqual([row["number"] for row in data["plan"]], numbers[:free])
+                self.assertEqual([s["number"] for s in data["skipped"]], numbers[free:])
+                self.assertTrue(all(s["why"] == "over --max 10" for s in data["skipped"]))
+
+    def test_ten_live_runs_fill_the_default_cap(self):
+        for n in range(40, 50):
+            self.write_run(n, pid=self.sleeper(n))
+        self.scenario(issues=[issue(12), issue(13)], ready=[ready_row(12), ready_row(13, "Second")])
+        p = self.ok("dispatch")
+        self.assertIn("10 live runs; --max 10 reached, nothing launched.", p.stdout)
+        self.assertEqual(self.claude_calls(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+
+    def test_a_real_dispatch_without_max_launches_ten_of_twelve(self):
+        numbers = self.board(12)
+        p = self.ok("dispatch", env=self.env(FAKECLAUDE_BG_ID="ten123", **CREDENTIALS))
+        for n in numbers[:10]:
+            self.assertRegex(p.stdout, rf"(?m)^#{n} bg on t/{n}-\S+ \(id ten123\)$")
+        for n in numbers[10:]:
+            self.assertNotRegex(p.stdout, rf"(?m)^#{n} bg on")
+        self.assertEqual(sorted(c["argv"][-1] for c in self.claude_calls()),
+                         sorted(f"/harness:work {n}" for n in numbers[:10]))
+        self.assertEqual(len([r for r in self.run_records() if r["venue"] == "bg"]), 10)
+
+    def test_a_real_dispatch_without_max_and_four_live_runs_launches_six(self):
+        for n in range(40, 44):
+            self.write_run(n, pid=self.sleeper(n))
+        numbers = list(range(12, 24))
+        self.scenario(issues=[issue(n, title=f"Ticket {n}") for n in numbers],
+                      ready=[ready_row(n, f"Ticket {n}") for n in numbers])
+        self.ok("dispatch", env=self.env(**CREDENTIALS))
+        self.assertEqual(sorted(c["argv"][-1] for c in self.claude_calls()),
+                         sorted(f"/harness:work {n}" for n in numbers[:6]))
+
+    def test_an_explicit_max_still_overrides_the_default(self):
+        # 3 is the old default and 10 the new one: an explicit value equal to either must be honored as given.
+        for most in (2, 3, 5, 10, 12):
+            with self.subTest(max=most):
+                numbers = self.board(12)
+                p = self.ok("dispatch", "--dry-run", "--max", str(most))
+                self.assertIn(f"Dry run: venue bg, 0 live, {most} of {most} slots free.", p.stdout)
+                starts = [ln for ln in p.stdout.splitlines() if ln.startswith("would start #")]
+                self.assertEqual(len(starts), most, p.stdout)
+                for n in numbers[most:]:
+                    self.assertIn(f"skip #{n}: over --max {most}", p.stdout.splitlines())
+                data = self.ok_json("dispatch", "--dry-run", "--max", str(most), "--json")
+                self.assertEqual([row["number"] for row in data["plan"]], numbers[:most])
+                self.assertEqual([s["why"] for s in data["skipped"]], [f"over --max {most}"] * (12 - most))
+
+    def test_an_explicit_max_in_the_equals_form_or_abbreviated_is_honored(self):
+        # `--max=3`, `--max=5` and the argparse abbreviation `--ma 3` are explicit too; none may fall back to 10.
+        for spelling, most in ((("--max=3",), 3), (("--max=5",), 5), (("--max=10",), 10), (("--ma", "3"), 3),
+                               (("--ma=5",), 5)):
+            with self.subTest(args=" ".join(spelling)):
+                numbers = self.board(12)
+                p = self.ok("dispatch", "--dry-run", *spelling)
+                self.assertIn(f"Dry run: venue bg, 0 live, {most} of {most} slots free.", p.stdout)
+                starts = [ln for ln in p.stdout.splitlines() if ln.startswith("would start #")]
+                self.assertEqual(len(starts), most, p.stdout)
+                for n in numbers[most:]:
+                    self.assertIn(f"skip #{n}: over --max {most}", p.stdout.splitlines())
+                data = self.ok_json("dispatch", "--dry-run", "--json", *spelling)
+                self.assertEqual([row["number"] for row in data["plan"]], numbers[:most])
+                self.assertEqual([s["why"] for s in data["skipped"]], [f"over --max {most}"] * (12 - most))
+
+    def test_a_real_dispatch_with_max_equals_three_launches_exactly_three(self):
+        numbers = self.board(12)
+        self.ok("dispatch", "--max=3", env=self.env(**CREDENTIALS))
+        self.assertEqual(sorted(c["argv"][-1] for c in self.claude_calls()),
+                         sorted(f"/harness:work {n}" for n in numbers[:3]))
+
+    def test_a_real_dispatch_with_an_explicit_max_of_three_launches_exactly_three(self):
+        numbers = self.board(12)
+        self.ok("dispatch", "--max", "3", env=self.env(**CREDENTIALS))
+        self.assertEqual(sorted(c["argv"][-1] for c in self.claude_calls()),
+                         sorted(f"/harness:work {n}" for n in numbers[:3]))
+        self.assertEqual(len(self.run_records()), 3)
+
+    def test_a_real_dispatch_with_an_explicit_max_of_three_and_one_live_run_launches_two(self):
+        self.write_run(40, pid=self.sleeper(40))
+        numbers = list(range(12, 24))
+        self.scenario(issues=[issue(n, title=f"Ticket {n}") for n in numbers],
+                      ready=[ready_row(n, f"Ticket {n}") for n in numbers])
+        self.ok("dispatch", "--max", "3", env=self.env(**CREDENTIALS))
+        self.assertEqual(sorted(c["argv"][-1] for c in self.claude_calls()),
+                         sorted(f"/harness:work {n}" for n in numbers[:2]))
+
+    def test_a_real_dispatch_with_an_explicit_max_of_ten_and_three_live_runs_launches_seven(self):
+        for n in range(40, 43):
+            self.write_run(n, pid=self.sleeper(n))
+        numbers = list(range(12, 24))
+        self.scenario(issues=[issue(n, title=f"Ticket {n}") for n in numbers],
+                      ready=[ready_row(n, f"Ticket {n}") for n in numbers])
+        self.ok("dispatch", "--max", "10", env=self.env(**CREDENTIALS))
+        self.assertEqual(sorted(c["argv"][-1] for c in self.claude_calls()),
+                         sorted(f"/harness:work {n}" for n in numbers[:7]))
+
+
+class DispatchDefaultMaxDocs(unittest.TestCase):
+    """Ticket #130: the help text, the usage line and every doc state the default as ten."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+
+    # Failures here print only short snippets, never a whole file: harness-red reads "no tests ran" in output as an
+    # empty run, and docs/design.md contains that phrase.
+    def doc(self, *parts):
+        return read_text(os.path.join(self.ROOT, *parts))
+
+    def snippet(self, text, pattern):
+        """The first match of pattern in text, cut to 100 characters, or None."""
+        m = re.search(pattern, text)
+        return m.group(0)[:100] if m else None
+
+    def test_dispatch_help_says_default_ten(self):
+        p = subprocess.run([sys.executable, TOOL, "dispatch", "--help"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr[:200])
+        text = " ".join(p.stdout.split())
+        m = re.search(r"--max MAX (.*?)(?= --venue)", text)
+        self.assertIsNotNone(m, "no --max entry in dispatch --help")
+        entry = m.group(1)[:100]
+        self.assertTrue("(default 10)" in m.group(1), f"the --max help does not say (default 10): {entry!r}")
+        self.assertIsNone(re.search(r"default 3\b", m.group(1)), f"the --max help still says default 3: {entry!r}")
+
+    def test_the_usage_docstring_shows_max_ten(self):
+        head = read_text(TOOL).split('"""', 2)[1]
+        line = "harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]"
+        self.assertTrue(line in head, "the harness-work usage docstring has no `dispatch [--max 10] ...` line: "
+                        + repr(self.snippet(head, r"harness-work dispatch [^\n]*")))
+        self.assertTrue("[--max 3]" not in head, "the harness-work usage docstring still says [--max 3]")
+
+    def test_design_md_dispatch_line_shows_max_ten(self):
+        design = self.doc("docs", "design.md")
+        line = "- `dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]`:"
+        self.assertTrue(line in design, "docs/design.md has no `dispatch [--max 10] ...` bullet; it has: "
+                        + repr(self.snippet(design, r"- `dispatch \[[^\n]*")))
+        self.assertTrue("[--max 3]" not in design, "docs/design.md still says [--max 3]")
+
+    def test_the_work_skill_dry_run_threshold_is_ten_ready_tickets(self):
+        body = skill_body()
+        self.assertTrue(re.search(r"more than (ten|10) ready tickets and no `--max`", body) is not None,
+                        "the work skill's dry-run rule does not say more than ten ready tickets and no `--max`; "
+                        "it says: " + repr(self.snippet(body, r"more than \w+ ready tickets[^\n]{0,30}")))
+        self.assertTrue(re.search(r"(?i)more than (three|3) ready tickets", body) is None,
+                        "the work skill still says more than three ready tickets")
+
+    def test_no_doc_states_three_as_the_dispatch_max_default(self):
+        docs = [os.path.join(self.ROOT, "README.md"), os.path.join(self.ROOT, "docs", "design.md"),
+                os.path.join(self.ROOT, "docs", "guide.md")]
+        for folder in (os.path.join(self.ROOT, "user"), os.path.join(self.ROOT, "plugins", "harness", "skills"),
+                       os.path.join(self.ROOT, "plugins", "harness", "agents")):
+            for base, _dirs, names in os.walk(folder):
+                docs += [os.path.join(base, n) for n in names if n.endswith(".md")]
+        for path in docs:
+            with self.subTest(doc=os.path.relpath(path, self.ROOT)):
+                text = read_text(path)
+                for pattern in (r"\[--max 3\]",
+                                r"(?i)--max[^\n]{0,60}\bdefault(?:s| is| of)? (?:3|three)\b",
+                                r"(?i)\bdefault(?:s| is| of)? (?:3|three)\b[^\n]{0,60}--max",
+                                r"(?i)\b(?:up to|at most|no more than) (?:3|three)\b(?! chars)",
+                                r"(?i)\b(?:3|three) (?:at a time|at once|live|concurrent|parallel)\b"):
+                    found = self.snippet(text, pattern)
+                    self.assertTrue(found is None, f"still states 3 as the --max default: {found!r}")
+
+
+class DispatchEffort(WorkTest):
+    """Ticket #176: `harness-work dispatch` launches each session at the effort the project configures
+    (HARNESS_CODE_EFFORT in the main checkout's .claude/settings.json), as `--effort <level>`; the dispatcher's own
+    CLAUDE_EFFORT neither decides the flag nor reaches the child. Without the setting nothing changes. WorkTest.env
+    drops every CLAUDE* and HARNESS_* variable of the real environment, so these tests set their own."""
+
+    BG_TODAY = ["--bg", "-n", "proj #12 Add the board tool", "--permission-mode", "auto", "/harness:work 12"]
+
+    def configure(self, **env):
+        """The main checkout's settings.json with the given env keys (HARNESS_CODE_EFFORT=...)."""
+        write(os.path.join(self.repo, ".claude", "settings.json"), json.dumps({"env": env}))
+
+    def bg_with_effort(self, name, effort, prompt):
+        return ["--bg", "-n", name, "--permission-mode", "auto", "--effort", effort, prompt]
+
+    def warnings(self, p):
+        return [ln for ln in p.stderr.splitlines() if ln.startswith("harness-work:")]
+
+    @staticmethod
+    def effort_problem(raw):
+        """The one warning for an invalid HARNESS_CODE_EFFORT: `harness-work: ` + load_routing's problems line."""
+        return f"harness-work: HARNESS_CODE_EFFORT={raw!r} is not one of low, medium, high, xhigh, max; ignored"
+
+    def dispatch_from(self, cwd, *args, env=None):
+        p = self.work("dispatch", *args, env=env, cwd=cwd)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return p
+
+    def headless_call(self, index=0):
+        self.assertTrue(wait_for(lambda: len(self.claude_calls()) > index), self.claude_calls())
+        return self.claude_calls()[index]
+
+    def settle(self):
+        """Wait for the fake headless runs to end, so no process outlives the test."""
+        for record in self.run_records():
+            if record.get("pid"):
+                self.assertTrue(wait_for(lambda: pid_gone(record["pid"])))
+
+    def test_bg_launch_passes_the_configured_effort(self):
+        self.configure(HARNESS_CODE_EFFORT="xhigh")
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        p = self.ok("dispatch")
+        self.assertIn(f"#12 bg on {BRANCH} (id abc123)", p.stdout)
+        self.assertEqual(self.warnings(p), [])
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"], ["--bg", "-n", "proj #12 Add the board tool", "--permission-mode", "auto",
+                                        "--effort", "xhigh", "/harness:work 12"])
+        self.assertEqual(os.path.realpath(call["cwd"]), self.worktree_path())
+        [record] = self.run_records()
+        self.assertEqual((record["venue"], record["bg_id"], record["effort"]), ("bg", "abc123", "xhigh"))
+
+    def test_the_flag_follows_the_setting_and_covers_every_launched_ticket(self):
+        # Two tickets in one dispatch both get the level; a later dispatch with another level gives that one. A
+        # hard-coded level or a flag that ignores the setting fails one of the three launches.
+        self.configure(HARNESS_CODE_EFFORT="low")
+        self.scenario(issues=[issue(12), issue(13, title="Second"), issue(14, title="Third")],
+                      ready=[ready_row(12), ready_row(13, "Second")])
+        self.ok("dispatch", "--max", "2")
+        calls = {c["argv"][c["argv"].index("-n") + 1]: c["argv"] for c in self.claude_calls()}
+        self.assertEqual(calls, {
+            "proj #12 Add the board tool": self.bg_with_effort("proj #12 Add the board tool", "low",
+                                                               "/harness:work 12"),
+            "proj #13 Second": self.bg_with_effort("proj #13 Second", "low", "/harness:work 13")})
+
+        self.configure(HARNESS_CODE_EFFORT="max")
+        agents = json.dumps([{"id": "abc123", "kind": "background", "state": "working",
+                              "cwd": self.worktree_path("t/12-add-the-board-tool")}])
+        self.scenario(issues=[issue(12), issue(13, title="Second"), issue(14, title="Third")],
+                      ready=[ready_row(14, "Third")])
+        self.ok("dispatch", env=self.env(FAKECLAUDE_AGENTS=agents))
+        newest = self.claude_calls()[-1]["argv"]
+        self.assertEqual(newest, self.bg_with_effort("proj #14 Third", "max", "/harness:work 14"))
+
+    def test_every_valid_level_is_passed_as_given(self):
+        # The level is the setting's value, lower-cased; one dispatch per level in a project of its own.
+        for level, written in (("low", "low"), ("medium", "medium"), ("high", "High"), ("xhigh", "XHIGH"),
+                               ("max", "max")):
+            with self.subTest(level=written):
+                self.setUp()                                     # a fresh project, home and logs per level
+                self.configure(HARNESS_CODE_EFFORT=written)
+                self.scenario(issues=[issue()], ready=[ready_row(12)])
+                self.ok("dispatch")
+                [call] = self.claude_calls()
+                self.assertEqual(call["argv"], self.bg_with_effort("proj #12 Add the board tool", level,
+                                                                   "/harness:work 12"))
+                self.assertEqual(self.run_records()[0]["effort"], level)
+
+    def test_headless_launch_passes_the_configured_effort(self):
+        keyfile = write(os.path.join(self.tmp, "key.txt"), SECRET + "\n")
+        self.configure(HARNESS_CODE_EFFORT="xhigh")
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        env = self.env(HARNESS_API_KEY_CMD=f"cat {keyfile}")
+        self.ok("dispatch", "--venue", "headless", env=env)
+        argv = self.headless_call()["argv"]
+        self.assertEqual(len(argv), 10, argv)
+        self.assertEqual(argv[:7], ["-p", "/harness:work 12", "--permission-mode", "auto", "--output-format", "json",
+                                    "--settings"])
+        self.assertEqual(json.loads(argv[7]), {"apiKeyHelper": f"cat {keyfile}"})
+        self.assertEqual(argv[8:], ["--effort", "xhigh"])
+        [record] = self.run_records()
+        self.assertEqual((record["venue"], record["effort"]), ("headless", "xhigh"))
+        self.assertNotIn(SECRET, json.dumps(self.claude_calls()))
+        self.settle()
+
+    def test_without_the_setting_argv_and_record_are_unchanged(self):
+        # No settings file at all, a settings file without the key, and a blank value: all three are "not set".
+        cases = (("no settings file", None), ("other keys only", {"HARNESS_CODE_TIER": "opus"}),
+                 ("blank value", {"HARNESS_CODE_EFFORT": "  "}))
+        for label, env in cases:
+            with self.subTest(label):
+                self.setUp()
+                if env is not None:
+                    self.configure(**env)
+                self.scenario(issues=[issue()], ready=[ready_row(12)])
+                p = self.ok("dispatch")
+                self.assertEqual(self.warnings(p), [])
+                [call] = self.claude_calls()
+                self.assertEqual(call["argv"], self.BG_TODAY)
+                [record] = self.run_records()
+                self.assertNotIn("effort", record)
+                self.assertEqual(sorted(record), sorted(["id", "ticket", "repo", "worktree", "branch", "venue", "log",
+                                                         "started_at", "ended_at", "exit", "outcome", "bg_id"]))
+        with self.subTest("headless"):
+            self.setUp()
+            self.scenario(issues=[issue()], ready=[ready_row(12)])
+            self.ok("dispatch", "--venue", "headless")
+            argv = self.headless_call()["argv"]
+            self.assertEqual(len(argv), 8, argv)
+            self.assertNotIn("--effort", argv)
+            [record] = self.run_records()
+            self.assertNotIn("effort", record)
+            self.settle()
+
+    def test_dry_run_and_json_name_the_effort(self):
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "/harness:work 13"])
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        self.write_run(13, pid=live.pid)
+        self.scenario(issues=[issue(), issue(13), issue(14)],
+                      ready=[ready_row(12), ready_row(13, "Second"), ready_row(14, "Third")])
+
+        self.configure(HARNESS_CODE_EFFORT="xhigh")
+        p = self.ok("dispatch", "--dry-run", "--max", "2")
+        lines = p.stdout.splitlines()
+        self.assertEqual(lines[0], "Dry run: venue bg, effort xhigh, 1 live, 1 of 2 slots free.")
+        self.assertIn("would start #12 Add the board tool (tier sonnet) and launch bg", lines)
+        self.assertTrue(any(ln.startswith("skip #14: over --max 2") for ln in lines), p.stdout)
+
+        p = self.ok("dispatch", "--dry-run", "--max", "3", "--venue", "headless")
+        self.assertEqual(p.stdout.splitlines()[0], "Dry run: venue headless, effort xhigh, 1 live, 2 of 3 slots free.")
+
+        self.configure(HARNESS_CODE_EFFORT="Max")                # the level as launched: lower-cased
+        data = self.ok_json("dispatch", "--dry-run", "--max", "2", "--json")
+        self.assertEqual((data["venue"], data["effort"]), ("bg", "max"))
+        self.assertEqual([row["number"] for row in data["plan"]], [12])
+        self.assertEqual(self.ok("dispatch", "--dry-run", "--max", "2").stdout.splitlines()[0],
+                         "Dry run: venue bg, effort max, 1 live, 1 of 2 slots free.")
+
+        self.configure()                                         # not set: the line is today's, effort is null
+        p = self.ok("dispatch", "--dry-run", "--max", "2")
+        self.assertEqual(p.stdout.splitlines()[0], "Dry run: venue bg, 1 live, 1 of 2 slots free.")
+        self.assertNotIn("effort", p.stdout)
+        data = self.ok_json("dispatch", "--dry-run", "--max", "2", "--json")
+        self.assertIn("effort", data)
+        self.assertIsNone(data["effort"])
+        self.assertEqual(self.claude_calls(), [])
+
+    def test_the_json_result_of_a_launch_carries_the_effort(self):
+        self.configure(HARNESS_CODE_EFFORT="high")
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        data = self.ok_json("dispatch", "--json")
+        self.assertEqual((data["venue"], data["effort"]), ("bg", "high"))
+        [launched] = data["launched"]
+        self.assertEqual((launched["ticket"], launched["effort"]), (12, "high"))
+
+        self.setUp()                                             # unset: the key is there, null, the record has none
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        data = self.ok_json("dispatch", "--json")
+        self.assertIn("effort", data)
+        self.assertIsNone(data["effort"])
+        [launched] = data["launched"]
+        self.assertNotIn("effort", launched)
+
+        self.setUp()                                             # nothing to launch: the key is still there
+        self.configure(HARNESS_CODE_EFFORT="high")
+        self.scenario()
+        data = self.ok_json("dispatch", "--json")
+        self.assertEqual((data["launched"], data["effort"]), ([], "high"))
+
+    def test_the_dispatchers_claude_effort_is_not_inherited(self):
+        # The dispatching Claude Code session exports CLAUDE_EFFORT (its own level) to its Bash tool.
+        self.configure(HARNESS_CODE_EFFORT="xhigh")
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        self.ok("dispatch", env=self.env(CLAUDE_EFFORT="max"))
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"], self.bg_with_effort("proj #12 Add the board tool", "xhigh", "/harness:work 12"))
+        self.assertNotIn("CLAUDE_EFFORT", call["env"])
+        self.assertNotIn("max", call["argv"])
+
+        self.setUp()                                             # headless: the same
+        self.configure(HARNESS_CODE_EFFORT="low")
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        self.ok("dispatch", "--venue", "headless", env=self.env(CLAUDE_EFFORT="max"))
+        call = self.headless_call()
+        self.assertEqual(call["argv"][8:], ["--effort", "low"])
+        self.assertNotIn("CLAUDE_EFFORT", call["env"])
+        self.settle()
+
+        self.setUp()                                             # no setting: the dispatcher's level decides nothing
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        self.ok("dispatch", env=self.env(CLAUDE_EFFORT="max"))
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"], self.BG_TODAY)
+        self.assertNotIn("--effort", call["argv"])
+        self.assertNotIn("CLAUDE_EFFORT", call["env"])
+        [record] = self.run_records()
+        self.assertNotIn("effort", record)
+
+    def test_invalid_effort_warns_and_launches_without_the_flag(self):
+        for bad in ("turbo", "extra-high", "5"):
+            with self.subTest(bad=bad):
+                self.setUp()
+                self.configure(HARNESS_CODE_EFFORT=bad)
+                self.scenario(issues=[issue()], ready=[ready_row(12)])
+                p = self.ok("dispatch", env=self.env(CLAUDE_EFFORT="max"))
+                self.assertEqual(self.warnings(p), [self.effort_problem(bad)], p.stderr)
+                [call] = self.claude_calls()
+                self.assertEqual(call["argv"], self.BG_TODAY)
+                self.assertNotIn("--effort", call["argv"])
+                [record] = self.run_records()
+                self.assertNotIn("effort", record)
+                self.assertIn(f"#12 bg on {BRANCH} (id abc123)", p.stdout)    # the ticket still launched
+
+    def test_an_invalid_effort_is_one_warning_per_dispatch_not_per_launch(self):
+        self.configure(HARNESS_CODE_EFFORT="turbo")
+        self.scenario(issues=[issue(12), issue(13, title="Second")],
+                      ready=[ready_row(12), ready_row(13, "Second")])
+        p = self.ok("dispatch", "--max", "2")
+        self.assertEqual(self.warnings(p), [self.effort_problem("turbo")], p.stderr)
+        self.assertEqual(p.stderr.count("HARNESS_CODE_EFFORT"), 1, p.stderr)
+        self.assertIn("#12 bg on", p.stdout)
+        self.assertIn("#13 bg on", p.stdout)
+        calls = {c["argv"][c["argv"].index("-n") + 1]: c["argv"] for c in self.claude_calls()}
+        self.assertEqual(calls, {
+            "proj #12 Add the board tool": ["--bg", "-n", "proj #12 Add the board tool", "--permission-mode", "auto",
+                                            "/harness:work 12"],
+            "proj #13 Second": ["--bg", "-n", "proj #13 Second", "--permission-mode", "auto", "/harness:work 13"]})
+        self.assertTrue(all("effort" not in r for r in self.run_records()))
+
+    def test_an_invalid_effort_is_warned_about_on_paths_that_launch_nothing(self):
+        bad = "turbo"
+        with self.subTest("dry run"):
+            self.setUp()
+            self.configure(HARNESS_CODE_EFFORT=bad)
+            self.scenario(issues=[issue(12), issue(13, title="Second")],
+                          ready=[ready_row(12), ready_row(13, "Second")])
+            p = self.ok("dispatch", "--dry-run", "--max", "2")
+            self.assertEqual(self.warnings(p), [self.effort_problem(bad)], p.stderr)
+            self.assertEqual(p.stderr.count("HARNESS_CODE_EFFORT"), 1, p.stderr)
+            self.assertEqual(p.stdout.splitlines()[0], "Dry run: venue bg, 0 live, 2 of 2 slots free.")
+            self.assertEqual(self.claude_calls(), [])
+        with self.subTest("empty board"):
+            self.setUp()
+            self.configure(HARNESS_CODE_EFFORT=bad)
+            self.scenario()
+            p = self.ok("dispatch")
+            self.assertIn("No ready tickets.", p.stdout)
+            self.assertEqual(self.warnings(p), [self.effort_problem(bad)], p.stderr)
+            self.assertEqual(p.stderr.count("HARNESS_CODE_EFFORT"), 1, p.stderr)
+            self.assertEqual(self.claude_calls(), [])
+        with self.subTest("empty board, invalid value from the environment"):
+            self.setUp()
+            self.scenario()
+            p = self.ok("dispatch", env=self.env(HARNESS_CODE_EFFORT="extra-high"))
+            self.assertEqual(self.warnings(p), [self.effort_problem("extra-high")], p.stderr)
+
+    def test_with_json_the_invalid_effort_warning_is_on_stderr_only(self):
+        for label, args, scenario in (
+                ("launch", ("dispatch", "--json"), dict(issues=[issue()], ready=[ready_row(12)])),
+                ("dry run", ("dispatch", "--dry-run", "--json"), dict(issues=[issue()], ready=[ready_row(12)])),
+                ("empty board", ("dispatch", "--json"), {})):
+            with self.subTest(label):
+                self.setUp()
+                self.configure(HARNESS_CODE_EFFORT="turbo")
+                self.scenario(**scenario)
+                p = self.ok(*args)
+                self.assertEqual(self.warnings(p), [self.effort_problem("turbo")], p.stderr)
+                self.assertNotIn("HARNESS_CODE_EFFORT", p.stdout)
+                data = json.loads(p.stdout)                      # stdout stays pure JSON
+                self.assertIn("effort", data)
+                self.assertIsNone(data["effort"])
+                if label == "launch":
+                    [launched] = data["launched"]
+                    self.assertNotIn("effort", launched)
+
+    def test_a_valid_effort_is_not_warned_about(self):
+        self.configure(HARNESS_CODE_EFFORT="medium")
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        p = self.ok("dispatch")
+        self.assertEqual(self.warnings(p), [])
+        self.assertEqual(p.stderr.strip(), "")
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"], self.bg_with_effort("proj #12 Add the board tool", "medium", "/harness:work 12"))
+
+    def test_the_setting_is_read_from_the_main_checkout_whatever_the_cwd(self):
+        # The setting lives only in the main checkout's settings.json. Dispatch run from a subdirectory of it, and
+        # from another worktree of the repository (whose own settings.json says otherwise), uses the main one.
+        for label in ("subdirectory", "other worktree"):
+            with self.subTest(label):
+                self.setUp()
+                self.configure(HARNESS_CODE_EFFORT="xhigh")
+                cwd = self.mk("proj", "docs", "deep")
+                if label == "other worktree":
+                    cwd = os.path.join(self.tmp, "side-wt")
+                    self.git(self.repo, "worktree", "add", "-q", "-b", "side", cwd)
+                    self.assertFalse(os.path.exists(os.path.join(cwd, ".claude", "settings.json")))
+                    write(os.path.join(cwd, ".claude", "settings.json"),
+                          json.dumps({"env": {"HARNESS_CODE_EFFORT": "low"}}))
+                self.scenario(issues=[issue()], ready=[ready_row(12)])
+                p = self.dispatch_from(cwd)
+                self.assertEqual(self.warnings(p), [])
+                [call] = self.claude_calls()
+                self.assertEqual(call["argv"], self.bg_with_effort("proj #12 Add the board tool", "xhigh",
+                                                                   "/harness:work 12"))
+                self.assertEqual(self.run_records()[0]["effort"], "xhigh")
+
+    def test_the_setting_is_found_from_a_subdirectory_for_headless_and_dry_run(self):
+        self.configure(HARNESS_CODE_EFFORT="medium")
+        sub = self.mk("proj", "a", "b")
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        p = self.dispatch_from(sub, "--dry-run", "--max", "3")
+        self.assertEqual(p.stdout.splitlines()[0], "Dry run: venue bg, effort medium, 0 live, 3 of 3 slots free.")
+        self.dispatch_from(sub, "--venue", "headless")
+        self.assertEqual(self.headless_call()["argv"][8:], ["--effort", "medium"])
+        self.settle()
+
+    def test_the_environment_beats_the_file_when_not_blank(self):
+        for label, in_env, in_file, want in (("env over file", "low", "xhigh", "low"),
+                                            ("env level lower-cased", "MAX", "low", "max"),
+                                            ("env padded", "  high ", "low", "high"),
+                                            ("env only", "medium", None, "medium")):
+            with self.subTest(label):
+                self.setUp()
+                if in_file is not None:
+                    self.configure(HARNESS_CODE_EFFORT=in_file)
+                self.scenario(issues=[issue()], ready=[ready_row(12)])
+                p = self.ok("dispatch", env=self.env(HARNESS_CODE_EFFORT=in_env))
+                self.assertEqual(self.warnings(p), [])
+                [call] = self.claude_calls()
+                self.assertEqual(call["argv"], self.bg_with_effort("proj #12 Add the board tool", want,
+                                                                   "/harness:work 12"))
+                self.assertEqual(self.run_records()[0]["effort"], want)
+
+    def test_a_blank_environment_value_falls_back_to_the_file(self):
+        for blank in ("", "   "):
+            with self.subTest(blank=blank):
+                self.setUp()
+                self.configure(HARNESS_CODE_EFFORT="high")
+                self.scenario(issues=[issue()], ready=[ready_row(12)])
+                p = self.ok("dispatch", env=self.env(HARNESS_CODE_EFFORT=blank))
+                self.assertEqual(self.warnings(p), [])
+                [call] = self.claude_calls()
+                self.assertEqual(call["argv"], self.bg_with_effort("proj #12 Add the board tool", "high",
+                                                                   "/harness:work 12"))
+
+    def test_an_invalid_environment_value_is_warned_about_and_not_rescued_by_the_file(self):
+        self.configure(HARNESS_CODE_EFFORT="high")
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        p = self.ok("dispatch", env=self.env(HARNESS_CODE_EFFORT="turbo"))
+        self.assertEqual(self.warnings(p), [self.effort_problem("turbo")], p.stderr)
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"], self.BG_TODAY)
+        self.assertNotIn("effort", self.run_records()[0])
+
+    def test_settings_local_json_is_never_read(self):
+        write(os.path.join(self.repo, ".claude", "settings.local.json"),
+              json.dumps({"env": {"HARNESS_CODE_EFFORT": "max"}}))
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        data = self.ok_json("dispatch", "--dry-run", "--json")
+        self.assertIsNone(data["effort"])
+        p = self.ok("dispatch")
+        self.assertEqual(self.warnings(p), [])
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"], self.BG_TODAY)
+        self.assertNotIn("effort", self.run_records()[0])
+
+        self.setUp()                                             # nor does it override settings.json
+        write(os.path.join(self.repo, ".claude", "settings.local.json"),
+              json.dumps({"env": {"HARNESS_CODE_EFFORT": "max"}}))
+        self.configure(HARNESS_CODE_EFFORT="low")
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        self.ok("dispatch")
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"], self.bg_with_effort("proj #12 Add the board tool", "low", "/harness:work 12"))
+
+    def test_another_invalid_routing_key_is_its_own_warning_and_leaves_the_effort_alone(self):
+        self.configure(HARNESS_CODE_EFFORT="xhigh", HARNESS_CODE_TIER="bogus")
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        p = self.ok("dispatch")
+        self.assertEqual(self.warnings(p),
+                         ["harness-work: HARNESS_CODE_TIER='bogus' is not one of sonnet, opus, fable; ignored"],
+                         p.stderr)
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"], self.bg_with_effort("proj #12 Add the board tool", "xhigh", "/harness:work 12"))
+        self.assertEqual(self.run_records()[0]["effort"], "xhigh")
+
+        self.setUp()                                             # three invalid keys: three warnings, routing order
+        self.configure(HARNESS_CODE_EFFORT="turbo", HARNESS_REVIEW_TIER="gold", HARNESS_CODE_TIER="bogus")
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        p = self.ok("dispatch")
+        self.assertEqual(self.warnings(p), [
+            "harness-work: HARNESS_CODE_TIER='bogus' is not one of sonnet, opus, fable; ignored",
+            self.effort_problem("turbo"),
+            "harness-work: HARNESS_REVIEW_TIER='gold' is not one of sonnet, opus, fable; ignored"], p.stderr)
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"], self.BG_TODAY)
+
+    def test_a_redispatched_ticket_gets_the_effort_too(self):
+        # #12 is in progress and its last run ended in an error; #13 is fresh from the board.
+        self.write_run(12, id=f"{self.key}-12-20261013090000", pid=self.dead_pid(), started_at=iso_ago(hours=3),
+                       ended_at=iso_ago(hours=2), outcome="error")
+        self.configure(HARNESS_CODE_EFFORT="xhigh")
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS), issue(13, title="Fresh")],
+                      ready=[ready_row(13, "Fresh")])
+        dry = self.ok("dispatch", "--dry-run", "--max", "3")
+        self.assertIn("would start #12 Add the board tool (again after error) and launch bg", dry.stdout)
+        self.assertEqual(dry.stdout.splitlines()[0], "Dry run: venue bg, effort xhigh, 0 live, 3 of 3 slots free.")
+
+        p = self.ok("dispatch", "--max", "3", env=self.env(FAKECLAUDE_BG_ID="redo57"))
+        self.assertRegex(p.stdout, r"(?m)^#12 bg on t/12-\S+ \(id redo57\)$")
+        calls = {c["argv"][c["argv"].index("-n") + 1]: c["argv"] for c in self.claude_calls()}
+        self.assertEqual(calls["proj #12 Add the board tool"],
+                         self.bg_with_effort("proj #12 Add the board tool", "xhigh", "/harness:work 12"))
+        self.assertEqual(calls["proj #13 Fresh"], self.bg_with_effort("proj #13 Fresh", "xhigh", "/harness:work 13"))
+        again = next(r for r in self.run_records() if r["ticket"] == 12 and r.get("bg_id") == "redo57")
+        self.assertEqual(again["effort"], "xhigh")
+
+    def test_a_redispatched_ticket_launches_headless_with_the_effort(self):
+        self.write_run(12, id=f"{self.key}-12-20261013090000", pid=self.dead_pid(), started_at=iso_ago(hours=3),
+                       ended_at=iso_ago(hours=2), outcome="error")
+        self.configure(HARNESS_CODE_EFFORT="high")
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS)])
+        self.ok("dispatch", "--venue", "headless")
+        argv = self.headless_call()["argv"]
+        self.assertEqual((argv[:2], argv[8:]), (["-p", "/harness:work 12"], ["--effort", "high"]))
+        self.settle()
 
 
 class RedispatchCap(WorkTest):

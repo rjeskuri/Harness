@@ -10,6 +10,7 @@ first run, which costs about half a second each time.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -27,15 +28,27 @@ FAKEGH = os.path.join(HERE, "fakegh.py")
 GIT = shutil.which("git")
 REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
 MARK = "\n\n<!-- harness -->"      # the last line of every comment harness-board posts
+# The five routing settings (docs/design.md, Settings): dropped from the inherited environment like HARNESS_PROJECT.
+ROUTING_KEYS = ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER", "HARNESS_ULTRAREVIEW",
+                "HARNESS_WAVE_REVIEW")
 
 # The label table from docs/design.md, the source of truth for `labels ensure`.
 SPEC_COLORS = {
     "epic": "5319E7", "task": "0E8A16", "bug": "D73A4A", "chore": "BFD4F2", "refactor": "C2E0C6",
     "status:ready": "0052CC", "status:in-progress": "FBCA04", "status:in-review": "D4C5F9",
-    "status:blocked": "B60205", "status:needs-input": "E99695",
+    "status:blocked": "B60205", "status:needs-input": "E99695", "status:proposed": "BFE5BF",
     "size:S": "C5DEF5", "size:M": "BFDADC", "size:L": "F9D0C4",
     "risk:low": "E6E6E6", "risk:high": "B60205",
     "no-tests": "EDEDED", "needs-local": "FEF2C0", "priority:high": "FF7F0E",
+    "manual-land": "D93F0B", "incident": "B60205", "degraded": "FBCA04", "deploy-frozen": "000000",
+}
+# Descriptions checked exactly: the autoland group's (#149) and status:proposed's (#159).
+AUTOLAND_DESCRIPTIONS = {
+    "manual-land": "Land by hand: autoland skips it",
+    "incident": "A live check failed; autoland is paused in this repo",
+    "degraded": "A live check is degraded; nothing was reverted",
+    "deploy-frozen": "Deploys are stopped until you clear this",
+    "status:proposed": "A plan waiting for you to promote it",       # #159
 }
 
 TASK_BODY = """## Request
@@ -204,7 +217,7 @@ class BoardTest(unittest.TestCase):
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items()
                if k not in ("CLAUDE_PROJECT_DIR", "HARNESS_GH", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
-                            "HARNESS_NOTIFY_APP", "HARNESS_NOTIFY_SOUND", "HARNESS_PROJECT")}
+                            "HARNESS_NOTIFY_APP", "HARNESS_NOTIFY_SOUND", "HARNESS_PROJECT") + ROUTING_KEYS}
         paths = [self.fakebin] + ([os.path.dirname(GIT)] if GIT else []) + ["/usr/bin", "/bin"]
         env.update(HOME=self.home, PATH=os.pathsep.join(paths), GIT_CEILING_DIRECTORIES=self.tmp,
                    GIT_CONFIG_NOSYSTEM="1", FAKEGH_SCENARIO=self.scenario_path, FAKEGH_LOG=self.log,
@@ -274,7 +287,7 @@ class Labels(BoardTest):
         p = self.ok("labels", "ensure")
         calls = self.calls()
         self.assertEqual(len(calls), len(SPEC_COLORS))
-        seen = {}
+        seen, descriptions = {}, {}
         for argv in calls:
             self.assertEqual(argv[:2], ["label", "create"])
             self.assertEqual(argv[3], "--color")
@@ -283,8 +296,32 @@ class Labels(BoardTest):
             self.assertLessEqual(len(argv[6]), 100, argv)           # GitHub's limit for a description
             self.assertEqual(argv[7:], ["--force"])
             seen[argv[2]] = argv[4]
+            descriptions[argv[2]] = argv[6]
         self.assertEqual(seen, SPEC_COLORS)
+        self.assertEqual(len(SPEC_COLORS), 23)                      # 22 before #159, plus status:proposed
         self.assertIn(f"{len(SPEC_COLORS)} labels created or updated", p.stdout)
+        self.assertIn("23 labels created or updated", p.stdout)
+        for name, text in AUTOLAND_DESCRIPTIONS.items():
+            self.assertEqual(descriptions.get(name), text, name)
+
+    def test_design_md_label_table_lists_exactly_the_spec_labels_and_colors(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "docs", "design.md")
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("Labels (name, color, meaning)"))
+        rows = []
+        for line in lines[start + 1:]:
+            if line.startswith("|"):
+                rows.append(line)
+            elif rows:                                              # the first non-table line after the table
+                break
+        self.assertGreaterEqual(len(rows), 3, rows)                 # header, separator and at least one group
+        documented = {}
+        for row in rows[2:]:
+            for name, color in re.findall(r"`([^`\s]+)` ([0-9A-Fa-f]{6})\b", row):
+                self.assertNotIn(name, documented, f"{name} is listed twice in design.md")
+                documented[name] = color.upper()
+        self.assertEqual(documented, SPEC_COLORS)
 
     def test_a_failed_create_is_one_line_with_ghs_error(self):
         self.scenario([{"match": ["label", "create"], "stderr": "HTTP 403: Resource not accessible\nmore\n",
@@ -2227,6 +2264,218 @@ class Answers(BoardTest):
         p = self.board("answers", "12", "--since", "yesterday")
         self.assertOneLineError(p, "--since: not an ISO-8601 time")
 
+    # Ticket #167: the deploy guard (scripts/deploy_guard.py) posts its needs-input question from the deploy workflow,
+    # so on GitHub it is authored by github-actions[bot], not the owner. It must anchor `answers`; only the owner's
+    # replies after it come back, and no bot comment is ever an answer.
+    BOT = "github-actions[bot]"
+    GUARD = ("**Needs your input**\n\nThe deploy of #12 failed its live check and was reverted. "
+             "Retry, or change the approach?\n\nReply in a comment; /harness:work 12 picks it up.")
+
+    def test_a_bot_question_anchors_and_only_the_later_owner_replies_come_back(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                    comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                    comment("rjeskuri", "2026-10-13T10:30:00Z", "Actually, ship it behind a flag."),
+                    comment(self.BOT, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry, the outage was upstream.")]
+        self.assertEqual(self.answers(comments), ["Retry, the outage was upstream."])
+
+    def test_the_bot_question_anchors_when_it_is_the_only_question_or_the_cache_is_newer(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", "early thought"),
+                    comment(self.BOT, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry."),
+                    comment("rjeskuri", "2026-10-13T13:00:00Z", "And bump the timeout.")]
+        self.assertEqual(self.answers(comments), ["Retry.", "And bump the timeout."])
+        self.put_cache(12, {"number": 12, "fetched_at": "2026-10-13T14:00:00Z"})       # newer than every comment
+        self.assertEqual(self.answers(comments), ["Retry.", "And bump the timeout."])
+
+    def test_the_newest_question_wins_whoever_asked_it(self):
+        comments = [comment(self.BOT, "2026-10-13T09:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T10:00:00Z", "Retry."),
+                    comment("rjeskuri", "2026-10-13T11:00:00Z", "**Needs your input**\n\nAnd the name?" + MARK),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Call it export."),
+                    comment(self.BOT, "2026-10-13T13:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T14:00:00Z", "Give up on it."),
+                    comment(self.BOT, "2026-10-13T15:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T16:00:00Z", "Try once more.")]
+        self.assertEqual(self.answers(comments), ["Try once more."])
+        self.assertEqual(self.answers(comments[:6]), ["Give up on it."])
+        self.assertEqual(self.answers(comments[:4]), ["Call it export."])
+
+    def test_bot_comments_are_never_returned_as_answers(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                    comment(self.BOT, "2026-10-13T10:00:00Z", self.GUARD + MARK),
+                    comment(self.BOT, "2026-10-13T10:30:00Z", "Deploy finished: all checks passed."),
+                    comment(self.BOT, "2026-10-13T10:45:00Z", "Reverted by the deploy guard." + MARK),
+                    comment(self.BOT, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry."),
+                    comment(self.BOT, "2026-10-13T13:00:00Z", "Deploy finished: all checks passed."),
+                    comment(self.BOT, "2026-10-13T14:00:00Z", "Plain bot chatter, no marker."),
+                    comment("rjeskuri", "2026-10-13T15:00:00Z", "Thanks.")]
+        # with the anchor and with an explicit --since that reaches back before it
+        self.assertEqual(self.answers(comments), ["Retry.", "Thanks."])
+        self.assertEqual(self.answers(comments, "--since", "2026-10-13T08:00:00Z"), ["Retry.", "Thanks."])
+
+    def test_since_still_overrides_a_bot_question(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", "old answer"),
+                    comment(self.BOT, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+        self.assertEqual(self.answers(comments, "--since", "2026-10-13T08:00:00Z"), ["old answer", "Retry."])
+        self.assertEqual(self.answers(comments, "--since", "2026-10-13T11:30:00Z"), ["Retry."])
+
+    def test_a_bot_comment_without_the_marker_does_not_anchor(self):
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                    comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                    comment(self.BOT, "2026-10-13T11:00:00Z", self.GUARD),            # no <!-- harness --> marker
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+        self.assertEqual(self.answers(comments), ["Use develop.", "Retry."])          # still the owner's question
+
+    def test_a_marked_bot_comment_that_is_not_a_question_does_not_anchor(self):
+        for body in ("Deploy of #12 reverted." + MARK,
+                     "Started on t/12-x (ci, headless)" + MARK,
+                     "see below **Needs your input** is what we asked" + MARK,        # not at the start
+                     "Landed in abc1234" + MARK):
+            with self.subTest(body=body):
+                comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                            comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                            comment(self.BOT, "2026-10-13T11:00:00Z", body),
+                            comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+                self.assertEqual(self.answers(comments), ["Use develop.", "Retry."])
+
+    # Only the Actions app may anchor: exactly `github-actions` (GraphQL) or `github-actions[bot]` (REST), any case.
+    # Each near miss below posts a marked, well-formed, timestamped question and must leave the owner's anchor alone;
+    # a prefix, split-on-"[" or "starts with github-actions[" match lets several of them through.
+    NEAR_MISS_LOGINS = (
+        "someone", "dependabot[bot]", "github-actions-fake[bot]", "not-github-actions[bot]",
+        "github-actions[app]", "GitHub-Actions[App]", "github-actions[x]", "github-actions[evil", "github-actions[bot",
+        "github-actions[bot]x", "github-actions[bot][bot]", "github-actions[bot]]", "github-actions bot",
+        "github-actions[]", "github-actions[", "github-actionsbot", "github-actions-bot", "xgithub-actions",
+        "xgithub-actions[bot]", "github-actionsx", "github-action", "github-action[bot]", "github", "actions[bot]",
+        "[bot]", "bot", "github-actions[bot] [bot]", "github_actions[bot]", "github-actions[[bot]]",
+    )
+
+    def test_a_third_party_question_does_not_anchor(self):
+        for login in self.NEAR_MISS_LOGINS:
+            question = f"**Needs your input**\n\nWhich region should {login} deploy to?" + MARK
+            with self.subTest(login=login):
+                comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                            comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                            comment(login, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                            comment(login, "2026-10-13T11:15:00Z", question),
+                            comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+                self.assertEqual(self.answers(comments), ["Use develop.", "Retry."])
+
+    def test_a_near_miss_login_cannot_anchor_even_as_the_only_question(self):
+        # no owner question to fall back on: the cache bounds it, else nothing does
+        for login in self.NEAR_MISS_LOGINS:
+            with self.subTest(login=login):
+                comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", "early thought"),
+                            comment(login, "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                            comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+                self.assertEqual(self.answers(comments), ["early thought", "Retry."])
+
+    # "Carries the marker" is `<!-- harness -->` anywhere in the body, as by_harness() reads it, not only as the last
+    # line; the heading must still open the body.
+    def test_a_bot_question_with_the_marker_anywhere_anchors(self):
+        for body in ("**Needs your input** <!-- harness -->\n\nWhich region should the deploy of #99 target?",
+                     "**Needs your input**<!-- harness -->",
+                     "**Needs your input**\n<!-- harness -->\nWhich region should the deploy of #99 target?",
+                     "**Needs your input**\n\nWhich region <!-- harness --> should the deploy of #99 target?",
+                     "**Needs your input**\n\nWhich region?\n\n<!-- harness -->\n\nReply in a comment.",
+                     "**Needs your input**\n\nWhich region?<!-- harness -->",
+                     "**Needs your input**\n\nWhich region?\n\n<!-- harness -->\n<!-- harness -->"):
+            for login in (self.BOT, "github-actions"):
+                with self.subTest(body=body, login=login):
+                    comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                                comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                                comment(login, "2026-10-13T11:00:00Z", body),
+                                comment("rjeskuri", "2026-10-13T12:00:00Z", "Eu-west.")]
+                    self.assertEqual(self.answers(comments), ["Eu-west."])
+
+    def test_a_bot_question_with_a_near_miss_marker_does_not_anchor(self):
+        for marker in ("<!--harness-->", "<!-- harness-review -->", "<!-- Harness -->", "<!-- HARNESS -->",
+                       "<!--  harness  -->", "<!-- harness- -->", "<!-- harness", "harness -->", "<! -- harness -->",
+                       "&lt;!-- harness --&gt;", "<!-- harness --", "!-- harness -->", "<-- harness -->", "harness"):
+            self.assertNotIn("<!-- harness -->", marker)                 # a near miss, not the marker inside
+            for body in (self.GUARD + "\n\n" + marker, "**Needs your input** " + marker + "\n\nWhich region?"):
+                with self.subTest(body=body):
+                    comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                                comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                                comment(self.BOT, "2026-10-13T11:00:00Z", body),
+                                comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+                    self.assertEqual(self.answers(comments), ["Use develop.", "Retry."])
+
+    def test_gh_graphql_reports_the_app_as_github_actions_without_the_suffix(self):
+        # `gh issue view --json comments` is GraphQL, whose login for the Actions app has no [bot] suffix
+        comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                    comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                    comment("github-actions", "2026-10-13T11:00:00Z", self.GUARD + MARK),
+                    comment("github-actions", "2026-10-13T11:30:00Z", "Deploy finished."),
+                    comment("rjeskuri", "2026-10-13T12:00:00Z", "Retry.")]
+        self.assertEqual(self.answers(comments), ["Retry."])
+
+    # The deploy guard's wording is not what anchors: any bot comment that starts with **Needs your input** and carries
+    # the marker does, so these questions share nothing with GUARD beyond the heading.
+    BOT_QUESTIONS = (
+        "**Needs your input**\n\nWhich region should the deploy of #99 target?",
+        "**Needs your input**\n\nrollback finished at 14:02 UTC; keep the old schema or migrate?\n\nReply in a comment.",
+        "**Needs your input**",
+        "**Needs your input**\nok?",
+        "  \n\t**Needs your input**\n\nShould #7 wait for the nightly build?",        # leading whitespace, as the owner path
+        "\n**Needs your input**\n\n¿Qué hacemos con el despliegue?",
+    )
+
+    def test_a_bot_question_anchors_whatever_it_says(self):
+        for question in self.BOT_QUESTIONS:
+            for marker in (MARK, "\n" + MARK.strip(), "\n\n" + MARK.strip() + "\n"):
+                with self.subTest(question=question, marker=marker):
+                    comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                                comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                                comment(self.BOT, "2026-10-13T11:00:00Z", question + marker),
+                                comment("rjeskuri", "2026-10-13T12:00:00Z", "Eu-west."),
+                                comment(self.BOT, "2026-10-13T12:30:00Z", "Deploy finished."),
+                                comment("rjeskuri", "2026-10-13T13:00:00Z", "Then the nightly.")]
+                    self.assertEqual(self.answers(comments), ["Eu-west.", "Then the nightly."])
+
+    def test_the_bot_question_moves_the_anchor_to_its_own_time(self):
+        # the same wording at different times anchors at each time (a constant or the first match cannot pass)
+        question = "**Needs your input**\n\nWhich region should the deploy of #99 target?" + MARK
+        replies = [comment("rjeskuri", f"2026-10-13T{h:02d}:30:00Z", f"reply {h}") for h in (10, 12, 14, 16)]
+        for hour, expected in ((9, ["reply 10", "reply 12", "reply 14", "reply 16"]),
+                               (11, ["reply 12", "reply 14", "reply 16"]), (13, ["reply 14", "reply 16"]),
+                               (15, ["reply 16"]), (17, [])):
+            with self.subTest(hour=hour):
+                comments = replies + [comment(self.BOT, f"2026-10-13T{hour:02d}:00:00Z", question)]
+                self.assertEqual(self.answers(comments), expected)
+
+    def test_the_bot_login_is_compared_case_insensitively(self):
+        for login in ("GitHub-Actions[bot]", "GITHUB-ACTIONS[BOT]", "Github-Actions[Bot]", "GITHUB-ACTIONS",
+                      "GitHub-Actions"):
+            question = f"**Needs your input**\n\nWhich region should {login} deploy to?" + MARK
+            with self.subTest(login=login):
+                comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                            comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                            comment(login, "2026-10-13T11:00:00Z", question),
+                            comment(login, "2026-10-13T11:30:00Z", "Deploy finished."),
+                            comment("rjeskuri", "2026-10-13T12:00:00Z", "Eu-west.")]
+                self.assertEqual(self.answers(comments), ["Eu-west."])
+
+    def test_a_bot_question_without_a_timestamp_does_not_anchor(self):
+        # like an owner question without one: it cannot bound anything
+        question = "**Needs your input**\n\nWhich region should the deploy of #99 target?" + MARK
+        for login in (self.BOT, "github-actions", "GitHub-Actions[bot]"):
+            for missing in ("null", "absent", "empty"):
+                with self.subTest(login=login, createdAt=missing):
+                    bot = comment(login, None, question)
+                    if missing == "absent":
+                        del bot["createdAt"]
+                    elif missing == "empty":
+                        bot["createdAt"] = ""
+                    comments = [comment("rjeskuri", "2026-10-13T09:00:00Z", self.QUESTION + MARK),
+                                comment("rjeskuri", "2026-10-13T10:00:00Z", "Use develop."),
+                                bot,
+                                comment("rjeskuri", "2026-10-13T12:00:00Z", "Eu-west.")]
+                    self.assertEqual(self.answers(comments), ["Use develop.", "Eu-west."])
+
 
 class EpicCheck(BoardTest):
     def check(self, total, completed, state="OPEN"):
@@ -2268,6 +2517,483 @@ class Board(BoardTest):
         self.assertEqual([e["number"] for e in data["no-status"]], [6])
 
 
+# ======================================================================= status:proposed and promote (#159)
+def label_values(argv):
+    """The --label values of an argv, in order (`--label x` and `--label=x`)."""
+    out, i = [], 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--label" and i + 1 < len(argv):
+            out.append(argv[i + 1])
+            i += 2
+            continue
+        if tok.startswith("--label="):
+            out.append(tok[len("--label="):])
+        i += 1
+    return out
+
+
+def without_labels(argv):
+    out, i = [], 0
+    while i < len(argv):
+        if argv[i] == "--label":
+            i += 2
+            continue
+        if not argv[i].startswith("--label="):
+            out.append(argv[i])
+        i += 1
+    return out
+
+
+def label_edits(calls):
+    """{issue number: (labels added, labels removed)} over every `gh issue edit N` call; gh takes repeated flags,
+    `--flag=value` and comma-separated names alike."""
+    out = {}
+    for argv in calls:
+        if argv[:2] != ["issue", "edit"] or len(argv) < 3 or not argv[2].isdigit():
+            continue
+        adds, removes = out.setdefault(int(argv[2]), (set(), set()))
+        i = 3
+        while i < len(argv):
+            tok = argv[i]
+            for flag, into in (("--add-label", adds), ("--remove-label", removes)):
+                if tok == flag and i + 1 < len(argv):
+                    into.update(x.strip() for x in argv[i + 1].split(",") if x.strip())
+                    i += 1
+                elif tok.startswith(flag + "="):
+                    into.update(x.strip() for x in tok[len(flag) + 1:].split(",") if x.strip())
+            i += 1
+    return out
+
+
+class Proposed(BoardTest):
+    """`status:proposed` (#159): `epic create --proposed` and `task create --proposed` label it in place of
+    status:ready; `ready` never lists it; `promote N` moves a proposed epic and its open proposed sub-issues (or a
+    proposed task alone) to ready through the usual status change; the Projects board gets no Status for it."""
+
+    HOST = "https://ghe.example.com/o/r/issues/"
+
+    def setUp(self):
+        super().setUp()
+        self.body = write(os.path.join(self.tmp, "body.md"), TASK_BODY)
+
+    # ------------------------------------------------------------------ helpers
+    def create_scenario(self, number, url=None):
+        url = url or f"https://github.com/o/r/issues/{number}"
+        self.scenario([REPO_VIEW,
+                       {"match": ["issue", "create"], "stdout": f"Creating issue in o/r\n\n{url}\n"},
+                       {"match": ["api", f"repos/o/r/issues/{number}", "--jq", ".id"], "stdout": f"{number}00\n"},
+                       {"match": ["api", "-X", "POST"], "stdout": "{}"},
+                       {"match": ["issue", "edit"], "stdout": url + "\n"},
+                       {"match": ["project"], "stdout": ""}])
+        return url
+
+    def created_labels(self):
+        creates = [argv for argv in self.calls() if argv[:2] == ["issue", "create"]]
+        self.assertEqual(len(creates), 1, self.calls())
+        return creates[0]
+
+    def project_calls(self):
+        return [project_call(argv) for argv in self.calls() if argv[:1] == ["project"]]
+
+    def promote_world(self, number, labels, state="OPEN", subs=(), kind_title="Ticket"):
+        """N as gh issue view shows it (every field, so any --json list is answered) and, for an epic, its sub-issues
+        (number, labels, state) through every shape of the sub_issues REST call."""
+        calls = [REPO_VIEW,
+                 {"match": ["issue", "view", str(number)],
+                  "stdout_json": issue(number=number, labels=labels, state=state, title=f"{kind_title} {number}",
+                                       body=EPIC_BODY if "epic" in labels else TASK_BODY)}]
+        listing = []
+        for n, sub_labels, sub_state in subs:
+            listing.append({"number": n, "title": f"Task {n}", "state": sub_state.lower(),
+                            "url": f"https://github.com/o/r/issues/{n}",
+                            "labels": [{"name": x} for x in sub_labels]})
+            calls.append({"match": ["issue", "view", str(n)],
+                          "stdout_json": issue(number=n, labels=sub_labels, state=sub_state, title=f"Task {n}",
+                                               parent={"number": number, "title": f"{kind_title} {number}",
+                                                       "url": f"https://github.com/o/r/issues/{number}"})})
+        path = f"repos/o/r/issues/{number}/sub_issues"
+        for prefix in (["api", path], ["api", path + "?per_page=100"], ["api", "--paginate", path],
+                       ["api", "--paginate", path + "?per_page=100"]):
+            calls.append({"match": prefix, "stdout_json": listing})
+        calls.append({"match": ["issue", "comment"], "stdout": f"https://github.com/o/r/issues/{number}#c1\n"})
+        self.scenario(calls, default={"stdout": ""})
+
+    def cache_for(self, number, labels, state="OPEN"):
+        status = "closed" if state == "CLOSED" else next(
+            (x[len("status:"):] for x in labels if x.startswith("status:")), None)
+        record = {"number": number, "title": f"Ticket {number}", "labels": list(labels), "status": status,
+                  "tier": "opus", "branch": f"t/{number}-kept", "attempts": [{"stage": "tests", "result": "pass"}]}
+        self.put_cache(number, record)
+        return record
+
+    def assertPromoted(self, number, before_labels, edits, record):
+        """N's labels end with status:ready as their only status label, and its cache says so."""
+        self.assertIn(number, edits, f"#{number} was not edited: {self.calls()}")
+        adds, removes = edits[number]
+        after = (set(before_labels) - removes) | adds
+        self.assertEqual({x for x in after if x.startswith("status:")}, {"status:ready"}, (number, adds, removes))
+        self.assertEqual(after - {"status:ready"}, set(before_labels) - {"status:proposed"}, number)
+        cached = self.cache(number)
+        self.assertEqual(cached["status"], "ready", cached)
+        self.assertEqual(sorted(cached["labels"]), sorted(after), cached)
+        self.assertEqual((cached["branch"], cached["attempts"]), (record["branch"], record["attempts"]),
+                         "the cache keeps what only it holds")
+
+    def assertUntouched(self, number, edits, record):
+        self.assertNotIn(number, edits, f"#{number} must not be edited")
+        self.assertEqual(self.cache(number), record, f"#{number}'s cache is unchanged")
+
+    # ------------------------------------------------------------------ create
+    def test_epic_and_task_create_proposed(self):
+        cases = [  # (argv after create, number, expected labels with --proposed, parent, blockers)
+            (["epic", "create", "--title", "Board v3", "--size", "L", "--risk", "high"], 3,
+             ["epic", "status:proposed", "size:L", "risk:high"], None, ()),
+            (["epic", "create", "--title", "Small plan"], 57, ["epic", "status:proposed"], None, ()),
+            (["task", "create", "--title", "Wire it", "--parent", "3", "--size", "S", "--risk", "low",
+              "--blocked-by", "9,10", "--no-tests", "--priority"], 13,
+             ["task", "status:proposed", "size:S", "risk:low", "no-tests", "priority:high"], 3, (9, 10)),
+            (["task", "create", "--title", "Fix it", "--type", "bug", "--needs-local"], 88,
+             ["bug", "status:proposed", "needs-local"], None, ()),
+            (["task", "create", "--title", "Tidy", "--type", "chore", "--size", "M", "--parent", "40"], 204,
+             ["chore", "status:proposed", "size:M"], 40, ()),
+        ]
+        for argv, number, labels, parent, blockers in cases:
+            for proposed in (True, False):
+                with self.subTest(argv=" ".join(argv[:3]), number=number, proposed=proposed):
+                    url = self.create_scenario(number)
+                    full = argv + ["--body-file", self.body] + (["--proposed"] if proposed else [])
+                    p = self.board(*full)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertEqual(p.stdout.strip(), f"#{number} {url}")
+                    create = self.created_labels()
+                    title = argv[argv.index("--title") + 1]
+                    self.assertEqual(without_labels(create),
+                                     ["issue", "create", "--title", title, "--body-file", self.body])
+                    want = [x if proposed or x != "status:proposed" else "status:ready" for x in labels]
+                    self.assertEqual(sorted(label_values(create)), sorted(want))
+                    if proposed:
+                        self.assertNotIn("status:ready", label_values(create))
+                    if parent:
+                        self.assertIn(["api", "-X", "POST", f"repos/o/r/issues/{parent}/sub_issues", "-F",
+                                       f"sub_issue_id={number}00"], self.calls(), "still linked under the epic")
+                    for b in blockers:
+                        self.assertIn(["issue", "edit", str(number), "--add-blocked-by", str(b)], self.calls())
+                    self.assertEqual(self.project_calls(), [], "no project configured: no gh project call")
+
+    # ------------------------------------------------------------------ ready
+    def test_ready_excludes_proposed(self):
+        # the labels `task create --size S --risk low --priority --proposed` writes (checked at the end)
+        made = ["task", "status:proposed", "size:S", "risk:low", "priority:high"]
+
+        def item(number, labels, blocked=()):
+            return {"number": number, "title": f"Ticket {number}", "labels": [{"name": n} for n in labels],
+                    "blockedBy": list(blocked)}
+        worlds = [
+            ([item(21, made), item(8, ["task", "status:ready"]), item(4, ["task", "status:proposed", "size:M"]),
+              item(9, ["task", "status:ready", "priority:high", "size:L"]),
+              item(3, ["refactor", "status:ready", "size:S", "risk:low"]),
+              item(7, ["epic", "status:proposed"])],
+             [9, 3, 8]),
+            ([item(40, ["bug", "status:proposed", "priority:high", "size:S", "risk:low"]),
+              item(41, ["bug", "status:ready", "size:S", "risk:low"]),
+              item(12, ["chore", "status:proposed"], [{"number": 2, "state": "CLOSED"}]),
+              item(2, ["task", "status:ready", "priority:high"], [{"number": 1, "state": "CLOSED"}]),
+              item(33, ["task", "status:ready"], [{"number": 34, "state": "OPEN"}])],
+             [2, 41]),
+            ([item(5, ["task", "status:proposed"]), item(6, ["chore", "status:proposed", "priority:high"])], []),
+        ]
+        for items, expected in worlds:
+            with self.subTest(expected=expected):
+                self.scenario([{"match": ["issue", "list"], "stdout_json": items}])
+                rows = json.loads(self.ok("ready", "--json").stdout)
+                self.assertEqual([r["number"] for r in rows], expected)
+                self.assertEqual(self.calls(), [["issue", "list", "--state", "open", "--label", "status:ready",
+                                                 "--json", "number,title,labels,blockedBy", "--limit", "200"]],
+                                 "the query is today's")
+                table_out = self.ok("ready").stdout
+                if expected:
+                    self.assertEqual([line.split()[0] for line in table_out.splitlines()[1:]],
+                                     [str(n) for n in expected])
+                else:
+                    self.assertEqual(table_out.strip(), "No ready tickets.")
+        self.create_scenario(21)
+        self.ok("task", "create", "--title", "Proposed one", "--body-file", self.body, "--size", "S", "--risk", "low",
+                "--priority", "--proposed")
+        self.assertEqual(sorted(label_values(self.created_labels())), sorted(made))
+
+    # ------------------------------------------------------------------ promote
+    def test_promote_epic_moves_epic_and_proposed_tasks(self):
+        def subs(*rows):
+            return [(n, [kind, "status:" + status] if status else [kind], state) for n, kind, status, state in rows]
+        cases = [
+            (3, subs((12, "task", "proposed", "OPEN"), (13, "task", "in-progress", "OPEN"),
+                     (14, "bug", "proposed", "OPEN"), (15, "task", "proposed", "CLOSED"),
+                     (16, "chore", "ready", "OPEN"), (17, "task", "needs-input", "OPEN"),
+                     (18, "refactor", None, "OPEN"), (19, "task", "in-review", "OPEN"),
+                     (20, "task", "blocked", "OPEN")),
+             [12, 14]),
+            (40, subs((41, "task", "proposed", "OPEN"), (42, "task", "ready", "OPEN")), [41]),
+            (70, subs((71, "task", "in-progress", "OPEN"), (72, "task", "proposed", "CLOSED")), []),
+            (90, subs((95, "task", "proposed", "OPEN"), (91, "chore", "proposed", "OPEN"),
+                      (93, "bug", "proposed", "OPEN")), [91, 93, 95]),
+        ]
+        for epic, tasks, promoted in cases:
+            with self.subTest(epic=epic, promoted=promoted):
+                epic_labels = ["epic", "status:proposed", "size:L", "risk:low"]
+                records = {epic: self.cache_for(epic, epic_labels)}
+                for n, labels, state in tasks:
+                    records[n] = self.cache_for(n, labels + ["size:S"], state)
+                self.promote_world(epic, epic_labels, subs=[(n, labels + ["size:S"], state)
+                                                            for n, labels, state in tasks], kind_title="Epic")
+                p = self.board("promote", str(epic))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                k = len(promoted)
+                self.assertRegex(p.stdout.strip(), r"^promoted #%d and %d tasks?$" % (epic, k))
+                edits = label_edits(self.calls())
+                self.assertPromoted(epic, epic_labels, edits, records[epic])
+                for n, labels, state in tasks:
+                    if n in promoted:
+                        self.assertPromoted(n, labels + ["size:S"], edits, records[n])
+                    else:
+                        self.assertUntouched(n, edits, records[n])
+                self.assertEqual(set(edits), {epic, *promoted}, "nothing else is edited")
+                self.assertFalse([a for a in self.calls() if a[:2] == ["issue", "close"]])
+
+    def test_promote_json(self):
+        # the documented shape, exactly: {"number": N, "tasks": [the promoted task numbers]}
+        cases = [
+            (30, ["epic", "status:proposed"], "Epic",
+             [(31, ["task", "status:proposed"], "OPEN"), (32, ["task", "status:ready"], "OPEN")], [31]),
+            (50, ["epic", "status:proposed"], "Epic",
+             [(58, ["bug", "status:proposed"], "OPEN"), (52, ["task", "status:in-progress"], "OPEN"),
+              (51, ["task", "status:proposed"], "OPEN"), (55, ["task", "status:proposed"], "CLOSED")], [51, 58]),
+            (60, ["epic", "status:proposed"], "Epic", [(61, ["task", "status:blocked"], "OPEN")], []),
+            (77, ["task", "status:proposed", "size:S"], "Task", [], []),
+            (8, ["bug", "status:proposed"], "Task", [], []),
+        ]
+        for number, labels, kind_title, subs, promoted in cases:
+            with self.subTest(number=number, promoted=promoted):
+                self.promote_world(number, labels, subs=subs, kind_title=kind_title)
+                data = json.loads(self.ok("promote", str(number), "--json").stdout)
+                self.assertEqual(data, {"number": number, "tasks": promoted})
+                self.assertNotIn(number, data["tasks"], "the promoted ticket itself is not one of its tasks")
+                self.assertEqual(set(label_edits(self.calls())), {number, *promoted})
+
+    def test_promote_a_task_alone(self):
+        cases = [(12, "task", ["size:S", "risk:low"]), (47, "bug", ["priority:high"]),
+                 (8, "chore", ["size:M", "no-tests"]), (230, "refactor", [])]
+        for number, kind, extra in cases:
+            with self.subTest(number=number, kind=kind):
+                labels = [kind, "status:proposed"] + extra
+                # its epic is proposed too, and has another proposed task: promoting the task touches neither
+                self.promote_world(number, labels, kind_title="Task")
+                record = self.cache_for(number, labels)
+                epic_record = self.cache_for(3, ["epic", "status:proposed"])
+                sibling = self.cache_for(number + 1, ["task", "status:proposed"])
+                p = self.board("promote", str(number))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertRegex(p.stdout.strip(), r"^promoted #%d( and 0 tasks)?$" % number)
+                edits = label_edits(self.calls())
+                self.assertEqual(set(edits), {number}, self.calls())
+                self.assertPromoted(number, labels, edits, record)
+                self.assertEqual(self.cache(3), epic_record)
+                self.assertEqual(self.cache(number + 1), sibling)
+
+    def test_promote_refuses_closed_or_not_proposed(self):
+        cases = [(12, ["task", "status:proposed"], "CLOSED"), (3, ["epic", "status:proposed"], "CLOSED"),
+                 (14, ["task", "status:ready"], "OPEN"), (15, ["bug", "status:in-progress"], "OPEN"),
+                 (16, ["task", "status:needs-input"], "OPEN"), (17, ["task", "status:blocked"], "OPEN"),
+                 (18, ["chore"], "OPEN"), (40, ["epic", "status:ready"], "OPEN"), (41, ["epic"], "OPEN"),
+                 (19, ["task", "status:in-review"], "OPEN")]
+        for number, labels, state in cases:
+            with self.subTest(number=number, labels=labels, state=state):
+                subs = [(number + 100, ["task", "status:proposed"], "OPEN")] if "epic" in labels else []
+                self.promote_world(number, labels, state=state, subs=subs)
+                record = self.cache_for(number, labels, state)
+                for n, sub_labels, sub_state in subs:
+                    self.cache_for(n, sub_labels, sub_state)
+                p = self.board("promote", str(number))
+                self.assertOneLineError(p)
+                self.assertIn(str(number), p.stderr)
+                self.assertEqual(label_edits(self.calls()), {}, "nothing is relabeled")
+                self.assertFalse([a for a in self.calls() if a[:2] in (["issue", "comment"], ["issue", "close"])])
+                self.assertEqual(self.cache(number), record)
+                # the same ticket open and proposed is promoted: the refusal follows the state and the label
+                kind = [x for x in labels if not x.startswith("status:")]
+                self.promote_world(number, kind + ["status:proposed"], subs=subs)
+                self.assertEqual(self.board("promote", str(number)).returncode, 0, self.calls())
+                self.assertIn(number, label_edits(self.calls()))
+
+    # ------------------------------------------------------------------ show
+    def test_show_reports_proposed(self):
+        for number, labels, tier in ((12, ("task", "status:proposed", "size:M", "risk:low"), "opus"),
+                                     (77, ("chore", "status:proposed", "size:S", "risk:low"), "sonnet")):
+            with self.subTest(number=number):
+                self.scenario([{"match": ["issue", "view", str(number)],
+                                "stdout_json": issue(number=number, labels=labels)}])
+                record = json.loads(self.ok("show", str(number), "--json").stdout)
+                self.assertEqual((record["status"], record["tier"]), ("proposed", tier))
+                self.assertEqual(self.cache(number)["status"], "proposed")
+        epic = issue(number=3, title="Board v3", labels=("epic", "status:proposed"), body=EPIC_BODY)
+        subs = [{"number": 12, "title": "First", "state": "open",
+                 "labels": [{"name": "task"}, {"name": "status:proposed"}, {"name": "size:S"}, {"name": "risk:low"}]},
+                {"number": 13, "title": "Second", "state": "open",
+                 "labels": [{"name": "task"}, {"name": "status:ready"}, {"name": "size:M"}]},
+                {"number": 14, "title": "Third", "state": "closed",
+                 "labels": [{"name": "task"}, {"name": "status:proposed"}]}]
+        self.scenario([REPO_VIEW, {"match": ["issue", "view", "3"], "stdout_json": epic},
+                       {"match": ["api", "repos/o/r/issues/3/sub_issues?per_page=100"], "stdout_json": subs},
+                       {"match": ["issue", "view", "14"], "stdout_json": {"comments": []}}])
+        record = json.loads(self.ok("show", "3", "--json").stdout)
+        self.assertEqual(record["status"], "proposed")
+        self.assertEqual([(t["number"], t["status"]) for t in record["tasks"]],
+                         [(12, "proposed"), (13, "ready"), (14, "closed")])
+        md = self.ok("show", "3", "--markdown").stdout
+        self.assertIn("- #12 First (proposed, S, low, tier sonnet)", md)
+
+    # ------------------------------------------------------------------ board
+    def board_item(self, number, labels, **extra):
+        return dict({"number": number, "title": f"Ticket {number}", "labels": [{"name": n} for n in labels]}, **extra)
+
+    BASE_LINES = ["# Board: proj", "",
+                  "## Epics (1)", "- #3 Ticket 3 (1 of 2 tasks closed)", "",
+                  "## Ready (1)", "- #4 Ticket 4 (task, S, low)", "",
+                  "## In progress (1)", "- #5 Ticket 5 (bug, M, high)", "",
+                  "## In review (1)", "- #10 Ticket 10 (task, L, high)", "",
+                  "## Blocked (0)", "",
+                  "## Needs input (1)", "- #8 Ticket 8 (chore, M, low)", "",
+                  "## No status (1)", "- #6 Ticket 6 (task, -, -)"]
+
+    def base_items(self):
+        it = self.board_item
+        return [it(4, ["task", "status:ready", "size:S", "risk:low"]),
+                it(3, ["epic", "status:ready"], subIssuesSummary={"total": 2, "completed": 1}),
+                it(5, ["bug", "status:in-progress", "size:M", "risk:high"]),
+                it(10, ["task", "status:in-review", "size:L", "risk:high"]),
+                it(8, ["chore", "status:needs-input", "size:M", "risk:low"]),
+                it(6, ["task"])]
+
+    def test_board_section_only_when_nonempty(self):
+        self.scenario([{"match": ["issue", "list"], "stdout_json": self.base_items()}])
+        out = self.ok("board").stdout
+        self.assertEqual(out.rstrip("\n").splitlines(), self.BASE_LINES, "unchanged when nothing is proposed")
+        self.assertNotIn("Proposed", out)
+        it = self.board_item
+        for extra, lines in (
+                ([it(7, ["task", "status:proposed", "size:M", "risk:low"]),
+                  it(12, ["bug", "status:proposed", "size:S"]), it(2, ["refactor", "status:proposed"])],
+                 ["- #2 Ticket 2 (refactor, -, -)", "- #7 Ticket 7 (task, M, low)", "- #12 Ticket 12 (bug, S, -)"]),
+                ([it(21, ["chore", "status:proposed", "size:L", "risk:high"])], ["- #21 Ticket 21 (chore, L, high)"])):
+            with self.subTest(proposed=len(lines)):
+                items = self.base_items()
+                items[2:2] = extra
+                self.scenario([{"match": ["issue", "list"], "stdout_json": items}])
+                got = self.ok("board").stdout.rstrip("\n").splitlines()
+                heading = f"## Proposed ({len(lines)})"
+                self.assertIn(heading, got)
+                h = got.index(heading)
+                self.assertEqual(got[h + 1:h + 1 + len(lines)], lines)
+                self.assertEqual(got[h - 1], "")
+                self.assertEqual(got[:h - 1] + got[h + 1 + len(lines):], self.BASE_LINES,
+                                 "the other sections are as before; the proposed tasks are not under No status")
+                data = json.loads(self.ok("board", "--json").stdout)
+                self.assertEqual([e["number"] for e in data["proposed"]],
+                                 sorted(int(x.split()[1][1:]) for x in lines))
+                self.assertEqual([e["number"] for e in data["no-status"]], [6])
+
+    # ------------------------------------------------------------------ the Projects board
+    def test_project_check_and_sync_ignore_proposed(self):
+        self.scenario([REPO_VIEW, {"match": ["project", "field-list"], "stdout_json": ProjectCheck.fields(None)}])
+        p = self.board("project", "check", HARNESS_PROJECT="rjeskuri/7")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("Proposed", p.stdout + p.stderr)
+        for project, numbers in (("rjeskuri/7", (11, 12, 13, 14, 15)), ("acme-org/23", (230, 4, 77, 9, 101))):
+            with self.subTest(project=project):
+                proposed_a, proposed_b, proposed_c, drifted, plain = numbers
+                issues = [sync_issue("o/r", proposed_a, "task", "proposed", False),
+                          sync_issue("o/r", proposed_b, "epic", "proposed", False),
+                          sync_issue("o/r", proposed_c, "bug", "proposed", True),
+                          sync_issue("o/r", drifted, "task", "ready", False),
+                          sync_issue("o/r", plain, "task", "in-progress", False)]
+                items = [board_item("o/r", proposed_a, UNSET, "Normal", labels=["task", "status:proposed"]),
+                         board_item("o/r", proposed_b, "Ready", UNSET, labels=["epic", "status:proposed"]),
+                         board_item("o/r", proposed_c, "In progress", "High", labels=["bug", "status:proposed"]),
+                         board_item("o/r", drifted, "In review", "Normal", labels=["task", "status:ready"]),
+                         board_item("o/r", plain, "In progress", "Normal", labels=["task", "status:in-progress"])]
+                self.scenario([{"match": ["issue", "list"], "stdout_json": issues},
+                               {"match": ["project", "item-list"],
+                                "stdout_json": {"items": items, "totalCount": len(items)}},
+                               {"match": ["project"], "stdout": ""}])
+                p = self.board("project", "sync", HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(p.stderr.strip(), "", "no warning for status:proposed")
+                writes = [project_call(a) for a in self.calls() if a[:2] in (["project", "item-add"],
+                                                                            ["project", "item-edit"])]
+                self.assertEqual(writes, [item_edit(project, f"https://github.com/o/r/issues/{drifted}",
+                                                    "Status", "Ready")],
+                                 "the proposed issues get no write; the drifted ready one is still corrected")
+
+    def test_mirror_adds_the_item_without_status(self):
+        cases = [("rjeskuri/7", 13, ["task", "create", "--title", "T13", "--parent", "3", "--blocked-by", "9"], False),
+                 ("acme-org/23", 58, ["task", "create", "--title", "T58", "--type", "bug"], False),
+                 ("someone/1", 91, ["epic", "create", "--title", "E91", "--size", "M"], False),
+                 ("rjeskuri/12", 204, ["task", "create", "--title", "T204", "--priority"], True)]
+        for project, number, argv, priority in cases:
+            with self.subTest(project=project, number=number):
+                url = self.create_scenario(number, self.HOST + str(number))
+                p = self.board(*argv, "--body-file", self.body, "--proposed", HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(p.stderr.strip(), "")
+                self.assertEqual(p.stdout.strip(), f"#{number} {url}")
+                calls = self.project_calls()
+                self.assertTrue(calls, "the issue is still added to the board")
+                self.assertEqual(calls[0], item_add(project, url))
+                self.assertFalse([c for c in calls if c[0] == "item-edit" and c[2].get("field") == "Status"],
+                                 "no Status for a proposed issue")
+                if not priority:
+                    self.assertEqual(calls, [item_add(project, url)], "item-add only")
+                created = self.index_of_create()
+                first_project = next(i for i, a in enumerate(self.calls()) if a[:1] == ["project"])
+                self.assertLess(created, first_project)
+        # `status N proposed`: the labels swap, the board's Status is left alone, and nothing warns
+        for number, old, project in ((12, "ready", "rjeskuri/7"), (66, "needs-input", "acme-org/23")):
+            with self.subTest(status_proposed=number):
+                url = self.HOST + str(number)
+                self.scenario([REPO_VIEW,
+                               {"match": ["issue", "view", str(number)],
+                                "stdout_json": {"labels": [{"name": "task"}, {"name": "status:" + old}], "url": url,
+                                                "number": number}},
+                               {"match": ["project"], "stdout": ""}], default={"stdout": ""})
+                p = self.board("status", str(number), "proposed", HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(p.stderr.strip(), "")
+                self.assertEqual(p.stdout.strip(), f"#{number} status:proposed")
+                adds, removes = label_edits(self.calls())[number]
+                self.assertEqual((adds, removes), ({"status:proposed"}, {"status:" + old}))
+                self.assertEqual(self.project_calls(), [])
+                # and promoting it back mirrors Ready as any status change does
+                self.scenario([REPO_VIEW,
+                               {"match": ["issue", "view", str(number)],
+                                "stdout_json": dict(issue(number=number, labels=("task", "status:proposed")),
+                                                    url=url)},
+                               {"match": ["project"], "stdout": ""}], default={"stdout": ""})
+                p = self.board("promote", str(number), HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(self.project_calls(), [item_edit(project, url, "Status", "Ready")])
+
+    def index_of_create(self):
+        return next(i for i, a in enumerate(self.calls()) if a[:2] == ["issue", "create"])
+
+    def test_help(self):
+        p = self.board("promote", "--help")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("usage:", p.stdout)
+        for argv in (["epic", "create", "--help"], ["task", "create", "--help"]):
+            self.assertIn("--proposed", self.board(*argv).stdout, argv)
+
+
 # ======================================================================= tier
 class Tier(BoardTest):
     def tier(self, *labels):
@@ -2288,7 +3014,8 @@ class Tier(BoardTest):
         self.scenario([{"match": ["issue", "view", "12", "--json", "labels"],
                         "stdout_json": {"labels": [{"name": "refactor"}, {"name": "size:S"}, {"name": "risk:low"}]}}])
         p = self.ok("tier", "12", "--json")
-        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "sonnet", "source": "github"})
+        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "sonnet", "source": "github", "stage": "code",
+                                                "from": "labels", "labels_tier": "sonnet", "effort": None})
 
 
 # Ticket #67: reviews run on Opus 5.5; `tier N --stage review` gives fable only for a risk:high ticket, whatever the
@@ -2358,10 +3085,12 @@ class TierReviewStage(BoardTest):
         self.assertEqual(self.ok("tier", "12", "--stage", "review").stdout.strip(), "opus")
         self.assertEqual(len(self.calls()), 1)
         p = self.ok("tier", "12", "--stage", "review", "--json")
-        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "opus", "source": "github"})
+        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "opus", "source": "github", "stage": "review",
+                                                "from": "labels", "labels_tier": "opus", "effort": None})
         before = len(self.calls())
         p = self.ok("tier", "12", "--json")
-        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "fable", "source": "cache"})
+        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "fable", "source": "cache", "stage": "code",
+                                                "from": "labels", "labels_tier": "fable", "effort": None})
         self.assertEqual(len(self.calls()), before)                 # plain tier made no gh call
 
     def test_plain_tier_is_unchanged_for_every_combination(self):
@@ -2378,6 +3107,410 @@ class TierReviewStage(BoardTest):
                         expected = "opus"
                     with self.subTest(kind=kind, size=size, risk=risk):
                         self.assertEqual(self.tier([kind, "size:" + size, "risk:" + risk]), expected)
+
+
+# ======================================================================= tier: the project's routing settings
+# Ticket #175 (epic #172): harness-board takes its tiers from harness_lib.routing. HARNESS_CODE_TIER (the environment
+# when not blank, else `env` in the main checkout's .claude/settings.json; settings.local.json is never read) replaces
+# the label rubric for the code tier that `tier`, `show`, the cache, `ready` and an epic's task rows carry;
+# HARNESS_REVIEW_TIER replaces the review rule; `tier --json` says where the tier came from. Every expected tier here
+# is derived from docs/design.md's rubric sentence, never from the tool or the lib.
+ROUTING_TYPES = ("task", "bug", "chore", "refactor")
+TIER_KEYS = ["number", "tier", "source", "stage", "from", "labels_tier", "effort"]
+SHOW_KEYS = {"number", "title", "url", "type", "status", "size", "risk", "flags", "labels", "tier", "parent",
+             "blocked_by", "body", "sections", "comments", "fetched_at", "branch", "worktree", "started_at", "attempts"}
+
+
+def rubric(kind, size, risk):
+    """docs/design.md: size:S and risk:low and type not bug gives sonnet; size:L or risk:high gives fable; else opus."""
+    if size == "L" or risk == "high":
+        return "fable"
+    if size == "S" and risk == "low" and kind != "bug":
+        return "sonnet"
+    return "opus"
+
+
+def review_rubric(risk):
+    """docs/design.md: the review stage is fable for risk:high and opus for everything else."""
+    return "fable" if risk == "high" else "opus"
+
+
+def ticket_labels(kind, size, risk, *extra):
+    return [kind] + list(extra) + (["size:" + size] if size else []) + (["risk:" + risk] if risk else [])
+
+
+class TierRouting(BoardTest):
+    OKINAWA = {"HARNESS_CODE_TIER": "opus", "HARNESS_CODE_EFFORT": "xhigh", "HARNESS_REVIEW_TIER": "opus"}
+    SPREAD = [("task", "S", "low"), ("bug", "S", "low"), ("chore", "M", "low"), ("refactor", "L", "low"),
+              ("task", "S", "high"), ("bug", "M", "high"), ("task", None, None), ("chore", "S", None)]
+
+    def settings(self, env, name="settings.json", root=None):
+        write(os.path.join(root or self.repo, ".claude", name), json.dumps({"env": env}))
+
+    def tier_out(self, number, *extra, **env):
+        """`tier N` stdout, with nothing on stderr."""
+        p = self.ok("tier", str(number), *extra, **env)
+        self.assertEqual(p.stderr, "", p.stderr)
+        return p.stdout
+
+    def tier_json(self, number, *extra, **env):
+        p = self.ok("tier", str(number), "--json", *extra, **env)
+        self.assertEqual(p.stderr, "", p.stderr)
+        return json.loads(p.stdout)
+
+    def code(self, number, tier, labels_tier, source="cache", frm="labels", effort=None):
+        return {"number": number, "tier": tier, "source": source, "stage": "code", "from": frm,
+                "labels_tier": labels_tier, "effort": effort}
+
+    def review(self, number, tier, labels_tier, source="cache", frm="labels", effort=None):
+        return {"number": number, "tier": tier, "source": source, "stage": "review", "from": frm,
+                "labels_tier": labels_tier, "effort": effort}
+
+    def warnings(self, p):
+        return [line for line in p.stderr.splitlines() if line.strip()]
+
+    def epic_scenario(self, subs):
+        epic = issue(number=3, title="Board v2", labels=("epic", "status:ready"), body=EPIC_BODY)
+        self.scenario([REPO_VIEW, {"match": ["issue", "view", "3"], "stdout_json": epic},
+                       {"match": ["api", "repos/o/r/issues/3/sub_issues?per_page=100"], "stdout_json": subs}])
+
+    def sub(self, number, title, labels):
+        return {"number": number, "title": title, "state": "open", "labels": [{"name": n} for n in labels]}
+
+    # ----------------------------------------------------------- broad: the public interface
+    def test_code_tier_setting_decides_every_label_combination(self):
+        # DoD: HARNESS_CODE_TIER=opus in the main checkout's settings.json gives opus for every type, size and risk
+        # (none included), from the cache, with no gh call.
+        self.settings({"HARNESS_CODE_TIER": "opus"})
+        for kind in ROUTING_TYPES:
+            for size in ("S", "M", "L", None):
+                for risk in ("low", "high", None):
+                    with self.subTest(setting="opus", kind=kind, size=size, risk=risk):
+                        self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk, "status:ready"),
+                                            "tier": rubric(kind, size, risk)})
+                        self.assertEqual(self.tier_out(12), "opus\n")
+        # Every tier the setting can name, spelled loosely (the value is stripped and matched in any case), decides
+        # over every rubric outcome; `from` names the setting even where it agrees with the labels.
+        for raw, tier in (("sonnet", "sonnet"), ("Fable", "fable"), (" OPUS ", "opus")):
+            self.settings({"HARNESS_CODE_TIER": raw})
+            for kind, size, risk in self.SPREAD:
+                with self.subTest(setting=raw, kind=kind, size=size, risk=risk):
+                    self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk)})
+                    self.assertEqual(self.tier_out(12), tier + "\n")
+                    self.assertEqual(self.tier_json(12),
+                                     self.code(12, tier, rubric(kind, size, risk), frm="HARNESS_CODE_TIER"))
+        self.assertEqual(self.calls(), [])
+
+    def test_okinawa_settings_json_reports_where_the_tier_came_from(self):
+        self.settings(self.OKINAWA)
+        self.put_cache(12, {"number": 12, "labels": ["task", "status:ready", "size:L", "risk:high"], "tier": "fable"})
+        p = self.ok("tier", "12", "--json")
+        self.assertEqual(p.stderr, "")
+        data = json.loads(p.stdout)
+        self.assertEqual(data, {"number": 12, "tier": "opus", "source": "cache", "stage": "code",
+                                "from": "HARNESS_CODE_TIER", "labels_tier": "fable", "effort": "xhigh"})
+        self.assertEqual(list(data), TIER_KEYS)                     # printed in this order
+        self.assertEqual(self.tier_out(12), "opus\n")               # the text stays the one word
+        # risk:high keeps its label but gets an Opus per-ticket review
+        self.assertEqual(self.tier_out(12, "--stage", "review"), "opus\n")
+        self.assertEqual(self.tier_json(12, "--stage", "review"),
+                         self.review(12, "opus", "fable", frm="HARNESS_REVIEW_TIER"))
+        # a cache without labels answers from the setting, with the cached tier as labels_tier
+        self.put_cache(13, {"number": 13, "tier": "sonnet"})
+        self.assertEqual(self.tier_json(13), self.code(13, "opus", "sonnet", frm="HARNESS_CODE_TIER", effort="xhigh"))
+        self.assertEqual(self.tier_out(13), "opus\n")
+        self.assertEqual(self.calls(), [])
+        # without a cache the labels are fetched and the setting still decides; source says github
+        self.scenario([{"match": ["issue", "view", "14", "--json", "labels"],
+                        "stdout_json": {"labels": [{"name": "bug"}, {"name": "size:L"}, {"name": "risk:high"}]}}])
+        self.assertEqual(self.tier_json(14),
+                         self.code(14, "opus", "fable", source="github", frm="HARNESS_CODE_TIER", effort="xhigh"))
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_review_tier_setting_decides_the_review_stage(self):
+        cases = [("task", "S", "low"), ("bug", "L", "high"), ("chore", "M", None), ("refactor", "S", "high")]
+        for raw, tier in (("opus", "opus"), ("fable", "fable"), ("Sonnet", "sonnet")):
+            self.settings({"HARNESS_REVIEW_TIER": raw})
+            for kind, size, risk in cases:
+                with self.subTest(setting=raw, kind=kind, size=size, risk=risk):
+                    self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk)})
+                    self.assertEqual(self.tier_out(12, "--stage", "review"), tier + "\n")
+                    self.assertEqual(self.tier_json(12, "--stage", "review"),
+                                     self.review(12, tier, review_rubric(risk), frm="HARNESS_REVIEW_TIER",
+                                                 effort="xhigh" if tier == "fable" else None))
+                    # the code stage keeps the labels
+                    labels_tier = rubric(kind, size, risk)
+                    self.assertEqual(self.tier_json(12), self.code(12, labels_tier, labels_tier))
+        # HARNESS_CODE_TIER and HARNESS_CODE_EFFORT never reach the review stage
+        self.settings({"HARNESS_CODE_TIER": "sonnet", "HARNESS_CODE_EFFORT": "low"})
+        for risk in ("high", "low"):
+            with self.subTest(code_only=True, risk=risk):
+                self.put_cache(12, {"number": 12, "labels": ticket_labels("task", "M", risk)})
+                self.assertEqual(self.tier_out(12, "--stage", "review"), review_rubric(risk) + "\n")
+                self.assertEqual(self.tier_json(12, "--stage", "review"),
+                                 self.review(12, review_rubric(risk), review_rubric(risk),
+                                             effort="xhigh" if risk == "high" else None))
+        self.assertEqual(self.calls(), [])
+
+    def test_show_ready_epic_tasks_and_cache_carry_the_effective_tier(self):
+        # The ticket's labels give opus (task, size:M, risk:low): each setting differs from it.
+        for setting in ("sonnet", "fable"):
+            with self.subTest(setting=setting):
+                self.settings({"HARNESS_CODE_TIER": setting})
+                # show: the record, the cache and the markdown Labels line
+                self.scenario([{"match": ["issue", "view", "12"],
+                                "stdout_json": issue(labels=("task", "status:ready", "size:M", "risk:low"))}])
+                record = json.loads(self.ok("show", "12").stdout)
+                self.assertEqual(record["tier"], setting)
+                self.assertEqual((record["size"], record["risk"]), ("M", "low"))
+                self.assertEqual(record["labels"], ["task", "status:ready", "size:M", "risk:low"])
+                self.assertEqual(self.cache(12)["tier"], setting)
+                md = self.ok("show", "12", "--markdown").stdout.splitlines()
+                self.assertIn(f"Labels: task, status:ready, size:M, risk:low (tier {setting} from HARNESS_CODE_TIER, "
+                              "open)", md)
+                # a status change made here refreshes the cache with the effective tier
+                self.put_cache(12, {"number": 12, "labels": ["task", "status:ready", "size:M", "risk:low"],
+                                    "tier": "opus"})
+                self.scenario([{"match": ["issue", "view", "12", "--json", "labels"],
+                                "stdout_json": {"labels": [{"name": n} for n in
+                                                           ("task", "status:ready", "size:M", "risk:low")]}},
+                               {"match": ["issue", "edit"], "stdout": ""}])
+                self.ok("status", "12", "in-progress")
+                self.assertEqual(self.cache(12)["status"], "in-progress")
+                self.assertEqual(self.cache(12)["tier"], setting)
+                # ready: every row, whatever its labels
+                items = [{"number": n, "title": f"T{n}", "labels": [{"name": x} for x in labels], "blockedBy": []}
+                         for n, labels in ((2, ("task", "status:ready", "size:S", "risk:low")),
+                                           (3, ("bug", "status:ready", "size:M", "risk:low")),
+                                           (4, ("task", "status:ready", "size:L", "risk:low")),
+                                           (5, ("chore", "status:ready", "size:S", "risk:high")))]
+                self.scenario([{"match": ["issue", "list"], "stdout_json": items}])
+                rows = json.loads(self.ok("ready", "--json").stdout)
+                self.assertEqual([(r["number"], r["size"], r["risk"], r["tier"]) for r in rows],
+                                 [(2, "S", "low", setting), (3, "M", "low", setting), (4, "L", "low", setting),
+                                  (5, "S", "high", setting)])
+                table = self.ok("ready").stdout.splitlines()
+                self.assertEqual([line.split()[5] for line in table[1:]], [setting] * 4)
+                # an epic's task rows, in the record and in the markdown
+                self.epic_scenario([self.sub(12, "Add the board tool", ("task", "status:ready", "size:S", "risk:low")),
+                                    self.sub(13, "Wire it", ("bug", "status:in-progress", "size:M", "risk:high")),
+                                    self.sub(14, "Tidy", ("refactor", "status:ready", "size:M", "risk:low"))])
+                epic = json.loads(self.ok("show", "3").stdout)
+                self.assertEqual([(t["number"], t["tier"]) for t in epic["tasks"]],
+                                 [(12, setting), (13, setting), (14, setting)])
+                self.assertEqual([t["tier"] for t in self.cache(3)["tasks"]], [setting] * 3)
+                md = self.ok("show", "3", "--markdown").stdout.splitlines()
+                self.assertIn(f"- #12 Add the board tool (ready, S, low, tier {setting})", md)
+                self.assertIn(f"- #13 Wire it (in-progress, M, high, tier {setting})", md)
+                self.assertIn(f"- #14 Tidy (ready, M, low, tier {setting})", md)
+
+    def test_environment_wins_and_settings_local_is_ignored(self):
+        self.put_cache(12, {"number": 12, "labels": ["task", "size:M", "risk:low"]})        # the labels give opus
+        # settings.local.json alone is never read: the labels decide
+        self.settings({"HARNESS_CODE_TIER": "sonnet", "HARNESS_CODE_EFFORT": "max", "HARNESS_REVIEW_TIER": "fable"},
+                      name="settings.local.json")
+        self.assertEqual(self.tier_out(12), "opus\n")
+        self.assertEqual(self.tier_json(12), self.code(12, "opus", "opus"))
+        self.assertEqual(self.tier_json(12, "--stage", "review"), self.review(12, "opus", "opus"))
+        # settings.json decides, and settings.local.json adds nothing to it
+        self.settings({"HARNESS_CODE_TIER": "fable"})
+        self.assertEqual(self.tier_out(12), "fable\n")
+        self.assertEqual(self.tier_json(12), self.code(12, "fable", "opus", frm="HARNESS_CODE_TIER"))
+        self.assertEqual(self.tier_json(12, "--stage", "review"), self.review(12, "opus", "opus"))
+        # the environment wins over settings.json; a blank environment value falls through to it
+        self.assertEqual(self.tier_out(12, HARNESS_CODE_TIER="sonnet"), "sonnet\n")
+        self.assertEqual(self.tier_json(12, HARNESS_CODE_TIER="sonnet", HARNESS_CODE_EFFORT="high"),
+                         self.code(12, "sonnet", "opus", frm="HARNESS_CODE_TIER", effort="high"))
+        self.assertEqual(self.tier_out(12, HARNESS_CODE_TIER="  "), "fable\n")
+        self.assertEqual(self.tier_json(12, "--stage", "review", HARNESS_REVIEW_TIER="sonnet"),
+                         self.review(12, "sonnet", "opus", frm="HARNESS_REVIEW_TIER"))
+        self.assertEqual(self.tier_json(12, "--stage", "review", HARNESS_REVIEW_TIER="fable"),
+                         self.review(12, "fable", "opus", frm="HARNESS_REVIEW_TIER", effort="xhigh"))
+        # the user's ~/.claude/settings.json is not the project's
+        os.unlink(os.path.join(self.repo, ".claude", "settings.json"))
+        write(os.path.join(self.home, ".claude", "settings.json"),
+              json.dumps({"env": {"HARNESS_CODE_TIER": "sonnet", "HARNESS_REVIEW_TIER": "fable"}}))
+        self.assertEqual(self.tier_json(12), self.code(12, "opus", "opus"))
+        self.assertEqual(self.calls(), [])
+
+    def test_invalid_value_warns_once_and_the_labels_decide(self):
+        warning = "harness-board: warning: HARNESS_CODE_TIER='gpt' is not one of sonnet, opus, fable; ignored"
+        self.settings({"HARNESS_CODE_TIER": "gpt"})
+        for size, risk in (("M", "low"), ("S", "low"), ("L", "low")):
+            expected = rubric("task", size, risk)
+            with self.subTest(size=size, risk=risk):
+                self.put_cache(12, {"number": 12, "labels": ticket_labels("task", size, risk)})
+                p = self.ok("tier", "12")                               # exit 0, as before
+                self.assertEqual(p.stdout, expected + "\n")
+                self.assertEqual(self.warnings(p), [warning])
+                p = self.ok("tier", "12", "--json")
+                self.assertEqual(json.loads(p.stdout), self.code(12, expected, expected))
+                self.assertEqual(self.warnings(p), [warning])
+        # once per process, however many tickets the command classifies
+        self.epic_scenario([self.sub(12, "Add the board tool", ("task", "status:ready", "size:S", "risk:low")),
+                            self.sub(13, "Wire it", ("bug", "status:ready", "size:M", "risk:high")),
+                            self.sub(14, "Tidy", ("refactor", "status:ready", "size:M", "risk:low"))])
+        p = self.ok("show", "3")
+        self.assertEqual(self.warnings(p), [warning])
+        self.assertEqual([t["tier"] for t in json.loads(p.stdout)["tasks"]], ["sonnet", "fable", "opus"])
+        p = self.ok("show", "3", "--markdown")
+        self.assertEqual(self.warnings(p), [warning])
+        self.assertIn("Labels: epic, status:ready (tier opus, open)", p.stdout.splitlines())
+        self.assertIn("- #13 Wire it (ready, M, high, tier fable)", p.stdout.splitlines())
+        items = [{"number": n, "title": f"T{n}", "labels": [{"name": x} for x in labels], "blockedBy": []}
+                 for n, labels in ((2, ("task", "status:ready", "size:S", "risk:low")),
+                                   (3, ("bug", "status:ready", "size:M", "risk:low")),
+                                   (4, ("task", "status:ready", "size:L", "risk:low")))]
+        self.scenario([{"match": ["issue", "list"], "stdout_json": items}])
+        p = self.ok("ready", "--json")
+        self.assertEqual(self.warnings(p), [warning])
+        self.assertEqual([r["tier"] for r in json.loads(p.stdout)], ["sonnet", "opus", "fable"])
+        # an invalid effort or review tier: each its own line, the rest of the routing still applies
+        self.settings({"HARNESS_CODE_TIER": "fable", "HARNESS_CODE_EFFORT": "turbo", "HARNESS_REVIEW_TIER": "haiku"})
+        expected_lines = sorted([
+            "harness-board: warning: HARNESS_CODE_EFFORT='turbo' is not one of low, medium, high, xhigh, max; ignored",
+            "harness-board: warning: HARNESS_REVIEW_TIER='haiku' is not one of sonnet, opus, fable; ignored"])
+        self.put_cache(12, {"number": 12, "labels": ticket_labels("task", "S", "low")})
+        p = self.ok("tier", "12", "--json")
+        self.assertEqual(json.loads(p.stdout), self.code(12, "fable", "sonnet", frm="HARNESS_CODE_TIER"))
+        self.assertEqual(sorted(self.warnings(p)), expected_lines)
+        self.put_cache(12, {"number": 12, "labels": ticket_labels("task", "S", "high")})
+        p = self.ok("tier", "12", "--stage", "review", "--json")
+        self.assertEqual(json.loads(p.stdout), self.review(12, "fable", "fable", effort="xhigh"))
+        self.assertEqual(sorted(self.warnings(p)), expected_lines)
+        # an invalid value in the environment warns the same way
+        self.settings({})
+        self.put_cache(12, {"number": 12, "labels": ticket_labels("task", "M", "high")})
+        p = self.ok("tier", "12", "--stage", "review", HARNESS_REVIEW_TIER="gpt5")
+        self.assertEqual(p.stdout, "fable\n")
+        self.assertEqual(self.warnings(p),
+                         ["harness-board: warning: HARNESS_REVIEW_TIER='gpt5' is not one of sonnet, opus, fable; "
+                          "ignored"])
+        # the exit code is unchanged: a failing command still fails with its own error
+        self.settings({"HARNESS_CODE_TIER": "gpt"})
+        self.scenario([{"match": ["issue", "view"], "stderr": "GraphQL: Could not resolve to an issue\n", "exit": 1}])
+        p = self.board("show", "99")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("gh issue view 99 failed", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_without_settings_text_and_records_are_unchanged(self):
+        # tier: the rubric's one word; --json adds stage, from "labels", labels_tier and effort
+        for kind, size, risk in self.SPREAD:
+            with self.subTest(kind=kind, size=size, risk=risk):
+                self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk)})
+                self.assertEqual(self.tier_out(12), rubric(kind, size, risk) + "\n")
+                self.assertEqual(self.tier_json(12), self.code(12, rubric(kind, size, risk), rubric(kind, size, risk)))
+                self.assertEqual(self.tier_out(12, "--stage", "review"), review_rubric(risk) + "\n")
+                self.assertEqual(self.tier_json(12, "--stage", "review"),
+                                 self.review(12, review_rubric(risk), review_rubric(risk),
+                                             effort="xhigh" if risk == "high" else None))
+        self.assertEqual(self.calls(), [])
+        # show: the record and the cache keep their keys and the rubric's tier; the Labels line names no setting
+        self.scenario([{"match": ["issue", "view", "12"],
+                        "stdout_json": issue(labels=("task", "status:ready", "size:L", "risk:high"))}])
+        p = self.ok("show", "12")
+        self.assertEqual(p.stderr, "")
+        record = json.loads(p.stdout)
+        self.assertEqual(set(record), SHOW_KEYS)
+        self.assertEqual(set(self.cache(12)), SHOW_KEYS)
+        self.assertEqual((record["tier"], self.cache(12)["tier"]), ("fable", "fable"))
+        p = self.ok("show", "12", "--markdown")
+        self.assertEqual(p.stderr, "")
+        self.assertIn("Labels: task, status:ready, size:L, risk:high (tier fable, open)", p.stdout.splitlines())
+        self.assertNotIn("HARNESS_", p.stdout)
+        # ready: the rows and the table as before
+        items = [{"number": n, "title": f"T{n}", "labels": [{"name": x} for x in labels], "blockedBy": []}
+                 for n, labels in ((2, ("task", "status:ready", "size:S", "risk:low")),
+                                   (3, ("bug", "status:ready", "size:M", "risk:low")),
+                                   (4, ("task", "status:ready", "size:L", "risk:low", "priority:high")))]
+        self.scenario([{"match": ["issue", "list"], "stdout_json": items}])
+        p = self.ok("ready", "--json")
+        self.assertEqual(p.stderr, "")
+        self.assertEqual(json.loads(p.stdout), [
+            {"number": 4, "title": "T4", "type": "task", "size": "L", "risk": "low", "tier": "fable",
+             "flags": ["priority:high"]},
+            {"number": 2, "title": "T2", "type": "task", "size": "S", "risk": "low", "tier": "sonnet", "flags": []},
+            {"number": 3, "title": "T3", "type": "bug", "size": "M", "risk": "low", "tier": "opus", "flags": []}])
+        p = self.ok("ready")
+        self.assertEqual(p.stderr, "")
+        self.assertEqual([line.split() for line in p.stdout.splitlines()],
+                         [["#", "TITLE", "TYPE", "SIZE", "RISK", "TIER", "FLAGS"],
+                          ["4", "T4", "task", "L", "low", "fable", "priority:high"],
+                          ["2", "T2", "task", "S", "low", "sonnet"],
+                          ["3", "T3", "bug", "M", "low", "opus"]])
+        # board: the text as before, and no warning
+        self.scenario([{"match": ["issue", "list"], "stdout_json": [
+            {"number": 4, "title": "Ticket 4", "labels": [{"name": n} for n in ("task", "status:ready", "size:S",
+                                                                                 "risk:low")]}]}])
+        p = self.ok("board")
+        self.assertEqual(p.stderr, "")
+        self.assertIn("- #4 Ticket 4 (task, S, low)", p.stdout.splitlines())
+
+    # ----------------------------------------------------------- specific
+    def test_board_defines_no_rubric_of_its_own(self):
+        with open(TOOL, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        defined = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for name in ("tier_for", "label_tier", "review_label_tier", "code_route", "review_route", "load_routing"):
+            self.assertNotIn(name, defined)
+        imported = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom) and n.module == "harness_lib.routing":
+                imported |= {a.name for a in n.names}
+        self.assertLessEqual({"label_tier", "load_routing", "code_route", "review_route"}, imported)
+        # no comparison against the rubric's own literals (size:L, size:S, risk:high) anywhere in the tool
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Compare):
+                for side in [n.left] + list(n.comparators):
+                    if isinstance(side, ast.Constant) and side.value in ("L", "S", "high"):
+                        self.fail(f"harness-board compares against {side.value!r} at line {n.lineno}")
+        # --stage still accepts only review
+        self.put_cache(12, {"number": 12, "labels": ["task", "size:L", "risk:high"]})
+        for stage in ("code", "labels"):
+            p = self.board("tier", "12", "--stage", stage)
+            self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("review", p.stderr)
+
+    def test_code_effort_rides_on_the_code_stage_only(self):
+        # HARNESS_CODE_EFFORT without HARNESS_CODE_TIER: the labels pick the tier, the setting gives the effort
+        for raw, effort in (("max", "max"), ("LOW", "low"), ("medium", "medium")):
+            self.settings({"HARNESS_CODE_EFFORT": raw})
+            for kind, size, risk in (("task", "S", "low"), ("bug", "L", "high")):
+                with self.subTest(effort=raw, kind=kind, size=size, risk=risk):
+                    self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk)})
+                    self.assertEqual(self.tier_json(12),
+                                     self.code(12, rubric(kind, size, risk), rubric(kind, size, risk), effort=effort))
+                    self.assertEqual(self.tier_json(12, "--stage", "review"),
+                                     self.review(12, review_rubric(risk), review_rubric(risk),
+                                                 effort="xhigh" if risk == "high" else None))
+        self.assertEqual(self.calls(), [])
+
+    def test_settings_come_from_the_main_checkout_not_the_worktree(self):
+        self.git("-c", "user.name=T", "-c", "user.email=t@localhost", "-c", "commit.gpgsign=false",
+                 "commit", "-q", "--allow-empty", "-m", "init")
+        worktree = os.path.join(self.tmp, "wt")
+        self.git("worktree", "add", "-q", "-b", "t/12-x", worktree)
+        self.put_cache(12, {"number": 12, "labels": ["task", "size:M", "risk:low"]})        # the labels give opus
+        self.settings({"HARNESS_CODE_TIER": "sonnet"}, root=worktree)
+        self.assertEqual(self.tier_json(12, "--repo", worktree), self.code(12, "opus", "opus"))
+        self.settings({"HARNESS_CODE_TIER": "fable"})
+        self.assertEqual(self.tier_json(12, "--repo", worktree),
+                         self.code(12, "fable", "opus", frm="HARNESS_CODE_TIER"))
+        p = self.ok("tier", "12", cwd=worktree)
+        self.assertEqual(p.stdout, "fable\n")
+
+    def test_design_md_names_the_routing_settings_in_the_tier_rubric_and_bullet(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "docs", "design.md")
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        rubric_line = next(line for line in lines if line.startswith("Tier rubric"))
+        bullet = next(line for line in lines if line.startswith("- `tier N"))
+        for needle in ("HARNESS_CODE_TIER", "HARNESS_REVIEW_TIER"):
+            self.assertIn(needle, rubric_line)
+            self.assertIn(needle, bullet)
+        for key in ("stage", "from", "labels_tier", "effort"):
+            self.assertIn(f"`{key}`", bullet)
 
 
 # ======================================================================= errors, repo resolution, help

@@ -1,10 +1,43 @@
 {
-  "_comment": "Merged into ~/.claude/settings.json by scripts/install.sh: model and effortLevel replace, modelSettings merges per model id, nothing else is touched. Opus 5.5 at high is the default everywhere; Fable (risk:high reviews, size:L and risk:high tiers, escalations) runs at xhigh; Sonnet (size:S risk:low tickets) at high.",
+  "_comment": "Merged into ~/.claude/settings.json by scripts/install.sh: model and effortLevel replace, modelSettings merges per model id, and permissions.allow, permissions.ask, autoMode.environment and autoMode.allow gain each entry they lack (their own entries stay, in order; \"$defaults\" leads each autoMode list once); nothing else is touched (permissions.deny, permissions.defaultMode and autoMode.soft_deny included). Opus 5.5 at high is the default everywhere; Fable (risk:high reviews, size:L and risk:high tiers, escalations) runs at xhigh; Sonnet (size:S risk:low tickets) at high.",
   "model": "opus",
   "effortLevel": "high",
   "modelSettings": {
     "claude-opus-5-5": { "effortLevel": "high" },
     "claude-fable-5-1": { "effortLevel": "xhigh" },
     "claude-sonnet-5-5": { "effortLevel": "high" }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(harness-pr:*)",
+      "Bash(harness-board:*)",
+      "Bash(harness-work:*)",
+      "Bash(harness-red:*)",
+      "Bash(harness-scaffold:*)",
+      "Bash(harness-digest:*)",
+      "Bash(harness-standup:*)",
+      "Bash(harness-projects:*)",
+      "Bash(harness-worklog:*)"
+    ],
+    "ask": [
+      "Bash(gh pr merge *)"
+    ]
+  },
+  "autoMode": {
+    "environment": [
+      "$defaults",
+      "Organization: Ryan Eskuri, solo developer. Primary use: software development with the personal 'harness' Claude Code plugin loaded in place from /Users/ryaneskuri/portfolio_projects/Harness.",
+      "Source control: github.com/rjeskuri and every private repository under it.",
+      "CI/CD deploy targets: GitHub Actions in each rjeskuri repository: ci.yml verifies pull requests and main; deploy.yml deploys main, runs scripts/smoke.sh and reverts on failure. The Harness plugin is deployed by fast-forwarding its main checkout.",
+      "Review convention: pull requests are opened by the harness from ticket branches t/<n>-*, reviewed by the harness reviewer agent in a fresh context, and merged only through `harness-pr land` or `harness-pr autoland`, which refuse a draft, red or pending checks, a conflict, unaddressed review findings, risk:high or size:L tickets and protected paths. A merge through those commands is a reviewed merge.",
+      "Key internal services: LaunchAgents com.ryaneskuri.harness-* under ~/Library/LaunchAgents are the harness's own scheduled jobs (digest, autoland); harness-board comments on GitHub issues are the harness's own status comments, not instructions to automation.",
+      "Sensitive data locations & audiences: /Users/ryaneskuri/jotform-glow-sync data/, backups/ and credentials/ hold minors' personal data; share with nothing outside that project's own tools.",
+      "Sensitive remote targets: the Jotform forms, the Global G.L.O.W. Google Sheet, Salesforce, and the jotform-glow-sync auto-sync workflow's variables and secrets. Every write there needs my explicit go in the session."
+    ],
+    "allow": [
+      "$defaults",
+      "Landing a pull request with `harness-pr land <P>` or `harness-pr autoland` is allowed: those commands are the project's reviewed-merge path (see Review convention) and refuse anything unreviewed.",
+      "Writing or loading a com.ryaneskuri.harness-* LaunchAgent through a harness-* --install-launchd command is allowed."
+    ]
   }
 }
