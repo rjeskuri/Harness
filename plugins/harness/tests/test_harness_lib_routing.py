@@ -864,13 +864,20 @@ class Module(RoutingCase):
                 self.assertTrue(cells[2], "empty default cell for %s" % key)
                 for word in words[key]:
                     self.assertRegex(cells[1], r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(word))
-        # routing.py in the Layout block's lib list, and in the harness_lib paragraph
-        lib_lines = [ln for ln in lines if ln.strip().startswith("lib/") and "harness_lib/__init__.py" in ln]
+        # routing.py as its own entry under "### harness_lib modules" (ticket #250), the Layout
+        # block's lib/ line and the harness_lib intro paragraph still there once each
+        lib_lines = [ln for ln in lines if ln.strip().startswith("lib/") and "harness_lib/" in ln]
         self.assertEqual(len(lib_lines), 1, "want one lib/ line in the Layout block")
-        self.assertIn("routing.py", lib_lines[0].split())
         paragraphs = [ln for ln in lines if ln.startswith("Code shared between files lives in")]
         self.assertEqual(len(paragraphs), 1)
-        self.assertIn("`routing.py`", paragraphs[0])
+        heads = [i for i, ln in enumerate(lines) if ln.rstrip() == "### harness_lib modules"]
+        self.assertEqual(len(heads), 1, "want one '### harness_lib modules' heading")
+        end = next((i for i in range(heads[0] + 1, len(lines)) if re.match(r"#{1,6} ", lines[i])), len(lines))
+        entries = [ln for ln in lines[heads[0] + 1:end] if ln.startswith("- `routing.py`: ")]
+        self.assertEqual(len(entries), 1, "want one `routing.py` entry under '### harness_lib modules'")
+        for term in ("`load_routing(main)`", "`code_route(kind, size, risk, routing)`",
+                     "`review_route(risk, routing)`", "`label_tier(kind, size, risk)`"):
+            self.assertIn(term, entries[0])
 
     def test_future_annotations_is_enabled(self):
         text = ROUTING_PY.read_text(encoding="utf-8")
