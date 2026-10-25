@@ -14,6 +14,11 @@ import os
 import subprocess
 
 GIT_TIMEOUT = 10  # seconds committed_env's git show may take
+# HARNESS_TEST_PATTERNS when a project sets none: tests_first, harness-red and the auto-land gate.
+DEFAULT_TEST_PATTERNS = (
+    "tests/**,test/**,**/test_*.py,**/*_test.py,**/conftest.py,**/*_test.js,"
+    "**/*.test.js,**/*.test.ts,**/*_test.ts,spec/**"
+)
 
 
 def settings_env(root, names=("settings.json", "settings.local.json")):

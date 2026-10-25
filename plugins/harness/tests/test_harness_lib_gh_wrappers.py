@@ -156,9 +156,17 @@ def setUpModule():
     W["poison"] = executable(os.path.join(fakebin, "gh-poison"), POISON.format(python=sys.executable))
     if str(LIB) not in sys.path:
         sys.path.insert(0, str(LIB))
+    # #187: gh_run logs each gh call under ~/.claude/harness/gh; the calls made in this process (and the tools
+    # started with clean_env(), which copies it) go to a temporary HOME, never the real one.
+    W["home"] = os.path.join(W["tmp"], "home")
+    os.makedirs(W["home"])
+    W["home_patch"] = mock.patch.dict(os.environ, {"HOME": W["home"]})
+    W["home_patch"].start()
 
 
 def tearDownModule():
+    if "home_patch" in W:
+        W.pop("home_patch").stop()
     shutil.rmtree(W["tmp"], ignore_errors=True)
 
 

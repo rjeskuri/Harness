@@ -50,6 +50,7 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.gh import GH_ENV, gh_binary
+    from harness_lib.ghlimit import log_call, ms_since
     from harness_lib.hookio import emit, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.repo import main_checkout
@@ -63,6 +64,7 @@ except Exception as exc:  # fail open: the brief goes on without ticket state an
     # The brief must still reach the session without the lib (the guards are off then),
     # so only here does this hook keep its own copy of the hook I/O, text helpers and gh lookup it needs.
     GH_ENV = {"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"}
+    log_call = None  # the gh call log is the lib's: without it the board's gh calls go unlogged
 
     def gh_binary() -> str | None:
         gh = os.environ.get("HARNESS_GH", "gh")
@@ -503,11 +505,13 @@ def run_side_by_side(
     cmds: list[list[str]], cwd: Path, timeout: float
 ) -> list[str] | None:
     """stdout of each command, run at the same time; None when one fails or the time runs
-    out (then every one still running is stopped)."""
+    out (then every one still running is stopped). With the lib, each command is logged
+    once as a gh call (ghlimit), with exit null when it was stopped."""
     env = dict(os.environ, **GH_ENV)
-    procs = []
+    procs, started = [], []
     try:
         for cmd in cmds:
+            started.append(time.monotonic())
             procs.append(
                 subprocess.Popen(
                     cmd,
@@ -530,8 +534,9 @@ def run_side_by_side(
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
     finally:
-        for proc in procs:
-            if proc.poll() is None:
+        for i, proc in enumerate(procs):
+            code = proc.poll()
+            if code is None:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except OSError:
@@ -540,6 +545,8 @@ def run_side_by_side(
                     proc.communicate(timeout=1)
                 except (OSError, subprocess.SubprocessError, ValueError):
                     pass
+            if log_call is not None:
+                log_call(cmds[i][1:], cwd=cwd, exit=code, ms=ms_since(started[i]))
 
 
 def label_names(issue) -> set[str]:
