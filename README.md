@@ -52,7 +52,7 @@ Then register your projects: `harness-projects discover`, and `harness-projects 
 | `test-author` | tier | Writes the tests a ticket names and shows them red; may not edit source |
 | `test-breaker` | tier | Tries to pass the new tests with a cheat in a scratch copy; may not edit tests |
 | `coder` | tier | Makes the tests and the verify command green, commits; may not edit tests |
-| `reviewer` | Opus (Fable, xhigh, for risk:high) | Reviews the branch against the definition of done; findings go on the PR |
+| `reviewer` | Opus (Fable, xhigh, for risk:high), unless the project sets `HARNESS_REVIEW_TIER` | Reviews the branch against the definition of done; findings go on the PR |
 | `researcher` | Opus | Answers from primary sources |
 | `quick` | Sonnet | Trivial mechanical tasks outside the ticket loop |
 
