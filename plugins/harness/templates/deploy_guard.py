@@ -11,9 +11,10 @@ Runs in the project checkout (the cwd: on main, full history), from the deploy w
 
 run, in this order: an open issue labelled `deploy-frozen` (and no --force) prints `deploys are frozen by #N` and
 exits 0, deploying nothing; no scripts/deploy.sh prints `no deploy script` and exits 0; scripts/deploy.sh runs
-(bounded by 30 minutes) and its failure or timeout exits 1 with no revert; no scripts/smoke.sh exits 0; else
-scripts/smoke.sh runs (bounded by DEPLOY_GUARD_SMOKE_TIMEOUT seconds, default 600) with its stdout and stderr in a
-log: 0 exits 0, 2 is `degraded` with that log, anything else or a timeout is `revert` with that log, and its exit.
+(bounded by DEPLOY_GUARD_DEPLOY_TIMEOUT seconds, default 1800) and its failure or timeout exits 1 with no revert;
+no scripts/smoke.sh exits 0; else scripts/smoke.sh runs (bounded by DEPLOY_GUARD_SMOKE_TIMEOUT seconds, default
+600) with its stdout and stderr in a log: 0 exits 0, 2 is `degraded` with that log, anything else or a timeout is
+`revert` with that log, and its exit.
 
 degraded: comment on the open issue labelled `degraded`, else open `Degraded: <owner/repo>` with that label (made
 sure of first, as below), naming the commit, with the last 60 lines of the --smoke-log fenced. Nothing is reverted
@@ -23,7 +24,7 @@ revert:
 1. Revert: fetch and check out (detached) origin/main; unless it already has a commit saying
    `This reverts commit SHA`, `git revert --no-edit SHA` on top of it as github-actions[bot] and
    `git push origin HEAD:main`. Then scripts/deploy.sh (when present) and scripts/smoke.sh run again from that
-   checkout, the smoke bounded by DEPLOY_GUARD_SMOKE_TIMEOUT seconds (default 600).
+   checkout, bounded by DEPLOY_GUARD_DEPLOY_TIMEOUT and DEPLOY_GUARD_SMOKE_TIMEOUT as in run.
 2. Incident: unless an open `incident` issue's body has the line `Merge commit: SHA`, open
    `Incident: <PR title> reverted` (no PR: the commit's subject), labelled `incident` and assigned to the repository
    owner, naming the merge commit, PR, ticket and revert commit, with the last 60 lines of the --smoke-log fenced.
@@ -174,26 +175,38 @@ def run_script(path, timeout=None, out=None):
         return None
 
 
-def smoke_timeout():
-    raw = os.environ.get("DEPLOY_GUARD_SMOKE_TIMEOUT", "").strip()
+def env_timeout(name, default):
+    """Seconds from the environment variable name, else default (with a warning when it is not a positive number)."""
+    raw = os.environ.get(name, "").strip()
     if not raw:
-        return SMOKE_TIMEOUT
+        return default
     try:
         value = float(raw)
     except ValueError:
         value = 0.0
     if value > 0:
         return value
-    warn(f"DEPLOY_GUARD_SMOKE_TIMEOUT={raw!r} is not a positive number of seconds; using {SMOKE_TIMEOUT:g}")
-    return SMOKE_TIMEOUT
+    warn(f"{name}={raw!r} is not a positive number of seconds; using {default:g}")
+    return default
+
+
+def smoke_timeout():
+    return env_timeout("DEPLOY_GUARD_SMOKE_TIMEOUT", SMOKE_TIMEOUT)
+
+
+def deploy_timeout():
+    return env_timeout("DEPLOY_GUARD_DEPLOY_TIMEOUT", DEPLOY_TIMEOUT)
 
 
 def redeploy():
     """scripts/deploy.sh when present, then scripts/smoke.sh: None, or why it failed."""
     deploy, smoke = DEPLOY_SH, SMOKE_SH
     if os.path.isfile(deploy):
+        timeout = deploy_timeout()
         say("redeploying with scripts/deploy.sh")
-        code = run_script(deploy)
+        code = run_script(deploy, timeout)
+        if code is None:
+            return f"scripts/deploy.sh ran past {timeout:g} s after the revert"
         if code:
             return f"scripts/deploy.sh exited {code} after the revert"
     if not os.path.isfile(smoke):
@@ -461,9 +474,11 @@ def cmd_run(args):
         say("no deploy script")
         return 0
     say(f"deploying {sha[:7]} with scripts/deploy.sh")
-    code = run_script(DEPLOY_SH, DEPLOY_TIMEOUT)
+    timeout = deploy_timeout()
+    code = run_script(DEPLOY_SH, timeout)
     if code is None or code:
-        warn(f"scripts/deploy.sh {'ran past 30 minutes' if code is None else f'exited {code}'}; nothing reverted")
+        why = f"ran past {timeout:g} s" if code is None else f"exited {code}"
+        warn(f"scripts/deploy.sh {why}; nothing reverted")
         return 1
     if not os.path.isfile(SMOKE_SH):
         say("no scripts/smoke.sh: deployed without a live check")

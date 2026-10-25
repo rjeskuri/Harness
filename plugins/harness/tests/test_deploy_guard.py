@@ -11,6 +11,7 @@ widget (#34)" style, which changes app.txt from version 1 to version 2. Some tes
 
 scripts/deploy.sh and scripts/smoke.sh are fakes committed in the project: each appends `deploy <HEAD> <app.txt
 first line>` or `smoke <HEAD>` to $GUARD_RUN_LOG and exits with $FAKE_DEPLOY_EXIT or $FAKE_SMOKE_EXIT (default 0);
+deploy.sh execs `sleep $FAKE_DEPLOY_SLEEP` after its line when that is set;
 smoke.sh execs `sleep $FAKE_SMOKE_SLEEP` when that is set. On the merge under test (app.txt at version 2) smoke.sh is
 the first, live check of `run`: it prints the file $FAKE_SMOKE_OUTPUT and the line $FAKE_SMOKE_STDERR (on stderr) when
 set, execs `sleep $FAKE_SMOKE_SLEEP_V2` when set, and exits $FAKE_SMOKE_EXIT_V2, else $FAKE_SMOKE_EXIT, else 0; on the
@@ -67,6 +68,9 @@ DEPLOY_SH = """#!/bin/sh
 cd "$(dirname "$0")/.."
 printf 'deploy %s %s\\n' "$(git rev-parse HEAD)" "$(head -n 1 app.txt)" >> "$GUARD_RUN_LOG"
 echo "deploying"
+if [ -n "${FAKE_DEPLOY_SLEEP:-}" ]; then
+  exec sleep "$FAKE_DEPLOY_SLEEP"
+fi
 exit "${FAKE_DEPLOY_EXIT:-0}"
 """
 
@@ -1312,6 +1316,104 @@ class Run(GuardTest):
                 for _, argv in made:
                     self.assertFalse({"--force", "-f"} & set(argv), "a customised degraded label stays as it is")
                 self.assertDegradedIssue(w, self.creates(w)[0])
+
+    # ============================================================= GitHub or deploy.sh failing
+    def answer_first(self, w, contains, response):
+        """Put a call answering `contains` with `response` ahead of the scenario's own answers."""
+        with open(w.scenario_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["calls"].insert(0, {"contains": list(contains), **response})
+        write(w.scenario_path, json.dumps(data))
+
+    def test_a_failed_freeze_lookup_deploys_nothing_unless_forced(self):
+        answers = [("gh exits 1", {"stderr": "HTTP 502: Bad Gateway (https://api.github.com/graphql)\n", "exit": 1}),
+                   ("gh exits 4", {"stderr": "gh: To use GitHub CLI in automation, set GH_TOKEN\n", "exit": 4}),
+                   ("not JSON", {"stdout": "<html><body>rate limited</body></html>\n"}),
+                   ("empty", {"stdout": ""})]
+        for name, answer in answers:
+            for forced in (False, True):
+                with self.subTest(name, forced=forced):
+                    w = self.make_world(re.sub(r"\W+", "-", f"{name}-{forced}"), slug="massive/dynamic",
+                                        title="Shard the ledger", pr=83, ticket=52, incident=310)
+                    self.scenario(w)
+                    self.answer_first(w, ["issue", "list", "deploy-frozen"], answer)
+                    before = self.snapshot(w)
+
+                    if forced:
+                        p = self.run_guard(w, "--force")
+                        self.assertExit(p, 0)
+                        self.assertEqual(self.ran(w), self.deployed_and_smoked(w), "--force deploys anyway")
+                    else:
+                        # a failing smoke, so a guard that deployed past the failed lookup would also revert
+                        p = self.run_guard(w, FAKE_SMOKE_EXIT_V2="1")
+                        self.assertExit(p, 1)
+                        self.assertEqual(self.ran(w), [], "neither deploy.sh nor smoke.sh runs")
+                    self.assertEqual(self.snapshot(w), before, "no git write")
+                    self.assertEqual(self.writes(w), [], "nothing filed on GitHub")
+
+    def test_deploy_timeout_is_read_from_the_environment(self):
+        # 2 s against a 40 s deploy times out, 15 s against a 3 s deploy passes: no constant timeout does both
+        cases = [("2", "40", True), ("15", "3", False)]
+        for limit, sleep, times_out in cases:
+            with self.subTest(timeout=limit, sleep=sleep):
+                w = self.make_world(f"d{limit}", slug="wonka/factory", title="Retool the line", pr=48, ticket=27,
+                                    incident=95)
+                self.scenario(w)
+                before = self.snapshot(w)
+                # on a timeout the smoke would fail, so a guard that went on to smoke.sh would also revert
+                env = {"FAKE_SMOKE_EXIT_V2": "1"} if times_out else {}
+                started = time.monotonic()
+                try:
+                    p = self.run_guard(w, timeout=25, DEPLOY_GUARD_DEPLOY_TIMEOUT=limit, FAKE_DEPLOY_SLEEP=sleep,
+                                       **env)
+                except subprocess.TimeoutExpired:
+                    self.fail(f"DEPLOY_GUARD_DEPLOY_TIMEOUT={limit} did not bound a {sleep} s scripts/deploy.sh")
+                elapsed = time.monotonic() - started
+
+                if times_out:
+                    self.assertLess(elapsed, 20, "DEPLOY_GUARD_DEPLOY_TIMEOUT bounds deploy.sh")
+                    self.assertExit(p, 1)
+                    self.assertEqual(self.ran(w), [f"deploy {w.sha} version: 2"], "no smoke after a timed-out deploy")
+                    self.assertEqual(self.snapshot(w), before, "no revert, no git write")
+                    self.assertEqual(self.writes(w), [], "no incident, no degraded issue")
+                else:
+                    self.assertExit(p, 0)
+                    self.assertEqual(self.ran(w), self.deployed_and_smoked(w))
+                    self.assertEqual(self.snapshot(w), before)
+                    self.assertEqual(self.writes(w), [])
+
+    def test_unreachable_github_fails_degraded_and_never_reverts(self):
+        refused = {"stderr": "error connecting to api.github.com\n", "exit": 1}
+        cases = [  # (name, open degraded issue, failing call)
+            ("list fails", False, ["issue", "list", "degraded"]),
+            ("comment fails", True, ["issue", "comment"]),
+            ("create fails", False, ["issue", "create"])]
+        for name, open_issue, failing in cases:
+            for via_run in (False, True):
+                with self.subTest(name, via_run=via_run):
+                    w = self.make_world(re.sub(r"\W+", "-", f"{name}-{via_run}"), slug="black-mesa/sector-c",
+                                        title="Align the spectrometer", pr=61, ticket=19, incident=240)
+                    log = [f"spectrometer probe {i}: p95 2600 ms" for i in range(1, 5)]
+                    degraded = [self.issue(w, 88, f"Degraded: {w.slug}", "degraded")] if open_issue else []
+                    self.scenario(w, degraded=degraded)
+                    self.answer_first(w, failing, refused)
+                    before = self.snapshot(w)
+
+                    if via_run:
+                        p = self.run_guard(w, FAKE_SMOKE_EXIT_V2="2", FAKE_SMOKE_OUTPUT=self.smoke_output(w, log))
+                        self.assertEqual(self.ran(w), self.deployed_and_smoked(w), "no redeploy, no second smoke")
+                    else:
+                        smoke_log = write(os.path.join(w.base, "degraded.log"), "\n".join(log) + "\n")
+                        p = self.degraded_cmd(w, smoke_log)
+                        self.assertEqual(self.ran(w), [], "degraded deploys nothing and runs no smoke")
+
+                    self.assertExit(p, 1)
+                    self.assertEqual(self.snapshot(w), before, "no revert, no git write")
+                    self.assertEqual([self.title(c) for c in self.creates(w) if self.title(c).startswith("Incident")],
+                                     [], "no incident")
+                    for verb in ("edit", "reopen"):
+                        self.assertEqual([c["argv"] for c in self.gh_calls(w) if c["argv"][:2] == ["issue", verb]],
+                                         [], f"no gh issue {verb}")
 
 
 # ---------------------------------------------------------------- deploy.yml v2

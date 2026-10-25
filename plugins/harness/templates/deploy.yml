@@ -24,8 +24,9 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # deploy.sh (30 min at most), the smoke check, and after a revert both again
-    timeout-minutes: 60
+    # worst case 80 min: deploy.sh (DEPLOY_GUARD_DEPLOY_TIMEOUT, 30 min) and smoke.sh (DEPLOY_GUARD_SMOKE_TIMEOUT,
+    # 10 min), then both again after a revert; plus 10 min for git and gh. Raise it with either timeout.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
         with:
