@@ -1779,6 +1779,35 @@ def trim_main(text: str) -> str:
     )
 
 
+# ort vs Myers (#231 re-check): main adds an import header and strips the trailing blank
+# lines; the branch adds a line to test_login. `git merge` (ort, histogram) merges it
+# cleanly; `git merge-file` (Myers) on the same three inputs conflicts.
+DIVERGE_TESTS = "def test_login():\n    pass\n\n\n"
+DIVERGE_MERGED = "import pytest\n\n\ndef test_login():\n" + BRANCH_LINE_5 + "    pass\n"
+
+
+def diverge_author(text: str) -> str:
+    return replaced(text, "def test_login():\n", "def test_login():\n" + BRANCH_LINE_5)
+
+
+def diverge_main(text: str) -> str:
+    assert text == DIVERGE_TESTS, text
+    return "import pytest\n\n\ndef test_login():\n    pass\n"
+
+
+def myers_merge(tmp: Path, ours: str, base: str, theirs: str, env: dict) -> tuple:
+    """(exit status, output) of `git merge-file -p` (Myers) on the three texts."""
+    paths = []
+    for name, text in (("ours", ours), ("base", base), ("theirs", theirs)):
+        path = tmp / f"myers-{name}"
+        path.write_text(text, encoding="utf-8")
+        paths.append(str(path))
+    r = subprocess.run(
+        ["git", "merge-file", "-p", "-q", *paths], capture_output=True, text=True, env=env
+    )
+    return r.returncode, r.stdout
+
+
 def content_hash(root: Path, files) -> str:
     """The red record's test_hash, from first principles: sha256 over each file's path,
     a newline and its bytes, in sorted path order."""
@@ -2380,6 +2409,79 @@ class TestsFirstMainMergeTests(GuardTestCase):
                 self.merge_cleanly(wt)
                 self.assertSourceAllowed(wt)
                 self.assertEqual(self.status(wt), "current: yes")
+
+    # ---- re-check round (#231): ort vs Myers, and records without a side file
+
+    def test_a_clean_merge_that_myers_would_conflict_on_keeps_source_allowed(self):
+        repo, wt = self.ticket("diverge", DIVERGE_TESTS, diverge_author)
+        self.on_main(repo, {"tests/test_app.py": diverge_main})
+        self.merge_cleanly(wt)
+        path = wt / "tests/test_app.py"
+        self.assertEqual(path.read_text(), DIVERGE_MERGED)
+        # the same three inputs through Myers merge-file do not give that file
+        code, myers = myers_merge(
+            self.tmp, diverge_author(DIVERGE_TESTS), DIVERGE_TESTS, diverge_main(DIVERGE_TESTS), self.env
+        )
+        self.assertFalse(code == 0 and myers == DIVERGE_MERGED, (code, myers))
+        self.assertSourceAllowed(wt)
+        self.assertEqual(self.status(wt), "current: yes")
+        # a test change of the branch's own after that merge still counts
+        head = self.git(wt, "rev-parse", "HEAD")
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                self.git(wt, "reset", "-q", "--hard", head)
+                self.write(path, replaced(DIVERGE_MERGED, BRANCH_LINE_5, "    assert login() == 'hi'\n"))
+                if committed:
+                    self.commit_all(wt, "the branch edits its test")
+                self.assertSourceDenied(wt)
+                self.assertEqual(self.status(wt), "current: no")
+        self.git(wt, "reset", "-q", "--hard", head)
+        self.assertSourceAllowed(wt)
+
+    def side_file(self, repo: Path) -> Path:
+        return self.record_file(repo).parent.parent / "red-files" / self.record_file(repo).name
+
+    def test_a_record_without_its_side_file_survives_a_merge_of_main(self):
+        # a record from before the side file: the bytes are recovered from the merge
+        repo, wt = self.ticket("no-side-file")
+        side = self.side_file(repo)
+        self.assertTrue(side.is_file(), "harness-red check writes the side file")
+        side.unlink()
+        self.on_main(repo, {"tests/test_app.py": lambda t: "# main's header\n" + t})
+        self.merge_cleanly(wt)
+        self.assertFalse(side.exists())
+        self.assertSourceAllowed(wt)
+        self.assertEqual(self.status(wt), "current: yes")
+        head = self.git(wt, "rev-parse", "HEAD")
+        path = wt / "tests/test_app.py"
+        own_test = "def test_case_5():\n" + BRANCH_LINE_5
+        for name, change in (
+            ("own-line", lambda t: replaced(t, BRANCH_LINE_5, "    assert login() == 'hi'\n")),
+            ("own-test-moved", lambda t: moved_to_end(t, own_test)),
+        ):
+            for committed in (False, True):
+                with self.subTest(case=name, committed=committed):
+                    self.git(wt, "reset", "-q", "--hard", head)
+                    self.write(path, change(path.read_text()))
+                    if committed:
+                        self.commit_all(wt, "the branch edits its tests")
+                    self.assertSourceDenied(wt)
+                    self.assertEqual(self.status(wt), "current: no")
+        self.git(wt, "reset", "-q", "--hard", head)
+        self.assertSourceAllowed(wt)
+
+    def test_a_hand_written_record_keeps_the_whole_file_check_across_a_merge(self):
+        # a regression guard: base_sha "0" * 40 and no side file, as before #231
+        repo, wt = self.ticket("hand-written")
+        self.side_file(repo).unlink()
+        record = json.loads(self.record_file(repo).read_text())
+        record["base_sha"] = "0" * 40
+        self.write(self.record_file(repo), json.dumps(record))
+        self.assertSourceAllowed(wt)  # the files still hash to test_hash
+        self.on_main(repo, {"tests/test_app.py": lambda t: "# main's header\n" + t})
+        self.merge_cleanly(wt)
+        self.assertSourceDenied(wt)
+        self.assertEqual(self.status(wt), "current: no")
 
 
 if __name__ == "__main__":

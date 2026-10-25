@@ -983,6 +983,71 @@ class RedTest(unittest.TestCase):
         self.merge_cleanly()
         self.assertEqual(self.current(), "current: yes")
 
+    # re-check round (#231): ort vs Myers, and records without a side file
+    def test_status_stays_current_across_a_clean_merge_that_myers_would_conflict_on(self):
+        # main adds an import header and strips the trailing blank lines; the branch adds a line to test_login.
+        # `git merge` (ort) merges it cleanly, Myers merge-file on the same inputs does not. The file is not run (a
+        # fake test command makes the red run), only compared.
+        base = "def test_login():\n    pass\n\n\n"
+        line = "    assert login() == 'ok'\n"
+        red = base.replace("def test_login():\n", "def test_login():\n" + line)
+        main = "import pytest\n\n\ndef test_login():\n    pass\n"
+        merged = "import pytest\n\n\ndef test_login():\n" + line + "    pass\n"
+        write(os.path.join(self.repo, "tests", "test_login.py"), base)
+        self.on_main({}, "the tests so far")
+        self.git(self.wt, "merge", "-q", "--ff-only", "origin/main")
+        self.put("tests/test_login.py", red)
+        self.git(self.wt, "commit", "-q", "-am", "tests for login")
+        p = self.red("check", **self.fake_runner("AssertionError: login is not built yet\n", 1))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.put("calc.py", CALC.replace("return None", "return a + b"))
+        self.git(self.wt, "commit", "-q", "-am", "the coder")
+        self.on_main({"tests/test_login.py": main})
+        self.merge_cleanly()
+        path = os.path.join(self.wt, "tests", "test_login.py")
+        self.assertEqual(read(path), merged)
+        ps = [write(os.path.join(self.tmp, "myers", n), t) for n, t in (("ours", red), ("base", base), ("theirs", main))]
+        m = subprocess.run([GIT, "merge-file", "-p", "-q", *ps], env=self.env, capture_output=True, text=True)
+        self.assertFalse(m.returncode == 0 and m.stdout == merged, (m.returncode, m.stdout))   # Myers differs
+        self.assertEqual(self.current(), "current: yes")
+        head = self.git(self.wt, "rev-parse", "HEAD")
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                self.git(self.wt, "reset", "-q", "--hard", head)
+                self.put("tests/test_login.py", once(merged, line, "    assert login() == 'hi'\n"))
+                if committed:
+                    self.git(self.wt, "commit", "-q", "-am", "the branch edits its test")
+                self.assertEqual(self.current(), "current: no")
+        self.git(self.wt, "reset", "-q", "--hard", head)
+        self.assertEqual(self.current(), "current: yes")
+
+    def test_a_record_without_its_side_file_stays_current_across_a_merge_of_main(self):
+        # a record from before the side file: the bytes are recovered from the merge
+        self.red_ticket_with_source()
+        side = os.path.join(self.state, "red-files", SLUG + ".json")
+        self.assertTrue(os.path.isfile(side), "harness-red check writes the side file")
+        os.remove(side)
+        self.on_main({"tests/test_calc.py": lambda t: once(t, "calc.sub(2, 2), 0)", "calc.sub(4, 4), 0)")})
+        self.merge_cleanly()
+        self.assertFalse(os.path.exists(side))
+        self.assertEqual(self.current(), "current: yes")
+        path = os.path.join(self.wt, "tests", "test_calc.py")
+        merged = read(path)
+        head = self.git(self.wt, "rev-parse", "HEAD")
+        for name, edited in (
+            ("own-line", once(merged, "calc.add(2, 3), 5)", "calc.add(3, 3), 6)")),
+            ("own-test-moved", moved_to_end(merged, BRANCH_ADD)),
+        ):
+            for committed in (False, True):
+                with self.subTest(edit=name, committed=committed):
+                    self.git(self.wt, "reset", "-q", "--hard", head)
+                    self.put("tests/test_calc.py", edited)
+                    if committed:
+                        self.git(self.wt, "commit", "-q", "-am", "the branch edits its tests")
+                    self.assertEqual(self.current(), "current: no")
+        self.git(self.wt, "reset", "-q", "--hard", head)
+        self.assertEqual(self.current(), "current: yes")
+
     # ------------------------------------------------------------ scratch
     def test_scratch_create_and_run(self):
         self.check_red()                                        # the test file is not committed
