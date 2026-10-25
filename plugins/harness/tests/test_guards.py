@@ -1320,10 +1320,17 @@ class BranchGuardBashExemptions(GuardTestCase):
                 "patch changes src/app.py inside the repo",
             ),
             (
-                f"cp {outside}/notes.md data/",
+                f"cp {outside}/notes.md docs/agent/",
                 f"cp {outside}/notes.md src/",
                 f"cp {outside}/notes.md src/",
                 "cp changes src/ inside the repo",
+            ),
+            # into an existing ignored directory: refused, as on main (ruling b, 2026-10-25)
+            (
+                f"cp {outside}/notes.md data/x.md",
+                f"cp {outside}/notes.md data/",
+                f"cp {outside}/notes.md data/",
+                "cp changes data/ inside the repo",
             ),
         ):
             with self.subTest(command=allowed):
@@ -1622,10 +1629,10 @@ class BranchGuardBashExemptions(GuardTestCase):
     def test_expanding_sources_copied_into_a_directory_refused(self):
         """A brace, glob or bracket source is expanded by the shell first, so
         `{keep,x}.log .` reaches the tracked keep.log; into a directory that is not itself
-        exempt it is refused. Into an exempt directory every copy lands there, so the
-        directory decides (ruling 2026-10-24)."""
+        exempt it is refused. Ruling (b), 2026-10-25: into an existing ignored directory
+        every copy is refused, plain or expanding source, as on main."""
         outside = self.outside
-        for name in ("keep.log", "x.log", "a.log", "b.log", "xa.log"):
+        for name in ("keep.log", "x.log", "a.log", "b.log", "xa.log", "app.py"):
             self.write(outside / name, "from outside\n")
         for command in (
             f"cp {outside}/{{keep,x}}.log .",
@@ -1636,25 +1643,32 @@ class BranchGuardBashExemptions(GuardTestCase):
             f"ln -s {outside}/{{keep,x}}.log .",
             # the repo root is not exempt, whatever the basename of the source
             f"cp {outside}/x.log .",
+            # into an ignored directory, plain or expanding sources
+            f"cp {outside}/notes.md cache/",
+            f"cp {outside}/x.log data/",
+            f"cp {outside}/*.log cache/",
+            f"cp {outside}/*.py cache/",
+            f"cp {outside}/{{app,b}}.py cache/",
+            f"cp {outside}/x[ab].log data/",
+            "cp $F cache/",
+            "cp ${F} data/",
+            f"install {outside}/*.log cache/",
+            f"ln -sf {outside}/*.log data/",
         ):
             with self.subTest(command=command):
                 self.assertRefusedPart(self.bash(command), command)
-        # into an ignored directory, plain or expanding sources stay free
-        self.assertAllowed(
-            (
-                f"cp {outside}/notes.md cache/",
-                f"cp {outside}/x.log data/",
-                f"cp {outside}/*.log cache/",
-            )
-        )
+        # the variable set earlier in the command: the copy is the part refused
+        command = f"F={outside}/app.py; cp $F cache/"
+        self.assertRefusedPart(self.bash(command), "cp $F cache/")
 
     # ---- fix round 3: a copy into a directory is judged by that directory
 
     def test_copy_into_a_directory_is_judged_by_the_directory(self):
         """BSD `cp -R src/ dest` copies the contents of src into dest, so `dest/src` is not
-        what is written. Ruling 2026-10-24: a cp, rsync, install or ln into a directory is
-        exempt only when that directory itself is under docs/agent/ or ignored by git; the
-        basename of the source no longer counts."""
+        what is written. Ruling (b), 2026-10-25: a cp, rsync, install or ln into an
+        existing directory is exempt only when that directory is under docs/agent/; into
+        an ignored directory it is refused, as on main. Named destinations keep the
+        ignored-path rule."""
         repo, outside = self.repo, self.outside
         # the scenario is real: data/ and .venv/ hold a README.md that would land on the
         # tracked README.md at the repo root
@@ -1684,43 +1698,68 @@ class BranchGuardBashExemptions(GuardTestCase):
             f"install -m 644 {outside}/x.log docs/",
             f"ln -sf {outside}/x.log tests/",
             f"cp {outside}/{{a,b}}.log .",
+            # the destination is an existing ignored directory: refused, as on main
+            f"cp {outside}/x.log data/",
+            f"cp {outside}/{{a,b}}.log cache/",
+            f"cp {outside}/x.log data",
+            f"install {outside}/x.log cache/",
+            f"ln -s {outside}/x.log data/",
+            f"cp -t cache {outside}/x.log",
+            f"cp {outside}/x.log {outside}/a.log cache/",
+            f"rsync -t {outside}/x.log cache/",
         ):
             with self.subTest(command=command):
                 self.assertRefusedPart(self.bash(command), command)
         # an exempt copy beside one into the root: the root copy is the part refused
         self.assertRefusedPart(
-            self.bash(f"cp {outside}/x.log data/ && cp {outside}/x.log ."),
+            self.bash(f"cp {outside}/x.log docs/agent/ && cp {outside}/x.log ."),
             f"cp {outside}/x.log .",
         )
-        # the repo root named absolutely, from outside the repo
-        for command in (f"cp -R {outside}/data/ {repo}", f"cp {outside}/x.log {repo}/"):
+        # an exempt named copy beside one into an ignored directory
+        self.assertRefusedPart(
+            self.bash(f"cp {outside}/x.log build.log && cp {outside}/x.log data/"),
+            f"cp {outside}/x.log data/",
+        )
+        # the repo root or an ignored directory named absolutely, from outside the repo
+        for command in (
+            f"cp -R {outside}/data/ {repo}",
+            f"cp {outside}/x.log {repo}/",
+            f"cp {outside}/x.log {repo}/data",
+            f"cp {outside}/x.log {repo}/cache/",
+        ):
             with self.subTest(command=command, cwd=str(outside)):
                 self.assertRefusedPart(self.bash(command, cwd=outside), command)
-        # the destination directory itself is exempt: every copy lands inside it
+        # the destination directory is under docs/agent/: every copy lands inside it
         self.assertAllowed(
             (
                 f"cp {outside}/notes.md docs/agent/",
                 f"cp -R {outside}/data/ docs/agent/specs/",
                 f"rsync -a {outside}/ docs/agent/imported/",
-                f"cp {outside}/x.log data/",
-                f"cp {outside}/{{a,b}}.log cache/",
                 f"cp -R {outside}/data/ docs/agent/",
-                f"cp {outside}/x.log data",
-                f"install {outside}/x.log cache/",
-                f"ln -s {outside}/x.log data/",
+                f"cp {outside}/x.log docs/agent",
+                f"install {outside}/x.log docs/agent/",
+                f"ln -s {outside}/x.log docs/agent/",
+                f"cp -t docs/agent {outside}/x.log",
                 f"rsync -a {outside}/data/ docs/agent/",
             )
         )
         self.assertAllowed(
-            (f"cp -R {outside}/data/ {repo}/docs/agent/", f"cp {outside}/x.log {repo}/data"),
+            (
+                f"cp -R {outside}/data/ {repo}/docs/agent/",
+                f"cp {outside}/x.log {repo}/docs/agent",
+            ),
             cwd=outside,
         )
-        # named file destinations are judged by the name, as before
+        # named file destinations are judged by the name, as before, ignored ones included
         self.assertAllowed(
             (
                 "cp notes.md docs/agent/handoff.md",
                 "ln -sfn ../.venv .venv",
                 f"cp {outside}/x.log build.log",
+                f"cp {outside}/x.log data/new.log",
+                f"cp {outside}/x.log cache/blob",
+                f"install -m 600 {outside}/x.log .env.local",
+                f"ln -sf {outside}/x.log cache/x.log",
             )
         )
 
@@ -1750,10 +1789,11 @@ class BranchGuardBashExemptions(GuardTestCase):
         return restore
 
     def test_recursive_copy_into_an_ignored_directory_refused(self):
-        """Ruling 2026-10-24: a recursive copy (cp -R/-r/-a, rsync -r/-a and their
-        combined and long forms) into an exempt directory is refused unless the directory
-        is under docs/agent/: an ignored directory may hold a symlink into tracked files
-        (rsync -aK writes through node_modules/@scope/pkg into packages/pkg)."""
+        """A recursive copy (cp -R/-r/-a, rsync -r/-a and their combined and long forms)
+        into an ignored directory is refused (ruling b, 2026-10-25: every copy into an
+        existing directory outside docs/agent/ is): an ignored directory may hold a
+        symlink into tracked files (rsync -aK writes through node_modules/@scope/pkg into
+        packages/pkg)."""
         repo, outside = self.repo, self.outside
         restore = self.workspace_fixture()
         nm = f"{restore}/node_modules/"
@@ -1792,7 +1832,7 @@ class BranchGuardBashExemptions(GuardTestCase):
                 f"cp -R {nm} node_modules/",
             ),
             (
-                f"cp {outside}/x.log data/; rsync -a {nm} node_modules/",
+                f"cp {outside}/x.log docs/agent/; rsync -a {nm} node_modules/",
                 f"rsync -a {nm} node_modules/",
             ),
         ):
@@ -1808,25 +1848,43 @@ class BranchGuardBashExemptions(GuardTestCase):
             with self.subTest(command=command, cwd=str(outside)):
                 self.assertRefusedPart(self.bash(command, cwd=outside), part)
 
-    def test_non_recursive_and_docs_agent_copies_stay_allowed(self):
-        """Non-recursive copies into an ignored directory and recursive copies into
-        docs/agent/ stay free; so does a recursive copy wholly outside the repo."""
+    def test_non_recursive_copies_into_ignored_directories_refused_docs_agent_allowed(self):
+        """Ruling (b), 2026-10-25: a non-recursive copy into an existing ignored directory
+        is refused as well, as on main; copies into docs/agent/, recursive or not, stay
+        free, and so does a recursive copy wholly outside the repo."""
         repo, outside = self.repo, self.outside
         restore = self.workspace_fixture()
+        for command in (
+            # not recursive: options other than -R/-r/-a, into ignored directories
+            f"cp {outside}/x.log data/",
+            f"cp -f {outside}/x.log cache/",
+            f"cp -pv {outside}/x.log cache/",
+            f"cp {outside}/notes.md node_modules/",
+            f"cp {outside}/notes.md node_modules/@scope/",
+            f"cp {outside}/{{a,b}}.log cache/",
+            f"install {outside}/x.log cache/",
+            f"install -m 644 {outside}/x.log data/",
+            f"ln -s {outside}/x.log data/",
+            f"ln -sf {outside}/x.log cache/",
+            f"rsync -t {outside}/x.log cache/",
+            f"rsync -v {outside}/x.log data/",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        for command in (
+            f"cp -v {outside}/x.log {repo}/cache/",
+            f"install {outside}/x.log {repo}/data/",
+        ):
+            with self.subTest(command=command, cwd=str(outside)):
+                self.assertRefusedPart(self.bash(command, cwd=outside), command)
         self.assertAllowed(
             (
-                # not recursive: options other than -R/-r/-a, into ignored directories
-                f"cp {outside}/x.log data/",
-                f"cp -f {outside}/x.log cache/",
-                f"cp -pv {outside}/x.log cache/",
-                f"cp {outside}/notes.md node_modules/",
-                f"cp {outside}/{{a,b}}.log cache/",
-                f"install {outside}/x.log cache/",
-                f"install -m 644 {outside}/x.log data/",
-                f"ln -s {outside}/x.log data/",
-                f"ln -sf {outside}/x.log cache/",
-                f"rsync -t {outside}/x.log cache/",
-                f"rsync -v {outside}/x.log data/",
+                # not recursive, into docs/agent/
+                f"cp {outside}/x.log docs/agent/",
+                f"cp -f {outside}/x.log docs/agent/",
+                f"install -m 644 {outside}/x.log docs/agent/",
+                f"ln -sf {outside}/x.log docs/agent/",
+                f"rsync -t {outside}/x.log docs/agent/",
                 # recursive, into docs/agent/
                 f"cp -R {outside}/data/ docs/agent/",
                 f"cp -a {outside}/data/ docs/agent/imported/",
@@ -1844,7 +1902,7 @@ class BranchGuardBashExemptions(GuardTestCase):
             (
                 f"cp -R {outside}/data/ {repo}/docs/agent/",
                 f"rsync -a {outside}/data/ {repo}/docs/agent/",
-                f"cp -v {outside}/x.log {repo}/cache/",
+                f"cp -v {outside}/x.log {repo}/docs/agent/",
             ),
             cwd=outside,
         )
@@ -1921,26 +1979,82 @@ class BranchGuardBashExemptions(GuardTestCase):
             cwd=outside,
         )
 
-    def test_copy_into_an_exempt_directory_onto_a_symlink_out_of_it_refused(self):
-        """Ruling 2026-10-24: a cp, install, ln, rsync or mv into an exempt directory is
-        refused when dest/<basename of a source> already exists and resolves outside the
-        exemption (BSD cp writes through the ignored cache/app.py into the tracked
-        src/app.py). A name that does not exist yet, or a plain file inside the exempt
-        directory, keeps the directory rule."""
+    def test_copy_into_docs_agent_onto_a_symlink_out_of_it_refused(self):
+        """Ruling 2026-10-24, kept for docs/agent/ by ruling (b): a cp, install, ln, rsync
+        or mv into docs/agent/ is refused when dest/<basename of a source> already exists
+        and resolves outside the exemption (BSD cp writes through docs/agent/x.md into the
+        tracked README.md). A name that does not exist yet, a plain file there, or a link
+        that stays inside the exemption keeps the directory rule. Into an ignored
+        directory every copy is refused (ruling b), symlink or not."""
         repo, outside = self.repo, self.outside
         os.symlink("../src/app.py", repo / "cache/app.py")
         os.symlink("../README.md", repo / "data/README.md")
         os.symlink("../keep.log", repo / "data/keep.log")  # tracked, ignored by name
         os.symlink("../../README.md", repo / "docs/agent/x.md")
+        (repo / "docs/agent/specs").mkdir()
+        os.symlink("../../../src/app.py", repo / "docs/agent/specs/app.py")
+        os.symlink("../../keep.log", repo / "docs/agent/keep.log")
         os.symlink("../build.log", repo / "cache/alias.log")  # ignored and untracked
+        os.symlink("handoff.md", repo / "docs/agent/alias.md")  # stays in docs/agent/
+        os.symlink("../../build.log", repo / "docs/agent/build.log")  # to an ignored file
         self.assertEqual(
             os.path.realpath(repo / "cache/app.py"), str(repo / "src/app.py")
         )
+        self.assertEqual(
+            os.path.realpath(repo / "docs/agent/specs/app.py"), str(repo / "src/app.py")
+        )
         for name in (
-            "app.py", "README.md", "keep.log", "x.md", "x.log",
-            "new.py", "blob", "a.csv", "alias.log", "handoff.md",
+            "app.py", "README.md", "keep.log", "x.md", "x.log", "new.py",
+            "blob", "a.csv", "alias.log", "handoff.md", "alias.md", "build.log",
         ):
             self.write(outside / name, "from outside\n")
+        for command in (
+            # docs/agent/: the name lands on a link out of the exemption
+            f"cp {outside}/x.md docs/agent/",
+            f"cp -f {outside}/x.md docs/agent",
+            f"mv {outside}/x.md docs/agent/",
+            f"install {outside}/x.md docs/agent/",
+            f"ln -sf {outside}/x.md docs/agent/",
+            f"rsync -t {outside}/x.md docs/agent/",
+            f"cp {outside}/keep.log docs/agent/",
+            f"cp {outside}/app.py docs/agent/specs/",
+            f"install -m 644 {outside}/app.py docs/agent/specs",
+            # one source of several reaches a tracked file
+            f"cp {outside}/new.py {outside}/x.md docs/agent/",
+            f"cp {outside}/x.log {outside}/app.py docs/agent/specs/",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        for command in (
+            f"cp {outside}/x.md {repo}/docs/agent/",
+            f"install {outside}/app.py {repo}/docs/agent/specs/",
+        ):
+            with self.subTest(command=command, cwd=str(outside)):
+                self.assertRefusedPart(self.bash(command, cwd=outside), command)
+        # docs/agent/: absent names, plain files, links that stay in the exemption
+        self.assertAllowed(
+            (
+                f"cp {outside}/handoff.md docs/agent/",
+                f"cp {outside}/new.py docs/agent/",
+                f"cp {outside}/new.py docs/agent/specs/",
+                f"cp {outside}/blob {outside}/new.py docs/agent/",
+                f"install {outside}/blob docs/agent/",
+                f"ln -sf {outside}/blob docs/agent/",
+                f"rsync -t {outside}/a.csv docs/agent/",
+                f"mv {outside}/new.py docs/agent/specs/",
+                f"cp {outside}/alias.md docs/agent/",
+                f"cp {outside}/build.log docs/agent/",
+            )
+        )
+        self.assertAllowed(
+            (
+                f"cp {outside}/blob {repo}/docs/agent/",
+                f"cp {outside}/new.py {repo}/docs/agent/specs/",
+            ),
+            cwd=outside,
+        )
+        # into an ignored directory: refused whether the name is a link out, a link that
+        # stays ignored, a plain file or absent
         for command in (
             f"cp {outside}/app.py cache/",
             f"cp -f {outside}/app.py cache",
@@ -1953,38 +2067,25 @@ class BranchGuardBashExemptions(GuardTestCase):
             # one source of several reaches a tracked file
             f"cp {outside}/x.log {outside}/README.md data/",
             f"cp {outside}/blob {outside}/app.py cache/",
-            # docs/agent/ is exempt, but x.md in it leads to the tracked README.md
-            f"cp {outside}/x.md docs/agent/",
-            f"mv {outside}/x.md docs/agent/",
+            f"cp {outside}/new.py cache/",
+            f"cp {outside}/blob cache/",
+            f"cp -f {outside}/a.csv data/",
+            f"cp {outside}/blob {outside}/new.py cache/",
+            f"install {outside}/blob cache/",
+            f"ln -sf {outside}/blob cache/",
+            f"rsync -t {outside}/a.csv data/",
+            f"cp {outside}/alias.log cache/",
         ):
             with self.subTest(command=command):
                 self.assertRefusedPart(self.bash(command), command)
         for command in (
             f"cp {outside}/app.py {repo}/cache/",
             f"install {outside}/README.md {repo}/data/",
+            f"cp {outside}/blob {repo}/cache/",
+            f"cp {outside}/new.py {repo}/data/",
         ):
             with self.subTest(command=command, cwd=str(outside)):
                 self.assertRefusedPart(self.bash(command, cwd=outside), command)
-        # absent names, plain files in the directory, links that stay inside it
-        self.assertAllowed(
-            (
-                f"cp {outside}/new.py cache/",
-                f"cp {outside}/blob cache/",
-                f"cp -f {outside}/a.csv data/",
-                f"cp {outside}/blob {outside}/new.py cache/",
-                f"install {outside}/blob cache/",
-                f"ln -sf {outside}/blob cache/",
-                f"rsync -t {outside}/a.csv data/",
-                f"mv {outside}/new.py data/",
-                f"cp {outside}/alias.log cache/",
-                f"cp {outside}/handoff.md docs/agent/",
-                f"cp {outside}/new.py docs/agent/",
-            )
-        )
-        self.assertAllowed(
-            (f"cp {outside}/blob {repo}/cache/", f"cp {outside}/new.py {repo}/data/"),
-            cwd=outside,
-        )
 
     def test_recursive_copy_to_a_new_name_keeps_the_named_rule(self):
         """A recursive copy to a name that does not exist yet creates it; it is a named
@@ -1999,6 +2100,179 @@ class BranchGuardBashExemptions(GuardTestCase):
             )
         )
         for command in (f"cp -R {outside}/data src/restored", f"cp -a {outside}/data newdir"):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+
+    # ---- fix round 5, ruling (b): holder() on both paths, expanding sources, ln -n
+
+    def test_copy_into_an_outside_symlink_to_a_protected_directory_refused(self):
+        """holder() judges where a copy into a directory lands, the directory resolved
+        and dest/<basename>: with ~/h -> <main checkout>/src, `cp evil.py ~/h/` writes the
+        tracked src/ and is refused, as on main; so is a link to the ignored cache/ (a
+        copy into an ignored directory, ruling b). A link to a directory outside every
+        repo stays free."""
+        repo, outside, home = self.repo, self.outside, self.home
+        os.symlink(str(repo / "src"), home / "h")
+        os.symlink(str(repo / "cache"), home / "c")
+        os.symlink(str(repo), self.tmp / "root")
+        os.symlink(str(outside), home / "o")
+        self.assertEqual(os.path.realpath(home / "h"), str(repo / "src"))
+        self.write(outside / "evil.py", "clobbered\n")
+        self.write(outside / "data/app.py", "clobbered\n")
+        refused = (
+            f"cp {outside}/evil.py ~/h/",
+            f"cp {outside}/evil.py {home}/h/",
+            f"cp {outside}/evil.py {home}/h",
+            f"cp {outside}/data/app.py {home}/h/",
+            f"cp -R {outside}/data/ {home}/h",
+            f"cp -R {outside}/data/ ~/h/",
+            f"cp -a {outside}/data {home}/h/",
+            f"rsync -a {outside}/data/ {home}/h/",
+            f"rsync -t {outside}/evil.py ~/h/",
+            f"install {outside}/evil.py {home}/h/",
+            f"ln -sf {outside}/evil.py {home}/h/",
+            f"cp -t {home}/h {outside}/evil.py",
+            f"cp {outside}/evil.py {outside}/notes.md ~/h/",
+            f"cp {outside}/evil.py {self.tmp}/root/",
+            f"cp -R {outside}/data/ {self.tmp}/root",
+            # a link to an ignored directory: a copy into an ignored directory
+            f"cp {outside}/evil.py ~/c/",
+            f"cp {outside}/evil.py {home}/c",
+            f"rsync -a {outside}/data/ {home}/c/",
+        )
+        for cwd in (outside, repo):
+            for command in refused:
+                with self.subTest(command=command, cwd=str(cwd)):
+                    self.assertRefusedPart(self.bash(command, cwd=cwd), command)
+        # beside an allowed write, the copy through the link is the part refused
+        command = f"echo x > {outside}/log.txt && cp {outside}/evil.py ~/h/"
+        self.assertRefusedPart(
+            self.bash(command, cwd=outside), f"cp {outside}/evil.py ~/h/"
+        )
+        # a link to a directory outside every repo
+        self.assertAllowed(
+            (
+                f"cp {outside}/evil.py ~/o/copy.py",
+                f"cp -R {outside}/data/ {home}/o/restored/",
+                f"rsync -a {outside}/data/ {home}/o/",
+            ),
+            cwd=outside,
+        )
+
+    def test_expanding_source_into_docs_agent_onto_a_symlink_out_of_it_refused(self):
+        """A glob, brace or $ source is expanded by the shell, so its basename does not
+        say which name lands in docs/agent/: into a docs/agent/ directory that holds a
+        name resolving out of the exemption (docs/agent/x.md -> README.md) it is refused,
+        as on main. Into an ignored directory it is refused outright (ruling b)."""
+        repo, outside = self.repo, self.outside
+        os.symlink("../../README.md", repo / "docs/agent/x.md")
+        (repo / "docs/agent/specs").mkdir()
+        os.symlink("../../../src/app.py", repo / "docs/agent/specs/app.py")
+        os.symlink("../src/app.py", repo / "cache/app.py")
+        for name in ("x.md", "z.md", "app.py", "b.py"):
+            self.write(outside / name, "from outside\n")
+        for command in (
+            f"cp {outside}/*.md docs/agent/",
+            f"cp {outside}/{{x,z}}.md docs/agent/",
+            f"cp {outside}/[xz].md docs/agent/",
+            f"cp {outside}/?.md docs/agent",
+            "cp $F docs/agent/",
+            "cp ${F} docs/agent/",
+            f"cp {outside}/notes.md $F docs/agent/",
+            f"install {outside}/*.md docs/agent/",
+            f"ln -sf {outside}/*.md docs/agent/",
+            f"rsync -t {outside}/*.md docs/agent/",
+            f"cp -t docs/agent {outside}/*.md",
+            f"cp {outside}/*.py docs/agent/specs/",
+            f"cp {outside}/{{app,b}}.py docs/agent/specs/",
+            "cp $F docs/agent/specs/",
+            # the reviewer's cases, into the ignored cache/ that holds cache/app.py
+            f"cp {outside}/*.py cache/",
+            f"cp {outside}/{{app,b}}.py cache/",
+            "cp $F cache/",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        for command in (
+            f"cp {outside}/*.md {repo}/docs/agent/",
+            f"cp $F {repo}/docs/agent/specs/",
+        ):
+            with self.subTest(command=command, cwd=str(outside)):
+                self.assertRefusedPart(self.bash(command, cwd=outside), command)
+        # the variable set earlier in the command, to the name that is a link out
+        command = f"F={outside}/x.md; cp $F docs/agent/"
+        self.assertRefusedPart(self.bash(command), "cp $F docs/agent/")
+        # plain sources into the same directories keep the round-4 rule
+        self.assertAllowed(
+            (
+                f"cp {outside}/z.md docs/agent/",
+                f"cp {outside}/b.py docs/agent/specs/",
+            )
+        )
+
+    def test_ln_no_dereference_onto_an_ignored_symlink_to_an_outside_directory_allowed(self):
+        """ln -n and -h treat a destination that is a symlink to a directory as a named
+        file, not a directory to link into: `ln -sfn ../.venv .venv` replaces the ignored
+        .venv link to ~/.venv, even when ~/.venv/.venv already exists. A real directory
+        stays a directory to link into, and a named link out of the exemption stays
+        refused. An ignored link to an ignored directory in the repo shows the difference:
+        with -n the link itself is replaced (a named destination), without it the new
+        link lands inside the ignored directory (refused, ruling b)."""
+        repo, home = self.repo, self.home
+        os.symlink("../.venv", repo / ".venv")
+        self.write(home / ".venv/.venv", "stray\n")
+        self.write(home / "other-venv/bin/python", "")
+        os.symlink("../src", repo / "cache/srclink")  # ignored name, tracked target
+        self.write(repo / "cache/py310/bin/python", "")
+        self.write(repo / "cache/py311/bin/python", "")
+        os.symlink("../cache/py310", repo / "data/venv")  # ignored link, ignored target
+        self.assertEqual(os.path.realpath(repo / ".venv"), str(home / ".venv"))
+        self.assertEqual(os.path.realpath(repo / "data/venv"), str(repo / "cache/py310"))
+        self.assertAllowed(
+            (
+                "ln -sfn ../.venv .venv",
+                "ln -sfh ../.venv .venv",
+                "ln -snf ../.venv .venv",
+                "ln -s -f -n ../.venv .venv",
+                f"ln -sfn {home}/.venv .venv",
+                f"ln -sfn {home}/other-venv .venv",
+                "ln -sfn ../other-venv ./.venv",
+                # without -n the link lands in ~/.venv, outside every repo, as on main
+                "ln -sf ../.venv .venv",
+                # -n onto the ignored link to the ignored cache/py310
+                "ln -sfn ../cache/py311 data/venv",
+                "ln -sfh ../cache/py311 data/venv",
+                "ln -nsf ../cache/py311 data/venv",
+                f"ln -sfn {repo}/cache/py311 data/venv",
+            )
+        )
+        for command in (
+            # without -n or -h: the link lands inside the ignored cache/py310
+            "ln -sf ../cache/py311 data/venv",
+            "ln -s ../cache/py311 data/venv",
+            f"ln -sf {repo}/cache/py311 data/venv",
+            "ln -sf ../cache/py311 data/venv/",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        self.assertAllowed(
+            (
+                f"ln -sfn {home}/.venv {repo}/.venv",
+                f"cd {repo} && ln -sfn ../.venv .venv",
+            ),
+            cwd=self.outside,
+        )
+        for command in (
+            # .venv as a real ignored directory: -n links into it (ruling b)
+            "ln -sfn ../.venv cache",
+            "ln -sfn ../.venv data/",
+            # a named link onto an ignored link to tracked src/
+            f"ln -sfn {self.outside} cache/srclink",
+            f"ln -sfh {self.outside} cache/srclink",
+            # -n onto a tracked or unignored name
+            "ln -sfn ../.venv venv",
+            "ln -sfn ../.venv src",
+        ):
             with self.subTest(command=command):
                 self.assertRefusedPart(self.bash(command), command)
 

@@ -23,15 +23,18 @@ the chain), restored after a subshell or a child shell, and moved for git by -C,
     that worktree, and a path outside any repo is never refused. A named path the Edit
     rule exempts (under docs/agent/, or one git ignores) is allowed for every form, rm,
     truncate and both sides of mv included; a directory holding a tracked file is not
-    ignored. A cp, mv, ln, install or rsync into a directory is judged by that
-    directory, for the repo it lands in and for the exemption (docs/agent, under it,
-    or ignored), whatever the sources are, since `cp -R src/ dest` copies the contents
-    of src. Into an existing exempt directory, a recursive cp (-R, -r, -a) or rsync
-    (-r, -a, --recursive, --archive) is refused unless the directory is under
-    docs/agent/ (an ignored directory may hold a symlink into tracked files), and so is
-    any of these copies when dest/<basename of a source> exists and is not exempt
-    itself (an ignored cache/app.py linked to the tracked src/app.py); a recursive copy
-    to a name that does not exist yet is a named destination. The exemption
+    ignored. A cp, mv, ln, install or rsync into an existing directory is judged by
+    where it lands, for the repo (the directory resolved and dest/<basename> of each
+    source) and for the exemption, which holds only when the resolved directory is
+    docs/agent or under it: into an ignored directory it is refused, since it may hold
+    a symlink into tracked files that the copy writes through. Under docs/agent/, it is
+    refused when dest/<basename of a source> exists and is not exempt itself
+    (docs/agent/x.md linked to the tracked README.md), and, for a recursive cp (-R,
+    -r, -a) or rsync (-r, -a, --recursive, --archive) or a source the shell expands
+    (glob, brace, $ or `), when any link in the directory (at any depth, if
+    recursive) is not exempt. A named destination keeps the rule for a named path: a
+    name that does not exist yet (`cp -R src data/restored`), and for ln -n or -h a
+    symlink to a directory (`ln -sfn ../.venv .venv`). The exemption
     judges what the write reaches: never for a word with an unquoted glob (*, ?, [) or
     brace expansion, nor for a path whose first component in the repo is .git, nor for
     a spelling that differs in case from a tracked file it
@@ -929,9 +932,9 @@ def patch_args(args: list[str]) -> tuple[str | None, str | None, list[str], bool
 def copy_writes(name: str, args: list[str], cwd: str | None, options: set) -> list:
     """(words as written, path written) for cp, install, ln and mv: the destination,
     or the name each source gets inside it when it is a directory, with that source
-    word after the destination's. branch_guard judges a copy by the destination (the
-    first word), its repo included, and the sources' names in it (copy_exempt);
-    tests_first judges each path."""
+    word after the destination's; ln -n or -h treats a symlink to a directory as a
+    named file. branch_guard judges a copy by the destination (the first word) and the
+    sources' names in it (copy_holder); tests_first judges each path."""
     target = option_value(args, ("-t", "--target-directory"))
     plain = plain_args(args, options)
     if target is not None:
@@ -941,10 +944,15 @@ def copy_writes(name: str, args: list[str], cwd: str | None, options: set) -> li
     elif len(plain) >= 2:
         dest, sources = plain[-1], plain[:-1]
         full = absolute(dest, cwd)
+        no_follow = name == "ln" and (short_flag(args, "n") or short_flag(args, "h"))
         into = (
             dest.endswith("/")
             or len(sources) > 1
-            or (full is not None and os.path.isdir(full))
+            or (
+                full is not None
+                and os.path.isdir(full)
+                and not (no_follow and os.path.islink(full))
+            )
         )
     else:
         return []
@@ -1235,12 +1243,6 @@ def written_exempt(state: dict, path: str, top: Path) -> bool:
     return not os.path.islink(target) and name_exempt(target, found[0])
 
 
-def under_notes(path: str, top: Path) -> bool:
-    """True for docs/agent of the repo `top` or a path under it."""
-    rel = repo_relative(path, top)
-    return rel is not None and (rel + "/").startswith(NOTES_DIR)
-
-
 def recursive_copy(name: str, args: list[str]) -> bool:
     """True for cp -R, -r or -a and rsync -r or -a, in a cluster or spelled out
     (rsync -R is --relative)."""
@@ -1252,23 +1254,47 @@ def recursive_copy(name: str, args: list[str]) -> bool:
     )
 
 
-def copy_exempt(
-    state: dict, path: str, sources: tuple, recursive: bool, top: Path
-) -> bool:
-    """destination_exempt for the destination `path` of a cp, mv, ln, install or rsync
-    with its source words (none for a named file); into an existing directory, also: a
-    recursive copy only under docs/agent/ (an ignored directory may hold a symlink into
-    tracked files that it writes through), and the name each source gets there, when it
-    exists, exempt itself (an ignored cache/app.py may link to the tracked src/app.py)."""
-    if not destination_exempt(state, path, top):
+def destination_exempt(state: dict, path: str | None, top: Path) -> bool:
+    """written_exempt for a named destination of a cp, mv, ln, install or rsync:
+    docs/agent itself counts as under it."""
+    if path is None:
         return False
-    if not sources or not os.path.isdir(path):
+    if repo_relative(path, top) == NOTES_DIR.rstrip("/") and not os.path.islink(path):
         return True
-    if recursive and not under_notes(path, top):
+    return written_exempt(state, path, top)
+
+
+def links_out(state: dict, directory: str, top: Path, deep: bool) -> bool:
+    """True when a symlink in `directory` (or anywhere under it, when `deep`) is not
+    written_exempt: a copy into the directory may write through it."""
+    for root, dirs, files in os.walk(directory):
+        for name in dirs + files:
+            entry = os.path.join(root, name)
+            if os.path.islink(entry) and not written_exempt(state, entry, top):
+                return True
+        if not deep:
+            break
+    return False
+
+
+def into_notes(
+    state: dict, real: str, sources: tuple, recursive: bool, top: Path, globbing: set
+) -> bool:
+    """True when a copy of `sources` into the existing directory `real` (resolved) of
+    the repo `top` gets the exemption: `real` is docs/agent or under it and no link
+    there leads out of the exemption. A copy that is not recursive, of literal
+    sources, checks the name each source gets (dest/<basename>) when it exists; a
+    recursive copy, or a source the shell expands (glob, brace, $ or `) and so names
+    no file that lands, checks every link in the directory, at any depth when
+    recursive (BSD `cp -R src/ dest` copies the contents of src)."""
+    rel = repo_relative(real, top)
+    if rel is None or not (rel + "/").startswith(NOTES_DIR):
         return False
+    if recursive or any(expanded(s, globbing) or "$" in s or "`" in s for s in sources):
+        return not links_out(state, real, top, recursive)
     for source in sources:
         name = os.path.basename(source.rstrip("/"))
-        inside = os.path.join(path, name)
+        inside = os.path.join(real, name)
         if name in ("", ".", "..") or not os.path.lexists(inside):
             continue
         if not written_exempt(state, inside, top):
@@ -1276,15 +1302,34 @@ def copy_exempt(
     return True
 
 
-def destination_exempt(state: dict, path: str | None, top: Path) -> bool:
-    """written_exempt for the destination of a cp, mv, ln, install or rsync, a named
-    file or the directory the files go into (BSD `cp -R src/ dest` copies the contents
-    of src, so no name inside it is known): docs/agent itself counts as under it."""
-    if path is None:
-        return False
-    if repo_relative(path, top) == NOTES_DIR.rstrip("/") and not os.path.islink(path):
-        return True
-    return written_exempt(state, path, top)
+def copy_holder(
+    state: dict, words: tuple, recursive: bool, cwd: str | None, globbing: set
+) -> tuple[Path, str] | None:
+    """The protected repo that a cp, mv, ln, install or rsync with `words` (the
+    destination, then the sources) writes in without the exemption; None when it may
+    run. A named destination (no sources, or not an existing directory) is judged by
+    its name. Into an existing directory, holder() judges where the copy lands, the
+    directory resolved and dest/<basename> of each source, and only a directory under
+    docs/agent/ is exempt (into_notes): into an ignored directory is refused."""
+    dest, sources = words[0], words[1:]
+    path = absolute(dest, cwd)
+    spread = expanded(dest, globbing)
+    if not sources or path is None or not os.path.isdir(path):
+        found = holder(state, path)
+        if found is None or (not spread and destination_exempt(state, path, found[0])):
+            return None
+        return found
+    real = os.path.realpath(path)
+    landing = [real] + [
+        os.path.join(path, os.path.basename(s.rstrip("/")) or s) for s in sources
+    ]
+    for target in landing:
+        found = holder(state, target)
+        if found is None:
+            continue
+        if spread or not into_notes(state, real, sources, recursive, found[0], globbing):
+            return found
+    return None
 
 
 def name_exempt(path: str, top: Path) -> bool:
@@ -1399,22 +1444,16 @@ def part_refusal(state: dict, part: Part, name: str, args: list[str]) -> tuple |
         return part.text, why, toplevel(where), None, FORCE_ADVICE
     globbing = None
     for text, path, why, exact in writes(part, name, args, cwd):
-        sources = None
-        if isinstance(text, tuple):  # a copy: judged by its destination, file or directory
-            text, sources = text[0], text[1:]
-            path = absolute(text, cwd)
-        found = holder(state, path)
-        if found is None:
-            continue
-        if exact and globbing is None:
+        if globbing is None:
             globbing = globbing_words(part.text)
-        exempt = exact and not expanded(text, globbing)
-        if exempt and sources is None:
-            exempt = written_exempt(state, path, found[0])
-        elif exempt:
-            recursive = recursive_copy(name, args)
-            exempt = copy_exempt(state, path, sources, recursive, found[0])
-        if not exempt:
+        if isinstance(text, tuple):  # a copy: judged by where it lands
+            found = copy_holder(state, text, recursive_copy(name, args), cwd, globbing)
+        else:
+            found = holder(state, path)
+            exempt = exact and not expanded(text, globbing)
+            if found is not None and exempt and written_exempt(state, path, found[0]):
+                found = None
+        if found is not None:
             return part.text, why, found[0], found[1], ADVICE
     if name == "git":
         there = repo_at(state, where)
