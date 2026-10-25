@@ -47,8 +47,9 @@ BASE_ALLOW = ["Bash(scripts/verify.sh)", "Bash(git status:*)", "Bash(git diff:*)
 HARNESS_NINE = [f"Bash(harness-{tool}:*)" for tool in ("pr", "board", "work", "red", "scaffold", "digest",
                                                        "standup", "projects", "worklog")]
 WILDCARD = "Bash(harness-*:*)"
-OLD_SPELLING_WARN = ("warn: .claude/settings.json allow rule Bash(harness-*:*) is a wildcard auto mode may drop; "
-                     "replace it with the nine harness-<tool> rules: " + ", ".join(HARNESS_NINE))
+OLD_SPELLING_WARN = ("warn: .claude/settings.json allow rule Bash(harness-*:*) matches no harness tool "
+                     "(a ':*' rule is a literal prefix); replace it with the nine harness-<tool> rules: "
+                     + ", ".join(HARNESS_NINE))
 REPO = os.path.dirname(os.path.dirname(PLUGIN))
 
 STUB = """#!{python}
@@ -1872,7 +1873,8 @@ class KeptSettings(ScaffoldTest):
         and besides it exactly the (needle, kind) warnings in `others`."""
         warns = self.warns(p)
         self.assertEqual(warns.count(OLD_SPELLING_WARN), 1, f"{mode}: {warns}\n{p.stdout}")
-        self.assertEqual(len([w for w in warns if "wildcard auto mode may drop" in w]), 1, f"{mode}: {warns}")
+        self.assertEqual(len([w for w in warns if "matches no harness tool" in w]), 1, f"{mode}: {warns}")
+        self.assertEqual([w for w in warns if "auto mode may drop" in w], [], f"{mode}: {warns}")
         self.assertEqual([w for w in warns if re.search(r"allow entry Bash\(harness-[^)]*\) is missing", w)], [],
                          f"{mode}: {warns}")
         rest = [w for w in warns if w != OLD_SPELLING_WARN]
@@ -1978,6 +1980,42 @@ class KeptSettings(ScaffoldTest):
 
 
 # =========================================================================== commit paths
+class NoDropClaim(unittest.TestCase):
+    """Ticket #226: auto mode never drops Bash(harness-*:*) (docs/research/auto-mode-classifier.md, #139);
+    the rule matches nothing because a ':*' rule is a literal prefix. No plugin text or design.md says otherwise."""
+
+    def test_no_text_says_auto_mode_drops_the_wildcard_rule(self):
+        files = [os.path.join(REPO, "docs", "design.md")]
+        for root, dirs, names in os.walk(PLUGIN):
+            dirs[:] = [d for d in dirs if d not in ("tests", "__pycache__")]
+            files += [os.path.join(root, n) for n in names]
+        verb = r"(?:drop|remov|strip|discard)\w*"
+        mode = r"auto[\s-]+mode"
+        # Either order, within 60 characters, any wording ("may drop", "can drop", "dropped by auto mode", ...),
+        # and about the wildcard rule: harness-* or "wildcard" within 200 characters of the match.
+        claim = re.compile(rf"{mode}\b.{{0,60}}?\b{verb}|\b{verb}.{{0,60}}?{mode}", re.IGNORECASE)
+        subject = re.compile(r"harness-\*|wildcard", re.IGNORECASE)
+        hits = []
+        for path in files:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    lines = fh.read().splitlines()
+            except (UnicodeDecodeError, OSError):
+                continue
+            # Join the lines with comment markers removed, so a claim wrapped over two comment lines is found.
+            text = " ".join(re.sub(r"^\s*(#|//|\*|>)\s?", "", line) for line in lines)
+            if any(subject.search(text[max(0, m.start() - 200):m.end() + 200]) for m in claim.finditer(text)):
+                hits.append(os.path.relpath(path, REPO))
+        self.assertEqual(hits, [], "still claims auto mode drops (or may drop) the wildcard rule")
+
+    def test_design_md_quotes_the_new_old_wildcard_warning(self):
+        prefix = OLD_SPELLING_WARN[:OLD_SPELLING_WARN.index("rules: ") + len("rules: ")]
+        with open(os.path.join(REPO, "docs", "design.md"), encoding="utf-8") as fh:
+            text = " ".join(fh.read().split())
+        # assertTrue, not assertIn: assertIn would print the whole of design.md on failure.
+        self.assertTrue(prefix in text, f"docs/design.md does not quote the new warning: {prefix!r}")
+
+
 class Paths(ScaffoldTest):
     def test_first_commit_path_makes_one_commit_on_main(self):
         root = os.path.join(self.tmp, "fresh")
