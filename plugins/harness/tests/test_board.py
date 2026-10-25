@@ -36,18 +36,19 @@ ROUTING_KEYS = ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER
 SPEC_COLORS = {
     "epic": "5319E7", "task": "0E8A16", "bug": "D73A4A", "chore": "BFD4F2", "refactor": "C2E0C6",
     "status:ready": "0052CC", "status:in-progress": "FBCA04", "status:in-review": "D4C5F9",
-    "status:blocked": "B60205", "status:needs-input": "E99695",
+    "status:blocked": "B60205", "status:needs-input": "E99695", "status:proposed": "BFE5BF",
     "size:S": "C5DEF5", "size:M": "BFDADC", "size:L": "F9D0C4",
     "risk:low": "E6E6E6", "risk:high": "B60205",
     "no-tests": "EDEDED", "needs-local": "FEF2C0", "priority:high": "FF7F0E",
     "manual-land": "D93F0B", "incident": "B60205", "degraded": "FBCA04", "deploy-frozen": "000000",
 }
-# The autoland group's descriptions, exact (#149).
+# Descriptions checked exactly: the autoland group's (#149) and status:proposed's (#159).
 AUTOLAND_DESCRIPTIONS = {
     "manual-land": "Land by hand: autoland skips it",
     "incident": "A live check failed; autoland is paused in this repo",
     "degraded": "A live check is degraded; nothing was reverted",
     "deploy-frozen": "Deploys are stopped until you clear this",
+    "status:proposed": "A plan waiting for you to promote it",       # #159
 }
 
 TASK_BODY = """## Request
@@ -297,9 +298,9 @@ class Labels(BoardTest):
             seen[argv[2]] = argv[4]
             descriptions[argv[2]] = argv[6]
         self.assertEqual(seen, SPEC_COLORS)
-        self.assertEqual(len(SPEC_COLORS), 22)                      # the 18 existing labels plus the four new
+        self.assertEqual(len(SPEC_COLORS), 23)                      # 22 before #159, plus status:proposed
         self.assertIn(f"{len(SPEC_COLORS)} labels created or updated", p.stdout)
-        self.assertIn("22 labels created or updated", p.stdout)
+        self.assertIn("23 labels created or updated", p.stdout)
         for name, text in AUTOLAND_DESCRIPTIONS.items():
             self.assertEqual(descriptions.get(name), text, name)
 
@@ -2514,6 +2515,483 @@ class Board(BoardTest):
         data = json.loads(self.ok("board", "--json").stdout)
         self.assertEqual([e["number"] for e in data["ready"]], [4])
         self.assertEqual([e["number"] for e in data["no-status"]], [6])
+
+
+# ======================================================================= status:proposed and promote (#159)
+def label_values(argv):
+    """The --label values of an argv, in order (`--label x` and `--label=x`)."""
+    out, i = [], 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--label" and i + 1 < len(argv):
+            out.append(argv[i + 1])
+            i += 2
+            continue
+        if tok.startswith("--label="):
+            out.append(tok[len("--label="):])
+        i += 1
+    return out
+
+
+def without_labels(argv):
+    out, i = [], 0
+    while i < len(argv):
+        if argv[i] == "--label":
+            i += 2
+            continue
+        if not argv[i].startswith("--label="):
+            out.append(argv[i])
+        i += 1
+    return out
+
+
+def label_edits(calls):
+    """{issue number: (labels added, labels removed)} over every `gh issue edit N` call; gh takes repeated flags,
+    `--flag=value` and comma-separated names alike."""
+    out = {}
+    for argv in calls:
+        if argv[:2] != ["issue", "edit"] or len(argv) < 3 or not argv[2].isdigit():
+            continue
+        adds, removes = out.setdefault(int(argv[2]), (set(), set()))
+        i = 3
+        while i < len(argv):
+            tok = argv[i]
+            for flag, into in (("--add-label", adds), ("--remove-label", removes)):
+                if tok == flag and i + 1 < len(argv):
+                    into.update(x.strip() for x in argv[i + 1].split(",") if x.strip())
+                    i += 1
+                elif tok.startswith(flag + "="):
+                    into.update(x.strip() for x in tok[len(flag) + 1:].split(",") if x.strip())
+            i += 1
+    return out
+
+
+class Proposed(BoardTest):
+    """`status:proposed` (#159): `epic create --proposed` and `task create --proposed` label it in place of
+    status:ready; `ready` never lists it; `promote N` moves a proposed epic and its open proposed sub-issues (or a
+    proposed task alone) to ready through the usual status change; the Projects board gets no Status for it."""
+
+    HOST = "https://ghe.example.com/o/r/issues/"
+
+    def setUp(self):
+        super().setUp()
+        self.body = write(os.path.join(self.tmp, "body.md"), TASK_BODY)
+
+    # ------------------------------------------------------------------ helpers
+    def create_scenario(self, number, url=None):
+        url = url or f"https://github.com/o/r/issues/{number}"
+        self.scenario([REPO_VIEW,
+                       {"match": ["issue", "create"], "stdout": f"Creating issue in o/r\n\n{url}\n"},
+                       {"match": ["api", f"repos/o/r/issues/{number}", "--jq", ".id"], "stdout": f"{number}00\n"},
+                       {"match": ["api", "-X", "POST"], "stdout": "{}"},
+                       {"match": ["issue", "edit"], "stdout": url + "\n"},
+                       {"match": ["project"], "stdout": ""}])
+        return url
+
+    def created_labels(self):
+        creates = [argv for argv in self.calls() if argv[:2] == ["issue", "create"]]
+        self.assertEqual(len(creates), 1, self.calls())
+        return creates[0]
+
+    def project_calls(self):
+        return [project_call(argv) for argv in self.calls() if argv[:1] == ["project"]]
+
+    def promote_world(self, number, labels, state="OPEN", subs=(), kind_title="Ticket"):
+        """N as gh issue view shows it (every field, so any --json list is answered) and, for an epic, its sub-issues
+        (number, labels, state) through every shape of the sub_issues REST call."""
+        calls = [REPO_VIEW,
+                 {"match": ["issue", "view", str(number)],
+                  "stdout_json": issue(number=number, labels=labels, state=state, title=f"{kind_title} {number}",
+                                       body=EPIC_BODY if "epic" in labels else TASK_BODY)}]
+        listing = []
+        for n, sub_labels, sub_state in subs:
+            listing.append({"number": n, "title": f"Task {n}", "state": sub_state.lower(),
+                            "url": f"https://github.com/o/r/issues/{n}",
+                            "labels": [{"name": x} for x in sub_labels]})
+            calls.append({"match": ["issue", "view", str(n)],
+                          "stdout_json": issue(number=n, labels=sub_labels, state=sub_state, title=f"Task {n}",
+                                               parent={"number": number, "title": f"{kind_title} {number}",
+                                                       "url": f"https://github.com/o/r/issues/{number}"})})
+        path = f"repos/o/r/issues/{number}/sub_issues"
+        for prefix in (["api", path], ["api", path + "?per_page=100"], ["api", "--paginate", path],
+                       ["api", "--paginate", path + "?per_page=100"]):
+            calls.append({"match": prefix, "stdout_json": listing})
+        calls.append({"match": ["issue", "comment"], "stdout": f"https://github.com/o/r/issues/{number}#c1\n"})
+        self.scenario(calls, default={"stdout": ""})
+
+    def cache_for(self, number, labels, state="OPEN"):
+        status = "closed" if state == "CLOSED" else next(
+            (x[len("status:"):] for x in labels if x.startswith("status:")), None)
+        record = {"number": number, "title": f"Ticket {number}", "labels": list(labels), "status": status,
+                  "tier": "opus", "branch": f"t/{number}-kept", "attempts": [{"stage": "tests", "result": "pass"}]}
+        self.put_cache(number, record)
+        return record
+
+    def assertPromoted(self, number, before_labels, edits, record):
+        """N's labels end with status:ready as their only status label, and its cache says so."""
+        self.assertIn(number, edits, f"#{number} was not edited: {self.calls()}")
+        adds, removes = edits[number]
+        after = (set(before_labels) - removes) | adds
+        self.assertEqual({x for x in after if x.startswith("status:")}, {"status:ready"}, (number, adds, removes))
+        self.assertEqual(after - {"status:ready"}, set(before_labels) - {"status:proposed"}, number)
+        cached = self.cache(number)
+        self.assertEqual(cached["status"], "ready", cached)
+        self.assertEqual(sorted(cached["labels"]), sorted(after), cached)
+        self.assertEqual((cached["branch"], cached["attempts"]), (record["branch"], record["attempts"]),
+                         "the cache keeps what only it holds")
+
+    def assertUntouched(self, number, edits, record):
+        self.assertNotIn(number, edits, f"#{number} must not be edited")
+        self.assertEqual(self.cache(number), record, f"#{number}'s cache is unchanged")
+
+    # ------------------------------------------------------------------ create
+    def test_epic_and_task_create_proposed(self):
+        cases = [  # (argv after create, number, expected labels with --proposed, parent, blockers)
+            (["epic", "create", "--title", "Board v3", "--size", "L", "--risk", "high"], 3,
+             ["epic", "status:proposed", "size:L", "risk:high"], None, ()),
+            (["epic", "create", "--title", "Small plan"], 57, ["epic", "status:proposed"], None, ()),
+            (["task", "create", "--title", "Wire it", "--parent", "3", "--size", "S", "--risk", "low",
+              "--blocked-by", "9,10", "--no-tests", "--priority"], 13,
+             ["task", "status:proposed", "size:S", "risk:low", "no-tests", "priority:high"], 3, (9, 10)),
+            (["task", "create", "--title", "Fix it", "--type", "bug", "--needs-local"], 88,
+             ["bug", "status:proposed", "needs-local"], None, ()),
+            (["task", "create", "--title", "Tidy", "--type", "chore", "--size", "M", "--parent", "40"], 204,
+             ["chore", "status:proposed", "size:M"], 40, ()),
+        ]
+        for argv, number, labels, parent, blockers in cases:
+            for proposed in (True, False):
+                with self.subTest(argv=" ".join(argv[:3]), number=number, proposed=proposed):
+                    url = self.create_scenario(number)
+                    full = argv + ["--body-file", self.body] + (["--proposed"] if proposed else [])
+                    p = self.board(*full)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertEqual(p.stdout.strip(), f"#{number} {url}")
+                    create = self.created_labels()
+                    title = argv[argv.index("--title") + 1]
+                    self.assertEqual(without_labels(create),
+                                     ["issue", "create", "--title", title, "--body-file", self.body])
+                    want = [x if proposed or x != "status:proposed" else "status:ready" for x in labels]
+                    self.assertEqual(sorted(label_values(create)), sorted(want))
+                    if proposed:
+                        self.assertNotIn("status:ready", label_values(create))
+                    if parent:
+                        self.assertIn(["api", "-X", "POST", f"repos/o/r/issues/{parent}/sub_issues", "-F",
+                                       f"sub_issue_id={number}00"], self.calls(), "still linked under the epic")
+                    for b in blockers:
+                        self.assertIn(["issue", "edit", str(number), "--add-blocked-by", str(b)], self.calls())
+                    self.assertEqual(self.project_calls(), [], "no project configured: no gh project call")
+
+    # ------------------------------------------------------------------ ready
+    def test_ready_excludes_proposed(self):
+        # the labels `task create --size S --risk low --priority --proposed` writes (checked at the end)
+        made = ["task", "status:proposed", "size:S", "risk:low", "priority:high"]
+
+        def item(number, labels, blocked=()):
+            return {"number": number, "title": f"Ticket {number}", "labels": [{"name": n} for n in labels],
+                    "blockedBy": list(blocked)}
+        worlds = [
+            ([item(21, made), item(8, ["task", "status:ready"]), item(4, ["task", "status:proposed", "size:M"]),
+              item(9, ["task", "status:ready", "priority:high", "size:L"]),
+              item(3, ["refactor", "status:ready", "size:S", "risk:low"]),
+              item(7, ["epic", "status:proposed"])],
+             [9, 3, 8]),
+            ([item(40, ["bug", "status:proposed", "priority:high", "size:S", "risk:low"]),
+              item(41, ["bug", "status:ready", "size:S", "risk:low"]),
+              item(12, ["chore", "status:proposed"], [{"number": 2, "state": "CLOSED"}]),
+              item(2, ["task", "status:ready", "priority:high"], [{"number": 1, "state": "CLOSED"}]),
+              item(33, ["task", "status:ready"], [{"number": 34, "state": "OPEN"}])],
+             [2, 41]),
+            ([item(5, ["task", "status:proposed"]), item(6, ["chore", "status:proposed", "priority:high"])], []),
+        ]
+        for items, expected in worlds:
+            with self.subTest(expected=expected):
+                self.scenario([{"match": ["issue", "list"], "stdout_json": items}])
+                rows = json.loads(self.ok("ready", "--json").stdout)
+                self.assertEqual([r["number"] for r in rows], expected)
+                self.assertEqual(self.calls(), [["issue", "list", "--state", "open", "--label", "status:ready",
+                                                 "--json", "number,title,labels,blockedBy", "--limit", "200"]],
+                                 "the query is today's")
+                table_out = self.ok("ready").stdout
+                if expected:
+                    self.assertEqual([line.split()[0] for line in table_out.splitlines()[1:]],
+                                     [str(n) for n in expected])
+                else:
+                    self.assertEqual(table_out.strip(), "No ready tickets.")
+        self.create_scenario(21)
+        self.ok("task", "create", "--title", "Proposed one", "--body-file", self.body, "--size", "S", "--risk", "low",
+                "--priority", "--proposed")
+        self.assertEqual(sorted(label_values(self.created_labels())), sorted(made))
+
+    # ------------------------------------------------------------------ promote
+    def test_promote_epic_moves_epic_and_proposed_tasks(self):
+        def subs(*rows):
+            return [(n, [kind, "status:" + status] if status else [kind], state) for n, kind, status, state in rows]
+        cases = [
+            (3, subs((12, "task", "proposed", "OPEN"), (13, "task", "in-progress", "OPEN"),
+                     (14, "bug", "proposed", "OPEN"), (15, "task", "proposed", "CLOSED"),
+                     (16, "chore", "ready", "OPEN"), (17, "task", "needs-input", "OPEN"),
+                     (18, "refactor", None, "OPEN"), (19, "task", "in-review", "OPEN"),
+                     (20, "task", "blocked", "OPEN")),
+             [12, 14]),
+            (40, subs((41, "task", "proposed", "OPEN"), (42, "task", "ready", "OPEN")), [41]),
+            (70, subs((71, "task", "in-progress", "OPEN"), (72, "task", "proposed", "CLOSED")), []),
+            (90, subs((95, "task", "proposed", "OPEN"), (91, "chore", "proposed", "OPEN"),
+                      (93, "bug", "proposed", "OPEN")), [91, 93, 95]),
+        ]
+        for epic, tasks, promoted in cases:
+            with self.subTest(epic=epic, promoted=promoted):
+                epic_labels = ["epic", "status:proposed", "size:L", "risk:low"]
+                records = {epic: self.cache_for(epic, epic_labels)}
+                for n, labels, state in tasks:
+                    records[n] = self.cache_for(n, labels + ["size:S"], state)
+                self.promote_world(epic, epic_labels, subs=[(n, labels + ["size:S"], state)
+                                                            for n, labels, state in tasks], kind_title="Epic")
+                p = self.board("promote", str(epic))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                k = len(promoted)
+                self.assertRegex(p.stdout.strip(), r"^promoted #%d and %d tasks?$" % (epic, k))
+                edits = label_edits(self.calls())
+                self.assertPromoted(epic, epic_labels, edits, records[epic])
+                for n, labels, state in tasks:
+                    if n in promoted:
+                        self.assertPromoted(n, labels + ["size:S"], edits, records[n])
+                    else:
+                        self.assertUntouched(n, edits, records[n])
+                self.assertEqual(set(edits), {epic, *promoted}, "nothing else is edited")
+                self.assertFalse([a for a in self.calls() if a[:2] == ["issue", "close"]])
+
+    def test_promote_json(self):
+        # the documented shape, exactly: {"number": N, "tasks": [the promoted task numbers]}
+        cases = [
+            (30, ["epic", "status:proposed"], "Epic",
+             [(31, ["task", "status:proposed"], "OPEN"), (32, ["task", "status:ready"], "OPEN")], [31]),
+            (50, ["epic", "status:proposed"], "Epic",
+             [(58, ["bug", "status:proposed"], "OPEN"), (52, ["task", "status:in-progress"], "OPEN"),
+              (51, ["task", "status:proposed"], "OPEN"), (55, ["task", "status:proposed"], "CLOSED")], [51, 58]),
+            (60, ["epic", "status:proposed"], "Epic", [(61, ["task", "status:blocked"], "OPEN")], []),
+            (77, ["task", "status:proposed", "size:S"], "Task", [], []),
+            (8, ["bug", "status:proposed"], "Task", [], []),
+        ]
+        for number, labels, kind_title, subs, promoted in cases:
+            with self.subTest(number=number, promoted=promoted):
+                self.promote_world(number, labels, subs=subs, kind_title=kind_title)
+                data = json.loads(self.ok("promote", str(number), "--json").stdout)
+                self.assertEqual(data, {"number": number, "tasks": promoted})
+                self.assertNotIn(number, data["tasks"], "the promoted ticket itself is not one of its tasks")
+                self.assertEqual(set(label_edits(self.calls())), {number, *promoted})
+
+    def test_promote_a_task_alone(self):
+        cases = [(12, "task", ["size:S", "risk:low"]), (47, "bug", ["priority:high"]),
+                 (8, "chore", ["size:M", "no-tests"]), (230, "refactor", [])]
+        for number, kind, extra in cases:
+            with self.subTest(number=number, kind=kind):
+                labels = [kind, "status:proposed"] + extra
+                # its epic is proposed too, and has another proposed task: promoting the task touches neither
+                self.promote_world(number, labels, kind_title="Task")
+                record = self.cache_for(number, labels)
+                epic_record = self.cache_for(3, ["epic", "status:proposed"])
+                sibling = self.cache_for(number + 1, ["task", "status:proposed"])
+                p = self.board("promote", str(number))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertRegex(p.stdout.strip(), r"^promoted #%d( and 0 tasks)?$" % number)
+                edits = label_edits(self.calls())
+                self.assertEqual(set(edits), {number}, self.calls())
+                self.assertPromoted(number, labels, edits, record)
+                self.assertEqual(self.cache(3), epic_record)
+                self.assertEqual(self.cache(number + 1), sibling)
+
+    def test_promote_refuses_closed_or_not_proposed(self):
+        cases = [(12, ["task", "status:proposed"], "CLOSED"), (3, ["epic", "status:proposed"], "CLOSED"),
+                 (14, ["task", "status:ready"], "OPEN"), (15, ["bug", "status:in-progress"], "OPEN"),
+                 (16, ["task", "status:needs-input"], "OPEN"), (17, ["task", "status:blocked"], "OPEN"),
+                 (18, ["chore"], "OPEN"), (40, ["epic", "status:ready"], "OPEN"), (41, ["epic"], "OPEN"),
+                 (19, ["task", "status:in-review"], "OPEN")]
+        for number, labels, state in cases:
+            with self.subTest(number=number, labels=labels, state=state):
+                subs = [(number + 100, ["task", "status:proposed"], "OPEN")] if "epic" in labels else []
+                self.promote_world(number, labels, state=state, subs=subs)
+                record = self.cache_for(number, labels, state)
+                for n, sub_labels, sub_state in subs:
+                    self.cache_for(n, sub_labels, sub_state)
+                p = self.board("promote", str(number))
+                self.assertOneLineError(p)
+                self.assertIn(str(number), p.stderr)
+                self.assertEqual(label_edits(self.calls()), {}, "nothing is relabeled")
+                self.assertFalse([a for a in self.calls() if a[:2] in (["issue", "comment"], ["issue", "close"])])
+                self.assertEqual(self.cache(number), record)
+                # the same ticket open and proposed is promoted: the refusal follows the state and the label
+                kind = [x for x in labels if not x.startswith("status:")]
+                self.promote_world(number, kind + ["status:proposed"], subs=subs)
+                self.assertEqual(self.board("promote", str(number)).returncode, 0, self.calls())
+                self.assertIn(number, label_edits(self.calls()))
+
+    # ------------------------------------------------------------------ show
+    def test_show_reports_proposed(self):
+        for number, labels, tier in ((12, ("task", "status:proposed", "size:M", "risk:low"), "opus"),
+                                     (77, ("chore", "status:proposed", "size:S", "risk:low"), "sonnet")):
+            with self.subTest(number=number):
+                self.scenario([{"match": ["issue", "view", str(number)],
+                                "stdout_json": issue(number=number, labels=labels)}])
+                record = json.loads(self.ok("show", str(number), "--json").stdout)
+                self.assertEqual((record["status"], record["tier"]), ("proposed", tier))
+                self.assertEqual(self.cache(number)["status"], "proposed")
+        epic = issue(number=3, title="Board v3", labels=("epic", "status:proposed"), body=EPIC_BODY)
+        subs = [{"number": 12, "title": "First", "state": "open",
+                 "labels": [{"name": "task"}, {"name": "status:proposed"}, {"name": "size:S"}, {"name": "risk:low"}]},
+                {"number": 13, "title": "Second", "state": "open",
+                 "labels": [{"name": "task"}, {"name": "status:ready"}, {"name": "size:M"}]},
+                {"number": 14, "title": "Third", "state": "closed",
+                 "labels": [{"name": "task"}, {"name": "status:proposed"}]}]
+        self.scenario([REPO_VIEW, {"match": ["issue", "view", "3"], "stdout_json": epic},
+                       {"match": ["api", "repos/o/r/issues/3/sub_issues?per_page=100"], "stdout_json": subs},
+                       {"match": ["issue", "view", "14"], "stdout_json": {"comments": []}}])
+        record = json.loads(self.ok("show", "3", "--json").stdout)
+        self.assertEqual(record["status"], "proposed")
+        self.assertEqual([(t["number"], t["status"]) for t in record["tasks"]],
+                         [(12, "proposed"), (13, "ready"), (14, "closed")])
+        md = self.ok("show", "3", "--markdown").stdout
+        self.assertIn("- #12 First (proposed, S, low, tier sonnet)", md)
+
+    # ------------------------------------------------------------------ board
+    def board_item(self, number, labels, **extra):
+        return dict({"number": number, "title": f"Ticket {number}", "labels": [{"name": n} for n in labels]}, **extra)
+
+    BASE_LINES = ["# Board: proj", "",
+                  "## Epics (1)", "- #3 Ticket 3 (1 of 2 tasks closed)", "",
+                  "## Ready (1)", "- #4 Ticket 4 (task, S, low)", "",
+                  "## In progress (1)", "- #5 Ticket 5 (bug, M, high)", "",
+                  "## In review (1)", "- #10 Ticket 10 (task, L, high)", "",
+                  "## Blocked (0)", "",
+                  "## Needs input (1)", "- #8 Ticket 8 (chore, M, low)", "",
+                  "## No status (1)", "- #6 Ticket 6 (task, -, -)"]
+
+    def base_items(self):
+        it = self.board_item
+        return [it(4, ["task", "status:ready", "size:S", "risk:low"]),
+                it(3, ["epic", "status:ready"], subIssuesSummary={"total": 2, "completed": 1}),
+                it(5, ["bug", "status:in-progress", "size:M", "risk:high"]),
+                it(10, ["task", "status:in-review", "size:L", "risk:high"]),
+                it(8, ["chore", "status:needs-input", "size:M", "risk:low"]),
+                it(6, ["task"])]
+
+    def test_board_section_only_when_nonempty(self):
+        self.scenario([{"match": ["issue", "list"], "stdout_json": self.base_items()}])
+        out = self.ok("board").stdout
+        self.assertEqual(out.rstrip("\n").splitlines(), self.BASE_LINES, "unchanged when nothing is proposed")
+        self.assertNotIn("Proposed", out)
+        it = self.board_item
+        for extra, lines in (
+                ([it(7, ["task", "status:proposed", "size:M", "risk:low"]),
+                  it(12, ["bug", "status:proposed", "size:S"]), it(2, ["refactor", "status:proposed"])],
+                 ["- #2 Ticket 2 (refactor, -, -)", "- #7 Ticket 7 (task, M, low)", "- #12 Ticket 12 (bug, S, -)"]),
+                ([it(21, ["chore", "status:proposed", "size:L", "risk:high"])], ["- #21 Ticket 21 (chore, L, high)"])):
+            with self.subTest(proposed=len(lines)):
+                items = self.base_items()
+                items[2:2] = extra
+                self.scenario([{"match": ["issue", "list"], "stdout_json": items}])
+                got = self.ok("board").stdout.rstrip("\n").splitlines()
+                heading = f"## Proposed ({len(lines)})"
+                self.assertIn(heading, got)
+                h = got.index(heading)
+                self.assertEqual(got[h + 1:h + 1 + len(lines)], lines)
+                self.assertEqual(got[h - 1], "")
+                self.assertEqual(got[:h - 1] + got[h + 1 + len(lines):], self.BASE_LINES,
+                                 "the other sections are as before; the proposed tasks are not under No status")
+                data = json.loads(self.ok("board", "--json").stdout)
+                self.assertEqual([e["number"] for e in data["proposed"]],
+                                 sorted(int(x.split()[1][1:]) for x in lines))
+                self.assertEqual([e["number"] for e in data["no-status"]], [6])
+
+    # ------------------------------------------------------------------ the Projects board
+    def test_project_check_and_sync_ignore_proposed(self):
+        self.scenario([REPO_VIEW, {"match": ["project", "field-list"], "stdout_json": ProjectCheck.fields(None)}])
+        p = self.board("project", "check", HARNESS_PROJECT="rjeskuri/7")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("Proposed", p.stdout + p.stderr)
+        for project, numbers in (("rjeskuri/7", (11, 12, 13, 14, 15)), ("acme-org/23", (230, 4, 77, 9, 101))):
+            with self.subTest(project=project):
+                proposed_a, proposed_b, proposed_c, drifted, plain = numbers
+                issues = [sync_issue("o/r", proposed_a, "task", "proposed", False),
+                          sync_issue("o/r", proposed_b, "epic", "proposed", False),
+                          sync_issue("o/r", proposed_c, "bug", "proposed", True),
+                          sync_issue("o/r", drifted, "task", "ready", False),
+                          sync_issue("o/r", plain, "task", "in-progress", False)]
+                items = [board_item("o/r", proposed_a, UNSET, "Normal", labels=["task", "status:proposed"]),
+                         board_item("o/r", proposed_b, "Ready", UNSET, labels=["epic", "status:proposed"]),
+                         board_item("o/r", proposed_c, "In progress", "High", labels=["bug", "status:proposed"]),
+                         board_item("o/r", drifted, "In review", "Normal", labels=["task", "status:ready"]),
+                         board_item("o/r", plain, "In progress", "Normal", labels=["task", "status:in-progress"])]
+                self.scenario([{"match": ["issue", "list"], "stdout_json": issues},
+                               {"match": ["project", "item-list"],
+                                "stdout_json": {"items": items, "totalCount": len(items)}},
+                               {"match": ["project"], "stdout": ""}])
+                p = self.board("project", "sync", HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(p.stderr.strip(), "", "no warning for status:proposed")
+                writes = [project_call(a) for a in self.calls() if a[:2] in (["project", "item-add"],
+                                                                            ["project", "item-edit"])]
+                self.assertEqual(writes, [item_edit(project, f"https://github.com/o/r/issues/{drifted}",
+                                                    "Status", "Ready")],
+                                 "the proposed issues get no write; the drifted ready one is still corrected")
+
+    def test_mirror_adds_the_item_without_status(self):
+        cases = [("rjeskuri/7", 13, ["task", "create", "--title", "T13", "--parent", "3", "--blocked-by", "9"], False),
+                 ("acme-org/23", 58, ["task", "create", "--title", "T58", "--type", "bug"], False),
+                 ("someone/1", 91, ["epic", "create", "--title", "E91", "--size", "M"], False),
+                 ("rjeskuri/12", 204, ["task", "create", "--title", "T204", "--priority"], True)]
+        for project, number, argv, priority in cases:
+            with self.subTest(project=project, number=number):
+                url = self.create_scenario(number, self.HOST + str(number))
+                p = self.board(*argv, "--body-file", self.body, "--proposed", HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(p.stderr.strip(), "")
+                self.assertEqual(p.stdout.strip(), f"#{number} {url}")
+                calls = self.project_calls()
+                self.assertTrue(calls, "the issue is still added to the board")
+                self.assertEqual(calls[0], item_add(project, url))
+                self.assertFalse([c for c in calls if c[0] == "item-edit" and c[2].get("field") == "Status"],
+                                 "no Status for a proposed issue")
+                if not priority:
+                    self.assertEqual(calls, [item_add(project, url)], "item-add only")
+                created = self.index_of_create()
+                first_project = next(i for i, a in enumerate(self.calls()) if a[:1] == ["project"])
+                self.assertLess(created, first_project)
+        # `status N proposed`: the labels swap, the board's Status is left alone, and nothing warns
+        for number, old, project in ((12, "ready", "rjeskuri/7"), (66, "needs-input", "acme-org/23")):
+            with self.subTest(status_proposed=number):
+                url = self.HOST + str(number)
+                self.scenario([REPO_VIEW,
+                               {"match": ["issue", "view", str(number)],
+                                "stdout_json": {"labels": [{"name": "task"}, {"name": "status:" + old}], "url": url,
+                                                "number": number}},
+                               {"match": ["project"], "stdout": ""}], default={"stdout": ""})
+                p = self.board("status", str(number), "proposed", HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(p.stderr.strip(), "")
+                self.assertEqual(p.stdout.strip(), f"#{number} status:proposed")
+                adds, removes = label_edits(self.calls())[number]
+                self.assertEqual((adds, removes), ({"status:proposed"}, {"status:" + old}))
+                self.assertEqual(self.project_calls(), [])
+                # and promoting it back mirrors Ready as any status change does
+                self.scenario([REPO_VIEW,
+                               {"match": ["issue", "view", str(number)],
+                                "stdout_json": dict(issue(number=number, labels=("task", "status:proposed")),
+                                                    url=url)},
+                               {"match": ["project"], "stdout": ""}], default={"stdout": ""})
+                p = self.board("promote", str(number), HARNESS_PROJECT=project)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(self.project_calls(), [item_edit(project, url, "Status", "Ready")])
+
+    def index_of_create(self):
+        return next(i for i, a in enumerate(self.calls()) if a[:2] == ["issue", "create"])
+
+    def test_help(self):
+        p = self.board("promote", "--help")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("usage:", p.stdout)
+        for argv in (["epic", "create", "--help"], ["task", "create", "--help"]):
+            self.assertIn("--proposed", self.board(*argv).stdout, argv)
 
 
 # ======================================================================= tier
