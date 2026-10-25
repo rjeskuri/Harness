@@ -33,9 +33,10 @@ Rules: an existing file is never overwritten without --force, and each path is r
 created, kept or updated. A kept .claude/settings.json is never edited, but `warn:` lines (--dry-run
 and the real run alike) name each ask or deny rule that would stop a dispatched run on a loop command
 (git, gh, harness-*, the file's own CLAUDE_VERIFY_CMD, else the rendered one), each allow entry of the
-stack's template that no allow rule covers (an allow rule Bash(harness-*:*), a wildcard auto mode may
-drop, gets one line naming the template's harness-<tool> rules in place of theirs) and each env key of
-it that is absent, with the value to add; a file that is not usable settings gets one warn line.
+stack's template that no allow rule covers (an allow rule Bash(harness-*:*), which matches no tool since
+a ':*' rule is a literal prefix, gets one line naming the template's harness-<tool> rules in place of
+theirs) and each env key of it that is absent, with the value to add; a file that is not usable
+settings gets one warn line.
 The stack skeleton (pyproject.toml, src/<pkg>/__init__.py,
 tests/test_smoke.py; package.json, tests/smoke.test.js) is written only when the project has no
 manifest of any stack, no Makefile with a test or check target and no tests (a tests/, test/ or spec/
@@ -93,8 +94,8 @@ STACK_ALLOW = {
 LOOP_COMMANDS = [["git", "add"], ["git", "commit"], ["git", "push"], ["git", "fetch"], ["git", "worktree"],
                  ["gh", "issue"], ["gh", "pr"], ["gh", "api"]]
 KEPT = ".claude/settings.json"
-# The old allow spelling for every harness tool, which auto mode may drop as a wildcarded program rule; a
-# kept file holding it is told to use the template's own harness-<tool> rules instead.
+# The old allow spelling for every harness tool. It matches none: a rule ending in ':*' is a literal prefix
+# (here 'harness-*'); a kept file holding it is told to use the template's own harness-<tool> rules instead.
 OLD_HARNESS_RULE = "Bash(harness-*:*)"
 HARNESS_TOOL_RULE = re.compile(r"Bash\(harness-[a-z]+:\*\)")
 
@@ -638,8 +639,8 @@ def kept_settings_report(root, files):
     if OLD_HARNESS_RULE in allow:          # one line for the old spelling, in place of one per harness tool
         tools = [e for e in allow_wanted if HARNESS_TOOL_RULE.fullmatch(e)]
         missing = [e for e in missing if e not in tools]
-        lines.append(f"warn: {KEPT} allow rule {OLD_HARNESS_RULE} is a wildcard auto mode may drop; replace it "
-                     f"with the nine harness-<tool> rules: {', '.join(tools)}")
+        lines.append(f"warn: {KEPT} allow rule {OLD_HARNESS_RULE} matches no harness tool (a ':*' rule is a "
+                     f"literal prefix); replace it with the nine harness-<tool> rules: {', '.join(tools)}")
     lines += [f"warn: {KEPT} allow entry {e} is missing, so a dispatched run would be stopped by a prompt "
               "no one can answer; add it to permissions.allow" for e in missing]
     lines += [f"warn: {KEPT} env key {k} is not set (the template sets it); add {json.dumps({k: v})[1:-1]} "
