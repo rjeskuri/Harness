@@ -2738,10 +2738,14 @@ class ToolsRunTheLib(unittest.TestCase):
         saved = os.path.join(self.tmp, "state", "ultra", "9.json")
         out = '{"findings": [], "note": "\u2603"}\n\n'
         claude = self.fake_exe("claude", f"printf '%s' '{out}'\n")
-        repo = mock.Mock(root=self.tmp)
+        # cmd_ultra reads the routing settings of repo.main first; with no settings file there, ultrareview is on
+        repo = mock.Mock(root=self.tmp, main=self.tmp)
         repo.state = lambda *parts: os.path.join(self.tmp, "state", *parts)
-        args = argparse.Namespace(number=9, post=False)
-        with mock.patch.dict(os.environ, {"HARNESS_CLAUDE": claude, "HOME": self.tmp}), \
+        args = argparse.Namespace(number=9, post=False, force=False)
+        # a blank routing variable counts as unset, so the developer's own HARNESS_* settings cannot switch the run off
+        routing = {k: "" for k in ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER",
+                                   "HARNESS_ULTRAREVIEW", "HARNESS_WAVE_REVIEW")}
+        with mock.patch.dict(os.environ, {**routing, "HARNESS_CLAUDE": claude, "HOME": self.tmp}), \
                 mock.patch.object(pr, "open_repo", lambda: repo):
             _, printed, _ = capture(pr.cmd_ultra, args)
         self.assertIn("no findings", printed)

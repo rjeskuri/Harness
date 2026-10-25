@@ -1176,6 +1176,368 @@ class Ultra(PrTest):
         self.assertFalse(os.path.exists(self.budgets_path()))
 
 
+ULTRA_OUT = json.dumps({"summary": "done", "findings": [{"severity": "high"}, {"severity": "low"}]})
+WARNING = "harness-pr: warning:"
+LIB = os.path.join(os.path.dirname(HERE), "lib")
+# What each routing key accepts, in the words of the warning (routing.py's "%s=%r is not one of %s; ignored").
+ACCEPTS = {
+    "HARNESS_CODE_TIER": "sonnet, opus, fable",
+    "HARNESS_CODE_EFFORT": "low, medium, high, xhigh, max",
+    "HARNESS_REVIEW_TIER": "sonnet, opus, fable",
+    "HARNESS_ULTRAREVIEW": "on, 1, true, yes, off, 0, false, no",
+    "HARNESS_WAVE_REVIEW": "sonnet, opus, fable, off, 0, false, no",
+}
+
+
+def off_line(number):
+    return f"ultrareview PR #{number}: off for this project (HARNESS_ULTRAREVIEW=off); nothing run"
+
+
+def bad(key, shown):
+    """The exact problem text for `key` given the (stripped) value `shown`."""
+    return f"{key}={shown!r} is not one of {ACCEPTS[key]}; ignored"
+
+
+class UltraSettingBase:
+    """Helpers for the HARNESS_ULTRAREVIEW switch: settings files in the main checkout, the cloud budget and the
+    saved ultra state, watched the way the Ultra tests watch them."""
+
+    def claude(self, stdout=ULTRA_OUT, stderr="", code=0):
+        return {"CLAUDE_STDOUT": write(os.path.join(self.tmp, "claude.out"), stdout),
+                "CLAUDE_STDERR": write(os.path.join(self.tmp, "claude.err"), stderr), "CLAUDE_EXIT": str(code)}
+
+    def budgets_path(self):
+        return os.path.join(self.home, ".claude", "harness", "budgets.json")
+
+    def settings(self, env, name="settings.json", root=None):
+        write(os.path.join(root or self.main, ".claude", name), json.dumps({"env": env}))
+
+    def go(self, number, file_env=None, raw=None, environ=None, flags=(), local=None):
+        """A fresh run: call logs cleared, the main checkout's settings files replaced by `file_env` (or the
+        exact text `raw`) and `local` (settings.local.json), then `harness-pr ultra <number>`."""
+        self.scenario([])
+        for name in ("settings.json", "settings.local.json"):
+            path = os.path.join(self.main, ".claude", name)
+            if os.path.exists(path):
+                os.unlink(path)
+        if raw is not None:
+            write(os.path.join(self.main, ".claude", "settings.json"), raw)
+        elif file_env is not None:
+            self.settings(file_env)
+        if local is not None:
+            self.settings(local, name="settings.local.json")
+        return self.pr("ultra", str(number), *flags, **(environ or {}), **self.claude())
+
+    def warnings(self, p):
+        return [line for line in p.stderr.splitlines() if line.startswith(WARNING)]
+
+    def routing_problems(self, environ):
+        """load_routing's problems for the main checkout as it is on disk now, under exactly `environ` as the
+        HARNESS_* environment (the oracle for the warning text)."""
+        if LIB not in sys.path:
+            sys.path.insert(0, LIB)
+        from harness_lib import routing
+        saved = dict(os.environ)
+        try:
+            for name in [n for n in os.environ if n.startswith("HARNESS_")]:
+                del os.environ[name]
+            os.environ.update(environ)
+            return routing.load_routing(self.main)["problems"]
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+    def assertWarnings(self, p, problems, environ=None):
+        """The `harness-pr: warning:` lines are exactly `problems`, in order, one each; `problems` is hand-written
+        and must agree with load_routing's."""
+        expected = [WARNING + " " + text for text in problems]
+        self.assertEqual([WARNING + " " + t for t in self.routing_problems(environ or {})], expected,
+                         "the test's expected problems disagree with load_routing")
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(self.warnings(p), expected, p.stderr)
+
+    def assertNothingRan(self, p, number):
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.stdout.strip(), off_line(number))
+        self.assertEqual(self.stub_calls("claude"), [])
+        self.assertEqual(self.gh_argv(), [])
+        self.assertFalse(os.path.exists(self.state_path("ultra", f"{number}.json")))
+        self.assertFalse(os.path.exists(self.budgets_path()))
+
+    def assertRan(self, p, number, *flags):
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.stub_calls("claude"),
+                         [["ultrareview", str(number), "--json", "--timeout", "30", *flags]])
+        self.assertNotIn("off for this project", p.stdout)
+        self.assertIn("2 findings (1 high, 1 low)", p.stdout)
+        with open(self.state_path("ultra", f"{number}.json"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), ULTRA_OUT)
+
+
+class UltraSetting(UltraSettingBase, PrTest):
+    def test_off_runs_nothing_and_says_so(self):
+        # Every spelling of off, in the settings file, for a spread of PR numbers; the PR number is in the line.
+        for i, value in enumerate(["off", "OFF", "0", "false", "False", "no", " off "]):
+            number = 7 + 27 * i
+            with self.subTest(value=value):
+                p = self.go(number, {"HARNESS_ULTRAREVIEW": value})
+                self.assertNothingRan(p, number)
+                self.assertEqual(self.warnings(p), [])
+        # A JSON number 0 in settings.json is off too (the settings reader turns it into "0").
+        self.assertNothingRan(self.go(52, {"HARNESS_ULTRAREVIEW": 0}), 52)
+
+    def test_off_with_post_runs_nothing_and_leaves_state_and_budget_alone(self):
+        self.settings({"HARNESS_ULTRAREVIEW": "off"})
+        old = write(self.state_path("ultra", "34.json"), '{"findings": []}')
+        budgets = write(self.budgets_path(), json.dumps({"api": {"exhausted_until": None, "reason": ""}}))
+        with open(budgets, "rb") as fh:
+            before = fh.read()
+        # A claude that would hit the billing error if it were called.
+        p = self.pr("ultra", "34", "--post", **self.claude(stderr="Error: Your credit balance is too low.\n", code=1))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout.strip(), off_line(34))
+        self.assertEqual(self.stub_calls("claude"), [])
+        self.assertEqual(self.gh_argv(), [])
+        with open(old, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), '{"findings": []}')
+        with open(budgets, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+
+    def test_force_runs_it_anyway(self):
+        for number, flags, setting in ((34, (), "off"), (91, ("--post",), "off"), (5, (), "0"),
+                                       (12, ("--post",), "false")):
+            with self.subTest(number=number, flags=flags, setting=setting):
+                p = self.go(number, {"HARNESS_ULTRAREVIEW": setting}, flags=("--force", *flags))
+                self.assertRan(p, number, *flags)
+                self.assertEqual(self.warnings(p), [])
+        # --force with the environment saying off, too.
+        p = self.go(63, environ={"HARNESS_ULTRAREVIEW": "off"}, flags=("--force",))
+        self.assertRan(p, 63)
+
+    def test_force_with_off_in_the_environment_and_the_settings_file_still_runs(self):
+        p = self.go(48, {"HARNESS_ULTRAREVIEW": "off"}, environ={"HARNESS_ULTRAREVIEW": "false"},
+                    flags=("--force",))
+        self.assertRan(p, 48)
+        self.assertEqual(self.warnings(p), [])
+        p = self.go(49, {"HARNESS_ULTRAREVIEW": "no"}, environ={"HARNESS_ULTRAREVIEW": "0"},
+                    flags=("--post", "--force"))
+        self.assertRan(p, 49, "--post")
+        self.assertEqual(self.warnings(p), [])
+
+    def test_force_with_invalid_values_still_warns_and_runs(self):
+        file_env = {"HARNESS_ULTRAREVIEW": "maybe", "HARNESS_CODE_TIER": "gigantic"}
+        p = self.go(34, file_env, flags=("--force",))
+        self.assertRan(p, 34)
+        self.assertWarnings(p, [bad("HARNESS_CODE_TIER", "gigantic"), bad("HARNESS_ULTRAREVIEW", "maybe")])
+        environ = {"HARNESS_ULTRAREVIEW": "sometimes", "HARNESS_WAVE_REVIEW": "huge"}
+        p = self.go(35, {"HARNESS_ULTRAREVIEW": "off"}, environ=environ, flags=("--force", "--post"))
+        self.assertRan(p, 35, "--post")
+        self.assertWarnings(p, [bad("HARNESS_ULTRAREVIEW", "sometimes"), bad("HARNESS_WAVE_REVIEW", "huge")], environ)
+
+    def test_unset_and_on_run_as_today(self):
+        cases = [("unset", None, None, 34, ()), ("settings on", {"HARNESS_ULTRAREVIEW": "on"}, None, 41, ("--post",)),
+                 ("settings 1", {"HARNESS_ULTRAREVIEW": "1"}, None, 8, ()),
+                 ("settings true", {"HARNESS_ULTRAREVIEW": "True"}, None, 19, ()),
+                 ("settings yes", {"HARNESS_ULTRAREVIEW": "yes"}, None, 77, ("--post",)),
+                 ("blank is unset", {"HARNESS_ULTRAREVIEW": "  "}, None, 23, ()),
+                 ("other keys only", {"HARNESS_CODE_TIER": "opus"}, None, 6, ()),
+                 ("environment on", None, "on", 15, ()),
+                 ("environment on beats settings off", {"HARNESS_ULTRAREVIEW": "off"}, "on", 29, ("--post",))]
+        for label, file_env, environment, number, flags in cases:
+            with self.subTest(label):
+                extra = {"HARNESS_ULTRAREVIEW": environment} if environment else {}
+                p = self.go(number, file_env, environ=extra, flags=flags)
+                self.assertRan(p, number, *flags)
+                self.assertEqual(self.warnings(p), [])
+
+    def test_invalid_value_warns_and_runs(self):
+        for number, value in ((34, "maybe"), (58, "of"), (9, "2")):
+            with self.subTest(value=value):
+                p = self.go(number, {"HARNESS_ULTRAREVIEW": value})
+                self.assertRan(p, number)
+                self.assertWarnings(p, [bad("HARNESS_ULTRAREVIEW", value)])
+        # From the environment, the same: one warning, and it runs.
+        environ = {"HARNESS_ULTRAREVIEW": "sometimes"}
+        p = self.go(71, environ=environ)
+        self.assertRan(p, 71)
+        self.assertWarnings(p, [bad("HARNESS_ULTRAREVIEW", "sometimes")], environ)
+
+    def test_every_problem_is_one_warning_line_with_load_routings_text(self):
+        # (label, file env, environment, expected problems in load_routing's order, whether it is off)
+        cases = [
+            ("two invalid keys, off",
+             {"HARNESS_ULTRAREVIEW": "off", "HARNESS_CODE_TIER": "gigantic", "HARNESS_CODE_EFFORT": "11"}, {},
+             [bad("HARNESS_CODE_TIER", "gigantic"), bad("HARNESS_CODE_EFFORT", "11")], True),
+            ("review tier, wave and switch invalid, switch ignored so it runs",
+             {"HARNESS_REVIEW_TIER": "Huge", "HARNESS_WAVE_REVIEW": "sometimes", "HARNESS_ULTRAREVIEW": "perhaps"}, {},
+             [bad("HARNESS_REVIEW_TIER", "Huge"), bad("HARNESS_ULTRAREVIEW", "perhaps"),
+              bad("HARNESS_WAVE_REVIEW", "sometimes")], False),
+            ("JSON numbers become their text",
+             {"HARNESS_CODE_EFFORT": 11, "HARNESS_WAVE_REVIEW": 2.5, "HARNESS_ULTRAREVIEW": "off"}, {},
+             [bad("HARNESS_CODE_EFFORT", "11"), bad("HARNESS_WAVE_REVIEW", "2.5")], True),
+            ("environment values are stripped and reported as given",
+             {"HARNESS_CODE_EFFORT": "extreme", "HARNESS_ULTRAREVIEW": "no"}, {"HARNESS_WAVE_REVIEW": "  xl  "},
+             [bad("HARNESS_CODE_EFFORT", "extreme"), bad("HARNESS_WAVE_REVIEW", "xl")], True),
+            ("environment keys",
+             {"HARNESS_ULTRAREVIEW": "off"}, {"HARNESS_CODE_TIER": "Ultra", "HARNESS_REVIEW_TIER": "tiny"},
+             [bad("HARNESS_CODE_TIER", "Ultra"), bad("HARNESS_REVIEW_TIER", "tiny")], True),
+            ("all five invalid",
+             {"HARNESS_CODE_TIER": "t1", "HARNESS_CODE_EFFORT": "e2", "HARNESS_REVIEW_TIER": "t3",
+              "HARNESS_ULTRAREVIEW": "maybe", "HARNESS_WAVE_REVIEW": "w5"}, {},
+             [bad("HARNESS_CODE_TIER", "t1"), bad("HARNESS_CODE_EFFORT", "e2"), bad("HARNESS_REVIEW_TIER", "t3"),
+              bad("HARNESS_ULTRAREVIEW", "maybe"), bad("HARNESS_WAVE_REVIEW", "w5")], False),
+            ("a single invalid wave value next to off",
+             {"HARNESS_WAVE_REVIEW": "opuss", "HARNESS_ULTRAREVIEW": "0"}, {},
+             [bad("HARNESS_WAVE_REVIEW", "opuss")], True),
+        ]
+        for i, (label, file_env, environ, problems, off) in enumerate(cases):
+            number = 100 + 13 * i
+            with self.subTest(label):
+                p = self.go(number, file_env, environ=environ)
+                if off:
+                    self.assertNothingRan(p, number)
+                else:
+                    self.assertRan(p, number)
+                self.assertWarnings(p, problems, environ)
+
+    def test_other_invalid_keys_warn_while_ultrareview_is_unset_and_it_runs(self):
+        cases = [({"HARNESS_CODE_TIER": "gigantic"}, [bad("HARNESS_CODE_TIER", "gigantic")]),
+                 ({"HARNESS_REVIEW_TIER": "zzz", "HARNESS_ULTRAREVIEW": "on"}, [bad("HARNESS_REVIEW_TIER", "zzz")]),
+                 ({"HARNESS_WAVE_REVIEW": "x", "HARNESS_CODE_EFFORT": "y"},
+                  [bad("HARNESS_CODE_EFFORT", "y"), bad("HARNESS_WAVE_REVIEW", "x")])]
+        for i, (file_env, problems) in enumerate(cases):
+            with self.subTest(file_env=file_env):
+                p = self.go(30 + i, file_env)
+                self.assertRan(p, 30 + i)
+                self.assertWarnings(p, problems)
+
+    def test_valid_values_of_the_other_keys_are_quiet_whatever_their_case(self):
+        file_env = {"HARNESS_CODE_TIER": "Opus", "HARNESS_CODE_EFFORT": " XHIGH ", "HARNESS_REVIEW_TIER": "FABLE",
+                    "HARNESS_WAVE_REVIEW": "Off"}
+        p = self.go(14, dict(file_env, HARNESS_ULTRAREVIEW="ON"))
+        self.assertRan(p, 14)
+        self.assertEqual(self.warnings(p), [])
+        p = self.go(16, {"HARNESS_WAVE_REVIEW": "0", "HARNESS_CODE_EFFORT": "max", "HARNESS_CODE_TIER": "sonnet"})
+        self.assertRan(p, 16)
+        self.assertEqual(self.warnings(p), [])
+
+    def test_valid_other_keys_do_not_hide_an_off(self):
+        file_env = {"HARNESS_CODE_TIER": "Opus", "HARNESS_CODE_EFFORT": " XHIGH ", "HARNESS_REVIEW_TIER": "FABLE"}
+        p = self.go(15, dict(file_env, HARNESS_WAVE_REVIEW="sonnet", HARNESS_ULTRAREVIEW="No"))
+        self.assertNothingRan(p, 15)
+        self.assertEqual(self.warnings(p), [])
+        p = self.go(17, dict(file_env, HARNESS_WAVE_REVIEW="Off", HARNESS_ULTRAREVIEW=" FALSE"))
+        self.assertNothingRan(p, 17)
+        self.assertEqual(self.warnings(p), [])
+
+    def test_json_booleans_and_other_non_text_values_are_not_values(self):
+        # A JSON true/false/null/list/object is "unset", not on and not off: it runs and says nothing.
+        for i, value in enumerate([True, False, None, ["off"], {"v": "off"}]):
+            with self.subTest(value=value):
+                p = self.go(60 + i, {"HARNESS_ULTRAREVIEW": value, "HARNESS_CODE_TIER": value})
+                self.assertRan(p, 60 + i)
+                self.assertEqual(self.warnings(p), [])
+
+    def test_json_numbers_are_their_text(self):
+        # A JSON number that is not a spelling of on or off is invalid, reported as its text.
+        for i, (value, shown, off) in enumerate([(0.0, "0.0", False), (2, "2", False), (1, None, False),
+                                                 (0, None, True)]):
+            with self.subTest(number=value):
+                number = 80 + i
+                p = self.go(number, {"HARNESS_ULTRAREVIEW": value})
+                if off:
+                    self.assertNothingRan(p, number)
+                else:
+                    self.assertRan(p, number)
+                self.assertWarnings(p, [bad("HARNESS_ULTRAREVIEW", shown)] if shown else [])
+
+    def test_broken_or_oddly_shaped_settings_count_as_no_file(self):
+        texts = ["{not json", "", "[]", '"off"', "null", '{"env": "off"}', '{"env": ["HARNESS_ULTRAREVIEW"]}',
+                 '{"env": null}', '{"env": {"HARNESS_ULTRAREVIEW": "off"}', '{"other": {"HARNESS_ULTRAREVIEW": "off"}}']
+        for i, text in enumerate(texts):
+            with self.subTest(text=text):
+                p = self.go(120 + i, raw=text)
+                self.assertRan(p, 120 + i)
+                self.assertEqual(self.warnings(p), [])
+
+    def test_a_broken_settings_file_does_not_hide_the_environment(self):
+        # Broken file, but the environment says off: off.
+        p = self.go(140, raw="{not json", environ={"HARNESS_ULTRAREVIEW": "off"})
+        self.assertNothingRan(p, 140)
+        # A broken file with a bad environment value: only the environment's warning.
+        environ = {"HARNESS_CODE_EFFORT": "wild"}
+        p = self.go(141, raw="[1, 2", environ=environ)
+        self.assertRan(p, 141)
+        self.assertWarnings(p, [bad("HARNESS_CODE_EFFORT", "wild")], environ)
+
+    def test_the_environment_wins_even_when_invalid_and_blank_falls_through(self):
+        # (settings value, environment value, expected problems, off)
+        cases = [
+            ("off", "perhaps", [bad("HARNESS_ULTRAREVIEW", "perhaps")], False),
+            ("maybe", "sometimes", [bad("HARNESS_ULTRAREVIEW", "sometimes")], False),
+            ("maybe", "off", [], True),
+            ("off", "   ", [], True),
+            ("on", " OFF ", [], True),
+            ("maybe", "on", [], False),
+            ("maybe", "", [bad("HARNESS_ULTRAREVIEW", "maybe")], False),
+            ("no", "yes", [], False),
+        ]
+        for i, (file_value, env_value, problems, off) in enumerate(cases):
+            with self.subTest(file=file_value, environment=env_value):
+                number = 150 + i
+                environ = {"HARNESS_ULTRAREVIEW": env_value}
+                p = self.go(number, {"HARNESS_ULTRAREVIEW": file_value}, environ=environ)
+                if off:
+                    self.assertNothingRan(p, number)
+                else:
+                    self.assertRan(p, number)
+                self.assertWarnings(p, problems, environ)
+
+    def test_environment_off_wins_and_settings_local_is_ignored(self):
+        # The environment says off while settings.json says on: off.
+        self.settings({"HARNESS_ULTRAREVIEW": "on"})
+        self.assertNothingRan(self.pr("ultra", "34", HARNESS_ULTRAREVIEW="off", **self.claude()), 34)
+        # The environment alone says off, with no settings files at all.
+        os.unlink(os.path.join(self.main, ".claude", "settings.json"))
+        self.assertNothingRan(self.pr("ultra", "35", HARNESS_ULTRAREVIEW="false", **self.claude()), 35)
+        # settings.local.json saying off does not turn it off.
+        p = self.go(36, local={"HARNESS_ULTRAREVIEW": "off"})
+        self.assertRan(p, 36)
+        self.assertEqual(self.warnings(p), [])
+        # ...and settings.local.json saying on does not undo an off in settings.json.
+        p = self.go(37, {"HARNESS_ULTRAREVIEW": "off"}, local={"HARNESS_ULTRAREVIEW": "on"})
+        self.assertNothingRan(p, 37)
+
+    def test_settings_local_never_adds_warnings(self):
+        local = {"HARNESS_CODE_TIER": "gigantic", "HARNESS_ULTRAREVIEW": "maybe", "HARNESS_WAVE_REVIEW": "q"}
+        p = self.go(44, {"HARNESS_REVIEW_TIER": "tiny"}, local=local)
+        self.assertRan(p, 44)
+        self.assertWarnings(p, [bad("HARNESS_REVIEW_TIER", "tiny")])
+
+
+class UltraSettingFromWorktree(UltraSettingBase, WorktreeTest):
+    """The switch is the main checkout's, also when harness-pr runs in the ticket worktree."""
+
+    def test_main_checkout_settings_apply_in_the_worktree(self):
+        self.settings({"HARNESS_ULTRAREVIEW": "off"})
+        self.assertNothingRan(self.pr("ultra", "34", cwd=self.wt, **self.claude()), 34)
+        self.scenario([])
+        p = self.pr("ultra", "35", "--force", cwd=self.wt, **self.claude())
+        self.assertRan(p, 35)
+
+    def test_the_worktrees_own_settings_file_does_not_count(self):
+        self.settings({"HARNESS_ULTRAREVIEW": "off"}, root=self.wt)
+        self.assertRan(self.pr("ultra", "34", cwd=self.wt, **self.claude()), 34)
+
+    def test_warnings_come_from_the_main_checkouts_settings_only(self):
+        self.settings({"HARNESS_ULTRAREVIEW": "off", "HARNESS_CODE_TIER": "gigantic"})
+        self.settings({"HARNESS_REVIEW_TIER": "wrong", "HARNESS_WAVE_REVIEW": "nope"}, root=self.wt)
+        p = self.pr("ultra", "34", cwd=self.wt, **self.claude())
+        self.assertNothingRan(p, 34)
+        self.assertWarnings(p, [bad("HARNESS_CODE_TIER", "gigantic")])
+
+
 # =========================================================================== land
 def land_view(**over):
     view = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": BRANCH,

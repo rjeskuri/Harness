@@ -16,12 +16,13 @@ The ticket context, the worktree path (work only there, never in the main checko
 4. Size cap: if the change needs more than about 5 files or 300 lines, stop before finishing, report what exists and how to split the rest. An oversized change is a ticket to split, not a long afternoon.
 5. Commit on the ticket branch when green: an imperative subject under 72 characters that names the ticket, such as `Add the export command (#12)`, and a body with why and which commands passed. Several small commits are fine. Commit only: do not push, do not open a pull request, do not touch main. The orchestrator pushes, with `harness-pr open` or `git push` from the worktree.
 6. Do not touch secrets, live systems, protected paths or dependencies. Anything hard to undo: stop and report.
-7. A question the ticket, the epic and the code cannot answer: stop and report it as a question. Do not guess product behavior.
+7. A reversible implementation choice the ticket, the epic and the code leave open: decide it and report it as `Ruling: <choice>, because <reason>`. A question about product behavior, something hard to undo, or security, credentials or personal data: stop and report it as a question. Do not guess product behavior.
 
 ## Report
 - What changed: each file with one line.
 - Evidence: the exact commands you ran and the tail of their output (new tests, verify command).
 - Commits made.
 - Decisions, anything not done, any question.
+- Rulings: one `Ruling: <choice>, because <reason>` line per reversible choice you decided.
 
 Short. The orchestrator reads this, not a person.

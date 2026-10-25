@@ -11,12 +11,14 @@ Usage:
     harness-pr ready P [--ticket N]
     harness-pr comments P [--since ISO] [--unresolved] [--json]
     harness-pr awaiting [--all-projects] [--json]
-    harness-pr ultra P [--post]
+    harness-pr ultra P [--post] [--force]
     harness-pr land P [--yes] [--discard] [--accept-findings]
 
 ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has
 findings and no commit newer than it, naming the findings, and refuse when gh cannot tell. --accept-findings on
 land is the only override; ready has none. land on a PR that is already merged skips the check.
+
+ultra runs nothing (one line, exit 0) when the project's HARNESS_ULTRAREVIEW is off, unless --force; see cmd_ultra.
 
 The repository is the cwd's (open: --worktree, else the cwd), else CLAUDE_PROJECT_DIR. gh is HARNESS_GH when
 set, else `gh`; claude is HARNESS_CLAUDE, else `claude`; harness-board and harness-red are found on PATH, else
@@ -50,6 +52,7 @@ try:
     from harness_lib.notify import notify
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
+    from harness_lib.routing import load_routing
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -1064,8 +1067,17 @@ def mark_cloud_exhausted(reason):
 
 
 def cmd_ultra(args):
+    """Run `claude ultrareview`, unless the project's HARNESS_ULTRAREVIEW is off (the environment, else the main
+    checkout's settings.json): then one line saying so and nothing run, unless --force. Each problem load_routing
+    finds is one `harness-pr: warning:` line, with --force too; an invalid HARNESS_ULTRAREVIEW is ignored."""
     repo = open_repo()
     number = args.number
+    routing = load_routing(repo.main)
+    for problem in routing["problems"]:
+        warn("harness-pr", problem)
+    if not routing["ultrareview"] and not args.force:
+        print(f"ultrareview PR #{number}: off for this project (HARNESS_ULTRAREVIEW=off); nothing run")
+        return 0
     exe = os.environ.get("HARNESS_CLAUDE", "claude")
     cmd = [exe, "ultrareview", str(number), "--json", "--timeout", str(ULTRA_MINUTES)]
     cmd += ["--post"] if args.post else []
@@ -1563,6 +1575,7 @@ def parser():
     ul = sub.add_parser("ultra", help="claude ultrareview (bills usage credits)")
     ul.add_argument("number", type=number_arg, metavar="P")
     ul.add_argument("--post", action="store_true", help="post the findings to the PR")
+    ul.add_argument("--force", action="store_true", help="run even when the project's HARNESS_ULTRAREVIEW is off")
 
     ld = sub.add_parser("land", help="squash-merge, remove the worktree and branch, update main, close the ticket")
     ld.add_argument("number", type=number_arg, metavar="P")
