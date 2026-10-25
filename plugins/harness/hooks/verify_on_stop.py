@@ -25,6 +25,16 @@ When it runs
   declares a Stop hook of its own, so a project with its own verify-on-stop is not
   checked twice.
 
+  A turn that changed only docs and config skips the run: when every path in the dirty
+  list and in git status, made repo-relative, matches HARNESS_SOURCE_EXEMPT, none matches
+  HARNESS_TEST_PATTERNS and none is test configuration (harness_lib.settings.TEST_CONFIG:
+  pyproject.toml, package.json, .claude/settings.json and the like), it says
+  "only docs and config changed (<n> files); verify skipped." and records nothing as green
+  or failed, so the dirty list stands for the next stop. The two keys come from the
+  environment, then the main checkout's tracked .claude/settings.json (never
+  settings.local.json, never a worktree's copy), as tests_first reads them, then the
+  defaults. A path outside the repo, or no path at all, never skips.
+
 What it does
   Runs the command through the shell from the repo root, with CLAUDE_VERIFY_TIMEOUT
   seconds (default 300, capped at 400 to stay inside the hook's own 420 s budget).
@@ -53,8 +63,11 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.hookio import emit, hook_cwd, read_input, run_fail_open
+    from harness_lib.repo import main_checkout
     from harness_lib.sessionstate import SessionState, porcelain_status, status_paths
-    from harness_lib.settings import setting, settings_env
+    from harness_lib.settings import (
+        DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, TEST_CONFIG, glob_match, patterns, setting, settings_env
+    )
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
     sys.stderr.write(f"verify_on_stop.py: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}\n")
     sys.exit(0)
@@ -65,6 +78,7 @@ DEFAULT_TIMEOUT = 300.0
 MAX_TIMEOUT = 400.0  # hooks.json gives this hook 420 s
 CANNOT_START = (126, 127)  # the shell's "not executable" and "command not found"
 STATUS_TIMEOUT = 8
+MAIN_TIMEOUT = 5  # main_checkout's two git calls, together
 GUIDANCE = (
     "Fix the root cause and re-run. Don't delete, skip or loosen tests. If a failure "
     "predates your change or is out of scope, say so explicitly."
@@ -151,6 +165,42 @@ def fingerprint(git_root: Path | None, files: list[Path]) -> str:
         except OSError:
             h.update(b"\0missing\0")
     return h.hexdigest()
+
+
+def relative(git_root: Path, path: Path) -> str | None:
+    """`path` relative to `git_root` with / separators, through either spelling; None
+    when it is outside."""
+    for base, full in ((git_root, path), (Path(os.path.realpath(git_root)), Path(os.path.realpath(path)))):
+        try:
+            rel = full.relative_to(base).as_posix()
+        except ValueError:
+            continue
+        if rel not in ("", "."):
+            return rel
+    return None
+
+
+def docs_only(git_root: Path | None, files: list[Path]) -> int:
+    """The number of changed paths when every one is exempt (HARNESS_SOURCE_EXEMPT), none is
+    a test (HARNESS_TEST_PATTERNS) and none is test configuration; else 0, as for no paths
+    or a path outside the repo. The two keys come from the environment, then the main
+    checkout's tracked .claude/settings.json, then the defaults."""
+    if git_root is None or not files:
+        return 0
+    rels = {relative(git_root, f) for f in files}
+    if None in rels or any(glob_match(p, rel) for rel in rels for p in TEST_CONFIG):
+        return 0
+    file_env: dict = {}
+    if not (setting("HARNESS_TEST_PATTERNS", {}) and setting("HARNESS_SOURCE_EXEMPT", {})):
+        main = main_checkout(str(git_root), timeout=MAIN_TIMEOUT)
+        if main is not None:
+            file_env = settings_env(main, ("settings.json",))
+    tests = patterns(setting("HARNESS_TEST_PATTERNS", file_env) or DEFAULT_TEST_PATTERNS)
+    exempt = patterns(setting("HARNESS_SOURCE_EXEMPT", file_env) or DEFAULT_SOURCE_EXEMPT)
+    for rel in rels:
+        if any(glob_match(p, rel) for p in tests) or not any(glob_match(p, rel) for p in exempt):
+            return 0
+    return len(rels)
 
 
 # ---------- running the command ----------
@@ -259,7 +309,14 @@ def main() -> int:
         state["blocks"] = 0
         save()
 
-    fp = fingerprint(git_root, sorted(set(session.dirty_files()) | set(listed)))
+    changed = sorted(set(session.dirty_files()) | set(listed))
+    n = docs_only(git_root, changed)
+    if n:  # nothing recorded as green or attempted: the dirty list waits for a real run
+        save()
+        emit({"systemMessage": f"verify_on_stop: only docs and config changed ({n} files); verify skipped."})
+        return 0
+
+    fp = fingerprint(git_root, changed)
     if fp == state.get("green"):
         save()
         return 0

@@ -67,7 +67,9 @@ try:
     from harness_lib.hookio import deny, edited_path, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.repo import main_checkout
-    from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, glob_match, patterns, setting, settings_env
+    from harness_lib.settings import (
+        DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, TEST_CONFIG, glob_match, patterns, setting, settings_env
+    )
     from harness_lib.text import read_json
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
     sys.stderr.write(f"tests_first.py: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}\n")
@@ -77,19 +79,6 @@ GIT_TIMEOUT = 3
 TICKET_BRANCH = re.compile(r"^t/(\d+)-")
 ROLES = {"test-author", "coder", "test-breaker"}
 RED_KINDS = {"assertion", "import", "error"}
-# Configuration that decides which tests run and how: tests, for the role rules.
-TEST_CONFIG = (
-    ".claude/settings.json",
-    ".claude/settings.local.json",
-    "pytest.ini",
-    "pyproject.toml",
-    "setup.cfg",
-    "tox.ini",
-    "conftest.py",
-    "jest.config.*",
-    "vitest.config.*",
-    "package.json",
-)
 AUTHOR_ON_SOURCE = (
     "You write tests only on this ticket. Report the source change the implementation "
     "needs; the coder makes it."

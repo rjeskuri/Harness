@@ -920,7 +920,7 @@ class VerifyOnStopTests(HookTestCase):
     def dirty(self) -> Path:
         return self.state_dir(self.repo) / "dirty-sess-1"
 
-    def edit(self) -> None:
+    def edit(self, path: Path | None = None) -> None:
         payload = {
             "session_id": "sess-1",
             "transcript_path": "/dev/null",
@@ -928,7 +928,7 @@ class VerifyOnStopTests(HookTestCase):
             "permission_mode": "default",
             "hook_event_name": "PostToolUse",
             "tool_name": "Edit",
-            "tool_input": {"file_path": str(self.src)},
+            "tool_input": {"file_path": str(path or self.src)},
         }
         r = self.run_hook("after_edit.py", payload)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -1258,6 +1258,252 @@ class VerifyOnStopTests(HookTestCase):
                 time.monotonic(), deadline, "the verify command outlived its hook"
             )
             time.sleep(0.02)
+
+    # ---- docs-and-config-only turns (#163)
+
+    def skipped(self, n: int) -> dict:
+        return {
+            "systemMessage": f"verify_on_stop: only docs and config changed ({n} files); "
+            "verify skipped."
+        }
+
+    def passed(self) -> dict:
+        return {"systemMessage": f"verify_on_stop: {self.touch(self.marker)} passed."}
+
+    def baseline(self, name: str | None = None, settings: dict | None = None) -> None:
+        """Point the test at a repo with app.py (and the project settings, if any)
+        committed, so git status lists nothing until the test changes something. A new
+        name is a new repo, hence a new session state; the marker is reset."""
+        if name is not None:
+            self.repo = self.make_repo(name)
+            self.src = self.write(self.repo / "app.py", "x = 1\n")
+        if settings is not None:
+            self.write(self.repo / ".claude/settings.json", json.dumps(settings))
+        self.git(self.repo, "add", "-A")
+        self.git(self.repo, "commit", "-q", "-m", "Baseline")
+        if self.marker.exists():
+            self.marker.unlink()
+
+    def change(self, *rels: str, record: bool = True) -> None:
+        """Write (or append to) each repo-relative path; record=True also reports each
+        write through after_edit.py, as the Edit tool would."""
+        for rel in rels:
+            path = self.repo / rel
+            old = path.read_text(encoding="utf-8") if path.exists() else ""
+            if rel.endswith(".json"):
+                text = json.dumps({"env": {}, "changed": len(old)})
+            else:
+                text = old + "changed\n"
+            self.write(path, text)
+            if record:
+                self.edit(path)
+
+    def verify_state(self) -> dict:
+        try:
+            return json.loads(
+                (self.state_dir(self.repo) / "verify-sess-1.json").read_text()
+            )
+        except (OSError, ValueError):
+            return {}
+
+    DOCS_ONLY = [
+        (("docs/guide/a.md", "docs/b.txt", "CHANGELOG.md"), 3),
+        ((".github/workflows/ci.yml",), 1),
+        (("notes/todo.txt", ".gitignore", "config/app.yaml", "LICENSE"), 4),
+        ((".claude/agents/helper.md", "docs/x.md"), 2),
+    ]
+
+    def test_docs_only_turn_skips_the_command(self):
+        cmd = self.touch(self.marker) + "; false"
+        self.baseline()
+        self.change("docs/x.md", "README.md")  # a new doc and a tracked one
+        self.assertEqual(self.stop(cmd), self.skipped(2))
+        self.assertFalse(self.marker.exists())
+        # Varied sets under the default HARNESS_SOURCE_EXEMPT, each in a repo of its own.
+        for i, (rels, n) in enumerate(self.DOCS_ONLY):
+            with self.subTest(rels=rels):
+                self.baseline(f"docs-only-{i}")
+                self.change(*rels)
+                self.assertEqual(self.stop(cmd), self.skipped(n))
+                self.assertFalse(self.marker.exists())
+
+    def test_docs_only_change_through_the_shell_skips_the_command(self):
+        cmd = self.touch(self.marker) + "; false"
+        self.baseline()
+        self.assertIsNone(self.stop(cmd))  # the first stop records the tree
+        # Nothing reported through after_edit.py: the paths come from git status alone.
+        self.change("docs/x.md", "docs/y.md", "README.md", record=False)
+        self.assertEqual(self.stop(cmd), self.skipped(3))
+        self.assertFalse(self.marker.exists())
+
+    def test_a_skipped_turn_records_nothing_as_green(self):
+        self.baseline()
+        self.change("docs/x.md")
+        self.assertEqual(self.stop(self.touch(self.marker)), self.skipped(1))
+        self.assertFalse(self.marker.exists())
+        state = self.verify_state()
+        self.assertNotIn("green", state)
+        self.assertNotIn("attempted", state)  # not a failure either
+        self.assertTrue(self.dirty.exists())
+        # A later source change in the same session runs the command, over both files.
+        self.change("app.py")
+        self.assertEqual(self.stop(self.touch(self.marker)), self.passed())
+        self.assertTrue(self.marker.exists())
+
+    def test_source_path_runs_the_command(self):
+        cases = [
+            ("README.md", "app.py"),
+            ("docs/x.md", "src/lib/util.py"),
+            ("docs/x.md", "scripts/build.sh"),
+            ("CHANGELOG.md", "Makefile"),
+        ]
+        for i, rels in enumerate(cases):
+            with self.subTest(rels=rels):
+                self.baseline(f"source-{i}")
+                self.change(*rels)
+                self.assertEqual(self.stop(self.touch(self.marker)), self.passed())
+                self.assertTrue(self.marker.exists())
+
+    def test_source_change_through_the_shell_beside_a_recorded_doc_runs(self):
+        self.baseline()
+        self.assertIsNone(self.stop(self.touch(self.marker)))  # records the tree
+        self.change("README.md")  # reported through after_edit.py
+        self.change("app.py", record=False)  # only git status sees this one
+        self.assertEqual(self.stop(self.touch(self.marker)), self.passed())
+        self.assertTrue(self.marker.exists())
+
+    def test_test_file_runs_the_command(self):
+        cases = [
+            ("docs/x.md", "tests/test_app.py"),
+            ("README.md", "pkg/test_util.py"),
+            ("docs/x.md", "web/a.test.js"),
+            # Exempt by extension, but a test by HARNESS_TEST_PATTERNS: a test wins.
+            ("docs/x.md", "tests/fixtures/data.json"),
+            ("tests/README.md",),
+            ("spec/notes.txt",),
+        ]
+        for i, rels in enumerate(cases):
+            with self.subTest(rels=rels):
+                self.baseline(f"test-file-{i}")
+                self.change(*rels)
+                self.assertEqual(self.stop(self.touch(self.marker)), self.passed())
+                self.assertTrue(self.marker.exists())
+
+    def test_test_configuration_runs_the_command(self):
+        # Each is exempt under the default HARNESS_SOURCE_EXEMPT, and still never skipped.
+        configs = [
+            "pyproject.toml",
+            "setup.cfg",
+            "tox.ini",
+            "pytest.ini",
+            "package.json",
+            "jest.config.json",
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            # A TEST_CONFIG entry without a slash matches the basename at any depth.
+            "web/package.json",
+            "pkg/setup.cfg",
+            "sub/pyproject.toml",
+            "vitest.config.json",
+            "lib/conftest.py",
+        ]
+        for i, rel in enumerate(configs):
+            with self.subTest(rel=rel):
+                self.baseline(f"config-{i}")
+                self.change("docs/x.md", rel)
+                self.assertEqual(self.stop(self.touch(self.marker)), self.passed())
+                self.assertTrue(self.marker.exists())
+
+    def test_project_exempt_setting_is_honoured(self):
+        cmd = self.touch(self.marker)
+        own = {"env": {"HARNESS_SOURCE_EXEMPT": "assets/**,**/*.md"}}
+        # (settings, environment, changed paths, files when skipped or None when it runs)
+        cases = [
+            # The project's list makes assets/ exempt, which the default does not ...
+            (own, {}, ("assets/logo.svg", "README.md"), 2),
+            (own, {}, ("assets/icons/a.png",), 1),
+            # ... and replaces the default, so docs/notes.txt is no longer exempt.
+            (own, {}, ("docs/notes.txt",), None),
+            (own, {}, ("README.md", "app.py"), None),
+            # The project's HARNESS_TEST_PATTERNS likewise: checks/ holds tests, tests/
+            # no longer does.
+            ({"env": {"HARNESS_TEST_PATTERNS": "checks/**"}}, {}, ("checks/notes.md",), None),
+            ({"env": {"HARNESS_TEST_PATTERNS": "checks/**"}}, {}, ("tests/notes.md",), 1),
+            # The environment wins over the project's settings.
+            (own, {"HARNESS_SOURCE_EXEMPT": "media/**,**/*.md"}, ("media/clip.mp4",), 1),
+            (own, {"HARNESS_SOURCE_EXEMPT": "media/**,**/*.md"}, ("assets/logo.svg",), None),
+            (
+                {"env": {"HARNESS_TEST_PATTERNS": "checks/**"}},
+                {"HARNESS_TEST_PATTERNS": "probes/**"},
+                ("probes/notes.md",),
+                None,
+            ),
+            (
+                {"env": {"HARNESS_TEST_PATTERNS": "checks/**"}},
+                {"HARNESS_TEST_PATTERNS": "probes/**"},
+                ("checks/notes.md",),
+                1,
+            ),
+        ]
+        for i, (settings, env, rels, n) in enumerate(cases):
+            with self.subTest(settings=settings, env=env, rels=rels):
+                self.baseline(f"project-{i}", settings=settings)
+                self.change(*rels)
+                result = self.stop(cmd, env=env)
+                if n is None:
+                    self.assertEqual(result, self.passed())
+                    self.assertTrue(self.marker.exists())
+                else:
+                    self.assertEqual(result, self.skipped(n))
+                    self.assertFalse(self.marker.exists())
+
+    def test_local_settings_do_not_set_the_patterns(self):
+        # As in tests_first: the environment, then the main checkout's settings.json, never
+        # settings.local.json (gitignored here, so it is not itself a dirty path).
+        cmd = self.touch(self.marker)
+        local = {"env": {"HARNESS_SOURCE_EXEMPT": "assets/**,**/*.md"}}
+        self.write(self.repo / ".gitignore", ".claude/settings.local.json\n")
+        self.write(self.repo / ".claude/settings.local.json", json.dumps(local))
+        self.baseline()
+        self.change("assets/logo.svg", "README.md")
+        self.assertEqual(self.stop(cmd), self.passed())
+        self.assertTrue(self.marker.exists())
+        # The same setting in settings.json is honoured.
+        self.baseline("local-vs-shared", settings=local)
+        self.change("assets/logo.svg", "README.md")
+        self.assertEqual(self.stop(cmd), self.skipped(2))
+        self.assertFalse(self.marker.exists())
+
+    def test_a_worktree_reads_the_main_checkouts_settings(self):
+        # The ticket branch forked before the main checkout's settings.json gained
+        # HARNESS_SOURCE_EXEMPT, so the worktree's own copy has no such setting.
+        cmd = self.touch(self.marker)
+        self.baseline()
+        self.git(self.repo, "branch", "t/1-ticket")
+        own = {"env": {"HARNESS_SOURCE_EXEMPT": "assets/**,**/*.md"}}
+        self.baseline(settings=own)
+        worktree = self.tmp / "proj-t1"
+        self.git(self.repo, "worktree", "add", "-q", str(worktree), "t/1-ticket")
+        self.assertFalse((worktree / ".claude/settings.json").exists())
+        self.repo, self.src = worktree, worktree / "app.py"
+        self.change("assets/logo.svg")
+        self.assertEqual(self.stop(cmd), self.skipped(1))
+        self.assertFalse(self.marker.exists())
+        # A change only the default would exempt is not exempt under the project's list.
+        self.change("docs/notes.txt")
+        self.assertEqual(self.stop(cmd), self.passed())
+        self.assertTrue(self.marker.exists())
+
+    def test_empty_dirty_set_runs_the_command_as_today(self):
+        self.baseline()
+        readme = self.repo / "README.md"
+        readme.write_text("changed through the shell\n")
+        self.assertIsNone(self.stop(self.touch(self.marker)))  # records the tree
+        # The tree goes clean: a change since the last stop, but git lists nothing and
+        # nothing was recorded. Not a docs-only turn, so the command runs as before.
+        self.git(self.repo, "checkout", "--", "README.md")
+        self.assertEqual(self.stop(self.touch(self.marker)), self.passed())
+        self.assertTrue(self.marker.exists())
 
     def test_bad_stdin_fails_open(self):
         r = self.run_hook(

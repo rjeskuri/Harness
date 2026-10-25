@@ -20,6 +20,10 @@ DEFAULT_TEST_PATTERNS = ("tests/**,test/**,**/test_*.py,**/*_test.py,**/conftest
                          "**/*.test.ts,**/*_test.ts,spec/**")
 DEFAULT_SOURCE_EXEMPT = ("docs/**,**/*.md,.claude/**,.github/**,.githooks/**,**/*.toml,**/*.cfg,**/*.ini,**/*.json,"
                          "**/*.yaml,**/*.yml,**/*.txt,**/*.lock,.gitignore,.worktreeinclude,LICENSE*")
+# Configuration that decides which tests run and how, matched with glob_match (an entry without / matches
+# the basename): tests for tests_first's role rules, and never skipped by verify_on_stop.
+TEST_CONFIG = (".claude/settings.json", ".claude/settings.local.json", "pytest.ini", "pyproject.toml", "setup.cfg",
+               "tox.ini", "conftest.py", "jest.config.*", "vitest.config.*", "package.json")
 
 
 def settings_env(root, names=("settings.json", "settings.local.json")):
