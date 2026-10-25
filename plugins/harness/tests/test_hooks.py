@@ -1557,6 +1557,63 @@ class VerifyOnStopTests(HookTestCase):
         self.assertEqual(self.stop(cmd), self.passed())
         self.assertTrue(self.marker.exists())
 
+    def test_source_committed_since_the_last_stop_runs_the_command(self):
+        # Files that reached HEAD since the previous stop join the skip decision, even when
+        # the working tree shows only docs (or nothing) afterwards.
+        cmd = self.touch(self.marker)
+
+        def commit(*rels: str) -> None:
+            self.git(self.repo, "add", *rels)
+            self.git(self.repo, "commit", "-q", "-m", "Through the shell")
+
+        with self.subTest("source written and committed in one Bash call"):
+            # git status lists only docs/x.md afterwards.
+            self.baseline("committed-source")
+            self.change("docs/x.md")
+            self.assertEqual(self.stop(cmd), self.skipped(1))
+            self.change("src/x.py", record=False)
+            commit("src/x.py")
+            self.assertEqual(self.stop(cmd), self.passed())
+            self.assertTrue(self.marker.exists())
+
+        with self.subTest("a test file committed with the doc: the tree is clean"):
+            self.baseline("committed-test")
+            self.change("docs/x.md")
+            self.assertEqual(self.stop(cmd), self.skipped(1))
+            self.change("tests/test_x.py", record=False)
+            commit("tests/test_x.py", "docs/x.md")
+            self.assertEqual(self.stop(cmd), self.passed())
+            self.assertTrue(self.marker.exists())
+
+        with self.subTest("a merge brings in a test file from another branch"):
+            self.baseline("merged-test")
+            self.git(self.repo, "checkout", "-q", "-b", "feature")
+            self.change("tests/test_feature.py", record=False)
+            commit("tests/test_feature.py")
+            self.git(self.repo, "checkout", "-q", "main")
+            self.change("docs/x.md")
+            self.assertEqual(self.stop(cmd), self.skipped(1))
+            self.git(self.repo, "merge", "-q", "--no-edit", "feature")
+            self.assertEqual(self.stop(cmd), self.passed())
+            self.assertTrue(self.marker.exists())
+
+        with self.subTest("contrast: only docs reach HEAD, so nothing runs"):
+            # The skip line or silence are both fine here.
+            self.baseline("committed-doc")
+            self.change("docs/x.md")
+            self.assertEqual(self.stop(cmd), self.skipped(1))
+            commit("docs/x.md")
+            self.stop(cmd)
+            self.assertFalse(self.marker.exists())
+            # And a docs-only merge likewise.
+            self.git(self.repo, "checkout", "-q", "-b", "notes")
+            self.change("docs/notes.md", record=False)
+            commit("docs/notes.md")
+            self.git(self.repo, "checkout", "-q", "main")
+            self.git(self.repo, "merge", "-q", "--no-edit", "notes")
+            self.stop(cmd)
+            self.assertFalse(self.marker.exists())
+
     def test_patterns_fall_back_when_the_main_checkout_cannot_be_found(self):
         # git answers everything except --git-common-dir, so main_checkout fails while the
         # repo works: the project's settings.json cannot be read, and the environment and

@@ -32,7 +32,11 @@ When it runs
   .claude/settings.json and the like), it says "only docs and config changed (<n> files);
   verify skipped." and records nothing as green or failed, so the dirty list stands for
   the next stop. It keeps the fingerprint it skipped, so a fresh stop with the same one
-  says nothing. The two keys come from the
+  says nothing. The files committed since the recorded HEAD (`head` in the state: set at
+  the first stop, moved by a skip or a green run only) join the decision too, so a source
+  or test file committed through Bash, merged or pulled is not skipped; when that
+  `git diff` fails, it does not skip. They join only a non-empty dirty set: with nothing
+  in the dirty list or git status it runs as before. The two keys come from the
   environment, then the main checkout's tracked .claude/settings.json (never
   settings.local.json, never a worktree's copy), as tests_first reads them, then the
   defaults. A path outside the repo, or no path at all, never skips.
@@ -150,15 +154,33 @@ def verify_timeout(file_env: dict) -> float:
 # ---------- what changed ----------
 
 
-def fingerprint(git_root: Path | None, files: list[Path]) -> str:
+def current_head(git_root: Path | None) -> str:
+    """HEAD's commit, or "" outside a repo, on an unborn branch or when git fails."""
+    if git_root is None:
+        return ""
+    try:
+        out = git(git_root, "rev-parse", "--verify", "-q", "HEAD")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def committed_paths(git_root: Path, old: str, new: str) -> list[Path] | None:
+    """The files that differ between commits `old` and `new` (a rename as both names);
+    None when either is empty or git fails or times out."""
+    if not old or not new:
+        return None
+    try:
+        out = git(git_root, "diff", "--name-only", "--no-renames", "-z", old, new, "--", timeout=STATUS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return [git_root / p for p in out.stdout.split("\0") if p]
+
+
+def fingerprint(head: str, files: list[Path]) -> str:
     """HEAD plus the contents of `files`."""
-    head = ""
-    if git_root is not None:
-        try:
-            out = git(git_root, "rev-parse", "--verify", "-q", "HEAD")
-            head = out.stdout.strip() if out.returncode == 0 else ""
-        except (OSError, subprocess.SubprocessError):
-            head = ""
     h = hashlib.sha256(head.encode("utf-8"))
     for f in files:
         h.update(b"\0" + str(f).encode("utf-8", "surrogateescape") + b"\0")
@@ -312,6 +334,13 @@ def main() -> int:
     tree = hashlib.sha256(status).hexdigest() if status is not None else None
     if tree is not None:
         state["tree"] = tree
+    # `head` is the commit up to which everything ran green or was judged docs-only: set
+    # at the first stop, then moved only by a skip or a green run, so commits since then
+    # (a commit through Bash, a merge, a pull) join the skip decision until one of those.
+    head = current_head(git_root)
+    base = state.get("head")
+    if not isinstance(base, str):
+        state["head"] = base = head
     if not session.dirty.is_file():
         if tree is None or seen is None or tree == seen:
             save()  # a session's first stop only records the tree
@@ -331,11 +360,19 @@ def main() -> int:
         save()
 
     changed = sorted(set(session.dirty_files()) | set(listed))
-    fp = fingerprint(git_root, changed)
-    # A rename's source counts for the skip, though only its new name is in `listed`.
+    fp = fingerprint(head, changed)
+    # For the skip only: a rename's source (only its new name is in `listed`), and the
+    # files committed since `head`; when that diff cannot be had, it does not skip. An
+    # empty dirty set never skips, as before, whatever was committed.
     moved = rename_sources(git_root, status) if git_root is not None and status else []
-    n = docs_only(git_root, sorted(set(changed) | set(moved)))
+    committed: list[Path] | None = []
+    if changed and base != head and git_root is not None:
+        committed = committed_paths(git_root, base, head)
+    n = 0
+    if changed and committed is not None:
+        n = docs_only(git_root, sorted(set(changed) | set(moved) | set(committed)))
     if n:  # nothing recorded as green or attempted: the dirty list waits for a real run
+        state["head"] = head
         if fresh and fp == state.get("skipped"):
             save()  # said already for this fingerprint
             return 0
@@ -389,7 +426,7 @@ def main() -> int:
         return 0
 
     if code == 0:
-        state.update(green=fp, blocks=0)
+        state.update(green=fp, blocks=0, head=head)
         state.pop("attempted", None)
         state.pop("attempted_cmd", None)
         save()
