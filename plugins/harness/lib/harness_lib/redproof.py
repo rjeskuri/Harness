@@ -20,11 +20,15 @@ the hash, two commits of main), so a match pins every byte of the file now, and 
 branch's own, made after the red run or in a merge resolution that changes its lines, leaves the record
 stale. A replay that differs from git's real merge can only give a false "not current".
 
-The new merge base is that of origin/main, then main (the refs harness-red check defaults to), with HEAD,
-and with MERGE_HEAD too while a merge is in progress (the base the merge commit will have). Only a base
-that descends from `base_sha` counts: an older one (a stale local main, a record made against a stacked
-parent) would let the branch undo main's changes. A `base_sha` that is not a commit here (a hand-written
-"0" * 40) gets the whole-file comparison only.
+The new merge base is that of origin/main, then main (the refs harness-red check defaults to, spelled in
+full), with HEAD, and with MERGE_HEAD too while a merge is in progress (the base the merge commit will
+have). Each ref counts at the commit its newest reflog entry set it to, and only when that entry is an
+update the harness trusts (`trusted_update`: a fetch or pull from origin, a push, a clone, and for main a
+commit, merge, rebase or reset), so a ref moved by `git update-ref`, `git fetch . x:<ref>` or a write to its
+file names no base. Only a base that descends from `base_sha` counts: an older one (a stale local main, a
+record made against a stacked parent) would let the branch undo main's changes. A `base_sha` that is not a
+commit id here (a hand-written "0" * 40; 40 hex digits in SHA-1 repositories, 64 in SHA-256 ones) gets the
+whole-file comparison only.
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -42,8 +46,17 @@ import time
 
 from harness_lib.text import read_json, write_json
 
-BASE_REFS = ("origin/main", "main")
-SHA = re.compile(r"^[0-9a-f]{40}$")
+# In full, so a tag or another ref spelled origin/main or main cannot stand in for them.
+BASE_REFS = ("refs/remotes/origin/main", "refs/heads/main")
+SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")  # a commit id: SHA-1, or SHA-256 (--object-format=sha256)
+# A reflog entry git fetch or pull wrote: `fetch <args>: <note>` (`pull --rebase (finish): ...` for a rebase).
+FETCH = re.compile(r"^(?:fetch|pull)((?: [^ ]+)*?)(?: \([a-z]+\))?: ")
+# The other updates that move these refs legitimately; main is the user's own checkout.
+TRUSTED = {
+    "refs/remotes/origin/main": ("update by push", "clone: from "),
+    "refs/heads/main": ("commit: ", "commit (", "merge ", "rebase", "reset: moving to ", "branch: Created from ",
+                        "clone: from "),
+}
 # The synthetic commit's identity and date: fixed, so the replay never reads the user's config for them.
 SYNTHETIC = {
     "GIT_AUTHOR_NAME": "harness-red", "GIT_AUTHOR_EMAIL": "harness-red@localhost",
@@ -98,21 +111,27 @@ def load_red_files(record_path: str, record: dict):
 
 def record_current(root: str, record: dict, record_path: str, timeout: float = 30) -> bool:
     """True when the test files under `root` are the ones `record` (read from `record_path`) proved red, as
-    above. All its git calls together get `timeout` seconds (a hook passes its own budget); any failure (a
-    missing file, git failing, the budget running out) counts as not current."""
+    above. All its git calls together get `timeout` seconds; any failure (a missing file, git failing, the
+    budget running out) counts as not current."""
+    return record_state(root, record, record_path, timeout) == "current"
+
+
+def record_state(root: str, record: dict, record_path: str, timeout: float = 30) -> str:
+    """record_current's answer as "current", "stale", or "unknown" when its git calls ran out of `timeout`
+    seconds (a hook passes what is left of its own deadline) before it could tell."""
     files = record.get("test_files")
     if not isinstance(files, list) or not files or not all(isinstance(f, str) and f for f in files):
-        return False
+        return "stale"
     try:
         contents = read_files(root, files)
     except OSError:
-        return False
+        return "stale"
     want = record.get("test_hash")
     if tests_hash(contents) == want:
-        return True
+        return "current"
     old = record.get("base_sha")
     if not isinstance(old, str) or not SHA.match(old):
-        return False
+        return "stale"
     kept = load_red_files(record_path, record)
     deadline = time.monotonic() + timeout
     try:
@@ -126,10 +145,12 @@ def record_current(root: str, record: dict, record_path: str, timeout: float = 3
             if red is not None and tests_hash(red) == want and replayed(
                 root, contents, red, old, new, before, after, deadline
             ):
-                return True
+                return "current"
+    except subprocess.TimeoutExpired:
+        return "unknown"
     except (OSError, subprocess.SubprocessError, ValueError):
         pass
-    return False
+    return "stale"
 
 
 def git(root: str, args, deadline: float, stdin: bytes = b"", env=None) -> subprocess.CompletedProcess:
@@ -143,19 +164,44 @@ def git(root: str, args, deadline: float, stdin: bytes = b"", env=None) -> subpr
 
 
 def moved_bases(root: str, old: str, deadline: float) -> list:
-    """The merge bases with origin/main and main (of HEAD, and of MERGE_HEAD too during a merge) that
-    descend from `old` and differ from it."""
+    """The merge bases with origin/main and main, each at its trusted tip (trusted_tip), of HEAD (and of
+    MERGE_HEAD too during a merge) that descend from `old` and differ from it."""
     merging = git(root, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], deadline).returncode == 0
     heads = ["HEAD", "MERGE_HEAD"] if merging else ["HEAD"]
     found = []
     for ref in BASE_REFS:
-        out = git(root, ["merge-base", ref, *heads], deadline)  # ref with a merge of the heads
+        tip = trusted_tip(root, ref, deadline)
+        if tip is None:
+            continue
+        out = git(root, ["merge-base", tip, *heads], deadline)  # the tip with a merge of the heads
         new = out.stdout.decode("ascii", "replace").strip()
         if out.returncode != 0 or not SHA.match(new) or new == old or new in found:
             continue
         if git(root, ["merge-base", "--is-ancestor", old, new], deadline).returncode == 0:
             found.append(new)
     return found
+
+
+def trusted_tip(root: str, ref: str, deadline: float):
+    """The commit `ref`'s newest reflog entry set it to, when trusted_update trusts that entry; else None (no
+    reflog, or a ref moved some other way). A ref file written without a reflog entry is not seen."""
+    out = git(root, ["log", "-g", "-1", "--format=%H%x00%gs", ref, "--"], deadline)
+    sha, _, subject = out.stdout.decode("utf-8", "replace").rstrip("\n").partition("\0")
+    return sha if out.returncode == 0 and SHA.match(sha) and trusted_update(ref, subject) else None
+
+
+def trusted_update(ref: str, subject: str) -> bool:
+    """True when the reflog entry `subject` of `ref` (one of BASE_REFS) is an update the harness trusts: a
+    fetch or pull from origin (named, or the default) whose refspecs name no destination or take main to one,
+    or one of TRUSTED[ref]. A fetch from `.` or another remote, `git update-ref` (no message, or one git
+    itself never writes) and `git branch -f` are not."""
+    m = FETCH.match(subject)
+    if m is None:
+        return subject.startswith(TRUSTED.get(ref, ()))
+    words = [w for w in m.group(1).split() if not w.startswith("-")]
+    if words and words[0] != "origin":
+        return False
+    return all(w.lstrip("+").split(":", 1)[0] in ("main", "refs/heads/main") for w in words[1:] if ":" in w)
 
 
 def file_blobs(root: str, wanted, deadline: float, env=None):

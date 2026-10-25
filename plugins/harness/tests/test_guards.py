@@ -12,19 +12,24 @@ Run: python3 -m unittest discover -s plugins/harness/tests -p "test_guards.py" -
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
+import runpy
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 HOOKS = Path(__file__).resolve().parent.parent / "hooks"
 SHOWN_LIMIT = 160  # a refused part is displayed cut to 160 characters
@@ -215,13 +220,18 @@ class GuardTestCase(unittest.TestCase):
         return path
 
     def make_repo(
-        self, name: str = "proj", commit: bool = True, branch: str = "main"
+        self,
+        name: str = "proj",
+        commit: bool = True,
+        branch: str = "main",
+        object_format: str | None = None,
     ) -> Path:
         """A repo on `branch` with README.md, src/app.py and tests/test_app.py committed
-        (or nothing, with commit=False)."""
+        (or nothing, with commit=False); `object_format` "sha256" makes a SHA-256 repo."""
         repo = self.tmp / name
+        fmt = [f"--object-format={object_format}"] if object_format else []
         subprocess.run(
-            ["git", "init", "-q", "-b", branch, str(repo)],
+            ["git", "init", "-q", "-b", branch, *fmt, str(repo)],
             check=True,
             capture_output=True,
             env=self.env,
@@ -3289,6 +3299,67 @@ def content_hash(root: Path, files) -> str:
     return h.hexdigest()
 
 
+# The hook's deadline (#231 ultrareview): hooks.json gives tests_first.py a timeout; a hook
+# Claude Code kills at it prints nothing, and the write goes through. Interpreter start and
+# imports come out of the same timeout, so the hook's own work must end this much sooner.
+STARTUP_ALLOWANCE = 0.5
+_REAL_RUN = subprocess.run
+_REAL_MONOTONIC = time.monotonic
+_REAL_PERF_COUNTER = time.perf_counter
+_REAL_TIME = time.time
+
+
+def hook_timeouts(script: str) -> dict:
+    """matcher -> the timeout (seconds) hooks.json gives `script` under PreToolUse."""
+    data = json.loads((HOOKS / "hooks.json").read_text(encoding="utf-8"))
+    found = {}
+    for entry in data["hooks"]["PreToolUse"]:
+        for hook in entry["hooks"]:
+            if any(str(a).endswith("/" + script) for a in hook.get("args", [])):
+                found[entry["matcher"]] = hook["timeout"]
+    return found
+
+
+class SlowGit:
+    """Every git that subprocess.run starts in this process takes `delay` seconds of a fake
+    clock (time.monotonic, time.perf_counter and time.time run ahead by it), or, given a
+    shorter timeout, finishes JUST_IN_TIME before it: the slowest git that never times out.
+    A call with no time left (a timeout under JUST_IN_TIME) is cut at its timeout and raises
+    TimeoutExpired, as subprocess.run would. A call that finishes runs the real git. No real
+    sleeping."""
+
+    JUST_IN_TIME = 0.05
+
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+        self.ahead = 0.0
+        self.calls: list = []
+
+    def monotonic(self) -> float:
+        return _REAL_MONOTONIC() + self.ahead
+
+    def perf_counter(self) -> float:
+        return _REAL_PERF_COUNTER() + self.ahead
+
+    def time(self) -> float:
+        return _REAL_TIME() + self.ahead
+
+    def run(self, args, *rest, **kwargs):
+        argv = list(args) if isinstance(args, (list, tuple)) else [args]
+        if argv and os.path.basename(str(argv[0])) == "git":
+            timeout = kwargs.get("timeout")
+            takes = self.delay
+            if timeout is not None:
+                takes = min(takes, float(timeout) - self.JUST_IN_TIME)
+            if takes < 0:
+                self.ahead += max(float(timeout), 0.0)
+                self.calls.append((argv, "timed out"))
+                raise subprocess.TimeoutExpired(argv, timeout)
+            self.ahead += takes
+            self.calls.append((argv, "ran"))
+        return _REAL_RUN(args, *rest, **kwargs)
+
+
 class TestsFirstMainMergeTests(GuardTestCase):
     """A red record survives a merge of main that edits the branch's test files in other
     hunks; a test change the branch makes itself (an edit, a commit, or a merge
@@ -3321,13 +3392,16 @@ class TestsFirstMainMergeTests(GuardTestCase):
             timeout=120,
         )
 
-    def ticket(self, name: str, base: str = BASE_TESTS, author=None) -> tuple[Path, Path]:
+    def ticket(
+        self, name: str, base: str = BASE_TESTS, author=None, object_format: str | None = None
+    ) -> tuple[Path, Path]:
         """(main checkout, ticket worktree) after the red run and the coder's commit.
         Main's test files hold `base`; the test-author applies `author` to each (default:
-        test_case_5's assert becomes BRANCH_LINE_5)."""
+        test_case_5's assert becomes BRANCH_LINE_5). `object_format` "sha256" makes the
+        repo a SHA-256 one."""
         if author is None:
             author = lambda t: replaced(t, MAIN_LINE_5, BRANCH_LINE_5)  # noqa: E731
-        repo = self.make_repo(name)
+        repo = self.make_repo(name, object_format=object_format)
         for rel in MERGE_TEST_FILES:
             self.write(repo / rel, base)
         self.commit_all(repo, "the tests so far")
@@ -3954,6 +4028,165 @@ class TestsFirstMainMergeTests(GuardTestCase):
         self.merge_cleanly(wt)
         self.assertSourceDenied(wt)
         self.assertEqual(self.status(wt), "current: no")
+
+    # ---- ultrareview round (#231): SHA-256 repositories, and the hook's deadline
+
+    def require_sha256(self) -> None:
+        probe = self.tmp / "sha256-probe"
+        r = subprocess.run(
+            ["git", "init", "-q", "--object-format=sha256", str(probe)],
+            capture_output=True,
+            env=self.env,
+        )
+        if r.returncode != 0:
+            self.skipTest("this git cannot make a SHA-256 repository")
+
+    def test_a_merge_of_main_keeps_source_allowed_in_a_sha256_repo(self):
+        self.require_sha256()
+        own_test = "def test_case_5():\n" + BRANCH_LINE_5
+        variants = {
+            # main edits other hunks of both files: merge-file replays it
+            "other-hunks": (
+                BASE_TESTS,
+                None,
+                {
+                    "tests/test_app.py": lambda t: replaced(
+                        t, "assert 0 + 0 == 0", "assert 0 * 0 == 0"
+                    ),
+                    "tests/test_util.py": lambda t: "# main's header\n" + t,
+                },
+                (
+                    ("own-line", lambda t: replaced(t, BRANCH_LINE_5, "    assert login() == 'hi'\n")),
+                    ("own-test-moved", lambda t: moved_to_end(t, own_test)),
+                ),
+            ),
+            # a merge only git's own (ort) gives: the synthetic commit, in SHA-256
+            "ort-only": (
+                DIVERGE_TESTS,
+                diverge_author,
+                {"tests/test_app.py": diverge_main, "tests/test_util.py": diverge_main},
+                (
+                    ("own-line", lambda t: replaced(t, BRANCH_LINE_5, "    assert login() == 'hi'\n")),
+                ),
+            ),
+        }
+        for name, (base, author, changes, branch_edits) in variants.items():
+            with self.subTest(variant=name):
+                repo, wt = self.ticket(f"sha256-{name}", base, author, object_format="sha256")
+                self.assertEqual(self.git(wt, "rev-parse", "--show-object-format"), "sha256")
+                record = json.loads(self.record_file(repo).read_text())
+                self.assertRegex(record["base_sha"], r"^[0-9a-f]{64}$")
+                self.on_main(repo, changes)
+                self.merge_cleanly(wt)
+                # the merge brought main's edits in: the files no longer hash to test_hash
+                self.assertNotEqual(
+                    content_hash(wt, record["test_files"]), record["test_hash"]
+                )
+                self.assertSourceAllowed(wt)
+                self.assertEqual(self.status(wt), "current: yes")
+                head = self.git(wt, "rev-parse", "HEAD")
+                path = wt / "tests/test_app.py"
+                for edit, change in branch_edits:
+                    for committed in (False, True):
+                        with self.subTest(variant=name, edit=edit, committed=committed):
+                            self.git(wt, "reset", "-q", "--hard", head)
+                            self.write(path, change(path.read_text()))
+                            if committed:
+                                self.commit_all(wt, "the branch edits its tests")
+                            self.assertSourceDenied(wt)
+                            self.assertEqual(self.status(wt), "current: no")
+                self.git(wt, "reset", "-q", "--hard", head)
+                self.assertSourceAllowed(wt)
+
+    def hook_with_slow_git(self, payload: dict, delay: float):
+        """(deny reason or None, seconds the hook took, git calls) for tests_first.py run as
+        its own __main__, in this process, with every git call taking `delay` seconds of a
+        fake clock (SlowGit). harness_lib is imported afresh under the fake clock."""
+        ours = ("harness_lib", "branch_guard")
+        saved = {
+            k: m for k, m in sys.modules.items() if k in ours or k.startswith("harness_lib.")
+        }
+        for k in saved:
+            del sys.modules[k]
+        slow = SlowGit(delay)
+        out, err = io.StringIO(), io.StringIO()
+        stdin = io.TextIOWrapper(io.BytesIO(json.dumps(payload).encode("utf-8")), encoding="utf-8")
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, self.env, clear=True))
+                stack.enter_context(mock.patch.object(subprocess, "run", slow.run))
+                stack.enter_context(mock.patch.object(time, "monotonic", slow.monotonic))
+                stack.enter_context(mock.patch.object(time, "perf_counter", slow.perf_counter))
+                stack.enter_context(mock.patch.object(time, "time", slow.time))
+                stack.enter_context(mock.patch.object(sys, "stdin", stdin))
+                stack.enter_context(mock.patch.object(sys, "dont_write_bytecode", True))
+                stack.enter_context(contextlib.redirect_stdout(out))
+                stack.enter_context(contextlib.redirect_stderr(err))
+                start = slow.monotonic()
+                try:
+                    runpy.run_path(str(HOOKS / "tests_first.py"), run_name="__main__")
+                except SystemExit as exc:
+                    self.assertIn(exc.code, (0, None), err.getvalue())
+                took = slow.monotonic() - start
+        finally:
+            for k in [k for k in sys.modules if k in ours or k.startswith("harness_lib.")]:
+                del sys.modules[k]
+            sys.modules.update(saved)
+        r = types.SimpleNamespace(stdout=out.getvalue(), stderr=err.getvalue())
+        return self.decision(r), took, slow.calls
+
+    def test_the_hook_decides_within_its_timeout_when_every_git_call_is_slow(self):
+        timeouts = hook_timeouts("tests_first.py")
+        self.assertEqual(set(timeouts), {"Bash", "Edit|Write|NotebookEdit"}, timeouts)
+        # a stale record after a merge of main: the branch moved its own test afterwards
+        repo, wt = self.ticket("slow-git")
+        self.on_main(repo, {"tests/test_app.py": lambda t: "# main's header\n" + t})
+        self.merge_cleanly(wt)
+        current_head = self.git(wt, "rev-parse", "HEAD")
+        path = wt / "tests/test_app.py"
+        self.write(path, moved_to_end(path.read_text(), "def test_case_5():\n" + BRANCH_LINE_5))
+        self.commit_all(wt, "the branch moves its test")
+        stale_head = self.git(wt, "rev-parse", "HEAD")
+        calls = {
+            "Edit|Write|NotebookEdit": self.payload(
+                "Edit",
+                {"file_path": str(wt / "src/app.py"), "old_string": "a", "new_string": "b"},
+                wt,
+                "harness:coder",
+            ),
+            "Bash": self.payload(
+                "Bash", {"command": "printf '\\n' >> src/app.py"}, wt, "harness:coder"
+            ),
+        }
+        # with git at full speed the in-process run gives what the hook process gives
+        for matcher, payload in calls.items():
+            with self.subTest(matcher=matcher, delay=0):
+                reason, took, _ = self.hook_with_slow_git(payload, 0.0)
+                self.assertIsNotNone(reason)
+                self.assertIn(CHANGED, reason)
+                self.assertEqual(
+                    reason, self.decision(self.run_hook("tests_first.py", payload))
+                )
+        # Every git call slow, none timing out: the repo lookup succeeds, so the hook knows
+        # the branch, and it must deny the stale record before hooks.json's timeout.
+        # (2.9 is the slowest at which main_checkout's two calls still fit its one budget.)
+        for delay in (0.5, 1.0, 1.4, 2.0, 2.5, 2.9):
+            for matcher, payload in calls.items():
+                limit = timeouts[matcher] - STARTUP_ALLOWANCE
+                with self.subTest(record="stale", matcher=matcher, delay=delay):
+                    reason, took, git_calls = self.hook_with_slow_git(payload, delay)
+                    self.assertGreaterEqual(len(git_calls), 2, git_calls)
+                    self.assertLess(took, limit, git_calls)
+                    self.assertIsNotNone(reason, git_calls)  # never let through
+        # a record that is current after the merge: allowed or denied, but decided in time
+        self.git(wt, "reset", "-q", "--hard", current_head)
+        self.assertNotEqual(current_head, stale_head)
+        for delay in (0.5, 1.4, 2.0, 2.9):
+            for matcher, payload in calls.items():
+                limit = timeouts[matcher] - STARTUP_ALLOWANCE
+                with self.subTest(record="current", matcher=matcher, delay=delay):
+                    _, took, git_calls = self.hook_with_slow_git(payload, delay)
+                    self.assertLess(took, limit, git_calls)
 
 
 if __name__ == "__main__":

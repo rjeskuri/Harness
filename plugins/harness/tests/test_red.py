@@ -1048,6 +1048,75 @@ class RedTest(unittest.TestCase):
         self.git(self.wt, "reset", "-q", "--hard", head)
         self.assertEqual(self.current(), "current: yes")
 
+    # ultrareview round (#231): a SHA-256 repository, whose commit ids are 64 hex digits
+    def use_sha256_repo(self):
+        """Swap the fixture for the same layout in SHA-256: a bare origin, a main checkout pushing to it (a clone
+        of an empty SHA-256 repository comes out SHA-1 in older git), the branch in a linked worktree. Skips the
+        test when this git cannot make a SHA-256 repository."""
+        root = os.path.join(self.tmp, "sha256")
+        origin, repo = os.path.join(root, "origin.git"), os.path.join(root, "repo")
+        os.makedirs(root)
+        probe = subprocess.run([GIT, "init", "-q", "--bare", "--object-format=sha256", origin], env=self.env,
+                               capture_output=True, text=True)
+        if probe.returncode != 0:
+            self.skipTest("this git cannot make a SHA-256 repository")
+        self.git(root, "init", "-q", "-b", "main", "--object-format=sha256", repo)
+        self.git(repo, "remote", "add", "origin", origin)
+        write(os.path.join(repo, "calc.py"), CALC)
+        write(os.path.join(repo, "README.md"), "# calc\n")
+        write(os.path.join(repo, ".claude", "settings.json"),
+              json.dumps({"env": {"HARNESS_TEST_CMD": "python3 -m unittest {files}"}}))
+        self.git(repo, "add", "-A")
+        self.git(repo, "commit", "-q", "-m", "calc")
+        self.git(repo, "push", "-q", "-u", "origin", "main")
+        with open(os.path.join(repo, ".git", "info", "exclude"), "a", encoding="utf-8") as fh:
+            fh.write(".claude/worktrees/\n")
+        self.repo = repo
+        self.wt = os.path.join(repo, ".claude", "worktrees", SLUG)
+        self.git(repo, "worktree", "add", "-q", self.wt, "-b", BRANCH, "origin/main")
+        key = hashlib.sha1(os.path.realpath(repo).encode("utf-8")).hexdigest()[:12]
+        self.state = os.path.join(self.home, ".claude", "harness", "repos", key)
+        self.record_path = os.path.join(self.state, "red", SLUG + ".json")
+        self.scratch = os.path.join(self.state, "scratch", SLUG)
+        self.assertEqual(self.git(self.wt, "rev-parse", "--show-object-format"), "sha256")
+
+    def test_status_stays_current_across_a_merge_of_main_in_a_sha256_repo(self):
+        self.use_sha256_repo()
+        self.red_ticket_with_source()
+        rec = self.record()
+        self.assertEqual(len(rec["base_sha"]), 64, rec["base_sha"])
+        self.assertEqual(rec["base_sha"], self.git(self.repo, "rev-parse", "origin/main"))
+        for name, changes in (
+            ("first-test", {"tests/test_calc.py": lambda t: once(t, "calc.sub(2, 2), 0)", "calc.sub(4, 4), 0)")}),
+            ("appended-and-more", {"tests/test_calc.py": lambda t: t + SUB_10, "util.py": "X = 1\n"}),
+        ):
+            with self.subTest(main=name):
+                self.on_main(changes)
+                self.merge_cleanly()
+                merged = read(os.path.join(self.wt, "tests", "test_calc.py"))
+                self.assertEqual(merged, once(read(os.path.join(self.repo, "tests", "test_calc.py")),
+                                              SUB_5, BRANCH_ADD + SUB_5))    # main's edits and the branch's own
+                self.assertNotEqual(expected_hash(self.wt, rec["test_files"]), rec["test_hash"])
+                self.assertEqual(self.current(), "current: yes")
+                self.assertIs(json.loads(self.red("status", "--json").stdout)["current"], True)
+        # a test change of the branch's own after the merges is not current
+        path = os.path.join(self.wt, "tests", "test_calc.py")
+        merged = read(path)
+        head = self.git(self.wt, "rev-parse", "HEAD")
+        for name, edited in (
+            ("own-line", once(merged, "calc.add(2, 3), 5)", "calc.add(3, 3), 6)")),
+            ("own-test-moved", moved_to_end(merged, BRANCH_ADD)),
+        ):
+            for committed in (False, True):
+                with self.subTest(edit=name, committed=committed):
+                    self.git(self.wt, "reset", "-q", "--hard", head)
+                    self.put("tests/test_calc.py", edited)
+                    if committed:
+                        self.git(self.wt, "commit", "-q", "-am", "the branch edits its tests")
+                    self.assertEqual(self.current(), "current: no")
+        self.git(self.wt, "reset", "-q", "--hard", head)
+        self.assertEqual(self.current(), "current: yes")
+
     # ------------------------------------------------------------ scratch
     def test_scratch_create_and_run(self):
         self.check_red()                                        # the test file is not committed

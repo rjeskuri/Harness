@@ -48,7 +48,10 @@ settings.local.json, which an agent could rewrite (a gitignored file is editable
 
 A refusal prints {"hookSpecificOutput": {"hookEventName": "PreToolUse",
 "permissionDecision": "deny", "permissionDecisionReason": "..."}} and exits 0. Allowing
-prints nothing. Fails open: any error of its own goes to stderr in one line, exit 0.
+prints nothing. Fails open: any error of its own goes to stderr in one line, exit 0. But
+the whole run keeps one deadline (HOOK_BUDGET, inside hooks.json's timeout), and when the
+red proof, the check-ignore of a refused path or the file list of a wholesale rewrite
+runs out of it, the edit is refused and says why; only the repo lookup fails open then.
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
 
@@ -58,6 +61,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
@@ -66,7 +70,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.hookio import deny, edited_path, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
-    from harness_lib.redproof import record_current
+    from harness_lib.redproof import record_state
     from harness_lib.repo import main_checkout
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, glob_match, patterns, setting, settings_env
     from harness_lib.text import read_json
@@ -75,6 +79,11 @@ except Exception as exc:  # fail open, like the __main__ wrapper below: one line
     sys.exit(0)
 
 GIT_TIMEOUT = 3
+# One deadline for the whole run: hooks.json gives the hook 10 s, a hook killed at it prints nothing (the
+# write goes through), and interpreter start and imports come out of the same 10 s. Every git call gets
+# at most GIT_TIMEOUT of what is left, the red proof all of it.
+HOOK_BUDGET = 8.5
+DEADLINE = time.monotonic() + HOOK_BUDGET
 TICKET_BRANCH = re.compile(r"^t/(\d+)-")
 ROLES = {"test-author", "coder", "test-breaker"}
 RED_KINDS = {"assertion", "import", "error"}
@@ -108,6 +117,11 @@ CODER_ON_CONFIG = (
     "tests. If it has to change, stop and ask the orchestrator."
 )
 CHANGED = "Tests changed since the red run; run harness-red check again."
+UNVERIFIED = (
+    "Could not check the red record for t/{number} in time (git was too slow); the edit is "
+    "refused, not judged. Retry it; harness-red status checks with a longer budget."
+)
+IGNORE_UNKNOWN = "(git did not say in time whether it ignores {rel}.)"
 # git stash subcommands that leave the working tree alone.
 STASH_READS = {"list", "show", "create", "store"}
 # find's primaries that run a command for each file, and its options before the paths.
@@ -138,7 +152,16 @@ def classify(rel: str, file_env: dict) -> str:
 # ---------- the repo holding the file ----------
 
 
+def time_left() -> float:
+    """Seconds left before the hook's DEADLINE."""
+    return DEADLINE - time.monotonic()
+
+
 def git(cwd: str, *args: str) -> subprocess.CompletedProcess:
+    """git in `cwd`, held to GIT_TIMEOUT or what is left of the deadline. Raises TimeoutExpired."""
+    left = min(GIT_TIMEOUT, time_left())
+    if left <= 0:
+        raise subprocess.TimeoutExpired(["git", "-C", cwd, *args], 0)
     return subprocess.run(
         ["git", "-C", cwd, *args],
         stdin=subprocess.DEVNULL,
@@ -146,7 +169,7 @@ def git(cwd: str, *args: str) -> subprocess.CompletedProcess:
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=GIT_TIMEOUT,
+        timeout=left,
     )
 
 
@@ -166,8 +189,10 @@ def repo_facts(directory: str) -> dict | None:
     which moves state kept under the spelling git reports), both canonical paths, branch
     (None when detached) and spelled (`directory`, for adopt_old_state); None outside a
     repo. One git call gives top and HEAD's branch, main_checkout's lookup is held to one more
-    GIT_TIMEOUT: at worst 2 x GIT_TIMEOUT, as on main. Only an unborn branch (that call exits
-    1 with the top alone) costs a third, symbolic-ref, call. The branch is spelled as
+    GIT_TIMEOUT (or what is left of the deadline): at worst 2 x GIT_TIMEOUT, as on main. A
+    lookup that runs out of time allows, like any failure of the hook's own (the branch is
+    unknown). Only an unborn branch (that call exits 1 with the top alone) costs a third,
+    symbolic-ref, call. The branch is spelled as
     `symbolic-ref --short HEAD` (harness-red's name) spells it: `--abbrev-ref=loose` shortens
     the same way, heads/<branch> when a tag or refs/<branch> shares the name; plain
     `--abbrev-ref` is strict, and also says heads/ for a clash with refs/remotes/<branch>."""
@@ -176,7 +201,7 @@ def repo_facts(directory: str) -> dict | None:
     if out.returncode not in (0, 1) or not lines or not lines[0]:
         return None
     top = lines[0]
-    main = main_checkout(directory, timeout=GIT_TIMEOUT)
+    main = main_checkout(directory, timeout=min(GIT_TIMEOUT, time_left()))
     if main is None:
         return None
     if out.returncode == 0:  # the short branch name, or HEAD when detached
@@ -283,9 +308,15 @@ def source_refusal(facts: dict, number: str) -> str | None:
             "harness-red check again."
         )
     # The files hash to test_hash, or are the red-time files (kept in red-files/) with main's
-    # merged changes (redproof.py).
-    current = record_current(str(facts["top"]), record, str(record_path), GIT_TIMEOUT)
-    return None if current else CHANGED
+    # merged changes (redproof.py), with what is left of the deadline. Fails closed: a proof that
+    # runs out of time, or breaks, refuses the edit.
+    try:
+        state = record_state(str(facts["top"]), record, str(record_path), time_left())
+    except Exception as exc:
+        return f"Could not check the red record for t/{number} ({' '.join(str(exc).split())}); the edit is refused."
+    if state == "current":
+        return None
+    return CHANGED if state == "stale" else UNVERIFIED.format(number=number)
 
 
 def facts_at(directory: str, cache: dict) -> dict | None:
@@ -311,7 +342,7 @@ def path_refusal(
 ) -> str | None:
     """Why `role` may not write the absolute `path` now, or None. With `skip_ignored`, a
     path git ignores (untracked, matched by an ignore rule: caches, build output, logs)
-    passes unless it is test configuration."""
+    passes unless it is test configuration; when git cannot tell in time, the refusal stands."""
     facts = facts_at(existing_dir(os.path.dirname(path)), cache)
     ticket = guarded(facts)
     if ticket is None:
@@ -327,7 +358,10 @@ def path_refusal(
     if why is None and kind == "source" and ticket is not True:
         why = source_refusal(facts, str(int(ticket.group(1))))
     if why and skip_ignored and kind != "config":
-        out = git(str(facts["top"]), "check-ignore", "-q", "--", rel)
+        try:
+            out = git(str(facts["top"]), "check-ignore", "-q", "--", rel)
+        except (OSError, subprocess.SubprocessError):
+            return f"{why} {IGNORE_UNKNOWN.format(rel=rel)}"
         if out.returncode == 0:
             return None
     return why
@@ -378,7 +412,10 @@ def bulk_refusal(directory: str | None, role: str, cache: dict) -> str | None:
     if guarded(facts) is None:
         return None
     top = str(facts["top"])
-    out = git(top, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    try:
+        out = git(top, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    except (OSError, subprocess.SubprocessError):
+        return f"git did not list the files of {top} in time, so this rewrite is refused; retry it."
     # The main checkout's tracked settings.json only, not settings.local.json (see path_refusal).
     file_env = settings_env(facts["main"], ("settings.json",))
     found = None
