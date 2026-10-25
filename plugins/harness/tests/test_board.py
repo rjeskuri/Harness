@@ -954,8 +954,8 @@ class Ready(BoardTest):
                                          "number,title,labels,blockedBy", "--limit", "200"]])
         self.assertEqual([r["number"] for r in rows], [9, 3, 6, 8])
         self.assertEqual(rows[0], {"number": 9, "title": "Ticket 9", "type": "task", "size": "L", "risk": None,
-                                   "tier": "fable", "flags": ["priority:high"]})
-        self.assertEqual([r["tier"] for r in rows], ["fable", "sonnet", "opus", "opus"])
+                                   "tier": "opus", "flags": ["priority:high"]})          # #239: size:L is opus
+        self.assertEqual([r["tier"] for r in rows], ["opus", "sonnet", "opus", "opus"])
         table = self.ok("ready").stdout.splitlines()
         self.assertTrue(table[0].startswith("#"))
         self.assertEqual([line.split()[0] for line in table[1:]], ["9", "3", "6", "8"])
@@ -3006,8 +3006,8 @@ class Tier(BoardTest):
         self.assertEqual(self.tier("task", "size:S", "risk:low"), "sonnet")
         self.assertEqual(self.tier("bug", "size:S", "risk:low"), "opus")
         self.assertEqual(self.tier("task", "size:M", "risk:low"), "opus")
-        self.assertEqual(self.tier("task", "size:L", "risk:low"), "fable")
-        self.assertEqual(self.tier("task", "size:S", "risk:high"), "fable")
+        self.assertEqual(self.tier("task", "size:L", "risk:low"), "opus")         # #239: not fable
+        self.assertEqual(self.tier("task", "size:S", "risk:high"), "opus")        # #239: not fable
         self.assertEqual(self.tier("chore", "size:S"), "opus")          # no risk label: not sonnet
 
     def test_fetched_without_a_cache(self):
@@ -3018,9 +3018,9 @@ class Tier(BoardTest):
                                                 "from": "labels", "labels_tier": "sonnet", "effort": None})
 
 
-# Ticket #67: reviews run on Opus 5.5; `tier N --stage review` gives fable only for a risk:high ticket, whatever the
-# type or size, and opus for every other combination. Plain `tier N` keeps the rubric (size:L or risk:high gives fable;
-# size:S, risk:low and not a bug gives sonnet; else opus).
+# Ticket #67: reviews run on Opus 5.5. Ticket #239: `tier N --stage review` gives opus for every combination (a
+# risk:high ticket's review runs at effort xhigh, see TierEffort), never fable by the labels. Plain `tier N` keeps the
+# rubric (size:S, risk:low and not a bug gives sonnet; else opus, size:L and risk:high included).
 class TierReviewStage(BoardTest):
     TYPES = ("task", "bug", "chore", "refactor")
     SIZES = ("S", "M", "L")
@@ -3031,10 +3031,10 @@ class TierReviewStage(BoardTest):
         self.assertEqual(self.calls(), [])                  # from the cache: no gh call
         return p.stdout.strip()
 
-    def test_review_stage_is_fable_exactly_when_the_ticket_is_risk_high(self):
+    def test_review_stage_is_opus_whatever_the_risk(self):
         for kind in self.TYPES:
             for size in self.SIZES:
-                for risk, expected in (("low", "opus"), ("high", "fable")):
+                for risk, expected in (("low", "opus"), ("high", "opus")):
                     with self.subTest(kind=kind, size=size, risk=risk):
                         self.assertEqual(self.tier([kind, "size:" + size, "risk:" + risk], "--stage", "review"),
                                          expected)
@@ -3043,9 +3043,9 @@ class TierReviewStage(BoardTest):
         self.assertEqual(self.tier(["task", "size:L", "risk:low"], "--stage", "review"), "opus")   # not fable by size
         self.assertEqual(self.tier(["task", "size:S", "risk:low"], "--stage", "review"), "opus")   # not sonnet
         self.assertEqual(self.tier(["bug", "size:S", "risk:low"], "--stage", "review"), "opus")
-        self.assertEqual(self.tier(["task", "size:S", "risk:high"], "--stage", "review"), "fable")
+        self.assertEqual(self.tier(["task", "size:S", "risk:high"], "--stage", "review"), "opus")  # #239
         self.assertEqual(self.tier(["bug", "size:L", "risk:high", "status:in-progress", "priority:high"],
-                                   "--stage", "review"), "fable")
+                                   "--stage", "review"), "opus")
 
     def test_review_stage_without_a_risk_label_is_opus(self):
         for labels in (["task", "size:L"], ["chore", "size:S"], ["task"], []):
@@ -3054,9 +3054,9 @@ class TierReviewStage(BoardTest):
 
     def test_review_stage_option_may_come_before_the_number_and_works_with_json(self):
         self.put_cache(12, {"number": 12, "labels": ["task", "size:L", "risk:high"]})
-        self.assertEqual(self.ok("tier", "--stage", "review", "12").stdout.strip(), "fable")
+        self.assertEqual(self.ok("tier", "--stage", "review", "12").stdout.strip(), "opus")
         p = self.ok("tier", "12", "--stage", "review", "--json")
-        self.assertEqual(json.loads(p.stdout)["tier"], "fable")
+        self.assertEqual((json.loads(p.stdout)["tier"], json.loads(p.stdout)["effort"]), ("opus", "xhigh"))
         self.put_cache(13, {"number": 13, "labels": ["task", "size:L", "risk:low"]})
         p = self.ok("tier", "13", "--stage", "review", "--json")
         self.assertEqual(json.loads(p.stdout)["tier"], "opus")
@@ -3089,18 +3089,20 @@ class TierReviewStage(BoardTest):
                                                 "from": "labels", "labels_tier": "opus", "effort": None})
         before = len(self.calls())
         p = self.ok("tier", "12", "--json")
-        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "fable", "source": "cache", "stage": "code",
-                                                "from": "labels", "labels_tier": "fable", "effort": None})
+        # #239: a cached tier of fable without labels is a pre-#239 rubric answer (size:L or risk:high): it now
+        # stands for opus at xhigh, never fable
+        self.assertEqual(json.loads(p.stdout), {"number": 12, "tier": "opus", "source": "cache", "stage": "code",
+                                                "from": "labels", "labels_tier": "opus", "effort": "xhigh"})
         self.assertEqual(len(self.calls()), before)                 # plain tier made no gh call
 
-    def test_plain_tier_is_unchanged_for_every_combination(self):
-        # Already true today: pins the rubric (derived here from its statement, not from the tool) so the change
-        # cannot leak into the other agents' tiers.
+    def test_plain_tier_for_every_combination(self):
+        # Pins the rubric (derived here from its statement, not from the tool): #239 moved size:L and risk:high
+        # from fable to opus.
         for kind in self.TYPES:
             for size in self.SIZES:
                 for risk in ("low", "high"):
                     if size == "L" or risk == "high":
-                        expected = "fable"
+                        expected = "opus"
                     elif size == "S" and kind != "bug":
                         expected = "sonnet"
                     else:
@@ -3122,17 +3124,25 @@ SHOW_KEYS = {"number", "title", "url", "type", "status", "size", "risk", "flags"
 
 
 def rubric(kind, size, risk):
-    """docs/design.md: size:S and risk:low and type not bug gives sonnet; size:L or risk:high gives fable; else opus."""
-    if size == "L" or risk == "high":
-        return "fable"
+    """#239: size:S and risk:low and type not bug gives sonnet; everything else opus (size:L and risk:high too)."""
     if size == "S" and risk == "low" and kind != "bug":
         return "sonnet"
     return "opus"
 
 
+def rubric_effort(kind, size, risk):
+    """#239: the labels' code effort: xhigh for size:L or risk:high, else none."""
+    return "xhigh" if size == "L" or risk == "high" else None
+
+
 def review_rubric(risk):
-    """docs/design.md: the review stage is fable for risk:high and opus for everything else."""
-    return "fable" if risk == "high" else "opus"
+    """#239: the review stage is opus for every risk (at xhigh for risk:high, see review_effort)."""
+    return "opus"
+
+
+def review_effort(risk):
+    """#239: the labels' review effort: xhigh for risk:high, else none."""
+    return "xhigh" if risk == "high" else None
 
 
 def ticket_labels(kind, size, risk, *extra):
@@ -3208,13 +3218,13 @@ class TierRouting(BoardTest):
         self.assertEqual(p.stderr, "")
         data = json.loads(p.stdout)
         self.assertEqual(data, {"number": 12, "tier": "opus", "source": "cache", "stage": "code",
-                                "from": "HARNESS_CODE_TIER", "labels_tier": "fable", "effort": "xhigh"})
+                                "from": "HARNESS_CODE_TIER", "labels_tier": "opus", "effort": "xhigh"})
         self.assertEqual(list(data), TIER_KEYS)                     # printed in this order
         self.assertEqual(self.tier_out(12), "opus\n")               # the text stays the one word
         # risk:high keeps its label but gets an Opus per-ticket review
         self.assertEqual(self.tier_out(12, "--stage", "review"), "opus\n")
         self.assertEqual(self.tier_json(12, "--stage", "review"),
-                         self.review(12, "opus", "fable", frm="HARNESS_REVIEW_TIER"))
+                         self.review(12, "opus", "opus", frm="HARNESS_REVIEW_TIER"))
         # a cache without labels answers from the setting, with the cached tier as labels_tier
         self.put_cache(13, {"number": 13, "tier": "sonnet"})
         self.assertEqual(self.tier_json(13), self.code(13, "opus", "sonnet", frm="HARNESS_CODE_TIER", effort="xhigh"))
@@ -3224,7 +3234,7 @@ class TierRouting(BoardTest):
         self.scenario([{"match": ["issue", "view", "14", "--json", "labels"],
                         "stdout_json": {"labels": [{"name": "bug"}, {"name": "size:L"}, {"name": "risk:high"}]}}])
         self.assertEqual(self.tier_json(14),
-                         self.code(14, "opus", "fable", source="github", frm="HARNESS_CODE_TIER", effort="xhigh"))
+                         self.code(14, "opus", "opus", source="github", frm="HARNESS_CODE_TIER", effort="xhigh"))
         self.assertEqual(len(self.calls()), 1)
 
     def test_review_tier_setting_decides_the_review_stage(self):
@@ -3238,9 +3248,10 @@ class TierRouting(BoardTest):
                     self.assertEqual(self.tier_json(12, "--stage", "review"),
                                      self.review(12, tier, review_rubric(risk), frm="HARNESS_REVIEW_TIER",
                                                  effort="xhigh" if tier == "fable" else None))
-                    # the code stage keeps the labels
+                    # the code stage keeps the labels, their effort included
                     labels_tier = rubric(kind, size, risk)
-                    self.assertEqual(self.tier_json(12), self.code(12, labels_tier, labels_tier))
+                    self.assertEqual(self.tier_json(12), self.code(12, labels_tier, labels_tier,
+                                                                   effort=rubric_effort(kind, size, risk)))
         # HARNESS_CODE_TIER and HARNESS_CODE_EFFORT never reach the review stage
         self.settings({"HARNESS_CODE_TIER": "sonnet", "HARNESS_CODE_EFFORT": "low"})
         for risk in ("high", "low"):
@@ -3249,7 +3260,7 @@ class TierRouting(BoardTest):
                 self.assertEqual(self.tier_out(12, "--stage", "review"), review_rubric(risk) + "\n")
                 self.assertEqual(self.tier_json(12, "--stage", "review"),
                                  self.review(12, review_rubric(risk), review_rubric(risk),
-                                             effort="xhigh" if risk == "high" else None))
+                                             effort=review_effort(risk)))
         self.assertEqual(self.calls(), [])
 
     def test_show_ready_epic_tasks_and_cache_carry_the_effective_tier(self):
@@ -3344,7 +3355,8 @@ class TierRouting(BoardTest):
                 self.assertEqual(p.stdout, expected + "\n")
                 self.assertEqual(self.warnings(p), [warning])
                 p = self.ok("tier", "12", "--json")
-                self.assertEqual(json.loads(p.stdout), self.code(12, expected, expected))
+                self.assertEqual(json.loads(p.stdout), self.code(12, expected, expected,
+                                                                 effort=rubric_effort("task", size, risk)))
                 self.assertEqual(self.warnings(p), [warning])
         # once per process, however many tickets the command classifies
         self.epic_scenario([self.sub(12, "Add the board tool", ("task", "status:ready", "size:S", "risk:low")),
@@ -3352,11 +3364,11 @@ class TierRouting(BoardTest):
                             self.sub(14, "Tidy", ("refactor", "status:ready", "size:M", "risk:low"))])
         p = self.ok("show", "3")
         self.assertEqual(self.warnings(p), [warning])
-        self.assertEqual([t["tier"] for t in json.loads(p.stdout)["tasks"]], ["sonnet", "fable", "opus"])
+        self.assertEqual([t["tier"] for t in json.loads(p.stdout)["tasks"]], ["sonnet", "opus", "opus"])
         p = self.ok("show", "3", "--markdown")
         self.assertEqual(self.warnings(p), [warning])
         self.assertIn("Labels: epic, status:ready (tier opus, open)", p.stdout.splitlines())
-        self.assertIn("- #13 Wire it (ready, M, high, tier fable)", p.stdout.splitlines())
+        self.assertIn("- #13 Wire it (ready, M, high, tier opus)", p.stdout.splitlines())
         items = [{"number": n, "title": f"T{n}", "labels": [{"name": x} for x in labels], "blockedBy": []}
                  for n, labels in ((2, ("task", "status:ready", "size:S", "risk:low")),
                                    (3, ("bug", "status:ready", "size:M", "risk:low")),
@@ -3364,7 +3376,7 @@ class TierRouting(BoardTest):
         self.scenario([{"match": ["issue", "list"], "stdout_json": items}])
         p = self.ok("ready", "--json")
         self.assertEqual(self.warnings(p), [warning])
-        self.assertEqual([r["tier"] for r in json.loads(p.stdout)], ["sonnet", "opus", "fable"])
+        self.assertEqual([r["tier"] for r in json.loads(p.stdout)], ["sonnet", "opus", "opus"])
         # an invalid effort or review tier: each its own line, the rest of the routing still applies
         self.settings({"HARNESS_CODE_TIER": "fable", "HARNESS_CODE_EFFORT": "turbo", "HARNESS_REVIEW_TIER": "haiku"})
         expected_lines = sorted([
@@ -3376,13 +3388,13 @@ class TierRouting(BoardTest):
         self.assertEqual(sorted(self.warnings(p)), expected_lines)
         self.put_cache(12, {"number": 12, "labels": ticket_labels("task", "S", "high")})
         p = self.ok("tier", "12", "--stage", "review", "--json")
-        self.assertEqual(json.loads(p.stdout), self.review(12, "fable", "fable", effort="xhigh"))
+        self.assertEqual(json.loads(p.stdout), self.review(12, "opus", "opus", effort="xhigh"))
         self.assertEqual(sorted(self.warnings(p)), expected_lines)
         # an invalid value in the environment warns the same way
         self.settings({})
         self.put_cache(12, {"number": 12, "labels": ticket_labels("task", "M", "high")})
         p = self.ok("tier", "12", "--stage", "review", HARNESS_REVIEW_TIER="gpt5")
-        self.assertEqual(p.stdout, "fable\n")
+        self.assertEqual(p.stdout, "opus\n")
         self.assertEqual(self.warnings(p),
                          ["harness-board: warning: HARNESS_REVIEW_TIER='gpt5' is not one of sonnet, opus, fable; "
                           "ignored"])
@@ -3400,11 +3412,12 @@ class TierRouting(BoardTest):
             with self.subTest(kind=kind, size=size, risk=risk):
                 self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk)})
                 self.assertEqual(self.tier_out(12), rubric(kind, size, risk) + "\n")
-                self.assertEqual(self.tier_json(12), self.code(12, rubric(kind, size, risk), rubric(kind, size, risk)))
+                self.assertEqual(self.tier_json(12), self.code(12, rubric(kind, size, risk), rubric(kind, size, risk),
+                                                               effort=rubric_effort(kind, size, risk)))
                 self.assertEqual(self.tier_out(12, "--stage", "review"), review_rubric(risk) + "\n")
                 self.assertEqual(self.tier_json(12, "--stage", "review"),
                                  self.review(12, review_rubric(risk), review_rubric(risk),
-                                             effort="xhigh" if risk == "high" else None))
+                                             effort=review_effort(risk)))
         self.assertEqual(self.calls(), [])
         # show: the record and the cache keep their keys and the rubric's tier; the Labels line names no setting
         self.scenario([{"match": ["issue", "view", "12"],
@@ -3414,10 +3427,10 @@ class TierRouting(BoardTest):
         record = json.loads(p.stdout)
         self.assertEqual(set(record), SHOW_KEYS)
         self.assertEqual(set(self.cache(12)), SHOW_KEYS)
-        self.assertEqual((record["tier"], self.cache(12)["tier"]), ("fable", "fable"))
+        self.assertEqual((record["tier"], self.cache(12)["tier"]), ("opus", "opus"))
         p = self.ok("show", "12", "--markdown")
         self.assertEqual(p.stderr, "")
-        self.assertIn("Labels: task, status:ready, size:L, risk:high (tier fable, open)", p.stdout.splitlines())
+        self.assertIn("Labels: task, status:ready, size:L, risk:high (tier opus, open)", p.stdout.splitlines())
         self.assertNotIn("HARNESS_", p.stdout)
         # ready: the rows and the table as before
         items = [{"number": n, "title": f"T{n}", "labels": [{"name": x} for x in labels], "blockedBy": []}
@@ -3428,7 +3441,7 @@ class TierRouting(BoardTest):
         p = self.ok("ready", "--json")
         self.assertEqual(p.stderr, "")
         self.assertEqual(json.loads(p.stdout), [
-            {"number": 4, "title": "T4", "type": "task", "size": "L", "risk": "low", "tier": "fable",
+            {"number": 4, "title": "T4", "type": "task", "size": "L", "risk": "low", "tier": "opus",
              "flags": ["priority:high"]},
             {"number": 2, "title": "T2", "type": "task", "size": "S", "risk": "low", "tier": "sonnet", "flags": []},
             {"number": 3, "title": "T3", "type": "bug", "size": "M", "risk": "low", "tier": "opus", "flags": []}])
@@ -3436,7 +3449,7 @@ class TierRouting(BoardTest):
         self.assertEqual(p.stderr, "")
         self.assertEqual([line.split() for line in p.stdout.splitlines()],
                          [["#", "TITLE", "TYPE", "SIZE", "RISK", "TIER", "FLAGS"],
-                          ["4", "T4", "task", "L", "low", "fable", "priority:high"],
+                          ["4", "T4", "task", "L", "low", "opus", "priority:high"],
                           ["2", "T2", "task", "S", "low", "sonnet"],
                           ["3", "T3", "bug", "M", "low", "opus"]])
         # board: the text as before, and no warning
@@ -3511,6 +3524,93 @@ class TierRouting(BoardTest):
             self.assertIn(needle, bullet)
         for key in ("stage", "from", "labels_tier", "effort"):
             self.assertIn(f"`{key}`", bullet)
+
+
+# ======================================================================= tier: no automatic Fable (#239)
+# size:L and risk:high route to opus at effort xhigh for the coding stages; a risk:high review routes to opus at xhigh;
+# S+low non-bug is still sonnet; everything else opus with no effort. Fable only when a setting names it. `tier N`
+# prints the tier alone; `--json` carries the effort. Expected values come from rubric()/rubric_effort() above.
+class TierEffort(BoardTest):
+    KINDS = ("task", "bug", "chore", "refactor")
+    SIZES = ("S", "M", "L", None)
+    RISKS = ("low", "high", None)
+
+    # TierRouting's helpers, borrowed without inheriting its tests
+    settings = TierRouting.settings
+    tier_out = TierRouting.tier_out
+    tier_json = TierRouting.tier_json
+    code = TierRouting.code
+    review = TierRouting.review
+
+    def test_every_label_combination_from_the_cache(self):
+        efforts = set()
+        for kind in self.KINDS:
+            for size in self.SIZES:
+                for risk in self.RISKS:
+                    with self.subTest(kind=kind, size=size, risk=risk):
+                        tier, effort = rubric(kind, size, risk), rubric_effort(kind, size, risk)
+                        self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk, "status:ready")})
+                        self.assertEqual(self.tier_out(12), tier + "\n")                 # the tier alone
+                        data = self.tier_json(12)
+                        self.assertEqual(data, self.code(12, tier, tier, effort=effort))
+                        self.assertEqual(list(data), TIER_KEYS)
+                        self.assertEqual(self.tier_out(12, "--stage", "review"), "opus\n")
+                        self.assertEqual(self.tier_json(12, "--stage", "review"),
+                                         self.review(12, "opus", "opus", effort=review_effort(risk)))
+                        efforts.add(effort)
+        self.assertEqual(efforts, {None, "xhigh"})
+        self.assertEqual(self.calls(), [])
+
+    def test_fetched_labels_carry_the_effort_too(self):
+        for n, (kind, size, risk) in enumerate([("task", "L", "low"), ("bug", "M", "high"), ("chore", "S", "low"),
+                                                ("refactor", "M", "low"), ("task", "S", "high")], start=20):
+            with self.subTest(kind=kind, size=size, risk=risk):
+                self.scenario([{"match": ["issue", "view", str(n), "--json", "labels"],
+                                "stdout_json": {"labels": [{"name": x} for x in ticket_labels(kind, size, risk)]}}])
+                tier = rubric(kind, size, risk)
+                self.assertEqual(self.tier_json(n), self.code(n, tier, tier, source="github",
+                                                              effort=rubric_effort(kind, size, risk)))
+                self.assertEqual(self.tier_json(n, "--stage", "review"),
+                                 self.review(n, "opus", "opus", source="github", effort=review_effort(risk)))
+                self.assertEqual(self.tier_out(n), tier + "\n")
+
+    def test_a_cache_without_labels_answers_from_its_tier(self):
+        # The cached tier stands in for the labels' tier. A cached fable is the pre-#239 rubric's answer for size:L
+        # or risk:high, so it now means opus at xhigh; sonnet and opus carry no effort.
+        for cached, tier, effort in (("sonnet", "sonnet", None), ("opus", "opus", None), ("fable", "opus", "xhigh")):
+            with self.subTest(cached=cached):
+                self.put_cache(13, {"number": 13, "tier": cached})
+                self.assertEqual(self.tier_out(13), tier + "\n")
+                self.assertEqual(self.tier_json(13), self.code(13, tier, tier, effort=effort))
+        # HARNESS_CODE_EFFORT still wins; HARNESS_CODE_TIER=fable still gives fable
+        self.put_cache(13, {"number": 13, "tier": "fable"})
+        self.assertEqual(self.tier_json(13, HARNESS_CODE_EFFORT="low"), self.code(13, "opus", "opus", effort="low"))
+        self.assertEqual(self.tier_json(13, HARNESS_CODE_TIER="fable"),
+                         self.code(13, "fable", "opus", frm="HARNESS_CODE_TIER"))
+        self.assertEqual(self.calls(), [])
+
+    def test_code_effort_setting_wins_over_the_labels_xhigh(self):
+        for raw, effort in (("low", "low"), ("MAX", "max"), ("high", "high")):
+            self.settings({"HARNESS_CODE_EFFORT": raw})
+            for kind, size, risk in (("task", "L", "low"), ("bug", "M", "high"), ("task", "S", "low")):
+                with self.subTest(effort=raw, kind=kind, size=size, risk=risk):
+                    self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk)})
+                    tier = rubric(kind, size, risk)
+                    self.assertEqual(self.tier_json(12), self.code(12, tier, tier, effort=effort))
+
+    def test_explicit_fable_still_gives_fable(self):
+        for kind, size, risk in (("task", "L", "high"), ("task", "S", "low"), ("bug", "M", "high")):
+            with self.subTest(kind=kind, size=size, risk=risk):
+                self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk)})
+                self.assertEqual(self.tier_out(12, HARNESS_CODE_TIER="fable"), "fable\n")
+                self.assertEqual(self.tier_json(12, HARNESS_CODE_TIER="fable"),
+                                 self.code(12, "fable", rubric(kind, size, risk), frm="HARNESS_CODE_TIER"))
+                self.assertEqual(self.tier_out(12, "--stage", "review", HARNESS_REVIEW_TIER="fable"), "fable\n")
+                self.assertEqual(self.tier_json(12, "--stage", "review", HARNESS_REVIEW_TIER="fable"),
+                                 self.review(12, "fable", "opus", frm="HARNESS_REVIEW_TIER", effort="xhigh"))
+                # without the settings the same ticket never prints fable
+                self.assertNotIn("fable", self.tier_out(12) + self.tier_out(12, "--stage", "review"))
+                self.assertNotIn("fable", json.dumps([self.tier_json(12), self.tier_json(12, "--stage", "review")]))
 
 
 # ======================================================================= errors, repo resolution, help

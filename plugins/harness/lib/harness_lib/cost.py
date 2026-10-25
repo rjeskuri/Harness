@@ -22,6 +22,7 @@ import statistics
 
 from harness_lib import transcripts
 from harness_lib.cli import table
+from harness_lib.routing import next_route
 from harness_lib.settings import glob_match
 from harness_lib.text import parse_iso
 
@@ -256,7 +257,8 @@ ROUND_KEYS = {"retry": "retry", "escalate": "escalate", "needs-input": "needs_in
 def attempt_action(stage, result, failures):
     """What `harness-work attempt` answers for a stage's attempt, `failures` being that stage's run of
     consecutive fails ending with it: done on a pass, then retry, escalate, needs-input (fix: retry, then
-    needs-input; it never escalates). The tier of an escalation is the caller's."""
+    needs-input; it never escalates). The tier of an escalation is the caller's (routing.next_route), and
+    when nothing is above the attempt's tier and effort the caller answers needs-input instead."""
     if result == "pass":
         return "done"
     if failures == 1:
@@ -280,7 +282,10 @@ def rounds(attempts):
         failed = entry.get("result") == "fail"
         counts["fails"] += failed
         run[stage] = run.get(stage, 0) + 1 if failed else 0
-        key = ROUND_KEYS.get(attempt_action(stage, entry.get("result"), run[stage]))
+        action = attempt_action(stage, entry.get("result"), run[stage])
+        if action == "escalate" and "effort" in entry and next_route(entry.get("tier"), entry.get("effort")) is None:
+            action = "needs-input"      # #239 records carry effort: nothing above opus xhigh or a named fable
+        key = ROUND_KEYS.get(action)
         if key:
             counts[key] += 1
     return {"stages": stages, "breaker_rerounds": stages.get("breaker", {}).get("fails", 0),

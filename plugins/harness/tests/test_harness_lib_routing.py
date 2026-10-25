@@ -2,17 +2,20 @@
 settings, the tier rubric and each stage's route, in one module so harness-board,
 harness-work and harness-pr agree.
 
-- label_tier: docs/design.md's sentence ("size:S and risk:low and type not bug gives sonnet;
-  size:L or risk:high gives fable; everything else gives opus"), checked for every type, size
-  and risk, None included, against an oracle written here from that sentence plus pinned
-  literal cases; review_label_tier: fable for risk high, opus for everything else.
+- label_tier (ticket #239): "size:S and risk:low and type not bug gives sonnet; everything else
+  gives opus" (size:L and risk:high give opus too, at effort xhigh; the labels never give fable),
+  checked for every type, size and risk, None included, against an oracle written here plus
+  pinned literal cases; review_label_tier: opus for every risk.
 - load_routing(main): defaults with no environment and no settings file; the environment when
   not blank, else <main>/.claude/settings.json's env; settings.local.json never read; values
   stripped and matched case-insensitively; an invalid value ignored with exactly one problem
   line naming the key, the value and the allowed values.
 - code_route / review_route: the dicts of the ticket's examples, plus tables over tiers, risks
-  and overrides (effort is xhigh on a fable review only; the code route never carries one
-  unless HARNESS_CODE_EFFORT is set).
+  and overrides. #239: a code route from the labels carries effort xhigh for size:L or
+  risk:high (HARNESS_CODE_EFFORT wins when set; a HARNESS_CODE_TIER override replaces the labels'
+  effort along with their tier); a review route from the labels carries xhigh for risk:high; a
+  fable review (only ever from HARNESS_REVIEW_TIER) carries xhigh; nothing routes to fable unless
+  a setting names it.
 - Module: the constants, and only the standard library and harness_lib imported.
 
 Run: python3 -m unittest plugins/harness/tests/test_harness_lib_routing.py -v
@@ -88,13 +91,21 @@ def load_routing_module():
 
 
 def expected_label_tier(kind, size, risk):
-    """design.md: `size:S` and `risk:low` and type not `bug` gives `sonnet`; `size:L` or
-    `risk:high` gives `fable`; everything else gives `opus`."""
-    if size == "L" or risk == "high":
-        return "fable"
+    """#239: `size:S` and `risk:low` and type not `bug` gives `sonnet`; everything else gives `opus`
+    (`size:L` and `risk:high` included: no label gives `fable`)."""
     if size == "S" and risk == "low" and kind != "bug":
         return "sonnet"
     return "opus"
+
+
+def expected_label_effort(kind, size, risk):
+    """#239: the labels' code effort: `xhigh` for `size:L` or `risk:high`, else none."""
+    return "xhigh" if size == "L" or risk == "high" else None
+
+
+def expected_review_effort(risk):
+    """#239: the labels' review effort: `xhigh` for `risk:high`, else none (the tier is always opus)."""
+    return "xhigh" if risk == "high" else None
 
 
 class RoutingCase(unittest.TestCase):
@@ -130,8 +141,9 @@ class LabelTier(RoutingCase):
             with self.subTest(kind=kind, size=size, risk=risk):
                 got = self.routing.label_tier(kind, size, risk)
                 self.assertEqual(got, expected_label_tier(kind, size, risk))
+                self.assertNotEqual(got, "fable")
                 seen.add(got)
-        self.assertEqual(seen, set(TIERS))  # the oracle exercises all three tiers
+        self.assertEqual(seen, {"sonnet", "opus"})  # the labels give sonnet or opus, never fable
 
     def test_rubric_pinned_cases(self):
         cases = [
@@ -139,32 +151,32 @@ class LabelTier(RoutingCase):
             ("chore", "S", "low", "sonnet"),
             ("refactor", "S", "low", "sonnet"),
             ("bug", "S", "low", "opus"),  # a bug is never sonnet
-            ("task", "S", "high", "fable"),  # risk:high beats size:S
-            ("task", "L", "low", "fable"),  # size:L beats risk:low
-            ("bug", "L", "high", "fable"),
+            ("task", "S", "high", "opus"),  # risk:high beats size:S: opus (at xhigh), not fable
+            ("task", "L", "low", "opus"),  # size:L beats risk:low: opus (at xhigh), not fable
+            ("bug", "L", "high", "opus"),
             ("task", "M", "low", "opus"),
-            ("task", "M", "high", "fable"),
+            ("task", "M", "high", "opus"),
             ("task", "S", None, "opus"),  # an unlabelled risk is not risk:low
             ("task", None, "low", "opus"),  # an unlabelled size is not size:S
             ("task", None, None, "opus"),
-            ("bug", None, "high", "fable"),
-            ("task", "L", None, "fable"),
+            ("bug", None, "high", "opus"),
+            ("task", "L", None, "opus"),
             # any kind but "bug" is sonnet at S/low, whatever its name
             ("docs", "S", "low", "sonnet"),
             ("spike", "S", "low", "sonnet"),
             ("", "S", "low", "sonnet"),
             ("unknown", "S", "low", "sonnet"),
-            ("docs", "S", "high", "fable"),
+            ("docs", "S", "high", "opus"),
             ("spike", "M", "low", "opus"),
-            ("unknown", "L", "low", "fable"),
+            ("unknown", "L", "low", "opus"),
         ]
         for kind, size, risk, want in cases:
             with self.subTest(kind=kind, size=size, risk=risk):
                 self.assertEqual(self.routing.label_tier(kind, size, risk), want)
 
-    def test_review_label_tier_is_fable_only_for_risk_high(self):
-        self.assertEqual(self.routing.review_label_tier("high"), "fable")
-        for risk in ("low", "medium", None, ""):
+    def test_review_label_tier_is_opus_for_every_risk(self):
+        # #239: risk:high no longer gives a Fable review; it gives Opus (at xhigh, see review_route)
+        for risk in ("high", "low", "medium", None, ""):
             with self.subTest(risk=risk):
                 self.assertEqual(self.routing.review_label_tier(risk), "opus")
 
@@ -584,11 +596,11 @@ class Routes(RoutingCase):
         d = dict(DEFAULTS)
         self.assertEqual(
             self.routing.code_route("task", "L", "high", d),
-            {"tier": "fable", "effort": None, "from": "labels", "labels_tier": "fable"},
+            {"tier": "opus", "effort": "xhigh", "from": "labels", "labels_tier": "opus"},
         )
         self.assertEqual(
             self.routing.review_route("high", d),
-            {"tier": "fable", "effort": "xhigh", "from": "labels", "labels_tier": "fable"},
+            {"tier": "opus", "effort": "xhigh", "from": "labels", "labels_tier": "opus"},
         )
         self.assertEqual(
             self.routing.review_route("low", d),
@@ -600,32 +612,35 @@ class Routes(RoutingCase):
         r = self.load()
         self.assertEqual(
             self.routing.code_route("task", "L", "high", r),
-            {"tier": "opus", "effort": "xhigh", "from": "HARNESS_CODE_TIER", "labels_tier": "fable"},
+            {"tier": "opus", "effort": "xhigh", "from": "HARNESS_CODE_TIER", "labels_tier": "opus"},
         )
+        # HARNESS_REVIEW_TIER replaces the labels' review rule, their xhigh included
         self.assertEqual(
             self.routing.review_route("high", r),
-            {"tier": "opus", "effort": None, "from": "HARNESS_REVIEW_TIER", "labels_tier": "fable"},
+            {"tier": "opus", "effort": None, "from": "HARNESS_REVIEW_TIER", "labels_tier": "opus"},
         )
 
     def test_code_route_with_and_without_the_override(self):
-        # without: the rubric, over a spread of labels, effort None, from labels
+        # without: the rubric, over a spread of labels, from labels; xhigh for size:L or risk:high only
         table = [
-            ("task", "S", "low", "sonnet"),
-            ("bug", "S", "low", "opus"),
-            ("task", "M", "low", "opus"),
-            ("task", None, None, "opus"),
-            ("task", "L", "low", "fable"),
-            ("chore", "S", "high", "fable"),
+            ("task", "S", "low", "sonnet", None),
+            ("bug", "S", "low", "opus", None),
+            ("task", "M", "low", "opus", None),
+            ("task", None, None, "opus", None),
+            ("task", "L", "low", "opus", "xhigh"),
+            ("chore", "S", "high", "opus", "xhigh"),
+            ("bug", "M", "high", "opus", "xhigh"),
+            ("refactor", "L", None, "opus", "xhigh"),
         ]
-        for kind, size, risk, want in table:
+        for kind, size, risk, want, effort in table:
             with self.subTest(kind=kind, size=size, risk=risk, override=False):
                 self.assertEqual(
                     self.routing.code_route(kind, size, risk, dict(DEFAULTS)),
-                    {"tier": want, "effort": None, "from": "labels", "labels_tier": want},
+                    {"tier": want, "effort": effort, "from": "labels", "labels_tier": want},
                 )
-        # with a tier override: it replaces the tier whatever the labels say
+        # with a tier override: it replaces the labels' tier and their effort, whatever the labels say
         for override in TIERS:
-            for kind, size, risk, labels in table:
+            for kind, size, risk, labels, _ in table:
                 with self.subTest(kind=kind, size=size, risk=risk, override=override):
                     routing = dict(DEFAULTS, code_tier=override)
                     self.assertEqual(
@@ -641,6 +656,14 @@ class Routes(RoutingCase):
                     self.routing.code_route("task", "S", "low", routing),
                     {"tier": "sonnet", "effort": effort, "from": "labels", "labels_tier": "sonnet"},
                 )
+            # #239: HARNESS_CODE_EFFORT wins over the labels' xhigh too
+            for size, risk in (("L", "low"), ("M", "high"), ("L", "high")):
+                with self.subTest(effort=effort, tier=None, size=size, risk=risk):
+                    routing = dict(DEFAULTS, code_effort=effort)
+                    self.assertEqual(
+                        self.routing.code_route("task", size, risk, routing),
+                        {"tier": "opus", "effort": effort, "from": "labels", "labels_tier": "opus"},
+                    )
             with self.subTest(effort=effort, tier="fable"):
                 routing = dict(DEFAULTS, code_tier="fable", code_effort=effort)
                 self.assertEqual(
@@ -655,16 +678,17 @@ class Routes(RoutingCase):
             {"tier": "opus", "effort": None, "from": "labels", "labels_tier": "opus"},
         )
 
-    def test_review_route_effort_is_xhigh_only_on_fable(self):
-        # without an override: the rubric decides, and fable carries xhigh
-        for risk, tier, effort in (("high", "fable", "xhigh"), ("low", "opus", None), (None, "opus", None)):
+    def test_review_route_effort_is_xhigh_on_risk_high_by_the_labels_or_on_fable(self):
+        # without an override: always opus; risk:high carries xhigh (#239: no longer fable)
+        for risk, tier, effort in (("high", "opus", "xhigh"), ("low", "opus", None), (None, "opus", None),
+                                   ("medium", "opus", None)):
             with self.subTest(risk=risk, override=None):
                 self.assertEqual(
                     self.routing.review_route(risk, dict(DEFAULTS)),
                     {"tier": tier, "effort": effort, "from": "labels", "labels_tier": tier},
                 )
-        # with an override: effort follows the resulting tier, from names the setting
-        for risk, labels in (("high", "fable"), ("low", "opus")):
+        # with an override: effort follows the resulting tier (xhigh on fable only), from names the setting
+        for risk, labels in (("high", "opus"), ("low", "opus")):
             for override in TIERS:
                 with self.subTest(risk=risk, override=override):
                     routing = dict(DEFAULTS, review_tier=override)
@@ -683,7 +707,7 @@ class Routes(RoutingCase):
                        wave_effort="xhigh")
         self.assertEqual(
             self.routing.review_route("high", routing),
-            {"tier": "fable", "effort": "xhigh", "from": "labels", "labels_tier": "fable"},
+            {"tier": "opus", "effort": "xhigh", "from": "labels", "labels_tier": "opus"},
         )
         self.assertEqual(
             self.routing.review_route("low", routing),
@@ -708,6 +732,78 @@ class Routes(RoutingCase):
         self.routing.code_route("task", "L", "high", routing)
         self.routing.review_route("high", routing)
         self.assertEqual(routing, before)
+
+
+class NoAutomaticFable(RoutingCase):
+    """Ticket #239: no route picks Fable on its own. size:L and risk:high give Opus at effort xhigh for the
+    coding stages; risk:high gives an Opus review at xhigh; S+low non-bug is still sonnet; everything else opus with
+    no effort. Fable comes only from a setting that names it (HARNESS_CODE_TIER / HARNESS_REVIEW_TIER = fable)."""
+
+    KINDS = ("task", "bug", "chore", "refactor", "docs", "")
+    SIZES = ("S", "M", "L", None)
+    RISKS = ("low", "medium", "high", None)
+
+    def test_code_route_by_the_labels_for_every_combination(self):
+        efforts = set()
+        for kind, size, risk in itertools.product(self.KINDS, self.SIZES, self.RISKS):
+            with self.subTest(kind=kind, size=size, risk=risk):
+                tier = expected_label_tier(kind, size, risk)
+                effort = expected_label_effort(kind, size, risk)
+                got = self.routing.code_route(kind, size, risk, dict(DEFAULTS))
+                self.assertEqual(got, {"tier": tier, "effort": effort, "from": "labels", "labels_tier": tier})
+                self.assertNotEqual(got["tier"], "fable")
+                efforts.add(effort)
+        self.assertEqual(efforts, {None, "xhigh"})  # both outcomes exercised
+
+    def test_review_route_by_the_labels_for_every_risk(self):
+        for risk in self.RISKS + ("",):
+            with self.subTest(risk=risk):
+                self.assertEqual(
+                    self.routing.review_route(risk, dict(DEFAULTS)),
+                    {"tier": "opus", "effort": expected_review_effort(risk), "from": "labels", "labels_tier": "opus"},
+                )
+
+    def test_the_labels_xhigh_is_exactly_size_l_or_risk_high(self):
+        # Each dimension on its own flips the effort: size L with a quiet risk, risk high with a quiet size.
+        cases = [
+            (("task", "M", "low"), None),
+            (("task", "L", "low"), "xhigh"),
+            (("task", "M", "high"), "xhigh"),
+            (("task", "S", "low"), None),
+            (("task", "S", "high"), "xhigh"),
+            (("bug", "S", "low"), None),
+            (("bug", "L", None), "xhigh"),
+            (("chore", None, "high"), "xhigh"),
+            (("chore", None, None), None),
+        ]
+        for (kind, size, risk), effort in cases:
+            with self.subTest(kind=kind, size=size, risk=risk):
+                self.assertEqual(self.routing.code_route(kind, size, risk, dict(DEFAULTS))["effort"], effort)
+
+    def test_explicit_fable_still_routes_to_fable(self):
+        for kind, size, risk in itertools.product(("task", "bug"), ("S", "M", "L"), ("low", "high")):
+            with self.subTest(stage="code", kind=kind, size=size, risk=risk):
+                got = self.routing.code_route(kind, size, risk, dict(DEFAULTS, code_tier="fable"))
+                self.assertEqual((got["tier"], got["from"]), ("fable", "HARNESS_CODE_TIER"))
+                self.assertEqual(got["labels_tier"], expected_label_tier(kind, size, risk))
+        for risk in ("low", "high", None):
+            with self.subTest(stage="review", risk=risk):
+                self.assertEqual(
+                    self.routing.review_route(risk, dict(DEFAULTS, review_tier="fable")),
+                    {"tier": "fable", "effort": "xhigh", "from": "HARNESS_REVIEW_TIER", "labels_tier": "opus"},
+                )
+
+    def test_explicit_fable_from_the_settings_file_end_to_end(self):
+        self.write_settings({"HARNESS_CODE_TIER": "Fable", "HARNESS_REVIEW_TIER": " FABLE "})
+        r = self.load()
+        self.assertEqual(self.routing.code_route("task", "L", "high", r)["tier"], "fable")
+        self.assertEqual(self.routing.review_route("high", r),
+                         {"tier": "fable", "effort": "xhigh", "from": "HARNESS_REVIEW_TIER", "labels_tier": "opus"})
+        # without the settings, the same labels never give fable
+        self.write_settings({})
+        r = self.load()
+        self.assertEqual(self.routing.code_route("task", "L", "high", r)["tier"], "opus")
+        self.assertEqual(self.routing.review_route("high", r)["tier"], "opus")
 
 
 class Module(RoutingCase):
