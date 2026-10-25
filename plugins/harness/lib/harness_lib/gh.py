@@ -17,6 +17,7 @@ import subprocess
 import time
 
 from harness_lib.cli import Problem
+from harness_lib.ghlimit import log_call, ms_since
 from harness_lib.text import first_line
 
 GH_ENV = {"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"}
@@ -97,19 +98,24 @@ def _text(texts, key, args, describe, exe, **fields):
 def gh_run(args, cwd, stdin=None, timeout=60, *, errors="replace", env=None, describe=describe, texts=None):
     """Run gh_exe() with `args` in `cwd` (None: the current directory), `stdin` as its input (None: /dev/null), in
     os.environ plus `env` (None: prompts disabled). The CompletedProcess, output decoded as utf-8 with `errors`,
-    whatever the exit; Problem when gh is missing, cannot start or runs past `timeout` seconds."""
+    whatever the exit; Problem when gh is missing, cannot start or runs past `timeout` seconds. A call that ran
+    is logged (ghlimit), with exit null when it timed out."""
     exe = gh_exe()
     io = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
     extra = env if env is not None else {"GH_PROMPT_DISABLED": "1"}
+    started = time.monotonic()
     try:
-        return subprocess.run([exe] + list(args), cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+        done = subprocess.run([exe] + list(args), cwd=cwd, capture_output=True, text=True, encoding="utf-8",
                               errors=errors, timeout=timeout, env=dict(os.environ, **extra), **io)
     except FileNotFoundError:
         raise Problem(_text(texts, "not_found", args, describe, exe)) from None
     except OSError as err:
         raise Problem(_text(texts, "cannot_run", args, describe, exe, why=err.strerror or err)) from None
     except subprocess.TimeoutExpired:
+        log_call(args, cwd=cwd, exit=None, ms=ms_since(started))
         raise Problem(_text(texts, "timed_out", args, describe, exe, timeout=timeout)) from None
+    log_call(args, cwd=cwd, exit=done.returncode, ms=ms_since(started))
+    return done
 
 
 def gh(args, cwd, stdin=None, timeout=60, *, pick=first_line, errors="replace", env=None, describe=describe,
@@ -141,14 +147,17 @@ def gh_json(args, cwd, *, pick=first_line, empty_ok=False, via=None, **kw):
 
 class GhBatch:
     """gh calls started side by side; results() waits for each until the shared deadline.
-    `budget_seconds` is only named in a timeout's message (the caller's own budget)."""
+    `budget_seconds` is only named in a timeout's message (the caller's own budget). Each call is logged
+    (ghlimit) once: when results() reads it, else when close() releases it (exit null when it was stopped)."""
 
     def __init__(self, gh, calls, cwd, deadline, *, budget_seconds, describe=describe_list_call):
         self.calls, self.deadline, self.procs = calls, deadline, []
         self.budget_seconds, self.describe = budget_seconds, describe
+        self.cwd, self.started, self.logged = cwd, [], set()
         env = dict(os.environ, **GH_ENV)
         try:
             for args in calls:
+                self.started.append(time.monotonic())
                 self.procs.append(subprocess.Popen([gh] + args, cwd=cwd, stdin=subprocess.DEVNULL,
                                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
                                                    start_new_session=True))
@@ -159,11 +168,12 @@ class GhBatch:
     def results(self):
         """One list of objects per call, in order; Problem naming the first call that failed."""
         out = []
-        for args, proc in zip(self.calls, self.procs):
+        for i, (args, proc) in enumerate(zip(self.calls, self.procs)):
             try:
                 stdout, stderr = proc.communicate(timeout=max(0.1, self.deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 raise Problem(f"{self.describe(args)} timed out after {self.budget_seconds} s") from None
+            self._log(i, proc.returncode)
             text = stdout.decode("utf-8", "replace")
             if proc.returncode != 0:
                 why = first_line(stderr.decode("utf-8", "replace")) or f"exit {proc.returncode}"
@@ -177,14 +187,22 @@ class GhBatch:
             out.append([x for x in data if isinstance(x, dict)])
         return out
 
+    def _log(self, i, code):
+        """Log call i with exit `code`, unless it already was."""
+        if i not in self.logged:
+            self.logged.add(i)
+            log_call(self.calls[i], cwd=self.cwd, exit=code, ms=ms_since(self.started[i]))
+
     def close(self):
-        """Stop every call still running and release the pipes."""
-        for proc in self.procs:
-            if proc.poll() is None:
+        """Stop every call still running and release the pipes; log each call results() did not read."""
+        for i, proc in enumerate(self.procs):
+            code = proc.poll()
+            if code is None:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except OSError:
                     pass
+            self._log(i, code)
             for pipe in (proc.stdout, proc.stderr):
                 try:
                     if pipe:

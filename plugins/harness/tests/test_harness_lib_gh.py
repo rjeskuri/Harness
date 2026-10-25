@@ -85,9 +85,17 @@ def setUpModule():
                          WRAPPER.format(python=sys.executable, fakegh=str(FAKEGH)))
     if str(LIB) not in sys.path:
         sys.path.insert(0, str(LIB))
+    # #187: GhBatch and run_side_by_side log each gh call under ~/.claude/harness/gh; the calls made in this
+    # process go to a temporary HOME, never the real one (clean_env() copies it into each test's environment).
+    W["home"] = os.path.join(W["tmp"], "home")
+    os.makedirs(W["home"])
+    W["home_patch"] = mock.patch.dict(os.environ, {"HOME": W["home"]})
+    W["home_patch"].start()
 
 
 def tearDownModule():
+    if "home_patch" in W:
+        W.pop("home_patch").stop()
     shutil.rmtree(W["tmp"], ignore_errors=True)
 
 
