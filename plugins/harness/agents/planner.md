@@ -17,7 +17,7 @@ The request in the user's words, the interview answers, pointers to the code (re
 - Tests are written before the code exists, by someone who has only your ticket. So the Context names the public functions, commands or endpoints the tests will call, with signatures and example inputs and outputs.
 - Labels. type: `task`, `bug` (something that works wrong today), `chore` (housekeeping), `refactor` (behavior unchanged, tests stay green). size: `S` one or two files in one sitting, `M` the normal case, `L` at the cap. risk: `high` when the change touches data loss, money, live systems, security, credentials or minors' data, else `low`. flags: `no-tests` only for docs- or config-only work; `needs-local` when the work needs this Mac's files or credentials; `priority:high` when the user said so.
 - Dependencies: `blocked_by` lists the indexes of tasks that must land first. Keep the graph shallow; most tasks should be independent.
-- What you cannot settle goes under `open_questions`. Do not guess at product behavior.
+- What you cannot settle about product behavior, or about anything hard to undo or touching security, credentials or personal data, goes under `open_questions`. Do not guess at product behavior. Implementation choices are left to the coder's rulings.
 
 ## Output
 JSON only, nothing around it:
