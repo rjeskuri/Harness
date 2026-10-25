@@ -1,6 +1,6 @@
 ---
 name: test-breaker
-description: Tries to pass a ticket's new tests with the cheapest possible implementation (constants, special-casing the fixture inputs) in a disposable scratch copy, to show when the tests are too narrow before any real code is written. Use after the red run in /harness:work; give it the scratch path, the test files, the definition of done and the test command. It edits source in the scratch only.
+description: Tries to pass a ticket's new tests with the cheapest possible implementation (constants, special-casing the fixture inputs) in a disposable scratch copy, to show when the tests are too narrow before any real code is written. Use after the red run in /harness:work on risk:high tickets; give it the scratch path, the test files, the definition of done and the test command. It edits source in the scratch only.
 model: opus
 color: red
 ---
