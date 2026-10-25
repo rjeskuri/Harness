@@ -20,7 +20,27 @@ the chain), restored after a subshell or a child shell, and moved for git by -C,
     redirection or tee to it, cp, mv, install, ln, rsync or dd into it, mv, rm, touch,
     truncate or chmod of it, and in-place edits (sed or gsed -i, perl -i, awk -i inplace,
     ed, patch). A path under <top>/.claude/worktrees/ or in a linked worktree belongs to
-    that worktree, and a path outside any repo is never refused;
+    that worktree, and a path outside any repo is never refused. A named path the Edit
+    rule exempts (under docs/agent/, or one git ignores) is allowed for every form, rm,
+    truncate and both sides of mv included; a directory holding a tracked file is not
+    ignored. A cp, mv, ln, install or rsync into an existing directory is judged by
+    where it lands, for the repo (the directory resolved and dest/<basename> of each
+    source) and for the exemption, which holds only when the resolved directory is
+    docs/agent or under it: into an ignored directory it is refused, since it may hold
+    a symlink into tracked files that the copy writes through. Under docs/agent/, it is
+    refused when dest/<basename of a source> exists and is not exempt itself
+    (docs/agent/x.md linked to the tracked README.md), and, for a recursive cp (-R,
+    -r, -a) or rsync (-r, -a, --recursive, --archive) or a source the shell expands
+    (glob, brace, $ or `), when any link in the directory (at any depth, if
+    recursive) is not exempt. A named destination keeps the rule for a named path: a
+    name that does not exist yet (`cp -R src data/restored`), and for ln -n or -h a
+    symlink to a directory (`ln -sfn ../.venv .venv`). The exemption
+    judges what the write reaches: never for a word with an unquoted glob (*, ?, [) or
+    brace expansion, nor for a path whose first component in the repo is .git, nor for
+    a spelling that differs in case from a tracked file it
+    names (git ls-files with :(icase) says); a symlink is exempt only when the file it
+    resolves to is exempt or lies outside every protected main working tree. The
+    refusal names the first target that is not exempt;
   - when the repo git runs in is on main or master with a commit: git commit, merge
     (except --ff-only), rebase, cherry-pick, revert, am, apply, reset, rm, mv, clean,
     restore, stash pop|apply, checkout of paths or -B main, switch -C main, branch -f, -m
@@ -28,7 +48,16 @@ the chain), restored after a subshell or a child shell, and moved for git by -C,
     push with no refspec, of HEAD, or deleting a remote branch. Aliases given with
     -c alias.<name>= are expanded first;
   - when the part runs in such a repo: python -c, node -e, or a program either reads from
-    a heredoc, that writes files;
+    a heredoc, that writes files, unless it has a path literal (a quoted string starting
+    with /, ~/, ./ or ../, holding a /, or a bare name with an extension) and every one,
+    resolved against the part's directory with ~ expanded, lies outside every protected
+    main working tree. A literal joined to a value known only at run time does not
+    count as outside: after + or += with a non-literal before it, an argument of any
+    .join( or .concat( call (os.path.join, path.join, str.join, String.concat) with a
+    non-literal argument before it or, for .concat(, a non-literal receiver, or an
+    f-string or template literal with an interpolation before a /. The literal check
+    is a heuristic: a path built at run time in a form it does not recognise is not
+    seen;
   - in every repo, on every branch: a force push (--force, -f, --force-with-lease or a
     +refspec), and a push that names main or master as the destination (main,
     HEAD:main, refs/heads/main, :main), --mirror, --all, or a matching (:) or wildcard
@@ -172,6 +201,21 @@ JS_WRITERS = re.compile(
     r"|truncateSync|symlink|symlinkSync)\s*\("
     r"|\bBun\.write\s*\("
 )
+# Path literals in an inline program: a quoted string (backslash escapes kept) that
+# starts with /, ~/, ./ or ../, holds a /, or is a bare file name with an extension.
+STRING_LITERAL = re.compile(r"""(["'`])((?:\\.|(?!\1)[^\\\n])*)\1""")
+BARE_FILE = re.compile(r"[A-Za-z0-9_.-]+[.][A-Za-z0-9]{1,8}$")
+# A path literal joined at run time: after + or +=, an argument of a .join( or
+# .concat( call, or an f-string or template literal with an interpolation before a /.
+STRING_PREFIX = re.compile(r"(?<![A-Za-z0-9_])[rRbBuUfF]{1,2}$")
+JOIN_CALL = re.compile(r"\.(join|concat)\s*\(")
+INTERPOLATION = re.compile(r"\{[^{}]*\}")
+LIST_PUNCTUATION = str.maketrans("", "", ",[]")
+INTERPOLATION_BEFORE_SLASH = re.compile(r"\{[^{}]*\}.*/")
+# What the shell expands in an unquoted word: a glob or a brace expansion. In the
+# unquoted spelling of a word, each quoted or escaped character is a NUL.
+SHELL_EXPANSION = re.compile(r"[*?[]|\{[^{}]*(?:,|\.\.)[^{}]*\}")
+WORD_BREAKS = " \t\r\n;|&()<>"
 
 
 def shown(text: str) -> str:
@@ -281,6 +325,18 @@ def notes_or_ignored(path: str, top: Path) -> bool:
     if rel.startswith(NOTES_DIR):
         return True
     return git(str(top), "check-ignore", "-q", "--", rel).returncode == 0
+
+
+def tracked_otherwise_spelled(path: str, top: Path, rel: str) -> bool:
+    """True when git tracks `path` (or a file under it) by a spelling of `rel` that
+    differs in case and names the same file: another spelling of a tracked file on a
+    case-insensitive file system, which check-ignore may report as ignored."""
+    listed = git(str(top), "ls-files", "-z", "--", f":(icase,literal){rel}").stdout
+    for entry in listed.split("\0"):
+        spelling = entry[: len(rel)]
+        if entry and spelling != rel and same_entry(os.path.join(str(top), spelling), path):
+            return True
+    return False
 
 
 def check_edit(data: dict, cwd: str) -> None:
@@ -874,8 +930,11 @@ def patch_args(args: list[str]) -> tuple[str | None, str | None, list[str], bool
 
 
 def copy_writes(name: str, args: list[str], cwd: str | None, options: set) -> list:
-    """(destination as written, path written) for cp, install, ln and mv: the
-    destination, or the name each source gets inside it when it is a directory."""
+    """(words as written, path written) for cp, install, ln and mv: the destination,
+    or the name each source gets inside it when it is a directory, with that source
+    word after the destination's; ln -n or -h treats a symlink to a directory as a
+    named file. branch_guard judges a copy by the destination (the first word) and the
+    sources' names in it (copy_holder); tests_first judges each path."""
     target = option_value(args, ("-t", "--target-directory"))
     plain = plain_args(args, options)
     if target is not None:
@@ -885,22 +944,29 @@ def copy_writes(name: str, args: list[str], cwd: str | None, options: set) -> li
     elif len(plain) >= 2:
         dest, sources = plain[-1], plain[:-1]
         full = absolute(dest, cwd)
+        no_follow = name == "ln" and (short_flag(args, "n") or short_flag(args, "h"))
         into = (
             dest.endswith("/")
             or len(sources) > 1
-            or (full is not None and os.path.isdir(full))
+            or (
+                full is not None
+                and os.path.isdir(full)
+                and not (no_follow and os.path.islink(full))
+            )
         )
     else:
         return []
     if not into:
-        return [(dest, dest)]
+        return [((dest,), dest)]
     return [
-        (dest, os.path.join(dest, os.path.basename(s.rstrip("/")) or s))
+        ((dest, s), os.path.join(dest, os.path.basename(s.rstrip("/")) or s))
         for s in sources
     ]
 
 
-def rsync_dest(args: list[str]) -> list[str]:
+def rsync_copy(args: list[str]) -> tuple[str, list[str]] | None:
+    """(destination, sources) for `rsync args`; None without two paths or for a remote
+    (host:path) destination."""
     plain: list[str] = []
     k = 0
     while k < len(args):
@@ -916,10 +982,10 @@ def rsync_dest(args: list[str]) -> list[str]:
         elif not a.startswith("-"):
             plain.append(a)
     if len(plain) < 2:
-        return []
+        return None
     if REMOTE_PATH.match(plain[-1]) and not plain[-1].startswith("/"):
-        return []  # host:path
-    return plain[-1:]
+        return None  # host:path
+    return plain[-1], plain[:-1]
 
 
 def edits_in_place(name: str, args: list[str]) -> bool:
@@ -934,7 +1000,10 @@ def edits_in_place(name: str, args: list[str]) -> bool:
 
 def file_writes(name: str, args: list[str], cwd: str | None) -> list:
     """(as written, path, why, exact) for each file `name args` creates, changes or
-    removes; `exact` is False when the path is only the directory the files are in."""
+    removes; `exact` is False when the path is only the directory the files are in.
+    As written is the word, or for a copy destination (cp, mv, ln, install, rsync) the
+    tuple of words the path comes from, the destination first and then the sources
+    (none for cp, mv, ln or install to a named file)."""
 
     def changes(paths: list[str]) -> list:
         return [(p, p, f"{name} changes {p} inside the repo", True) for p in paths]
@@ -965,7 +1034,11 @@ def file_writes(name: str, args: list[str], cwd: str | None) -> list:
     if name == "dd":
         return changes([a[3:] for a in args if a.startswith("of=")])
     if name == "rsync":
-        return changes(rsync_dest(args))
+        copy = rsync_copy(args)
+        if copy is None:
+            return []
+        dest, sources = copy
+        return [((dest, *sources), dest, f"rsync changes {dest} inside the repo", True)]
     if name in ("cp", "mv", "ln", "install"):
         if name == "install" and short_flag(args, "d"):
             return []  # creates directories, as mkdir does
@@ -976,8 +1049,9 @@ def file_writes(name: str, args: list[str], cwd: str | None) -> list:
             target = option_value(args, ("-t", "--target-directory"))
             moved = plain if target is not None else plain[:-1]
             found.extend(changes(moved))
-        for dest, path in copy_writes(name, args, cwd, options):
-            found.append((dest, path, f"{name} changes {dest} inside the repo", True))
+        for words, path in copy_writes(name, args, cwd, options):
+            why = f"{name} changes {words[0]} inside the repo"
+            found.append((words, path, why, True))
         return found
     if name == "patch":
         directory, out, files, dry = patch_args(args)
@@ -1059,15 +1133,19 @@ def inline_programs(name: str, args: list[str], part: Part) -> list[str]:
     return programs
 
 
+def program_writes(name: str, code: str) -> str | None:
+    """Why the python or node program `code` writes files, or None."""
+    if PYTHON.match(name):
+        return python_writes(code)
+    if JS_WRITERS.search(code):
+        return "node writes, moves or deletes files"
+    return None
+
+
 def code_writes(name: str, args: list[str], part: Part) -> str | None:
     """Why the python or node program `part` runs inline writes files, or None."""
     for code in inline_programs(name, args, part):
-        if PYTHON.match(name):
-            why = python_writes(code)
-        else:
-            why = None
-            if JS_WRITERS.search(code):
-                why = "node writes, moves or deletes files"
+        why = program_writes(name, code)
         if why:
             return why
     return None
@@ -1107,6 +1185,255 @@ def holder(state: dict, path: str | None) -> tuple[Path, str] | None:
     return found
 
 
+def globbing_words(text: str) -> set[str]:
+    """The words of the shell text `text`, quotes removed, that hold an unquoted glob
+    (*, ?, [) or brace expansion ({a,b}, {a..b}): the shell expands them, so they do not
+    name the files a command writes."""
+    found: set[str] = set()
+    word = raw = quote = ""
+    started = False
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if (quote == "'" and c != "'") or (quote == '"' and c not in '"\\'):
+            word, raw = word + c, raw + "\0"
+        elif quote and c == quote:
+            quote = ""
+        elif quote == '"':  # a backslash inside double quotes
+            if text[i + 1 : i + 2] in ('"', "\\", "$", "`"):
+                i += 1
+            word, raw = word + text[i : i + 1], raw + "\0"
+        elif c in WORD_BREAKS:
+            if started and SHELL_EXPANSION.search(raw):
+                found.add(word)
+            word = raw = ""
+            started = False
+        elif c == "\\":
+            i += 1
+            word, raw, started = word + text[i : i + 1], raw + "\0", True
+        elif c in "'\"":
+            quote, started = c, True
+        else:
+            word, raw, started = word + c, raw + c, True
+        i += 1
+    if started and SHELL_EXPANSION.search(raw):
+        found.add(word)
+    return found
+
+
+def expanded(text: str, globbing: set[str]) -> bool:
+    """True when the write target `text` comes from one of the `globbing` words (the
+    word itself, or its end, as in dd's of=)."""
+    return bool(text) and any(word.endswith(text) for word in globbing)
+
+
+def written_exempt(state: dict, path: str, top: Path) -> bool:
+    """True when a Bash write to the absolute `path` in the protected repo `top` gets the
+    Edit exemption: the name is under docs/agent/ or ignored, is not under .git and is
+    not another case spelling of a tracked file; and when it is a symlink, the file it
+    reaches is exempt as well or lies outside every protected main working tree."""
+    if not name_exempt(path, top):
+        return False
+    if not os.path.islink(path):
+        return True
+    target = os.path.realpath(path)
+    found = holder(state, target)
+    if found is None:
+        return True
+    return not os.path.islink(target) and name_exempt(target, found[0])
+
+
+def recursive_copy(name: str, args: list[str]) -> bool:
+    """True for cp -R, -r or -a and rsync -r or -a, in a cluster or spelled out
+    (rsync -R is --relative)."""
+    letters = {"cp": "Rra", "rsync": "ra"}.get(name, "")
+    if not letters:
+        return False
+    return any(short_flag(args, c) for c in letters) or bool(
+        {"--recursive", "--archive"} & set(args)
+    )
+
+
+def destination_exempt(state: dict, path: str | None, top: Path) -> bool:
+    """written_exempt for a named destination of a cp, mv, ln, install or rsync:
+    docs/agent itself counts as under it."""
+    if path is None:
+        return False
+    if repo_relative(path, top) == NOTES_DIR.rstrip("/") and not os.path.islink(path):
+        return True
+    return written_exempt(state, path, top)
+
+
+def links_out(state: dict, directory: str, top: Path, deep: bool) -> bool:
+    """True when a symlink in `directory` (or anywhere under it, when `deep`) is not
+    written_exempt: a copy into the directory may write through it."""
+    for root, dirs, files in os.walk(directory):
+        for name in dirs + files:
+            entry = os.path.join(root, name)
+            if os.path.islink(entry) and not written_exempt(state, entry, top):
+                return True
+        if not deep:
+            break
+    return False
+
+
+def into_notes(
+    state: dict, real: str, sources: tuple, recursive: bool, top: Path, globbing: set
+) -> bool:
+    """True when a copy of `sources` into the existing directory `real` (resolved) of
+    the repo `top` gets the exemption: `real` is docs/agent or under it and no link
+    there leads out of the exemption. A copy that is not recursive, of literal
+    sources, checks the name each source gets (dest/<basename>) when it exists; a
+    recursive copy, or a source the shell expands (glob, brace, $ or `) and so names
+    no file that lands, checks every link in the directory, at any depth when
+    recursive (BSD `cp -R src/ dest` copies the contents of src)."""
+    rel = repo_relative(real, top)
+    if rel is None or not (rel + "/").startswith(NOTES_DIR):
+        return False
+    if recursive or any(expanded(s, globbing) or "$" in s or "`" in s for s in sources):
+        return not links_out(state, real, top, recursive)
+    for source in sources:
+        name = os.path.basename(source.rstrip("/"))
+        inside = os.path.join(real, name)
+        if name in ("", ".", "..") or not os.path.lexists(inside):
+            continue
+        if not written_exempt(state, inside, top):
+            return False
+    return True
+
+
+def copy_holder(
+    state: dict, words: tuple, recursive: bool, cwd: str | None, globbing: set
+) -> tuple[Path, str] | None:
+    """The protected repo that a cp, mv, ln, install or rsync with `words` (the
+    destination, then the sources) writes in without the exemption; None when it may
+    run. A named destination (no sources, or not an existing directory) is judged by
+    its name. Into an existing directory, holder() judges where the copy lands, the
+    directory resolved and dest/<basename> of each source, and only a directory under
+    docs/agent/ is exempt (into_notes): into an ignored directory is refused."""
+    dest, sources = words[0], words[1:]
+    path = absolute(dest, cwd)
+    spread = expanded(dest, globbing)
+    if not sources or path is None or not os.path.isdir(path):
+        found = holder(state, path)
+        if found is None or (not spread and destination_exempt(state, path, found[0])):
+            return None
+        return found
+    real = os.path.realpath(path)
+    landing = [real] + [
+        os.path.join(path, os.path.basename(s.rstrip("/")) or s) for s in sources
+    ]
+    for target in landing:
+        found = holder(state, target)
+        if found is None:
+            continue
+        if spread or not into_notes(state, real, sources, recursive, found[0], globbing):
+            return found
+    return None
+
+
+def name_exempt(path: str, top: Path) -> bool:
+    """The name checks of written_exempt for the absolute `path` in the repo `top`."""
+    rel = repo_relative(path, top)
+    if rel is None or rel.split("/")[0] == ".git" or not notes_or_ignored(path, top):
+        return False
+    return not tracked_otherwise_spelled(path, top, rel)
+
+
+def literal_spans(code: str) -> list[tuple[int, int, str, bool]]:
+    """(start, end, text, template) for each quoted string in `code`: start includes a
+    string prefix such as f or r, and template is True for an f-string or a backtick
+    template literal."""
+    spans = []
+    for m in STRING_LITERAL.finditer(code):
+        prefix = STRING_PREFIX.search(code, 0, m.start())
+        start = prefix.start() if prefix else m.start()
+        template = m.group(1) == "`" or bool(prefix and "f" in prefix.group(0).lower())
+        spans.append((start, m.end(), m.group(2), template))
+    return spans
+
+
+def is_path_literal(text: str) -> bool:
+    """A string that looks like a path: starting with /, ~/, ./ or ../, holding a /
+    anywhere (which covers those), or a bare file name with an extension."""
+    return "/" in text or bool(BARE_FILE.match(text))
+
+
+def fixed(span: tuple[int, int, str, bool]) -> bool:
+    """True for a string whose value is in the program: not a template that interpolates."""
+    return not (span[3] and INTERPOLATION.search(span[2]))
+
+
+def joined_at_run_time(code: str, spans: list, k: int) -> bool:
+    """True when the string spans[k] of `code` is joined to a value known only at run
+    time: + or += with a non-literal before it, an argument of a .join( or .concat(
+    call with a non-literal argument before it or, for .concat(, a non-literal
+    receiver, or a template interpolation before a /. A heuristic: a path built at
+    run time in another form is not seen."""
+    start, _, text, template = spans[k]
+    if template and INTERPOLATION_BEFORE_SLASH.search(text):
+        return True
+    ending = {span[1]: span for span in spans}
+    before = code[:start].rstrip()
+    while before.endswith(("+", "+=")):
+        if before.endswith(("+=", "++")):
+            return True
+        before = before[:-1].rstrip()
+        span = ending.get(len(before))
+        if span is None or not fixed(span):
+            return True
+        before = code[: span[0]].rstrip()
+    for m in JOIN_CALL.finditer(code):
+        opened = m.end() - 1
+        if not opened < start < closing(code, opened):
+            continue
+        if m.group(1) == "concat":
+            receiver = ending.get(len(code[: m.start()].rstrip()))
+            if receiver is None or not fixed(receiver):
+                return True
+        rest, j = "", opened + 1
+        for span in spans:
+            if opened < span[0] < start:
+                if not fixed(span):
+                    return True
+                rest += code[j : span[0]]
+                j = span[1]
+        rest += code[j:start]
+        if rest.translate(LIST_PUNCTUATION).strip():  # a list of literals is fixed
+            return True
+    return False
+
+
+def outside_only(state: dict, code: str, cwd: str) -> bool:
+    """True when `code` has a path literal, none is joined to a value known only at run
+    time, and every one, resolved against `cwd` (~ expanded), lies outside every
+    protected main working tree."""
+    spans = literal_spans(code)
+    literals = [k for k, span in enumerate(spans) if is_path_literal(span[2])]
+    if not literals:
+        return False
+    for k in literals:
+        if joined_at_run_time(code, spans, k):
+            return False
+        text = spans[k][2]
+        path = os.path.expanduser(text) if text.startswith("~/") else text
+        if holder(state, os.path.normpath(os.path.join(cwd, path))) is not None:
+            return False
+    return True
+
+
+def program_refusal(
+    state: dict, name: str, args: list[str], part: Part, cwd: str
+) -> str | None:
+    """Why an inline python or node program `part` runs writes files, unless every path
+    literal in it lies outside the protected repos; None when none must be refused."""
+    for code in inline_programs(name, args, part):
+        why = program_writes(name, code)
+        if why and not outside_only(state, code, cwd):
+            return why
+    return None
+
+
 def part_refusal(state: dict, part: Part, name: str, args: list[str]) -> tuple | None:
     """(text, why, top, branch, advice) when `part` must not run; branch is None for the
     rules that hold on every branch."""
@@ -1115,8 +1442,17 @@ def part_refusal(state: dict, part: Part, name: str, args: list[str]) -> tuple |
     if name == "git" and is_force_push(sub, rest):
         why = "a force push rewrites history"
         return part.text, why, toplevel(where), None, FORCE_ADVICE
-    for _, path, why, _ in writes(part, name, args, cwd):
-        found = holder(state, path)
+    globbing = None
+    for text, path, why, exact in writes(part, name, args, cwd):
+        if globbing is None:
+            globbing = globbing_words(part.text)
+        if isinstance(text, tuple):  # a copy: judged by where it lands
+            found = copy_holder(state, text, recursive_copy(name, args), cwd, globbing)
+        else:
+            found = holder(state, path)
+            exempt = exact and not expanded(text, globbing)
+            if found is not None and exempt and written_exempt(state, path, found[0]):
+                found = None
         if found is not None:
             return part.text, why, found[0], found[1], ADVICE
     if name == "git":
@@ -1131,7 +1467,7 @@ def part_refusal(state: dict, part: Part, name: str, args: list[str]) -> tuple |
                 return part.text, why, toplevel(where), None, PUSH_ADVICE
     here = repo_at(state, cwd)
     if here is not None:
-        why = code_writes(name, args, part)
+        why = program_refusal(state, name, args, part, cwd)
         if why:
             return part.text, why, here[0], here[1], ADVICE
     return None

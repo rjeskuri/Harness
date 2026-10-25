@@ -4967,6 +4967,493 @@ class SkillWording(unittest.TestCase):
                 self.assertTrue(any(p.startswith(fault) for p in problems), (fault, problems))
 
 
+# =========================================================================== #178: routed model and effort in the docs
+# `effort` from `harness-board tier N [--stage review] --json` is passed only when it is not null: a condition (when,
+# whenever, if, unless) carries the null, or the text says null means pass none.
+NOT_NULL = re.compile(r"\b(?:when|whenever|if|where|once)\b[^.;]{0,50}?(?:\bnot `?null\b|\bnon-null\b|\bisn't `?null\b)"
+                      r"|\bunless\b[^.;]{0,40}?\bnull\b"
+                      r"|\bnull\b[^.;]{0,20}\bmeans (?:pass(?:ing)? )?(?:none|nothing|no effort|no `?effort)"
+                      r"|\bpass(?:es)? (?:none|nothing|no effort|no `effort`)\b[^.;]{0,20}\b(?:when|if)\b[^.;]{0,30}\bnull\b")
+# Wording that passes the effort whatever it is, or says it is never null.
+NULL_INVERT = re.compile(r"\bwhether or not\b|\beven (?:when|if)\b|\bregardless\b|\bno matter\b|\bin practice\b"
+                         r"|\bnever (?:be )?`?null\b|\balways\b[^.;]{0,40}\beffort\b|\beffort\b[^.;]{0,40}\balways\b")
+PASS_WORD = re.compile(r"\bpass(?:es|ed|ing)?\b")
+# The effort passed is the one the tool printed, not a literal one.
+EFFORT_FROM_JSON = re.compile(r"\b(?:its|that|the printed|the routed|the json'?s?|the tool'?s?)\s+`?effort\b"
+                              r"|`effort` (?:field|value)\b|\beffort (?:field|value)\b|harness-board tier n\b[^.;]*--json"
+                              r"|\bprint(?:s|ed)?\b[^.;]{0,40}\beffort\b|\beffort\b[^.;]{0,30}\b(?:it|the tool|the json) "
+                              r"(?:prints|printed|gives|says)\b")
+EFFORT_LITERAL = re.compile(r"\beffort:\s*`?\s*(?:low|medium|high|max)\b|\b(?:low|medium|high|max) effort\b")
+# Escalation counts from the tier the tool printed (the overridden one), not from the labels.
+ONE_TIER_UP = re.compile(r"\bone tier (?:up|higher|above)(?: from| than| over)? (?P<src>[^.;,()]{0,60})")
+PRINTED_SOURCE = re.compile(r"\b(?:printed|prints|the tool|harness-board tier|json|routed)\b|`tier`"
+                            r"|^(?:that|this|the same|its) tier\b|^(?:it|that|there)\b")
+FABLE_XHIGH = re.compile(r"model: fable`?.{0,40}`?effort: xhigh|effort: xhigh`?.{0,40}`?model: fable")
+CODE_SETTINGS = ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT")
+ROUTING_SETTINGS = ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER")
+SETTINGS_WORD = re.compile(r"\b(?:these|the|routing|project's|its|those|such) settings?\b(?!\.json)")
+SETTING_NAME = re.compile(r"\bharness_(?:code_tier|code_effort|review_tier|ultrareview)\b")
+# A setting that is named only to be dismissed, or labels that overrule a setting the project made.
+DISMISS = re.compile(r"\bdeprecated\b|\bobsolete\b|\bunused\b|\b(?:nobody|no one|none of us) uses?\b|\bdisregard\w*"
+                     r"|\bignor(?:e|es|ed|ing)\b|\bdiscard\w*|\bdrop(?:s|ped)?\b|\bno effect\b|\bhave no say\b"
+                     r"|\bnever (?:read|used|consulted|applied|passed|honou?red)\b"
+                     r"|\b(?:is|are) not (?:read|used|consulted|applied|passed|honou?red)\b")
+LABELS_OVERRULE = re.compile(r"\blabels?(?: rubric)?\b(?P<gap>[^.;]{0,25}?)\b(?:overrul\w*|overrid\w*|wins?|beats?"
+                             r"|takes? precedence|supersed\w*|trumps?)\b")
+LABELS_DISOWNED = re.compile(r"\blabels?(?: rubric)? (?:never|no longer|do not|don't|does not|doesn't|cannot|can't)\b"
+                             r"|\blabels?(?: rubric)? (?:decide|decides|give|gives|set|sets|pick|picks) (?:nothing|none)\b")
+UNSET = (r"(?:otherwise|else|when (?:\S+ ){0,4}?(?:unset|not set|absent)|if (?:\S+ ){0,4}?(?:unset|not set|absent)"
+         r"|unset|not set|without (?:them|it|any|one|a setting|the settings?)|in their absence|(?:with )?none (?:is |are )?set)")
+LABEL_VERB = (r"(?:decide|decides|give|gives|set|sets|pick|picks|choose|chooses|apply|applies|rule|rules|govern|governs"
+              r"|do|does|hold|holds|determine|determines|route|routes)")
+LABELS_THEN_UNSET = re.compile(r"\blabels?(?: rubric)?\b(?: " + LABEL_VERB + r"\b)?(?:[^.;,]{0,40}?\b" + UNSET
+                               + r"|,? unless (?:\S+ ){0,3}?sets?)\b")
+UNSET_THEN_LABELS = re.compile(r"\b(?P<unset>" + UNSET + r")\b(?P<gap>,?\s+(?:\S+ ){0,4}?)labels?(?: rubric)?\b"
+                               r"(?! (?:decide|decides|give|gives|do|does) (?:nothing|none)\b)")
+FALLS_BACK = re.compile(r"\bfalls? back (?:on|to) (?:the )?(?:ticket's )?(?:labels?|label rubric)\b")
+SETTING_VERB = re.compile(r"\b(?:decide|decides|override|overrides|replace|replaces|give|gives|pick|picks|choose"
+                          r"|chooses|win|wins|take precedence|takes precedence|apply|applies|govern|governs|determine"
+                          r"|determines|route|routes|supersede|supersedes|set the|sets the|rule|rules)\b")
+FROM_SETTING = re.compile(r"\b(?:come|comes|taken|read|set|sets|picked)\b[^.;]{0,20}\bfrom (?:the project's |a project's |its )?"
+                          r"`?harness_(?:code_tier|code_effort|review_tier)\b")
+
+
+def flat(text):
+    return " ".join(text.split())
+
+
+def doc_units(text):
+    """The text as prose units: each table row and each list item is its own unit, a paragraph's lines are joined."""
+    units = []
+    for block in blocks(prose(text)):
+        cur = None
+        for line in block:
+            if line.lstrip().startswith("|") or LIST_ITEM.match(line) or line.lstrip().startswith("#"):
+                if cur is not None:
+                    units.append(cur)
+                cur = line.strip()
+            else:
+                cur = line.strip() if cur is None else cur + " " + line.strip()
+        if cur is not None:
+            units.append(cur)
+    return units
+
+
+def doc_sentences(text):
+    return [s for u in doc_units(text) for s in sentences_of(flat(u))]
+
+
+def affirmed(text, pattern):
+    """The matches of `pattern` in lower-cased `text` that no negation precedes and no 'nothing'/'none' follows."""
+    out = []
+    for m in re.finditer(pattern, text):
+        if negated(text, m.start()) or re.match(r"\s+(?:nothing|none|no)\b", text[m.end():]):
+            continue
+        out.append(m)
+    return out
+
+
+def labels_decide_when_unset(text):
+    """True when one sentence of `text` names a routing setting (or the settings) and says the labels decide when the
+    setting is unset ("..., the labels otherwise", "unset, the label rubric decides", "otherwise the labels decide")."""
+    for s in doc_sentences(text):
+        low = s.lower()
+        if not (SETTING_NAME.search(low) or SETTINGS_WORD.search(low)):
+            continue
+        if LABELS_DISOWNED.search(low):
+            continue
+        hits = [m for m in LABELS_THEN_UNSET.finditer(low) if not negated(low, m.start())]
+        hits += [m for m in UNSET_THEN_LABELS.finditer(low)
+                 if not negated(low, m.start()) and not negated(m.group("gap"), len(m.group("gap")))]
+        hits += [m for m in FALLS_BACK.finditer(low) if not negated(low, m.start())]
+        if hits:
+            return True
+    return False
+
+
+def settings_decide(text, names=CODE_SETTINGS):
+    """True when a sentence makes one of `names` decide: the setting is the subject of an affirmed decide/override verb
+    (no labels between them), or the tier or effort comes from it."""
+    for s in doc_sentences(text):
+        low = s.lower()
+        for name in names:
+            for m in re.finditer(re.escape(name.lower()), low):
+                rest = re.split(r"[.;](?=\s|$)", low[m.end():])[0][:140]
+                verbs = affirmed(rest, SETTING_VERB.pattern)
+                if verbs and not re.search(r"\blabels?\b", rest[:verbs[0].start()]):
+                    return True
+        if any(not negated(low, m.start()) for m in FROM_SETTING.finditer(low)):
+            return True
+    return False
+
+
+def setting_problems(text):
+    """The sentences of `text` that name a routing setting and dismiss it, or let the labels overrule it."""
+    bad = []
+    for s in doc_sentences(text):
+        low = s.lower()
+        if not SETTING_NAME.search(low) and not SETTINGS_WORD.search(low):
+            continue
+        if DISMISS.search(low) or LABELS_DISOWNED.search(low):
+            bad.append(s)
+            continue
+        for m in LABELS_OVERRULE.finditer(low):
+            if not re.search(r"\b(?:otherwise|else|unset|not set)\b", m.group("gap")) and not negated(low, m.start()):
+                bad.append(s)
+                break
+    return bad
+
+
+def withheld_effort(text):
+    """The negated 'pass' phrases in lower-cased `text` that withhold the effort other than when it is null ("never
+    pass that effort"); "do not pass one when it is null" is the rule, not a problem."""
+    bad = []
+    for m in PASS_WORD.finditer(text):
+        rest = re.split(r"[.;,]", text[m.end():])[0]
+        if not negated(text, m.start()) or not re.search(r"\beffort\b|\bone\b|\bit\b", rest[:40]):
+            continue
+        if re.search(r"\b(?:when|if)\b[^.;,]*\bnull\b", rest) and not re.search(r"\bnot `?null\b|\bnon-null\b", rest):
+            continue
+        bad.append(text[m.start():m.end() + len(rest)])
+    return bad
+
+
+def ultra_off_problems(sentence):
+    """What a sentence about ultrareview and HARNESS_ULTRAREVIEW gets wrong: risk:high PRs get ultrareview, and the
+    project's HARNESS_ULTRAREVIEW=off is the exception."""
+    low = sentence.lower()
+    problems = []
+    if "risk:high" not in low:
+        problems.append("no risk:high")
+    if not re.search(r"ultrareview", re.sub(r"harness_ultrareview", "", low)):
+        problems.append("no ultrareview")
+    if not affirmed(low, r"\b(?:get|gets|receive|receives|run|runs|goes to|go to)\b"):
+        problems.append("risk:high PRs do not get it")
+    exception = re.search(r"\b(?:unless|except|but not when|other than when|save when)\b[^.;]{0,80}"
+                          r"harness_ultrareview\W{0,3}(?:=|is |to |set to )?\W{0,2}off\b", low)
+    when_off = re.search(r"\b(?:when|if|where|once)\b[^.;]{0,60}harness_ultrareview\W{0,3}(?:=|is |to |set to )?\W{0,2}"
+                         r"off\b[^.]*\b(?:nothing|none|skip\w*|not|no)\b", low)
+    if not (exception or when_off):
+        problems.append("HARNESS_ULTRAREVIEW=off is not the exception")
+    if re.search(r"\bnever\b|\bon or off\b|\bregardless\b|\bwhether\b|\beither way\b|\balways\b", low):
+        problems.append("unconditional")
+    return problems
+
+
+# Contradictions a doc may add next to a correct routing sentence; each is checked on every sentence of the text.
+# A setting bound to the wrong stage or quantity: the object of the setting's own verb (a list of settings is a
+# collective subject and is not checked).
+ROUTING_SETTING = re.compile(r"\bharness_(?P<kind>code_tier|code_effort|review_tier)\b")
+SETTING_LIST_GLUE = re.compile(r"[\s`,/]*(?:\band\b|\bor\b|\band/or\b)?[\s`,/]*")
+BOUND_VERB = re.compile(r"^\W*(?:[\w'`-]+\s+){0,3}?\b(?:decide|decides|set|sets|pick|picks|choose|chooses|give|gives"
+                        r"|override|overrides|replace|replaces|apply|applies|govern|governs|determine|determines"
+                        r"|route|routes|rule|rules|control|controls|is|are)\b\s+(?P<obj>(?:[^\s.;]+\s+){0,3}[^\s.;]+)")
+WRONG_TARGET = {"code_tier": r"\breview\w*|\beffort\b", "code_effort": r"\breview\w*|\btier\b|\bmodel\b",
+                "review_tier": r"\bcoder'?s?\b|\btest-author'?s?\b|\bbreaker'?s?\b|\beffort\b"}
+# The settings scoped to some tickets ("for tickets with no labels", "on risk:high tickets only", "Sonnet tickets").
+SCOPED = re.compile(r"\btickets? only\b|\bonly\b(?![^.;]{0,30}\bnull\b)|\bno labels?\b|\bunlabell?ed\b"
+                    r"|\bwithout (?:any |size |risk |size or risk )?labels\b|\b(?:sonnet|opus|fable) tickets?\b")
+# A null effort that is passed anyway, or replaced by a default.
+NULL_PASSED = re.compile(r"\b(?:when|whenever|if|where|once)\b(?P<cond>[^.;,]{0,40}?)\bnull\b[^.;]{0,15}?"
+                         r"\b(?:pass|use|send|give|set|default)\w*\b(?! (?:none|nothing|no)\b)")
+NULL_DEFAULT = re.compile(r"\bnull included\b|\bincluding (?:a )?null\b|\beven (?:a )?null\b"
+                          r"|\bnull\b[^.;]{0,40}\binstead\b|\bdefaults? to\b|\bnull (?:or not|too|as well)\b|\bnull or\b")
+# A reviewer that takes the coder's routing, or a review rule limited to the first review.
+REVIEWER_BORROWS = re.compile(r"\bfirst review\b|\bfix[- ]round review\w*"
+                              r"|\b(?:reuses?|reusing|same as|taken from|takes|from) (?:the )?coder'?s?\b|\bcoder's (?:model|effort|tier|`?harness-board)\b")
+ESCALATION_FROM_LABELS = re.compile(r"\blabels?\b|\bbefore\b[^.;]{0,30}harness_\w+|\brubric\b")
+
+
+def prose(text):
+    """`text` without HTML comments and fenced code blocks."""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    return re.sub(r"(?ms)^\s*```.*?^\s*```[^\n]*$", "", text)
+
+
+def binding_problems(low):
+    """The settings in lower-cased `low` whose own verb binds them to another stage or quantity ("HARNESS_CODE_EFFORT
+    decides the reviewer's tier", "HARNESS_REVIEW_TIER decides the coder's tier")."""
+    bad = []
+    ms = list(ROUTING_SETTING.finditer(low))
+    for i, m in enumerate(ms):
+        if i and SETTING_LIST_GLUE.fullmatch(low[ms[i - 1].end():m.start()]):
+            continue
+        if i + 1 < len(ms) and SETTING_LIST_GLUE.fullmatch(low[m.end():ms[i + 1].start()]):
+            continue
+        rest = low[m.end():ms[i + 1].start() if i + 1 < len(ms) else len(low)]
+        v = BOUND_VERB.match(rest)
+        if not v:
+            continue
+        obj = v.group("obj")
+        for x in re.finditer(WRONG_TARGET[m.group("kind")], obj):
+            if not negated(obj, x.start()) and not re.search(r"\b(?:but|except|other than)\b", obj[:x.start()]):
+                bad.append(f"{m.group(0)} bound to {obj!r}")
+                break
+    return bad
+
+
+def routing_contradictions(text):
+    """(sentence, fault) for every sentence of `text` that binds a setting to the wrong stage, scopes the settings to
+    some tickets, passes a null effort or a default, puts Fable's xhigh on a routed effort, or gives the reviewer
+    the coder's routing."""
+    bad = []
+    for s in doc_sentences(prose(text)):
+        low = s.lower()
+        faults = binding_problems(low)
+        if ROUTING_SETTING.search(low):
+            faults += [f"scoped: {m.group(0)!r}" for m in SCOPED.finditer(low) if not negated(low, m.start())]
+        faults += [f"null passed: {m.group(0)!r}" for m in NULL_PASSED.finditer(low)
+                   if not re.search(r"\bnot\b|\bnon-|\bisn't\b", m.group("cond"))]
+        faults += [f"null default: {m.group(0)!r}" for m in NULL_DEFAULT.finditer(low) if not negated(low, m.start())]
+        if (re.search(r"\beffort\b", low) and NULL_INVERT.search(low)
+                and re.search(r"null|--json|harness-board tier", low)):
+            faults.append("effort passed whatever it is")
+        if "xhigh" in low and "fable" not in low and re.search(r"\bnull\b|--json", low):
+            faults.append("xhigh outside Fable")
+        if re.search(r"\breview", low) and re.search(r"\bmodel\b|\beffort\b|--stage review", low):
+            faults += [f"reviewer borrows: {m.group(0)!r}" for m in REVIEWER_BORROWS.finditer(low)
+                       if not negated(low, m.start())]
+        bad += [(s, f) for f in faults]
+    return bad
+
+
+def ultra_contradictions(sentence):
+    """What a sentence about HARNESS_ULTRAREVIEW adds that is wrong: ultrareview on every PR, off turning it on, a
+    review failure, or billing to the API key (it runs on usage credits)."""
+    low = sentence.lower()
+    out = []
+    for pat, fault in ((r"\bturns? (?:\S+ ){0,2}?on\b|\bswitch\w* (?:\S+ ){0,2}?on\b|\benables?\b", "off turns it on"),
+                       (r"\bevery (?:pr|pull request)s?\b|\ball (?:prs|pull requests)\b|\bnot only\b|\bany pr\b",
+                        "not only risk:high"),
+                       (r"\bfail\w*\b|harness-work attempt", "a failure"),
+                       (r"\bapi(?: key| budget)?\b|--api\b|\bheadless\b", "billed to the API")):
+        if any(not negated(low, m.start()) for m in re.finditer(pat, low)):
+            out.append(fault)
+    return out
+
+
+def md_section(text, title):
+    """The lines under `## <title>` up to the next level-1 or level-2 heading; '' when there is no such heading."""
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines) if re.match(r"^##\s+" + re.escape(title) + r"\s*$", ln, re.I)), None)
+    if start is None:
+        return ""
+    end = next((j for j in range(start + 1, len(lines)) if re.match(r"^#{1,2}\s", lines[j])), len(lines))
+    return "\n".join(lines[start + 1:end])
+
+
+class RoutingSettingsSkill(unittest.TestCase):
+    """Ticket #178: the work skill passes the routed model and effort from `harness-board tier N --json` (and
+    `--stage review --json` for the reviewer), and user/CLAUDE.md, README, guide and design.md name the project's
+    routing settings (HARNESS_CODE_TIER, HARNESS_CODE_EFFORT, HARNESS_REVIEW_TIER, HARNESS_ULTRAREVIEW), the labels
+    deciding when they are unset."""
+
+    def routing_paragraph(self):
+        lines = [ln for ln in prose(skill_body()).splitlines() if ln.startswith("You orchestrate")]
+        self.assertEqual(len(lines), 1, "no routing paragraph (the one that starts 'You orchestrate')")
+        return lines[0]
+
+    def review_step(self):
+        lines = [ln for ln in prose(skill_body()).splitlines() if re.match(r"^5[.)]\s+\*\*Review", ln)]
+        self.assertEqual(len(lines), 1, "no numbered step 5 named Review")
+        return lines[0]
+
+    def assert_settings_honoured(self, text, names, where):
+        self.assertTrue(settings_decide(text, names),
+                        f"{where}: no sentence makes {'/'.join(names)} decide when the project sets them: " + text)
+        self.assertTrue(labels_decide_when_unset(text),
+                        f"{where}: no sentence says the labels decide when {'/'.join(names)} are unset: " + text)
+        self.assertEqual(setting_problems(text), [], f"{where}: a sentence dismisses the settings or lets the labels "
+                                                     "overrule them")
+        self.assertEqual(routing_contradictions(text), [], f"{where}: a sentence contradicts the routing rule")
+
+    def test_effort_from_tier_json_is_passed_on_every_stage_agent_call(self):
+        para = self.routing_paragraph()
+        self.assertIn("harness-board tier N --json", para, para)
+        for key in CODE_SETTINGS:
+            self.assertIn(key, para, f"the routing paragraph does not name {key}")
+        self.assert_settings_honoured(para, CODE_SETTINGS, "the routing paragraph")
+        self.assertNotRegex(para.lower(), EFFORT_LITERAL, "the routing paragraph hard-codes an effort besides "
+                                                          "Fable's xhigh: " + para)
+        # The sentences that pass the routed effort: about `effort`, saying to pass it, and neither Fable's fixed
+        # xhigh nor the reviewer's own command.
+        passing = [s for s in sentences_of(para)
+                   if re.search(r"\beffort\b", s) and affirmed(s.lower(), PASS_WORD.pattern)
+                   and "fable" not in s.lower() and "--stage review" not in s]
+        self.assertTrue(passing, "no sentence says to pass the routed effort (outside Fable and the review): " + para)
+        text = " ".join(passing).lower()
+        self.assertRegex(text, NOT_NULL, "the effort is not passed only when it is not null: " + text)
+        self.assertNotRegex(text, NULL_INVERT, "the effort is passed whatever it is: " + text)
+        self.assertRegex(text, EFFORT_FROM_JSON, "the effort passed is not the one the tier JSON prints: " + text)
+        self.assertNotRegex(text, DISMISS, "the effort sentence dismisses the routed effort: " + text)
+        self.assertEqual(withheld_effort(text), [], "the effort sentence withholds a non-null effort: " + text)
+        for role in ("test-author", "breaker", "coder"):
+            self.assertRegex(text, r"\b" + role + r"\b", f"the effort sentence does not cover the {role}: " + text)
+        self.assertRegex(text, r"\bretr(?:y|ies)\b", "the effort sentence does not include retries: " + text)
+        self.assertRegex(text, r"\bfix(?:es)?\b(?: rounds?\b)?|`#n fix`",
+                         "the effort sentence does not include fix rounds: " + text)
+
+    def test_reviewer_model_and_effort_come_from_tier_stage_review_json(self):
+        para = self.routing_paragraph()
+        self.assertIn("harness-board tier N --stage review --json", para, para)
+        review = " ".join(s for s in sentences_of(para) if "--stage review --json" in s).lower()
+        self.assertRegex(review, r"\bmodel\b", review)
+        self.assertRegex(review, r"\beffort\b", "the reviewer's effort does not come from --stage review --json: "
+                         + review)
+        self.assertTrue(affirmed(review, r"\b(?:come|comes|from|take|takes|taken|read|reads|use|uses|pass|passes"
+                                         r"|give|gives|print|prints)\b"),
+                        "the reviewer's model and effort are not taken from --stage review --json: " + review)
+        self.assertTrue(NOT_NULL.search(review)
+                        or re.search(r"\b(?:likewise|the same way|in the same way|as for the|as above)\b", review),
+                        "the reviewer's effort is not passed only when it is not null: " + review)
+        self.assertNotRegex(review, NULL_INVERT, "the reviewer's effort is passed whatever it is: " + review)
+        self.assertNotRegex(review, DISMISS, "the reviewer's model or effort is dismissed: " + review)
+        self.assertNotRegex(review, EFFORT_LITERAL, "the reviewer's effort is hard-coded: " + review)
+        self.assertNotRegex(review, r"\bset (?:them|it|both|the model|model|the effort|effort)\b[^.;]{0,20}\bto\b",
+                            "the reviewer's model or effort is hard-coded: " + review)
+        self.assertEqual([m.group(0) for m in affirmed(review, r"\b(?:sonnet|haiku)\b")], [],
+                         "the reviewer is put on a tier the JSON did not print: " + review)
+        step = self.review_step()
+        self.assertIn("--stage review --json", step, step)
+        self.assertRegex(step, r"\bmodel\b", step)
+        # the effort the step takes from the JSON, not only Fable's fixed xhigh
+        rest = re.sub(r"`?effort: xhigh`?", "", step)
+        effort = [s for s in sentences_of(rest) if re.search(r"\beffort\b", s)]
+        self.assertTrue(effort, "step 5 does not take the reviewer's effort from the JSON: " + step)
+        joined = " ".join(effort).lower()
+        self.assertTrue(affirmed(joined, r"\b(?:from|pass|passes|passed|take|takes|taken|use|uses|print|prints"
+                                         r"|printed|give|gives)\b"),
+                        "step 5 does not take the reviewer's effort from the JSON: " + joined)
+        self.assertNotRegex(joined, DISMISS, "step 5 drops the reviewer's effort: " + joined)
+        self.assertNotRegex(joined, NULL_INVERT, "step 5 passes the effort whatever it is: " + joined)
+        self.assertNotIn("tier N --json", step, "step 5 takes the reviewer's routing from the coder's command: " + step)
+        self.assertEqual(routing_contradictions(step), [], "step 5 contradicts the reviewer's routing")
+        self.assertEqual(routing_contradictions(para), [], "the routing paragraph contradicts the reviewer's routing")
+
+    def test_escalation_goes_one_tier_up_from_the_printed_tier(self):
+        para = self.routing_paragraph()
+        escalation = [s for s in sentences_of(para) if re.search(r"escalat", s, re.I)]
+        self.assertTrue(escalation, "the routing paragraph says nothing about escalation")
+        good = []
+        for s in escalation:
+            for clause in re.split(r";", s.lower()):
+                for m in ONE_TIER_UP.finditer(clause):
+                    src = m.group("src").strip()
+                    if not PRINTED_SOURCE.search(src) or re.search(r"\blabels?\b", src) or negated(clause, m.start()):
+                        continue
+                    after = clause[m.start():]
+                    if any(not negated(after, x.start()) for x in re.finditer(r"\blabels?\b", after)):
+                        continue
+                    if any(negated(after, x.start()) for x in re.finditer(r"\b(?:printed|prints)\b", after)):
+                        continue
+                    good.append(clause)
+        # nothing elsewhere in an escalation sentence takes the tier back to the labels
+        back = [(s, m.group(0)) for s in escalation for m in ESCALATION_FROM_LABELS.finditer(s.lower())
+                if not negated(s.lower(), m.start())]
+        self.assertEqual(back, [], "an escalation sentence counts from the labels' tier")
+        self.assertTrue(good, "no escalation sentence says one tier up from the tier the tool printed: "
+                        + " | ".join(escalation))
+        fable = [s for s in sentences_of(para) if re.search(r"fable", s, re.I) and re.search(r"escalat", s, re.I)]
+        self.assertTrue(any(FABLE_XHIGH.search(s) for s in fable),
+                        "no escalation sentence gives Fable `model: fable` with `effort: xhigh`: " + " | ".join(fable))
+
+    def test_skill_says_ultra_may_be_off_for_the_project(self):
+        # In the routing paragraph (step 8 is left alone): `harness-pr ultra` may print that it ran nothing because
+        # the project sets HARNESS_ULTRAREVIEW=off, and the orchestrator reports that line.
+        para = self.routing_paragraph()
+        ultra = [s for s in sentences_of(para) if "harness-pr ultra" in s]
+        self.assertTrue(ultra, "the routing paragraph does not mention `harness-pr ultra`: " + para)
+        text = " ".join(ultra)
+        low = text.lower()
+        self.assertIn("HARNESS_ULTRAREVIEW", text, text)
+        self.assertRegex(low, r"\boff\b", text)
+        self.assertTrue(affirmed(low, r"\breport(?:s|ed|ing)?\b"),
+                        "the orchestrator is not told to report the off line: " + text)
+        self.assertEqual([m.group(0) for m in affirmed(low, r"\b(?:ignor\w*|suppress\w*|hide|hides|swallow\w*|omit\w*"
+                                                            r"|discard\w*)\b")], [],
+                         "the off line is hidden: " + text)
+        self.assertEqual([(s, ultra_contradictions(s)) for s in ultra if ultra_contradictions(s)], [],
+                         "the ultra sentence adds a wrong rule")
+        for m in re.finditer(r"--force", low):
+            with self.subTest(at=m.start()):
+                self.assertTrue(negated(low, m.start()), "the off line is overridden with --force: " + text)
+
+    def test_user_claude_md_names_the_project_routing_settings(self):
+        claude_md = read_repo_file(REPO_ROOT, "user", "CLAUDE.md")
+        routing, budgets = md_section(claude_md, "Model routing"), md_section(claude_md, "Budgets")
+        self.assertTrue(routing.strip(), "user/CLAUDE.md has no ## Model routing section")
+        self.assertTrue(budgets.strip(), "user/CLAUDE.md has no ## Budgets section")
+        for key in ROUTING_SETTINGS:
+            self.assertIn(key, routing, f"Model routing does not name {key}")
+        self.assert_settings_honoured(routing, ROUTING_SETTINGS, "Model routing")
+        self.assertEqual(setting_problems(budgets), [], "Budgets dismisses a routing setting")
+        self.assertEqual(routing_contradictions(budgets), [], "Budgets contradicts the routing rule")
+        tier_json = [s for s in doc_sentences(routing) if "harness-board tier N" in s and "--json" in s]
+        said = [s for s in tier_json if re.search(r"\beffort\b", s)
+                and affirmed(s.lower(), r"\b(?:pass|passes|passed|use|uses|apply|applies|send|sends)\b|\bagent call\b")
+                and not DISMISS.search(s.lower())]
+        self.assertTrue(said, "Model routing does not say `harness-board tier N --json` gives the effort to pass: "
+                        + " | ".join(tier_json))
+        dispatch = [s for s in doc_sentences(routing + "\n" + budgets)
+                    if "HARNESS_CODE_EFFORT" in s and re.search(r"\bdispatch", s)]
+        self.assertTrue(any(affirmed(s.lower(), r"\b(?:launch\w*|run|runs|running|start\w*|pass|passes|use|uses|at)\b")
+                            and not DISMISS.search(s.lower()) for s in dispatch),
+                        "no sentence says dispatch launches at HARNESS_CODE_EFFORT: " + " | ".join(dispatch))
+        limited = [s for s in dispatch if re.search(r"\bonly (?:with|on|for|when|if|in|under)\b"
+                                                    r"|\bat (?:low|medium|high|max)\b", s.lower())
+                   or EFFORT_LITERAL.search(s.lower())]
+        self.assertEqual(limited, [], "dispatch launches at HARNESS_CODE_EFFORT only on some venues or at a fixed "
+                                      "effort")
+        ultra = [s for s in doc_sentences(budgets) if "HARNESS_ULTRAREVIEW" in s]
+        self.assertTrue(ultra, "Budgets does not name HARNESS_ULTRAREVIEW: " + budgets)
+        self.assertTrue(any(not ultra_off_problems(s) for s in ultra),
+                        "Budgets does not say risk:high PRs get ultrareview unless HARNESS_ULTRAREVIEW is off: "
+                        + " | ".join(f"{s} {ultra_off_problems(s)}" for s in ultra))
+        self.assertEqual([(s, ultra_contradictions(s)) for s in ultra if ultra_contradictions(s)], [],
+                         "a Budgets sentence on HARNESS_ULTRAREVIEW adds a wrong rule")
+
+    def test_design_names_the_routing_settings_in_the_agents_paragraph(self):
+        section = md_section(read_repo_file(REPO_ROOT, "docs", "design.md"), "Agents")
+        self.assertTrue(section.strip(), "design.md has no ## Agents section")
+        paras = [" ".join(b) for b in blocks(prose(section))
+                 if not b[0].lstrip().startswith("|") and "harness-board tier" in " ".join(b)]
+        self.assertTrue(paras, "the Agents section has no paragraph about `harness-board tier`")
+        para = " ".join(paras)
+        for key in ROUTING_SETTINGS:
+            self.assertIn(key, para, f"the Agents paragraph does not name {key}")
+        self.assertRegex(para, r"harness-board tier N(?: --stage review)? --json", para)
+        self.assert_settings_honoured(para, ROUTING_SETTINGS, "the Agents paragraph")
+        effort = " ".join(s for s in sentences_of(flat(para)) if re.search(r"\beffort\b", s)).lower()
+        self.assertRegex(effort, NOT_NULL, "the Agents paragraph does not pass effort only when not null: " + para)
+        self.assertNotRegex(effort, NULL_INVERT, "the Agents paragraph passes the effort whatever it is: " + effort)
+        self.assertRegex(effort, EFFORT_FROM_JSON, "the Agents paragraph's effort is not the one the tier JSON prints: "
+                         + effort)
+
+    def test_readme_and_guide_name_the_project_routing_settings(self):
+        readme = read_repo_file(REPO_ROOT, "README.md")
+        paras = [" ".join(b) for b in blocks(prose(readme))
+                 if not b[0].lstrip().startswith("|") and "harness-board tier" in " ".join(b)]
+        self.assertTrue(paras, "README has no routing paragraph about `harness-board tier`")
+        guide = read_repo_file(REPO_ROOT, "docs", "guide.md")
+        for name, text in (("README's routing paragraph", " ".join(paras)), ("docs/guide.md", guide)):
+            with self.subTest(doc=name):
+                for key in ROUTING_SETTINGS:
+                    self.assertIn(key, text, f"{name} does not name {key}")
+                self.assert_settings_honoured(text, ROUTING_SETTINGS, name)
+        for name, text in (("README.md", readme), ("docs/guide.md", guide)):
+            with self.subTest(doc=name, about="ultrareview"):
+                lines = [u for u in doc_units(text) if "HARNESS_ULTRAREVIEW" in u
+                         and re.search(r"ultrareview", u.replace("HARNESS_ULTRAREVIEW", ""), re.I)]
+                self.assertTrue(lines, f"{name} names ultrareview nowhere with HARNESS_ULTRAREVIEW")
+                self.assertTrue(any(re.search(r"\boff\b", u) and not re.search(r"\b(?:never|on or off|regardless)\b",
+                                                                               u.lower()) for u in lines),
+                                f"{name} does not say HARNESS_ULTRAREVIEW=off turns ultrareview off: "
+                                + " | ".join(lines))
+                self.assertEqual([u for u in lines if setting_problems(u)], [], f"{name} dismisses HARNESS_ULTRAREVIEW")
+                self.assertEqual([(u, ultra_contradictions(u)) for u in lines if ultra_contradictions(u)], [],
+                                 f"{name} adds a wrong rule about HARNESS_ULTRAREVIEW")
+
+
 # =========================================================================== budget
 class Budget(WorkTest):
     def test_status_exhaust_and_reset(self):
