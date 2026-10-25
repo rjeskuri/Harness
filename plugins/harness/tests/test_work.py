@@ -638,16 +638,16 @@ class Attempt(WorkTest):
             (["code", "pass"], "done"),
             (["code", "fail"], "retry"),                     # a pass ends the stage's run of failures
             (["review", "fail", "--tier", "opus"], "retry"),
-            (["review", "fail", "--tier", "opus"], "escalate fable"),
+            (["review", "fail", "--tier", "opus"], "escalate opus xhigh"),     # #239: opus goes to opus xhigh
             (["ci", "fail", "--tier", "fable"], "retry"),
-            (["ci", "fail", "--tier", "fable"], "escalate fable"),   # Fable stays Fable
+            (["ci", "fail", "--tier", "fable"], "needs-input"),    # #239: nothing above an explicit Fable
         ]
         for argv, expected in sequence:
             with self.subTest(argv=argv):
                 self.assertEqual(self.ok("attempt", "12", *argv).stdout.strip(), expected)
         attempts = self.read_json(self.cache_path())["attempts"]
         self.assertEqual(len(attempts), len(sequence))
-        self.assertEqual(set(attempts[0]), {"stage", "tier", "result", "at"})
+        self.assertEqual(set(attempts[0]), {"stage", "tier", "effort", "result", "at"})     # #239: effort recorded
         self.assertEqual((attempts[0]["stage"], attempts[0]["tier"], attempts[0]["result"]), ("code", "sonnet", "fail"))
         self.assertEqual(attempts[-1]["tier"], "fable")
 
@@ -656,11 +656,12 @@ class Attempt(WorkTest):
 
     def test_escalation_starts_from_the_overridden_tier(self):
         """#175: HARNESS_CODE_TIER in the main checkout's .claude/settings.json is the tier `start` reports and the
-        cache holds, and `attempt` escalates one tier up from it, not from the labels' tier (fable here)."""
+        cache holds, and `attempt` escalates from it, not from the labels' route (opus xhigh here). #239: the override
+        replaces the labels' effort too, so opus escalates to opus xhigh and sonnet to opus."""
         hard = ("task", "status:ready", "size:L", "risk:high")
         self.scenario(issues=[issue(labels=hard), issue(number=13, labels=hard)])
         settings = os.path.join(self.repo, ".claude", "settings.json")
-        for number, setting, escalated in ((12, "opus", "fable"), (13, "sonnet", "opus")):
+        for number, setting, escalated in ((12, "opus", "opus xhigh"), (13, "sonnet", "opus")):
             with self.subTest(setting=setting):
                 write(settings, json.dumps({"env": {"HARNESS_CODE_TIER": setting}}))
                 data = self.ok_json("start", str(number), "--json")
@@ -694,7 +695,7 @@ class Attempt(WorkTest):
                 self.assertEqual(self.ok("attempt", "12", *argv).stdout.strip(), expected)
         attempts = self.read_json(self.cache_path())["attempts"]
         self.assertEqual(len(attempts), len(sequence))
-        self.assertEqual(set(attempts[0]), {"stage", "tier", "result", "at"})
+        self.assertEqual(set(attempts[0]), {"stage", "tier", "effort", "result", "at"})
         self.assertEqual([a["stage"] for a in attempts], ["fix"] * len(sequence))
         self.assertEqual((attempts[0]["tier"], attempts[0]["result"]), ("sonnet", "fail"))
         self.assertEqual((attempts[3]["tier"], attempts[3]["result"]), ("sonnet", "pass"))
@@ -721,7 +722,7 @@ class Attempt(WorkTest):
         sequence = [
             (["review", "fail", "--tier", "opus"], "retry"),
             (["fix", "fail"], "retry"),                      # review's failure is not fix's
-            (["review", "fail", "--tier", "opus"], "escalate fable"),   # fix's failure did not reset review
+            (["review", "fail", "--tier", "opus"], "escalate opus xhigh"),   # fix's failure did not reset review
             (["fix", "fail"], "needs-input"),                # review's failures did not advance or reset fix
             (["code", "fail"], "retry"),                     # nor does either count for code
             (["review", "fail", "--tier", "fable"], "needs-input"),
@@ -747,6 +748,343 @@ class Attempt(WorkTest):
                 self.assertOneLineError(p, stage, "fix")     # the refusal names the bad stage and the valid ones
                 self.assertEqual(p.stdout, "")
         self.assertEqual(self.read_json(self.cache_path())["attempts"], attempts)
+
+
+# =========================================================================== attempt: effort-aware escalation (#239)
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def route_of(kind, size, risk):
+    """#239's label route for the coding stages, from the ticket's words: S+low non-bug is sonnet with no effort;
+    size:L or risk:high is opus at xhigh; everything else opus with no effort. Never fable."""
+    tier = "sonnet" if size == "S" and risk == "low" and kind != "bug" else "opus"
+    return tier, ("xhigh" if size == "L" or risk == "high" else None)
+
+
+def escalation_of(tier, effort):
+    """#239: where an escalation-worthy failure at (tier, effort) goes: sonnet to opus; opus below xhigh to opus at
+    xhigh; opus at xhigh or above, and an explicit fable, have nothing above them (None: needs-input)."""
+    if tier == "sonnet":
+        return "opus", None
+    if tier == "opus" and effort in (None, "low", "medium", "high"):
+        return "opus", "xhigh"
+    return None
+
+
+def escalation_text(tier, effort):
+    nxt = escalation_of(tier, effort)
+    if nxt is None:
+        return "needs-input"
+    return " ".join(["escalate", nxt[0]] + ([nxt[1]] if nxt[1] else []))
+
+
+def ticket_labels(kind, size, risk):
+    return [kind, "status:in-progress"] + (["size:" + size] if size else []) + (["risk:" + risk] if risk else [])
+
+
+class Keys(dict):
+    """A JSON object whose missing key reads as a marker, so a missing field fails an assertion instead of raising."""
+
+    def __missing__(self, key):
+        return f"<no {key}>"
+
+
+class AttemptEffort(WorkTest):
+    """Ticket #239: `harness-work attempt` knows the effort a stage ran at (`--effort`, else the ticket's own route
+    for that stage) and never escalates to Fable: sonnet goes to opus (`escalate opus`), opus to opus at xhigh
+    (`escalate opus xhigh`), and a stage already at opus xhigh (or max), or on an explicit fable, goes to needs-input
+    on its second failure. --json carries `effort` and `next_effort` beside `tier` and `next_tier`. WorkTest.env drops
+    every HARNESS_* variable of the real environment."""
+
+    SPREAD = [("task", "S", "low"), ("bug", "S", "low"), ("task", "M", "low"), ("chore", "M", "high"),
+              ("task", "L", "low"), ("refactor", "L", "high"), ("task", "S", "high"), ("task", None, None),
+              ("bug", "L", None)]
+
+    def put_ticket(self, number, kind, size, risk, tier=None):
+        """A ticket cache as `harness-board show` writes it: labels, type, size, risk and the effective tier."""
+        write(self.cache_path(number), json.dumps({
+            "number": number, "title": TITLE, "type": kind, "size": size, "risk": risk, "flags": [],
+            "labels": ticket_labels(kind, size, risk), "tier": tier or route_of(kind, size, risk)[0],
+            "attempts": []}))
+
+    def attempt(self, number, *argv, env=None):
+        return self.ok("attempt", str(number), *argv, env=env).stdout.strip()
+
+    def attempt_json(self, number, *argv, env=None):
+        return Keys(self.ok_json("attempt", str(number), *argv, "--json", env=env))
+
+    def attempts(self, number):
+        return [Keys(a) for a in self.read_json(self.cache_path(number))["attempts"]]
+
+    def configure(self, **env):
+        write(os.path.join(self.repo, ".claude", "settings.json"), json.dumps({"env": env}))
+
+    # ----------------------------------------------------------- broad: the ticket's route decides the default
+    def test_the_ticket_route_decides_the_tier_and_effort_of_each_failure(self):
+        seen = set()
+        for i, (kind, size, risk) in enumerate(self.SPREAD):
+            tier, effort = route_of(kind, size, risk)
+            seen.add(escalation_text(tier, effort))
+            with self.subTest(kind=kind, size=size, risk=risk, output="text"):
+                n = 100 + i
+                self.put_ticket(n, kind, size, risk)
+                answers = [self.attempt(n, "code", "fail") for _ in range(3)]
+                self.assertEqual(answers, ["retry", escalation_text(tier, effort), "needs-input"])
+                self.assertNotIn("fable", " ".join(answers))
+                attempts = self.attempts(n)
+                self.assertEqual([(a["stage"], a["tier"], a["effort"], a["result"]) for a in attempts],
+                                 [("code", tier, effort, "fail")] * 3)
+            with self.subTest(kind=kind, size=size, risk=risk, output="json"):
+                n = 200 + i
+                self.put_ticket(n, kind, size, risk)
+                first = self.attempt_json(n, "code", "fail")
+                self.assertEqual({k: first[k] for k in ("tier", "effort", "action", "failures", "next_tier",
+                                                        "next_effort")},
+                                 {"tier": tier, "effort": effort, "action": "retry", "failures": 1, "next_tier": None,
+                                  "next_effort": None})
+                second = self.attempt_json(n, "code", "fail")
+                nxt = escalation_of(tier, effort)
+                self.assertEqual({k: second[k] for k in ("tier", "effort", "action", "failures", "next_tier",
+                                                         "next_effort")},
+                                 {"tier": tier, "effort": effort, "action": "escalate" if nxt else "needs-input",
+                                  "failures": 2, "next_tier": nxt[0] if nxt else None,
+                                  "next_effort": nxt[1] if nxt else None})
+                done = self.attempt_json(n, "code", "pass")
+                self.assertEqual((done["action"], done["next_tier"], done["next_effort"]), ("done", None, None))
+        # the spread reaches all three answers
+        self.assertEqual(seen, {"escalate opus", "escalate opus xhigh", "needs-input"})
+
+    def test_size_l_and_risk_high_run_at_opus_xhigh_and_go_to_needs_input(self):
+        # DoD: a failure at opus xhigh gives needs-input; nothing prints fable. Every escalating stage alike.
+        for n, (kind, size, risk) in ((31, ("task", "L", "low")), (32, ("bug", "M", "high")),
+                                      (33, ("chore", "S", "high"))):
+            self.put_ticket(n, kind, size, risk)
+            for stage in ("tests", "breaker", "code", "ci"):
+                with self.subTest(ticket=n, stage=stage):
+                    self.assertEqual(self.attempt(n, stage, "fail"), "retry")
+                    data = self.attempt_json(n, stage, "fail")
+                    self.assertEqual((data["tier"], data["effort"], data["action"], data["next_tier"],
+                                      data["next_effort"]), ("opus", "xhigh", "needs-input", None, None))
+                    self.assertEqual(self.attempt(n, stage, "fail"), "needs-input")
+
+    def test_a_second_failure_at_opus_says_escalate_opus_xhigh(self):
+        # DoD: an M/low ticket runs at opus with no effort; its second failure escalates to opus at xhigh
+        for n, kind in ((41, "task"), (42, "bug"), (43, "refactor")):
+            with self.subTest(kind=kind):
+                self.put_ticket(n, kind, "M", "low")
+                self.assertEqual(self.attempt(n, "code", "fail"), "retry")
+                self.assertEqual(self.attempt(n, "code", "fail"), "escalate opus xhigh")
+                # the escalated run, recorded at opus xhigh, fails again: needs-input
+                self.assertEqual(self.attempt(n, "code", "fail", "--tier", "opus", "--effort", "xhigh"), "needs-input")
+
+    # ----------------------------------------------------------- explicit --tier and --effort
+    def test_every_explicit_tier_and_effort(self):
+        n = 300
+        for tier in ("sonnet", "opus", "fable"):
+            for effort in (None,) + EFFORT_LEVELS:
+                flags = ["--tier", tier] + (["--effort", effort] if effort else [])
+                with self.subTest(tier=tier, effort=effort):
+                    n += 1
+                    self.put_ticket(n, "task", "M", "low")              # its own route: opus, no effort
+                    first = self.attempt_json(n, "breaker", "fail", *flags)
+                    self.assertEqual((first["tier"], first["effort"], first["action"]), (tier, effort, "retry"))
+                    second = self.attempt_json(n, "breaker", "fail", *flags)
+                    self.assertEqual((second["tier"], second["effort"]), (tier, effort))
+                    nxt = escalation_of(tier, effort)
+                    if tier == "sonnet":
+                        self.assertEqual((second["action"], second["next_tier"]), ("escalate", "opus"))
+                    else:
+                        self.assertEqual((second["action"], second["next_tier"], second["next_effort"]),
+                                         ("escalate" if nxt else "needs-input", nxt[0] if nxt else None,
+                                          nxt[1] if nxt else None))
+                    attempts = self.attempts(n)
+                    self.assertEqual([(a["tier"], a["effort"]) for a in attempts], [(tier, effort)] * 2)
+                    n += 1
+                    self.put_ticket(n, "task", "M", "low")
+                    self.assertEqual(self.attempt(n, "breaker", "fail", *flags), "retry")
+                    text = self.attempt(n, "breaker", "fail", *flags)
+                    self.assertNotIn("fable", text)
+                    if tier == "sonnet":
+                        self.assertTrue(text.startswith("escalate opus"), text)
+                    else:
+                        self.assertEqual(text, escalation_text(tier, effort))
+                    if tier == "sonnet" and effort is None:
+                        self.assertEqual(text, "escalate opus")
+
+    def test_an_explicit_tier_that_matches_the_stage_route_takes_its_effort(self):
+        # Without --effort, an attempt at the tier its stage routes to ran at that route's effort; at another tier it
+        # ran at none. The review stage's route is the review's, not the coder's.
+        cases = [
+            # (labels, stage, flags, second answer)
+            (("task", "L", "low"), "code", ["--tier", "opus"], "needs-input"),            # code route: opus xhigh
+            (("task", "L", "low"), "review", ["--tier", "opus"], "escalate opus xhigh"),  # review route: opus
+            (("task", "M", "high"), "review", ["--tier", "opus"], "needs-input"),        # review route: opus xhigh
+            (("task", "M", "high"), "code", ["--tier", "opus"], "needs-input"),
+            (("task", "M", "low"), "review", ["--tier", "opus"], "escalate opus xhigh"),
+            (("task", "L", "low"), "code", ["--tier", "sonnet"], "escalate opus"),       # not the route's tier
+            (("task", "L", "low"), "code", ["--tier", "opus", "--effort", "high"], "escalate opus xhigh"),
+            (("task", "M", "high"), "review", ["--tier", "fable"], "needs-input"),
+        ]
+        for i, ((kind, size, risk), stage, flags, want) in enumerate(cases):
+            with self.subTest(labels=(kind, size, risk), stage=stage, flags=flags):
+                n = 400 + i
+                self.put_ticket(n, kind, size, risk)
+                self.assertEqual(self.attempt(n, stage, "fail", *flags), "retry")
+                self.assertEqual(self.attempt(n, stage, "fail", *flags), want)
+
+    def test_effort_takes_the_five_levels_and_refuses_anything_else(self):
+        self.put_ticket(12, "task", "M", "low")
+        for bad in ("extra", "XHIGHER", "5"):
+            with self.subTest(bad=bad):
+                p = self.work("attempt", "12", "code", "fail", "--effort", bad)
+                self.assertOneLineError(p, bad)
+                self.assertEqual(p.stdout, "")
+        self.assertEqual(self.read_json(self.cache_path())["attempts"], [])
+        for level in EFFORT_LEVELS:
+            with self.subTest(level=level):
+                data = self.attempt_json(12, "code", "pass", "--effort", level)
+                self.assertEqual((data["effort"], data["action"]), (level, "done"))
+        self.assertEqual([a["effort"] for a in self.attempts(12)], list(EFFORT_LEVELS))
+
+    # ----------------------------------------------------------- settings and stale caches
+    def test_a_pre_239_cache_that_says_fable_never_escalates_to_fable(self):
+        # A cache written before #239 holds the old rubric's tier (fable for size:L or risk:high). The labels decide
+        # now: opus at xhigh, and needs-input on the second failure.
+        for n, (kind, size, risk) in ((51, ("task", "L", "high")), (52, ("task", "M", "high")),
+                                      (53, ("bug", "L", "low"))):
+            with self.subTest(kind=kind, size=size, risk=risk):
+                self.put_ticket(n, kind, size, risk, tier="fable")
+                first = self.attempt_json(n, "code", "fail")
+                self.assertEqual((first["tier"], first["effort"]), ("opus", "xhigh"))
+                self.assertEqual(self.attempt(n, "code", "fail"), "needs-input")
+                self.assertNotIn("fable", json.dumps(self.read_json(self.cache_path(n))["attempts"]))
+
+    def test_explicit_fable_from_the_settings_still_runs_fable_and_tops_out(self):
+        for n, how in ((61, "settings.json"), (62, "environment")):
+            with self.subTest(how=how):
+                self.setUp()
+                env = None
+                if how == "settings.json":
+                    self.configure(HARNESS_CODE_TIER="fable")
+                else:
+                    env = self.env(HARNESS_CODE_TIER="fable")
+                self.put_ticket(n, "task", "M", "low", tier="fable")
+                first = self.attempt_json(n, "code", "fail", env=env)
+                self.assertEqual(first["tier"], "fable")
+                second = self.attempt_json(n, "code", "fail", env=env)
+                self.assertEqual((second["tier"], second["action"], second["next_tier"]),
+                                 ("fable", "needs-input", None))
+
+    def test_the_code_effort_setting_is_the_effort_a_stage_ran_at(self):
+        # HARNESS_CODE_EFFORT wins over the labels' xhigh, as it does for `harness-board tier`
+        cases = [("low", ("task", "L", "low"), "escalate opus xhigh"),
+                 ("high", ("bug", "M", "high"), "escalate opus xhigh"),
+                 ("max", ("task", "M", "low"), "needs-input"),
+                 ("xhigh", ("task", "M", "low"), "needs-input"),
+                 ("medium", ("task", "S", "low"), "escalate opus")]
+        for i, (level, (kind, size, risk), want) in enumerate(cases):
+            with self.subTest(level=level, labels=(kind, size, risk)):
+                self.configure(HARNESS_CODE_EFFORT=level)
+                n = 70 + i
+                self.put_ticket(n, kind, size, risk)
+                first = self.attempt_json(n, "code", "fail")
+                self.assertEqual((first["tier"], first["effort"]), (route_of(kind, size, risk)[0], level))
+                self.assertEqual(self.attempt(n, "code", "fail"), want)
+
+    def test_a_code_tier_override_drops_the_labels_xhigh(self):
+        # Ruling: HARNESS_CODE_TIER replaces the labels' tier and their effort. A size:L ticket under
+        # HARNESS_CODE_TIER=opus runs at opus with no effort, so its second failure escalates to opus xhigh.
+        for n, how, (kind, size, risk) in ((91, "settings.json", ("task", "L", "low")),
+                                           (92, "environment", ("bug", "L", "high")),
+                                           (93, "settings.json", ("task", "M", "high"))):
+            with self.subTest(how=how, labels=(kind, size, risk)):
+                self.setUp()
+                env = None
+                if how == "settings.json":
+                    self.configure(HARNESS_CODE_TIER="opus")
+                else:
+                    env = self.env(HARNESS_CODE_TIER="opus")
+                self.put_ticket(n, kind, size, risk, tier="opus")       # the effective tier harness-board writes
+                first = self.attempt_json(n, "code", "fail", env=env)
+                self.assertEqual((first["tier"], first["effort"], first["action"]), ("opus", None, "retry"))
+                self.assertEqual(self.attempt(n, "code", "fail", env=env), "escalate opus xhigh")
+                self.assertEqual([(a["tier"], a["effort"]) for a in self.attempts(n)], [("opus", None)] * 2)
+                # HARNESS_CODE_EFFORT set beside it is the effort the stage ran at
+                self.put_ticket(n + 10, kind, size, risk, tier="opus")
+                env2 = self.env(HARNESS_CODE_TIER="opus", HARNESS_CODE_EFFORT="xhigh")
+                self.assertEqual(self.attempt_json(n + 10, "code", "fail", env=env2)["effort"], "xhigh")
+                self.assertEqual(self.attempt(n + 10, "code", "fail", env=env2), "needs-input")
+
+    def test_a_review_tier_override_drops_the_labels_xhigh(self):
+        # Ruling: HARNESS_REVIEW_TIER replaces the labels' review rule, their xhigh included. A risk:high review
+        # recorded at `--tier opus` ran at opus xhigh by the labels (needs-input on the second failure), but at opus
+        # with no effort under HARNESS_REVIEW_TIER=opus (escalate opus xhigh). HARNESS_REVIEW_TIER=fable runs at
+        # fable xhigh and tops out.
+        cases = [
+            (None, "opus", "xhigh", "needs-input"),
+            ({"HARNESS_REVIEW_TIER": "opus"}, "opus", None, "escalate opus xhigh"),
+            ({"HARNESS_REVIEW_TIER": "fable"}, "fable", "xhigh", "needs-input"),
+        ]
+        for i, (settings, tier, effort, want) in enumerate(cases):
+            for where in (("settings.json", "environment") if settings else (None,)):
+                with self.subTest(settings=settings, where=where):
+                    self.setUp()
+                    env = None
+                    if where == "settings.json":
+                        self.configure(**settings)
+                    elif where == "environment":
+                        env = self.env(**settings)
+                    n = 95 + i
+                    self.put_ticket(n, "task", "M", "high")
+                    first = self.attempt_json(n, "review", "fail", "--tier", tier, env=env)
+                    self.assertEqual((first["tier"], first["effort"], first["action"]), (tier, effort, "retry"))
+                    second = self.attempt_json(n, "review", "fail", "--tier", tier, env=env)
+                    nxt = escalation_of(tier, effort)
+                    self.assertEqual((second["action"], second["next_tier"], second["next_effort"]),
+                                     ("escalate" if nxt else "needs-input", nxt[0] if nxt else None,
+                                      nxt[1] if nxt else None))
+                    self.put_ticket(n + 10, "task", "M", "high")
+                    self.assertEqual(self.attempt(n + 10, "review", "fail", "--tier", tier, env=env), "retry")
+                    self.assertEqual(self.attempt(n + 10, "review", "fail", "--tier", tier, env=env), want)
+
+    def test_a_cache_without_labels_that_says_fable_reads_as_opus_xhigh(self):
+        # Agrees with `harness-board tier` on the same cache: a stored fable without labels is the pre-#239 rubric's
+        # answer for size:L or risk:high, so the attempt runs at opus xhigh and the second failure is needs-input.
+        for n, stage in ((85, "code"), (86, "tests"), (87, "ci")):
+            with self.subTest(stage=stage):
+                write(self.cache_path(n), json.dumps({"number": n, "title": TITLE, "tier": "fable", "attempts": []}))
+                first = self.attempt_json(n, stage, "fail")
+                self.assertEqual((first["tier"], first["effort"], first["action"]), ("opus", "xhigh", "retry"))
+                second = self.attempt_json(n, stage, "fail")
+                self.assertEqual((second["tier"], second["effort"], second["action"], second["next_tier"],
+                                  second["next_effort"]), ("opus", "xhigh", "needs-input", None, None))
+                self.assertEqual([(a["tier"], a["effort"]) for a in self.attempts(n)], [("opus", "xhigh")] * 2)
+                self.assertNotIn("fable", json.dumps([dict(first), dict(second)]))
+                self.assertNotIn("fable", json.dumps(self.read_json(self.cache_path(n))["attempts"]))
+                write(self.cache_path(n + 10), json.dumps({"number": n + 10, "title": TITLE, "tier": "fable",
+                                                           "attempts": []}))
+                self.assertEqual([self.attempt(n + 10, stage, "fail") for _ in range(2)], ["retry", "needs-input"])
+        # the board agrees on the same cache
+        board = os.path.join(os.path.dirname(TOOL), "harness-board")
+        p = subprocess.run([sys.executable, board, "tier", "85", "--json"], cwd=self.repo, env=self.env(),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        data = json.loads(p.stdout)
+        self.assertEqual((data["tier"], data["effort"]), ("opus", "xhigh"))
+        # an explicit HARNESS_CODE_TIER=fable still gives fable on that cache
+        write(self.cache_path(88), json.dumps({"number": 88, "title": TITLE, "tier": "fable", "attempts": []}))
+        env = self.env(HARNESS_CODE_TIER="fable")
+        self.assertEqual(self.attempt_json(88, "code", "fail", env=env)["tier"], "fable")
+        self.assertEqual(self.attempt(88, "code", "fail", env=env), "needs-input")
+
+    def test_a_cache_without_labels_keeps_its_tier(self):
+        # Caches written by hand or by old tools carry no labels: the cached tier stands, with no effort.
+        for n, tier, want in ((81, "sonnet", "escalate opus"), (82, "opus", "escalate opus xhigh")):
+            with self.subTest(tier=tier):
+                write(self.cache_path(n), json.dumps({"number": n, "title": TITLE, "tier": tier, "attempts": []}))
+                first = self.attempt_json(n, "code", "fail")
+                self.assertEqual((first["tier"], first["effort"]), (tier, None))
+                self.assertEqual(self.attempt(n, "code", "fail"), want)
 
 
 # =========================================================================== dispatch
@@ -1944,6 +2282,133 @@ class DispatchEffort(WorkTest):
         argv = self.headless_call()["argv"]
         self.assertEqual((argv[:2], argv[8:]), (["-p", "/harness:work 12"], ["--effort", "high"]))
         self.settle()
+
+
+class DispatchRouteEffort(WorkTest):
+    """Ticket #239: with HARNESS_CODE_EFFORT unset, `harness-work dispatch` launches each ticket at its route's effort:
+    a size:L or risk:high ticket gets `--effort xhigh` (bg and headless) and `effort: xhigh` in its run record; any
+    other ticket launches as before, with no flag. HARNESS_CODE_EFFORT still wins when set; a HARNESS_CODE_TIER
+    override replaces the labels' effort with its tier."""
+
+    configure = DispatchEffort.configure
+    bg_with_effort = DispatchEffort.bg_with_effort
+    headless_call = DispatchEffort.headless_call
+    settle = DispatchEffort.settle
+
+    @staticmethod
+    def labels_for(size, risk, kind="task", status="status:ready"):
+        return (kind, status) + (("size:" + size,) if size else ()) + (("risk:" + risk,) if risk else ())
+
+    @staticmethod
+    def name(n, title):
+        return f"proj #{n} {title}"
+
+    def bg_today(self, n, title):
+        return ["--bg", "-n", self.name(n, title), "--permission-mode", "auto", f"/harness:work {n}"]
+
+    def test_each_ticket_launches_at_its_routes_effort(self):
+        # One dispatch, four tickets: the route's effort per ticket (xhigh for size:L or risk:high, else no flag).
+        tickets = [(12, "Small", "task", "S", "low"), (13, "Risky", "task", "M", "high"),
+                   (14, "Large", "task", "L", "low"), (15, "Medium bug", "bug", "M", "low")]
+        self.scenario(issues=[issue(n, labels=self.labels_for(s, r, k), title=t) for n, t, k, s, r in tickets],
+                      ready=[ready_row(n, t, labels=self.labels_for(s, r, k)) for n, t, k, s, r in tickets])
+        p = self.ok("dispatch", "--max", "4")
+        self.assertNotIn("harness-work:", p.stderr)
+        calls = {c["argv"][c["argv"].index("-n") + 1]: c["argv"] for c in self.claude_calls()}
+        records = {r["ticket"]: r for r in self.run_records()}
+        for n, title, kind, size, risk in tickets:
+            effort = route_of(kind, size, risk)[1]
+            with self.subTest(ticket=n, size=size, risk=risk):
+                if effort:
+                    self.assertEqual(calls[self.name(n, title)],
+                                     self.bg_with_effort(self.name(n, title), effort, f"/harness:work {n}"))
+                    self.assertEqual(records[n]["effort"], effort)
+                else:
+                    self.assertEqual(calls[self.name(n, title)], self.bg_today(n, title))
+                    self.assertNotIn("effort", records[n])
+
+    def test_a_size_l_ticket_launches_bg_with_effort_xhigh(self):
+        large = self.labels_for("L", "low")
+        self.scenario(issues=[issue(labels=large)], ready=[ready_row(12, labels=large)])
+        data = self.ok_json("dispatch", "--json")
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"], self.bg_with_effort("proj #12 Add the board tool", "xhigh", "/harness:work 12"))
+        [record] = self.run_records()
+        self.assertEqual(record["effort"], "xhigh")
+        [launched] = data["launched"]
+        self.assertEqual((launched["ticket"], launched["effort"]), (12, "xhigh"))
+
+    def test_a_risk_high_ticket_launches_headless_with_effort_xhigh(self):
+        keyfile = write(os.path.join(self.tmp, "key.txt"), SECRET + "\n")
+        risky = self.labels_for("S", "high")
+        self.scenario(issues=[issue(labels=risky)], ready=[ready_row(12, labels=risky)])
+        self.ok("dispatch", "--venue", "headless", env=self.env(HARNESS_API_KEY_CMD=f"cat {keyfile}"))
+        argv = self.headless_call()["argv"]
+        self.assertEqual(len(argv), 10, argv)
+        self.assertEqual(argv[:2], ["-p", "/harness:work 12"])
+        self.assertEqual(argv[8:], ["--effort", "xhigh"])
+        [record] = self.run_records()
+        self.assertEqual((record["venue"], record["effort"]), ("headless", "xhigh"))
+        self.settle()
+
+    def test_the_code_effort_setting_wins_over_the_route(self):
+        # Unset: each ticket at its route's effort. Set (file or environment): every ticket at the setting.
+        tickets = [(12, "Small", "S", "low"), (13, "Large", "L", "high")]
+        for level, where in ((None, None), ("low", "settings.json"), ("max", "environment"),
+                             ("medium", "settings.json")):
+            with self.subTest(level=level, where=where):
+                self.setUp()
+                self.scenario(issues=[issue(n, labels=self.labels_for(s, r), title=t) for n, t, s, r in tickets],
+                              ready=[ready_row(n, t, labels=self.labels_for(s, r)) for n, t, s, r in tickets])
+                env = None
+                if where == "settings.json":
+                    self.configure(HARNESS_CODE_EFFORT=level)
+                elif where == "environment":
+                    env = self.env(HARNESS_CODE_EFFORT=level)
+                self.ok("dispatch", "--max", "2", env=env)
+                calls = {c["argv"][c["argv"].index("-n") + 1]: c["argv"] for c in self.claude_calls()}
+                records = {r["ticket"]: r for r in self.run_records()}
+                for n, title, size, risk in tickets:
+                    want = level or route_of("task", size, risk)[1]
+                    if want:
+                        self.assertEqual(calls[self.name(n, title)],
+                                         self.bg_with_effort(self.name(n, title), want, f"/harness:work {n}"))
+                        self.assertEqual(records[n]["effort"], want)
+                    else:
+                        self.assertEqual(calls[self.name(n, title)], self.bg_today(n, title))
+                        self.assertNotIn("effort", records[n])
+
+    def test_a_tier_override_replaces_the_labels_effort(self):
+        # HARNESS_CODE_TIER replaces the label rubric, its effort included: a size:L ticket launches with no flag
+        # unless HARNESS_CODE_EFFORT is set too. Without the override the same ticket launches at xhigh.
+        large = self.labels_for("L", "high")
+        for tier in (None, "opus", "sonnet", "fable"):
+            with self.subTest(tier=tier):
+                self.setUp()
+                if tier:
+                    self.configure(HARNESS_CODE_TIER=tier)
+                self.scenario(issues=[issue(labels=large)], ready=[ready_row(12, labels=large)])
+                self.ok("dispatch")
+                [call] = self.claude_calls()
+                if tier:
+                    self.assertEqual(call["argv"], self.bg_today(12, TITLE))
+                    self.assertNotIn("effort", self.run_records()[0])
+                else:
+                    self.assertEqual(call["argv"], self.bg_with_effort(self.name(12, TITLE), "xhigh",
+                                                                       "/harness:work 12"))
+                    self.assertEqual(self.run_records()[0]["effort"], "xhigh")
+
+    def test_a_redispatched_size_l_ticket_gets_xhigh(self):
+        self.write_run(12, id=f"{self.key}-12-20261013090000", pid=self.dead_pid(), started_at=iso_ago(hours=3),
+                       ended_at=iso_ago(hours=2), outcome="error")
+        large = self.labels_for("L", "low", status="status:in-progress")
+        self.scenario(issues=[issue(12, labels=large)])
+        p = self.ok("dispatch", env=self.env(FAKECLAUDE_BG_ID="redo58"))
+        self.assertRegex(p.stdout, r"(?m)^#12 bg on t/12-\S+ \(id redo58\)$")
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"], self.bg_with_effort("proj #12 Add the board tool", "xhigh", "/harness:work 12"))
+        again = next(r for r in self.run_records() if r.get("bg_id") == "redo58")
+        self.assertEqual(again["effort"], "xhigh")
 
 
 class RedispatchCap(WorkTest):
@@ -4632,9 +5097,66 @@ def sentences(text):
     return [s.strip() for s in re.split(r"(?<=[.;:])\s+|\n", text) if s.strip()]
 
 
+# Ticket #239: wording that makes the labels or an escalation pick Fable. Each pattern is matched on lower-cased prose;
+# a match is excused only when a negation word stands before it in its clause or inside it ("no longer gives fable",
+# "never escalates to fable").
+FABLE_BY_RULE = [
+    re.compile(r"\bescalat\w*\s+(?:\w+\s+){0,2}?(?:to\s+)?`?fable\b"),           # escalate fable, escalates to fable
+    re.compile(r"\b(?:size:l|risk:high)`?(?:\s+(?:or|and)\s+`?(?:size:l|risk:high)`?)?\s+(?:\w+\s+){0,2}?"
+               r"(?:gives?|is|are|picks?|means|runs? on|routes? to|goes to)\s+`?fable\b"),  # risk:high gives fable
+    re.compile(r"\bfable\b[^.;|]{0,30}?\b(?:for|on|when|if)\b[^.;|]{0,25}?`?(?:size:l|risk:high)\b"),  # fable for risk:high
+    re.compile(r"\bfable\b[^.;|]{0,40}?\bescalation(?:s| rules?)\b"),         # fable ... for escalations
+    re.compile(r"\border is sonnet, opus,? (?:and |then )?fable\b"),           # escalation order is sonnet, opus, fable
+    re.compile(r"\bfable stays fable\b"),
+    re.compile(r"\b(?:size:l|risk:high)\b[^.;|]{0,40}?\b(?:top|highest|strongest) (?:tier|model)\b"),  # top tier
+]
+
+# Ticket #239, verb-independent: a sentence (or table cell) that names Fable beside a label or an escalation must
+# carry the explicit setting or request that picks it, unless the Fable it names is negated in its clause.
+FABLE_TRIGGER = re.compile(r"\bsize:l\b|\brisk:high\b|\bescalat\w*|\bfailures?\b|\btier up\b"
+                           r"|\bmoves? (?:\w+ ){0,3}?up\b|\b(?:top|highest) tier\b")
+FABLE_MARKER = re.compile(r"harness_code_tier|harness_review_tier|harness_wave_review|--tier fable"
+                          r"|\bmanual\w*|\bexplicit\w*|\bby hand\b"
+                          r"|\b(?:you|ryan|the user|the owner) (?:launch|launches|name|names|ask|asks|set|sets)\b")
+
+
+def fable_units(text):
+    """`text` as sentences and table cells: split at . ; ! ? followed by space, at newlines and at |."""
+    return [u.strip() for u in re.split(r"(?<=[.;!?])\s+|\n|\|", text) if u.strip()]
+
+
+def fable_unmarked(text):
+    """The units of `text` that name an affirmed Fable beside a label or an escalation with no explicit marker."""
+    out = []
+    for unit in fable_units(text):
+        low = unit.lower()
+        if not FABLE_TRIGGER.search(low) or FABLE_MARKER.search(low):
+            continue
+        for m in re.finditer(r"\bfable\b", low):
+            clause_after = CLAUSE_END.split(low[m.end():])[0]
+            if negated(low, m.start()) or any(w in NEGATION for w in WORD.findall(clause_after)[:6]):
+                continue
+            out.append(unit)
+            break
+    return out
+
+
+def fable_by_rule(text):
+    """The phrases in `text` that say the labels or an escalation pick Fable, negated ones excused."""
+    low = text.lower()
+    out = []
+    for pat in FABLE_BY_RULE:
+        for m in pat.finditer(low):
+            if negated(low, m.start()) or any(w in NEGATION for w in WORD.findall(m.group(0))):
+                continue
+            out.append(m.group(0))
+    return out
+
+
 class ReviewModel(unittest.TestCase):
-    """Ticket #67: the review runs on Opus 5.5; Fable only for a risk:high ticket or after the review stage has
-    escalated by failure. The work skill takes the model from `harness-board tier N --stage review`."""
+    """Ticket #67: the review runs on Opus 5.5. Ticket #239: Fable never by the labels or by escalation; a risk:high
+    review runs on Opus at xhigh, and Fable only when a setting names it. The work skill takes the model from
+    `harness-board tier N --stage review`."""
 
     def routing_paragraph(self):
         lines = [ln for ln in skill_body().splitlines() if ln.startswith("You orchestrate")]
@@ -4656,31 +5178,37 @@ class ReviewModel(unittest.TestCase):
         step = self.review_step()
         self.assertRegex(step, r"--stage review", step)
 
-    def test_fable_is_for_risk_high_or_escalation_only(self):
+    def test_fable_is_never_picked_by_the_labels_or_by_escalation(self):
+        # #239 (replaces #67's "Fable for risk:high or escalation"): the routing paragraph and the review step still
+        # speak of risk:high (an Opus review at xhigh) and of escalation, but neither picks Fable.
         where = self.routing_paragraph() + "\n" + self.review_step()
         text = " ".join(where.split())
         self.assertRegex(text.lower(), r"risk:high", text)
         self.assertRegex(text.lower(), r"escalat", text)
-        for sentence in sentences(where):
-            low = sentence.lower()
-            if "fable" in low and "review" in low:
-                with self.subTest(sentence=sentence):
-                    self.assertTrue("risk:high" in low or "escalat" in low or "--stage review" in low,
-                                    "an unconditional Fable review: " + sentence)
+        self.assertEqual(fable_by_rule(text), [], "the labels or an escalation pick Fable: " + text)
+        self.assertEqual(fable_unmarked(where), [], "Fable beside a label or an escalation with no explicit setting")
 
     def test_no_unconditional_review_on_fable_anywhere_in_the_skill(self):
+        # A sentence that puts the review on Fable names the setting that chose it (or the --stage review JSON that
+        # reports it); never risk:high or an escalation.
         body = skill_body()
         self.assertNotRegex(body.lower(), r"or reviewing on fable", "the old unconditional rule is still there")
-        for sentence in sentences(body):
+        self.assertEqual(fable_by_rule(flat(body)), [], "the skill lets the labels or an escalation pick Fable")
+        for sentence in sentences_of(flat(prose(body))):
             low = sentence.lower()
-            if "fable" in low and re.search(r"\breview(?:s|er|ing)?\b", low) and "ultrareview" not in low:
+            if (affirmed(low, r"\bfable\b") and re.search(r"\breview(?:s|er|ing)?\b", low)
+                    and "ultrareview" not in low):
                 with self.subTest(sentence=sentence):
-                    self.assertTrue("risk:high" in low or "escalat" in low or "--stage review" in low,
-                                    "an unconditional Fable review: " + sentence)
+                    self.assertRegex(low, r"harness_review_tier|harness_code_tier|--tier fable|--stage review"
+                                          r"|explicit|manual|by hand", "an unconditional Fable review: " + sentence)
 
     def test_fable_effort_is_still_xhigh_when_fable_is_used(self):
+        # #239: the skill need not name Fable at all; where it puts a stage on `model: fable`, the effort is xhigh.
         body = skill_body()
-        self.assertRegex(body, r"model: fable.{0,40}effort: xhigh|effort: xhigh.{0,40}model: fable")
+        for m in re.finditer(r"model: fable", body):
+            with self.subTest(at=m.start()):
+                near = body[max(0, m.start() - 40):m.end() + 40]
+                self.assertIn("effort: xhigh", near, near)
 
     def test_the_reviewer_agent_runs_on_opus(self):
         front = read_repo_file(PLUGIN, "agents", "reviewer.md").split("\n---", 1)[0]
@@ -4707,8 +5235,9 @@ class ReviewModel(unittest.TestCase):
                         with self.subTest(file="/".join(name), sentence=sentence[:100]):
                             self.assertIsNone(re.search(r"\b(always|every)\b", re.sub(r"every agent call", "", sentence, flags=re.I), re.I), sentence)
 
-    def test_the_reviewer_table_rows_name_fable_only_with_risk_high(self):
-        # README, guide and design list the reviewer in a table; its model cell may say Fable only for risk:high.
+    def test_the_reviewer_table_rows_name_fable_only_with_its_setting(self):
+        # README, guide and design list the reviewer in a table. #239: its model cell may name Fable only beside the
+        # setting that picks it (HARNESS_REVIEW_TIER), never for risk:high.
         for name in (("README.md",), ("docs", "guide.md"), ("docs", "design.md")):
             rows = [ln for ln in read_repo_file(REPO_ROOT, *name).splitlines()
                     if ln.lstrip().startswith("|") and re.search(r"`reviewer`", ln)]
@@ -4717,9 +5246,10 @@ class ReviewModel(unittest.TestCase):
             for row in rows:
                 cells = [c.strip() for c in row.strip().strip("|").split("|")][:-1]    # all but the description
                 for cell in cells:
-                    if re.search(r"fable", cell, re.I):
+                    if affirmed(cell.lower(), r"\bfable\b"):
                         with self.subTest(file="/".join(name), cell=cell):
-                            self.assertIn("risk:high", cell.lower(), row)
+                            self.assertIn("harness_review_tier", cell.lower(), row)
+                            self.assertEqual(fable_by_rule(cell), [], row)
 
     def test_no_user_facing_doc_says_every_review_runs_on_fable(self):
         # DoD: nothing in the skills, agents or docs says every review runs on Fable.
@@ -4733,6 +5263,90 @@ class ReviewModel(unittest.TestCase):
                     with self.subTest(file="/".join(name), line=line[:80]):
                         self.assertTrue("risk:high" in low or "escalat" in low or "opus" in low,
                                         "reviewer row names Fable unconditionally: " + line)
+
+
+def without_sections(text, titles):
+    """`text` without the level-2 sections whose heading starts with one of `titles` (the dated history)."""
+    out, skip = [], False
+    for line in text.splitlines():
+        m = re.match(r"^##\s+(.*)$", line)
+        if m:
+            skip = any(m.group(1).strip().lower().startswith(t.lower()) for t in titles)
+        if not skip:
+            out.append(line)
+    return "\n".join(out)
+
+
+class NoAutomaticFableText(unittest.TestCase):
+    """Ticket #239, DoD: no text under plugins/harness, user/ or docs/design.md (nor README.md or docs/guide.md,
+    which repeat the rubric) says the labels or escalation pick Fable. design.md's dated history (Implementation
+    notes, Interview decisions) records what was true then and is not checked."""
+
+    def documents(self):
+        docs = []
+        for top in (PLUGIN, os.path.join(REPO_ROOT, "user")):
+            for root, dirs, files in os.walk(top):
+                dirs[:] = [d for d in dirs if d not in ("tests", "__pycache__")]
+                for name in sorted(files):
+                    path = os.path.join(root, name)
+                    try:
+                        text = read_repo_file(path)
+                    except (UnicodeDecodeError, OSError):
+                        continue
+                    docs.append((os.path.relpath(path, REPO_ROOT), text))
+        design = read_repo_file(REPO_ROOT, "docs", "design.md")
+        docs.append(("docs/design.md", without_sections(design, ("Implementation notes", "Interview decisions"))))
+        docs.append(("README.md", read_repo_file(REPO_ROOT, "README.md")))
+        docs.append(("docs/guide.md", read_repo_file(REPO_ROOT, "docs", "guide.md")))
+        return docs
+
+    def check_the_patterns(self):
+        """The checker itself: it catches the old wording and spares the new."""
+        old = ["`size:L` or `risk:high` gives `fable`", "size:L or risk:high gives Fable",
+               "its second failure says `escalate fable`", "a stage that escalates to Fable gets `model: fable`",
+               "opus (fable, xhigh, for risk:high)", "Opus (Fable for risk:high)", "on Fable for a risk:high ticket",
+               "runs on Fable when the ticket is risk:high", "Escalation order is sonnet, opus, fable.",
+               "the tier above the last used, Fable stays Fable", "reviewer (opus; fable if risk:high)",
+               "Fable per the tier and escalation rules", "unset (`fable` for `risk:high`, else `opus`)",
+               "`size:L` or `risk:high` is fable",
+               # verb-independent wording (the breaker's round on #239)
+               "size:L or risk:high: Fable.", "risk:high tickets get Fable",
+               "a second failure moves the stage up to Fable", "label risk:high selects fable",
+               "size:L or risk:high gives the top tier", "risk:high tickets get Fable, not Opus",
+               "Fable is what an escalation from opus reaches"]
+        new = ["size:L or risk:high gives `opus` at effort xhigh", "escalation never goes to Fable",
+               "a risk:high review runs on Opus at xhigh, not Fable",
+               "Fable only when HARNESS_REVIEW_TIER or HARNESS_CODE_TIER is fable",
+               "`escalate opus xhigh`; a stage already at opus xhigh goes to needs-input",
+               "size:L no longer gives fable", "HARNESS_REVIEW_TIER=fable gives a Fable review at xhigh",
+               "An explicit fable stage goes to needs-input on its second failure: nothing is above it.",
+               "A risk:high review runs on Opus at xhigh; Fable only when HARNESS_REVIEW_TIER names it.",
+               "With `--tier fable` a second failure gives needs-input.",
+               "Fable is never picked by the labels or by an escalation.",
+               "| `reviewer` | Opus (xhigh for risk:high); Fable only with `HARNESS_REVIEW_TIER=fable` | Reviews |",
+               "Escalation tops out at Opus xhigh, and Fable runs only when you launch it."]
+        for phrase in old:
+            with self.subTest(old=phrase):
+                self.assertTrue(fable_by_rule(phrase) or fable_unmarked(phrase), phrase)
+        for phrase in new:
+            with self.subTest(new=phrase):
+                self.assertEqual((fable_by_rule(phrase), fable_unmarked(phrase)), ([], []), phrase)
+
+    def test_no_text_says_the_labels_or_escalation_pick_fable(self):
+        self.check_the_patterns()
+        docs = self.documents()
+        self.assertTrue(any(name.endswith("SKILL.md") for name, _ in docs), [n for n, _ in docs])
+        found = []
+        for name, text in docs:
+            # prose (Markdown and the user/ files) also gets the verb-independent check; code gets the phrase check
+            is_prose = name.endswith(".md") or name.startswith("user" + os.sep) or name.startswith("user/")
+            for line in text.splitlines():
+                for phrase in fable_by_rule(line):
+                    found.append(f"{name}: {phrase!r} in {line.strip()[:160]!r}")
+                if is_prose:
+                    for unit in fable_unmarked(line):
+                        found.append(f"{name}: unmarked Fable beside a label or escalation: {unit[:160]!r}")
+        self.assertEqual(found, [], "\n".join(found))
 
 
 class SkillWording(unittest.TestCase):
@@ -5208,8 +5822,11 @@ def routing_contradictions(text):
         if (re.search(r"\beffort\b", low) and NULL_INVERT.search(low)
                 and re.search(r"null|--json|harness-board tier", low)):
             faults.append("effort passed whatever it is")
-        if "xhigh" in low and "fable" not in low and re.search(r"\bnull\b|--json", low):
-            faults.append("xhigh outside Fable")
+        # #239: xhigh is also the routed effort of size:L, risk:high and an escalation from opus; outside those it is
+        # a fixed effort put on a routed one
+        if ("xhigh" in low and re.search(r"\bnull\b|--json", low)
+                and not re.search(r"fable|opus|size:l\b|risk:high|escalat|harness-work attempt", low)):
+            faults.append("xhigh outside Fable, Opus routes and escalation")
         if re.search(r"\breview", low) and re.search(r"\bmodel\b|\beffort\b|--stage review", low):
             faults += [f"reviewer borrows: {m.group(0)!r}" for m in REVIEWER_BORROWS.finditer(low)
                        if not negated(low, m.start())]
@@ -5330,32 +5947,28 @@ class RoutingSettingsSkill(unittest.TestCase):
         self.assertEqual(routing_contradictions(step), [], "step 5 contradicts the reviewer's routing")
         self.assertEqual(routing_contradictions(para), [], "the routing paragraph contradicts the reviewer's routing")
 
-    def test_escalation_goes_one_tier_up_from_the_printed_tier(self):
+    def test_escalation_passes_the_tier_and_effort_attempt_names(self):
+        # #239 (replaces "one tier up, Fable at xhigh"): an escalation runs at the tier and effort `harness-work
+        # attempt` names (`escalate opus` or `escalate opus xhigh`), counted from what the stage ran at, never from
+        # the labels, and never to Fable.
         para = self.routing_paragraph()
         escalation = [s for s in sentences_of(para) if re.search(r"escalat", s, re.I)]
         self.assertTrue(escalation, "the routing paragraph says nothing about escalation")
-        good = []
-        for s in escalation:
-            for clause in re.split(r";", s.lower()):
-                for m in ONE_TIER_UP.finditer(clause):
-                    src = m.group("src").strip()
-                    if not PRINTED_SOURCE.search(src) or re.search(r"\blabels?\b", src) or negated(clause, m.start()):
-                        continue
-                    after = clause[m.start():]
-                    if any(not negated(after, x.start()) for x in re.finditer(r"\blabels?\b", after)):
-                        continue
-                    if any(negated(after, x.start()) for x in re.finditer(r"\b(?:printed|prints)\b", after)):
-                        continue
-                    good.append(clause)
+        good = [s for s in escalation
+                if re.search(r"harness-work attempt", s) and affirmed(s.lower(), r"\beffort\b")
+                and re.search(r"\b(?:names?|named|prints?|printed|says|gives)\b", s.lower())]
+        self.assertTrue(good, "no escalation sentence passes the tier and effort `harness-work attempt` names: "
+                        + " | ".join(escalation))
         # nothing elsewhere in an escalation sentence takes the tier back to the labels
         back = [(s, m.group(0)) for s in escalation for m in ESCALATION_FROM_LABELS.finditer(s.lower())
                 if not negated(s.lower(), m.start())]
         self.assertEqual(back, [], "an escalation sentence counts from the labels' tier")
-        self.assertTrue(good, "no escalation sentence says one tier up from the tier the tool printed: "
-                        + " | ".join(escalation))
-        fable = [s for s in sentences_of(para) if re.search(r"fable", s, re.I) and re.search(r"escalat", s, re.I)]
-        self.assertTrue(any(FABLE_XHIGH.search(s) for s in fable),
-                        "no escalation sentence gives Fable `model: fable` with `effort: xhigh`: " + " | ".join(fable))
+        self.assertEqual([(s, fable_by_rule(s)) for s in escalation if fable_by_rule(s)], [],
+                         "an escalation sentence goes to Fable")
+        self.assertEqual([u for s in escalation for u in fable_unmarked(s)], [],
+                         "an escalation sentence names Fable with no explicit setting")
+        self.assertEqual([s for s in escalation if FABLE_XHIGH.search(s)], [],
+                         "an escalation sentence still puts the stage on `model: fable`")
 
     def test_skill_says_ultra_may_be_off_for_the_project(self):
         # In the routing paragraph (step 8 is left alone): `harness-pr ultra` may print that it ran nothing because

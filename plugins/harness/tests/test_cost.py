@@ -629,7 +629,7 @@ class CostCommand(CostBase):
                 answers = [self.attempt(n, stage, result) for stage, result in seq]
                 if n == 82:
                     self.assertEqual([a for (s, _), a in zip(seq, answers) if s == "breaker"],
-                                     ["retry", "escalate fable", "needs-input"])
+                                     ["retry", "escalate opus xhigh", "needs-input"])     # #239
                 self.assertEqual(tally(seq, answers), expected, "fixture: the attempt answers")
                 record = json.loads(self.cost(n, "--json"))
                 self.assertEqual(record["rounds"], expected)
@@ -641,6 +641,37 @@ class CostCommand(CostBase):
                 self.assertEqual(len(rounds), 1, text)
                 for piece in line[len("Rounds: "):].replace(";", ",").split(", "):
                     self.assertIn(piece, rounds[0])
+
+    def test_rounds_replay_the_top_of_the_ladder_as_needs_input(self):
+        # #239: a record that carries an `effort` key (written by #239's attempt) and has nothing above its tier and
+        # effort (opus xhigh or max, or fable) replays its second failure as needs-input, as attempt answered. A
+        # record with effort null at opus still escalates; a pre-#239 record (no `effort` key) replays as before.
+        def entry(i, stage, result, tier, **effort):
+            return dict({"stage": stage, "tier": tier, "result": result, "at": "2026-10-25T%02d:00:00Z" % (9 + i)},
+                        **effort)
+
+        cases = [
+            # (ticket, attempts' tier and effort fields, expected code-stage counts)
+            (601, ("opus", {"effort": "xhigh"}), stage_counts(2, 2, retry=1, needs_input=1)),
+            (602, ("opus", {"effort": "max"}), stage_counts(2, 2, retry=1, needs_input=1)),
+            (603, ("fable", {"effort": None}), stage_counts(2, 2, retry=1, needs_input=1)),
+            (604, ("fable", {"effort": "xhigh"}), stage_counts(2, 2, retry=1, needs_input=1)),
+            (605, ("opus", {"effort": None}), stage_counts(2, 2, retry=1, escalate=1)),
+            (606, ("opus", {"effort": "high"}), stage_counts(2, 2, retry=1, escalate=1)),
+            (607, ("sonnet", {"effort": None}), stage_counts(2, 2, retry=1, escalate=1)),
+            (608, ("fable", {}), stage_counts(2, 2, retry=1, escalate=1)),     # pre-#239: no effort key
+            (609, ("opus", {}), stage_counts(2, 2, retry=1, escalate=1)),
+        ]
+        for n, (tier, effort), counts in cases:
+            with self.subTest(ticket=n, tier=tier, effort=effort):
+                self.write_cache(n, tier=tier)
+                path = self.state("tickets", f"{n}.json")
+                with open(path, encoding="utf-8") as fh:
+                    cache = json.load(fh)
+                cache["attempts"] = [entry(0, "code", "fail", tier, **effort), entry(1, "code", "fail", tier, **effort)]
+                write(path, json.dumps(cache))
+                record = json.loads(self.cost(n, "--json"))
+                self.assertEqual(record["rounds"]["stages"], {"code": counts})
 
     # ----------------------------------------------------------- sessions
     def test_session_total_line_only_for_own_sessions(self):

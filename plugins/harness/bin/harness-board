@@ -65,7 +65,7 @@ try:
     from harness_lib.repo import RepoError, repo_facts
     from harness_lib.registry import load_registry
     from harness_lib.gh import describe, gh as lib_gh, gh_json as lib_gh_json
-    from harness_lib.routing import code_route, label_tier, load_routing, review_route
+    from harness_lib.routing import cached_code_route, code_route, label_tier, load_routing, review_route
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-board: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -920,10 +920,7 @@ def cmd_tier(repo, args):
         found, source = route(label_names(cached["labels"])), "cache"
     elif cached and cached.get("tier") in TIERS and not args.stage:
         # no labels to route: the cached tier stands in for the labels' tier, and the setting still decides
-        override = routing["code_tier"]
-        found = {"tier": override or cached["tier"], "effort": routing["code_effort"],
-                 "from": "HARNESS_CODE_TIER" if override else "labels", "labels_tier": cached["tier"]}
-        source = "cache"
+        found, source = cached_code_route(cached["tier"], routing), "cache"
     else:
         data = gh_json(repo, ["issue", "view", str(args.number), "--json", "labels"])
         found, source = route(label_names(data.get("labels") if isinstance(data, dict) else None)), "github"
@@ -1182,10 +1179,12 @@ def parser():
     sub.add_parser("board", parents=[common], help="open issues by status")
 
     tier = sub.add_parser("tier", parents=[common],
-                          help="sonnet, opus or fable: HARNESS_CODE_TIER when set, else from the ticket's labels")
+                          help="sonnet, opus or fable: HARNESS_CODE_TIER when set, else from the ticket's labels "
+                               "(sonnet or opus; --json adds the effort, xhigh for size:L or risk:high)")
     tier.add_argument("number", type=issue_number, metavar="N")
     tier.add_argument("--stage", choices=("review",),
-                      help="the review stage: HARNESS_REVIEW_TIER when set, else fable for a risk:high ticket and opus")
+                      help="the review stage: HARNESS_REVIEW_TIER when set, else opus (at effort xhigh for a "
+                           "risk:high ticket)")
 
     project = sub.add_parser("project", help=f"the Projects board named by {PROJECT_SETTING}")
     project_sub = project.add_subparsers(dest="action", metavar="{check,sync}")
