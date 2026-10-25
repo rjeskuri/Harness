@@ -54,7 +54,7 @@ One session per project. `claude agents` in a terminal lists every session, incl
 | Red proof | `harness-red check` | Runs the new tests against unchanged source. They must fail; the record is written |
 | Break | `test-breaker` | In a scratch copy, tries to pass the tests with a cheat. If it can, the tests go back to the author, at most twice |
 | Code | `coder` at the tier | Changes source only, until the new tests and `CLAUDE_VERIFY_CMD` pass, and commits |
-| Review | `reviewer`, Opus (Fable for risk:high) | Checks the branch against the definition of done. High and medium findings go back to the coder, at most twice |
+| Review | `reviewer`, Opus (Fable for risk:high), unless the project sets `HARNESS_REVIEW_TIER` | Checks the branch against the definition of done. High and medium findings go back to the coder, at most twice |
 | PR | `harness-pr open`, `harness-pr review` | Pushes the branch, opens a draft PR, posts the findings as a review |
 | CI | `harness-pr checks <P> --wait` | Waits for checks. Failures go back to the coder, at most twice |
 | Ultrareview | `harness-pr ultra <P> --post` | Only on `risk:high`; posts a cloud review to the PR. With `HARNESS_ULTRAREVIEW=off` in the project's settings it prints one line saying ultrareview is off and runs nothing |
@@ -174,6 +174,6 @@ A project that sets `HARNESS_ULTRAREVIEW=off` gets no ultrareview: `harness-pr u
 | Skill | A procedure in a SKILL.md, started with `/name`. The harness ones are `/harness:<name>` |
 | Subagent | A separate Claude with its own context, model and tools, given one task |
 | Plugin | A package of agents, skills and hooks installed as one unit. `ryan` is your marketplace |
-| Effort | How much reasoning a model spends per turn. Set per model under `modelSettings`; a project's `HARNESS_CODE_EFFORT` sets it for the test-author, breaker and coder and for the sessions dispatch launches, and without it none is passed |
+| Effort | How much reasoning a model spends per turn. Set per model under `modelSettings`; a project's `HARNESS_CODE_EFFORT` sets it for the test-author, breaker and coder and for the sessions dispatch launches; without it dispatch passes none, and so do those stages except one escalated to Fable, which gets `xhigh` (as a Fable review does) |
 | Fleet, console | `claude agents`: every session on the machine |
 | Handoff | `docs/agent/handoff.md`, the note a session writes so the next one can continue |
