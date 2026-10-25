@@ -141,13 +141,14 @@ def bad_json():
     return "{" + token()
 
 
-def exit_when_run_as(prefix):
-    """Module-level code that exits, with a random code and no message, when the program's file name starts with
-    `prefix`."""
+def exit_when_run_as(*names):
+    """Module-level code that exits, with a random code and no message, when the program's file name is exactly
+    one of `names`."""
     mod = ident()
+    spelled = "".join(f"{spell(name)}, " for name in names)
     return (
         f"\n{mod} = __import__({spell('sys')})\n"
-        f"if (getattr({mod}, {spell('argv')}) or [''])[0].rsplit('/', 1)[-1].startswith({spell(prefix)}):\n"
+        f"if (getattr({mod}, {spell('argv')}) or [''])[0].rsplit('/', 1)[-1] in ({spelled}):\n"
         f"    getattr({mod}, {spell('exit')})({exit_code()})\n"
     )
 
@@ -592,9 +593,12 @@ SCENARIOS = {
     },
     # Every hook file unchanged: hookio.py's deny does nothing, so every refusal becomes an allow.
     "hookio broken at runtime": {"lib/harness_lib/hookio.py": ("", noop_global("deny"))},
-    # Every tool file unchanged: gh.py exits, no message, when loaded by a harness-* tool; only harness-digest
-    # and harness-standup load it (session_brief.py does too, as a hook, and is unaffected).
-    "reporting lib broken for its tools": {"lib/harness_lib/gh.py": ("", exit_when_run_as("harness-"))},
+    # Every tool file unchanged: gh.py exits, no message, when loaded by harness-digest or harness-standup.
+    # harness-board, harness-pr and harness-work load gh.py too and must be unaffected, as must session_brief.py,
+    # which loads it as a hook.
+    "reporting lib broken for its tools": {
+        "lib/harness_lib/gh.py": ("", exit_when_run_as("harness-digest", "harness-standup"))
+    },
     "hooks broken at runtime": dict(
         {f"hooks/{name}.py": edit for name, edit in RUNTIME_BREAKS.items()},
         **{"hooks/branch_guard.py": (BASH_BRANCH, f'    elif tool == "Bash" and {falsy()}:\n')},
