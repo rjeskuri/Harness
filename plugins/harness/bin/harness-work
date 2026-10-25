@@ -24,7 +24,8 @@ record `cost` writes), runs/<repo-key>-<N>-<stamp>.json and .log (one dispatched
 attempt: appends {stage, tier, effort, result, at} to the ticket cache's attempts and prints the failure policy's
 answer. The tier is --tier, else the stage's route (harness_lib.routing: review_route for review, code_route for the
 other stages, from the cache's labels and the current settings), except that a coding stage keeps a cached sonnet or
-opus (a cached fable is the pre-#239 rubric's and yields to the route; a cache without labels keeps its tier). The
+opus (a cached fable is the pre-#239 rubric's and yields to the route; a cache without labels routes from its tier
+as `harness-board tier` does, a cached fable reading as opus xhigh). The
 effort is --effort, else the route's effort when the attempt ran at the route's tier, else none (null). The second
 failure in a row escalates: sonnet prints `escalate opus`, opus with no effort or below xhigh `escalate opus xhigh`;
 a stage already at opus xhigh or max, or on an explicitly named fable, gets needs-input instead. No escalation goes to
@@ -100,7 +101,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
-    from harness_lib.routing import EFFORTS, code_route, load_routing, next_route, review_route
+    from harness_lib.routing import EFFORTS, cached_code_route, code_route, load_routing, next_route, review_route
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, patterns, setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
     from harness_lib import cost
@@ -1103,14 +1104,17 @@ def stage_route(repo, cache, stage):
     labels and the current settings (review_route for review, code_route for every other stage), and the tier an
     attempt without --tier ran at. That is the route's tier, except that a coding stage keeps a cached sonnet or opus
     (the effective tier harness-board wrote); a cached fable is the pre-#239 rubric's and yields to the route. A
-    cache without labels keeps its cached tier (opus when it has none) with no effort."""
+    cache without labels routes from its cached tier (opus when it has none) as `harness-board tier` does
+    (cached_code_route: a cached fable reads as opus xhigh, and the code settings still decide); the review stage
+    reads it the same way without the code settings."""
     cached = cache.get("tier") if cache.get("tier") in TIERS else None
     labels = cache.get("labels")
-    if not isinstance(labels, list):
-        return (cached or DEFAULT_TIER), None, (cached or DEFAULT_TIER)
     routing = load_routing(repo.main)
     for problem in routing["problems"]:
         warn(problem)
+    if not isinstance(labels, list):
+        route = cached_code_route(cached or DEFAULT_TIER, {} if stage == "review" else routing)
+        return route["tier"], route["effort"], route["tier"]
     names = [x.get("name") if isinstance(x, dict) else x for x in labels]
     kind = cost.label_fields([x for x in names if isinstance(x, str)])
     if stage == "review":

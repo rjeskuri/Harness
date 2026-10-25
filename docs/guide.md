@@ -60,7 +60,7 @@ One session per project. `claude agents` in a terminal lists every session, incl
 | Ultrareview | `harness-pr ultra <P> --post` | Only on `risk:high`; posts a cloud review to the PR. With `HARNESS_ULTRAREVIEW=off` in the project's settings it prints one line saying ultrareview is off and runs nothing |
 | Ready | `harness-pr ready <P>` | Marks the PR ready, sets `status:in-review`, notifies you |
 
-Every stage reports pass or fail to `harness-work attempt`. A first failure retries at the same tier, a second re-runs one tier up, a third posts a needs-input question on the ticket and stops.
+Every stage reports pass or fail to `harness-work attempt`. A first failure retries at the same tier and effort. A second re-runs one step up: Sonnet goes to Opus, Opus goes to Opus at effort xhigh, and a second failure already at Opus xhigh (or max), or on an explicitly named Fable run, posts a needs-input question instead. A third posts a needs-input question on the ticket and stops. No escalation goes to Fable.
 
 The hooks refuse three kinds of action, so the rules hold even when a prompt is ignored:
 

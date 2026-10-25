@@ -1047,6 +1047,36 @@ class AttemptEffort(WorkTest):
                     self.assertEqual(self.attempt(n + 10, "review", "fail", "--tier", tier, env=env), "retry")
                     self.assertEqual(self.attempt(n + 10, "review", "fail", "--tier", tier, env=env), want)
 
+    def test_a_cache_without_labels_that_says_fable_reads_as_opus_xhigh(self):
+        # Agrees with `harness-board tier` on the same cache: a stored fable without labels is the pre-#239 rubric's
+        # answer for size:L or risk:high, so the attempt runs at opus xhigh and the second failure is needs-input.
+        for n, stage in ((85, "code"), (86, "tests"), (87, "ci")):
+            with self.subTest(stage=stage):
+                write(self.cache_path(n), json.dumps({"number": n, "title": TITLE, "tier": "fable", "attempts": []}))
+                first = self.attempt_json(n, stage, "fail")
+                self.assertEqual((first["tier"], first["effort"], first["action"]), ("opus", "xhigh", "retry"))
+                second = self.attempt_json(n, stage, "fail")
+                self.assertEqual((second["tier"], second["effort"], second["action"], second["next_tier"],
+                                  second["next_effort"]), ("opus", "xhigh", "needs-input", None, None))
+                self.assertEqual([(a["tier"], a["effort"]) for a in self.attempts(n)], [("opus", "xhigh")] * 2)
+                self.assertNotIn("fable", json.dumps([dict(first), dict(second)]))
+                self.assertNotIn("fable", json.dumps(self.read_json(self.cache_path(n))["attempts"]))
+                write(self.cache_path(n + 10), json.dumps({"number": n + 10, "title": TITLE, "tier": "fable",
+                                                           "attempts": []}))
+                self.assertEqual([self.attempt(n + 10, stage, "fail") for _ in range(2)], ["retry", "needs-input"])
+        # the board agrees on the same cache
+        board = os.path.join(os.path.dirname(TOOL), "harness-board")
+        p = subprocess.run([sys.executable, board, "tier", "85", "--json"], cwd=self.repo, env=self.env(),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        data = json.loads(p.stdout)
+        self.assertEqual((data["tier"], data["effort"]), ("opus", "xhigh"))
+        # an explicit HARNESS_CODE_TIER=fable still gives fable on that cache
+        write(self.cache_path(88), json.dumps({"number": 88, "title": TITLE, "tier": "fable", "attempts": []}))
+        env = self.env(HARNESS_CODE_TIER="fable")
+        self.assertEqual(self.attempt_json(88, "code", "fail", env=env)["tier"], "fable")
+        self.assertEqual(self.attempt(88, "code", "fail", env=env), "needs-input")
+
     def test_a_cache_without_labels_keeps_its_tier(self):
         # Caches written by hand or by old tools carry no labels: the cached tier stands, with no effort.
         for n, tier, want in ((81, "sonnet", "escalate opus"), (82, "opus", "escalate opus xhigh")):
