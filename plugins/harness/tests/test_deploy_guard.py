@@ -1,4 +1,5 @@
-"""Tests for the deploy_guard.py template (`revert --sha SHA [--smoke-log F]`), driven by the fake gh.
+"""Tests for the deploy_guard.py template (`run --sha SHA [--force]`, `degraded --sha SHA --smoke-log F`, `revert --sha
+SHA [--smoke-log F]`), driven by the fake gh, and for the deploy.yml v2 template.
 
     python3 -m unittest discover -s plugins/harness/tests -v
 
@@ -10,7 +11,11 @@ widget (#34)" style, which changes app.txt from version 1 to version 2. Some tes
 
 scripts/deploy.sh and scripts/smoke.sh are fakes committed in the project: each appends `deploy <HEAD> <app.txt
 first line>` or `smoke <HEAD>` to $GUARD_RUN_LOG and exits with $FAKE_DEPLOY_EXIT or $FAKE_SMOKE_EXIT (default 0);
-smoke.sh execs `sleep $FAKE_SMOKE_SLEEP` when that is set.
+deploy.sh execs `sleep $FAKE_DEPLOY_SLEEP` after its line when that is set;
+smoke.sh execs `sleep $FAKE_SMOKE_SLEEP` when that is set. On the merge under test (app.txt at version 2) smoke.sh is
+the first, live check of `run`: it prints the file $FAKE_SMOKE_OUTPUT and the line $FAKE_SMOKE_STDERR (on stderr) when
+set, execs `sleep $FAKE_SMOKE_SLEEP_V2` when set, and exits $FAKE_SMOKE_EXIT_V2, else $FAKE_SMOKE_EXIT, else 0; on the
+reverted code (version 1) it behaves as before, so a run whose first smoke fails can end in a healthy revert.
 
 gh is fakegh.py behind a wrapper named `gh` (on PATH, and HARNESS_GH unless a test drops it). The contract the
 scenario encodes, beyond the ticket's outline:
@@ -21,6 +26,10 @@ scenario encodes, beyond the ticket's outline:
 - the incident is created with `gh issue create` (--title, --label/-l, --assignee/-a, --body or --body-file -), its
   number taken from the issue URL gh prints; the ticket comment is `gh issue comment N` (--body or --body-file -);
   status labels change through `gh issue edit N --add-label/--remove-label`.
+- open issues by label come from `gh issue list` with the label as its own argv token (`--label deploy-frozen`, `-l
+  degraded`, as the guard already does for `incident`); the fake answers each label with its own list and a list
+  without a known label with every open issue (labels included in the JSON);
+- the degraded issue is `gh issue create` too, a comment on it `gh issue comment N`.
 fakegh's scenarios are static, so idempotency is tested by running twice and swapping in a scenario that shows what
 the first run created (the incident, the comment) before the second.
 """
@@ -59,12 +68,27 @@ DEPLOY_SH = """#!/bin/sh
 cd "$(dirname "$0")/.."
 printf 'deploy %s %s\\n' "$(git rev-parse HEAD)" "$(head -n 1 app.txt)" >> "$GUARD_RUN_LOG"
 echo "deploying"
+if [ -n "${FAKE_DEPLOY_SLEEP:-}" ]; then
+  exec sleep "$FAKE_DEPLOY_SLEEP"
+fi
 exit "${FAKE_DEPLOY_EXIT:-0}"
 """
 
 SMOKE_SH = """#!/bin/sh
 cd "$(dirname "$0")/.."
 printf 'smoke %s\\n' "$(git rev-parse HEAD)" >> "$GUARD_RUN_LOG"
+if [ "$(head -n 1 app.txt)" = "version: 2" ]; then
+  if [ -n "${FAKE_SMOKE_OUTPUT:-}" ]; then
+    cat "$FAKE_SMOKE_OUTPUT"
+  fi
+  if [ -n "${FAKE_SMOKE_STDERR:-}" ]; then
+    echo "$FAKE_SMOKE_STDERR" >&2
+  fi
+  if [ -n "${FAKE_SMOKE_SLEEP_V2:-}" ]; then
+    exec sleep "$FAKE_SMOKE_SLEEP_V2"
+  fi
+  exit "${FAKE_SMOKE_EXIT_V2:-${FAKE_SMOKE_EXIT:-0}}"
+fi
 if [ -n "${FAKE_SMOKE_SLEEP:-}" ]; then
   exec sleep "$FAKE_SMOKE_SLEEP"
 fi
@@ -111,7 +135,15 @@ def setUpModule():
     root = os.path.realpath(tempfile.mkdtemp(prefix="harness-guard-bin-"))
     fakebin = os.path.join(root, "fakebin")
     executable(os.path.join(fakebin, "gh"), f'#!/bin/sh\nexec "{sys.executable}" "{FAKEGH}" "$@"\n')
-    BINS.update(root=root, fakebin=fakebin, gh=os.path.join(fakebin, "gh"), py39=find_python39())
+    # pybin/python3: records the deploy.yml step's python3 calls (argv, GH_TOKEN) to $FAKE_PY_LOG, exits $FAKE_PY_EXIT
+    pybin = os.path.join(root, "pybin")
+    recorder = write(os.path.join(root, "pyrecorder.py"), (
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_PY_LOG'], 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(json.dumps({'argv': sys.argv[1:], 'gh_token': os.environ.get('GH_TOKEN')}) + '\\n')\n"
+        "sys.exit(int(os.environ.get('FAKE_PY_EXIT') or '0'))\n"))
+    executable(os.path.join(pybin, "python3"), f'#!/bin/sh\nexec "{sys.executable}" "{recorder}" "$@"\n')
+    BINS.update(root=root, fakebin=fakebin, gh=os.path.join(fakebin, "gh"), py39=find_python39(), pybin=pybin)
 
 
 def tearDownModule():
@@ -170,7 +202,7 @@ class GuardTest(unittest.TestCase):
 
     # ------------------------------------------------------------- the world
     def make_world(self, name="w", *, slug="acme/shop", title="Add the widget", pr=34, ticket=12, incident=77,
-                   later=None, deploy=True, reverted=False):
+                   later=None, deploy=True, smoke=True, reverted=False):
         """A bare origin with the seeded history, the merge under test, and a fresh clone to run the guard in.
         later: None, "conflict" (a later commit edits app.txt's changed line) or "other" (a later commit
         touches only other.txt). reverted: the revert of the merge is already on origin/main, as if a first
@@ -194,7 +226,8 @@ class GuardTest(unittest.TestCase):
         write(os.path.join(w.seed, "banner.txt"), "old banner\n")
         if deploy:
             executable(os.path.join(w.seed, "scripts", "deploy.sh"), DEPLOY_SH)
-        executable(os.path.join(w.seed, "scripts", "smoke.sh"), SMOKE_SH)
+        if smoke:
+            executable(os.path.join(w.seed, "scripts", "smoke.sh"), SMOKE_SH)
         self.commit(w.seed, "Initial")
         write(os.path.join(w.seed, "banner.txt"), "new banner\n")
         banner = self.commit(w.seed, "Add the banner (#30)")
@@ -255,7 +288,7 @@ class GuardTest(unittest.TestCase):
 
     def scenario(self, w=None, *, incidents=(), ticket_labels=("task", "status:in-review", "status:blocked",
                                                                 "size:M", "risk:low"),
-                 ticket_comments=(), ticket_state="CLOSED", label_create_fails=False):
+                 ticket_comments=(), ticket_state="CLOSED", label_create_fails=False, frozen=(), degraded=()):
         w = w or self.w
         owner, repo_name = w.slug.split("/")
         pulls = [self.pr_api(w)] if w.pr else []
@@ -280,7 +313,11 @@ class GuardTest(unittest.TestCase):
                           "labels": [{"name": n} for n in ticket_labels], "comments": list(ticket_comments)}}]
         calls += [{"contains": ["repo", "view"], "stdout_json": {"nameWithOwner": w.slug, "name": repo_name,
                                                                  "owner": {"login": owner}}},
-                  {"contains": ["issue", "list"], "stdout_json": list(incidents)},
+                  {"contains": ["issue", "list", "deploy-frozen"], "stdout_json": list(frozen)},
+                  {"contains": ["issue", "list", "degraded"], "stdout_json": list(degraded)},
+                  {"contains": ["issue", "list", "incident"], "stdout_json": list(incidents)},
+                  {"contains": ["issue", "list"], "stdout_json": list(
+                      {i["number"]: i for i in (*incidents, *frozen, *degraded)}.values())},
                   {"contains": ["issue", "create"], "stdout": f"https://github.com/{w.slug}/issues/{w.incident}\n"},
                   {"contains": ["issue", "comment"],
                    "stdout": f"https://github.com/{w.slug}/issues/{w.ticket}#issuecomment-4242\n"}]
@@ -414,6 +451,31 @@ class GuardTest(unittest.TestCase):
         self.assertIncidentBody(w, self.body(call), revert_sha)
         return call
 
+    def label_creates(self, w=None):
+        """(index in the gh log, label name, argv) of each `gh label create NAME ...`."""
+        valued = {"--color", "-c", "--description", "-d", "--repo", "-R"}
+        out = []
+        for i, call in enumerate(self.gh_calls(w)):
+            argv = call["argv"]
+            if argv[:2] != ["label", "create"]:
+                continue
+            j, name = 2, None
+            while j < len(argv):
+                if argv[j] in valued:
+                    j += 2
+                    continue
+                if not argv[j].startswith("-"):
+                    name = argv[j]
+                    break
+                j += 1
+            out.append((i, name, argv))
+        return out
+
+    def index_of(self, verb, w=None):
+        found = [i for i, c in enumerate(self.gh_calls(w)) if c["argv"][:2] == ["issue", verb]]
+        self.assertTrue(found, f"no gh issue {verb} in {[c['argv'] for c in self.gh_calls(w)]}")
+        return found[0]
+
 
 class Revert(GuardTest):
     # ============================================================= broad behavior
@@ -534,6 +596,27 @@ class Revert(GuardTest):
                     self.assertIn(f"Revert commit: {revert_sha}", self.body_lines(body))
                     self.assertIn("smoke check 100 FAILED: GET /health -> 500", self.smoke_tail(body))
 
+    def test_redeploy_past_the_deploy_timeout_freezes(self):
+        # `revert` runs deploy.sh only once, after the revert, so FAKE_DEPLOY_SLEEP hangs just the redeploy
+        w = self.make_world(slug="stark/forge", title="Retune the furnace", pr=73, ticket=36, incident=118)
+        self.scenario()
+        before_tip, before_count = self.origin_tip(), self.origin_count()
+        started = time.monotonic()
+        try:
+            p = self.guard(timeout=25, DEPLOY_GUARD_DEPLOY_TIMEOUT="2", FAKE_DEPLOY_SLEEP="40")
+        except subprocess.TimeoutExpired:
+            self.fail("DEPLOY_GUARD_DEPLOY_TIMEOUT=2 did not bound the 40 s redeploy after the revert")
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 20, "DEPLOY_GUARD_DEPLOY_TIMEOUT bounds the redeploy")
+        self.assertExit(p, 1)
+        revert_sha = self.assertOneRevertPushed(w, before_tip, before_count)   # the revert stays pushed
+        self.assertEqual(self.ran(), [f"deploy {revert_sha} version: 1"], "no smoke after a timed-out redeploy")
+        call = self.assertFrozenIncident(w, revert_sha)
+        frozen = [line for line in self.body_lines(self.body(call)) if line.startswith("Deploys are frozen:")]
+        self.assertEqual(len(frozen), 1, self.body(call))
+        self.assertIn("scripts/deploy.sh", frozen[0])
+
     def test_sha_without_a_pr_names_no_ticket(self):
         # no GITHUB_REPOSITORY (gh repo view names it) and no HARNESS_GH (gh from PATH); the SHA is not the tip
         w = self.make_world(slug="zed-labs/api", title="Hotfix the importer", pr=None, incident=9, later="other")
@@ -613,31 +696,6 @@ class Revert(GuardTest):
         self.assertExit(p, 0)
         self.assertEqual((self.origin_tip(), self.origin_count()), before, "no new commit on origin/main")
         self.assertEqual(self.ran(), [f"deploy {w.revert_sha} version: 1", f"smoke {w.revert_sha}"])
-
-    def label_creates(self, w=None):
-        """(index in the gh log, label name, argv) of each `gh label create NAME ...`."""
-        valued = {"--color", "-c", "--description", "-d", "--repo", "-R"}
-        out = []
-        for i, call in enumerate(self.gh_calls(w)):
-            argv = call["argv"]
-            if argv[:2] != ["label", "create"]:
-                continue
-            j, name = 2, None
-            while j < len(argv):
-                if argv[j] in valued:
-                    j += 2
-                    continue
-                if not argv[j].startswith("-"):
-                    name = argv[j]
-                    break
-                j += 1
-            out.append((i, name, argv))
-        return out
-
-    def index_of(self, verb, w=None):
-        found = [i for i, c in enumerate(self.gh_calls(w)) if c["argv"][:2] == ["issue", verb]]
-        self.assertTrue(found, f"no gh issue {verb} in {[c['argv'] for c in self.gh_calls(w)]}")
-        return found[0]
 
     def test_labels_are_made_sure_of_before_they_are_used(self):
         cases = [  # (name, world options, guard env, labels needed before the call, the call)
@@ -911,6 +969,867 @@ class Revert(GuardTest):
         self.assertExit(p, 0)
         self.assertOneRevertPushed(w, before_tip, before_count)
         self.assertEqual(len(self.creates()), 1)
+
+
+class Run(GuardTest):
+    """`run --sha SHA [--force]`: frozen, stop; scripts/deploy.sh; scripts/smoke.sh; 0 done, 2 degraded, else revert."""
+
+    def run_guard(self, w=None, *extra, timeout=120, **env):
+        w = w or self.w
+        argv = [sys.executable, TEMPLATE, "run", "--sha", w.sha, *extra]
+        return subprocess.run(argv, cwd=w.work, env=self.guard_env(w, **env), capture_output=True, text=True,
+                              timeout=timeout)
+
+    def degraded_cmd(self, w, smoke_log):
+        argv = [sys.executable, TEMPLATE, "degraded", "--sha", w.sha, "--smoke-log", smoke_log]
+        return subprocess.run(argv, cwd=w.work, env=self.guard_env(w), capture_output=True, text=True, timeout=120)
+
+    def smoke_output(self, w, lines):
+        """A file smoke.sh prints on the merge under test (FAKE_SMOKE_OUTPUT)."""
+        return write(os.path.join(w.base, "smoke-output.txt"), "\n".join(lines) + "\n")
+
+    def issue(self, w, number, title, *labels, body=""):
+        return {"number": number, "title": title, "state": "OPEN", "labels": [{"name": n} for n in labels],
+                "url": f"https://github.com/{w.slug}/issues/{number}", "body": body}
+
+    def snapshot(self, w=None):
+        w = w or self.w
+        return self.origin_tip(w), self.origin_count(w), self.setup_git(w.work, "rev-parse", "HEAD")
+
+    def output(self, p):
+        return p.stdout + p.stderr
+
+    def writes(self, w=None):
+        """Every recorded gh call that changes GitHub."""
+        out = []
+        for c in self.gh_calls(w):
+            a = c["argv"]
+            if a[:1] == ["issue"] and a[1:2] and a[1] in ("create", "comment", "edit", "reopen", "close", "delete"):
+                out.append(a)
+            elif a[:1] == ["pr"] and a[1:2] and a[1] in ("create", "comment", "edit", "merge", "close"):
+                out.append(a)
+            elif a[:1] == ["api"]:
+                methods = [m.upper() for m in flag_values(a, "-X", "--method")]
+                fields = flag_values(a, "-f", "-F", "--field", "--raw-field", "--input")
+                if any(m != "GET" for m in methods) or (fields and not methods):
+                    out.append(a)
+        return out
+
+    def comments(self, w=None):
+        return [c for c in self.gh_calls(w) if c["argv"][:2] == ["issue", "comment"]]
+
+    def fenced_with(self, body, needle):
+        """The one fenced block holding a line with `needle`, its lines right-stripped."""
+        blocks = [[line.rstrip() for line in b] for b in fenced_blocks(body) if any(needle in line for line in b)]
+        self.assertEqual(len(blocks), 1, body)
+        return blocks[0]
+
+    def assertDegradedIssue(self, w, call):
+        # `Degraded: <repo>`: the ticket does not say slug or name, so either is accepted
+        self.assertIn(self.title(call), {f"Degraded: {w.slug}", f"Degraded: {w.slug.split('/')[1]}"})
+        labels = self.labels(call)
+        self.assertIn("degraded", labels)
+        self.assertFalse({"incident", "deploy-frozen"} & labels, f"degraded is not an incident: {labels}")
+
+    def deployed_and_smoked(self, w):
+        return [f"deploy {w.sha} version: 2", f"smoke {w.sha}"]
+
+    # ============================================================= broad behavior
+    def test_healthy_deploy_and_smoke_exit_zero(self):
+        cases = [("acme/shop", "Add the widget", 34, 12), ("globex/store", "Rework the cart", 88, 41)]
+        for slug, title, pr, ticket in cases:
+            with self.subTest(slug):
+                w = self.make_world(slug.replace("/", "-"), slug=slug, title=title, pr=pr, ticket=ticket)
+                other = self.issue(w, 5, "Incident: Something else reverted", "incident",
+                                   body=f"Merge commit: {'f' * 40}\n")
+                self.scenario(w, incidents=[other])
+                before = self.snapshot(w)
+
+                p = self.run_guard(w)
+
+                self.assertExit(p, 0)
+                self.assertEqual(self.ran(w), self.deployed_and_smoked(w), "deploy.sh then smoke.sh, once each")
+                self.assertEqual(self.snapshot(w), before, "no git write")
+                self.assertEqual(self.writes(w), [], "nothing filed on GitHub")
+
+    def test_smoke_exit_one_reverts(self):
+        w = self.make_world(slug="initech/portal", title="Swap the pricing", pr=7, ticket=3, incident=64)
+        output = [f"live check {i:03d} FAILED: GET /pricing -> 502" for i in range(1, 76)]
+        self.scenario()
+        before_tip, before_count = self.origin_tip(), self.origin_count()
+
+        p = self.run_guard(w, FAKE_SMOKE_EXIT_V2="1", FAKE_SMOKE_OUTPUT=self.smoke_output(w, output))
+
+        self.assertExit(p, 0)                                   # a healthy revert exits 0
+        revert_sha = self.assertOneRevertPushed(w, before_tip, before_count)
+        self.assertEqual(self.ran(), self.deployed_and_smoked(w) + [f"deploy {revert_sha} version: 1",
+                                                                     f"smoke {revert_sha}"])
+        creates = self.creates()
+        self.assertEqual([self.title(c) for c in creates], [f"Incident: {w.title} reverted"],
+                         [c["argv"] for c in self.gh_calls()])
+        body = self.body(creates[0])
+        self.assertIncidentBody(w, body, revert_sha)
+        # the first smoke's output reached revert as its --smoke-log: the incident fences its last 60 lines
+        self.assertEqual(self.fenced_with(body, "live check"), output[-60:])
+        self.assertEqual([self.body(c).rstrip("\n") for c in self.comments_on(w.ticket)],
+                         [self.expected_comment(w, revert_sha)])
+
+    def test_other_exit_codes_and_timeout_revert(self):
+        cases = [  # (name, guard env, slug, title, pr, ticket, incident)
+            ("exit 3", {"FAKE_SMOKE_EXIT_V2": "3"}, "hooli/web", "Move the footer", 12, 4, 23),
+            ("exit 127", {"FAKE_SMOKE_EXIT_V2": "127"}, "vandelay/imports", "Import the latex", 91, 45, 318),
+            ("exit 255", {"FAKE_SMOKE_EXIT_V2": "255"}, "stark/forge", "Retune the furnace", 71, 26, 133),
+            ("timeout", {"DEPLOY_GUARD_SMOKE_TIMEOUT": "2", "FAKE_SMOKE_SLEEP_V2": "60"}, "wayne/cave",
+             "Rewire the lights", 96, 47, 412)]
+        for name, env, slug, title, pr, ticket, incident in cases:
+            with self.subTest(name):
+                w = self.make_world(name.replace(" ", "-"), slug=slug, title=title, pr=pr, ticket=ticket,
+                                    incident=incident)
+                output = [f"{name}: probe {c} failed" for c in "xyz"]
+                self.scenario(w)
+                before_tip, before_count = self.origin_tip(w), self.origin_count(w)
+                started = time.monotonic()
+
+                p = self.run_guard(w, FAKE_SMOKE_OUTPUT=self.smoke_output(w, output), **env)
+
+                self.assertLess(time.monotonic() - started, 40, "DEPLOY_GUARD_SMOKE_TIMEOUT bounds the first smoke")
+                self.assertExit(p, 0)
+                revert_sha = self.assertOneRevertPushed(w, before_tip, before_count)
+                self.assertEqual(self.ran(w), self.deployed_and_smoked(w) + [f"deploy {revert_sha} version: 1",
+                                                                              f"smoke {revert_sha}"])
+                creates = self.creates(w)
+                self.assertEqual([self.title(c) for c in creates], [f"Incident: {title} reverted"],
+                                 [c["argv"] for c in self.gh_calls(w)])
+                self.assertNotIn("degraded", self.labels(creates[0]))
+                body = self.body(creates[0])
+                self.assertIncidentBody(w, body, revert_sha)
+                if name != "timeout":
+                    self.assertTrue(set(output) <= set(self.fenced_with(body, "probe")), body)
+
+    def test_smoke_exit_two_files_degraded_and_never_reverts(self):
+        cases = [("cyberdyne/skynet", "Teach the network", 29, 17), ("tyrell/replicant", "Extend the lifespan", 19, 8)]
+        for slug, title, pr, ticket in cases:
+            with self.subTest(slug):
+                w = self.make_world(slug.replace("/", "-"), slug=slug, title=title, pr=pr, ticket=ticket)
+                output = [f"{slug} check {i:03d} DEGRADED: p95 {2000 + i} ms" for i in range(1, 76)]
+                other = self.issue(w, 5, "Incident: Something else reverted", "incident",
+                                   body=f"Merge commit: {'f' * 40}\n")
+                self.scenario(w, incidents=[other])
+                before = self.snapshot(w)
+
+                p = self.run_guard(w, FAKE_SMOKE_EXIT_V2="2", FAKE_SMOKE_OUTPUT=self.smoke_output(w, output))
+
+                self.assertExit(p, 0)
+                self.assertEqual(self.snapshot(w), before, "no revert, no git write")
+                self.assertEqual(self.ran(w), self.deployed_and_smoked(w), "no redeploy, no second smoke")
+                creates = self.creates(w)
+                self.assertEqual(len(creates), 1, [c["argv"] for c in self.gh_calls(w)])
+                self.assertDegradedIssue(w, creates[0])
+                body = self.body(creates[0])
+                self.assertIn(w.sha, body)
+                self.assertEqual(self.fenced_with(body, "DEGRADED"), output[-60:])
+                for verb in ("comment", "edit", "reopen"):
+                    self.assertEqual([c["argv"] for c in self.gh_calls(w) if c["argv"][:2] == ["issue", verb]], [],
+                                     f"no gh issue {verb}: no incident, no ticket question")
+
+    def test_degraded_appends_to_the_open_issue(self):
+        w = self.make_world(slug="soylent/green", title="Index the orders", pr=118, ticket=73, incident=418)
+        output = [f"check {c}: p95 3100 ms over the 2000 ms budget" for c in "abcde"]
+        smoke_out = self.smoke_output(w, output)
+        unrelated = self.issue(w, 501, "Incident: Something else reverted", "incident",
+                               body=f"Merge commit: {'e' * 40}\n")
+        self.scenario(incidents=[unrelated])
+        p = self.run_guard(w, FAKE_SMOKE_EXIT_V2="2", FAKE_SMOKE_OUTPUT=smoke_out)
+        self.assertExit(p, 0)
+        creates = self.creates()
+        self.assertEqual(len(creates), 1, [c["argv"] for c in self.gh_calls()])
+        self.assertDegradedIssue(w, creates[0])
+        self.assertEqual(self.comments(), [])
+
+        # GitHub now shows the degraded issue the first run made (#418); the next exit 2 comments on it
+        existing = self.issue(w, 418, self.title(creates[0]), "degraded", body=self.body(creates[0]))
+        self.scenario(incidents=[unrelated], degraded=[existing])
+        os.unlink(w.run_log)
+        before = self.snapshot()
+
+        p = self.run_guard(w, FAKE_SMOKE_EXIT_V2="2", FAKE_SMOKE_OUTPUT=smoke_out)
+
+        self.assertExit(p, 0)
+        self.assertEqual(self.snapshot(), before, "no git write")
+        self.assertEqual(self.ran(), self.deployed_and_smoked(w))
+        self.assertEqual(self.creates(), [], "the degraded issue is not opened twice")
+        comments = self.comments()
+        self.assertEqual(len(comments), 1, [c["argv"] for c in self.gh_calls()])
+        self.assertTrue(targets(comments[0]["argv"], 418), comments[0]["argv"])
+        body = self.body(comments[0])
+        self.assertIn(w.sha, body)
+        self.assertTrue(set(output) <= set(self.fenced_with(body, "p95")), body)
+
+    def test_frozen_stops_unless_forced(self):
+        cases = [  # (name, frozen issue number, world options, run arguments, deploys)
+            ("frozen", 13, {}, (), False),
+            ("frozen without a deploy script", 207, {"deploy": False}, (), False),
+            ("frozen and forced", 13, {}, ("--force",), True)]
+        for name, number, opts, args, deploys in cases:
+            with self.subTest(name):
+                w = self.make_world(re.sub(r"\W+", "-", name), slug="initrode/tps", title="Reformat the reports",
+                                    pr=77, ticket=39, incident=402, **opts)
+                frozen = self.issue(w, number, "Incident: Earlier merge: revert failed, deploys frozen", "incident",
+                                    "deploy-frozen", body=f"Merge commit: {'d' * 40}\n")
+                self.scenario(w, incidents=[frozen], frozen=[frozen])
+                before = self.snapshot(w)
+
+                # a failing smoke, so a guard that ignored the freeze would also revert
+                p = self.run_guard(w, *args, **({} if deploys else {"FAKE_SMOKE_EXIT_V2": "1"}))
+
+                self.assertExit(p, 0)
+                if deploys:
+                    # forced past the freeze, the run is a normal healthy one
+                    self.assertEqual(self.ran(w), self.deployed_and_smoked(w))
+                    self.assertEqual(self.snapshot(w), before)
+                    self.assertEqual(self.writes(w), [])
+                    continue
+
+                self.assertIn(f"deploys are frozen by #{number}", self.output(p))
+                self.assertNotIn("no deploy script", self.output(p), "the freeze is checked first")
+                self.assertEqual(self.ran(w), [], "nothing deployed, nothing checked")
+                self.assertEqual(self.snapshot(w), before)
+                self.assertEqual(self.writes(w), [])
+
+        # an open incident and an open degraded issue are not a freeze
+        w = self.make_world("not-frozen", slug="initrode/tps", title="Reformat the reports", pr=77, ticket=39)
+        self.scenario(w, incidents=[self.issue(w, 5, "Incident: Something reverted", "incident",
+                                               body=f"Merge commit: {'c' * 40}\n")],
+                      degraded=[self.issue(w, 6, "Degraded: initrode/tps", "degraded")])
+        p = self.run_guard(w)
+        self.assertExit(p, 0)
+        self.assertNotIn("deploys are frozen", self.output(p))
+        self.assertEqual(self.ran(w), self.deployed_and_smoked(w))
+
+    def test_no_deploy_or_no_smoke_script_stops_cleanly(self):
+        w = self.make_world("no-deploy", slug="acme/docs", title="Trim the index", pr=5, ticket=2, deploy=False)
+        self.scenario(w)
+        before = self.snapshot(w)
+        p = self.run_guard(w, FAKE_SMOKE_EXIT_V2="1")
+        self.assertExit(p, 0)
+        self.assertIn("no deploy script", self.output(p))
+        self.assertEqual(self.ran(w), [], "no deploy script: the smoke does not run either")
+        self.assertEqual(self.snapshot(w), before)
+        self.assertEqual(self.writes(w), [])
+
+        w = self.make_world("no-smoke", slug="acme/api", title="Bump the client", pr=6, ticket=3, smoke=False)
+        self.scenario(w)
+        before = self.snapshot(w)
+        p = self.run_guard(w)
+        self.assertExit(p, 0)
+        self.assertNotIn("no deploy script", self.output(p))
+        self.assertEqual(self.ran(w), [f"deploy {w.sha} version: 2"])
+        self.assertEqual(self.snapshot(w), before)
+        self.assertEqual(self.writes(w), [])
+
+    def test_failed_deploy_exits_one_without_revert(self):
+        for code in ("1", "2", "3"):
+            with self.subTest(deploy_exit=code):
+                w = self.make_world(f"deploy-{code}", slug="oscorp/labs", title="Bump the serum", pr=57, ticket=14)
+                self.scenario(w)
+                before = self.snapshot(w)
+
+                p = self.run_guard(w, FAKE_DEPLOY_EXIT=code, FAKE_SMOKE_EXIT_V2="1")
+
+                self.assertExit(p, 1)
+                self.assertEqual(self.ran(w), [f"deploy {w.sha} version: 2"], "no smoke after a failed deploy")
+                self.assertEqual(self.snapshot(w), before, "no revert")
+                self.assertEqual(self.writes(w), [], "no incident, no degraded issue")
+
+    # ============================================================= specific cases
+    def test_a_failed_revert_passes_its_exit_code_through(self):
+        # the smoke fails on the merge and again on the revert: revert freezes deploys and exits 1, so run does
+        w = self.make_world(slug="umbrella/api", title="Cache the lookups", pr=150, ticket=140, incident=200)
+        self.scenario()
+        before_tip, before_count = self.origin_tip(), self.origin_count()
+
+        p = self.run_guard(w, FAKE_SMOKE_EXIT="1")
+
+        self.assertExit(p, 1)
+        revert_sha = self.assertOneRevertPushed(w, before_tip, before_count)
+        self.assertEqual(self.ran(), self.deployed_and_smoked(w) + [f"deploy {revert_sha} version: 1",
+                                                                     f"smoke {revert_sha}"])
+        self.assertFrozenIncident(w, revert_sha)
+
+    def test_smoke_timeout_is_read_from_the_environment(self):
+        # 3 s against a 5 s smoke reverts, 10 s against a 6 s smoke passes: no constant timeout does both
+        cases = [("3", "5", True), ("10", "6", False)]
+        for limit, sleep, reverts in cases:
+            with self.subTest(timeout=limit, sleep=sleep):
+                w = self.make_world(f"t{limit}", slug="acme/shop", title="Queue the invoices", pr=64, ticket=33,
+                                    incident=55)
+                self.scenario(w)
+                before = self.snapshot(w)
+
+                p = self.run_guard(w, DEPLOY_GUARD_SMOKE_TIMEOUT=limit, FAKE_SMOKE_SLEEP_V2=sleep)
+
+                self.assertExit(p, 0)
+                if reverts:
+                    self.assertOneRevertPushed(w, before[0], before[1])
+                    self.assertEqual([self.title(c) for c in self.creates(w)],
+                                     ["Incident: Queue the invoices reverted"])
+                else:
+                    self.assertEqual(self.snapshot(w), before)
+                    self.assertEqual(self.ran(w), self.deployed_and_smoked(w))
+                    self.assertEqual(self.writes(w), [])
+
+    def test_degraded_command_files_then_appends_the_given_log(self):
+        w = self.make_world(slug="pendant/publishing", title="Print the catalog", pr=26, ticket=11, incident=61)
+        log = [f"catalog probe {i}: 1 of 3 regions slow" for i in range(1, 9)]
+        smoke_log = write(os.path.join(w.base, "degraded.log"), "\n".join(log) + "\n")
+        self.scenario()
+        before = self.snapshot()
+
+        p = self.degraded_cmd(w, smoke_log)
+
+        self.assertExit(p, 0)
+        self.assertEqual(self.ran(), [], "degraded deploys nothing and runs no smoke")
+        self.assertEqual(self.snapshot(), before)
+        creates = self.creates()
+        self.assertEqual(len(creates), 1, [c["argv"] for c in self.gh_calls()])
+        self.assertDegradedIssue(w, creates[0])
+        body = self.body(creates[0])
+        self.assertIn(w.sha, body)
+        self.assertEqual(self.fenced_with(body, "catalog probe"), log, "a short log is fenced whole")
+        self.assertEqual(self.comments(), [])
+
+        self.scenario(degraded=[self.issue(w, 61, f"Degraded: {w.slug}", "degraded", body=body)])
+        p = self.degraded_cmd(w, smoke_log)
+        self.assertExit(p, 0)
+        self.assertEqual(self.creates(), [])
+        comments = self.comments()
+        self.assertEqual(len(comments), 1, [c["argv"] for c in self.gh_calls()])
+        self.assertTrue(targets(comments[0]["argv"], 61), comments[0]["argv"])
+        self.assertIn(w.sha, self.body(comments[0]))
+        self.assertEqual(self.fenced_with(self.body(comments[0]), "catalog probe"), log)
+
+    def test_smoke_stderr_reaches_the_degraded_tail(self):
+        w = self.make_world(slug="aperture/lab", title="Calibrate the portal", pr=44, ticket=21)
+        output = ["portal check 1: ok", "portal check 2: slow"]
+        self.scenario()
+
+        p = self.run_guard(w, FAKE_SMOKE_EXIT_V2="2", FAKE_SMOKE_OUTPUT=self.smoke_output(w, output),
+                           FAKE_SMOKE_STDERR="portal check 3: warning: cache cold")
+
+        self.assertExit(p, 0)
+        creates = self.creates()
+        self.assertEqual(len(creates), 1, [c["argv"] for c in self.gh_calls()])
+        block = self.fenced_with(self.body(creates[0]), "portal check")
+        self.assertTrue(set(output) | {"portal check 3: warning: cache cold"} <= set(block), block)
+
+    def test_degraded_label_is_made_sure_of_before_the_issue(self):
+        for fails in (False, True):
+            with self.subTest(label_create_fails=fails):
+                w = self.make_world(f"label-{fails}", slug="hooli/web", title="Move the footer", pr=12, ticket=4)
+                self.scenario(w, label_create_fails=fails)
+
+                p = self.run_guard(w, FAKE_SMOKE_EXIT_V2="2")
+
+                self.assertExit(p, 0)
+                at = self.index_of("create", w)
+                made = [(i, argv) for i, label, argv in self.label_creates(w) if label == "degraded"]
+                self.assertTrue(any(i < at for i, _ in made), "gh label create degraded before gh issue create")
+                for _, argv in made:
+                    self.assertFalse({"--force", "-f"} & set(argv), "a customised degraded label stays as it is")
+                self.assertDegradedIssue(w, self.creates(w)[0])
+
+    # ============================================================= GitHub or deploy.sh failing
+    def answer_first(self, w, contains, response):
+        """Put a call answering `contains` with `response` ahead of the scenario's own answers."""
+        with open(w.scenario_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["calls"].insert(0, {"contains": list(contains), **response})
+        write(w.scenario_path, json.dumps(data))
+
+    def test_a_failed_freeze_lookup_deploys_nothing_unless_forced(self):
+        answers = [("gh exits 1", {"stderr": "HTTP 502: Bad Gateway (https://api.github.com/graphql)\n", "exit": 1}),
+                   ("gh exits 4", {"stderr": "gh: To use GitHub CLI in automation, set GH_TOKEN\n", "exit": 4}),
+                   ("not JSON", {"stdout": "<html><body>rate limited</body></html>\n"}),
+                   ("empty", {"stdout": ""})]
+        for name, answer in answers:
+            for forced in (False, True):
+                with self.subTest(name, forced=forced):
+                    w = self.make_world(re.sub(r"\W+", "-", f"{name}-{forced}"), slug="massive/dynamic",
+                                        title="Shard the ledger", pr=83, ticket=52, incident=310)
+                    self.scenario(w)
+                    self.answer_first(w, ["issue", "list", "deploy-frozen"], answer)
+                    before = self.snapshot(w)
+
+                    if forced:
+                        p = self.run_guard(w, "--force")
+                        self.assertExit(p, 0)
+                        self.assertEqual(self.ran(w), self.deployed_and_smoked(w), "--force deploys anyway")
+                    else:
+                        # a failing smoke, so a guard that deployed past the failed lookup would also revert
+                        p = self.run_guard(w, FAKE_SMOKE_EXIT_V2="1")
+                        self.assertExit(p, 1)
+                        self.assertEqual(self.ran(w), [], "neither deploy.sh nor smoke.sh runs")
+                    self.assertEqual(self.snapshot(w), before, "no git write")
+                    self.assertEqual(self.writes(w), [], "nothing filed on GitHub")
+
+    def test_deploy_timeout_is_read_from_the_environment(self):
+        # 2 s against a 40 s deploy times out, 15 s against a 3 s deploy passes: no constant timeout does both
+        cases = [("2", "40", True), ("15", "3", False)]
+        for limit, sleep, times_out in cases:
+            with self.subTest(timeout=limit, sleep=sleep):
+                w = self.make_world(f"d{limit}", slug="wonka/factory", title="Retool the line", pr=48, ticket=27,
+                                    incident=95)
+                self.scenario(w)
+                before = self.snapshot(w)
+                # on a timeout the smoke would fail, so a guard that went on to smoke.sh would also revert
+                env = {"FAKE_SMOKE_EXIT_V2": "1"} if times_out else {}
+                started = time.monotonic()
+                try:
+                    p = self.run_guard(w, timeout=25, DEPLOY_GUARD_DEPLOY_TIMEOUT=limit, FAKE_DEPLOY_SLEEP=sleep,
+                                       **env)
+                except subprocess.TimeoutExpired:
+                    self.fail(f"DEPLOY_GUARD_DEPLOY_TIMEOUT={limit} did not bound a {sleep} s scripts/deploy.sh")
+                elapsed = time.monotonic() - started
+
+                if times_out:
+                    self.assertLess(elapsed, 20, "DEPLOY_GUARD_DEPLOY_TIMEOUT bounds deploy.sh")
+                    self.assertExit(p, 1)
+                    self.assertEqual(self.ran(w), [f"deploy {w.sha} version: 2"], "no smoke after a timed-out deploy")
+                    self.assertEqual(self.snapshot(w), before, "no revert, no git write")
+                    self.assertEqual(self.writes(w), [], "no incident, no degraded issue")
+                else:
+                    self.assertExit(p, 0)
+                    self.assertEqual(self.ran(w), self.deployed_and_smoked(w))
+                    self.assertEqual(self.snapshot(w), before)
+                    self.assertEqual(self.writes(w), [])
+
+    def test_unreachable_github_fails_degraded_and_never_reverts(self):
+        refused = {"stderr": "error connecting to api.github.com\n", "exit": 1}
+        cases = [  # (name, open degraded issue, failing call)
+            ("list fails", False, ["issue", "list", "degraded"]),
+            ("comment fails", True, ["issue", "comment"]),
+            ("create fails", False, ["issue", "create"])]
+        for name, open_issue, failing in cases:
+            for via_run in (False, True):
+                with self.subTest(name, via_run=via_run):
+                    w = self.make_world(re.sub(r"\W+", "-", f"{name}-{via_run}"), slug="black-mesa/sector-c",
+                                        title="Align the spectrometer", pr=61, ticket=19, incident=240)
+                    log = [f"spectrometer probe {i}: p95 2600 ms" for i in range(1, 5)]
+                    degraded = [self.issue(w, 88, f"Degraded: {w.slug}", "degraded")] if open_issue else []
+                    self.scenario(w, degraded=degraded)
+                    self.answer_first(w, failing, refused)
+                    before = self.snapshot(w)
+
+                    if via_run:
+                        p = self.run_guard(w, FAKE_SMOKE_EXIT_V2="2", FAKE_SMOKE_OUTPUT=self.smoke_output(w, log))
+                        self.assertEqual(self.ran(w), self.deployed_and_smoked(w), "no redeploy, no second smoke")
+                    else:
+                        smoke_log = write(os.path.join(w.base, "degraded.log"), "\n".join(log) + "\n")
+                        p = self.degraded_cmd(w, smoke_log)
+                        self.assertEqual(self.ran(w), [], "degraded deploys nothing and runs no smoke")
+
+                    self.assertExit(p, 1)
+                    self.assertEqual(self.snapshot(w), before, "no revert, no git write")
+                    self.assertEqual([self.title(c) for c in self.creates(w) if self.title(c).startswith("Incident")],
+                                     [], "no incident")
+                    for verb in ("edit", "reopen"):
+                        self.assertEqual([c["argv"] for c in self.gh_calls(w) if c["argv"][:2] == ["issue", verb]],
+                                         [], f"no gh issue {verb}")
+
+
+# ---------------------------------------------------------------- deploy.yml v2
+DEPLOY_YML = os.path.join(PLUGIN, "templates", "deploy.yml")
+TOKEN = "ghs_fake_workflow_token"
+
+
+def yaml_scalar(text):
+    text = text.strip()
+    if text[:1] in ("'", '"'):
+        quote = text[0]
+        m = re.match(r"'((?:[^']|'')*)'" if quote == "'" else r'"((?:[^"\\]|\\.)*)"', text)
+        if m:
+            return m.group(1).replace("''", "'") if quote == "'" else m.group(1)
+    text = re.split(r"\s+#", text, 1)[0].strip()
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1].strip()
+        return [yaml_scalar(part) for part in inner.split(",")] if inner else []
+    return None if text in ("", "~", "null") else text
+
+
+class MiniYaml:
+    """Enough YAML for a workflow file: block mappings and lists, flow lists, quoted scalars and | > blocks."""
+    KEY = re.compile(r"""^('(?:[^']|'')*'|"[^"]*"|[^'"\s\-\[{][^:]*?|-[^\s:][^:]*?):(?:\s+(.*))?$""")
+
+    def __init__(self, text):
+        self.lines = text.expandtabs().splitlines()
+        self.i = 0
+
+    @classmethod
+    def load(cls, text):
+        y = cls(text)
+        value = y.node(0)
+        if y.peek() is not None:
+            raise ValueError(f"line {y.i + 1}: unexpected {y.lines[y.i]!r}")
+        return value
+
+    def peek(self):
+        while self.i < len(self.lines) and (not self.lines[self.i].strip()
+                                            or self.lines[self.i].lstrip().startswith("#")):
+            self.i += 1
+        if self.i >= len(self.lines):
+            return None
+        line = self.lines[self.i]
+        return len(line) - len(line.lstrip(" ")), line.strip()
+
+    @staticmethod
+    def is_item(content):
+        return content == "-" or content.startswith("- ")
+
+    def node(self, indent):
+        p = self.peek()
+        if p is None or p[0] < indent:
+            return None
+        return self.seq(p[0]) if self.is_item(p[1]) else self.mapping(p[0])
+
+    def mapping(self, indent):
+        out = {}
+        while True:
+            p = self.peek()
+            if p is None or p[0] < indent:
+                return out
+            if p[0] > indent or self.is_item(p[1]):
+                raise ValueError(f"line {self.i + 1}: unexpected {p[1]!r}")
+            m = self.KEY.match(p[1])
+            if not m:
+                raise ValueError(f"line {self.i + 1}: not a key: {p[1]!r}")
+            self.i += 1
+            out[yaml_scalar(m.group(1))] = self.value(m.group(2) or "", indent)
+
+    def value(self, rest, indent):
+        rest = rest.strip()
+        if re.fullmatch(r"[|>][-+]?\d*", rest):
+            return self.block(indent, rest[0] == ">")
+        if not rest or rest.startswith("#"):
+            p = self.peek()
+            if p and (p[0] > indent or (p[0] == indent and self.is_item(p[1]))):
+                return self.node(p[0])
+            return None
+        return yaml_scalar(rest)
+
+    def seq(self, indent):
+        out = []
+        while True:
+            p = self.peek()
+            if p is None or p[0] < indent or (p[0] == indent and not self.is_item(p[1])):
+                return out
+            if p[0] > indent:
+                raise ValueError(f"line {self.i + 1}: unexpected {p[1]!r}")
+            rest = p[1][1:]
+            item = rest.lstrip()
+            if not item:
+                self.i += 1
+                out.append(self.node(indent + 1))
+            elif self.KEY.match(item):
+                inner = indent + 1 + len(rest) - len(item)
+                self.lines[self.i] = " " * inner + item
+                out.append(self.mapping(inner))
+            else:
+                self.i += 1
+                out.append(yaml_scalar(item))
+
+    def block(self, indent, folded):
+        lines = []
+        while self.i < len(self.lines):
+            line = self.lines[self.i]
+            if line.strip() and len(line) - len(line.lstrip(" ")) <= indent:
+                break
+            lines.append(line)
+            self.i += 1
+        while lines and not lines[-1].strip():
+            lines.pop()
+        cut = min((len(x) - len(x.lstrip(" ")) for x in lines if x.strip()), default=0)
+        lines = [x[cut:] for x in lines]
+        return (" ".join(lines) if folded else "\n".join(lines)) + "\n"
+
+
+EXPR_TOKEN = re.compile(r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<num>\d+(?:\.\d+)?)|(?P<op>==|!=|&&|\|\||!|\(|\))"
+                        r"|(?P<ref>[A-Za-z_][\w.-]*))")
+
+
+def gh_number(value):
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value.strip()) if value.strip() else 0.0
+    except ValueError:
+        return float("nan")
+
+
+def gh_truthy(value):
+    if isinstance(value, float) and value != value:
+        return False
+    return value not in (None, False, 0, 0.0, "")
+
+
+def gh_equal(a, b):
+    """GitHub's loose equality: same types compare (strings ignoring case), else both become numbers."""
+    if type(a) is type(b) or (a is None and b is None):
+        return a.lower() == b.lower() if isinstance(a, str) else a == b
+    x, y = gh_number(a), gh_number(b)
+    return x == y and x == x
+
+
+def gh_render(value):
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else str(value)
+    return str(value)
+
+
+def gh_eval(expr, ctx):
+    """A GitHub Actions expression: context references, literals, !, ==, !=, && and || with parentheses."""
+    tokens, pos, expr = [], 0, expr.strip()
+    while pos < len(expr):
+        m = EXPR_TOKEN.match(expr, pos)
+        if not m or m.end() == pos:
+            raise ValueError(f"the test cannot evaluate ${{{{ {expr} }}}} at {expr[pos:]!r}")
+        tokens.append((m.lastgroup, m.group(m.lastgroup)))
+        pos = m.end()
+        while pos < len(expr) and expr[pos].isspace():
+            pos += 1
+    at = [0]
+
+    def peek():
+        return tokens[at[0]] if at[0] < len(tokens) else (None, None)
+
+    def take():
+        at[0] += 1
+        return tokens[at[0] - 1]
+
+    def primary():
+        kind, text = take() if at[0] < len(tokens) else (None, None)
+        if kind == "op" and text == "(":
+            value = either()
+            if take() != ("op", ")"):
+                raise ValueError(f"unbalanced parentheses in {expr!r}")
+            return value
+        if kind == "op" and text == "!":
+            return not gh_truthy(primary())
+        if kind == "str":
+            return text[1:-1].replace("''", "'")
+        if kind == "num":
+            return float(text)
+        if kind == "ref":
+            low = text.lower()
+            if low in ("true", "false"):
+                return low == "true"
+            if low == "null":
+                return None
+            if low not in ctx:
+                raise ValueError(f"the test knows no context {text!r} (in ${{{{ {expr} }}}})")
+            return ctx[low]
+        raise ValueError(f"the test cannot evaluate ${{{{ {expr} }}}}")
+
+    def compare():
+        left = primary()
+        while peek() in (("op", "=="), ("op", "!=")):
+            op = take()[1]
+            right = primary()
+            left = gh_equal(left, right) == (op == "==")
+        return left
+
+    def both():
+        left = compare()
+        while peek() == ("op", "&&"):
+            take()
+            right = compare()
+            left = right if gh_truthy(left) else left
+        return left
+
+    def either():
+        left = both()
+        while peek() == ("op", "||"):
+            take()
+            right = both()
+            left = left if gh_truthy(left) else right
+        return left
+
+    value = either()
+    if at[0] != len(tokens):
+        raise ValueError(f"the test cannot evaluate ${{{{ {expr} }}}}")
+    return value
+
+
+def gh_substitute(text, ctx):
+    return re.sub(r"\$\{\{(.*?)\}\}", lambda m: gh_render(gh_eval(m.group(1), ctx)), str(text), flags=re.S)
+
+
+DEPLOY_STEP_SH = '#!/bin/sh\necho deployed >> "$DEPLOY_LOG"\necho "deploying"\nexit "${FAKE_DEPLOY_EXIT:-0}"\n'
+
+
+class Workflow(unittest.TestCase):
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="harness-deployyml-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def load(self):
+        self.assertTrue(os.path.isfile(DEPLOY_YML), f"{DEPLOY_YML} does not exist")
+        with open(DEPLOY_YML, encoding="utf-8") as fh:
+            text = fh.read()
+        doc = MiniYaml.load(text)
+        self.assertIsInstance(doc, dict, text)
+        jobs = doc.get("jobs") or {}
+        self.assertEqual(len(jobs), 1, f"one job: {list(jobs)}")
+        job = next(iter(jobs.values()))
+        steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
+        return doc, job, steps
+
+    @staticmethod
+    def flat(value):
+        return re.sub(r"\s+", "", str(value))
+
+    def the_run_step(self, steps):
+        runs = [s for s in steps if "run" in s]
+        self.assertEqual(len(runs), 1, f"one run step: {steps}")
+        return runs[0]
+
+    def test_deploy_yml_v2_triggers_permissions_concurrency_and_step(self):
+        doc, job, steps = self.load()
+        on = doc.get("on")
+        self.assertIsInstance(on, dict, f"on: {on!r}")
+        self.assertEqual(set(on), {"push", "workflow_dispatch"})
+        branches = (on.get("push") or {}).get("branches")
+        self.assertEqual([branches] if isinstance(branches, str) else branches, ["main"])
+        inputs = (on.get("workflow_dispatch") or {}).get("inputs") or {}
+        self.assertIn("force", inputs, f"workflow_dispatch inputs: {inputs!r}")
+        force = inputs["force"] or {}
+        self.assertEqual(str(force.get("type")).lower(), "boolean")
+        if force.get("default") is not None:
+            self.assertEqual(str(force["default"]).lower(), "false")
+
+        concurrency = doc.get("concurrency") or job.get("concurrency") or {}
+        self.assertIsInstance(concurrency, dict, f"concurrency: {concurrency!r}")
+        self.assertEqual(concurrency.get("group"), "deploy-main")
+        self.assertEqual(str(concurrency.get("cancel-in-progress")).lower(), "false")
+
+        permissions = doc.get("permissions") or job.get("permissions") or {}
+        self.assertIsInstance(permissions, dict, f"permissions: {permissions!r}")
+        self.assertEqual(permissions.get("contents"), "write")
+        self.assertEqual(permissions.get("issues"), "write")
+
+        checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")]
+        self.assertEqual(len(checkouts), 1, steps)
+        self.assertEqual(str((checkouts[0].get("with") or {}).get("fetch-depth")), "0")
+        step = self.the_run_step(steps)
+        self.assertEqual([s for s in steps if s is not step and s is not checkouts[0]], [],
+                         "checkout and the one run step only")
+        self.assertLess(steps.index(checkouts[0]), steps.index(step))
+        script = " ".join(step["run"].split())
+        self.assertIn("python3 scripts/deploy_guard.py run --sha", script)
+        self.assertTrue("GITHUB_SHA" in script or "github.sha" in self.flat(script), script)
+        self.assertIn("--force", script)
+        self.assertIn("scripts/deploy.sh", script, "without the guard, v1's deploy.sh logic")
+        self.assertIn("no deploy script", script)
+        env = {**(doc.get("env") or {}), **(job.get("env") or {}), **(step.get("env") or {})}
+        self.assertEqual(self.flat(env.get("GH_TOKEN")), "${{github.token}}", env)
+
+    def run_step(self, doc, job, step, *, event, force, sha, guard, deploy, py_exit=0, deploy_exit=0):
+        """The step as the runner runs it: expressions filled in, bash -eo pipefail, in a fresh project."""
+        project = os.path.join(self.tmp, f"project-{len(os.listdir(self.tmp))}")
+        os.makedirs(os.path.join(project, "scripts"))
+        if guard:
+            write(os.path.join(project, "scripts", "deploy_guard.py"), "raise SystemExit('the fake python3 runs')\n")
+        if deploy:
+            write(os.path.join(project, "scripts", "deploy.sh"), DEPLOY_STEP_SH)     # not executable, as in v1
+        dispatch = event == "workflow_dispatch"
+        ctx = {"github.sha": sha, "github.token": TOKEN, "secrets.github_token": TOKEN, "github.event_name": event,
+               "github.ref": "refs/heads/main", "github.ref_name": "main", "github.repository": "acme/shop",
+               "github.workspace": project, "inputs.force": force if dispatch else None,
+               "github.event.inputs.force": (gh_render(force) if dispatch else None)}
+        condition = step.get("if")
+        if condition is not None:
+            raw = str(condition).strip()
+            raw = raw[3:-2] if raw.startswith("${{") and raw.endswith("}}") else raw
+            self.assertTrue(gh_truthy(gh_eval(raw, ctx)), f"the step is skipped on {event}: if: {condition}")
+        py_log, deploy_log = os.path.join(project, "..", f"{os.path.basename(project)}-py.log"), \
+            os.path.join(project, "..", f"{os.path.basename(project)}-deploy.log")
+        env = {"PATH": os.pathsep.join([BINS["pybin"], "/usr/bin", "/bin"]), "HOME": self.tmp, "GITHUB_SHA": sha,
+               "GITHUB_EVENT_NAME": event, "GITHUB_REF": "refs/heads/main", "GITHUB_REPOSITORY": "acme/shop",
+               "GITHUB_WORKSPACE": project, "FAKE_PY_LOG": py_log, "FAKE_PY_EXIT": str(py_exit),
+               "DEPLOY_LOG": deploy_log, "FAKE_DEPLOY_EXIT": str(deploy_exit)}
+        for scope in (doc, job, step):
+            for key, value in (scope.get("env") or {}).items():
+                env[key] = gh_substitute(value, ctx)
+        script = write(os.path.join(self.tmp, f"{os.path.basename(project)}-step.sh"),
+                       gh_substitute(step["run"], ctx))
+        shell = str(step.get("shell") or "bash")
+        argv = (["/bin/sh", "-e", script] if shell == "sh" else
+                ["/bin/bash", "--noprofile", "--norc", "-eo", "pipefail", script])
+        p = subprocess.run(argv, cwd=project, env=env, capture_output=True, text=True, timeout=60)
+        calls = []
+        if os.path.exists(py_log):
+            with open(py_log, encoding="utf-8") as fh:
+                calls = [json.loads(line) for line in fh if line.strip()]
+        deploys = 0
+        if os.path.exists(deploy_log):
+            with open(deploy_log, encoding="utf-8") as fh:
+                deploys = len(fh.read().splitlines())
+        return p, calls, deploys
+
+    def assertGuardCall(self, calls, sha, forced):
+        self.assertEqual(len(calls), 1, calls)
+        argv = calls[0]["argv"]
+        self.assertEqual([os.path.normpath(argv[0])] + argv[1:2], ["scripts/deploy_guard.py", "run"], argv)
+        rest = []
+        for tok in argv[2:]:
+            rest += tok.split("=", 1) if tok.startswith("--sha=") else [tok]
+        self.assertEqual(rest.count("--force"), 1 if forced else 0, argv)
+        self.assertEqual([t for t in rest if t != "--force"], ["--sha", sha], argv)
+        self.assertEqual(calls[0]["gh_token"], TOKEN, "GH_TOKEN from github.token")
+
+    def test_deploy_yml_v2_step_runs_the_guard_or_falls_back_to_v1(self):
+        doc, job, steps = self.load()
+        step = self.the_run_step(steps)
+        sha_a, sha_b = "3f9c2e1" + "a" * 33, "b7d40c9" + "1" * 33
+        cases = [  # (name, event, force input, sha, guard present, deploy.sh present, py exit, deploy exit)
+            ("push", "push", None, sha_a, True, True, 0, 0),
+            ("dispatch, force false", "workflow_dispatch", False, sha_b, True, True, 0, 0),
+            ("dispatch, force true", "workflow_dispatch", True, sha_a, True, True, 0, 0),
+            ("guard exits 1", "push", None, sha_b, True, True, 1, 0),
+            ("no guard", "push", None, sha_a, False, True, 0, 0),
+            ("no guard, forced", "workflow_dispatch", True, sha_b, False, True, 0, 0),
+            ("no guard, no deploy.sh", "push", None, sha_a, False, False, 0, 0),
+            ("no guard, deploy.sh exits 3", "push", None, sha_b, False, True, 0, 3)]
+        for name, event, force, sha, guard, deploy, py_exit, deploy_exit in cases:
+            with self.subTest(name):
+                p, calls, deploys = self.run_step(doc, job, step, event=event, force=force, sha=sha, guard=guard,
+                                                  deploy=deploy, py_exit=py_exit, deploy_exit=deploy_exit)
+                out = f"exit {p.returncode}\nstdout:\n{p.stdout}\nstderr:\n{p.stderr}"
+                if guard:
+                    self.assertGuardCall(calls, sha, forced=force is True)
+                    self.assertEqual(deploys, 0, "the guard runs deploy.sh itself")
+                    if py_exit:
+                        self.assertNotEqual(p.returncode, 0, "the guard's failure fails the step: " + out)
+                    else:
+                        self.assertEqual(p.returncode, 0, out)
+                    continue
+                self.assertEqual(calls, [], "no guard, no python3 scripts/deploy_guard.py")
+                if not deploy:
+                    self.assertEqual(p.returncode, 0, out)
+                    self.assertIn("no deploy script", p.stdout + p.stderr)
+                elif deploy_exit:
+                    self.assertEqual(deploys, 1, out)
+                    self.assertNotEqual(p.returncode, 0, "a failed deploy.sh fails the step: " + out)
+                else:
+                    self.assertEqual(deploys, 1, out)
+                    self.assertEqual(p.returncode, 0, out)
 
 
 if __name__ == "__main__":

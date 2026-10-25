@@ -49,13 +49,12 @@ try:
     from harness_lib.repo import NotARepository, RepoError, repo_facts
     from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
     from harness_lib.settings import DEFAULT_TEST_PATTERNS as TEST_PATTERNS  # also read by tests/test_red.py
+    from harness_lib.settings import DEFAULT_SOURCE_EXEMPT as SOURCE_EXEMPT  # also read by tests/test_red.py
     from harness_lib.cli import Parser, Problem, run_main  # Problem also caught by tests/test_red.py
     from harness_lib.text import last_line, write_json
 except Exception as exc:  # one line, exit 1, like the __main__ wrapper below
     sys.exit(f"harness-red: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
-SOURCE_EXEMPT = ("docs/**,**/*.md,.claude/**,.github/**,.githooks/**,**/*.toml,**/*.cfg,**/*.ini,**/*.json,"
-                 "**/*.yaml,**/*.yml,**/*.txt,**/*.lock,.gitignore,.worktreeinclude,LICENSE*")
 DEFAULT_TIMEOUT = 300.0
 TAIL_LINES = 40
 CANNOT_START = (126, 127)          # the shell's "not executable" and "command not found"

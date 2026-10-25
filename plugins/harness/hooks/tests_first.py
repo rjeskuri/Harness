@@ -68,7 +68,7 @@ try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.redproof import record_current
     from harness_lib.repo import main_checkout
-    from harness_lib.settings import DEFAULT_TEST_PATTERNS, glob_match, patterns, setting, settings_env
+    from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, glob_match, patterns, setting, settings_env
     from harness_lib.text import read_json
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
     sys.stderr.write(f"tests_first.py: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}\n")
@@ -90,11 +90,6 @@ TEST_CONFIG = (
     "jest.config.*",
     "vitest.config.*",
     "package.json",
-)
-DEFAULT_SOURCE_EXEMPT = (
-    "docs/**,**/*.md,.claude/**,.github/**,.githooks/**,**/*.toml,**/*.cfg,**/*.ini,"
-    "**/*.json,**/*.yaml,**/*.yml,**/*.txt,**/*.lock,.gitignore,.worktreeinclude,"
-    "LICENSE*"
 )
 AUTHOR_ON_SOURCE = (
     "You write tests only on this ticket. Report the source change the implementation "

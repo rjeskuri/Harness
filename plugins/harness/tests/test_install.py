@@ -15,6 +15,7 @@ import datetime as dt
 import json
 import os
 import plistlib
+import re
 import shutil
 import stat
 import subprocess
@@ -65,12 +66,14 @@ SETTINGS = {
 
 
 # The snippet's permission and autoMode lists, pinned independently of the installer: the nine harness rules of
-# the project template, the one ask rule, and the two autoMode lists led by the "$defaults" sentinel (the prose
-# entries are pinned by their opening words, from the ticket's Context).
-ASK_RULES = ["Bash(gh pr merge *)"]
+# the project template, the three ask rules (a raw merge and both landing commands: sessions may not land, #240),
+# and the two autoMode lists led by the "$defaults" sentinel (the prose entries are pinned by their opening words,
+# from the ticket's Context; no autoMode.allow entry allows landing).
+LAND_ASK_RULES = ["Bash(harness-pr land *)", "Bash(harness-pr autoland *)"]
+ASK_RULES = ["Bash(gh pr merge *)"] + LAND_ASK_RULES
 ENVIRONMENT_OPENINGS = ["Organization:", "Source control:", "CI/CD deploy targets:", "Review convention:",
                         "Key internal services:", "Sensitive data locations & audiences:", "Sensitive remote targets:"]
-AUTO_ALLOW_OPENINGS = ["Landing a pull request with", "Writing or loading a com.ryaneskuri.harness-* LaunchAgent"]
+AUTO_ALLOW_OPENINGS = ["Writing or loading a com.ryaneskuri.harness-* LaunchAgent"]
 DEFAULTS = "$defaults"
 LISTS = (("permissions", "allow"), ("permissions", "ask"), ("autoMode", "environment"), ("autoMode", "allow"))
 # What a merge into a file holding none of the snippet's entries reports: every entry counted, "$defaults" not.
@@ -210,7 +213,7 @@ class Install(unittest.TestCase):
         for piece in ("~/.claude/settings.json: set model, effortLevel; ",
                       f'set modelSettings for {", ".join(snippet["modelSettings"])}',
                       'removed enabledPlugins["companion@ryan"]', ADDED_ALL,
-                      "added 9 permissions.allow, 1 permissions.ask, 7 autoMode.environment, 2 autoMode.allow",
+                      "added 9 permissions.allow, 3 permissions.ask, 7 autoMode.environment, 1 autoMode.allow",
                       f"(backup settings.json.bak-{today})"):
             self.assertIn(piece, line)
 
@@ -247,7 +250,7 @@ class Install(unittest.TestCase):
         for piece in ("~/.claude/settings.json: set model, effortLevel; ",
                       f'set modelSettings for {", ".join(snippet["modelSettings"])}',
                       ADDED_ALL,
-                      "added 9 permissions.allow, 1 permissions.ask, 7 autoMode.environment, 2 autoMode.allow"):
+                      "added 9 permissions.allow, 3 permissions.ask, 7 autoMode.environment, 1 autoMode.allow"):
             self.assertIn(piece, line)
         self.assertTrue(line.endswith(" (created)"), line)
 
@@ -298,6 +301,137 @@ class Install(unittest.TestCase):
         self.assertIn("the LaunchAgent is not loaded", p.stdout)
         self.assertIn("security add-generic-password", p.stdout)                  # the install carried on
 
+    # Sessions may not land (#240): after an install, both landing commands prompt and nothing in autoMode.allow
+    # lets the classifier wave a landing through. The rules are spelled out here, not read from the snippet.
+
+    def test_sessions_may_not_land_after_install(self):
+        starts = {
+            "fresh HOME, no settings": None,
+            "settings with none of the lists": SETTINGS,
+            "own ask and autoMode.allow": {"permissions": {"allow": ["Bash(ls:*)"],
+                                                           "ask": ["Bash(git push --force:*)"]},
+                                           "autoMode": {"allow": ["Running make test is allowed."]}},
+            "the raw-merge ask rule already there": {"permissions": {"ask": ["Bash(gh pr merge *)"]},
+                                                     "autoMode": {"allow": [DEFAULTS], "environment": []}},
+            "one land rule already there": {"permissions": {"ask": ["Bash(harness-pr autoland *)", "Bash(x)"]}},
+        }
+        for name, start in starts.items():
+            with self.subTest(start=name):
+                if start is None:
+                    if os.path.exists(self.settings):
+                        os.remove(self.settings)
+                else:
+                    self.reset(start)
+                p = self.install()
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                merged = read_json(self.settings)
+                ask = merged["permissions"]["ask"]
+                for rule in ("Bash(gh pr merge *)", "Bash(harness-pr land *)", "Bash(harness-pr autoland *)"):
+                    self.assertEqual(ask.count(rule), 1, (rule, ask))
+                self.assertIn("Bash(harness-pr:*)", merged["permissions"]["allow"])  # allowed, but landing asks
+                for rule in ("Bash(harness-pr land *)", "Bash(harness-pr autoland *)"):
+                    self.assertNotIn(rule, merged["permissions"]["allow"])
+                landing = [e for e in merged["autoMode"]["allow"]
+                           if re.search(r"\bland|autoland|harness-pr|\bmerg", e, re.IGNORECASE)]
+                self.assertEqual(landing, [], "an autoMode.allow entry mentions landing")
+                self.assertEqual(merged["autoMode"]["allow"][0], DEFAULTS)
+                self.assertGreaterEqual(len(merged["autoMode"]["allow"]), 2, "the LaunchAgent entry is gone too")
+
+    def test_the_snippet_asks_before_landing_and_never_allows_it(self):
+        snippet = read_json(SNIPPET)
+        ask = snippet["permissions"]["ask"]
+        self.assertEqual(ask[:1], ["Bash(gh pr merge *)"])                       # the land rules come after it
+        for rule in ("Bash(harness-pr land *)", "Bash(harness-pr autoland *)"):
+            self.assertEqual(ask.count(rule), 1, (rule, ask))
+            self.assertGreater(ask.index(rule), 0)
+        for entry in snippet["autoMode"]["allow"]:
+            self.assertIsNone(re.search(r"\bland|autoland|harness-pr", entry, re.IGNORECASE), entry)
+
+    # Neither `harness-pr autoland` nor an autoland LaunchAgent exists yet (epic #132). The text checks below read
+    # each sentence (a line split after . ; ! or ?) with backticks removed. A line that is only a permission rule
+    # string, such as "Bash(harness-pr autoland *)", is a rule, not a description, and is exempt.
+    RULE_ONLY = re.compile(r'^\s*"[A-Za-z]+\([^"]*\)",?\s*$')
+    # Said of autoland, these fail a sentence whatever else it says: merge or land wording reaching autoland
+    # through via/through/by/with (no parenthesis or clause break between), autoland followed by a merge or land
+    # verb, "Merging: autoland", and autoland in the same sentence as "eligible" (the auto-land rubric).
+    AUTOLAND_CLAIMS = re.compile(
+        r"\b(merg\w*|land\w*)\b[^.;()]{0,30}?\b(via|through|by|with)\b[^.;()]{0,40}?autoland"
+        r"|autoland\b[^.;()]{0,30}?\b(merges|lands|merged|landed|merging|landing)\b"
+        r"|\bmerging:\s*(harness-pr\W+)?autoland"
+        r"|\beligible\b[^.;]*autoland|autoland[^.;]*\beligible\b", re.IGNORECASE)
+    MERGE_OR_LAND = re.compile(r"\b(merg\w*|land|lands|landed|landing)\b", re.IGNORECASE)
+    # Planned means explicit planning wording within a few words of autoland or of epic #132 ("once", "will",
+    # "later" do not count: they read as present-tense conditions).
+    _PLAN_WORD = r"(not yet|planned|plan|does not exist yet|is not built)"
+    PLANNED = re.compile(rf"(autoland|\b132)\b\W+(\w+\W+){{0,4}}?{_PLAN_WORD}\b"
+                         rf"|\b{_PLAN_WORD}\W+(\w+\W+){{0,4}}?(\S*autoland|#?132)\b", re.IGNORECASE)
+
+    def user_files(self):
+        folder = os.path.join(REPO, "user")
+        names = sorted(os.listdir(folder))
+        self.assertIn("CLAUDE.md", names)
+        self.assertIn("settings.snippet.json", names)
+        out = {}
+        for name in names:
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8") as fh:
+                    out[name] = fh.read()
+        return out
+
+    @staticmethod
+    def sentences(text):
+        return [s for s in re.split(r"(?<=[.;!?])\s+", text.replace("`", "")) if s.strip()]
+
+    def test_user_text_does_not_say_autoland_merges_today(self):
+        # Nothing under user/ says autoland merges or lands pull requests today: no sentence pairs autoland with
+        # merge or land wording (AUTOLAND_CLAIMS), and a sentence naming autoland beside merge or land wording frames it
+        # as planned. Every line naming autoland also names epic #132.
+        for name, text in self.user_files().items():
+            for number, line in enumerate(text.splitlines(), 1):
+                if "autoland" not in line.lower() or self.RULE_ONLY.match(line):
+                    continue
+                with self.subTest(file=name, line=number):
+                    self.assertRegex(line, r"#132\b|epic 132\b")
+                for sentence in self.sentences(line):
+                    if "autoland" not in sentence.lower():
+                        continue
+                    with self.subTest(file=name, line=number, sentence=sentence.strip()[:70]):
+                        self.assertIsNone(self.AUTOLAND_CLAIMS.search(sentence), "says autoland merges today")
+                        if self.MERGE_OR_LAND.search(sentence):
+                            self.assertRegex(sentence, self.PLANNED, "autoland beside merge/land wording, "
+                                                                     "not framed as planned")
+
+    def test_auto_mode_environment_names_autoland_only_as_planned(self):
+        # The classifier context does not list autoland among what exists today (the LaunchAgents, the merge
+        # path): every sentence of an autoMode.environment entry that names autoland frames it as planned.
+        env = read_json(SNIPPET)["autoMode"]["environment"]
+        services = [e for e in env if e.startswith("Key internal services:")]
+        self.assertEqual(len(services), 1)
+        self.assertIn("com.ryaneskuri.harness-", services[0])                      # still describes the jobs
+        # The LaunchAgents that exist today: autoland is in no parenthesised list there, and no sentence naming
+        # the LaunchAgents or scheduled jobs names autoland.
+        for group in re.findall(r"\(([^()]*)\)", services[0]):
+            with self.subTest(group=group[:70]):
+                self.assertNotIn("autoland", group.lower())
+        for sentence in self.sentences(services[0]):
+            if re.search(r"launchagent|scheduled", sentence, re.IGNORECASE):
+                with self.subTest(sentence=sentence[:70]):
+                    self.assertNotIn("autoland", sentence.lower())
+        for entry in env:
+            for sentence in self.sentences(entry):
+                if "autoland" in sentence.lower():
+                    with self.subTest(sentence=sentence[:70]):
+                        self.assertIsNone(self.AUTOLAND_CLAIMS.search(sentence))
+                        self.assertRegex(sentence, self.PLANNED)
+
+    def test_user_claude_md_says_how_landing_works_today(self):
+        # Ryan lands with /harness:land or approves the land prompt: one sentence of user/CLAUDE.md says both.
+        text = self.user_files()["CLAUDE.md"]
+        both = [s for s in self.sentences(text)
+                if "/harness:land" in s and re.search(r"approv\w*\W+(\w+\W+){0,4}?(the\W+)?(land|prompt)", s, re.I)]
+        self.assertTrue(both, "no sentence names /harness:land and approving the land prompt")
+
     # The permission and autoMode merge. Expected lists are derived from the test's own fixture and the
     # snippet's entries (checked against the ticket by snippet_lists), never from the installer.
 
@@ -330,9 +464,9 @@ class Install(unittest.TestCase):
         env, auto_allow = wanted["autoMode", "environment"], wanted["autoMode", "allow"]
         own = {
             ("permissions", "allow"): ["Bash(ls:*)", allow[3], "Read(~/notes/**)", allow[0], "Bash(make test)"],
-            ("permissions", "ask"): ["Bash(git push --force:*)"],
+            ("permissions", "ask"): ["Bash(git push --force:*)", ask[2]],
             ("autoMode", "environment"): ["My own context line.", env[2], DEFAULTS, "Another of mine."],
-            ("autoMode", "allow"): [auto_allow[2], "Running make test is allowed."],
+            ("autoMode", "allow"): [auto_allow[1], "Running make test is allowed."],
         }
         mine = {"theme": "light", "model": "opus",
                 "permissions": {"allow": own["permissions", "allow"], "ask": own["permissions", "ask"],
@@ -350,11 +484,12 @@ class Install(unittest.TestCase):
         self.assertEqual(merged["autoMode"]["soft_deny"], mine["autoMode"]["soft_deny"])
         self.assertEqual(merged["theme"], "light")
         line = settings_line(p.stdout)
-        # The own lists already hold env[2] (and the sentinel) and auto_allow[2]: one fewer of each is added.
-        self.assertIn(f"added {len(allow) - 2} permissions.allow, {len(ask)} permissions.ask, "
-                      f"{len(ENVIRONMENT_OPENINGS) - 1} autoMode.environment, "
-                      f"{len(AUTO_ALLOW_OPENINGS) - 1} autoMode.allow", line)
-        self.assertIn("added 7 permissions.allow, 1 permissions.ask, 6 autoMode.environment, 1 autoMode.allow", line)
+        # The own lists already hold ask[2], env[2] (and the sentinel) and auto_allow[1]: one fewer of the first two
+        # is added, and autoMode.allow, already holding its one prose entry, gains nothing and gets no count (only its sentinel moves).
+        self.assertIn(f"added {len(allow) - 2} permissions.allow, {len(ask) - 1} permissions.ask, "
+                      f"{len(ENVIRONMENT_OPENINGS) - 1} autoMode.environment", line)
+        self.assertIn("added 7 permissions.allow, 2 permissions.ask, 6 autoMode.environment", line)
+        self.assertNotRegex(line, r"\d+ autoMode\.allow")
         self.assertIn(" (backup settings.json.bak-", line)
         self.assertEqual(len(self.backups()), 1)
 
@@ -376,7 +511,7 @@ class Install(unittest.TestCase):
         line = settings_line(p.stdout)
         self.assertIn(f"added {len(allow[:4])} permissions.allow, {len(env[1:3])} autoMode.environment, "
                       f"{len(AUTO_ALLOW_OPENINGS)} autoMode.allow", line)               # env[3:] held already
-        self.assertIn("added 4 permissions.allow, 2 autoMode.environment, 2 autoMode.allow", line)
+        self.assertIn("added 4 permissions.allow, 2 autoMode.environment, 1 autoMode.allow", line)
         self.assertNotIn("permissions.ask", line)                                  # nothing added there
 
     def test_defaults_sentinel_leads_each_auto_mode_list(self):
@@ -390,7 +525,7 @@ class Install(unittest.TestCase):
             "last, and first": {"environment": [env[1], env[4], DEFAULTS], "allow": [DEFAULTS, "Mine B."]},
             "twice": {"environment": [DEFAULTS, "Mine A.", DEFAULTS], "allow": ["Mine B.", DEFAULTS, DEFAULTS]},
             "only the sentinel out of place": {"environment": env[1:] + [DEFAULTS],
-                                               "allow": [auto_allow[2], DEFAULTS, auto_allow[1]]},
+                                               "allow": [auto_allow[1], DEFAULTS]},
         }
         snippet = read_json(SNIPPET)
         for name, auto in cases.items():

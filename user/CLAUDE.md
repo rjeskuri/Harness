@@ -10,12 +10,12 @@
 
 - Every piece of work is a GitHub issue on the project's board: an epic with task sub-issues, each with a request, an outline, a definition of done and the tests that must pass. Read the ticket (`harness-board show N --markdown`) and its epic before working. Status changes go through `harness-board`; `harness-board board` shows the whole board.
 - A question the ticket, the epic and the code cannot answer becomes `harness-board needs-input N --question ...` when it is about product behavior, is hard to undo, or touches security, credentials or personal data; never a guess. A reversible implementation choice they leave open is decided and recorded as a `Ruling:` line under `### Rulings` in the PR's Notes. I answer on the ticket; the next `/harness:work N` reads the answer.
-- New work: `/harness:plan <request>`. Tickets to pull requests: `/harness:work [N]`. Merging: `harness-pr autoland` for eligible PRs, `/harness:land [PR#]` for the rest. A new or existing repository joins the board with `/harness:new-project`.
+- New work: `/harness:plan <request>`. Tickets to pull requests: `/harness:work [N]`. Landing: I land with `/harness:land [PR#]` or by approving the land prompt; `harness-pr autoland` is the epic #132 plan. A new or existing repository joins the board with `/harness:new-project`.
 
 ## Never on main
 
 - Work happens on a ticket branch `t/<issue>-<slug>` in its own worktree, created by `harness-work start N`. A hook denies edits, commits and pushes on main; do not look for a way around it.
-- Agents may push `t/*` branches and open or update pull requests without asking. Eligible pull requests (risk:low, size S or M, review and checks green at head, no protected path) are merged by `harness-pr autoland`; I land the rest with `/harness:land`. Nobody pushes main, force-pushes or deletes a branch by hand.
+- Agents may push `t/*` branches and open or update pull requests without asking; a session does not land them. I land each with `/harness:land` or by approving the land prompt; `harness-pr autoland` is the epic #132 plan. Nobody pushes main, force-pushes or deletes a branch by hand.
 
 ## Tests first
 
@@ -24,14 +24,14 @@
 
 ## Model routing
 
-- Default: Opus 5.5 at high effort, for the main session and every agent. `harness-board tier N` maps a ticket's labels to a tier: size:S and risk:low on a non-bug gives `sonnet`; size:L or risk:high gives `fable`; otherwise `opus`. Pass that as `model` on the Agent call. The reviewer's model comes from `harness-board tier N --stage review`: Opus 5.5, and Fable only when the ticket is risk:high. When a stage escalates to Fable, or the review runs on a risk:high ticket, pass `model: fable` and `effort: xhigh` on the Agent call.
+- Default: Opus 5.5 at high effort, for the main session and every agent. `harness-board tier N` maps a ticket's labels to a tier: size:S and risk:low on a non-bug gives `sonnet`; size:L or risk:high gives `fable`; otherwise `opus`. A project's `HARNESS_CODE_TIER` and `HARNESS_CODE_EFFORT` (in its `.claude/settings.json`) replace that rubric for the test-author, breaker and coder, and its `HARNESS_REVIEW_TIER` replaces it for the reviewer; the labels decide when they are unset. `harness-board tier N --json` says which decided and gives the tier and the effort to pass: its `tier` as `model` on the Agent call, and its `effort` when it is not null. The reviewer's model and effort come from `harness-board tier N --stage review --json` the same way; by the labels that is Opus 5.5, and Fable with `xhigh` when the ticket is risk:high. When a stage escalates to Fable, or `--stage review --json` prints `fable` (by the labels, a risk:high ticket), pass `model: fable` and `effort: xhigh` on the Agent call.
 - Escalation is by failure, recorded with `harness-work attempt`: a stage's first failure retries at the same tier, the second re-runs one tier up, the third stops with needs-input.
-- Standard reviews run on Opus 5.5. `harness:reviewer` runs on Fable when the ticket is risk:high or when the review stage escalates by failure: record the stage with `harness-work attempt N review pass|fail --tier <the output of harness-board tier N --stage review>`, and its second failure says `escalate fable`. `harness:planner` is Opus at xhigh. `harness:researcher` answers from primary sources. `harness:quick` (Sonnet) does trivial mechanical tasks outside tickets.
-- Parallel work: `/harness:work` with no number dispatches a session per ready ticket. A Workflow is yours to launch when it pays off, Opus for coding and judgment stages, Fable per the tier and escalation rules. Say what you launched and why.
+- Standard reviews run on Opus 5.5. `harness:reviewer` runs on Fable when the ticket is risk:high by the labels (unless `HARNESS_REVIEW_TIER` is set) or when the review stage escalates by failure: record the stage with `harness-work attempt N review pass|fail --tier <the output of harness-board tier N --stage review>`, and its second failure says `escalate fable`. `harness:planner` is Opus at xhigh. `harness:researcher` answers from primary sources. `harness:quick` (Sonnet) does trivial mechanical tasks outside tickets.
+- Parallel work: `/harness:work` with no number dispatches a session per ready ticket, launched at the project's `HARNESS_CODE_EFFORT` when it sets one. A Workflow is yours to launch when it pays off, Opus for coding and judgment stages, Fable per the tier and escalation rules. Say what you launched and why.
 
 ## Budgets
 
-- Interactive sessions and dispatched tickets run on the subscription by default: `harness-work dispatch` launches background sessions. The API key is spent only on request: `/harness:work --api` (or `harness-work dispatch --venue headless`) launches headless runs billed to it. While the API budget is exhausted, `--api` and `--venue headless` are refused. `risk:high` pull requests get `claude ultrareview` on usage credits. `harness-work budget status` shows what is exhausted; report it, do not fight it.
+- Interactive sessions and dispatched tickets run on the subscription by default: `harness-work dispatch` launches background sessions. The API key is spent only on request: `/harness:work --api` (or `harness-work dispatch --venue headless`) launches headless runs billed to it. While the API budget is exhausted, `--api` and `--venue headless` are refused. `risk:high` pull requests get `claude ultrareview` on usage credits, unless the project sets `HARNESS_ULTRAREVIEW=off`. `harness-work budget status` shows what is exhausted; report it, do not fight it.
 
 ## Across projects
 
