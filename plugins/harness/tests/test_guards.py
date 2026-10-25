@@ -1756,6 +1756,29 @@ REPEATED_TESTS = pep8(["import pytest", *[SAME_TEST] * 10, "def test_last():\n  
 LOGIN_GAP = 6
 
 
+# Blank-line runs (#231 review): main trims the blank lines after the imports, as black
+# does, and appends a test; the branch adds a line after the first blank line of
+# test_login's body. git merges it cleanly (ort, and merge-file's Myers alike), but
+# taking main's change back out of the merged file aligns the runs of blank lines
+# differently and lands the branch's line in the wrong place.
+TRIM_TESTS = (
+    "import pytest\n\n\n\n\ndef test_login():\n\n\n    assert True\n\n\n"
+    "def test_other():\n    assert True\n"
+)
+TRIM_ANCHOR = "def test_login():\n\n"
+
+
+def trim_author(text: str) -> str:
+    return replaced(text, TRIM_ANCHOR, TRIM_ANCHOR + BRANCH_LINE_5)
+
+
+def trim_main(text: str) -> str:
+    return (
+        replaced(text, "import pytest\n\n\n\n\n", "import pytest\n\n\n")
+        + "\n\ndef test_more():\n    assert True\n"
+    )
+
+
 def content_hash(root: Path, files) -> str:
     """The red record's test_hash, from first principles: sha256 over each file's path,
     a newline and its bytes, in sorted path order."""
@@ -2221,6 +2244,142 @@ class TestsFirstMainMergeTests(GuardTestCase):
                 self.assertSourceDenied(wt)
                 self.assertEqual(self.status(wt), "current: no")
                 self.git(wt, "reset", "-q", "--hard", before)
+
+    # ---- review round (#231): an older base, a merge in progress, blank-line runs, a
+    # branch commit before the merge, and the "ours" ruling
+
+    def test_an_older_merge_base_does_not_let_the_branch_revert_mains_edit(self):
+        # The red run was made against a stacked parent that carries main commit X (an
+        # edit of a recorded test, away from the branch's hunk); main itself is older.
+        # The merge base with main is then an ancestor of the record's base: undoing X's
+        # lines on the branch is the branch's own test change.
+        repo = self.make_repo("older-base")
+        for rel in MERGE_TEST_FILES:
+            self.write(repo / rel, BASE_TESTS)
+        self.commit_all(repo, "the tests so far")
+        self.git(repo, "switch", "-q", "-c", "parent")
+        x_line = "    assert 0 * 0 == 0\n"
+        self.write(repo / "tests/test_app.py", replaced(BASE_TESTS, case_line(0), x_line))
+        self.commit_all(repo, "X: the parent edits test_case_0")
+        self.git(repo, "switch", "-q", "main")
+        key = hashlib.sha1(str(repo.resolve()).encode()).hexdigest()[:12]
+        ticket = {"number": 12, "title": "Fix login", "type": "task", "flags": [], "labels": ["task"]}
+        self.write(self.home / ".claude/harness/repos" / key / "tickets/12.json", json.dumps(ticket))
+        wt = self.tmp / "older-base-wt"
+        self.git(repo, "worktree", "add", "-q", "-b", BRANCH, str(wt), "parent")
+        for rel in MERGE_TEST_FILES:  # the test-author
+            self.write(wt / rel, replaced((wt / rel).read_text(), MAIN_LINE_5, BRANCH_LINE_5))
+        self.commit_all(wt, "tests for login")
+        r = self.harness_red(wt, "check", "--base", "parent")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(
+            json.loads(self.record_file(repo).read_text())["base_sha"],
+            self.git(repo, "rev-parse", "parent"),
+        )
+        self.write(wt / "src/app.py", "def login():\n    return 'ok'\n")  # the coder
+        self.commit_all(wt, "login")
+        self.assertSourceAllowed(wt)
+        self.assertEqual(self.status(wt), "current: yes")
+        head = self.git(wt, "rev-parse", "HEAD")
+        path = wt / "tests/test_app.py"
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                self.git(wt, "reset", "-q", "--hard", head)
+                self.write(path, replaced(path.read_text(), x_line, case_line(0)))  # X undone
+                if committed:
+                    self.commit_all(wt, "the branch undoes X")
+                self.assertSourceDenied(wt)
+                self.assertEqual(self.status(wt), "current: no")
+                self.git(wt, "reset", "-q", "--hard", head)
+                self.assertSourceAllowed(wt)
+
+    def test_source_edits_are_allowed_while_a_merge_of_main_is_in_conflict(self):
+        repo, wt = self.ticket("mid-merge")
+        self.on_main(
+            repo,
+            {
+                "tests/test_app.py": lambda t: "# main's header\n" + t,  # clean
+                "src/app.py": "def login():\n    return 'main'\n",  # conflicts with the coder's
+            },
+        )
+        r = self.merge_main(wt)
+        self.assertNotEqual(r.returncode, 0, "the merge must conflict in src/app.py")
+        self.git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD")  # still merging
+        self.assertEqual(self.git(wt, "diff", "--name-only", "--diff-filter=U"), "src/app.py")
+        merged = replaced((repo / "tests/test_app.py").read_text(), MAIN_LINE_5, BRANCH_LINE_5)
+        self.assertEqual((wt / "tests/test_app.py").read_text(), merged)
+        # resolving the source conflict needs source edits
+        self.assertSourceAllowed(wt)
+        for command in ("git checkout --theirs src/app.py", "git checkout --ours -- src/app.py"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.bash(wt, command, "harness:coder"))
+        self.assertEqual(self.status(wt), "current: yes")
+        # a test change of the branch's own, mid-merge, still counts
+        path = wt / "tests/test_app.py"
+        self.write(path, replaced(merged, BRANCH_LINE_5, "    assert login() == 'hi'\n"))
+        self.assertSourceDenied(wt)
+        self.assertEqual(self.status(wt), "current: no")
+        self.write(path, merged)
+        self.assertSourceAllowed(wt)
+
+    def test_a_merge_of_main_trimming_blank_lines_keeps_source_allowed(self):
+        repo, wt = self.ticket("trim", TRIM_TESTS, trim_author)
+        self.on_main(repo, {"tests/test_app.py": trim_main, "tests/test_util.py": trim_main})
+        self.merge_cleanly(wt)
+        for rel in MERGE_TEST_FILES:  # main's trim and test_more, and the branch's line
+            self.assertEqual((wt / rel).read_text(), trim_author(trim_main(TRIM_TESTS)))
+        self.assertSourceAllowed(wt)
+        self.assertEqual(self.status(wt), "current: yes")
+
+    def test_a_branch_test_commit_before_a_merge_of_main_denies_source(self):
+        # a regression guard: it passes before the review round too
+        repo, wt = self.ticket("commit-then-merge")
+        path = wt / "tests/test_app.py"
+        self.write(path, replaced(path.read_text(), case_line(8), "    assert 8 * 2 == 16\n"))
+        self.commit_all(wt, "the branch edits test_case_8")
+        self.on_main(
+            repo,
+            {"tests/test_app.py": lambda t: replaced(t, case_line(0), "    assert 0 * 0 == 0\n")},
+        )
+        self.merge_cleanly(wt)
+        self.assertIn("    assert 0 * 0 == 0\n", path.read_text())
+        self.assertSourceDenied(wt)
+        self.assertEqual(self.status(wt), "current: no")
+
+    def test_an_ours_resolution_of_the_branchs_own_line_keeps_source_allowed(self):
+        # a regression guard: it passes before the review round too
+        for how in ("merge -X ours", "by hand"):
+            with self.subTest(resolution=how):
+                repo, wt = self.ticket("ours-" + how.split()[-1])
+                # main edits the top cleanly and rewrites the branch's own line
+                self.on_main(
+                    repo,
+                    {"tests/test_app.py": lambda t: "# main's header\n"
+                     + replaced(t, MAIN_LINE_5, MAIN_LINE_5_REWRITTEN)},
+                )
+                theirs = (repo / "tests/test_app.py").read_text()
+                ours = replaced(theirs, MAIN_LINE_5_REWRITTEN, BRANCH_LINE_5)
+                if how == "by hand":
+                    r = self.merge_main(wt)
+                    self.assertNotEqual(r.returncode, 0, "the merge must conflict")
+                    self.write(wt / "tests/test_app.py", ours)
+                    self.git(wt, "add", "tests/test_app.py")
+                    self.git(wt, "commit", "-q", "--no-edit")
+                else:
+                    self.git(wt, "merge", "-q", "--no-edit", "-X", "ours", "main")
+                self.assertEqual((wt / "tests/test_app.py").read_text(), ours)
+                self.assertEqual(len(self.git(wt, "rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+                self.assertSourceAllowed(wt)
+                self.assertEqual(self.status(wt), "current: yes")
+                # and a later merge of main stays allowed
+                self.on_main(
+                    repo,
+                    {"tests/test_app.py": lambda t: replaced(t, case_line(9), "    assert 9 * 2 == 18\n")},
+                    "main moves again",
+                )
+                self.merge_cleanly(wt)
+                self.assertSourceAllowed(wt)
+                self.assertEqual(self.status(wt), "current: yes")
 
 
 if __name__ == "__main__":

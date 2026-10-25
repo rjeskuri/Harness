@@ -866,6 +866,123 @@ class RedTest(unittest.TestCase):
                 self.assertEqual(self.current(), "current: no")
                 self.git(self.wt, "reset", "-q", "--hard", before)
 
+    # review round (#231): an older base, a merge in progress, blank-line runs, a branch commit before the merge,
+    # and the "ours" ruling
+    def test_an_older_merge_base_does_not_let_the_branch_revert_mains_edit(self):
+        # Local main is behind origin/main by X (an edit of the test file away from the branch's hunk); the record
+        # is made against origin/main, so its base has X. Local main's merge base is an ancestor of the record's:
+        # undoing X's lines on the branch is the branch's own test change.
+        write(os.path.join(self.repo, "tests", "test_calc.py"), CALC_SUITE)
+        self.on_main({}, "the tests so far")
+        x_line = sub_line(0).replace("(2, 2), 0)", "(4, 4), 0)")
+        self.on_main({"tests/test_calc.py": lambda t: once(t, sub_line(0), x_line)}, "X")
+        self.git(self.repo, "reset", "-q", "--hard", "HEAD~1")            # local main without X
+        self.git(self.wt, "merge", "-q", "--ff-only", "origin/main")
+        path = os.path.join(self.wt, "tests", "test_calc.py")
+        self.put("tests/test_calc.py", once(read(path), SUB_5, BRANCH_ADD + SUB_5))
+        self.git(self.wt, "commit", "-q", "-am", "tests for add")
+        p = self.red("check")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.record()["base_sha"], self.git(self.repo, "rev-parse", "origin/main"))
+        self.put("calc.py", CALC.replace("return None", "return a + b"))
+        self.git(self.wt, "commit", "-q", "-am", "add")
+        self.assertEqual(self.current(), "current: yes")
+        head = self.git(self.wt, "rev-parse", "HEAD")
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                self.git(self.wt, "reset", "-q", "--hard", head)
+                self.put("tests/test_calc.py", once(read(path), x_line, sub_line(0)))   # X undone
+                if committed:
+                    self.git(self.wt, "commit", "-q", "-am", "the branch undoes X")
+                self.assertEqual(self.current(), "current: no")
+                self.git(self.wt, "reset", "-q", "--hard", head)
+                self.assertEqual(self.current(), "current: yes")
+
+    def test_status_is_current_while_a_merge_of_main_is_in_conflict(self):
+        self.red_ticket_with_source()
+        self.on_main({"tests/test_calc.py": lambda t: '"""Tests for calc."""\n' + t,          # clean
+                      "calc.py": lambda t: once(t, "return None", "return b + a")})       # conflicts with the coder's
+        p = self.merge_main()
+        self.assertNotEqual(p.returncode, 0, "the merge must conflict in calc.py")
+        self.git(self.wt, "rev-parse", "-q", "--verify", "MERGE_HEAD")                    # still merging
+        self.assertEqual(self.git(self.wt, "diff", "--name-only", "--diff-filter=U"), "calc.py")
+        path = os.path.join(self.wt, "tests", "test_calc.py")
+        merged = once(read(os.path.join(self.repo, "tests", "test_calc.py")), SUB_5, BRANCH_ADD + SUB_5)
+        self.assertEqual(read(path), merged)
+        self.assertEqual(self.current(), "current: yes")
+        self.put("tests/test_calc.py", once(merged, "calc.add(2, 3), 5)", "calc.add(3, 3), 6)"))  # the branch's own
+        self.assertEqual(self.current(), "current: no")
+        self.put("tests/test_calc.py", merged)
+        self.assertEqual(self.current(), "current: yes")
+
+    def test_status_stays_current_across_a_merge_of_main_trimming_blank_lines(self):
+        # git merges it cleanly; taking main's change back out of the merged file aligns the blank-line runs
+        # differently. The file is not run (a fake test command makes the red run), only compared.
+        trim = ("import pytest\n\n\n\n\ndef test_login():\n\n\n    assert True\n\n\n"
+                "def test_other():\n    assert True\n")
+        anchor = "def test_login():\n\n"
+
+        def author(t):
+            return once(t, anchor, anchor + "    assert login() == 'ok'\n")
+
+        def main_trims(t):
+            return once(t, "import pytest\n\n\n\n\n", "import pytest\n\n\n") + "\n\ndef test_more():\n    assert True\n"
+
+        write(os.path.join(self.repo, "tests", "test_login.py"), trim)
+        self.on_main({}, "the tests so far")
+        self.git(self.wt, "merge", "-q", "--ff-only", "origin/main")
+        self.put("tests/test_login.py", author(trim))
+        self.git(self.wt, "commit", "-q", "-am", "tests for login")
+        p = self.red("check", **self.fake_runner("AssertionError: login is not built yet\n", 1))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.put("calc.py", CALC.replace("return None", "return a + b"))
+        self.git(self.wt, "commit", "-q", "-am", "the coder")
+        self.assertEqual(self.current(), "current: yes")
+        self.on_main({"tests/test_login.py": main_trims})
+        self.merge_cleanly()
+        self.assertEqual(read(os.path.join(self.wt, "tests", "test_login.py")), author(main_trims(trim)))
+        self.assertEqual(self.current(), "current: yes")
+
+    def test_a_branch_test_commit_before_a_merge_of_main_is_not_current(self):
+        # a regression guard: it passes before the review round too
+        self.red_ticket_with_source()
+        path = os.path.join(self.wt, "tests", "test_calc.py")
+        self.put("tests/test_calc.py", once(read(path), sub_line(8), sub_line(8).replace("(10, 2), 8)", "(11, 3), 8)")))
+        self.git(self.wt, "commit", "-q", "-am", "the branch edits test_sub_8")
+        self.on_main({"tests/test_calc.py": lambda t: once(t, "calc.sub(2, 2), 0)", "calc.sub(4, 4), 0)")})
+        self.merge_cleanly()
+        self.assertIn("calc.sub(4, 4), 0)", read(path))
+        self.assertEqual(self.current(), "current: no")
+
+    def test_an_ours_resolution_of_the_branchs_own_test_stays_current(self):
+        # a regression guard: it passes before the review round too
+        self.red_ticket_with_source()
+        self.on_main({"tests/test_calc.py": lambda t: '"""Tests for calc."""\n' + once(t, SUB_5, MAIN_ADD + SUB_5)})
+        theirs = read(os.path.join(self.repo, "tests", "test_calc.py"))
+        ours = once(theirs, MAIN_ADD, BRANCH_ADD)
+        before = self.git(self.wt, "rev-parse", "HEAD")
+        path = os.path.join(self.wt, "tests", "test_calc.py")
+        for how in ("merge -X ours", "by hand"):
+            with self.subTest(resolution=how):
+                if how == "by hand":
+                    p = self.merge_main()
+                    self.assertNotEqual(p.returncode, 0, "the merge must conflict")
+                    self.put("tests/test_calc.py", ours)
+                    self.git(self.wt, "add", "tests/test_calc.py")
+                    self.git(self.wt, "commit", "-q", "--no-edit")
+                else:
+                    self.git(self.wt, "merge", "-q", "--no-edit", "-X", "ours", "origin/main")
+                self.assertEqual(read(path), ours)
+                self.assertEqual(len(self.git(self.wt, "rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+                self.assertEqual(self.current(), "current: yes")
+                self.git(self.wt, "reset", "-q", "--hard", before)
+        # kept, then a later merge of main
+        self.git(self.wt, "merge", "-q", "--no-edit", "-X", "ours", "origin/main")
+        self.on_main({"tests/test_calc.py": lambda t: once(t, sub_line(9), sub_line(9).replace("(11, 2), 9)", "(12, 3), 9)"))},
+                     "main moves again")
+        self.merge_cleanly()
+        self.assertEqual(self.current(), "current: yes")
+
     # ------------------------------------------------------------ scratch
     def test_scratch_create_and_run(self):
         self.check_red()                                        # the test file is not committed

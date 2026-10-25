@@ -262,7 +262,8 @@ def source_refusal(facts: dict, number: str) -> str | None:
                 flags.extend(str(f) for f in ticket[key])
     if "no-tests" in flags:
         return None
-    record = read_json(state / "red" / f"{branch.replace('/', '-')}.json")
+    record_path = state / "red" / f"{branch.replace('/', '-')}.json"
+    record = read_json(record_path)
     if not isinstance(record, dict):  # likewise: a red record that is not an object is no red run
         record = None
     if record is None:
@@ -286,8 +287,10 @@ def source_refusal(facts: dict, number: str) -> str | None:
             f"The red record for t/{number} does not say how the tests failed; run "
             "harness-red check again."
         )
-    # The files hash to test_hash, or are the red-time files with main's merged changes (redproof.py).
-    return None if record_current(str(facts["top"]), record, GIT_TIMEOUT) else CHANGED
+    # The files hash to test_hash, or are the red-time files (kept in red-files/) with main's
+    # merged changes (redproof.py).
+    current = record_current(str(facts["top"]), record, str(record_path), GIT_TIMEOUT)
+    return None if current else CHANGED
 
 
 def facts_at(directory: str, cache: dict) -> dict | None:
