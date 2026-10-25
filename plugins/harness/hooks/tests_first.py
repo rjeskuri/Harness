@@ -67,7 +67,7 @@ try:
     from harness_lib.hookio import deny, edited_path, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.repo import main_checkout
-    from harness_lib.settings import glob_match, patterns, setting, settings_env
+    from harness_lib.settings import DEFAULT_TEST_PATTERNS, glob_match, patterns, setting, settings_env
     from harness_lib.text import read_json
 except Exception as exc:  # fail open, like the __main__ wrapper below: one line, exit 0
     sys.stderr.write(f"tests_first.py: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}\n")
@@ -75,10 +75,6 @@ except Exception as exc:  # fail open, like the __main__ wrapper below: one line
 
 GIT_TIMEOUT = 3
 TICKET_BRANCH = re.compile(r"^t/(\d+)-")
-DEFAULT_TEST_PATTERNS = (
-    "tests/**,test/**,**/test_*.py,**/*_test.py,**/conftest.py,**/*_test.js,"
-    "**/*.test.js,**/*.test.ts,**/*_test.ts,spec/**"
-)
 ROLES = {"test-author", "coder", "test-breaker"}
 RED_KINDS = {"assertion", "import", "error"}
 # Configuration that decides which tests run and how: tests, for the role rules.
