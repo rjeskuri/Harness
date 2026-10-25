@@ -18,9 +18,11 @@ Standard library only; works with the python3 from Xcode's command line tools (3
 from __future__ import annotations
 
 import re
+import statistics
 
 from harness_lib import transcripts
 from harness_lib.cli import table
+from harness_lib.settings import glob_match
 from harness_lib.text import parse_iso
 
 # stage order of the rows; the first five are the words of the `#N <stage>` convention
@@ -302,6 +304,108 @@ def build_record(number: int, main: str, usage: dict, cache: dict | None, pr: in
             "coverage": COVERAGE}
 
 
+# --------------------------------------------------------------- the gh-backed parts (pure; harness-work asks gh)
+LABEL_TYPES = ("epic", "bug", "refactor", "chore", "task")   # harness-board's order: the first present wins
+FAILED_RUNS = ("failure", "timed_out", "startup_failure")
+NEEDS_INPUT = "**Needs your input**"
+STARTED = "Started on "
+
+
+def pick_pr(prs):
+    """The branch's pull request from `gh pr list`: the latest merged one, else the newest; None for none."""
+    prs = [p for p in prs or [] if isinstance(p, dict) and isinstance(p.get("number"), int)]
+    merged = [p for p in prs if parse_iso(p.get("mergedAt"))]
+    pool = merged or prs
+    if not pool:
+        return None
+    key = "mergedAt" if merged else "createdAt"
+    epoch = parse_iso("1970-01-01T00:00:00Z")
+    return max(pool, key=lambda p: (parse_iso(p.get(key)) or epoch, p["number"]))
+
+
+def file_kind(path, test_globs, exempt_globs):
+    """test when the path matches a test pattern, else other when it matches an exempt one, else source."""
+    if any(glob_match(g, path) for g in test_globs):
+        return "test"
+    if any(glob_match(g, path) for g in exempt_globs):
+        return "other"
+    return "source"
+
+
+def line_counts(pages, test_globs, exempt_globs):
+    """{"test", "source", "other": {"added", "removed"}} summed over the files endpoint's pages (--slurp: an array
+    of the page arrays)."""
+    out = {kind: {"added": 0, "removed": 0} for kind in ("test", "source", "other")}
+    for page in pages if isinstance(pages, list) else []:
+        for f in page if isinstance(page, list) else [page]:
+            name = f.get("filename") if isinstance(f, dict) else None
+            if not isinstance(name, str) or not name:
+                continue
+            part = out[file_kind(name, test_globs, exempt_globs)]
+            for key, field in (("added", "additions"), ("removed", "deletions")):
+                value = f.get(field)
+                part[key] += value if isinstance(value, int) and not isinstance(value, bool) else 0
+    return out
+
+
+def _body(comment):
+    body = comment.get("body") if isinstance(comment, dict) else None
+    return body.lstrip() if isinstance(body, str) else ""
+
+
+def _earliest(comments, test):
+    """The earliest createdAt, as given, of the comments whose body (leading space aside) passes `test`; or None."""
+    times = [c.get("createdAt") for c in comments or [] if test(_body(c)) and parse_iso(c.get("createdAt"))]
+    return min(times, key=parse_iso) if times else None
+
+
+def needs_input_count(comments):
+    """The ticket's needs-input questions: the comments starting `**Needs your input**`."""
+    return sum(1 for c in comments or [] if _body(c).startswith(NEEDS_INPUT))
+
+
+def started_from_comments(comments):
+    """The earliest `Started on ` comment's time, or None."""
+    return _earliest(comments, lambda body: body.startswith(STARTED))
+
+
+def ready_from_comments(comments, pr):
+    """The earliest `PR #<pr> ready for review` comment's time, or None."""
+    mark = f"PR #{pr} ready for review"
+    return _earliest(comments, lambda body: body.startswith(mark))
+
+
+def label_fields(names):
+    """type, size and risk from issue label names (harness-board's reading), each None when absent."""
+    present = set(names)
+    size = next((s for s in ("L", "M", "S") if "size:" + s in present), None)
+    risk = "high" if "risk:high" in present else "low" if "risk:low" in present else None
+    return {"type": next((t for t in LABEL_TYPES if t in present), None), "size": size, "risk": risk}
+
+
+def _seconds(start, end):
+    a, b = parse_iso(start), parse_iso(end)
+    return int((b - a).total_seconds()) if a and b else None
+
+
+def elapsed(started_at, pr_opened_at, ready_at, landed_at):
+    """{"started_at", "pr_opened_at", "ready_at", "landed_at", "start_to_ready_s", "start_to_land_s"}, a span null
+    when either end is missing; None when none of them is known."""
+    part = {"started_at": started_at, "pr_opened_at": pr_opened_at, "ready_at": ready_at, "landed_at": landed_at,
+            "start_to_ready_s": _seconds(started_at, ready_at), "start_to_land_s": _seconds(started_at, landed_at)}
+    return part if any(v is not None for v in part.values()) else None
+
+
+def ci_summary(runs):
+    """{"runs", "failed", "cancelled", "total_s", "median_s"} over the completed runs of `gh run list`: a run lasts
+    updatedAt minus startedAt (createdAt without one); median_s in whole seconds, None without a run."""
+    done = [r for r in runs or [] if isinstance(r, dict) and r.get("status") == "completed"]
+    spans = [max(0, _seconds(r.get("startedAt") or r.get("createdAt"), r.get("updatedAt")) or 0) for r in done]
+    return {"runs": len(done), "failed": sum(1 for r in done if r.get("conclusion") in FAILED_RUNS),
+            "cancelled": sum(1 for r in done if r.get("conclusion") == "cancelled"), "total_s": sum(spans),
+            "median_s": int(statistics.median(spans)) if spans else None}
+
+
 def tokens_text(count):
     """999, 12.3k, 12.3M."""
     if count < 1000:
@@ -351,7 +455,8 @@ def total_row(record):
 
 
 def notes(record):
-    """The lines under the table that have data: the session total, the rounds, the shared sessions left out."""
+    """The lines under the table that have data: the session total, the rounds, the extras (lines, elapsed, CI,
+    needs input), the shared sessions left out."""
     lines = []
     st = record["session_totals"]
     if st:
@@ -367,11 +472,38 @@ def notes(record):
         lines.append(f"Rounds: breaker re-rounds {r['breaker_rerounds']}, fix rounds {r['fix_rounds']}; "
                      f"retries {tally['retry']}, escalations {tally['escalate']}, "
                      f"needs-input {tally['needs_input']}")
+    lines += extras(record)
     shared = [s["id"][:8] for s in record["sessions"] if not s["own"]]
     if shared:
         what = "the orchestrator of shared session" if len(shared) == 1 else "the orchestrators of shared sessions"
         lines.append(f"Not counted: {what} {', '.join(shared)}")
     return lines
+
+
+def extras(record):
+    """The Lines, Elapsed, CI and Needs input lines whose parts have data; Elapsed names only the known spans."""
+    out = []
+    lines = record["lines"]
+    if lines:
+        out.append("Lines: " + ", ".join(f"{word} +{lines[kind]['added']} -{lines[kind]['removed']}"
+                                         for word, kind in (("tests", "test"), ("source", "source"),
+                                                            ("other", "other"))))
+    e = record["elapsed"] or {}
+    spans = [f"{word} {duration_text(e[key] * 1000)}"
+             for word, key in (("start to ready", "start_to_ready_s"), ("start to land", "start_to_land_s"))
+             if e.get(key) is not None]
+    if spans:
+        out.append("Elapsed: " + ", ".join(spans))
+    ci = record["ci"]
+    if ci:
+        pieces = [f"{ci['runs']} runs ({ci['failed']} failed, {ci['cancelled']} cancelled)",
+                  f"{duration_text(ci['total_s'] * 1000)} total"]
+        if ci["median_s"] is not None:
+            pieces.append(f"{duration_text(ci['median_s'] * 1000)} median")
+        out.append("CI: " + ", ".join(pieces))
+    if record["needs_input"] is not None:
+        out.append(f"Needs input: {record['needs_input']}")
+    return out
 
 
 def render_text(record: dict) -> str:

@@ -1,4 +1,4 @@
-"""Tests for `harness-work cost N [--pr P] [--json | --markdown] [--repo PATH]` (ticket #113, epic #108):
+"""Tests for `harness-work cost N [--pr P] [--json | --markdown] [--repo PATH]` (tickets #113 and #114, epic #108):
 a ticket's tokens and model time per stage and model, read from the transcripts (harness_lib/cost.py's
 ticket_usage) and its attempts (the ticket cache), printed and saved as
 ~/.claude/harness/repos/<key>/cost/<N>.json. Tokens and time only: no dollar figure anywhere.
@@ -6,8 +6,9 @@ ticket_usage) and its attempts (the ticket cache), printed and saved as
 The contract under test (the ticket's Context):
 - The record: ticket, title, repo, computed_at, type, size, risk, tier, pr, rows, totals, by_model,
   session_totals, sessions, rounds, needs_input, lines, elapsed, ci, landed_at, coverage. rows to sessions are
-  ticket_usage's; pr is --pr or null; the five task-6 fields stay null; title to tier and rounds are null
-  without a ticket cache.
+  ticket_usage's; pr is --pr or null; title to tier and rounds are null without a ticket cache. With every gh
+  call failing (CostCommand's default scenario), lines, ci, needs_input and landed_at are null and elapsed holds
+  no PR or ready time, so the Cost block gains no line.
 - Rounds: per stage, in attempt order, a fail extends that stage's run of failures; its first fail is a retry,
   the second an escalate, the third and later needs-input (fix: retry, then needs-input), as `harness-work
   attempt` answers; a pass ends the run; each stage counts on its own. breaker_rerounds = breaker fails,
@@ -19,7 +20,13 @@ The contract under test (the ticket's Context):
 
 Each test has a temporary HOME holding the transcripts (~/.claude/projects/<folder>) and the ticket cache,
 written by the fixture writers below, and a real `git init` main checkout. HARNESS_GH is fakegh.py with a
-scenario whose default exits 1 (task 6 adds gh calls to this command), so stderr is never asserted empty.
+scenario whose default exits 1, so CostCommand never asserts stderr empty.
+
+CostExtras (ticket #114) scripts the gh calls the ticket's Outline names: `pr view P`, `pr list --head <branch>
+--state all`, `api repos/{owner}/{repo}/pulls/P/files?per_page=100 --paginate --slurp` (an array of page arrays),
+`issue view N --json comments,labels` and `run list --branch <headRefName>`, and checks the record's lines,
+elapsed, ci, needs_input and landed_at and the `Lines:`, `Elapsed:`, `CI:` and `Needs input:` lines that follow
+the Rounds line in the text and the Cost block. File kinds, sums, seconds and medians are written out by hand.
 Expected figures are written out by hand from the fixtures, or summed here from the same message specs the
 writers wrote; the rounds are also tallied from the real `harness-work attempt` answers. The fake gh wrapper
 is written once for the module.
@@ -57,7 +64,6 @@ STAGES = ("tests", "breaker", "code", "review", "fix", "other", "orchestrator")
 RECORD_KEYS = {"ticket", "title", "repo", "computed_at", "type", "size", "risk", "tier", "pr", "rows", "totals",
                "by_model", "session_totals", "sessions", "rounds", "needs_input", "lines", "elapsed", "ci",
                "landed_at", "coverage"}
-TASK6_KEYS = ("needs_input", "lines", "elapsed", "ci", "landed_at")
 CACHE_KEYS = ("title", "type", "size", "risk", "tier")
 TOTAL_KEYS = ("input", "output", "cache_write", "cache_read", "total", "messages", "model_ms")
 
@@ -287,7 +293,8 @@ def tearDownModule():
     shutil.rmtree(BINS.get("root", ""), True)
 
 
-class CostCommand(unittest.TestCase):
+class CostBase(unittest.TestCase):
+    """The temporary HOME, main checkout, fake gh and fixture writers both test classes use."""
 
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="harness-cost-cmd-"))
@@ -306,26 +313,31 @@ class CostCommand(unittest.TestCase):
             {"calls": [], "default": {"stderr": "fakegh: no network in this test\n", "exit": 1}}))
 
     # ----------------------------------------------------------- helpers
-    def env(self):
+    def env(self, extra=None):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("CLAUDE", "HARNESS_", "GIT_", "FAKEGH_"))}
         env.update(HOME=self.home, PATH=os.pathsep.join([BINS["fakebin"], BINS["toolbin"], "/usr/bin", "/bin"]),
                    GIT_CONFIG_NOSYSTEM="1", HARNESS_GH=os.path.join(BINS["fakebin"], "gh"),
                    FAKEGH_SCENARIO=os.path.join(self.tmp, "scenario.json"),
                    FAKEGH_LOG=os.path.join(self.tmp, "gh.log"))
+        env.update(extra or {})
         return env
 
-    def work(self, *args):
-        done = subprocess.run([sys.executable, TOOL] + [str(a) for a in args], cwd=self.tmp, env=self.env(),
+    def work(self, *args, env=None):
+        done = subprocess.run([sys.executable, TOOL] + [str(a) for a in args], cwd=self.tmp, env=self.env(env),
                               capture_output=True, text=True, timeout=120)
         self.assertNotIn("Traceback", done.stderr)
         return done
 
-    def cost(self, n, *extra):
+    def cost_run(self, n, *extra, env=None):
+        """`harness-work cost N ... --repo <main>`, which must exit 0; the finished process."""
+        done = self.work("cost", n, *extra, "--repo", self.repo, env=env)
+        self.assertEqual(done.returncode, 0, f"cost {n} {' '.join(map(str, extra))}: {done.stdout}{done.stderr}")
+        return done
+
+    def cost(self, n, *extra, env=None):
         """`harness-work cost N ... --repo <main>`, which must exit 0; its stdout."""
-        done = self.work("cost", n, *extra, "--repo", self.repo)
-        self.assertEqual(done.returncode, 0, f"cost {n} {' '.join(extra)}: {done.stdout}{done.stderr}")
-        return done.stdout
+        return self.cost_run(n, *extra, env=env).stdout
 
     def attempt(self, n, stage, result):
         done = self.work("attempt", n, stage, result, "--repo", self.repo)
@@ -350,15 +362,16 @@ class CostCommand(unittest.TestCase):
         return os.path.join(self.projects, re.sub(r"[^A-Za-z0-9]", "-", wt))
 
     def write_cache(self, n, title="Add the widget", type_="task", size="M", risk="low", tier="opus",
-                    attempts=()):
+                    attempts=(), branch=..., started_at="2026-10-20T08:00:00Z"):
         labels = [type_, "status:in-progress"] + ([f"size:{size}"] if size else []) + (
             [f"risk:{risk}"] if risk else [])
         cache = {"number": n, "title": title, "url": f"https://github.com/o/r/issues/{n}", "type": type_,
                  "status": "in-progress", "size": size, "risk": risk, "flags": [], "labels": labels, "tier": tier,
                  "parent": {"number": 108, "title": "Measure", "goal": "Tokens only."}, "blocked_by": [],
                  "body": "## Request\nAdd it.\n", "sections": {"request": "Add it."}, "comments": [],
-                 "fetched_at": "2026-10-20T08:00:00Z", "branch": f"t/{n}-add-the-widget", "worktree": None,
-                 "started_at": "2026-10-20T08:00:00Z",
+                 "fetched_at": "2026-10-20T08:00:00Z",
+                 "branch": f"t/{n}-add-the-widget" if branch is ... else branch, "worktree": None,
+                 "started_at": started_at,
                  "attempts": [{"stage": s, "tier": tier, "result": r, "at": "2026-10-20T%02d:00:00Z" % (9 + i)}
                               for i, (s, r) in enumerate(attempts)]}
         write(self.state("tickets", f"{n}.json"), json.dumps(cache, indent=2))
@@ -436,8 +449,12 @@ class CostCommand(unittest.TestCase):
         self.assertEqual(sorted(record["sessions"], key=lambda s: s["id"]),
                          sorted(expected["sessions"], key=lambda s: s["id"]))
         self.assertEqual(record["rounds"], expected.get("rounds"))
-        for key in TASK6_KEYS:
+        # every gh call fails in CostCommand: no PR, no comments, no runs
+        for key in ("needs_input", "lines", "ci", "landed_at"):
             self.assertIsNone(record[key], key)
+        if record["elapsed"] is not None:
+            for key in ("pr_opened_at", "ready_at", "landed_at", "start_to_ready_s", "start_to_land_s"):
+                self.assertIsNone(record["elapsed"][key], key)
         self.assertIsInstance(record["coverage"], str)
         self.assertRegex(record["coverage"], r"(?i)lower bound")
 
@@ -450,6 +467,9 @@ class CostCommand(unittest.TestCase):
     @staticmethod
     def markdown_lines(text):
         return [line for line in text.splitlines() if line.strip()]
+
+
+class CostCommand(CostBase):
 
     # ----------------------------------------------------------- broad: the three outputs
     def test_prints_the_stage_by_model_table_and_saves_the_record(self):
@@ -810,6 +830,535 @@ class CostCommand(unittest.TestCase):
         # and the good ones next to them work
         self.assertEqual(json.loads(self.cost(12, "--json"))["ticket"], 12)
         self.assertTrue(self.cost(12, "--markdown").startswith(HEADER))
+
+
+# ------------------------------------------------------------------ ticket #114: the gh-backed parts
+REPO_URL = "https://github.com/o/r"
+EXTRA_PREFIXES = ("Lines:", "Elapsed:", "CI:", "Needs input:")
+ELAPSED_KEYS = {"started_at", "pr_opened_at", "ready_at", "landed_at", "start_to_ready_s", "start_to_land_s"}
+CODE_ROW = ("code", "opus-5-5", "1", "999", "98", "45s", "45s")
+CODE_TOTAL = ("999", "98", "45s")
+ROUNDS_ONE = "Rounds: breaker re-rounds 0, fix rounds 0; retries 0, escalations 0, needs-input 0"
+NEEDS = "**Needs your input**"
+MISSING = object()
+
+# File kinds under the defaults harness-red uses, labelled by hand: (path template, kind)
+DEFAULT_KINDS = [
+    ("tests/unit/test_a{i}.py", "test"),
+    ("plugins/harness/tests/test_m{i}.py", "test"),        # **/test_*.py
+    ("pkg/mod{i}_test.py", "test"),
+    ("web/c{i}.test.ts", "test"),
+    ("spec/s{i}.rb", "test"),
+    ("pkg{i}/conftest.py", "test"),
+    ("tests/fixtures/f{i}.json", "test"),                   # tests/** before the exempt **/*.json
+    ("src/m{i}.py", "source"),
+    ("plugins/harness/bin/tool{i}", "source"),
+    ("plugins/harness/tests/helper{i}.py", "source"),       # tests/ not at the root, not test_*.py
+    ("web/app{i}.ts", "source"),
+    ("assets/logo{i}.svg", "source"),
+    ("docs/img{i}.png", "other"),
+    ("notes/n{i}.md", "other"),
+    ("conf/c{i}.json", "other"),
+    (".github/workflows/w{i}.yml", "other"),
+    ("cfg/s{i}.toml", "other"),
+    ("data/d{i}.txt", "other"),
+    (".claude/agents/a{i}.py", "other"),                    # .claude/** even for a .py
+]
+DEFAULT_SINGLES = [(".gitignore", "other", 2, 1), ("LICENSE", "other", 21, 0), ("uv.lock", "other", 300, 280)]
+
+
+def default_kind_files():
+    """123 files (two pages of the files endpoint): (path, additions, deletions, kind)."""
+    files = []
+    for i in range(120):
+        template, kind = DEFAULT_KINDS[i % len(DEFAULT_KINDS)]
+        files.append((template.format(i=i), (i * 37) % 97 + 1, (i * 11) % 13, kind))
+    return files + [(path, a, d, kind) for path, kind, a, d in DEFAULT_SINGLES]
+
+
+def lines_of(files):
+    """The expected `lines` part, summed here from hand-labelled (path, additions, deletions, kind)."""
+    out = {kind: {"added": 0, "removed": 0} for kind in ("test", "source", "other")}
+    for _, added, removed, kind in files:
+        out[kind]["added"] += added
+        out[kind]["removed"] += removed
+    return out
+
+
+def lines_line(part):
+    t, s, o = part["test"], part["source"], part["other"]
+    return (f"Lines: tests +{t['added']} -{t['removed']}, source +{s['added']} -{s['removed']}, "
+            f"other +{o['added']} -{o['removed']}")
+
+
+def extra_lines(text):
+    return [line for line in text.splitlines() if line.startswith(EXTRA_PREFIXES)]
+
+
+# ------------------------------------------------------------------ gh responses and scenario calls
+def comment(body, at, login="rjeskuri", harness=True):
+    text = body + ("\n\n<!-- harness -->" if harness else "")
+    return {"id": "IC_" + hashlib.sha1((body + at).encode("utf-8")).hexdigest()[:12], "author": {"login": login},
+            "authorAssociation": "OWNER", "body": text, "createdAt": at, "includesCreatedEdit": False,
+            "isMinimized": False, "minimizedReason": "", "reactionGroups": [],
+            "url": f"{REPO_URL}/issues/1#issuecomment-1", "viewerDidAuthor": True}
+
+
+def needs(question, at):
+    return comment(f"{NEEDS}\n\n{question}", at)
+
+
+def issue_json(comments=(), labels=("task", "status:in-progress", "size:M", "risk:low")):
+    return {"comments": list(comments),
+            "labels": [{"id": "LA_" + name, "name": name, "description": "", "color": "ededed"} for name in labels]}
+
+
+def pr_json(number, created, merged, head):
+    return {"number": number, "url": f"{REPO_URL}/pull/{number}", "createdAt": created, "mergedAt": merged,
+            "headRefName": head}
+
+
+def files_endpoint(pr):
+    return f"repos/{{owner}}/{{repo}}/pulls/{pr}/files?per_page=100"
+
+
+def file_pages(files, size=100):
+    entries = [{"sha": hashlib.sha1(path.encode("utf-8")).hexdigest(), "filename": path, "status": "modified",
+                "additions": a, "deletions": d, "changes": a + d,
+                "blob_url": f"{REPO_URL}/blob/abc/{path}", "patch": "@@ -1 +1 @@"} for path, a, d, *_ in files]
+    return [entries[i:i + size] for i in range(0, len(entries), size)] or [[]]
+
+
+def run_json(rid, status, conclusion, created, started, updated):
+    run = {"databaseId": rid, "status": status, "conclusion": conclusion, "createdAt": created,
+           "updatedAt": updated}
+    if started is not MISSING:
+        run["startedAt"] = started
+    return run
+
+
+def gh_pr_view(pr):
+    return {"match": ["pr", "view", str(pr["number"])], "stdout_json": pr}
+
+
+def gh_pr_list(branch, prs):
+    return {"match": ["pr", "list"], "contains": ["--head", branch, "--state", "all"], "stdout_json": prs}
+
+
+def gh_files(pr, files):
+    return {"match": ["api"], "contains": [files_endpoint(pr), "--paginate", "--slurp"],
+            "stdout_json": file_pages(files)}
+
+
+def gh_issue(n, data):
+    return {"match": ["issue", "view", str(n)], "stdout_json": data}
+
+
+def gh_runs(branch, runs):
+    return {"match": ["run", "list"], "contains": ["--branch", branch], "stdout_json": runs}
+
+
+def gh_fails(call):
+    """The same call, failing the way gh does."""
+    return {k: v for k, v in call.items() if k in ("match", "contains")} | {
+        "stderr": "HTTP 502: Bad Gateway (https://api.github.com/graphql)\n", "exit": 1}
+
+
+class CostExtras(CostBase):
+    """Ticket #114: lines, elapsed, ci, needs_input, landed_at and the labels from gh, and their four lines."""
+
+    def scenario(self, *calls):
+        write(self.scenario_path, json.dumps({"calls": list(calls), "default": {
+            "stderr": "fakegh: not scripted in this test\n", "exit": 1}}))
+        state = self.scenario_path + ".state.json"
+        if os.path.exists(state):
+            os.remove(state)
+
+    def ticket(self, n, cache=True, attempts=(("tests", "pass"),), **fields):
+        """Ticket n's own session (one code message: CODE_ROW) and, with `cache`, its ticket cache."""
+        self.own_session(n, "extras", agents=[("harness:coder", f"#{n} code", [
+            Msg(f"msg_{n}_1", T("09:00:00.000"), T("09:00:45.000"), (1, 98, 0, 900))])])
+        if cache:
+            self.write_cache(n, attempts=attempts, **fields)
+
+    def assertExtras(self, text, expected):
+        """The Lines/Elapsed/CI/Needs input lines are exactly `expected`, in order, right after the Rounds line."""
+        self.assertEqual(extra_lines(text), expected, text)
+        lines = text.splitlines()
+        rounds = [i for i, line in enumerate(lines) if line.startswith("Rounds:")]
+        if expected and rounds:
+            at = [lines.index(line) for line in expected]
+            self.assertEqual(at, list(range(rounds[0] + 1, rounds[0] + 1 + len(expected))),
+                             f"the lines follow the Rounds line:\n{text}")
+
+    # ----------------------------------------------------------- lines
+    def test_lines_split_into_tests_source_and_other(self):
+        files = default_kind_files()
+        self.assertEqual([len(p) for p in file_pages(files)], [100, 23], "fixture: two pages")
+        self.assertNotEqual(lines_of(files), lines_of(files[:100]), "fixture: the second page counts")
+        small = [("README.md", 5, 1, "other"), ("plugins/harness/tests/fakegh.py", 7, 2, "source"),
+                 ("tests/fixtures/data.json", 9, 0, "test")]
+        self.ticket(91, branch="t/91-lines")
+        self.ticket(92, branch="t/92-lines")
+        self.scenario(gh_pr_view(pr_json(157, "2026-10-20T09:00:00Z", None, "t/91-lines")), gh_files(157, files),
+                      gh_pr_view(pr_json(158, "2026-10-20T09:00:00Z", None, "t/92-lines")), gh_files(158, small))
+        self.assertEqual(lines_of(small), {"test": {"added": 9, "removed": 0}, "source": {"added": 7, "removed": 2},
+                                           "other": {"added": 5, "removed": 1}})
+        for n, pr, fixture in ((91, 157, files), (92, 158, small)):
+            with self.subTest(ticket=n):
+                want = lines_of(fixture)
+                out = self.cost(n, "--pr", pr)
+                record = self.read_record(n)
+                self.assertEqual(set(record), RECORD_KEYS)
+                self.assertEqual(record["pr"], pr)
+                self.assertEqual(record["lines"], want)
+                self.assertEqual([x for x in extra_lines(out) if x.startswith("Lines:")], [lines_line(want)])
+                self.assertExtras(self.cost(n, "--pr", pr, "--markdown"), [lines_line(want)])
+                self.assertEqual(json.loads(self.cost(n, "--pr", pr, "--json"))["lines"], want)
+        self.assertIn("Lines: tests +9 -0, source +7 -2, other +5 -1", self.cost(92, "--pr", 158).splitlines())
+
+    def test_patterns_come_from_the_main_checkouts_settings(self):
+        # (path, additions, deletions); the kinds per settings are written out by hand below
+        files = [("checks/a.py", 11, 1), ("src/thing_spec.py", 13, 2), ("tests/test_x.py", 17, 3),
+                 ("docs/x.md", 19, 4), ("plugins/a.json", 23, 5), ("assets/logo.svg", 29, 6), ("lib/core.py", 37, 8)]
+
+        def part(test, source, other):
+            return {"test": dict(zip(("added", "removed"), test)), "source": dict(zip(("added", "removed"), source)),
+                    "other": dict(zip(("added", "removed"), other))}
+
+        cases = [  # (ticket, pr, extra environment, expected)
+            (93, 193, None, part((17, 3), (90, 17), (42, 9))),                 # the defaults: no settings yet
+            (94, 194, None, part((24, 3), (77, 16), (48, 10))),                # the main checkout's settings.json
+            (95, 195, {"HARNESS_TEST_PATTERNS": "assets/**"}, part((29, 6), (101, 19), (19, 4))),
+            (96, 196, {"HARNESS_SOURCE_EXEMPT": "**/*.py"}, part((24, 3), (71, 15), (54, 11))),
+        ]
+        calls = []
+        for n, pr, _, _ in cases:
+            self.ticket(n, branch=f"t/{n}-patterns")
+            calls += [gh_pr_view(pr_json(pr, "2026-10-20T09:00:00Z", None, f"t/{n}-patterns")), gh_files(pr, files)]
+        self.scenario(*calls)
+        for n, pr, extra, want in cases:
+            with self.subTest(ticket=n, env=extra):
+                self.assertEqual(sum(want[k]["added"] for k in want), 149, "fixture")
+                self.assertEqual(sum(want[k]["removed"] for k in want), 29, "fixture")
+                if n == 94:     # tracked settings.json counts; settings.local.json does not
+                    write(os.path.join(self.main, ".claude", "settings.json"), json.dumps({"env": {
+                        "HARNESS_TEST_PATTERNS": "checks/**, **/*_spec.py",
+                        "HARNESS_SOURCE_EXEMPT": "assets/**,**/*.md"}}))
+                    write(os.path.join(self.main, ".claude", "settings.local.json"), json.dumps({"env": {
+                        "HARNESS_TEST_PATTERNS": "**", "HARNESS_SOURCE_EXEMPT": "**"}}))
+                    for args in (["add", ".claude/settings.json"],
+                                 ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "s"]):
+                        done = subprocess.run([GIT, "-C", self.main] + args, env=self.env(), capture_output=True,
+                                              text=True)
+                        self.assertEqual(done.returncode, 0, done.stderr)
+                out = self.cost(n, "--pr", pr, env=extra)
+                self.assertEqual(self.read_record(n)["lines"], want)
+                self.assertIn(lines_line(want), out.splitlines())
+
+    # ----------------------------------------------------------- elapsed
+    def test_elapsed_from_start_to_ready_and_to_land(self):
+        # 101: the cache's started_at (an older Started on comment does not count), the earliest ready of PR #201
+        self.ticket(101, branch="t/101-elapsed", started_at="2026-10-20T08:00:00Z")
+        issue101 = issue_json([
+            comment("Started on t/101-elapsed (MacBook-Pro-5, bg)", "2026-10-19T20:00:00Z"),
+            comment("PR #200 ready for review: https://github.com/o/r/pull/200", "2026-10-20T09:10:00Z"),
+            comment("PR #2011 ready for review: https://github.com/o/r/pull/2011", "2026-10-20T09:15:00Z"),
+            comment("PR #201 ready for review: https://github.com/o/r/pull/201", "2026-10-20T09:29:40Z"),
+            comment("PR #201 ready for review: https://github.com/o/r/pull/201", "2026-10-20T11:00:00Z"),
+        ])
+        runs101 = [run_json(1, "completed", "success", "2026-10-20T10:00:00Z", "2026-10-20T10:00:00Z",
+                            "2026-10-20T10:05:00Z"),
+                   run_json(2, "completed", "success", "2026-10-20T10:20:00Z", "2026-10-20T10:20:00Z",
+                            "2026-10-20T10:29:00Z"),
+                   run_json(3, "completed", "failure", "2026-10-20T09:06:00Z", "2026-10-20T09:06:00Z",
+                            "2026-10-20T09:10:00Z")]
+        files101 = [("plugins/harness/bin/harness-work", 45, 2), ("plugins/harness/tests/test_cost.py", 746, 3),
+                    ("docs/design.md", 24, 0)]
+        # 102: no cache, so the earliest Started on comment; lands the next day but one
+        self.ticket(102, cache=False)
+        issue102 = issue_json([
+            comment("Started on t/102-elapsed (MacBook-Pro-5, bg)", "2026-10-21T22:50:00Z"),
+            comment("PR #202 ready for review: https://github.com/o/r/pull/202", "2026-10-21T23:35:30Z"),
+            comment("Started on t/102-elapsed (MacBook-Pro-5, interactive)", "2026-10-22T09:00:00Z"),
+        ])
+        # 103: ready but not landed
+        self.ticket(103, branch="t/103-elapsed", started_at="2026-10-22T12:00:00Z")
+        issue103 = issue_json([comment("PR #203 ready for review: https://github.com/o/r/pull/203",
+                                       "2026-10-22T12:00:50Z")])
+        self.scenario(
+            gh_pr_view(pr_json(201, "2026-10-20T09:05:00Z", "2026-10-20T10:12:05Z", "t/101-elapsed")),
+            gh_files(201, files101), gh_runs("t/101-elapsed", runs101), gh_issue(101, issue101),
+            gh_pr_view(pr_json(202, "2026-10-21T23:20:00Z", "2026-10-23T01:05:00Z", "t/102-elapsed")),
+            gh_issue(102, issue102),
+            gh_pr_view(pr_json(203, "2026-10-22T12:00:20Z", None, "t/103-elapsed")), gh_issue(103, issue103))
+
+        cases = [
+            (101, 201, {"started_at": "2026-10-20T08:00:00Z", "pr_opened_at": "2026-10-20T09:05:00Z",
+                        "ready_at": "2026-10-20T09:29:40Z", "landed_at": "2026-10-20T10:12:05Z",
+                        "start_to_ready_s": 5380, "start_to_land_s": 7925},
+             "Elapsed: start to ready 1h29m, start to land 2h12m"),
+            (102, 202, {"started_at": "2026-10-21T22:50:00Z", "pr_opened_at": "2026-10-21T23:20:00Z",
+                        "ready_at": "2026-10-21T23:35:30Z", "landed_at": "2026-10-23T01:05:00Z",
+                        "start_to_ready_s": 2730, "start_to_land_s": 94500},
+             "Elapsed: start to ready 45m, start to land 26h15m"),
+            (103, 203, {"started_at": "2026-10-22T12:00:00Z", "pr_opened_at": "2026-10-22T12:00:20Z",
+                        "ready_at": "2026-10-22T12:00:50Z", "landed_at": None,
+                        "start_to_ready_s": 50, "start_to_land_s": None},
+             "Elapsed: start to ready 50s"),
+        ]
+        for n, pr, elapsed, line in cases:
+            with self.subTest(ticket=n):
+                self.assertEqual(set(elapsed), ELAPSED_KEYS)
+                out = self.cost(n, "--pr", pr)
+                record = self.read_record(n)
+                self.assertEqual(record["elapsed"], elapsed)
+                self.assertEqual(record["landed_at"], elapsed["landed_at"])
+                self.assertEqual([x for x in extra_lines(out) if x.startswith("Elapsed:")], [line])
+                md = self.cost(n, "--pr", pr, "--markdown")
+                self.assertEqual([x for x in extra_lines(md) if x.startswith("Elapsed:")], [line])
+
+        # 101 has every part: the whole Cost block, the four lines after the Rounds line
+        md = self.cost(101, "--pr", 201, "--markdown")
+        self.assertEqual(md.strip("\n"), block(
+            [CODE_ROW], CODE_TOTAL, ROUNDS_ONE,
+            "Lines: tests +746 -3, source +45 -2, other +24 -0",
+            "Elapsed: start to ready 1h29m, start to land 2h12m",
+            "CI: 3 runs (1 failed, 0 cancelled), 18m total, 5m median",
+            "Needs input: 0"))
+        self.assertExtras(self.cost(101, "--pr", 201), [
+            "Lines: tests +746 -3, source +45 -2, other +24 -0",
+            "Elapsed: start to ready 1h29m, start to land 2h12m",
+            "CI: 3 runs (1 failed, 0 cancelled), 18m total, 5m median",
+            "Needs input: 0"])
+
+    # ----------------------------------------------------------- ci
+    def test_ci_runs_failures_and_durations(self):
+        heavy = [  # each started 30 s after it was created, except the two without a startedAt
+            run_json(11, "completed", "success", "2026-10-20T09:59:30Z", "2026-10-20T10:00:00Z",
+                     "2026-10-20T10:05:00Z"),                                                   # 300
+            run_json(12, "completed", "failure", "2026-10-20T10:09:30Z", "2026-10-20T10:10:00Z",
+                     "2026-10-20T10:14:30Z"),                                                   # 270, failed
+            run_json(13, "completed", "cancelled", "2026-10-20T10:19:30Z", "2026-10-20T10:20:00Z",
+                     "2026-10-20T10:21:00Z"),                                                   # 60, cancelled
+            run_json(14, "completed", "timed_out", "2026-10-20T10:30:00Z", MISSING,
+                     "2026-10-20T11:00:00Z"),                                                   # 1800, failed
+            run_json(15, "completed", "startup_failure", "2026-10-20T10:40:00Z", None,
+                     "2026-10-20T10:40:10Z"),                                                   # 10, failed
+            run_json(16, "completed", "skipped", "2026-10-20T10:59:30Z", "2026-10-20T11:00:00Z",
+                     "2026-10-20T11:00:05Z"),                                                   # 5
+            run_json(17, "completed", "success", "2026-10-20T11:09:30Z", "2026-10-20T11:10:00Z",
+                     "2026-10-20T11:16:40Z"),                                                   # 400
+            run_json(18, "in_progress", "", "2026-10-20T11:19:30Z", "2026-10-20T11:20:00Z",
+                     "2026-10-20T11:50:00Z"),                                                   # not completed
+            run_json(19, "queued", "", "2026-10-20T11:30:00Z", MISSING, "2026-10-20T11:30:00Z"),
+        ]
+        light = [
+            run_json(21, "completed", "success", "2026-10-21T09:00:00Z", "2026-10-21T09:00:00Z",
+                     "2026-10-21T09:02:00Z"),                                                   # 120
+            run_json(22, "completed", "success", "2026-10-21T10:00:00Z", "2026-10-21T10:00:00Z",
+                     "2026-10-21T10:10:10Z"),                                                   # 610
+            run_json(23, "completed", "success", "2026-10-21T11:00:00Z", "2026-10-21T11:00:00Z",
+                     "2026-10-21T11:03:20Z"),                                                   # 200
+            run_json(24, "in_progress", "", "2026-10-21T12:00:00Z", "2026-10-21T12:00:00Z",
+                     "2026-10-21T13:00:00Z"),
+        ]
+        decoy = [run_json(31, "completed", "failure", "2026-10-21T08:00:00Z", "2026-10-21T08:00:00Z",
+                          "2026-10-21T08:01:40Z")]
+        self.ticket(111, branch="t/111-ci-heavy")
+        self.ticket(112, branch="t/112-old-name")      # the PR's head branch is what counts
+        self.scenario(gh_pr_view(pr_json(211, "2026-10-20T09:50:00Z", None, "t/111-ci-heavy")),
+                      gh_runs("t/111-ci-heavy", heavy),
+                      gh_pr_view(pr_json(212, "2026-10-21T08:50:00Z", None, "t/112-ci-light")),
+                      gh_runs("t/112-ci-light", light), gh_runs("t/112-old-name", decoy))
+        cases = [
+            (111, 211, {"runs": 7, "failed": 3, "cancelled": 1, "total_s": 2845, "median_s": 270},
+             "CI: 7 runs (3 failed, 1 cancelled), 47m total, 4m median"),
+            (112, 212, {"runs": 3, "failed": 0, "cancelled": 0, "total_s": 930, "median_s": 200},
+             "CI: 3 runs (0 failed, 0 cancelled), 15m total, 3m median"),
+        ]
+        for n, pr, ci, line in cases:
+            with self.subTest(ticket=n):
+                out = self.cost(n, "--pr", pr)
+                self.assertEqual(self.read_record(n)["ci"], ci)
+                self.assertEqual([x for x in extra_lines(out) if x.startswith("CI:")], [line])
+                md = self.cost(n, "--pr", pr, "--markdown")
+                self.assertEqual([x for x in extra_lines(md) if x.startswith("CI:")], [line])
+                self.assertEqual(json.loads(self.cost(n, "--pr", pr, "--json"))["ci"], ci)
+
+    # ----------------------------------------------------------- needs input
+    def test_needs_input_counts_the_questions(self):
+        quoted = comment(f"> {NEEDS}\n> Which table?\n\nAnswered above.", "2026-10-20T13:00:00Z", harness=False)
+        mention = comment(f"About the {NEEDS} question: done.", "2026-10-20T13:30:00Z", harness=False)
+        answer = comment("Use the second one.", "2026-10-20T11:00:00Z", harness=False)
+        started = comment("Started on t/12x-needs (MacBook-Pro-5, bg)", "2026-10-20T08:00:00Z")
+        cases = [
+            (121, [started, needs("Which table?", "2026-10-20T10:00:00Z"), answer,
+                   needs("And the index?", "2026-10-20T12:00:00Z"), quoted, mention], 2),
+            (122, [started, answer, quoted, mention], 0),
+            (123, [started, needs("One?", "2026-10-20T09:00:00Z"), needs("Two?", "2026-10-20T09:10:00Z"), answer,
+                   needs("Three?", "2026-10-20T09:20:00Z")], 3),
+        ]
+        calls = []
+        for n, comments, _ in cases:
+            self.ticket(n, branch=f"t/{n}-needs")
+            calls += [gh_issue(n, issue_json(comments)), gh_pr_list(f"t/{n}-needs", [])]
+        self.scenario(*calls)
+        for n, _, count in cases:
+            with self.subTest(ticket=n):
+                out = self.cost(n)
+                record = self.read_record(n)
+                self.assertEqual(record["needs_input"], count)
+                # no PR: no lines, CI or PR times, so the needs-input line alone
+                self.assertExtras(out, [f"Needs input: {count}"])
+                self.assertExtras(self.cost(n, "--markdown"), [f"Needs input: {count}"])
+
+    # ----------------------------------------------------------- the PR by branch
+    def test_pr_found_by_branch_when_not_given(self):
+        b61, b62 = "t/61-find-me", "t/62-find-newest"
+        self.ticket(61, branch=b61)
+        self.ticket(62, branch=b62)
+        self.scenario(
+            gh_pr_list(b61, [pr_json(70, "2026-10-22T09:00:00Z", None, b61),
+                             pr_json(66, "2026-10-20T09:00:00Z", "2026-10-21T10:00:00Z", b61),
+                             pr_json(64, "2026-10-19T09:00:00Z", None, b61)]),
+            gh_files(70, [("src/a.py", 70, 7)]),
+            gh_files(66, [("src/a.py", 66, 6), ("tests/test_a.py", 6, 0)]),
+            gh_files(64, [("src/a.py", 64, 4)]),
+            gh_pr_list(b62, [pr_json(80, "2026-10-19T09:00:00Z", None, b62),
+                             pr_json(82, "2026-10-21T09:00:00Z", None, b62),
+                             pr_json(81, "2026-10-20T09:00:00Z", None, b62)]),
+            gh_files(80, [("src/b.py", 80, 8)]),
+            gh_files(81, [("src/b.py", 81, 1)]),
+            gh_files(82, [("src/b.py", 82, 2), ("docs/b.md", 2, 2)]))
+        cases = [  # (ticket, pr, pr_opened_at, landed_at, lines)
+            (61, 66, "2026-10-20T09:00:00Z", "2026-10-21T10:00:00Z",
+             {"test": {"added": 6, "removed": 0}, "source": {"added": 66, "removed": 6},
+              "other": {"added": 0, "removed": 0}}),       # the merged one, though not the newest
+            (62, 82, "2026-10-21T09:00:00Z", None,
+             {"test": {"added": 0, "removed": 0}, "source": {"added": 82, "removed": 2},
+              "other": {"added": 2, "removed": 2}}),       # none merged: the newest, though not listed first
+        ]
+        for n, pr, opened, landed, lines in cases:
+            with self.subTest(ticket=n):
+                out = self.cost(n)
+                record = self.read_record(n)
+                self.assertEqual(record["pr"], pr)
+                self.assertEqual(record["lines"], lines)
+                self.assertEqual(record["landed_at"], landed)
+                self.assertIsInstance(record["elapsed"], dict)
+                self.assertEqual((record["elapsed"]["pr_opened_at"], record["elapsed"]["landed_at"]),
+                                 (opened, landed))
+                self.assertIn(lines_line(lines), out.splitlines())
+
+    # ----------------------------------------------------------- labels
+    def test_labels_from_the_issue_when_the_cache_lacks_them(self):
+        self.ticket(71, cache=False)
+        self.ticket(72, cache=False)
+        self.ticket(73, type_="chore", size="S", risk="low", tier="sonnet")
+        self.scenario(gh_issue(71, issue_json(labels=("task", "status:in-review", "size:L", "risk:high"))),
+                      gh_issue(72, issue_json(labels=("status:ready", "bug", "size:S", "risk:low"))),
+                      gh_issue(73, issue_json(labels=("task", "size:L", "risk:high"))))
+        for n, want in ((71, ("task", "L", "high")), (72, ("bug", "S", "low")), (73, ("chore", "S", "low"))):
+            with self.subTest(ticket=n):
+                out = self.cost(n)
+                record = self.read_record(n)
+                self.assertEqual((record["type"], record["size"], record["risk"]), want)
+                head = out.splitlines()[0]
+                self.assertTrue(head.startswith(f"#{n}"), head)
+                for piece in (want[0], f"size {want[1]}", f"risk {want[2]}"):
+                    self.assertIn(piece, head)
+
+    # ----------------------------------------------------------- failures
+    def test_a_failed_gh_call_empties_its_part_only(self):
+        branch = "t/131-fail"
+        self.ticket(131, branch=branch, started_at="2026-10-20T08:00:00Z")
+        pr_list = gh_pr_list(branch, [pr_json(231, "2026-10-20T08:30:00Z", "2026-10-20T09:00:00Z", branch)])
+        files = gh_files(231, [("src/x.py", 10, 1), ("tests/test_x.py", 20, 2), ("docs/x.md", 3, 0)])
+        runs = gh_runs(branch, [
+            run_json(41, "completed", "success", "2026-10-20T08:31:00Z", "2026-10-20T08:31:00Z",
+                     "2026-10-20T08:36:00Z"),                                               # 300
+            run_json(42, "completed", "success", "2026-10-20T08:40:00Z", "2026-10-20T08:40:00Z",
+                     "2026-10-20T08:42:00Z"),                                               # 120
+            run_json(43, "completed", "success", "2026-10-20T08:46:00Z", "2026-10-20T08:46:00Z",
+                     "2026-10-20T08:53:00Z")])                                              # 420
+        issue = gh_issue(131, issue_json([needs("Which?", "2026-10-20T08:10:00Z"),
+                                          comment("PR #231 ready for review: https://github.com/o/r/pull/231",
+                                                  "2026-10-20T08:45:00Z")]))
+        full = {"lines": {"test": {"added": 20, "removed": 2}, "source": {"added": 10, "removed": 1},
+                          "other": {"added": 3, "removed": 0}},
+                "ci": {"runs": 3, "failed": 0, "cancelled": 0, "total_s": 840, "median_s": 300},
+                "elapsed": {"started_at": "2026-10-20T08:00:00Z", "pr_opened_at": "2026-10-20T08:30:00Z",
+                            "ready_at": "2026-10-20T08:45:00Z", "landed_at": "2026-10-20T09:00:00Z",
+                            "start_to_ready_s": 2700, "start_to_land_s": 3600},
+                "needs_input": 1, "landed_at": "2026-10-20T09:00:00Z"}
+        L = "Lines: tests +20 -2, source +10 -1, other +3 -0"
+        E = "Elapsed: start to ready 45m, start to land 1h00m"
+        C = "CI: 3 runs (0 failed, 0 cancelled), 14m total, 5m median"
+        N = "Needs input: 1"
+        no_pr = {"lines": None, "ci": None, "landed_at": None,
+                 "elapsed": dict(full["elapsed"], pr_opened_at=None, ready_at=None, landed_at=None,
+                                 start_to_ready_s=None, start_to_land_s=None)}
+        cases = [  # (name, the scenario, words naming the failed call, the parts that change, the lines shown)
+            ("all succeed", (pr_list, files, runs, issue), None, {}, [L, E, C, N]),
+            ("pr list", (gh_fails(pr_list), files, runs, issue), ("pr list",), no_pr, [N]),
+            ("files", (pr_list, gh_fails(files), runs, issue), ("api", "files"), {"lines": None}, [E, C, N]),
+            ("run list", (pr_list, files, gh_fails(runs), issue), ("run list",), {"ci": None}, [L, E, N]),
+            ("issue view", (pr_list, files, runs, gh_fails(issue)), ("issue view",),
+             {"needs_input": None, "elapsed": dict(full["elapsed"], ready_at=None, start_to_ready_s=None)},
+             [L, "Elapsed: start to land 1h00m", C]),
+        ]
+        for name, calls, words, changed, shown in cases:
+            with self.subTest(failing=name):
+                self.scenario(*calls)
+                if os.path.exists(self.record_path(131)):
+                    os.remove(self.record_path(131))
+                done = self.cost_run(131)
+                self.assertTrue(os.path.isfile(self.record_path(131)), "the record is still written")
+                record = self.read_record(131)
+                self.assertEqual(set(record), RECORD_KEYS)
+                self.assertEqual({k: record[k] for k in full}, dict(full, **changed))
+                self.assertEqual((record["type"], record["size"], record["risk"]), ("task", "M", "low"))
+                self.assertGreater(record["totals"]["total"], 0, "the transcripts still count")
+                self.assertExtras(done.stdout, shown)
+                errors = [x for x in done.stderr.splitlines() if x.strip()]
+                if words is None:
+                    self.assertEqual(errors, [], done.stderr)
+                else:
+                    self.assertEqual(len(errors), 1, f"one stderr line for the failed call:\n{done.stderr}")
+                    for word in words:
+                        self.assertIn(word, errors[0])
+                self.assertExtras(self.cost(131, "--markdown"), shown)
+
+        # no PR at all: none on the branch, or a cache without a branch and no --pr
+        self.ticket(132, branch=None, started_at="2026-10-20T08:00:00Z")
+        self.scenario(gh_pr_list(branch, []), files, runs, issue,
+                      gh_issue(132, issue_json([needs("Which?", "2026-10-20T08:10:00Z")])))
+        for n in (131, 132):
+            with self.subTest(no_pr=n):
+                done = self.cost_run(n)
+                record = self.read_record(n)
+                self.assertEqual({k: record[k] for k in full}, dict(full, **no_pr))
+                self.assertIsNone(record["pr"])
+                self.assertExtras(done.stdout, [N])
+
+    # ----------------------------------------------------------- the defaults
+    def test_lib_defaults_equal_harness_reds(self):
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        lib = os.path.join(os.path.dirname(HERE), "lib")
+        if lib not in sys.path:
+            sys.path.insert(0, lib)
+        from harness_lib import settings
+        red_path = os.path.join(os.path.dirname(HERE), "bin", "harness-red")
+        loader = SourceFileLoader("harness_red_for_cost", red_path)
+        spec = importlib.util.spec_from_loader("harness_red_for_cost", loader)
+        red = importlib.util.module_from_spec(spec)
+        loader.exec_module(red)
+        self.assertEqual(settings.DEFAULT_TEST_PATTERNS, red.TEST_PATTERNS)
+        self.assertEqual(settings.DEFAULT_SOURCE_EXEMPT, red.SOURCE_EXEMPT)
+        self.assertIn("tests/**", settings.patterns(settings.DEFAULT_TEST_PATTERNS))
+        self.assertIn("docs/**", settings.patterns(settings.DEFAULT_SOURCE_EXEMPT))
 
 
 if __name__ == "__main__":
