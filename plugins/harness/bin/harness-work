@@ -5,7 +5,7 @@ of a headless or background session per ready ticket, the run records, the budge
 
 Usage:
     harness-work start N [--venue interactive|headless|bg]
-    harness-work attempt N tests|breaker|code|review|fix|ci pass|fail [--tier sonnet|opus|fable]
+    harness-work attempt N tests|breaker|code|review|fix|ci|verify pass|fail [--tier sonnet|opus|fable]
                          [--effort low|medium|high|xhigh|max]
     harness-work cost N [--pr P] [--json | --markdown]
     harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]
@@ -29,7 +29,7 @@ as `harness-board tier` does, a cached fable reading as opus xhigh). The
 effort is --effort, else the route's effort when the attempt ran at the route's tier, else none (null). The second
 failure in a row escalates: sonnet prints `escalate opus`, opus with no effort or below xhigh `escalate opus xhigh`;
 a stage already at opus xhigh or max, or on an explicitly named fable, gets needs-input instead. No escalation goes to
-fable. --json adds effort, next_tier and next_effort.
+fable. fix and breaker never escalate: retry, then needs-input. --json adds effort, next_tier and next_effort.
 
 cost: ticket N's tokens and model time per stage and model from the repository's transcripts (harness_lib/cost.py's
 ticket_usage), its labels and rounds from the ticket cache (the attempts replayed with attempt's rule; null without
@@ -112,7 +112,7 @@ except Exception as exc:  # no state key can be guessed without the lib: one lin
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-STAGES = ("tests", "breaker", "code", "review", "fix", "ci")
+STAGES = ("tests", "breaker", "code", "review", "fix", "ci", "verify")
 TIERS = ("sonnet", "opus", "fable")
 DEFAULT_TIER = "opus"
 VENUES = ("headless", "bg")
@@ -1143,7 +1143,7 @@ def cmd_attempt(repo, args):
         if entry.get("result") != "fail":
             break
         failures += 1
-    action = cost.attempt_action(args.stage, args.result, failures)     # fix: at most two rounds, never escalates
+    action = cost.attempt_action(args.stage, args.result, failures)     # fix, breaker: two rounds, never escalate
     nxt = next_route(tier, effort) if action == "escalate" else None
     if action == "escalate" and nxt is None:
         action = "needs-input"          # nothing above opus xhigh or an explicit fable
@@ -1487,8 +1487,8 @@ def parser():
 
     attempt = sub.add_parser("attempt", parents=[with_repo, with_json],
                              help="record a stage's result; prints done, retry, escalate <tier> [<effort>] or "
-                                  "needs-input (escalate opus, then escalate opus xhigh, then needs-input; fix: "
-                                  "retry, then needs-input; it never escalates)")
+                                  "needs-input (escalate opus, then escalate opus xhigh, then needs-input; fix and "
+                                  "breaker retry, then needs-input; they never escalate)")
     attempt.add_argument("number", type=issue_number, metavar="N")
     attempt.add_argument("stage", choices=STAGES)
     attempt.add_argument("result", choices=("pass", "fail"))

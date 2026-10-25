@@ -256,14 +256,15 @@ ROUND_KEYS = {"retry": "retry", "escalate": "escalate", "needs-input": "needs_in
 
 def attempt_action(stage, result, failures):
     """What `harness-work attempt` answers for a stage's attempt, `failures` being that stage's run of
-    consecutive fails ending with it: done on a pass, then retry, escalate, needs-input (fix: retry, then
-    needs-input; it never escalates). The tier of an escalation is the caller's (routing.next_route), and
-    when nothing is above the attempt's tier and effort the caller answers needs-input instead."""
+    consecutive fails ending with it: done on a pass, then retry, escalate, needs-input (fix and breaker:
+    retry, then needs-input; they never escalate). The tier of an escalation is the caller's
+    (routing.next_route), and when nothing is above the attempt's tier and effort the caller answers
+    needs-input instead."""
     if result == "pass":
         return "done"
     if failures == 1:
         return "retry"
-    if stage != "fix" and failures == 2:
+    if stage not in ("fix", "breaker") and failures == 2:
         return "escalate"
     return "needs-input"
 
