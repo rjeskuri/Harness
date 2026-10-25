@@ -7,6 +7,8 @@ the checks, mark it ready, read the comments, list the PRs awaiting the user, ru
 Usage:
     harness-pr open N [--worktree PATH] [--verify-log F] [--review F] [--notes F] [--json]
     harness-pr review P --findings F [--checked TEXT] [--model NAME]
+    harness-pr findings N [--worktree PATH] --review F [--rulings R] [--json]
+    harness-pr findings N --latest [--json]
     harness-pr checks P [--wait] [--timeout 1200] [--json]
     harness-pr ready P [--ticket N]
     harness-pr comments P [--since ISO] [--unresolved] [--json]
@@ -18,6 +20,14 @@ Usage:
 ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has
 findings and no commit newer than it, naming the findings, and refuse when gh cannot tell. --accept-findings on
 land is the only override; ready has none. land on a PR that is already merged skips the check.
+
+findings splits a review by the files the ticket branch changed (`git diff --name-only` from the merge-base of HEAD
+and origin/main, else main): high and medium on a changed file block, low on one is low, anything else is outside.
+It records the round (harness_lib/reviews.py; the same HEAD replaces the latest round), writes
+round-<k>-blocking.json, round-<k>-review.json and notes.md (Low findings, Out of scope, Rulings, gathered over
+every round) under ~/.claude/harness/repos/<key>/reviews/N/, and prints the `harness-work stage` record: review
+pass in round 1, then fix pass or fail. A review with no findings array exits 1 and records nothing; --latest
+prints the latest round and writes nothing. It makes no gh call.
 
 ultra runs nothing (one line, exit 0) when the project's HARNESS_ULTRAREVIEW is off, unless --force; see cmd_ultra.
 
@@ -53,13 +63,14 @@ try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.cli import Parser, Problem, emit, run_main, table, warn
     from harness_lib.text import (as_list, first_line, harness_home, home, last_line, one_line, parse_iso, read_json,
-                                  read_text, write_json, write_text)
+                                  now_iso, read_text, write_json, write_text)
     from harness_lib.notify import notify
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
     from harness_lib.autoland import (CONVERSATION, check_entries as lib_check_entries, evaluate, fetch_origin,
                                       gate_settings, gather_facts, overall)
     from harness_lib.routing import load_routing
+    from harness_lib.reviews import add_rulings, latest_round, load_rounds, reviews_dir, save_round
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -101,7 +112,9 @@ ULTRA_MINUTES = 30
 EXHAUSTED_HOURS = 24
 DEFAULT_CHECKED = "the diff against the ticket's definition of done"
 LAND_FIELDS = "isDraft,mergeable,headRefName,closingIssuesReferences,statusCheckRollup,title,url,state"
-AWAIT_FIELDS = "number,title,isDraft,createdAt,url,headRefName,closingIssuesReferences,statusCheckRollup"
+RULING_LINE = re.compile(r"^[ \t]*(?:- )?(Ruling:.*\S)[ \t]*$", re.M)
+OUTSIDE_NOTE = "(outside the files this ticket changed)"
+AWAIT_FIELDS ="number,title,isDraft,createdAt,url,headRefName,closingIssuesReferences,statusCheckRollup"
 
 
 def plural(n, word):
@@ -634,6 +647,126 @@ def cmd_review(args):
         raise Problem(f"{describe(call)} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
     print(f"PR #{number}: review posted, {plural(len(findings), 'finding')} "
           f"({len(inline)} inline, {len(outside)} in the body)")
+    return 0
+
+
+# --------------------------------------------------------------- findings
+def merge_base(path):
+    """The merge-base of HEAD and origin/main, else of HEAD and main, in the worktree at `path`."""
+    for target in ("origin/main", "main"):
+        done = git(path, "merge-base", "HEAD", target)
+        if done.returncode == 0 and done.stdout.strip():
+            return done.stdout.strip()
+    raise Problem(f"no merge-base of HEAD and origin/main or main in {path}")
+
+
+def touched_files(path, base):
+    """The files the branch at `path` changed since `base`."""
+    return set(nul_fields(git_ok(path, "diff", "--name-only", "-z", base, "HEAD")))
+
+
+def split_findings(findings, touched):
+    """(blocking, low, outside): high and medium on a touched file, low on one, anything on another path."""
+    blocking, low, outside = [], [], []
+    for f in findings:
+        if f["path"] not in touched:
+            outside.append(f)
+        else:
+            (low if f["severity"] == "low" else blocking).append(f)
+    return blocking, low, outside
+
+
+def ruling_lines(text):
+    """The `Ruling:` lines of a rulings file (optionally bulleted with `- `), in order."""
+    return [m.group(1).rstrip() for m in RULING_LINE.finditer(text or "")]
+
+
+def notes_line(f, outside):
+    """One notes bullet; the body on one line, so no heading can start a line of it."""
+    line = f"- {where(f)} [{f.get('severity')}] {one_line(f.get('body') or '')}"
+    return f"{line} {OUTSIDE_NOTE}" if outside else line
+
+
+def notes_text(rounds, rulings):
+    """notes.md from every round and every ruling: Low findings, Out of scope, Rulings, each once and each left out
+    when empty."""
+    low, out_of_scope = [], []
+    for rnd in rounds:
+        low += [notes_line(f, False) for f in as_findings(rnd.get("low"))]
+        for f in as_findings(rnd.get("outside")):
+            (low if f.get("severity") == "low" else out_of_scope).append(notes_line(f, True))
+    sections = [("Low findings", low), ("Out of scope", out_of_scope), ("Rulings", [f"- {r}" for r in rulings])]
+    parts = [f"### {name}\n" + "\n".join(dict.fromkeys(lines)) for name, lines in sections if lines]
+    return "\n\n".join(parts) + "\n" if parts else ""
+
+
+def round_text(number, rnd):
+    lines = [f"#{number} review round {rnd.get('round')} at {rnd.get('at')}: "
+             + ", ".join(f"{len(as_findings(rnd.get(k)))} {k}" for k in ("blocking", "low", "outside")),
+             f"head {rnd.get('head')}, base {rnd.get('base')}"]
+    for k in ("blocking", "low", "outside"):
+        lines += [f"{k}: {where(f)} [{f.get('severity')}] {one_line(f.get('body') or '')}"
+                  for f in as_findings(rnd.get(k))]
+    return "\n".join(lines)
+
+
+def as_findings(value):
+    """The finding dicts of a recorded list."""
+    return [f for f in value if isinstance(f, dict)] if isinstance(value, list) else []
+
+
+def cmd_findings(args):
+    number = args.number
+    if args.latest:
+        if args.review or args.rulings:
+            raise Problem("--latest takes no --review or --rulings")
+        repo = open_repo(args.worktree)
+        rnd = latest_round(repo.key, number)
+        if rnd is None:
+            print(f"no review round recorded for #{number}", file=sys.stderr)
+            return 1
+        emit(args.json, rnd, round_text(number, rnd))
+        return 0
+    if not args.review:
+        raise Problem("findings needs --review F (or --latest)")
+    repo = open_repo(args.worktree)
+    rulings = ruling_lines(read_text(args.rulings, "rulings file")) if args.rulings else []
+    findings = None
+    if read_text(args.review, "review file").strip():      # an empty file is a reviewer that wrote nothing
+        try:
+            findings = load_findings(args.review)
+        except Problem:
+            pass
+    if findings is None:
+        print(f"{args.review}: no findings array; the review stage failed", file=sys.stderr)
+        return 1
+    head = git_ok(repo.root, "rev-parse", "HEAD").strip()
+    fork = merge_base(repo.root)
+    blocking, low, outside = split_findings(findings, touched_files(repo.root, fork))
+
+    key = repo.key
+    rounds = load_rounds(key, number)
+    earlier = rounds[:-1] if rounds and rounds[-1].get("head") == head else rounds
+    base = earlier[-1].get("head") if earlier else fork
+    rnd = save_round(key, number, {"at": now_iso(), "head": head, "base": base, "blocking": blocking, "low": low,
+                                   "outside": outside, "pr": None, "review_id": None})
+    k = rnd["round"]
+    folder = reviews_dir(key, number)
+    files = {"blocking": os.path.join(folder, f"round-{k}-blocking.json"),
+             "review": os.path.join(folder, f"round-{k}-review.json"),
+             "notes": os.path.join(folder, "notes.md")}
+    write_json(files["blocking"], blocking, prefix=".findings-")
+    write_json(files["review"], blocking + low, prefix=".findings-")
+    write_text(files["notes"], notes_text(load_rounds(key, number), add_rulings(key, number, rulings)),
+               prefix=".findings-")
+
+    stage, result = ("review", "pass") if k == 1 else ("fix", "fail" if blocking else "pass")
+    out = {"ticket": number, "round": k, "head": head, "base": base, "review_base": head, "blocking": blocking,
+           "low": low, "outside": outside, "files": files, "record": {"stage": stage, "result": result}}
+    text = "\n".join([f"#{number} review round {k}: {len(blocking)} blocking, {len(low)} low, "
+                      f"{len(outside)} outside; record: harness-work stage {number} {stage} {result}"]
+                     + [f"{name}: {short_home(path)}" for name, path in files.items()])
+    emit(args.json, out, text)
     return 0
 
 
@@ -1537,9 +1670,10 @@ def seconds_arg(text):
 
 
 def parser():
-    ap = Parser(prog="harness-pr", description="Pull requests for tickets: open, review, checks, ready, comments, "
-                                               "awaiting, ultra, land, gate.")
-    sub = ap.add_subparsers(dest="cmd", metavar="{open,review,checks,ready,comments,awaiting,ultra,land,gate}")
+    ap = Parser(prog="harness-pr", description="Pull requests for tickets: open, review, findings, checks, ready, "
+                                               "comments, awaiting, ultra, land, gate.")
+    sub = ap.add_subparsers(dest="cmd",
+                            metavar="{open,review,findings,checks,ready,comments,awaiting,ultra,land,gate}")
     sub.required = True
 
     op = sub.add_parser("open", help="push the ticket branch and open (or update) its draft PR")
@@ -1555,6 +1689,14 @@ def parser():
     rv.add_argument("--findings", required=True, metavar="F", help='[{"path", "line", "severity", "body"}]')
     rv.add_argument("--checked", metavar="TEXT", default=DEFAULT_CHECKED, help="what was checked (no findings)")
     rv.add_argument("--model", metavar="NAME", default="opus", help="the reviewer's model, named in the review")
+
+    fd = sub.add_parser("findings", help="split a review by the ticket's changed files, record the round, notes")
+    fd.add_argument("number", type=number_arg, metavar="N", help="the ticket")
+    fd.add_argument("--worktree", metavar="PATH", help="the ticket worktree (default: the cwd)")
+    fd.add_argument("--review", metavar="F", help="the reviewer's output: its findings array, then the verdict")
+    fd.add_argument("--rulings", metavar="R", help="a file whose `Ruling:` lines go in the notes")
+    fd.add_argument("--latest", action="store_true", help="print the latest recorded round; write nothing")
+    fd.add_argument("--json", action="store_true")
 
     ck = sub.add_parser("checks", help="the PR's checks: 0 green, 1 failed, 8 pending")
     ck.add_argument("number", type=number_arg, metavar="P")
@@ -1595,7 +1737,7 @@ def parser():
     return ap
 
 
-COMMANDS = {"open": cmd_open, "review": cmd_review, "checks": cmd_checks, "ready": cmd_ready,
+COMMANDS = {"open": cmd_open, "review": cmd_review, "findings": cmd_findings, "checks": cmd_checks, "ready": cmd_ready,
             "comments": cmd_comments, "awaiting": cmd_awaiting, "ultra": cmd_ultra, "land": cmd_land,
             "gate": cmd_gate}
 
