@@ -717,6 +717,125 @@ class Attempt(WorkTest):
                 self.assertEqual((data["action"], data["failures"], data["tier"], data["next_tier"]),
                                  (action, failures, "opus", None))
 
+    def test_breaker_stage_allows_two_rounds_then_needs_input(self):
+        """#252: the breaker follows the fix rule: retry on a run's first failure, needs-input on the second and every
+        later one, at any tier; never an escalation. A breaker pass ends the run; other stages neither advance nor
+        reset it (the tests stage passes between breaker rounds)."""
+        write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
+        sequence = [
+            (["breaker", "fail"], "retry"),
+            (["breaker", "fail"], "needs-input"),            # two rounds at most; sonnet does not escalate to opus
+            (["breaker", "fail"], "needs-input"),
+            (["breaker", "pass"], "done"),
+            (["breaker", "fail"], "retry"),                  # a pass ends the run of breaker failures
+            (["tests", "pass"], "done"),                     # the tightened tests do not end the breaker's run
+            (["breaker", "fail", "--tier", "opus"], "needs-input"),     # opus does not escalate to opus xhigh
+            (["code", "fail"], "retry"),                     # nor does the breaker's run count for code
+            (["breaker", "pass", "--tier", "opus"], "done"),
+            (["breaker", "fail", "--tier", "opus"], "retry"),
+            (["breaker", "fail", "--tier", "opus", "--effort", "high"], "needs-input"),
+            (["breaker", "pass", "--tier", "fable"], "done"),
+            (["breaker", "fail", "--tier", "fable"], "retry"),
+            (["breaker", "fail", "--tier", "fable"], "needs-input"),
+            (["breaker", "fail", "--tier", "sonnet"], "needs-input"),
+        ]
+        for argv, expected in sequence:
+            with self.subTest(argv=argv):
+                self.assertEqual(self.ok("attempt", "12", *argv).stdout.strip(), expected)
+        attempts = self.read_json(self.cache_path())["attempts"]
+        self.assertEqual(len(attempts), len(sequence))
+        self.assertEqual(set(attempts[0]), {"stage", "tier", "effort", "result", "at"})     # the record is unchanged
+        self.assertEqual([(a["stage"], a["result"]) for a in attempts], [(argv[0], argv[1]) for argv, _ in sequence])
+        self.assertEqual((attempts[0]["tier"], attempts[0]["result"]), ("sonnet", "fail"))
+        self.assertEqual((attempts[6]["tier"], attempts[6]["result"]), ("opus", "fail"))
+        self.assertEqual((attempts[-2]["tier"], attempts[-2]["result"]), ("fable", "fail"))
+
+        # --json on a fresh run, at each tier: the tier never moves and no next tier (or effort) is named
+        for tier in ("sonnet", "opus", "fable"):
+            write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
+            for failures, action in ((1, "retry"), (2, "needs-input"), (3, "needs-input")):
+                with self.subTest(json_tier=tier, json_failures=failures):
+                    data = self.ok_json("attempt", "12", "breaker", "fail", "--tier", tier, "--json")
+                    self.assertEqual((data["stage"], data["result"], data["action"], data["failures"], data["tier"],
+                                      data["next_tier"], data["next_effort"]),
+                                     ("breaker", "fail", action, failures, tier, None, None))
+            data = self.ok_json("attempt", "12", "breaker", "pass", "--tier", tier, "--json")
+            self.assertEqual((data["action"], data["failures"], data["next_tier"]), ("done", 0, None))
+            data = self.ok_json("attempt", "12", "breaker", "fail", "--tier", tier, "--json")
+            self.assertEqual((data["action"], data["failures"], data["next_tier"]), ("retry", 1, None))
+        # without --tier the cached sonnet is the tier, and the second failure still names no next tier
+        write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
+        self.assertEqual(self.ok_json("attempt", "12", "breaker", "fail", "--json")["next_tier"], None)
+        data = self.ok_json("attempt", "12", "breaker", "fail", "--json")
+        self.assertEqual((data["action"], data["failures"], data["tier"], data["next_tier"]),
+                         ("needs-input", 2, "sonnet", None))
+
+    def test_verify_stage_answers_like_ci_and_counts_apart(self):
+        """#252: `verify` (the full verify run just before ready) is a stage of its own after ci, answered by the
+        default rule as ci is: retry, escalate, needs-input; a pass ends its run. verify's failures and ci's count
+        apart, and neither counts for code."""
+        sequence = [
+            (["fail"], "retry"),
+            (["fail"], "escalate opus"),
+            (["fail"], "needs-input"),
+            (["fail"], "needs-input"),
+            (["pass"], "done"),
+            (["fail"], "retry"),
+            (["fail", "--tier", "opus"], "escalate opus xhigh"),
+            (["pass", "--tier", "opus"], "done"),
+            (["fail", "--tier", "opus", "--effort", "xhigh"], "retry"),
+            (["fail", "--tier", "opus", "--effort", "xhigh"], "needs-input"),
+            (["pass", "--tier", "fable"], "done"),
+            (["fail", "--tier", "fable"], "retry"),
+            (["fail", "--tier", "fable"], "needs-input"),
+        ]
+        answers = {}
+        for stage in ("ci", "verify"):
+            write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
+            answers[stage] = []
+            for argv, expected in sequence:
+                with self.subTest(stage=stage, argv=argv):
+                    out = self.ok("attempt", "12", stage, *argv).stdout.strip()
+                    answers[stage].append(out)
+                    self.assertEqual(out, expected)
+            attempts = self.read_json(self.cache_path())["attempts"]
+            self.assertEqual([(a["stage"], a["result"]) for a in attempts], [(stage, argv[0]) for argv, _ in sequence])
+            self.assertEqual(set(attempts[0]), {"stage", "tier", "effort", "result", "at"})
+        self.assertEqual(answers["verify"], answers["ci"])
+
+        # --json: verify's escalation names the next tier as ci's does
+        for stage in ("ci", "verify"):
+            write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
+            first = self.ok_json("attempt", "12", stage, "fail", "--json")
+            self.assertEqual((first["stage"], first["action"], first["failures"], first["next_tier"]),
+                             (stage, "retry", 1, None))
+            second = self.ok_json("attempt", "12", stage, "fail", "--json")
+            self.assertEqual((second["stage"], second["action"], second["failures"], second["tier"],
+                              second["next_tier"]), (stage, "escalate", 2, "sonnet", "opus"))
+
+        # interleaved: each stage keeps its own run
+        write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
+        interleaved = [
+            (["verify", "fail"], "retry"),
+            (["ci", "fail"], "retry"),                       # verify's failure is not ci's
+            (["verify", "fail"], "escalate opus"),           # ci's failure did not reset verify
+            (["code", "fail"], "retry"),                     # nor does either count for code
+            (["ci", "pass"], "done"),
+            (["verify", "fail"], "needs-input"),             # a ci pass does not end verify's run
+            (["ci", "fail"], "retry"),
+            (["verify", "pass"], "done"),
+            (["ci", "fail"], "escalate opus"),               # a verify pass does not end ci's run
+            (["verify", "fail"], "retry"),
+            (["ci", "fail"], "needs-input"),
+            (["verify", "fail", "--tier", "opus"], "escalate opus xhigh"),
+        ]
+        for argv, expected in interleaved:
+            with self.subTest(interleaved=argv):
+                self.assertEqual(self.ok("attempt", "12", *argv).stdout.strip(), expected)
+        attempts = self.read_json(self.cache_path())["attempts"]
+        self.assertEqual([(a["stage"], a["result"]) for a in attempts],
+                         [(argv[0], argv[1]) for argv, _ in interleaved])
+
     def test_fix_and_review_failures_count_apart(self):
         write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
         sequence = [
@@ -855,7 +974,7 @@ class AttemptEffort(WorkTest):
         self.assertEqual(seen, {"escalate opus", "escalate opus xhigh", "needs-input"})
 
     def test_size_l_and_risk_high_run_at_opus_xhigh_and_go_to_needs_input(self):
-        # DoD: a failure at opus xhigh gives needs-input; nothing prints fable. Every escalating stage alike.
+        # DoD: a failure at opus xhigh gives needs-input; nothing prints fable. Every stage alike.
         for n, (kind, size, risk) in ((31, ("task", "L", "low")), (32, ("bug", "M", "high")),
                                       (33, ("chore", "S", "high"))):
             self.put_ticket(n, kind, size, risk)
@@ -885,10 +1004,10 @@ class AttemptEffort(WorkTest):
                 flags = ["--tier", tier] + (["--effort", effort] if effort else [])
                 with self.subTest(tier=tier, effort=effort):
                     n += 1
-                    self.put_ticket(n, "task", "M", "low")              # its own route: opus, no effort
-                    first = self.attempt_json(n, "breaker", "fail", *flags)
+                    self.put_ticket(n, "task", "M", "low")              # code route: opus, no effort
+                    first = self.attempt_json(n, "code", "fail", *flags)
                     self.assertEqual((first["tier"], first["effort"], first["action"]), (tier, effort, "retry"))
-                    second = self.attempt_json(n, "breaker", "fail", *flags)
+                    second = self.attempt_json(n, "code", "fail", *flags)
                     self.assertEqual((second["tier"], second["effort"]), (tier, effort))
                     nxt = escalation_of(tier, effort)
                     if tier == "sonnet":
@@ -901,8 +1020,8 @@ class AttemptEffort(WorkTest):
                     self.assertEqual([(a["tier"], a["effort"]) for a in attempts], [(tier, effort)] * 2)
                     n += 1
                     self.put_ticket(n, "task", "M", "low")
-                    self.assertEqual(self.attempt(n, "breaker", "fail", *flags), "retry")
-                    text = self.attempt(n, "breaker", "fail", *flags)
+                    self.assertEqual(self.attempt(n, "code", "fail", *flags), "retry")
+                    text = self.attempt(n, "code", "fail", *flags)
                     self.assertNotIn("fable", text)
                     if tier == "sonnet":
                         self.assertTrue(text.startswith("escalate opus"), text)
