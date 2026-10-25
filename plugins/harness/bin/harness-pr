@@ -19,7 +19,8 @@ findings and no commit newer than it, naming the findings, and refuse when gh ca
 land is the only override; ready has none. land on a PR that is already merged skips the check.
 
 The repository is the cwd's (open: --worktree, else the cwd), else CLAUDE_PROJECT_DIR. gh is HARNESS_GH when
-set, else `gh`; claude is HARNESS_CLAUDE, else `claude`; harness-board and harness-red are found on PATH, else
+set, else `gh`; claude is HARNESS_CLAUDE, else `claude`; harness-board, harness-red and harness-work (land's Cost
+block on each Resolution; a failed cost run is a warning) are found on PATH, else
 next to this script. A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through
 to stderr, in order; its other stderr stays hidden. HARNESS_POLL_SECONDS replaces the 20 s poll interval (tests).
 
@@ -1262,6 +1263,21 @@ def resolution_here(body, url):
         and any(line.strip() == f"PR: {url}" for line in body.splitlines())
 
 
+def cost_block(repo, number, pr):
+    """`harness-work cost N --pr P --markdown` for the ticket, stripped; "" when it prints nothing. A run that
+    fails, times out or cannot start is one warning line and "": the land goes on without the block."""
+    try:
+        done = tool("harness-work", ["cost", str(number), "--pr", str(pr), "--markdown", "--repo", repo.main],
+                    repo.main, check=False)
+    except Problem as err:
+        warn("harness-pr", f"no cost block for #{number}: {err}")
+        return ""
+    if done.returncode != 0:
+        warn("harness-pr", f"no cost block for #{number}: {first_line(done.stderr) or f'exit {done.returncode}'}")
+        return ""
+    return (done.stdout or "").strip()
+
+
 def land_ticket(repo, number, sha, pr, resolution, url=None):
     """Close the ticket when GitHub has not, drop its status labels, comment the Resolution (`resolution()`) and
     then `Landed in <sha>` unless the ticket already has this landing's own (a resumed land; this landing's
@@ -1296,7 +1312,9 @@ def land_ticket(repo, number, sha, pr, resolution, url=None):
         else:
             # the Resolution goes first: a land that stops between the two still finds `Landed in` missing
             if not mine:
-                board(repo, "comment", str(number), "--body", resolution())
+                text = resolution()                # the PR's, shared by its tickets; the Cost block is this one's
+                block = cost_block(repo, number, pr)
+                board(repo, "comment", str(number), "--body", f"{text}\n\n{block}" if block else text)
             board(repo, "comment", str(number), "--body", f"{LANDED} {sha}" if sha else f"{LANDED} PR #{pr}")
             done.append("commented")
         parent = ticket_parent(repo, number)
