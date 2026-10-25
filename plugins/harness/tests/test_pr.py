@@ -758,15 +758,24 @@ def at(hour):
     return f"2026-10-12T{hour:02d}:00:00Z"
 
 
-def harness_review(rid, when, inline=(), body_only=(), model="fable"):
-    """(the review, its inline comments) as `harness-pr review` posts them; a finding: (path, line, severity, body)."""
+def harness_review(rid, when, inline=(), body_only=(), model="fable", summary=None):
+    """(the review, its inline comments) as `harness-pr review` posts them; a finding: (path, line, severity, body).
+    An inline finding whose severity is None is posted with no `[severity]` prefix. `summary`, when given, is the
+    (total, high, medium, low) the summary line declares instead of the counts of the listed findings; a string is
+    the summary line verbatim (an older format, say), and "" leaves the summary line out."""
     findings = list(inline) + list(body_only)
-    if not findings:
+    if not findings and summary is None:
         body = f"Harness review: no findings. Checked: the diff against the ticket's definition of done\n\n{MARKER}"
     else:
         counts = {s: sum(1 for f in findings if f[2] == s) for s in ("high", "medium", "low")}
-        parts = [f"Harness review ({model}): {len(findings)} finding{'s' if len(findings) != 1 else ''}, "
-                 f"{counts['high']} high, {counts['medium']} medium, {counts['low']} low."]
+        total = len(findings)
+        if isinstance(summary, tuple):
+            total, counts["high"], counts["medium"], counts["low"] = summary
+        if isinstance(summary, str):
+            parts = [summary] if summary else []
+        else:
+            parts = [f"Harness review ({model}): {total} finding{'s' if total != 1 else ''}, "
+                     f"{counts['high']} high, {counts['medium']} medium, {counts['low']} low."]
         if body_only:
             parts.append("\n".join(["Not on a changed line:"] + [f"- `{p}:{n}` [{s}] {b}" for p, n, s, b in body_only]))
         parts.append(MARKER)
@@ -774,7 +783,8 @@ def harness_review(rid, when, inline=(), body_only=(), model="fable"):
     review = {"id": rid, "user": {"login": "rjeskuri"}, "body": body, "state": "COMMENTED", "submitted_at": when,
               "commit_id": "c" * 40}
     comments = [{"id": rid * 100 + i, "pull_request_review_id": rid, "user": {"login": "rjeskuri"}, "path": p,
-                 "line": n, "original_line": n, "side": "RIGHT", "body": f"[{s}] {b}\n\n{MARKER}", "created_at": when}
+                 "line": n, "original_line": n, "side": "RIGHT",
+                 "body": (f"{b}" if s is None else f"[{s}] {b}") + f"\n\n{MARKER}", "created_at": when}
                 for i, (p, n, s, b) in enumerate(inline)]
     return review, comments
 
@@ -804,17 +814,49 @@ OFF_BY_ONE = ("lib/frob.py", 41, "medium", "Off by one in the loop bound.")
 README = ("README.md", 1, "high", "Document the new flag.")
 TOKEN = ("src/app.py", 5, "high", "Leaks the token into the log.")
 LIMIT = ("docs/x.md", 7, "medium", "Explain the limit.")
+CAP = ("lib/cap.py", 17, "medium", "Cap is never checked on retry.")
+TYPO = ("docs/guide.md", 22, "low", "Typo in the heading of the guide.")
+UNMARKED = ("lib/gate.py", 12, None, "Returns before the lock is released.")     # no [severity] prefix at all
+BLOCKER = ("lib/gate.py", 30, "blocker", "Swallows the gh error silently.")      # a severity the tool never posts
 # name: (reviews, commits, the findings a refusal names or None for proceed, findings it must not name)
+# Only high and medium findings refuse (#255); low ones never do, and a refusal does not name them.
 GATE_CASES = {
     "findings and no commit since": (
         [harness_review(101, at(10), inline=[FROBS], body_only=[NOTES])], [pr_commit("a", at(9))],
-        [FROBS, NOTES], []),
+        [FROBS], [NOTES]),
+    "only low findings and no commit since": (
+        [harness_review(101, at(10), inline=[OLD_NIT], body_only=[NOTES])], [pr_commit("a", at(9))],
+        None, []),
+    "a medium finding in the body only": (
+        [harness_review(101, at(10), inline=[OLD_NIT], body_only=[CAP, NOTES])], [pr_commit("a", at(9))],
+        [CAP], [OLD_NIT, NOTES]),
+    "an inline comment without a severity": (
+        [harness_review(101, at(10), inline=[UNMARKED], body_only=[NOTES], summary=(2, 0, 0, 2))],
+        [pr_commit("a", at(9))], [UNMARKED], [NOTES]),
+    "an inline comment with an unknown severity": (
+        [harness_review(101, at(10), inline=[OLD_NIT, BLOCKER], summary=(2, 0, 0, 2))],
+        [pr_commit("a", at(9))], [BLOCKER], [OLD_NIT]),
+    "the summary counts more high than are listed": (
+        [harness_review(101, at(10), inline=[FROBS], body_only=[NOTES], summary=(3, 2, 0, 1), model="opus")],
+        [pr_commit("a", at(9))], [FROBS], [NOTES]),
+    "only low findings listed, the summary counts a medium": (
+        [harness_review(101, at(10), inline=[OLD_NIT], body_only=[TYPO], summary=(3, 0, 1, 2), model="sonnet")],
+        [pr_commit("a", at(9))], [], [OLD_NIT, TYPO]),
+    "the summary counts one high, none listed": (
+        [harness_review(101, at(10), summary=(1, 1, 0, 0), model="opus")], [pr_commit("a", at(9))], [], []),
+    "the summary counts more low than are listed": (
+        [harness_review(101, at(10), inline=[OLD_NIT], summary=(3, 0, 0, 3))], [pr_commit("a", at(9))],
+        None, []),
     "a commit after the findings": (
         [harness_review(101, at(10), inline=[FROBS], body_only=[NOTES])],
         [pr_commit("a", at(9)), pr_commit("b", at(11))],
         None, []),
+    "only low findings, a commit after them": (
+        [harness_review(101, at(10), inline=[OLD_NIT], body_only=[TYPO])],
+        [pr_commit("a", at(9)), pr_commit("b", at(11))],
+        None, []),
     "an older review with findings, the latest clean": (
-        [harness_review(101, at(10), inline=[OLD_NIT]), harness_review(102, at(12))], [pr_commit("a", at(9))],
+        [harness_review(101, at(10), inline=[TOKEN]), harness_review(102, at(12))], [pr_commit("a", at(9))],
         None, []),
     "an older clean review, the latest with findings (listed newest first)": (
         [harness_review(102, at(12), inline=[OFF_BY_ONE]), harness_review(101, at(10))],
@@ -826,12 +868,33 @@ GATE_CASES = {
         [harness_review(101, at(10), inline=[TOKEN]), owner_review(201, at(12), "LGTM")], [pr_commit("a", at(9))],
         [TOKEN], []),
     "two reviews with findings, a commit between them": (
-        [harness_review(101, at(10), inline=[OLD_NIT]),
-         harness_review(102, at(12), inline=[OFF_BY_ONE], body_only=[README])],
-        [pr_commit("a", at(9)), pr_commit("b", at(11))], [OFF_BY_ONE, README], [OLD_NIT]),
+        [harness_review(101, at(10), inline=[TOKEN]),
+         harness_review(102, at(12), inline=[OFF_BY_ONE, NOTES], body_only=[README, TYPO])],
+        [pr_commit("a", at(9)), pr_commit("b", at(11))], [OFF_BY_ONE, README], [TOKEN, NOTES, TYPO]),
     "every finding in the review body": (
         [harness_review(101, at(10), body_only=[LIMIT])], [pr_commit("a", at(9))], [LIMIT], []),
+    # The listed findings' severities decide, whatever the summary line says or whether there is one at all.
+    "an older summary without per-severity counts": (
+        [harness_review(101, at(10), inline=[FROBS], body_only=[CAP], summary="Harness review (opus): 2 findings.")],
+        [pr_commit("a", at(9))], [FROBS, CAP], []),
+    "the summary counts no high or medium, a high and a medium listed": (
+        [harness_review(101, at(10), inline=[OFF_BY_ONE], body_only=[README], summary=(2, 0, 0, 2))],
+        [pr_commit("a", at(9))], [OFF_BY_ONE, README], []),
+    "no summary line, a high listed": (
+        [harness_review(101, at(10), inline=[TOKEN], body_only=[TYPO], summary="")],
+        [pr_commit("a", at(9))], [TOKEN], [TYPO]),
 }
+# The refused cases whose summary declares more high plus medium findings than the review lists: how many more.
+GATE_NOT_LISTED = {
+    "the summary counts more high than are listed": 1,
+    "only low findings listed, the summary counts a medium": 1,
+    "the summary counts one high, none listed": 1,
+}
+# The proceed cases in which ready has nothing to warn about: a newer commit cleared the findings, the latest harness
+# review is clean, or there is no harness review. Ready prints nothing on stderr for them.
+GATE_QUIET = ("a commit after the findings", "only low findings, a commit after them",
+              "an older review with findings, the latest clean", "no harness review, only the owner's",
+              "no review at all")
 
 
 GATE_FAILURE_TEXT = "HTTP 502: Bad Gateway (fake)"
@@ -855,9 +918,18 @@ class GateAsserts:
         said = p.stdout + p.stderr
         for path, line, severity, body in named:
             self.assertIn(f"{path}:{line}", said)
-            self.assertTrue(severity in said or body[:20] in said, (severity, body, said))
-        for path, line, _s, _b in not_named:
+            self.assertIn(body[:20], said, (severity, body, said))
+        for path, line, _s, body in not_named:
             self.assertNotIn(f"{path}:{line}", said)
+            self.assertNotIn(body[:20], said)
+
+    def assertNotListedCount(self, name, p):
+        """A refusal adds "K more high or medium not listed (see the review)" exactly when the summary declares K
+        more high plus medium findings than the review lists."""
+        if name in GATE_NOT_LISTED:
+            self.assertIn(f"{GATE_NOT_LISTED[name]} more high or medium not listed (see the review)", p.stderr)
+        else:
+            self.assertNotIn("not listed", p.stdout + p.stderr)
 
 
 # =========================================================================== ready
@@ -1006,9 +1078,78 @@ class ReadyGate(GateAsserts, PrTest):
                     self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                     self.assertIn(["pr", "ready", "34"], self.gh_argv())
                     self.assertEqual([a[:3] for a in self.stub_calls("harness-board")], [["status", "12", "in-review"]])
+                    if name in GATE_QUIET:
+                        self.assertEqual(p.stderr, "")
                 else:
                     self.assertRefused(p)
                     self.assertNamesFindings(p, named, not_named)
+                    self.assertNotListedCount(name, p)
+
+    def test_ready_refusal_counts_the_high_and_medium_findings_and_says_what_to_do(self):
+        """The refusal: "PR #P: the latest harness review (<submitted_at>) has <n> high or medium findings and no
+        commit after it: <each>; fix them, push, then harness-pr ready P", n counting only high and medium."""
+        cases = [("findings and no commit since", at(10), 1),
+                 ("a medium finding in the body only", at(10), 1),
+                 ("an inline comment without a severity", at(10), 1),
+                 ("an older clean review, the latest with findings (listed newest first)", at(12), 1),
+                 ("two reviews with findings, a commit between them", at(12), 2)]
+        for name, when, n in cases:
+            with self.subTest(name):
+                reviews, commits, _named, _ = GATE_CASES[name]
+                p = self.run_case(reviews, commits)
+                self.assertRefused(p)
+                self.assertRegex(p.stderr, re.escape(f"PR #34: the latest harness review ({when}) has {n} high or "
+                                                     "medium finding") + r"s? and no commit after it: ")
+                self.assertIn("; fix them, push, then harness-pr ready 34", p.stderr)
+
+    def test_ready_says_how_many_high_or_medium_findings_the_review_does_not_list(self):
+        """K is the summary's high plus medium less the high and medium listed; extra low ones in the summary never
+        add the line, and the low ones listed are not counted against it."""
+        cases = [  # (inline, body_only, summary (total, high, medium, low), the model named, K or 0 for no line)
+            ([FROBS], [NOTES], (3, 2, 0, 1), "fable", 1),
+            ([OLD_NIT], [NOTES], (5, 1, 2, 2), "opus", 3),
+            ([TOKEN], [NOTES, TYPO], (8, 3, 2, 3), "sonnet", 4),
+            ([FROBS, OLD_NIT], [CAP], (4, 1, 2, 1), "opus", 1),
+            ([FROBS], [NOTES], (6, 1, 0, 5), "opus", 0),
+            ([], [], (1, 1, 0, 0), "sonnet", 1),
+            ([], [], (1, 0, 1, 0), "fable", 1),
+            ([], [], (2, 0, 2, 0), "opus", 2),
+        ]
+        for inline, body_only, summary, model, k in cases:
+            with self.subTest(summary=summary, model=model):
+                reviews = [harness_review(101, at(10), inline=inline, body_only=body_only, summary=summary,
+                                          model=model)]
+                p = self.run_case(reviews, [pr_commit("a", at(9))])
+                self.assertRefused(p)
+                listed = [f for f in inline + body_only if f[2] in ("high", "medium")]
+                lows = [f for f in inline + body_only if f[2] == "low"]
+                self.assertNamesFindings(p, listed, lows)
+                if k:
+                    self.assertIn(f"{k} more high or medium not listed (see the review)", p.stderr)
+                else:
+                    self.assertNotIn("not listed", p.stderr)
+
+    def test_ready_warns_about_the_low_findings_it_lets_through(self):
+        """Only low findings and no commit since: ready marks the PR, sets in-review and notifies as usual, and
+        prints one line on stderr: "harness-pr: warning: PR #P: <n> low findings left for the owner: <each>"."""
+        cases = [([OLD_NIT], [NOTES]), ([], [TYPO]), ([OLD_NIT, NOTES], [TYPO]), ([NOTES], [])]
+        for inline, body_only in cases:
+            lows = inline + body_only
+            with self.subTest(lows=[f[0] for f in lows]):
+                p = self.run_case([harness_review(101, at(10), inline=inline, body_only=body_only)],
+                                  [pr_commit("a", at(9))])
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
+                self.assertIn(["pr", "ready", "34"], self.gh_argv())
+                self.assertEqual([a[:3] for a in self.stub_calls("harness-board")], [["status", "12", "in-review"]])
+                self.assertEqual(len(self.notifications()), 1)
+                lines = p.stderr.splitlines()
+                self.assertEqual(len(lines), 1, p.stderr)
+                self.assertRegex(lines[0], r"^harness-pr: warning: PR #34: " + str(len(lows))
+                                 + r" low findings? left for the owner: ")
+                for path, line, _s, body in lows:
+                    self.assertIn(f"{path}:{line}", lines[0])
+                    self.assertIn(body[:20], lines[0])
 
     def test_ready_has_no_override(self):
         reviews, commits, named, _ = GATE_CASES["findings and no commit since"]
@@ -3113,6 +3254,14 @@ class LandGate(GateAsserts, WorktreeTest):
                 self.assertTrue(os.path.isdir(self.wt))
                 self.assertTrue(self.branch_exists())
                 self.assertNamesFindings(p, named, not_named)
+                self.assertNotListedCount(name, p)
+
+    def test_land_proceeds_when_only_low_findings_are_open(self):
+        """The same PR with a high finding refuses; with only low findings and no commit since, it lands."""
+        self.assertTwins("findings and no commit since", "only low findings and no commit since")
+
+    def test_land_proceeds_when_the_summary_counts_only_more_low_findings(self):
+        self.assertTwins("the summary counts more high than are listed", "the summary counts more low than are listed")
 
     # Each proceed case first runs its refused twin (the same PR but for the one fact that decides), so the pair
     # shows that fact is what lets the land through.

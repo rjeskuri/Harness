@@ -15,9 +15,12 @@ Usage:
     harness-pr land P [--yes] [--discard] [--accept-findings]
     harness-pr gate P [--json]
 
-ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has
-findings and no commit newer than it, naming the findings, and refuse when gh cannot tell. --accept-findings on
-land is the only override; ready has none. land on a PR that is already merged skips the check.
+ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has high
+or medium findings and no commit newer than it, naming those findings, and refuse when gh cannot tell. A finding
+without a recognisable severity counts as high; low findings never refuse, and ready names them in one warning
+line. When the review's summary counts more high plus medium findings than it lists, the refusal says how many
+more. --accept-findings on land is the only override; ready has none. land on a PR that is already merged skips
+the check.
 
 ultra runs nothing (one line, exit 0) when the project's HARNESS_ULTRAREVIEW is off, unless --force; see cmd_ultra.
 
@@ -68,7 +71,9 @@ TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 TICKET_BRANCH = re.compile(r"^t/(\d+)-")
 MARKER = "<!-- harness-review -->"
 BODY_FINDING = re.compile(r"^- (`[^`]*`|\(no path\)) \[(\w+)\] (.*)$")     # a finding listed in a review's body
-REVIEW_COUNT = re.compile(r"^Harness review \([^)]*\): (\d+) findings?\b")
+REVIEW_COUNT = re.compile(r"^Harness review \([^)]*\): (\d+) findings?\b"          # a review's summary line, with
+                          r"(?:, (\d+) high, (\d+) medium, (\d+) low\b)?")           # or without per-severity counts
+INLINE_SEVERITY = re.compile(r"^\[(\w+)\]")                                        # an inline finding's prefix
 LANDED = "Landed in"
 RESOLUTION = "**Resolution**"
 HIGH_RISK = "High risk: review the data and live-system paths before merging."
@@ -737,41 +742,53 @@ def short(text, n=100):
     return text if len(text) <= n else text[:n - 3] + "..."
 
 
+def gate_severity(value):
+    """A finding's severity for the review gate: one of SEVERITIES, else high (fail closed)."""
+    sev = str(value or "").lower()
+    return sev if sev in SEVERITIES else "high"
+
+
 def review_findings(repo, slug, number, review):
-    """["path:line [severity] body"] of a harness review: the inline comments and the body's list; [] when it says
-    "no findings". A finding count in the summary with fewer findings found adds one line for the rest."""
+    """([(severity, "path:line [severity] body")], unlisted) of a harness review: the body's list and the inline
+    comments, [] when it says "no findings"; a finding without a recognisable severity is high. unlisted is how
+    many more high plus medium findings the summary line counts than are listed (a summary without per-severity
+    counts: how many more findings of any severity, each counted as high)."""
     body = review.get("body") or ""
     if body.startswith("Harness review: no findings."):
-        return []
+        return [], 0
     found = []
     for line in body.splitlines():
         m = BODY_FINDING.match(line)
         if m:
-            found.append(f"{m.group(1).strip('`')} [{m.group(2)}] {short(m.group(3))}")
+            found.append((gate_severity(m.group(2)), f"{m.group(1).strip('`')} [{m.group(2)}] {short(m.group(3))}"))
     for c in api_list(repo, f"repos/{slug}/pulls/{number}/reviews/{review.get('id')}/comments"):
         if not isinstance(c, dict):
             continue
         text = (c.get("body") or "").replace(MARKER, "").strip()
         line = c.get("line") or c.get("original_line")
         place = f"{c.get('path') or '(no path)'}" + (f":{line}" if line else "")
-        found.append(f"{place} {short(text)}")
+        m = INLINE_SEVERITY.match(text)
+        found.append((gate_severity(m.group(1) if m else None), f"{place} {short(text)}"))
     m = REVIEW_COUNT.match(body)
-    declared = int(m.group(1)) if m else 0
-    if declared > len(found):
-        found.append(f"{declared - len(found)} more not listed (see the review)")
-    return found
+    if not m:
+        return found, 0
+    if m.group(2) is None:
+        return found, max(int(m.group(1)) - len(found), 0)
+    listed = sum(1 for sev, _ in found if sev != "low")
+    return found, max(int(m.group(2)) + int(m.group(3)) - listed, 0)
 
 
 def review_gate(repo, number):
-    """(the latest harness review, its findings) when that review has findings and no commit on the PR is newer
-    than it; else (review or None, []). A failing gh call raises Problem."""
+    """(the latest harness review, its high and medium findings, its low findings, how many more high or medium
+    findings its summary counts than it lists) when that review has findings and no commit on the PR is newer than
+    it; else (review or None, [], [], 0). A failing gh call raises Problem."""
     slug = repo.slug()
     review = latest_harness_review(api_list(repo, f"repos/{slug}/pulls/{number}/reviews"))
     if review is None:
-        return None, []
-    findings = review_findings(repo, slug, number, review)
-    if not findings:
-        return review, []
+        return None, [], [], 0
+    found, unlisted = review_findings(repo, slug, number, review)
+    if not found and not unlisted:
+        return review, [], [], 0
     submitted = parse_iso(review.get("submitted_at"))
     for c in api_list(repo, f"repos/{slug}/pulls/{number}/commits"):
         meta = c.get("commit") if isinstance(c, dict) else None
@@ -781,13 +798,16 @@ def review_gate(repo, number):
             person = meta.get(who)
             when = when or (parse_iso(person.get("date")) if isinstance(person, dict) else None)
         if when is not None and when > submitted:
-            return review, []
-    return review, findings
+            return review, [], [], 0
+    return (review, [text for sev, text in found if sev != "low"], [text for sev, text in found if sev == "low"],
+            unlisted)
 
 
-def unaddressed(number, review, findings):
-    return (f"PR #{number}: the latest harness review ({review.get('submitted_at')}) has findings and no commit "
-            "after it: " + "; ".join(findings))
+def unaddressed(number, review, blocking, unlisted):
+    """The refusal: the high and medium findings listed, then a line for those the summary counts beyond them."""
+    items = blocking + ([f"{unlisted} more high or medium not listed (see the review)"] if unlisted else [])
+    return (f"PR #{number}: the latest harness review ({review.get('submitted_at')}) has "
+            f"{plural(len(blocking) + unlisted, 'high or medium finding')} and no commit after it: " + "; ".join(items))
 
 
 # --------------------------------------------------------------- ready
@@ -795,11 +815,12 @@ def cmd_ready(args):
     repo = open_repo()
     number = args.number
     try:
-        review, findings = review_gate(repo, number)
+        review, blocking, lows, unlisted = review_gate(repo, number)
     except Problem as err:
         raise Problem(f"cannot check the harness review findings of PR #{number}: {err}") from None
-    if findings:
-        raise Problem(unaddressed(number, review, findings) + f"; fix them, push, then harness-pr ready {number}")
+    if blocking or unlisted:
+        raise Problem(unaddressed(number, review, blocking, unlisted)
+                      + f"; fix them, push, then harness-pr ready {number}")
     gh(["pr", "ready", str(number)], repo.root)
     view = pr_view(repo, number, "url,title,closingIssuesReferences")
     url, title = view.get("url") or "", view.get("title") or ""
@@ -812,6 +833,8 @@ def cmd_ready(args):
             error = error or err
     notify(f"{repo.name} PR #{number} ready for review: {title}", f"harness-{repo.key}-pr-{number}")
     print(f"PR #{number} ready for review: {url}")
+    if lows:
+        warn("harness-pr", f"PR #{number}: {plural(len(lows), 'low finding')} left for the owner: " + "; ".join(lows))
     if not tickets:
         warn("harness-pr", f"PR #{number} names no ticket (no Closes #N, no --ticket); no status changed")
     if error:
@@ -1334,21 +1357,21 @@ def merge_preconditions(repo, number, view):
 
 
 def land_gate(repo, number, accept):
-    """Refuse a PR whose latest harness review has findings and no newer commit, and fail closed when gh cannot
-    tell; with --accept-findings, warn instead."""
+    """Refuse a PR whose latest harness review has high or medium findings and no newer commit, and fail closed
+    when gh cannot tell; with --accept-findings, warn instead. Low findings never refuse."""
     try:
-        review, findings = review_gate(repo, number)
+        review, blocking, _lows, unlisted = review_gate(repo, number)
     except Problem as err:
         if not accept:
             raise Problem(f"cannot check the harness review findings of PR #{number}: {err}") from None
         warn("harness-pr",
              f"cannot check the harness review findings of PR #{number} ({err}); landing it (--accept-findings)")
         return
-    if findings and not accept:
-        raise Problem(unaddressed(number, review, findings)
+    if (blocking or unlisted) and not accept:
+        raise Problem(unaddressed(number, review, blocking, unlisted)
                       + f"; fix them and push, or harness-pr land {number} --accept-findings to land it anyway")
-    if findings:
-        warn("harness-pr", unaddressed(number, review, findings) + "; landing it (--accept-findings)")
+    if blocking or unlisted:
+        warn("harness-pr", unaddressed(number, review, blocking, unlisted) + "; landing it (--accept-findings)")
 
 
 def cmd_land(args):
