@@ -77,7 +77,7 @@ try:
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
     from harness_lib.autoland import (CONVERSATION, check_entries as lib_check_entries, evaluate, fetch_origin,
-                                      gate_settings, gather_facts, overall)
+                                      gate_settings, gather_facts, overall, review_counts)
     from harness_lib.routing import load_routing
     from harness_lib.reviews import (add_rulings, add_ticket, finding_key, latest_round, load_rounds, load_tickets,
                                      reviews_dir, save_round)
@@ -89,8 +89,7 @@ TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 TICKET_BRANCH = re.compile(r"^t/(\d+)-")
 MARKER = "<!-- harness-review -->"
 BODY_FINDING = re.compile(r"^- (`[^`]*`|\(no path\)) \[(\w+)\] (.*)$")     # a finding listed in a review's body
-REVIEW_COUNT = re.compile(r"^Harness review \([^)]*\): (\d+) findings?\b"          # a review's summary line, with
-                          r"(?:, (\d+) high, (\d+) medium, (\d+) low\b)?")           # or without per-severity counts
+REVIEW_COUNT = re.compile(r"^Harness review \([^)]*\): (\d+) findings?\b")       # a review's summary line: the total only
 INLINE_SEVERITY = re.compile(r"^\[(\w+)\]")                                        # an inline finding's prefix
 LANDED = "Landed in"
 RESOLUTION = "**Resolution**"
@@ -1049,8 +1048,9 @@ def gate_severity(value):
 def review_findings(repo, slug, number, review):
     """([(severity, "path:line [severity] body")], unlisted) of a harness review: the body's list and the inline
     comments, [] when it says "no findings"; a finding without a recognisable severity is high. unlisted is how
-    many more high plus medium findings the summary line counts than are listed (a summary without per-severity
-    counts: how many more findings of any severity, each counted as high)."""
+    many more high plus medium findings the summary line counts than are listed, the counts read by
+    autoland.review_counts (a summary it cannot read: how many more findings of any severity the total counts,
+    each as high)."""
     body = review.get("body") or ""
     if body.startswith("Harness review: no findings."):
         return [], 0
@@ -1067,13 +1067,12 @@ def review_findings(repo, slug, number, review):
         place = f"{c.get('path') or '(no path)'}" + (f":{line}" if line else "")
         m = INLINE_SEVERITY.match(text)
         found.append((gate_severity(m.group(1) if m else None), f"{place} {short(text)}"))
+    counts = review_counts(body)
+    if counts is not None:
+        listed = sum(1 for sev, _ in found if sev != "low")
+        return found, max(counts["high"] + counts["medium"] - listed, 0)
     m = REVIEW_COUNT.match(body)
-    if not m:
-        return found, 0
-    if m.group(2) is None:
-        return found, max(int(m.group(1)) - len(found), 0)
-    listed = sum(1 for sev, _ in found if sev != "low")
-    return found, max(int(m.group(2)) + int(m.group(3)) - listed, 0)
+    return found, max(int(m.group(1)) - len(found), 0) if m else 0
 
 
 def review_gate(repo, number):
