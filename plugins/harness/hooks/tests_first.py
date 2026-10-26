@@ -10,7 +10,7 @@ conftest.py, jest.config.*, vitest.config.*, package.json) count as tests. Then:
     tests or that configuration (the part of `agent_type` after the last ":" names the
     role);
   - a source edit, by anyone, needs a red run: ~/.claude/harness/repos/<key>/red/<slug>.json
-    written by harness-red check. A ticket flagged no-tests needs none; a refactor needs a
+    written by harness-red check (or reprove). A ticket flagged no-tests needs none; a refactor needs a
     record of any kind; any other ticket needs a red record (kind assertion, import or
     error) whose test files still hash to its test_hash, or are those files with main's
     changes merged in since (harness_lib/redproof.py). Without a ticket cache
@@ -105,7 +105,10 @@ CODER_ON_CONFIG = (
     "{rel} decides which tests run and how, so it is fixed for this ticket like the "
     "tests. If it has to change, stop and ask the orchestrator."
 )
-CHANGED = "Tests changed since the red run; run harness-red check again."
+CHANGED = (
+    "Tests changed since the red run; run harness-red check again, or harness-red reprove "
+    "once the branch has source changes."
+)
 UNVERIFIED = (
     "Could not check the red record for t/{number} in time (git was too slow); the edit is "
     "refused, not judged. Retry it; harness-red status checks with a longer budget."
