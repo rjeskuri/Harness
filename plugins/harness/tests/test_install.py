@@ -79,6 +79,18 @@ LISTS = (("permissions", "allow"), ("permissions", "ask"), ("autoMode", "environ
 # What a merge into a file holding none of the snippet's entries reports: every entry counted, "$defaults" not.
 ADDED_ALL = (f"added 9 permissions.allow, {len(ASK_RULES)} permissions.ask, "
              f"{len(ENVIRONMENT_OPENINGS)} autoMode.environment, {len(AUTO_ALLOW_OPENINGS)} autoMode.allow")
+# #282: the "Sensitive remote targets:" entry earlier installs wrote, byte for byte. jotform-glow-sync's live gate
+# (live_gate.sh, rjeskuri/jotform-glow-sync#146) now passes writes there, so the snippet carries a reworded entry
+# and the installer replaces this exact string (never another entry by its opening words) in autoMode.environment.
+REMOTE_TARGETS = "Sensitive remote targets:"
+RETIRED_REMOTE_TARGETS = ("Sensitive remote targets: the Jotform forms, the Global G.L.O.W. Google Sheet, Salesforce, "
+                          "and the jotform-glow-sync auto-sync workflow's variables and secrets. Every write there "
+                          "needs my explicit go in the session.")
+# Unchanged by #282, byte for byte.
+DATA_LOCATIONS = ("Sensitive data locations & audiences: /Users/ryaneskuri/jotform-glow-sync data/, backups/ and "
+                  "credentials/ hold minors' personal data; share with nothing outside that project's own tools.")
+# How the summary line reports the replacement (beside "added ..."; the new entry is not also counted as added).
+REPLACED_ENV = "replaced 1 autoMode.environment"
 
 
 def write(path, text):
@@ -704,6 +716,232 @@ class Install(unittest.TestCase):
         merged = read_json(self.settings)
         self.assertEqual(merged["model"], "opus")
         self.assertEqual(merged["enabledPlugins"], {})
+
+    # Jotform live writes through the live gate (#282). The classifier reads autoMode.environment: the remote-targets
+    # entry says writes there go through once jotform-glow-sync's live gate has passed them (a backup of what is
+    # written first, the write logged and notified), and deletes and --prune still need Ryan's explicit go. No synonym
+    # list can catch every way of saying "writes still wait for me", so the checks are structural: the entry's shape
+    # (assert_live_gate_policy) and two rules on every sentence (assert_writes_wait_for_nobody).
+
+    # A person word names Ryan or his session; a gating word makes something wait. "hold" is left out ("credentials/
+    # hold minors' personal data"), "held" and "on hold" are in; "Ryan" is a whole word (not /Users/ryaneskuri).
+    PERSON = re.compile(r"\b(my|me|mine|myself|i|ryan|session|human|manual\w*|explicit\w*)\b", re.I)
+    GATING = re.compile(r"\b(need\w*|requir\w*|wait\w*|must|until|only|held|on hold|pending|subject|clear\w*|"
+                        r"review\w*|after)\b", re.I)
+    WRITE = re.compile(r"\bwrit\w*", re.I)
+    DELETES = re.compile(r"\bdelet\w*|--prune", re.I)
+    GATE_NAME = re.compile(r"live[ _-]?gate\b|live_gate\.sh", re.I)
+    # The live-gate sentence says writes go through, without hedging to staging, drafting or a dry run.
+    GO_THROUGH = re.compile(r"\b(allowed|allows?|go(es)? through|proceeds?|permitted|automatic(ally)?)\b", re.I)
+    NOT_ALLOWED = re.compile(r"(\b(not|never|no longer)|n't)\W+(\w+\W+){0,2}?(allow\w*|go(es)? through|proceed\w*|"
+                             r"permitted)\b", re.I)
+    HEDGE = re.compile(r"\b(stag\w*|prepar\w*|queu\w*|draft\w*|propos\w*|dry[- ]?run\w*|simulat\w*|preview\w*|"
+                       r"plan\w*|suggest\w*)\b", re.I)
+
+    @staticmethod
+    def clauses(text):
+        """`text` split after . ; ! or ? (not after a lone capital, so "G.L.O.W. Google" stays whole), backticks
+        removed."""
+        return [s for s in re.split(r"(?<=[.;!?])(?<!\b[A-Z]\.)\s+", text.replace("`", "")) if s.strip()]
+
+    def gated_only_by_the_live_gate(self, sentence):
+        """The sentence names the live gate, and every gating word in it leads to the live gate within five words
+        ("allowed only after jotform-glow-sync's live gate has passed them")."""
+        if not self.GATE_NAME.search(sentence):
+            return False
+        return all(re.match(r"\W+(\S+\s+){0,4}?\S*?(live[ _-]?gate)", sentence[m.end():], re.I)
+                   for m in self.GATING.finditer(sentence))
+
+    def assert_writes_wait_for_nobody(self, sentence):
+        """A sentence naming Ryan (or his explicit go) is about deletes or --prune and names no write; a sentence
+        with a gating word is about deletes or --prune, or is the live-gate sentence with the gate its only
+        condition."""
+        if self.PERSON.search(sentence):
+            self.assertRegex(sentence, self.DELETES, "names Ryan, not about deletes or --prune")
+            self.assertNotRegex(sentence, self.WRITE, "names Ryan beside a write")
+        if self.GATING.search(sentence) and not self.DELETES.search(sentence):
+            self.assertTrue(self.gated_only_by_the_live_gate(sentence),
+                            f"makes something wait on more than the live gate: {sentence}")
+
+    def assert_live_gate_policy(self, entry):
+        """The entry's shape: the target list, the live-gate sentence (writes go through once the gate passed them),
+        at most two sentences more on the backup, the log and the notification, then the deletes sentence. Nothing
+        else, and every sentence passes assert_writes_wait_for_nobody."""
+        self.assertTrue(entry.startswith(REMOTE_TARGETS), entry)
+        self.assertNotEqual(entry, RETIRED_REMOTE_TARGETS)
+        parts = self.clauses(entry)
+        self.assertIn(len(parts), (3, 4, 5), f"not targets, gate, up to two on the record, deletes: {parts}")
+        targets, gate, record, deletes = parts[0], parts[1], parts[2:-1], parts[-1]
+        with self.subTest(part="targets", sentence=targets[:70]):
+            for target in ("jotform", "google sheet", "salesforce", "auto-sync"):      # still the same targets
+                self.assertIn(target, targets.lower())
+            for pattern in (self.WRITE, self.GATE_NAME, self.PERSON, self.GATING, self.DELETES):
+                self.assertNotRegex(targets, pattern)
+        with self.subTest(part="gate", sentence=gate[:70]):
+            self.assertRegex(gate, self.GATE_NAME)
+            self.assertRegex(gate, self.WRITE)
+            self.assertRegex(gate, self.GO_THROUGH)
+            self.assertNotRegex(gate, self.NOT_ALLOWED)
+            self.assertNotRegex(gate, self.HEDGE)
+            self.assertNotRegex(gate, self.DELETES)
+        for sentence in record:
+            with self.subTest(part="record", sentence=sentence[:70]):
+                self.assertRegex(sentence, re.compile(r"\bbackup|\blog(ged|s)?\b|\bnotif\w*", re.I))
+                for pattern in (self.PERSON, self.GATING, self.HEDGE, self.DELETES):
+                    self.assertNotRegex(sentence, pattern)
+        said = " ".join([gate] + record)
+        self.assertTrue(any(re.search(r"\bbackup", s, re.I) and re.search(r"\b(first|before\w*|already)\b", s, re.I)
+                            for s in [gate] + record), f"no sentence says a backup exists first: {entry}")
+        self.assertRegex(said, re.compile(r"\blog(ged|s)?\b", re.I))
+        self.assertRegex(said, re.compile(r"\bnotif\w*", re.I))
+        with self.subTest(part="deletes", sentence=deletes[:70]):
+            self.assertRegex(deletes, re.compile(r"\bdelet\w*", re.I))
+            self.assertIn("--prune", deletes)
+            self.assertRegex(deletes, re.compile(r"explicit\s+go", re.I))
+            self.assertNotRegex(deletes, self.WRITE)
+        for sentence in parts:
+            with self.subTest(sentence=sentence[:70]):
+                self.assert_writes_wait_for_nobody(sentence)
+
+    def remote_targets(self, entries):
+        """The one "Sensitive remote targets:" entry of `entries`, after checking it says the live-gate policy."""
+        found = [e for e in entries if e.startswith(REMOTE_TARGETS)]
+        self.assertEqual(len(found), 1, found)
+        self.assert_live_gate_policy(found[0])
+        return found[0]
+
+    def test_snippet_remote_targets_entry_allows_live_gate_writes_and_asks_for_deletes(self):
+        wanted = snippet_lists(self)                     # the seven openings, in order, "$defaults" first
+        env = wanted["autoMode", "environment"]
+        self.assertNotIn(RETIRED_REMOTE_TARGETS, env)
+        self.remote_targets(env)
+        self.assertEqual([e for e in env if e.startswith("Sensitive data locations & audiences:")], [DATA_LOCATIONS])
+
+    def test_fresh_home_gets_the_live_gate_line_and_not_the_retired_one(self):
+        wanted = snippet_lists(self)
+        new = self.remote_targets(wanted["autoMode", "environment"])
+        for name, start in (("no settings file", None), ("settings without autoMode", SETTINGS),
+                            ("an empty autoMode.environment", {"autoMode": {"environment": []}})):
+            with self.subTest(start=name):
+                if start is None:
+                    if os.path.exists(self.settings):
+                        os.remove(self.settings)
+                else:
+                    self.reset(start)
+                p = self.install()
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                env = read_json(self.settings)["autoMode"]["environment"]
+                self.assertNotIn(RETIRED_REMOTE_TARGETS, env)
+                self.assertEqual(env.count(new), 1, env)
+                self.assertEqual(self.remote_targets(env), new)
+                self.assertEqual([e for e in env if e.startswith("Sensitive data locations")], [DATA_LOCATIONS])
+                self.assertEqual(env[:1], [DEFAULTS])
+                line = settings_line(p.stdout)
+                self.assertIn(f"{len(ENVIRONMENT_OPENINGS)} autoMode.environment", line)   # the new one is added
+                self.assertNotIn("replaced", line)                                      # nothing was there to replace
+
+    def test_reinstall_replaces_the_retired_line_in_place(self):
+        wanted = snippet_lists(self)
+        env = wanted["autoMode", "environment"]
+        new = self.remote_targets(env)
+        same_label = "Sensitive remote targets: my own staging bucket at s3://mine; writes there need nothing."
+        near_miss = RETIRED_REMOTE_TARGETS.replace("Salesforce, ", "")       # mine: not the retired string exactly
+        last_install = [RETIRED_REMOTE_TARGETS if e == new else e for e in env]  # what the previous install wrote
+        self.assertEqual(last_install.count(RETIRED_REMOTE_TARGETS), 1)
+        cases = {
+            "the last install's list, then mine": last_install + ["Mine."],
+            "mid-list beside my own remote-targets entries": [DEFAULTS, "Mine A.", RETIRED_REMOTE_TARGETS, same_label,
+                                                              near_miss, "Mine B."],
+            "alone, no sentinel": [RETIRED_REMOTE_TARGETS],
+            "before a mid-list sentinel": ["Mine A.", RETIRED_REMOTE_TARGETS, DEFAULTS, env[1], "Mine B."],
+            "the new line already there too": [DEFAULTS, new, "Mine A.", RETIRED_REMOTE_TARGETS, env[2]],
+            "twice": [RETIRED_REMOTE_TARGETS, "Mine A.", RETIRED_REMOTE_TARGETS],
+        }
+        snippet = read_json(SNIPPET)
+        for name, own in cases.items():
+            with self.subTest(case=name):
+                # The retired string takes the new entry in its place; when the new entry is already there, the
+                # retired one is only dropped. Derived from the fixture, not from the installer.
+                replaced, have_new = [], new in own
+                for entry in own:
+                    if entry != RETIRED_REMOTE_TARGETS:
+                        replaced.append(entry)
+                    elif not have_new:
+                        replaced.append(new)
+                        have_new = True
+                # Everything else already as the snippet has it, so the line names only autoMode.environment.
+                mine = {k: snippet[k] for k in ("model", "effortLevel", "modelSettings")}
+                mine.update(theme="dark", permissions={k: wanted["permissions", k] for k in ("allow", "ask")},
+                            autoMode={"environment": own, "allow": wanted["autoMode", "allow"],
+                                      "soft_deny": [DEFAULTS, "Never push to main."]})
+                before = self.reset(mine)
+                p = self.install()
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                merged = read_json(self.settings)
+                got = merged["autoMode"]["environment"]
+                self.assertNotIn(RETIRED_REMOTE_TARGETS, got)
+                self.assertEqual(got.count(new), 1, got)
+                self.assert_merged(got, replaced, env, sentinel=True)      # mine stay, in order; new in old's place
+                for entry in own:
+                    if entry != RETIRED_REMOTE_TARGETS:
+                        self.assertIn(entry, got)
+                self.assertEqual(merged["autoMode"]["allow"], wanted["autoMode", "allow"])
+                self.assertEqual(merged["autoMode"]["soft_deny"], [DEFAULTS, "Never push to main."])
+                self.assertEqual(merged["permissions"], {k: wanted["permissions", k] for k in ("allow", "ask")})
+                self.assertEqual(merged["theme"], "dark")
+
+                line = settings_line(p.stdout)
+                self.assertTrue(line.startswith("~/.claude/settings.json: "), line)
+                self.assertNotIn("already up to date", line)
+                if name == "twice":
+                    self.assertRegex(line, r"\breplaced [12] autoMode\.environment\b")
+                else:
+                    self.assertIn(REPLACED_ENV, line)
+                added = [e for e in env if e != DEFAULTS and e not in replaced]
+                if added:
+                    self.assertIn(f"added {len(added)} autoMode.environment", line)
+                else:
+                    self.assertNotIn("added", line)
+                if own[:1] == [DEFAULTS] and own.count(DEFAULTS) == 1:            # the sentinel did not move
+                    self.assertNotIn("$defaults", line)
+                self.assertNotRegex(line, r"permissions\.|autoMode\.allow")
+                backups = self.backups()
+                self.assertEqual(len(backups), 1)
+                with open(os.path.join(os.path.dirname(self.settings), backups[0]), "rb") as fh:
+                    self.assertEqual(fh.read(), before)
+                with open(self.settings, "rb") as fh:
+                    after_first = fh.read()
+
+                p = self.install()                                         # again: nothing left to replace
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("~/.claude/settings.json: already up to date", p.stdout)
+                self.assertNotIn("replaced", settings_line(p.stdout))
+                with open(self.settings, "rb") as fh:
+                    self.assertEqual(fh.read(), after_first)
+                self.assertEqual(self.backups(), backups)
+
+        with self.subTest(case="the last install's list, exactly"):          # the common case, spelled out
+            self.reset({"autoMode": {"environment": last_install}})
+            p = self.install()
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertEqual(read_json(self.settings)["autoMode"]["environment"], env)
+
+    def test_user_text_does_not_say_every_jotform_write_needs_an_explicit_go(self):
+        # No file under user/ keeps the retired sentence. Every sentence there asking for Ryan's explicit go, and every
+        # sentence of a line naming the remote targets (Jotform, Salesforce, G.L.O.W., "remote targets"), passes
+        # assert_writes_wait_for_nobody: only deletes and --prune wait for Ryan, or for anything but the live gate.
+        # Sentences are read per line, so one in a JSON string does not run on into the next entry.
+        targets = re.compile(r"jotform|salesforce|g\.l\.o\.w|remote targets", re.I)
+        for name, text in self.user_files().items():
+            with self.subTest(file=name):
+                self.assertFalse("every write there needs my explicit go" in text.lower() or
+                                 RETIRED_REMOTE_TARGETS in text, f"user/{name} keeps the retired sentence")
+            for line in text.splitlines():
+                for sentence in self.clauses(line):
+                    if not (targets.search(line) or re.search(r"explicit\s+go", sentence, re.I)):
+                        continue
+                    with self.subTest(file=name, sentence=sentence.strip()[:70]):
+                        self.assert_writes_wait_for_nobody(sentence)
 
 
 if __name__ == "__main__":

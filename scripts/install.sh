@@ -41,7 +41,8 @@ cp "$HERE/user/CLAUDE.md" "$HOME/.claude/CLAUDE.md" && echo "~/.claude/CLAUDE.md
 # Settings: model and effortLevel come from the snippet, modelSettings is merged per model id (the snippet's
 # entries set or override theirs, other model ids stay), permissions.allow, permissions.ask,
 # autoMode.environment and autoMode.allow gain each snippet entry they lack (their own entries stay, in order;
-# "$defaults" leads each autoMode list exactly once), every other key stays (permissions.deny,
+# "$defaults" leads each autoMode list exactly once; an entry the harness once shipped and has since reworded is
+# replaced in place by its new wording, matched by its exact string only), every other key stays (permissions.deny,
 # permissions.defaultMode and autoMode.soft_deny included), and the retired companion plugin is dropped. A dated
 # backup is kept when anything changes. A failure (an unreadable file, or a wrong-typed object or list) leaves
 # the file unchanged; the remaining steps still run and the installer exits with the failure at the end.
@@ -86,6 +87,14 @@ for key in ("model", "effortLevel", "modelSettings"):
         changed.append(key)
 LISTS = (("permissions", "allow"), ("permissions", "ask"), ("autoMode", "environment"), ("autoMode", "allow"))
 DEFAULTS = "$defaults"
+# Entries earlier installs wrote and the snippet has since reworded, by exact string, with the list each lives in.
+# Each takes the snippet entry of that list with the same label (the words before the first colon) in its place,
+# or is dropped when the list holds that entry already. Nothing is ever removed by its label alone.
+RETIRED = {
+    "Sensitive remote targets: the Jotform forms, the Global G.L.O.W. Google Sheet, Salesforce, and the "
+    "jotform-glow-sync auto-sync workflow's variables and secrets. Every write there needs my explicit go in the "
+    "session.": ("autoMode", "environment"),                # #282: writes pass jotform-glow-sync's live gate now
+}
 for obj, key in LISTS:                      # checked before anything changes: a wrong type is the user's to fix
     if obj in settings and not isinstance(settings[obj], dict):
         sys.exit(f"{name}: left unchanged, {obj} is not a JSON object; merge user/settings.snippet.json by hand")
@@ -94,28 +103,40 @@ for obj, key in LISTS:                      # checked before anything changes: a
     if key in current and not (isinstance(entries, list) and all(isinstance(e, str) for e in entries)):
         sys.exit(f"{name}: left unchanged, {obj}.{key} is not a list of strings; "
                  "merge user/settings.snippet.json by hand")
-added, sentinel = [], []
+added, replaced, sentinel = [], [], []
 for obj, key in LISTS:
     wanted = (snippet.get(obj) or {}).get(key)
     if not wanted:
         continue
     before = settings.get(obj, {}).get(key, [])
+    kept, retired = [], set()               # a retired entry's successor takes its index once, never a duplicate
+    for e in before:
+        if RETIRED.get(e) != (obj, key):
+            kept.append(e)
+            continue
+        retired.add(e)
+        successor = next((w for w in wanted if w.startswith(e.split(":", 1)[0] + ":")), None)
+        if successor is not None and successor not in before and successor not in kept:
+            kept.append(successor)
     lead = DEFAULTS in wanted               # the sentinel leads the list exactly once, the rest keeps its order
     after = [DEFAULTS] if lead else []
-    after += [e for e in before if not (lead and e == DEFAULTS)]
+    after += [e for e in kept if not (lead and e == DEFAULTS)]
+    moved = after != kept
     new = [e for e in wanted if e not in after]
     after += new
     if after != before:
         settings.setdefault(obj, {})[key] = after
         if new:
             added.append(f"{len(new)} {obj}.{key}")
-        else:
+        elif moved:
             sentinel.append(f"{obj}.{key}")
+        if retired:
+            replaced.append(f"{len(retired)} {obj}.{key}")
 plugins = settings.get("enabledPlugins")
 dropped = isinstance(plugins, dict) and "companion@ryan" in plugins
 if dropped:
     del plugins["companion@ryan"]
-if not changed and not models and not added and not sentinel and not dropped:
+if not changed and not models and not added and not replaced and not sentinel and not dropped:
     print(f"{name}: already up to date (model, effortLevel, modelSettings, "
           f"{', '.join(f'{obj}.{key}' for obj, key in LISTS)})")
     sys.exit(0)
@@ -131,6 +152,7 @@ with open(target, "w", encoding="utf-8") as fh:          # in place: a symlinked
 what = [f"set {', '.join(changed)}"] if changed else []
 what += [f"set modelSettings for {', '.join(models)}"] if models else []
 what += [f"added {', '.join(added)}"] if added else []
+what += [f"replaced {', '.join(replaced)}"] if replaced else []
 what += [f"put $defaults first in {', '.join(sentinel)}"] if sentinel else []
 what += ['removed enabledPlugins["companion@ryan"]'] if dropped else []
 print(f"{name}: {'; '.join(what)}" + (f" (backup {os.path.basename(backup)})" if backup else " (created)"))
