@@ -1473,9 +1473,10 @@ class HooksCallSessionStateTests(TracedCase):
         env = {
             "SESSIONSTATE_TEST_ROOT": str(steer),
             "SESSIONSTATE_TEST_STATUS_FILE": str(status),
-            "SESSIONSTATE_TEST_EXTRA": "via-status-paths.txt",
+            "SESSIONSTATE_TEST_EXTRA": "via-status-paths.py",
         }
-        status.write_bytes(b" M README.md\0")
+        # Source paths throughout: a docs-only set would be skipped (#163), not run.
+        status.write_bytes(b" M app.py\0")
         r, _ = self.run_traced(
             "verify_on_stop.py",
             self.stop_event(repo),
@@ -1486,7 +1487,7 @@ class HooksCallSessionStateTests(TracedCase):
         self.assertFalse((sdir / "dirty-sess-1").exists())
         self.assertIn("tree", json.loads((sdir / "verify-sess-1.json").read_text()))
 
-        status.write_bytes(b" M README.md\0?? other.txt\0")  # the tree changed
+        status.write_bytes(b" M app.py\0?? other.py\0")  # the tree changed
         r, called = self.run_traced(
             "verify_on_stop.py",
             self.stop_event(repo),
@@ -1497,7 +1498,7 @@ class HooksCallSessionStateTests(TracedCase):
         self.assertEqual(json.loads(r.stdout.decode("utf-8"))["decision"], "block")
         self.assertEqual(
             (sdir / "dirty-sess-1").read_text().splitlines(),
-            [str(repo / "README.md"), str(repo / "other.txt"), str(repo / "via-status-paths.txt")],
+            [str(repo / "app.py"), str(repo / "other.py"), str(repo / "via-status-paths.py")],
         )
         self.assertIn("SessionState.record", called)
 
