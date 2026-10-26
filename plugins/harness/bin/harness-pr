@@ -18,8 +18,8 @@ Usage:
     harness-pr gate P [--json]
     harness-pr revert P|SHA [--reason TEXT] [--evidence-file F] [--json]
 
-revert undoes a landed PR on main through the main checkout (on main, no tracked changes; fetched and
-fast-forwarded first): `git revert --no-edit` of its merge commit and `git push origin main` (a rejected push gets one
+revert undoes a landed PR on main through the main checkout (on main, no tracked changes, no commit origin/main lacks
+but this revert; fetched and fast-forwarded first): `git revert --no-edit` of its merge commit and `git push origin main` (a rejected push gets one
 `git pull --rebase`), an incident bug under the ticket's epic, the ticket reopened as needs-input, a notification.
 A step an earlier run did is skipped. autoland calls revert_landed() in-process; the work loop never runs it.
 
@@ -1855,7 +1855,7 @@ def merged_pr_sha(repo, number):
 
 
 def ready_main_checkout(main):
-    """Refuse unless the main checkout is on main with no tracked changes; then fetch origin and fast-forward."""
+    """Refuse unless the main checkout is on main with no tracked changes; then fetch origin."""
     on = current_branch(main)
     if on != "main":
         raise Problem(f"the main checkout {main} is on {on or 'a detached HEAD'}, not main; nothing reverted")
@@ -1864,6 +1864,27 @@ def ready_main_checkout(main):
     if changed:
         raise Problem(f"the main checkout {main} has tracked changes: {listing(changed)}; nothing reverted")
     git_ok(main, "fetch", "origin", timeout=PUSH_TIMEOUT)
+
+
+def local_only(main):
+    """The commits on main that origin/main lacks, newest first."""
+    return git_ok(main, "rev-list", "origin/main..HEAD").split()
+
+
+def reverts(main, commit, sha):
+    return f"This reverts commit {sha}" in git_ok(main, "log", "-1", "--format=%B", commit)
+
+
+def sync_main(main, sha):
+    """Refuse unless main has no commit that origin/main lacks, or only one: a pending revert of `sha` (an earlier
+    run whose pushes failed), so a push of main publishes nothing but the revert; else fast-forward main."""
+    local = local_only(main)
+    if len(local) == 1 and reverts(main, local[0], sha):
+        return
+    if local:
+        other = next((c for c in local if not reverts(main, c, sha)), local[0])
+        raise Problem(f"main in {main} has {len(local)} commit(s) not on origin/main, {other[:7]} among them; a push "
+                      f"would publish them with the revert; nothing reverted")
     git_ok(main, "pull", "--ff-only", timeout=PUSH_TIMEOUT)
 
 
@@ -1878,16 +1899,22 @@ def pushed(main, commit):
     return git(main, "merge-base", "--is-ancestor", commit, "origin/main").returncode == 0
 
 
-def push_main(main):
-    """Push main; a rejected push gets one `git pull --rebase` and one more push. The pushed HEAD; Problem when the
-    second push fails too, naming the revert commit left local."""
+def push_main(main, sha):
+    """Push main, which holds the revert of `sha` as its one commit not on origin/main; a rejected push gets one
+    `git pull --rebase` and one more push, only while the revert is still the one local commit. The pushed HEAD;
+    Problem when the second push fails too, naming the revert commit left local."""
     if git(main, "push", "origin", "main", timeout=PUSH_TIMEOUT).returncode == 0:
         return git_ok(main, "rev-parse", "HEAD").strip()
     rebased = git(main, "pull", "--rebase", "origin", "main", timeout=PUSH_TIMEOUT)
     if rebased.returncode != 0:
         git(main, "rebase", "--abort")
-    elif git(main, "push", "origin", "main", timeout=PUSH_TIMEOUT).returncode == 0:
-        return git_ok(main, "rev-parse", "HEAD").strip()
+    else:
+        local = local_only(main)
+        if len(local) != 1 or not reverts(main, local[0], sha):
+            raise Problem(f"after git pull --rebase, main in {main} has {len(local)} commit(s) not on origin/main, "
+                          f"not just the revert of {sha[:7]}; nothing pushed")
+        if git(main, "push", "origin", "main", timeout=PUSH_TIMEOUT).returncode == 0:
+            return git_ok(main, "rev-parse", "HEAD").strip()
     head = git_ok(main, "rev-parse", "HEAD").strip()
     raise Problem(f"git push origin main was rejected, also after one git pull --rebase; the revert commit "
                   f"{head[:7]} is local and unpushed in {main}")
@@ -1907,7 +1934,7 @@ def revert_on_main(main, sha):
                 raise Problem(f"reverting {sha[:7]} gives a conflict in {listing(files)}; aborted, main unchanged")
             why = last_line(done.stderr) or last_line(done.stdout) or f"exit {done.returncode}"
             raise Problem(f"git revert {sha[:7]} failed: {why}; main unchanged")
-    return push_main(main), True
+    return push_main(main, sha), True
 
 
 def landed_pr(repo, sha):
@@ -1925,14 +1952,19 @@ def landed_pr(repo, sha):
 
 
 def open_incident(repo, sha):
-    """The open `incident` issue whose body has the line `Merge commit: <sha>`, or None."""
-    issues = gh_json(["issue", "list", "--label", INCIDENT, "--state", "open", "--limit", "200", "--json",
-                      "number,body"], repo.main)
+    """The open issue whose body has the line `Merge commit: <sha>`: an `incident` one, else any (a bug filed by an
+    earlier run whose label edit failed, labelled `incident` now); its number, or None."""
     line = f"Merge commit: {sha}"
-    for issue in as_list(issues):
-        if isinstance(issue.get("number"), int) and any(row.strip() == line
-                                                        for row in (issue.get("body") or "").splitlines()):
-            return issue["number"]
+    for label in ([INCIDENT], []):
+        flags = ["--label"] + label if label else []
+        issues = gh_json(["issue", "list"] + flags + ["--state", "open", "--limit", "200", "--json", "number,body"],
+                         repo.main)
+        for issue in as_list(issues):
+            if isinstance(issue.get("number"), int) and any(row.strip() == line
+                                                            for row in (issue.get("body") or "").splitlines()):
+                if not label:
+                    gh(["issue", "edit", str(issue["number"]), "--add-label", INCIDENT], repo.main)
+                return issue["number"]
     return None
 
 
@@ -2017,6 +2049,7 @@ def revert_landed(repo, sha, reason, evidence):
     if not pushed(main, full):
         raise Problem(f"{full[:7]} is not on origin/main; nothing reverted")
     sha, reason = full, one_line(reason) or DEFAULT_REASON
+    sync_main(main, sha)
     pr = landed_pr(repo, sha)
     ticket = None
     if pr:

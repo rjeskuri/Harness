@@ -404,5 +404,88 @@ class Revert(RevertTest):
         self.assertNothingFiled()
 
 
+class LocalCommitsOnMain(RevertTest):
+    """Local main ahead of origin/main: a push of main would publish every local-only commit along with the
+    revert, so the revert refuses unless the only local commit is this run's own pending revert of the same sha."""
+
+    def commit(self, name, text, message):
+        write(os.path.join(self.main, name), text)
+        self.git(self.main, "add", name)
+        self.git(self.main, "commit", "-q", "-m", message)
+        return self.git(self.main, "rev-parse", "HEAD")
+
+    def pending_revert(self, sha):
+        """`git revert` of `sha` in the main checkout, left unpushed (an earlier run whose pushes both failed)."""
+        self.git(self.main, "revert", "--no-edit", sha)
+        head = self.git(self.main, "rev-parse", "HEAD")
+        self.assertIn(f"This reverts commit {sha}", self.git(self.main, "log", "-1", "--format=%B", head))
+        return head
+
+    def assertRefusedLocal(self, local):
+        """Refused in one line naming a local-only commit; origin/main, local main and the board untouched."""
+        origin_before, head = self.origin_log(), self.git(self.main, "rev-parse", "HEAD")
+        p = self.refused()
+        self.assertTrue(any(c[:7] in p.stderr for c in local), (local, p.stderr))
+        self.assertEqual(self.origin_log(), origin_before)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git(self.main, "rev-list", "--count", "origin/main..HEAD"), str(len(local)))
+        self.assertFalse([line for line in self.order() if line.startswith("git") and " push " in f" {line} "],
+                         self.order())
+        self.assertFalse([line for line in self.order() if line.startswith("git") and " revert " in f" {line} "],
+                         self.order())
+        self.assertNothingFiled()
+        self.assertEqual(self.jsonl(self.notify_log), [])
+        return p
+
+    def test_refuses_when_local_main_has_commits_not_on_origin(self):
+        cases = {
+            "one unrelated commit": lambda: [self.commit("NOTES.md", "local notes\n", "Local notes")],
+            "two unrelated commits": lambda: [self.commit("NOTES.md", "local notes\n", "Local notes"),
+                                              self.commit("TODO.md", "later\n", "Local todo")],
+            "own pending revert on top of an unrelated commit":
+                lambda: [self.commit("NOTES.md", "local notes\n", "Local notes"), self.pending_revert(self.sha)],
+            "unrelated commit on top of the own pending revert":
+                lambda: [self.pending_revert(self.sha), self.commit("NOTES.md", "local notes\n", "Local notes")],
+        }
+        for name, make in cases.items():
+            with self.subTest(case=name):
+                # each case starts with main and origin/main both at the merge, whatever an earlier case pushed
+                self.git(self.main, "reset", "-q", "--hard", self.sha)
+                self.git(self.main, "push", "-q", "--force", "origin", "main")
+                self.scenario(self.calls())
+                local = make()
+                self.assertRefusedLocal(local)
+
+    def test_refuses_with_a_pending_revert_of_a_different_pr(self):
+        # PR A (ticket #13) lands after #34; an earlier revert of A left its commit local when both pushes failed
+        other = self.commit("gadget.py", "def gadget():\n    return 1\n", "Add the gadget (#13)")
+        self.git(self.main, "push", "-q", "origin", "main")
+        pending = self.pending_revert(other)
+        self.scenario(self.calls())
+        p = self.assertRefusedLocal([pending])
+        self.assertIn(pending[:7], p.stderr)
+        self.assertEqual(self.reverts_on_origin(), [])
+        self.assertTrue(os.path.exists(os.path.join(self.main, "widget.py")))
+
+    def test_only_its_own_pending_revert_is_reused_and_pushed_alone(self):
+        # an earlier `revert 34` whose pushes both failed left the revert local; something was committed over it
+        own = self.pending_revert(self.sha)
+        unrelated = self.commit("NOTES.md", "local notes\n", "Local notes")
+        self.assertRefusedLocal([own, unrelated])
+        # with only the own pending revert left local, the run reuses it: origin/main gains exactly that commit
+        self.git(self.main, "reset", "-q", "--hard", own)
+        self.scenario(self.calls())
+        before = self.origin_log()
+        p = self.ok("revert", "34", "--reason", REASON, "--json")
+        after = self.origin_log()
+        self.assertEqual(after[1:], before, after)
+        self.assertEqual(after[0].split(" ", 1)[0], own)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), own)
+        self.assertFalse([line for line in self.order() if line.startswith("git") and " revert " in f" {line} "],
+                         self.order())
+        self.assertEqual(len(self.board_argv(["task", "create"])), 1, self.board_calls())
+        self.assertEqual(json.loads(p.stdout), {"pr": 34, "sha": self.sha, "revert": own, "ticket": 12, "bug": 40})
+
+
 if __name__ == "__main__":
     unittest.main()
