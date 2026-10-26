@@ -3326,9 +3326,10 @@ class SlowGit:
     shorter timeout, finishes JUST_IN_TIME before it: the slowest git that never times out.
     A call with no time left (a timeout under JUST_IN_TIME) is cut at its timeout and raises
     TimeoutExpired, as subprocess.run would. A call that finishes runs the real git, under a
-    real timeout of REAL_TIMEOUT instead of the fake one. The fake clock stands still between git calls, and the real git's own wall time does not
-    count either: only the fake git time moves it, so a run decides the same however loaded
-    the machine is (#285: real time on the clock cut the JUST_IN_TIME margin under load).
+    real timeout of REAL_TIMEOUT instead of the fake one. The fake clock stands still between
+    git calls, and the real git's own wall time does not count either: only the fake git time
+    moves it, so a run decides the same however loaded the machine is (#285: real time on the
+    clock cut the JUST_IN_TIME margin under load).
     `hang(argv, index)`, given, picks the calls (index counts this run's git calls from 0)
     that never answer: each takes its whole timeout and raises TimeoutExpired. No real
     sleeping."""
