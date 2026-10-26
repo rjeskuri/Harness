@@ -52,9 +52,9 @@ Code's session total for N's own sessions, the rounds, the Lines, Elapsed, CI an
 sessions whose orchestrator is not counted, the lower-bound note and the saved path; --json prints the record,
 --markdown the Cost block of the Resolution. Tokens and time only, no dollar figure.
 
-start: refuses an epic, a closed issue, status:blocked and open blockers; fetches origin; reuses a worktree
-already on t/N-*, else a branch origin/t/N-*, else a local t/N-*, else creates t/N-<slug> from origin/main
-(main without an origin) in <main>/.claude/worktrees/t-N-<slug>; a new worktree gets HARNESS_WORKTREE_SETUP
+start: refuses an epic, a closed issue, status:blocked, status:proposed and open blockers; fetches origin;
+reuses a worktree already on t/N-*, else a branch origin/t/N-*, else a local t/N-*, else creates t/N-<slug> from
+origin/main (main without an origin) in <main>/.claude/worktrees/t-N-<slug>; a new worktree gets HARNESS_WORKTREE_SETUP
 (environment, then the project's .claude/settings.local.json, then .claude/settings.json) or the detected
 setup (uv sync, npm ci); gitignored files of the main checkout matching .worktreeinclude are copied when
 missing; a clean worktree, or a reused local branch, behind origin/<branch> is fast-forwarded to it, while a diverged
@@ -396,6 +396,8 @@ def refusal(record):
         return f"#{n} is closed"
     if record.get("status") == "blocked":
         return f"#{n} is status:blocked; read its comments, then harness-board status {n} ready"
+    if record.get("status") == "proposed":
+        return f"#{n} is status:proposed; it waits for harness-board promote {n}"
     blockers = [f"#{b.get('number')}" for b in record.get("blocked_by") or []
                 if isinstance(b, dict) and str(b.get("state", "")).upper() != "CLOSED"]
     if blockers:
