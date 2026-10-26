@@ -1,7 +1,8 @@
 """Review rounds: one ticket's harness reviews, recorded by `harness-pr findings` and read by
 `harness-work stage`. One folder per ticket at ~/.claude/harness/repos/<key>/reviews/<ticket>/,
-holding `rounds.json` (the list of rounds, oldest first) and `rulings.json` (the `Ruling:` lines
-gathered so far). A round is
+holding `rounds.json` (the list of rounds, oldest first), `rulings.json` (the `Ruling:` lines
+gathered so far) and `tickets.json` (the out-of-scope findings ticketed so far, each
+{"key": [path, body], "number": n}). A round is
 
     {"round": 1, "at": "2026-10-26T10:00:00Z", "head": "<sha>", "base": "<sha>",
      "blocking": [...], "low": [...], "outside": [...], "pr": null, "review_id": null}
@@ -33,6 +34,10 @@ def rounds_path(key, ticket):
 
 def rulings_path(key, ticket):
     return os.path.join(reviews_dir(key, ticket), "rulings.json")
+
+
+def tickets_path(key, ticket):
+    return os.path.join(reviews_dir(key, ticket), "tickets.json")
 
 
 # --------------------------------------------------------------- rounds
@@ -93,3 +98,31 @@ def add_rulings(key, ticket, lines):
         rulings += new
         write_json(rulings_path(key, ticket), rulings, prefix=PREFIX)
     return rulings
+
+
+# --------------------------------------------------------------- out-of-scope tickets
+def finding_key(f):
+    """The key an out-of-scope finding is ticketed under: [path, body], whatever its line or severity."""
+    return [str(f.get("path") or ""), str(f.get("body") or "")]
+
+
+def load_tickets(key, ticket):
+    """The out-of-scope tickets made for the ticket, oldest first, each {"key": [path, body], "number": n};
+    [] when none or broken."""
+    found = read_json(tickets_path(key, ticket))
+    if not isinstance(found, list):
+        return []
+    return [t for t in found if isinstance(t, dict) and isinstance(t.get("key"), list)
+            and isinstance(t.get("number"), int) and not isinstance(t.get("number"), bool)]
+
+
+def add_ticket(key, ticket, finding, number):
+    """Record that `finding` became ticket `number` and return every ticket recorded. A key already
+    recorded keeps its first number and writes nothing."""
+    tickets = load_tickets(key, ticket)
+    k = finding_key(finding)
+    if any(t["key"] == k for t in tickets):
+        return tickets
+    tickets.append({"key": k, "number": number})
+    write_json(tickets_path(key, ticket), tickets, prefix=PREFIX)
+    return tickets

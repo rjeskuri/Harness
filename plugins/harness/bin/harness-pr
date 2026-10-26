@@ -7,7 +7,7 @@ the checks, mark it ready, read the comments, list the PRs awaiting the user, ru
 Usage:
     harness-pr open N [--worktree PATH] [--verify-log F] [--review F] [--notes F] [--json]
     harness-pr review P --findings F [--checked TEXT] [--model NAME]
-    harness-pr findings N [--worktree PATH] --review F [--rulings R] [--json]
+    harness-pr findings N [--worktree PATH] --review F [--rulings R] [--model NAME] [--json]
     harness-pr findings N --latest [--json]
     harness-pr checks P [--wait] [--timeout 1200] [--json]
     harness-pr ready P [--ticket N]
@@ -17,9 +17,12 @@ Usage:
     harness-pr land P [--yes] [--discard] [--accept-findings]
     harness-pr gate P [--json]
 
-ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has
-findings and no commit newer than it, naming the findings, and refuse when gh cannot tell. --accept-findings on
-land is the only override; ready has none. land on a PR that is already merged skips the check.
+ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has high
+or medium findings and no commit newer than it, naming those findings, and refuse when gh cannot tell. A finding
+without a recognisable severity counts as high; low findings never refuse, and ready names them in one warning
+line. When the review's summary counts more high plus medium findings than it lists, the refusal says how many
+more. --accept-findings on land is the only override; ready has none. land on a PR that is already merged skips
+the check.
 
 findings splits a review by the files the ticket branch changed (`git diff --name-only` from the merge-base of HEAD
 and origin/main, else main): high and medium on a changed file block, low on one is low, anything else is outside.
@@ -27,7 +30,13 @@ It records the round (harness_lib/reviews.py; the same HEAD replaces the latest 
 round-<k>-blocking.json, round-<k>-review.json and notes.md (Low findings, Out of scope, Rulings, gathered over
 every round) under ~/.claude/harness/repos/<key>/reviews/N/, and prints the `harness-work stage` record: review
 pass in round 1, then fix pass or fail. A review with no findings array exits 1 and records nothing; --latest
-prints the latest round and writes nothing. It makes no gh call.
+prints the latest round and writes nothing (and makes no gh call). With an open PR for the branch (`gh pr list
+--head <branch> --state open`) it posts round-<k>-review.json there as `review` would (post_review) and records the
+PR and the review id; a PR head that is not the worktree's HEAD (or gh failing) refuses before anything is posted or
+recorded; no open PR records the round with a warning and posts nothing. Then, with an open PR, each high or medium
+outside finding of any recorded round not ticketed yet (by path and body, kept in tickets.json) becomes a proposed
+bug ticket under the ticket's epic (`harness-board task create`, the body on stdin, naming this round's PR), its
+number on the notes line; a failed create is a warning, and the next round with a PR tries it again.
 
 ultra runs nothing (one line, exit 0) when the project's HARNESS_ULTRAREVIEW is off, unless --force; see cmd_ultra.
 
@@ -70,7 +79,8 @@ try:
     from harness_lib.autoland import (CONVERSATION, check_entries as lib_check_entries, evaluate, fetch_origin,
                                       gate_settings, gather_facts, overall)
     from harness_lib.routing import load_routing
-    from harness_lib.reviews import add_rulings, latest_round, load_rounds, reviews_dir, save_round
+    from harness_lib.reviews import (add_rulings, add_ticket, finding_key, latest_round, load_rounds, load_tickets,
+                                     reviews_dir, save_round)
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -79,7 +89,9 @@ TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 TICKET_BRANCH = re.compile(r"^t/(\d+)-")
 MARKER = "<!-- harness-review -->"
 BODY_FINDING = re.compile(r"^- (`[^`]*`|\(no path\)) \[(\w+)\] (.*)$")     # a finding listed in a review's body
-REVIEW_COUNT = re.compile(r"^Harness review \([^)]*\): (\d+) findings?\b")
+REVIEW_COUNT = re.compile(r"^Harness review \([^)]*\): (\d+) findings?\b"          # a review's summary line, with
+                          r"(?:, (\d+) high, (\d+) medium, (\d+) low\b)?")           # or without per-severity counts
+INLINE_SEVERITY = re.compile(r"^\[(\w+)\]")                                        # an inline finding's prefix
 LANDED = "Landed in"
 RESOLUTION = "**Resolution**"
 HIGH_RISK = "High risk: review the data and live-system paths before merging."
@@ -114,6 +126,8 @@ DEFAULT_CHECKED = "the diff against the ticket's definition of done"
 LAND_FIELDS = "isDraft,mergeable,headRefName,closingIssuesReferences,statusCheckRollup,title,url,state"
 RULING_LINE = re.compile(r"^[ \t]*(?:- )?(Ruling:.*\S)[ \t]*$", re.M)
 OUTSIDE_NOTE = "(outside the files this ticket changed)"
+SENTENCE_END = re.compile(r"[.!?](?= |$)")
+TITLE_SENTENCE = 60          # an out-of-scope ticket's title: at most this much of the finding's first sentence
 AWAIT_FIELDS = "number,title,isDraft,createdAt,url,headRefName,closingIssuesReferences,statusCheckRollup"
 
 
@@ -304,10 +318,12 @@ def sibling(name):
     raise Problem(f"{name} not found on PATH or in {HERE}")
 
 
-def tool(name, args, cwd, check=True):
+def tool(name, args, cwd, check=True, stdin=None):
+    """A sibling tool's CompletedProcess; `stdin` is the text it reads, else it gets none."""
+    feed = {"stdin": subprocess.DEVNULL} if stdin is None else {"input": stdin}
     try:
         done = subprocess.run([sibling(name)] + list(args), cwd=cwd, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=TOOL_TIMEOUT)
+                              encoding="utf-8", errors="replace", timeout=TOOL_TIMEOUT, **feed)
     except OSError as err:
         raise Problem(f"cannot run {name}: {err.strerror or err}") from None
     except subprocess.TimeoutExpired:
@@ -321,15 +337,20 @@ def tool(name, args, cwd, check=True):
 BOARD_WARNING = "harness-board: warning:"
 
 
-def board(repo, *args):
-    """harness-board on this repository; its stdout. Its `harness-board: warning:` stderr lines go to our stderr,
-    in order; its other stderr stays hidden."""
-    done = tool("harness-board", list(args) + ["--repo", repo.main], repo.main)
+def board_run(repo, args, check=True, stdin=None):
+    """harness-board on this repository; its CompletedProcess. Its `harness-board: warning:` stderr lines go to our
+    stderr, in order; its other stderr stays hidden."""
+    done = tool("harness-board", list(args) + ["--repo", repo.main], repo.main, check=check, stdin=stdin)
     for line in (done.stderr or "").splitlines():
         if line.startswith(BOARD_WARNING):
             sys.stderr.write(line + "\n")
     sys.stderr.flush()
-    return done.stdout
+    return done
+
+
+def board(repo, *args):
+    """harness-board on this repository; its stdout (see board_run)."""
+    return board_run(repo, args).stdout
 
 
 def pr_view(repo, number, fields, cwd=None):
@@ -611,15 +632,15 @@ def review_body(model, findings, outside):
     return "\n\n".join(parts)
 
 
-def cmd_review(args):
-    repo = open_repo()
-    number = args.number
-    findings = load_findings(args.findings)
+def post_review(repo, number, findings, model, checked):
+    """Post `findings` on PR `number` as one COMMENT review carrying the harness marker, inline where they sit on
+    the diff, the rest listed in its body; no findings posts `Harness review: no findings. Checked: <checked>`.
+    Returns (review_id, inline, outside): the id GitHub gave the review (None for a no-findings post, or when the
+    reply names none) and the findings posted inline and in the body. Problem when the post fails."""
     if not findings:
         gh(["pr", "review", str(number), "--comment", "-b",
-            f"Harness review: no findings. Checked: {args.checked}\n\n{MARKER}"], repo.root)
-        print(f"PR #{number}: review posted, no findings")
-        return 0
+            f"Harness review: no findings. Checked: {checked}\n\n{MARKER}"], repo.root)
+        return None, [], []
     slug = repo.slug()
     diff = gh_run(["pr", "diff", str(number)], repo.root)
     if diff.returncode != 0:
@@ -634,17 +655,35 @@ def cmd_review(args):
     comments = [{"path": f["path"], "line": f["line"], "side": "RIGHT",
                  "body": f"[{f['severity']}] {f['body']}\n\n{MARKER}"} for f in inline]
     call = ["api", "-X", "POST", f"repos/{slug}/pulls/{number}/reviews", "--input", "-"]
-    payload = {"event": "COMMENT", "body": review_body(args.model, findings, outside), "comments": comments}
+    payload = {"event": "COMMENT", "body": review_body(model, findings, outside), "comments": comments}
     done = gh_run(call, repo.root, stdin=json.dumps(payload))
     if done.returncode != 0 and comments:
         warn("harness-pr",
              f"GitHub refused the inline comments ({first_line(done.stderr) or f'exit {done.returncode}'}); "
              "posting every finding in the review body")
         inline, outside = [], findings
-        payload = {"event": "COMMENT", "body": review_body(args.model, findings, outside), "comments": []}
+        payload = {"event": "COMMENT", "body": review_body(model, findings, outside), "comments": []}
         done = gh_run(call, repo.root, stdin=json.dumps(payload))
     if done.returncode != 0:
         raise Problem(f"{describe(call)} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
+    try:
+        reply = json.loads(done.stdout)
+    except ValueError:
+        reply = None
+    review_id = reply.get("id") if isinstance(reply, dict) else None
+    if not isinstance(review_id, int) or isinstance(review_id, bool):
+        review_id = None
+    return review_id, inline, outside
+
+
+def cmd_review(args):
+    repo = open_repo()
+    number = args.number
+    findings = load_findings(args.findings)
+    _review_id, inline, outside = post_review(repo, number, findings, args.model, args.checked)
+    if not findings:
+        print(f"PR #{number}: review posted, no findings")
+        return 0
     print(f"PR #{number}: review posted, {plural(len(findings), 'finding')} "
           f"({len(inline)} inline, {len(outside)} in the body)")
     return 0
@@ -687,14 +726,19 @@ def notes_line(f, outside):
     return f"{line} {OUTSIDE_NOTE}" if outside else line
 
 
-def notes_text(rounds, rulings):
+def notes_text(rounds, rulings, tickets=()):
     """notes.md from every round and every ruling: Low findings, Out of scope, Rulings, each once and each left out
-    when empty."""
+    when empty. An out-of-scope line whose finding was ticketed ends in ` -> #<n>`."""
+    numbers = {tuple(t["key"]): t["number"] for t in tickets}
     low, out_of_scope = [], []
     for rnd in rounds:
         low += [notes_line(f, False) for f in as_findings(rnd.get("low"))]
         for f in as_findings(rnd.get("outside")):
-            (low if f.get("severity") == "low" else out_of_scope).append(notes_line(f, True))
+            if f.get("severity") == "low":
+                low.append(notes_line(f, True))
+                continue
+            n = numbers.get(tuple(finding_key(f)))
+            out_of_scope.append(notes_line(f, True) + (f" -> #{n}" if n else ""))
     sections = [("Low findings", low), ("Out of scope", out_of_scope), ("Rulings", [f"- {r}" for r in rulings])]
     parts = [f"### {name}\n" + "\n".join(dict.fromkeys(lines)) for name, lines in sections if lines]
     return "\n\n".join(parts) + "\n" if parts else ""
@@ -713,6 +757,119 @@ def round_text(number, rnd):
 def as_findings(value):
     """The finding dicts of a recorded list."""
     return [f for f in value if isinstance(f, dict)] if isinstance(value, list) else []
+
+
+def branch_pr(repo, number, head):
+    """The number of the open PR for the worktree's branch, or None (with a warning) when there is none. Problem,
+    before anything is recorded, when gh cannot tell or the PR's head is not the worktree's HEAD."""
+    branch = current_branch(repo.root)
+    if not branch:
+        warn("harness-pr", f"no branch checked out in {repo.root}; nothing posted")
+        return None
+    data = gh_json(["pr", "list", "--head", branch, "--state", "open", "--json", "number,url,headRefOid"], repo.root)
+    prs = [p for p in as_list(data) if isinstance(p.get("number"), int)]
+    if not prs:
+        warn("harness-pr", f"no open PR for {branch}; nothing posted (harness-pr open {number} first)")
+        return None
+    pr, sha = prs[0]["number"], str(prs[0].get("headRefOid") or "")
+    if sha != head:
+        raise Problem(f"PR #{pr} is at {sha[:7] or 'no known commit'}, the worktree at {head[:7]}; push first")
+    return pr
+
+
+def first_sentence(text):
+    """The text's first sentence on one line, without its closing `.`, `!` or `?`."""
+    text = one_line(text)
+    m = SENTENCE_END.search(text)
+    return text[:m.start()] if m else text
+
+
+def ticket_title(f):
+    """`<path>: <the body's first sentence>`, the sentence cut to at most 60 characters (at a word when it can)."""
+    sentence = first_sentence(f.get("body") or "") or "(no body)"
+    if len(sentence) > TITLE_SENTENCE:
+        cut = sentence[:TITLE_SENTENCE - 1]
+        word = cut.rsplit(" ", 1)[0].rstrip(" .,;:")
+        sentence = (word if len(word) >= TITLE_SENTENCE // 2 else cut.rstrip()) + "…"
+    return f"{f.get('path') or '(no path)'}: {sentence}"
+
+
+def ticket_body(f, pr, number):
+    """An out-of-scope finding as a task in templates/ticket_task.md's headings; the finding quoted, so no line of
+    it can start a heading."""
+    sev = f.get("severity")
+    quoted = "\n".join(f"> {line}".rstrip() for line in (f.get("body") or "(no body)").splitlines())
+    return "\n".join([
+        "## Request",
+        f"A {sev} finding outside the files #{number} changed, found in the review of PR #{pr} for #{number}:",
+        "", quoted, "",
+        "## Outline",
+        f"1. Confirm the finding at {where(f)}: reproduce the scenario it describes.",
+        "2. Fix it, or close this ticket with the reason it does not hold.", "",
+        "## Definition of done",
+        "- [ ] The scenario the finding describes no longer fails.",
+        "- [ ] The project's verify command passes.", "",
+        "## Tests that must pass",
+        "- A test that reproduces the scenario: red before the fix, green after.",
+        "The existing suite stays green.", "",
+        "## Context",
+        f"- {where(f)}: where the review found it, severity {sev}.",
+        f"- Found in the review of PR #{pr} for #{number}.", ""])
+
+
+def create_ticket(repo, f, epic, pr, number):
+    """One proposed bug ticket for an out-of-scope finding, under `epic` when there is one; its number, or None
+    after a warning naming the finding. A ticket created whose linking failed still gives its number."""
+    args = (["task", "create"] + (["--parent", str(epic)] if epic else [])
+            + ["--proposed", "--type", "bug", "--size", "S", "--risk", "low", "--title", ticket_title(f),
+               "--body-file", "-", "--json"])
+    what = f"the out-of-scope finding at {where(f)}"
+    try:
+        done = board_run(repo, args, check=False, stdin=ticket_body(f, pr, number))
+    except Problem as err:
+        warn("harness-pr", f"no ticket for {what}: {err}")
+        return None
+    try:
+        data = json.loads(done.stdout)
+    except ValueError:
+        data = None
+    n = data.get("number") if isinstance(data, dict) else None
+    n = n if isinstance(n, int) and not isinstance(n, bool) else None
+    if done.returncode != 0:
+        why = one_line(done.stderr) or f"exit {done.returncode}"
+        warn("harness-pr", f"ticket #{n} for {what}: {why}" if n else f"no ticket for {what}: harness-board task "
+                                                                       f"create failed: {why}")
+    elif n is None:
+        warn("harness-pr", f"no ticket for {what}: harness-board task create printed no ticket number")
+    return n
+
+
+def ticket_outside(repo, key, number, pr):
+    """A ticket for each high or medium outside finding of any recorded round not ticketed yet (by path and body),
+    so one whose create failed is tried again even when no later review repeats it; the new numbers."""
+    recorded = {tuple(t["key"]) for t in load_tickets(key, number)}
+    wanted = []
+    for f in (f for rnd in load_rounds(key, number) for f in as_findings(rnd.get("outside"))):
+        k = tuple(finding_key(f))
+        if f.get("severity") in ("high", "medium") and k not in recorded:
+            recorded.add(k)
+            wanted.append(f)
+    if not wanted:
+        return []
+    try:
+        parent = show_ticket(repo, number).get("parent")
+    except Problem as err:
+        warn("harness-pr", f"no out-of-scope tickets this round: {err}")
+        return []
+    epic = parent.get("number") if isinstance(parent, dict) else None
+    epic = epic if isinstance(epic, int) and not isinstance(epic, bool) else None
+    made = []
+    for f in wanted:
+        n = create_ticket(repo, f, epic, pr, number)
+        if n is not None:
+            add_ticket(key, number, f, n)
+            made.append(n)
+    return made
 
 
 def cmd_findings(args):
@@ -743,13 +900,17 @@ def cmd_findings(args):
     head = git_ok(repo.root, "rev-parse", "HEAD").strip()
     fork = merge_base(repo.root)
     blocking, low, outside = split_findings(findings, touched_files(repo.root, fork))
+    pr = branch_pr(repo, number, head)                 # refuses before anything is posted or recorded
+    review_id = None
+    if pr is not None:                                 # a failed post raises, and nothing is recorded
+        review_id, inline, off = post_review(repo, pr, blocking + low, args.model, DEFAULT_CHECKED)
 
     key = repo.key
     rounds = load_rounds(key, number)
     earlier = rounds[:-1] if rounds and rounds[-1].get("head") == head else rounds
     base = earlier[-1].get("head") if earlier else fork
     rnd = save_round(key, number, {"at": now_iso(), "head": head, "base": base, "blocking": blocking, "low": low,
-                                   "outside": outside, "pr": None, "review_id": None})
+                                   "outside": outside, "pr": pr, "review_id": review_id})
     k = rnd["round"]
     folder = reviews_dir(key, number)
     files = {"blocking": os.path.join(folder, f"round-{k}-blocking.json"),
@@ -757,15 +918,24 @@ def cmd_findings(args):
              "notes": os.path.join(folder, "notes.md")}
     write_json(files["blocking"], blocking, prefix=".findings-")
     write_json(files["review"], blocking + low, prefix=".findings-")
-    write_text(files["notes"], notes_text(load_rounds(key, number), add_rulings(key, number, rulings)),
+    all_rulings = add_rulings(key, number, rulings)
+    tickets = ticket_outside(repo, key, number, pr) if pr is not None else []
+    write_text(files["notes"], notes_text(load_rounds(key, number), all_rulings, load_tickets(key, number)),
                prefix=".findings-")
 
     stage, result = ("review", "pass") if k == 1 else ("fix", "fail" if blocking else "pass")
     out = {"ticket": number, "round": k, "head": head, "base": base, "review_base": head, "blocking": blocking,
-           "low": low, "outside": outside, "files": files, "record": {"stage": stage, "result": result}}
-    text = "\n".join([f"#{number} review round {k}: {len(blocking)} blocking, {len(low)} low, "
-                      f"{len(outside)} outside; record: harness-work stage {number} {stage} {result}"]
-                     + [f"{name}: {short_home(path)}" for name, path in files.items()])
+           "low": low, "outside": outside, "files": files, "record": {"stage": stage, "result": result},
+           "pr": pr, "review_id": review_id, "tickets": tickets}
+    lines = [f"#{number} review round {k}: {len(blocking)} blocking, {len(low)} low, "
+             f"{len(outside)} outside; record: harness-work stage {number} {stage} {result}"]
+    if pr is not None:
+        lines.append(f"PR #{pr}: review posted, " + (f"{plural(len(blocking + low), 'finding')} ({len(inline)} "
+                                                     f"inline, {len(off)} in the body)" if blocking + low
+                                                     else "no findings"))
+    if tickets:
+        lines.append("out-of-scope tickets: " + ", ".join(f"#{n}" for n in tickets))
+    text = "\n".join(lines + [f"{name}: {short_home(path)}" for name, path in files.items()])
     emit(args.json, out, text)
     return 0
 
@@ -870,41 +1040,53 @@ def short(text, n=100):
     return text if len(text) <= n else text[:n - 3] + "..."
 
 
+def gate_severity(value):
+    """A finding's severity for the review gate: one of SEVERITIES, else high (fail closed)."""
+    sev = str(value or "").lower()
+    return sev if sev in SEVERITIES else "high"
+
+
 def review_findings(repo, slug, number, review):
-    """["path:line [severity] body"] of a harness review: the inline comments and the body's list; [] when it says
-    "no findings". A finding count in the summary with fewer findings found adds one line for the rest."""
+    """([(severity, "path:line [severity] body")], unlisted) of a harness review: the body's list and the inline
+    comments, [] when it says "no findings"; a finding without a recognisable severity is high. unlisted is how
+    many more high plus medium findings the summary line counts than are listed (a summary without per-severity
+    counts: how many more findings of any severity, each counted as high)."""
     body = review.get("body") or ""
     if body.startswith("Harness review: no findings."):
-        return []
+        return [], 0
     found = []
     for line in body.splitlines():
         m = BODY_FINDING.match(line)
         if m:
-            found.append(f"{m.group(1).strip('`')} [{m.group(2)}] {short(m.group(3))}")
+            found.append((gate_severity(m.group(2)), f"{m.group(1).strip('`')} [{m.group(2)}] {short(m.group(3))}"))
     for c in api_list(repo, f"repos/{slug}/pulls/{number}/reviews/{review.get('id')}/comments"):
         if not isinstance(c, dict):
             continue
         text = (c.get("body") or "").replace(MARKER, "").strip()
         line = c.get("line") or c.get("original_line")
         place = f"{c.get('path') or '(no path)'}" + (f":{line}" if line else "")
-        found.append(f"{place} {short(text)}")
+        m = INLINE_SEVERITY.match(text)
+        found.append((gate_severity(m.group(1) if m else None), f"{place} {short(text)}"))
     m = REVIEW_COUNT.match(body)
-    declared = int(m.group(1)) if m else 0
-    if declared > len(found):
-        found.append(f"{declared - len(found)} more not listed (see the review)")
-    return found
+    if not m:
+        return found, 0
+    if m.group(2) is None:
+        return found, max(int(m.group(1)) - len(found), 0)
+    listed = sum(1 for sev, _ in found if sev != "low")
+    return found, max(int(m.group(2)) + int(m.group(3)) - listed, 0)
 
 
 def review_gate(repo, number):
-    """(the latest harness review, its findings) when that review has findings and no commit on the PR is newer
-    than it; else (review or None, []). A failing gh call raises Problem."""
+    """(the latest harness review, its high and medium findings, its low findings, how many more high or medium
+    findings its summary counts than it lists) when that review has findings and no commit on the PR is newer than
+    it; else (review or None, [], [], 0). A failing gh call raises Problem."""
     slug = repo.slug()
     review = latest_harness_review(api_list(repo, f"repos/{slug}/pulls/{number}/reviews"))
     if review is None:
-        return None, []
-    findings = review_findings(repo, slug, number, review)
-    if not findings:
-        return review, []
+        return None, [], [], 0
+    found, unlisted = review_findings(repo, slug, number, review)
+    if not found and not unlisted:
+        return review, [], [], 0
     submitted = parse_iso(review.get("submitted_at"))
     for c in api_list(repo, f"repos/{slug}/pulls/{number}/commits"):
         meta = c.get("commit") if isinstance(c, dict) else None
@@ -914,13 +1096,16 @@ def review_gate(repo, number):
             person = meta.get(who)
             when = when or (parse_iso(person.get("date")) if isinstance(person, dict) else None)
         if when is not None and when > submitted:
-            return review, []
-    return review, findings
+            return review, [], [], 0
+    return (review, [text for sev, text in found if sev != "low"], [text for sev, text in found if sev == "low"],
+            unlisted)
 
 
-def unaddressed(number, review, findings):
-    return (f"PR #{number}: the latest harness review ({review.get('submitted_at')}) has findings and no commit "
-            "after it: " + "; ".join(findings))
+def unaddressed(number, review, blocking, unlisted):
+    """The refusal: the high and medium findings listed, then a line for those the summary counts beyond them."""
+    items = blocking + ([f"{unlisted} more high or medium not listed (see the review)"] if unlisted else [])
+    return (f"PR #{number}: the latest harness review ({review.get('submitted_at')}) has "
+            f"{plural(len(blocking) + unlisted, 'high or medium finding')} and no commit after it: " + "; ".join(items))
 
 
 # --------------------------------------------------------------- ready
@@ -928,11 +1113,12 @@ def cmd_ready(args):
     repo = open_repo()
     number = args.number
     try:
-        review, findings = review_gate(repo, number)
+        review, blocking, lows, unlisted = review_gate(repo, number)
     except Problem as err:
         raise Problem(f"cannot check the harness review findings of PR #{number}: {err}") from None
-    if findings:
-        raise Problem(unaddressed(number, review, findings) + f"; fix them, push, then harness-pr ready {number}")
+    if blocking or unlisted:
+        raise Problem(unaddressed(number, review, blocking, unlisted)
+                      + f"; fix them, push, then harness-pr ready {number}")
     gh(["pr", "ready", str(number)], repo.root)
     view = pr_view(repo, number, "url,title,closingIssuesReferences")
     url, title = view.get("url") or "", view.get("title") or ""
@@ -945,6 +1131,8 @@ def cmd_ready(args):
             error = error or err
     notify(f"{repo.name} PR #{number} ready for review: {title}", f"harness-{repo.key}-pr-{number}")
     print(f"PR #{number} ready for review: {url}")
+    if lows:
+        warn("harness-pr", f"PR #{number}: {plural(len(lows), 'low finding')} left for the owner: " + "; ".join(lows))
     if not tickets:
         warn("harness-pr", f"PR #{number} names no ticket (no Closes #N, no --ticket); no status changed")
     if error:
@@ -1467,21 +1655,21 @@ def merge_preconditions(repo, number, view):
 
 
 def land_gate(repo, number, accept):
-    """Refuse a PR whose latest harness review has findings and no newer commit, and fail closed when gh cannot
-    tell; with --accept-findings, warn instead."""
+    """Refuse a PR whose latest harness review has high or medium findings and no newer commit, and fail closed
+    when gh cannot tell; with --accept-findings, warn instead. Low findings never refuse."""
     try:
-        review, findings = review_gate(repo, number)
+        review, blocking, _lows, unlisted = review_gate(repo, number)
     except Problem as err:
         if not accept:
             raise Problem(f"cannot check the harness review findings of PR #{number}: {err}") from None
         warn("harness-pr",
              f"cannot check the harness review findings of PR #{number} ({err}); landing it (--accept-findings)")
         return
-    if findings and not accept:
-        raise Problem(unaddressed(number, review, findings)
+    if (blocking or unlisted) and not accept:
+        raise Problem(unaddressed(number, review, blocking, unlisted)
                       + f"; fix them and push, or harness-pr land {number} --accept-findings to land it anyway")
-    if findings:
-        warn("harness-pr", unaddressed(number, review, findings) + "; landing it (--accept-findings)")
+    if blocking or unlisted:
+        warn("harness-pr", unaddressed(number, review, blocking, unlisted) + "; landing it (--accept-findings)")
 
 
 def cmd_land(args):
@@ -1695,6 +1883,7 @@ def parser():
     fd.add_argument("--worktree", metavar="PATH", help="the ticket worktree (default: the cwd)")
     fd.add_argument("--review", metavar="F", help="the reviewer's output: its findings array, then the verdict")
     fd.add_argument("--rulings", metavar="R", help="a file whose `Ruling:` lines go in the notes")
+    fd.add_argument("--model", metavar="NAME", default="opus", help="the reviewer's model, named in the posted review")
     fd.add_argument("--latest", action="store_true", help="print the latest recorded round; write nothing")
     fd.add_argument("--json", action="store_true")
 
