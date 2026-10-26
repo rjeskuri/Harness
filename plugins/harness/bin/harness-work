@@ -7,13 +7,14 @@ Usage:
     harness-work start N [--venue interactive|headless|bg]
     harness-work attempt N tests|breaker|code|review|fix|ci|verify pass|fail [--tier sonnet|opus|fable]
                          [--effort low|medium|high|xhigh|max]
+    harness-work stage N <stage> pass|fail [--tier T] [--effort E]
     harness-work cost N [--pr P] [--json | --markdown]
     harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]
     harness-work runs [--sweep] [--all]
     harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
     harness-work worktrees [--stale DAYS]
     harness-work worktree remove BRANCH [--discard]
-    start, attempt, cost, dispatch, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR, else the
+    start, attempt, stage, cost, dispatch, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR, else the
     cwd's repository); every subcommand except worktree remove takes --json.
 
 State, under ~/.claude/harness: repos/<repo-key>/tickets/<N>.json (the ticket cache that `harness-board show`
@@ -30,6 +31,15 @@ effort is --effort, else the route's effort when the attempt ran at the route's 
 failure in a row escalates: sonnet prints `escalate opus`, opus with no effort or below xhigh `escalate opus xhigh`;
 a stage already at opus xhigh or max, or on an explicitly named fable, gets needs-input instead. No escalation goes to
 fable. fix and breaker never escalate: retry, then needs-input. --json adds effort, next_tier and next_effort.
+
+stage: records as attempt does (the same code, store and answer), then prints `next: <step>` on a second line
+(--json: attempt's object plus "next"). retry and escalate repeat the stage, a breaker failure going back to tests;
+needs-input names needs-input; done goes tests -> breaker (risk:high) or code, breaker -> code, code -> review,
+review and fix -> fix while the latest review round (harness_lib.reviews) has blocking findings, else ci,
+ci -> `ultra, then verify` (risk:high) or verify, verify -> ready. Risk and flags come from the ticket cache (risk,
+flags, labels). Refused, exit 1 and nothing recorded: tests or breaker on a no-tests ticket, breaker on one that is
+not risk:high, review or fix with no review round, fix pass while the latest round has blocking findings and fix
+fail while it has none.
 
 cost: ticket N's tokens and model time per stage and model from the repository's transcripts (harness_lib/cost.py's
 ticket_usage), its labels and rounds from the ticket cache (the attempts replayed with attempt's rule; null without
@@ -104,7 +114,7 @@ try:
     from harness_lib.routing import EFFORTS, cached_code_route, code_route, load_routing, next_route, review_route
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, patterns, setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
-    from harness_lib import cost
+    from harness_lib import cost, reviews
     from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
     from harness_lib.text import write_json as _write_json
     from harness_lib import gh as ghlib
@@ -1126,11 +1136,17 @@ def stage_route(repo, cache, stage):
     return route["tier"], route["effort"], route["tier"]
 
 
-def cmd_attempt(repo, args):
-    n = args.number
+def ticket_cache(repo, n):
     cache = read_cache(repo, n)
     if cache is None:
         raise Problem(f"no ticket cache for #{n} ({repo.ticket_path(n)}); run harness-work start {n} first")
+    return cache
+
+
+def record_attempt(repo, cache, args):
+    """Append args' attempt to ticket args.number's cache `cache`, write it and return the failure policy's answer
+    as attempt's --json object. attempt and stage both record through here."""
+    n = args.number
     route_tier, route_effort, default_tier = stage_route(repo, cache, args.stage)
     tier = args.tier or default_tier
     effort = args.effort or (route_effort if tier == route_tier else None)
@@ -1148,10 +1164,78 @@ def cmd_attempt(repo, args):
     if action == "escalate" and nxt is None:
         action = "needs-input"          # nothing above opus xhigh or an explicit fable
     next_tier, next_effort = nxt or (None, None)
-    emit(wants_json(args), {"number": n, "stage": args.stage, "result": args.result, "tier": tier, "effort": effort,
-                            "failures": failures, "action": action, "next_tier": next_tier,
-                            "next_effort": next_effort},
-         " ".join(x for x in (action, next_tier, next_effort) if x))
+    return {"number": n, "stage": args.stage, "result": args.result, "tier": tier, "effort": effort,
+            "failures": failures, "action": action, "next_tier": next_tier, "next_effort": next_effort}
+
+
+def answer_text(data):
+    """attempt's text answer: `done`, `retry`, `escalate <tier> [<effort>]` or `needs-input`."""
+    return " ".join(x for x in (data["action"], data["next_tier"], data["next_effort"]) if x)
+
+
+def cmd_attempt(repo, args):
+    data = record_attempt(repo, ticket_cache(repo, args.number), args)
+    emit(wants_json(args), data, answer_text(data))
+
+
+def ticket_marks(cache):
+    """The cache's label names and flags, plus `risk:<risk>` from its risk: where stage reads risk:high and
+    no-tests."""
+    labels = cache.get("labels") if isinstance(cache.get("labels"), list) else []
+    flags = cache.get("flags") if isinstance(cache.get("flags"), list) else []
+    marks = [x.get("name") if isinstance(x, dict) else x for x in labels] + flags
+    if isinstance(cache.get("risk"), str):
+        marks.append("risk:" + cache["risk"])
+    return {m for m in marks if isinstance(m, str)}
+
+
+def stage_refusal(n, stage, result, marks, found):
+    """Why `stage` must not record this attempt, or None. `found` is the latest review round's blocking count
+    (None without a round), read for review and fix only."""
+    if stage in ("tests", "breaker") and "no-tests" in marks:
+        return f"#{n} is flagged no-tests; it has no {stage} stage"
+    if stage == "breaker" and "risk:high" not in marks:
+        return f"#{n} is not risk:high; the breaker runs only on risk:high tickets"
+    if stage not in ("review", "fix"):
+        return None
+    if found is None:
+        return f"no review round recorded for #{n}; run harness-pr findings first"
+    if stage == "fix" and (result == "pass") == (found > 0):
+        findings = f"{found} blocking finding" + ("" if found == 1 else "s")
+        return (f"fix {result} on #{n}: its latest review round has {findings}; "
+                f"fix {result} needs {'none' if result == 'pass' else 'at least one'}")
+    return None
+
+
+def next_step(data, marks, found):
+    """The work loop's step after the attempt `data`: the same stage on retry or escalate (tests after a breaker
+    failure, so the author tightens them), needs-input, or the stage a pass leads to."""
+    stage, action = data["stage"], data["action"]
+    if action == "needs-input":
+        return "needs-input"
+    if action != "done":
+        return "tests" if stage == "breaker" else stage
+    if stage in ("review", "fix"):
+        return "fix" if found else "ci"
+    high = "risk:high" in marks
+    return {"tests": "breaker" if high else "code", "breaker": "code", "code": "review",
+            "ci": "ultra, then verify" if high else "verify", "verify": "ready"}[stage]
+
+
+def cmd_stage(repo, args):
+    n = args.number
+    cache = ticket_cache(repo, n)
+    marks = ticket_marks(cache)
+    found = None
+    if args.stage in ("review", "fix"):
+        rnd = reviews.latest_round(repo.key, n)
+        found = None if rnd is None else len(reviews.blocking(rnd))
+    why = stage_refusal(n, args.stage, args.result, marks, found)
+    if why:
+        raise Problem(why)
+    data = record_attempt(repo, cache, args)
+    data["next"] = next_step(data, marks, found)
+    emit(wants_json(args), data, f"{answer_text(data)}\nnext: {data['next']}")
 
 
 PR_FIELDS = "number,url,createdAt,mergedAt,headRefName"
@@ -1476,7 +1560,7 @@ def parser():
     nested_json = argparse.ArgumentParser(add_help=False)     # never resets a --json given before the action
     nested_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
     ap = Parser(prog="harness-work", description="Ticket worktrees, attempts, dispatch, runs and budgets.")
-    sub = ap.add_subparsers(dest="cmd", metavar="{start,attempt,cost,dispatch,runs,budget,worktrees,worktree}")
+    sub = ap.add_subparsers(dest="cmd", metavar="{start,attempt,stage,cost,dispatch,runs,budget,worktrees,worktree}")
     sub.required = True
 
     start = sub.add_parser("start", parents=[with_repo, with_json],
@@ -1496,6 +1580,16 @@ def parser():
     attempt.add_argument("--effort", choices=EFFORTS,
                          help="the effort this attempt ran at (default: the stage route's effort when it ran at that "
                               "route's tier, else none)")
+
+    stage = sub.add_parser("stage", parents=[with_repo, with_json],
+                           help="record a stage's result as attempt does, then print the work loop's next step")
+    stage.add_argument("number", type=issue_number, metavar="N")
+    stage.add_argument("stage", choices=STAGES)
+    stage.add_argument("result", choices=("pass", "fail"))
+    stage.add_argument("--tier", choices=TIERS, help="the tier this attempt ran at (default: the stage's route)")
+    stage.add_argument("--effort", choices=EFFORTS,
+                       help="the effort this attempt ran at (default: the stage route's effort when it ran at that "
+                            "route's tier, else none)")
 
     cost_ = sub.add_parser("cost", parents=[with_repo],
                            help="a ticket's tokens and model time per stage and model, with its rounds; "
@@ -1556,7 +1650,7 @@ def main():
         elif args.cmd == "budget":
             cmd_budget(args)
         else:
-            command = {"start": cmd_start, "attempt": cmd_attempt, "cost": cmd_cost, "dispatch": cmd_dispatch,
+            command = {"start": cmd_start, "attempt": cmd_attempt, "stage": cmd_stage, "cost": cmd_cost, "dispatch": cmd_dispatch,
                        "worktrees": cmd_worktrees, "worktree": cmd_worktree_remove}[args.cmd]
             command(open_repo(args.repo), args)
     except Problem as err:
