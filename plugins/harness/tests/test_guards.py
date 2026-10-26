@@ -156,7 +156,11 @@ NO_RED = (
     "(No red run recorded.)"
 )
 NO_CACHE = " There is no ticket cache either; harness-work start 12 writes it."
-CHANGED = "Tests changed since the red run; run harness-red check again."
+# #275: a stale record can also be re-proved against main's code with harness-red reprove.
+CHANGED = (
+    "Tests changed since the red run; run harness-red check again, or harness-red "
+    "reprove once the branch has source changes."
+)
 BRANCH = "t/12-fix-login"
 # Test configuration (tests_first's TEST_CONFIG) that the default HARNESS_TEST_PATTERNS do
 # not also call tests: on a no-tests ticket the coder may edit these (#281). conftest.py is
@@ -4022,6 +4026,32 @@ class TestsFirstMainMergeTests(GuardTestCase):
         self.write(path, replaced(path.read_text(), "1 + 1 == 2", "1 + 1 == 3"))
         self.commit_all(wt, "the branch edits its other test file")
         self.assertSourceDenied(wt)
+
+    # ---- #275: a fix round's test commit, re-proved with harness-red reprove
+
+    def test_harness_red_reprove_after_a_fix_round_test_commit_allows_source_again(self):
+        # PR #274's shape: after the coder's source commit, a fix round commits a test of
+        # the branch's own (coverage that passes at HEAD). The record is stale and check
+        # refuses (source changed); reprove proves the tests as they are now against
+        # main's code at the merge base, and source edits are allowed again.
+        repo, wt = self.ticket("reprove")
+        path = wt / "tests/test_app.py"
+        self.write(path, path.read_text() + "\n\ndef test_login_again():\n    assert login() == 'ok'\n")
+        self.commit_all(wt, "coverage for login")
+        self.assertEqual(self.status(wt), "current: no")
+        self.assertSourceDenied(wt)
+        r = self.harness_red(wt, "check")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("Source already changed before the red run", r.stderr)
+        r = self.harness_red(wt, "reprove")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("red (assertion)", r.stdout)
+        record = json.loads(self.record_file(repo).read_bytes())
+        self.assertEqual(record["base_sha"], self.git(wt, "merge-base", "HEAD", "main"))
+        self.assertEqual(record["test_files"], sorted(MERGE_TEST_FILES))
+        self.assertEqual(record["test_hash"], content_hash(wt, record["test_files"]))
+        self.assertEqual(self.status(wt), "current: yes")
+        self.assertSourceAllowed(wt)
 
     # ---- DoD 3: a merge resolution that changes the branch's own test lines denies
 
