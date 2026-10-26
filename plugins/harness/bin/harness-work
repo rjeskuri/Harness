@@ -13,15 +13,18 @@ Usage:
     harness-work cost N [--pr P] [--json | --markdown]
     harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]
     harness-work runs [--sweep] [--all]
+    harness-work waves [--all] [--refresh]
+    harness-work wave drop ID N
     harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
     harness-work worktrees [--stale DAYS]
     harness-work worktree remove BRANCH [--discard]
-    start, attempt, stage, cost, dispatch, cloud, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR,
+    start, attempt, stage, cost, dispatch, cloud, waves, wave, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR,
     else the cwd's repository); every subcommand except worktree remove takes --json.
 
 State, under ~/.claude/harness: repos/<repo-key>/tickets/<N>.json (the ticket cache that `harness-board show`
 writes; start adds branch, worktree and started_at, attempt adds to attempts), repos/<repo-key>/cost/<N>.json (the
-record `cost` writes), runs/<repo-key>-<N>-<stamp>.json and .log (one dispatched run), budgets.json
+record `cost` writes), repos/<repo-key>/waves/<id>.json (a wave, harness_lib/waves.py), runs/<repo-key>-<N>-<stamp>.json
+and .log (one dispatched run), budgets.json
 ({"api"|"cloud": {"exhausted_until", "reason"}}).
 
 attempt: appends {stage, tier, effort, result, at} to the ticket cache's attempts and prints the failure policy's
@@ -83,6 +86,23 @@ replaces the labels), as `--effort <level>` (bg: before the prompt; headless: la
 record. With no effort: no flag, no key. An invalid value is one `harness-work:` warning on stderr per command (a dry
 run and an empty board too) and is ignored. The dispatcher's own CLAUDE_EFFORT is never inherited. --dry-run's first line names the
 effort when set (`Dry run: venue bg, effort xhigh, ...`); every --json result has a top-level `effort` (null when unset).
+Waves (#180): with HARNESS_WAVE_REVIEW set (load_routing's wave_tier), the tickets one dispatch launched that are in no
+unreviewed wave become one new wave (waves.create_wave, at that tier and effort xhigh), printed as `wave <id>: #12, #13
+(reviewed together once all are in review)`; a redispatched ticket keeps its unreviewed wave, so a dispatch that
+launches only those makes none. Every launched run record gets `wave` (its id) and every --json result a top-level
+`wave` (the new id, or null). --dry-run prints `would group #12, #13 into a wave` and its JSON has `"wave": {"id":
+null, "tickets": [...]}` (null when nothing would be grouped); it writes no wave. Without the setting nothing changes:
+no wave, no `wave` key.
+
+waves: this repository's waves (those with a ticket not closed; --all every one) as ID, TICKETS, STATE (empty,
+working, due, reviewing, reviewed) and DETAIL (`1 of 2 in review; waiting for #13 (in-progress)`, `due`, `reviewing
+(run <id>)`, `reviewed <time>`), the statuses from the ticket caches with no gh call; --refresh asks `gh issue view N
+--json state,labels` once per waiting ticket and uses its status (a failing call is one warning; the caches are not
+written). --json prints each wave record plus state, done, waiting and detail.
+
+wave drop ID N: moves ticket N from the wave's tickets to dropped (waves.drop_ticket), so a wave with a stuck ticket
+can become due; refused, one line and exit 1, for an unknown wave, a ticket the wave does not list and a wave whose
+review was launched.
 
 runs --sweep: closes the records of runs that ended and classifies each (ok, error, billing, auth; a bg run by its
 `claude agents` state, done being ok). An `ok` run, headless or bg, whose issue is OPEN and still status:in-progress
@@ -139,7 +159,7 @@ try:
     from harness_lib.routing import EFFORTS, cached_code_route, code_route, load_routing, next_route, review_route
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, patterns, setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
-    from harness_lib import cost, reviews
+    from harness_lib import cost, reviews, waves
     from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
     from harness_lib.text import write_json as _write_json
     from harness_lib import gh as ghlib
@@ -1657,28 +1677,38 @@ def cmd_dispatch(repo, args):
             detail += f", draft PR #{row['draft_pr']}"
         return f"#{row['number']} {row.get('title') or ''} ({detail})"
 
+    wave_tier = routing["wave_tier"]
+    extra = {"wave": None} if wave_tier else {}     # without HARNESS_WAVE_REVIEW the output is as before #180
     if args.dry_run:
         shown = f"effort {effort}, " if effort else ""
         lines = [f"Dry run: venue {venue}, {shown}{len(live)} live, {max(0, slots)} of {args.max} slots free."]
         lines += [f"would start {describe(row)} and launch {venue}" for row in plan]
+        group = [row["number"] for row in plan if open_wave(repo, row["number"]) is None] if wave_tier else []
+        if group:
+            lines.append(f"would group {tickets_text(group)} into a wave")
+            extra["wave"] = {"id": None, "tickets": sorted(group)}
         lines += [f"skip #{s['number']}: {s['why']}" for s in skipped]
         if not candidates:
             lines.append("No ready tickets.")
-        emit(wants_json(args), {"venue": venue, "effort": effort, "dry_run": True, "live": [r["id"] for r in live.values()],
-                    "plan": plan, "skipped": skipped}, "\n".join(lines))
+        emit(wants_json(args), dict({"venue": venue, "effort": effort, "dry_run": True,
+                                     "live": [r["id"] for r in live.values()], "plan": plan, "skipped": skipped},
+                                    **extra), "\n".join(lines))
         return
     if not args.json:
         for s in capped:
             print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
-        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped}, "No ready tickets.")
+        emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
+                                     "skipped": skipped}, **extra), "No ready tickets.")
         return
     if slots <= 0:
-        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped},
+        emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
+                                     "skipped": skipped}, **extra),
              f"{len(live)} live runs; --max {args.max} reached, nothing launched.")
         return
     if not plan:
-        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped},
+        emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
+                                     "skipped": skipped}, **extra),
              "Nothing to launch: " + "; ".join(f"#{s['number']} has a {s['why']}" for s in skipped
                                                if s not in capped) + ".")
         return
@@ -1704,11 +1734,124 @@ def cmd_dispatch(repo, args):
         if not args.json:
             where = f"pid {record['pid']}, log {record['log']}" if venue == "headless" else f"id {record['bg_id']}"
             print(f"#{n} {venue} on {record['branch']} ({where})", flush=True)
+    if wave_tier and launched:
+        extra["wave"] = group_wave(repo, launched, wave_tier, routing["wave_effort"], args.json)
     if args.json:
-        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": launched, "failed": failures,
-                                "skipped": skipped}, "")
+        emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": launched, "failed": failures,
+                                     "skipped": skipped}, **extra), "")
     if failures:
         sys.exit(1)
+
+
+def tickets_text(numbers):
+    return ", ".join(f"#{n}" for n in sorted(numbers))
+
+
+def open_wave(repo, n):
+    """Ticket n's newest wave (waves.wave_of) while its review has not finished, else None: a redispatched ticket
+    stays in that wave, and one whose wave was reviewed joins a new one."""
+    wave = waves.wave_of(repo.key, n)
+    review = wave.get("review") if wave else None
+    if wave is None or (isinstance(review, dict) and review.get("reviewed_at")):
+        return None
+    return wave
+
+
+def group_wave(repo, launched, tier, effort, as_json):
+    """Stamp each launched run record with its wave: a ticket already in an unreviewed wave keeps it, the rest form
+    one new wave (waves.create_wave), announced on stdout. The new wave's id, or None when every ticket had one."""
+    kept, fresh = {}, []
+    for record in launched:
+        wave = open_wave(repo, record["ticket"])
+        if wave is None:
+            fresh.append(record)
+        else:
+            kept[record["id"]] = wave["id"]
+    new = waves.create_wave(repo.key, repo.main, [r["ticket"] for r in fresh], tier, effort) if fresh else None
+    for record in launched:
+        record["wave"] = kept.get(record["id"]) or new["id"]
+        save_run(record)
+    if new is None:
+        return None
+    if not as_json:
+        print(f"wave {new['id']}: {tickets_text(new['tickets'])} (reviewed together once all are in review)",
+              flush=True)
+    return new["id"]
+
+
+def issue_status(issue):
+    """The board status of a `gh issue view --json state,labels` answer: closed for a CLOSED issue, else the name
+    after `status:` of its first status label, else None."""
+    if not isinstance(issue, dict):
+        return None
+    if str(issue.get("state", "")).upper() == "CLOSED":
+        return "closed"
+    for label in issue.get("labels") or []:
+        name = label.get("name") if isinstance(label, dict) else label
+        if isinstance(name, str) and name.startswith("status:"):
+            return name[len("status:"):]
+    return None
+
+
+def wave_detail(wave, state, prog):
+    if state == "working":
+        total = len(prog["done"]) + len(prog["waiting"])
+        waiting = ", ".join(f"#{w['number']} ({w['status'] or 'no status'})" for w in prog["waiting"])
+        return f"{len(prog['done'])} of {total} in review; waiting for {waiting}"
+    review = wave.get("review") if isinstance(wave.get("review"), dict) else {}
+    if state == "reviewing":
+        return f"reviewing (run {review.get('run')})"
+    if state == "reviewed":
+        return f"reviewed {review.get('reviewed_at')}"
+    return "no tickets" if state == "empty" else state
+
+
+def cmd_waves(repo, args):
+    """This repository's waves with their state and what each waits for, from the ticket caches; --refresh asks gh
+    once per waiting ticket."""
+    every = waves.load_waves(repo.key)
+    numbers = sorted({n for w in every for n in w.get("tickets") or [] if isinstance(n, int)})
+    statuses = waves.ticket_statuses(repo.key, numbers)
+    if args.refresh:
+        for n in numbers:
+            if statuses[n] in waves.DONE:
+                continue
+            try:
+                found = gh_json(repo, ["issue", "view", str(n), "--json", "state,labels"])
+            except Problem as err:
+                warn(f"#{n}: cannot refresh its status; the cache's stands: {err}")
+                continue
+            statuses[n] = issue_status(found)
+    rows = []
+    for wave in every:
+        tickets = [n for n in wave.get("tickets") or [] if isinstance(n, int)]
+        if not args.all and all(statuses.get(n) == "closed" for n in tickets):
+            continue
+        prog = waves.progress(wave, statuses)
+        state = waves.wave_state(wave, statuses)
+        rows.append(dict(wave, state=state, done=prog["done"], waiting=prog["waiting"],
+                         detail=wave_detail(wave, state, prog)))
+    if args.json:
+        emit(True, rows, "")
+    elif not rows:
+        print("No waves." if args.all else "No open waves (--all lists every wave).")
+    else:
+        lines = [("ID", "TICKETS", "STATE", "DETAIL")]
+        lines += [(r["id"], tickets_text(r.get("tickets") or []) or "-", r["state"], r["detail"]) for r in rows]
+        print(table(lines))
+
+
+def cmd_wave_drop(repo, args):
+    wave = waves.load_wave(repo.key, args.id)
+    if wave is None:
+        raise Problem(f"no wave {args.id} in this repository; harness-work waves --all lists them")
+    review = wave.get("review")
+    if isinstance(review, dict) and review.get("launched_at"):
+        raise Problem(f"wave {args.id}'s review was launched at {review['launched_at']}; nothing dropped")
+    if args.number not in (wave.get("tickets") or []):
+        raise Problem(f"#{args.number} is not in wave {args.id}")
+    wave = waves.drop_ticket(repo.key, args.id, args.number)
+    emit(wants_json(args), wave, f"dropped #{args.number} from wave {args.id}")
 
 
 def cmd_runs(args):
@@ -1858,7 +2001,8 @@ def parser():
     nested_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
     ap = Parser(prog="harness-work", description="Ticket worktrees, attempts, dispatch, runs and budgets.")
     sub = ap.add_subparsers(dest="cmd",
-                            metavar="{start,attempt,stage,cost,dispatch,cloud,runs,budget,worktrees,worktree}")
+                            metavar="{start,attempt,stage,cost,dispatch,cloud,runs,waves,wave,budget,worktrees,"
+                                    "worktree}")
     sub.required = True
 
     start = sub.add_parser("start", parents=[with_repo, with_json],
@@ -1916,6 +2060,20 @@ def parser():
     runs.add_argument("--sweep", action="store_true", help="close ended runs and classify their outcome")
     runs.add_argument("--all", action="store_true", help="every run on record")
 
+    waves_ = sub.add_parser("waves", parents=[with_repo, with_json],
+                            help="this repository's waves (the tickets one dispatch launched) and where each stands")
+    waves_.add_argument("--all", action="store_true", help="every wave, those whose tickets are all closed too")
+    waves_.add_argument("--refresh", action="store_true",
+                        help="ask gh for each waiting ticket's status instead of trusting its cache")
+
+    wave = sub.add_parser("wave", help="one wave")
+    wave_sub = wave.add_subparsers(dest="action", metavar="{drop}")
+    wave_sub.required = True
+    drop = wave_sub.add_parser("drop", parents=[with_repo, with_json],
+                               help="take a ticket out of a wave whose review was not launched")
+    drop.add_argument("id", metavar="ID")
+    drop.add_argument("number", type=issue_number, metavar="N")
+
     budget = sub.add_parser("budget", parents=[with_json], help="the api and cloud budgets")
     budget_sub = budget.add_subparsers(dest="action", metavar="{status,exhaust,reset}")
     budget_sub.add_parser("status", parents=[nested_json], help="each budget's state (the default)")
@@ -1953,7 +2111,8 @@ def main():
             cmd_budget(args)
         else:
             command = {"start": cmd_start, "attempt": cmd_attempt, "stage": cmd_stage, "cost": cmd_cost, "dispatch": cmd_dispatch,
-                       "cloud": cmd_cloud, "worktrees": cmd_worktrees, "worktree": cmd_worktree_remove}[args.cmd]
+                       "cloud": cmd_cloud, "waves": cmd_waves, "wave": cmd_wave_drop, "worktrees": cmd_worktrees,
+                       "worktree": cmd_worktree_remove}[args.cmd]
             command(open_repo(args.repo), args)
     except Problem as err:
         sys.exit(f"harness-work: {one_line(err)}")
