@@ -124,6 +124,7 @@ Per project, in `.claude/settings.json` under `env` (read by hooks and tools the
 | `HARNESS_WORKTREE_SETUP` | command run in a fresh worktree | detected: `uv sync` when `uv.lock`, `npm ci` when `package-lock.json`; always followed by copying gitignored files that match `.worktreeinclude` |
 | `HARNESS_ALLOW_MAIN` | `1` disables the branch guard for this project | unset |
 | `HARNESS_TEST_TIMEOUT` | seconds for a red run | 300 |
+| `HARNESS_VERIFY_TIMEOUT` | seconds a `harness-red verify` run may take before its supervisor stops it and records `timeout` | 3600 |
 | `HARNESS_CODE_TIER` | `sonnet`, `opus` or `fable`: the tier the coding stage uses whatever the labels say | unset (the label rubric decides) |
 | `HARNESS_CODE_EFFORT` | `low`, `medium`, `high`, `xhigh` or `max`: the effort passed with the coding stage's tier | unset (no effort passed) |
 | `HARNESS_REVIEW_TIER` | `sonnet`, `opus` or `fable`: the tier the review stage uses whatever the labels say; a `fable` review carries effort `xhigh`, any other tier none | unset (the labels: `opus`, at effort `xhigh` for `risk:high`) |
@@ -150,6 +151,7 @@ Globs match against the repo-relative path with `/` separators; `**` matches any
   - `scratch/<branch-slug>/`: the adversary's working copy.
   - `tickets/<issue>.json`: ticket cache.
   - `ultra/<pr>.json`
+  - `verify/<branch-slug>.json` and `.log`: the branch's last `harness-red verify` run and its output; schema under harness-red.
   - `waves/<id>.json`: one dispatch batch, below.
 - `$TMPDIR/claude-harness/<repo-key>/`: the v1 ephemeral state (dirty lists, fingerprints), unchanged.
 
@@ -417,6 +419,12 @@ Runs in a ticket worktree (cwd, or `--worktree PATH`). On a `t/<n>-` branch whos
 - `run [--base origin/main]`: `HARNESS_TEST_CMD` (or the detected default) with `{files}` = the `files` list, `cwd` = worktree, timeout `HARNESS_TEST_TIMEOUT`, `PYTHONDONTWRITEBYTECODE=1`; prints `own tests: <n> files, exit <code>` and the last 40 lines, exit 0 when the command passed, else 1; a timeout prints `own tests: <n> files, <cmd> timed out after <t>s and was stopped`, exit 1. No files: `no own test files for this branch's changes; nothing run`, exit 0. It writes no record and never reads the red record.
 - After a merge of main the record stays current, so no new `check` is needed; one run anyway refuses with `Source already changed before the red run` (the coder's source is on the branch) and leaves the record as it was.
 - `scratch create`: a detached worktree of `HEAD` at `~/.claude/harness/repos/<key>/scratch/<branch-slug>` (plus uncommitted test files copied in), prints the path; `scratch run`: `HARNESS_TEST_CMD` on the record's test files in the scratch, prints `cheat passed` (exit 0) or `cheat failed` (exit 1) and the tail; `scratch remove`.
+- `verify [--wait] [--timeout SECONDS] [--rerun] [--json]`: the full verify, run once just before `harness-pr ready`, outliving the call that starts it and waited on in slices (the orchestrator calls it with `--wait --timeout 540` inside a 600 s Bash call).
+  1. The command is `CLAUDE_VERIFY_CMD` (the environment, else `env` in the worktree's `.claude/settings.local.json` over `.claude/settings.json`); unset or blank: `no verify command (CLAUDE_VERIFY_CMD unset); nothing run`, exit 0 (`--json`: `{"state": "none", ...}`).
+  2. Anything `git status --porcelain` lists: `uncommitted changes in <worktree>; commit them first`, exit 1, no run and no record.
+  3. The record `verify/<branch-slug>.json` is `{"branch", "head" (full SHA), "cmd", "state": "running|passed|failed|timeout", "pid", "started_at", "finished_at", "exit", "log"}`; the output goes to `verify/<branch-slug>.log`. Finished (a timeout included) for this HEAD and command: reported, nothing run (`--rerun` starts a fresh one, stopping a live one first). Running for this HEAD and command: attached to. Running for another HEAD or command: its process group is killed, then a fresh run starts. None: one starts. A `running` record whose pid is gone, a zombie, another user's, or a process that began more than 5 s after `started_at` (a recycled pid) is dead: a fresh run starts and that pid is never signalled.
+  4. A run is a supervisor (`harness-red` itself, launched in a session of its own) that writes the record with its own pid, runs the command through the shell from the worktree root in its process group with stdout and stderr to the log and `PYTHONDONTWRITEBYTECODE=1`, and writes the result when the command ends; after `HARNESS_VERIFY_TIMEOUT` seconds it records `timeout` and kills its whole process group. The record is therefore finished by the run itself, with nobody waiting, and killing the call (SIGTERM or SIGKILL to its group) leaves the run going. A call waits at most 15 s for a new supervisor to record its run, else it stops it and exits 1 naming the log.
+  5. Without `--wait` the call reports the state at once; with `--wait` it polls until the run finishes or `--timeout` seconds (default 540) pass. Exit 0 passed (`verify passed at <sha>`); 1 failed or timed out, with the log's last 60 lines; 8 still running, `verify running for <n> s; run harness-red verify --wait again`, `n` counted from `started_at`. A run that dies or is replaced during a wait exits 1 with a line saying so. `--json`: `{"state", "head", "cmd", "exit", "log", "started_at", "finished_at", "tail"}` (`exit` is null while running and for a timeout).
 
 ### harness-pr
 
