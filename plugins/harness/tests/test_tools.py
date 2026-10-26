@@ -71,7 +71,7 @@ def system_path():
 def tool_env(home, fakebin, ceiling, **extra):
     """The environment the tools run in: a fake HOME, `fakebin` first on PATH, git confined below `ceiling`."""
     env = {k: v for k, v in os.environ.items()
-           if k not in ("CLAUDE_PROJECT_DIR", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+           if k not in ("CLAUDE_PROJECT_DIR", "HARNESS_SESSION_PROJECT", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
     env.update(HOME=home, PATH=os.pathsep.join([fakebin, system_path()]), GIT_CEILING_DIRECTORIES=ceiling,
                GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@localhost",
                GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@localhost")

@@ -37,7 +37,11 @@ the others come from the environment, then `env` in the worktree's .claude/setti
 .claude/settings.local.json over it: HARNESS_TEST_CMD ({files} becomes the test files, shell-quoted; detected when unset) and
 HARNESS_TEST_TIMEOUT (seconds, default 300) and HARNESS_TEST_MAP (comma-separated SOURCE_GLOB=TEST_GLOB pairs:
 a changed path matching SOURCE_GLOB adds the test modules matching TEST_GLOB to `files`), and for verify
-CLAUDE_VERIFY_CMD and HARNESS_VERIFY_TIMEOUT (seconds, default 3600).
+CLAUDE_VERIFY_CMD and HARNESS_VERIFY_TIMEOUT (seconds, default 3600). In a session of another project
+(CLAUDE_PROJECT_DIR names a folder whose main checkout is not this repository's) the environment holds that
+project's settings, so these come from the worktree's settings alone. A test command that cannot start (exit 126
+or 127, or output that is only npm's complaint of no package.json or no test script, or only python3's of a
+missing -m module or script) is refused, never red.
 
 The verify record is ~/.claude/harness/repos/<repo-key>/verify/<branch-slug>.json: {"branch", "head", "cmd",
 "state": "running|passed|failed|timeout", "pid", "started_at", "finished_at", "exit", "log"}, the output going
@@ -69,6 +73,7 @@ try:
     from harness_lib.redproof import read_files, record_current, save_red_files, tests_hash
     from harness_lib.repo import NotARepository, RepoError, repo_facts
     from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
+    from harness_lib.settings import other_project, project_setting
     from harness_lib.settings import DEFAULT_TEST_PATTERNS as TEST_PATTERNS  # also read by tests/test_red.py
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT as SOURCE_EXEMPT  # also read by tests/test_red.py
     from harness_lib.cli import Parser, Problem, run_main, warn  # Problem also caught by tests/test_red.py
@@ -79,6 +84,14 @@ except Exception as exc:  # one line, exit 1, like the __main__ wrapper below
 DEFAULT_TIMEOUT = 300.0
 TAIL_LINES = 40
 CANNOT_START = (126, 127)          # the shell's "not executable" and "command not found"
+# The runner itself did not start, whatever its exit, when the whole output is its own complaint: npm's lines alone,
+# one saying it found no package.json (ENOENT) or no test script, or the interpreter's one line for a missing -m
+# module or script file (a test importing a missing module is red: its traceback says `ModuleNotFoundError: No
+# module named 'x'`, never `python3: No module named x`). Output a test printed (a test that runs npm) is not that.
+NPM_LINE_RE = re.compile(r"npm (?:ERR!|error|warn|WARN)(?:\s|$)")
+NPM_CANNOT_START_RE = re.compile(r"npm (?:ERR!|error) (?:enoent .*package\.json|missing script: )", re.I)
+PYTHON_CANNOT_START_RE = re.compile(r"[^:]*python[\w.]*: (?:No module named |can't open file |"
+                                    r"Error while finding module specification for )", re.I)
 IMPORT_RE = re.compile(r"ModuleNotFoundError|ImportError|No module named|Cannot find module|ERR_MODULE_NOT_FOUND")
 ASSERTION_RE = re.compile(r"AssertionError|assert |FAILED|failed|✗|not ok")
 # A run that proves nothing: no record. Exit 5 is pytest's and (3.12+) unittest's "no tests ran".
@@ -132,8 +145,8 @@ def detect_test_cmd(root, files):
     return None
 
 
-def test_timeout(file_env):
-    raw = setting("HARNESS_TEST_TIMEOUT", file_env)
+def test_timeout(file_env, foreign=False):
+    raw = project_setting("HARNESS_TEST_TIMEOUT", file_env, foreign)
     try:
         value = float(raw) if raw is not None else DEFAULT_TIMEOUT
     except ValueError:
@@ -186,6 +199,9 @@ class Repo:
         self.verify_record = os.path.join(state, "verify", self.slug + ".json")
         self.verify_log = os.path.join(state, "verify", self.slug + ".log")
         self.env = settings_env(self.top)
+        # A session of another project carries that project's settings in the environment: then the worktree's
+        # settings alone decide the settings read through worktree_setting.
+        self.foreign = other_project(self.main)
         # What counts as a test is decided by the main checkout's tracked settings.json only, as in
         # tests_first: the worktree's files and settings.local.json are agent-editable.
         classify_env = settings_env(self.main, ("settings.json",))
@@ -200,8 +216,13 @@ class Repo:
             return "exempt"
         return "source"
 
+    def worktree_setting(self, name):
+        """A worktree setting: the environment, then the worktree's settings; the settings alone in another
+        project's session."""
+        return project_setting(name, self.env, self.foreign)
+
     def test_command(self, files):
-        cmd = setting("HARNESS_TEST_CMD", self.env) or detect_test_cmd(self.top, files)
+        cmd = self.worktree_setting("HARNESS_TEST_CMD") or detect_test_cmd(self.top, files)
         if not cmd:
             raise Problem("no test command for these files: set HARNESS_TEST_CMD under env in "
                           ".claude/settings.json ({files} becomes the test files)")
@@ -329,10 +350,20 @@ def kind_of(code, output):
     return "error"
 
 
+def cannot_start(output):
+    """The line saying the runner never started (its own complaint alone, see NPM_LINE_RE), or None."""
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    if lines and all(NPM_LINE_RE.match(ln) for ln in lines):
+        return next((ln for ln in lines if NPM_CANNOT_START_RE.match(ln)), None)
+    if len(lines) == 1 and PYTHON_CANNOT_START_RE.match(lines[0]):
+        return lines[0]
+    return None
+
+
 def run_tests(repo, files, cwd):
     """(cmd, exit, output, timed out) for the test files run in `cwd`; refuses a command that cannot start."""
     cmd = repo.test_command(files)
-    timeout = test_timeout(repo.env)
+    timeout = test_timeout(repo.env, repo.foreign)
     try:
         code, output = run_command(cmd, cwd, timeout)
     except subprocess.TimeoutExpired:
@@ -342,6 +373,9 @@ def run_tests(repo, files, cwd):
     if code in CANNOT_START:
         said = [ln.strip() for ln in output.splitlines() if ln.strip()]
         raise Problem(f"could not start {cmd}: {said[-1] if said else f'exit {code}'}; set HARNESS_TEST_CMD")
+    said = cannot_start(output) if code else None
+    if said:
+        raise Problem(f"could not start {cmd}: {said} (exit {code}); set HARNESS_TEST_CMD")
     return cmd, code, output, None
 
 
@@ -375,7 +409,7 @@ def name_keys(path):
 def test_map(repo):
     """HARNESS_TEST_MAP as (source glob, test glob) pairs; an entry without `=` is skipped with a warning."""
     pairs = []
-    for entry in patterns(setting("HARNESS_TEST_MAP", repo.env) or ""):
+    for entry in patterns(repo.worktree_setting("HARNESS_TEST_MAP") or ""):
         source, eq, test = entry.partition("=")
         if not eq:
             warn("harness-red", f"HARNESS_TEST_MAP entry {entry!r} has no '=' (SOURCE_GLOB=TEST_GLOB); skipped")
@@ -667,8 +701,8 @@ POLL = 0.5
 UNSET_CMD = "no verify command (CLAUDE_VERIFY_CMD unset); nothing run"
 
 
-def verify_timeout(file_env):
-    raw = setting("HARNESS_VERIFY_TIMEOUT", file_env)
+def verify_timeout(file_env, foreign=False):
+    raw = project_setting("HARNESS_VERIFY_TIMEOUT", file_env, foreign)
     try:
         value = float(raw) if raw is not None else VERIFY_TIMEOUT
     except ValueError:
@@ -829,7 +863,7 @@ def verify_report(record, as_json):
 
 
 def cmd_verify(repo, args):
-    cmd = setting("CLAUDE_VERIFY_CMD", repo.env)
+    cmd = repo.worktree_setting("CLAUDE_VERIFY_CMD")
     if not cmd:
         if args.json:
             print(json.dumps(dict(dict.fromkeys(VERIFY_KEYS), state="none", tail=""), indent=2))
@@ -846,7 +880,7 @@ def cmd_verify(repo, args):
     if not (same and not args.rerun and (live or record.get("state") in FINISHED)):
         if live:                                # a dead record's pid may be someone else's now: never killed
             stop_run(record)
-        record = start_run(repo, cmd, head, verify_timeout(repo.env))
+        record = start_run(repo, cmd, head, verify_timeout(repo.env, repo.foreign))
     if args.wait:
         record = wait_run(repo, record, args.timeout)
     return verify_report(record, args.json)

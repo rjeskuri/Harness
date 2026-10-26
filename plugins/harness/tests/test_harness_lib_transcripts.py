@@ -1086,7 +1086,7 @@ class SessionDirs(Base):
             "print(json.dumps({'dirs': dirs, 'file': t.__file__, 'opened': opened,\n"
             "                  'loaded': sorted(m for m in sys.modules if 'worklog' in m.lower())}))\n"
         )
-        env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+        env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON") and k != "HARNESS_SESSION_PROJECT"}
         env.update(HOME=str(self.home), PYTHONDONTWRITEBYTECODE="1")
         p = subprocess.run([sys.executable, "-I", "-c", script, str(iso / "lib"), self.main],
                            capture_output=True, text=True, env=env, cwd=str(iso), timeout=60)
