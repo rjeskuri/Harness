@@ -97,12 +97,13 @@ def worktree_entries(main, git):
     return [Worktree(**entry) for entry in entries]
 
 
-def main_checkout(path, timeout=TIMEOUT):
+def main_checkout(path, timeout=TIMEOUT, raise_timeout=False):
     """The canonical spelling of the main working tree of the repository holding `path` (from a
     subdirectory or a linked worktree too), with state under an earlier spelling's key moved to
     its key as repo_facts does; None outside a repository, without git, when git fails, or when
     the whole lookup (both git calls, one deadline) takes longer than `timeout` seconds. A hook
-    passes its own git budget, which sits inside the timeout hooks.json gives it."""
+    passes its own git budget, which sits inside the timeout hooks.json gives it; with
+    `raise_timeout`, running out of it raises subprocess.TimeoutExpired instead of answering None."""
     deadline = time.monotonic() + timeout
 
     def git(cwd, *args):
@@ -114,5 +115,9 @@ def main_checkout(path, timeout=TIMEOUT):
 
     try:
         return repo_facts(path, git, str.strip)[2]
+    except subprocess.TimeoutExpired:
+        if raise_timeout:
+            raise
+        return None
     except (RepoError, OSError, subprocess.SubprocessError):
         return None
