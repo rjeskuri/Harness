@@ -61,6 +61,7 @@ try:
     from harness_lib.hookio import emit, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.repo import main_checkout
+    from harness_lib.settings import claude_project_dir
     from harness_lib.text import one_line, read_json
 
     LIB_PROBLEM = ""
@@ -98,6 +99,9 @@ except Exception as exc:  # fail open: the brief goes on without ticket state an
 
     def hook_cwd(data: dict) -> str:
         return str(data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+
+    def claude_project_dir():
+        return os.environ.get("CLAUDE_PROJECT_DIR") or None
 
     def emit(obj: dict) -> None:
         sys.stdout.write(json.dumps(obj))
@@ -663,7 +667,7 @@ def export_session_project() -> None:
     later Bash call of the session sources first. Nothing when either is unset or blank or the
     file cannot be written; a last line without a newline gets one first."""
     target = os.environ.get("CLAUDE_ENV_FILE") or ""
-    project = os.environ.get("CLAUDE_PROJECT_DIR") or ""
+    project = claude_project_dir() or ""
     if not target.strip() or not project.strip():
         return
     line = os.fsencode(f"export HARNESS_SESSION_PROJECT={shlex.quote(project)}\n")

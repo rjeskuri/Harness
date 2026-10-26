@@ -81,6 +81,12 @@ def setting_from(name, file_env):
     return None
 
 
+def claude_project_dir():
+    """CLAUDE_PROJECT_DIR, the session's project as Claude Code gives it to a hook process, never
+    the event's cwd; None when unset or empty."""
+    return os.environ.get("CLAUDE_PROJECT_DIR") or None
+
+
 def other_project(main):
     """Is the session another project's? The session's project is HARNESS_SESSION_PROJECT (which
     session_brief exports through CLAUDE_ENV_FILE to the session's Bash calls), else
