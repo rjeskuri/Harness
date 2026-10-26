@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """SessionStart hook: a short brief so a new, resumed or compacted session starts oriented.
 
-Matcher (hooks.json): startup|resume|compact. Adds at most 40 lines of context:
+Matcher (hooks.json): startup|resume|clear|compact|fork. First, when CLAUDE_ENV_FILE and
+CLAUDE_PROJECT_DIR are both set and not blank, it appends one line
+`export HARNESS_SESSION_PROJECT=<CLAUDE_PROJECT_DIR, shell-quoted>` to that file (on a line of
+its own, never truncating it), so the session's Bash calls, which Claude Code gives no
+CLAUDE_PROJECT_DIR, know the session's project (harness_lib.settings.other_project); a file
+that cannot be written is skipped silently, and the export happens even where the brief does
+not. Adds at most 40 lines of context:
   ## Session brief: <repo> on <branch>, <n> uncommitted, last commit <age>: <subject>
   - on a ticket branch (t/<N>-...): Ticket #N: <title> (<status>, tier <tier>), up to six
     definition-of-done lines and Red run: <kind> at <time> (or none), from the ticket
@@ -38,6 +44,7 @@ import datetime as dt
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -651,8 +658,30 @@ def extras(
 # ---------- main ----------
 
 
+def export_session_project() -> None:
+    """Append `export HARNESS_SESSION_PROJECT=<CLAUDE_PROJECT_DIR>` to CLAUDE_ENV_FILE, which each
+    later Bash call of the session sources first. Nothing when either is unset or blank or the
+    file cannot be written; a last line without a newline gets one first."""
+    target = os.environ.get("CLAUDE_ENV_FILE") or ""
+    project = os.environ.get("CLAUDE_PROJECT_DIR") or ""
+    if not target.strip() or not project.strip():
+        return
+    line = os.fsencode(f"export HARNESS_SESSION_PROJECT={shlex.quote(project)}\n")
+    try:
+        with open(target, "ab+") as fh:  # appends; makes the file, never its folder
+            fh.seek(0, os.SEEK_END)
+            if fh.tell():
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) != b"\n":
+                    line = b"\n" + line
+            fh.write(line)
+    except Exception:  # fail open: no export rather than a broken brief
+        pass
+
+
 def main() -> int:
     started = time.monotonic()
+    export_session_project()
     data = read_input()
     cwd = Path(hook_cwd(data))
     git_root = repo_root(cwd)

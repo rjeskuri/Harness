@@ -642,6 +642,52 @@ class Verify(unittest.TestCase):
                 self.assertEqual([s[2] for s in self.starts()], tags, read(self.counter))
                 self.assertEqual(self.record()["cmd"], extra["CLAUDE_VERIFY_CMD"])
 
+    # A session's Bash calls never see CLAUDE_PROJECT_DIR (Claude Code sets it for hooks only); they see the
+    # HARNESS_SESSION_PROJECT the harness's SessionStart hook exported through CLAUDE_ENV_FILE.
+    def test_another_projects_verify_cmd_does_not_reach_this_worktree_from_a_sessions_bash(self):
+        foreign = self.counted("foreign", "echo foreign")
+        projects = self.other_projects()
+        cases = [(project, None) for project in projects] + [(projects[0], self.repo)]
+        for project, claude_dir in cases:
+            for cwd, args in ((project, ("--worktree", self.wt)), (self.wt, ())):
+                with self.subTest(project=project, claude_dir=claude_dir, cwd=cwd):
+                    extra = {"HARNESS_SESSION_PROJECT": project, "CLAUDE_VERIFY_CMD": foreign}
+                    if claude_dir is not None:
+                        extra["CLAUDE_PROJECT_DIR"] = claude_dir
+                    p = self.verify_from(cwd, *args, "--wait", "--timeout", "5", **extra)
+                    self.assertEqual(p.returncode, 0, self.out(p))
+                    self.assertIn(UNSET, p.stdout)
+                    self.assertEqual(self.starts(), [], read(self.counter))
+                    self.assertFalse(os.path.exists(self.record_path), "a run was recorded")
+        # With a command of its own (committed settings.json), that one runs, not the other project's.
+        own = self.counted("own", "echo own")
+        self.commit(".claude/settings.json", json.dumps({"env": {"CLAUDE_VERIFY_CMD": own}}))
+        p = self.verify_from(projects[0], "--worktree", self.wt, "--wait", "--timeout", "60",
+                             HARNESS_SESSION_PROJECT=projects[0], CLAUDE_VERIFY_CMD=foreign)
+        self.assertEqual(p.returncode, 0, self.out(p))
+        self.assertEqual([s[2] for s in self.starts()], ["own"], read(self.counter))
+        self.assertEqual(self.record()["cmd"], own)
+
+    def test_the_environment_verify_cmd_still_wins_when_the_session_is_this_repositorys(self):
+        # HARNESS_SESSION_PROJECT naming this repository (its main checkout or this worktree) keeps today's order,
+        # whatever CLAUDE_PROJECT_DIR says: the environment's command wins over the worktree's settings.
+        tracked = self.counted("tracked", "true")
+        self.commit(".claude/settings.json", json.dumps({"env": {"CLAUDE_VERIFY_CMD": tracked}}))
+        okinawa = self.other_projects()[0]
+        tags = []
+        for tag, session, claude_dir in (("session-main", self.repo, None), ("session-worktree", self.wt, None),
+                                         ("session-main-over-foreign", self.repo, okinawa),
+                                         ("session-worktree-over-foreign", self.wt, okinawa)):
+            with self.subTest(tag):
+                extra = {"CLAUDE_VERIFY_CMD": self.counted(tag, f"echo {tag}"), "HARNESS_SESSION_PROJECT": session}
+                if claude_dir is not None:
+                    extra["CLAUDE_PROJECT_DIR"] = claude_dir
+                p = self.verify_from(self.wt, "--worktree", self.wt, "--wait", "--timeout", "60", **extra)
+                self.assertEqual(p.returncode, 0, self.out(p))
+                tags.append(tag)
+                self.assertEqual([s[2] for s in self.starts()], tags, read(self.counter))
+                self.assertEqual(self.record()["cmd"], extra["CLAUDE_VERIFY_CMD"])
+
     def test_dirty_tree_is_refused(self):
         cmd = self.counted("dirty", "echo ran")
         cases = [

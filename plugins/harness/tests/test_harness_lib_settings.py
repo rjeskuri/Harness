@@ -509,12 +509,52 @@ class ProjectSettingTests(unittest.TestCase):
         self.git(path, "commit", "-q", "--allow-empty", "-m", "init")
         return path
 
-    def foreign(self, project, main: str) -> bool:
-        """other_project(main) with CLAUDE_PROJECT_DIR set to `project` (None: unset)."""
-        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": project or ""}):
-            if project is None:
-                del os.environ["CLAUDE_PROJECT_DIR"]
+    def foreign(self, project, main: str, session=None) -> bool:
+        """other_project(main) with CLAUDE_PROJECT_DIR set to `project` and HARNESS_SESSION_PROJECT to
+        `session` (None: unset; the suite may itself run in a session whose Bash exports it)."""
+        values = {"CLAUDE_PROJECT_DIR": project, "HARNESS_SESSION_PROJECT": session}
+        with mock.patch.dict(os.environ, {k: v or "" for k, v in values.items()}):
+            for key, value in values.items():
+                if value is None:
+                    del os.environ[key]
             return self.lib.other_project(main)
+
+    def test_the_session_project_decides_before_claude_project_dir(self):
+        # Claude Code sets CLAUDE_PROJECT_DIR for hook processes only; a session's Bash calls see the
+        # HARNESS_SESSION_PROJECT its SessionStart hook exported. That one is read first; unset or blank, the
+        # call falls back to CLAUDE_PROJECT_DIR; both unset, it is this repository's own session.
+        main = self.repository("main")
+        wt = os.path.join(self.tmp, "wt")
+        self.git(main, "worktree", "add", "-q", wt, "-b", "t/1-x")
+        os.makedirs(os.path.join(main, "sub"))
+        link = os.path.join(self.tmp, "link")
+        os.symlink(main, link)
+        other = self.repository("OkinawaDream")
+        plain = os.path.join(self.tmp, "notes")
+        os.makedirs(plain)
+        cases = [
+            # (name, HARNESS_SESSION_PROJECT, CLAUDE_PROJECT_DIR, another project's session?)
+            ("session: another repository", other, None, True),
+            ("session: no repository", plain, None, True),
+            ("session: missing folder", os.path.join(self.tmp, "gone"), None, True),
+            ("session: another repository over CLAUDE_PROJECT_DIR main", other, main, True),
+            ("session: no repository over CLAUDE_PROJECT_DIR worktree", plain, wt, True),
+            ("session: main checkout", main, None, False),
+            ("session: worktree", wt, None, False),
+            ("session: subdirectory", os.path.join(main, "sub"), None, False),
+            ("session: symlinked main", link, None, False),
+            ("session: main over CLAUDE_PROJECT_DIR another repository", main, other, False),
+            ("session: worktree over CLAUDE_PROJECT_DIR no repository", wt, plain, False),
+            ("no session: CLAUDE_PROJECT_DIR another repository", None, other, True),
+            ("no session: CLAUDE_PROJECT_DIR main", None, main, False),
+            ("blank session: CLAUDE_PROJECT_DIR another repository", "  ", other, True),
+            ("blank session: CLAUDE_PROJECT_DIR worktree", "", wt, False),
+            ("both unset", None, None, False),
+            ("both blank", " ", "", False),
+        ]
+        for name, session, project, expected in cases:
+            with self.subTest(name):
+                self.assertIs(self.foreign(project, main, session), expected)
 
     def test_setting_from_reads_the_file_alone(self):
         with mock.patch.dict(os.environ, {self.name: "from env"}):

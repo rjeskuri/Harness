@@ -217,7 +217,8 @@ class BoardTest(unittest.TestCase):
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items()
                if k not in ("CLAUDE_PROJECT_DIR", "HARNESS_GH", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
-                            "HARNESS_NOTIFY_APP", "HARNESS_NOTIFY_SOUND", "HARNESS_PROJECT") + ROUTING_KEYS}
+                            "HARNESS_NOTIFY_APP", "HARNESS_NOTIFY_SOUND", "HARNESS_PROJECT",
+                            "HARNESS_SESSION_PROJECT") + ROUTING_KEYS}
         paths = [self.fakebin] + ([os.path.dirname(GIT)] if GIT else []) + ["/usr/bin", "/bin"]
         env.update(HOME=self.home, PATH=os.pathsep.join(paths), GIT_CEILING_DIRECTORIES=self.tmp,
                    GIT_CONFIG_NOSYSTEM="1", FAKEGH_SCENARIO=self.scenario_path, FAKEGH_LOG=self.log,

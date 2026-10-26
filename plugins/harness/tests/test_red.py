@@ -480,6 +480,73 @@ exit 254
                 p = self.red("check", "--worktree", self.wt, cwd=project or self.wt, **extra)
                 self.assertOwnRed(p, cmd=expected, said="AssertionError: from the environment")
 
+    # Claude Code sets CLAUDE_PROJECT_DIR for hook processes only, never for a session's Bash calls: there the
+    # session's project is HARNESS_SESSION_PROJECT, which the harness's SessionStart hook exports through
+    # CLAUDE_ENV_FILE. self.env carries neither, so each case below names exactly what it sets.
+    def test_another_projects_test_cmd_does_not_reach_this_worktree_from_a_sessions_bash(self):
+        self.put("tests/test_calc.py", TEST_ADD)
+        foreign, marker = self.foreign_cmd()
+        npm_log = self.fake_npm()
+        projects = self.foreign_projects()
+        cases = [(name, project, None) for name, project in projects]
+        # A stale or inherited CLAUDE_PROJECT_DIR naming this repository does not outweigh the session's project.
+        cases.append(("another repository, CLAUDE_PROJECT_DIR this repository", projects[0][1], self.repo))
+        for name, project, claude_dir in cases:
+            for env_cmd in (foreign, "npm test -- {files}"):
+                for how, cwd, args in (("--worktree from the other project", project, ("--worktree", self.wt)),
+                                       ("run in the worktree", self.wt, ())):
+                    with self.subTest(project=name, env_cmd=env_cmd, how=how):
+                        if os.path.exists(self.record_path):
+                            os.remove(self.record_path)
+                        extra = {"HARNESS_SESSION_PROJECT": project, "HARNESS_TEST_CMD": env_cmd}
+                        if claude_dir is not None:
+                            extra["CLAUDE_PROJECT_DIR"] = claude_dir
+                        p = self.red("check", *args, cwd=cwd, **extra)
+                        self.assertOwnRed(p)
+                        self.assertFalse(os.path.exists(marker), "the other project's command ran")
+                        self.assertFalse(os.path.exists(npm_log), "the other project's npm ran")
+
+    def test_the_worktrees_own_settings_decide_from_another_sessions_bash(self):
+        # The worktree's own HARNESS_TEST_CMD runs, not the one the other project's session exported.
+        self.put("tests/test_calc.py", TEST_ADD)
+        foreign, marker = self.foreign_cmd()
+        okinawa = self.foreign_projects()[0][1]
+        own = write(os.path.join(self.tmp, "own_runner.py"),
+                    "import sys\nprint('AssertionError: own runner', sys.argv[1], sys.argv[2:])\nsys.exit(1)\n")
+        own_cmd = f"python3 {shlex.quote(own)} wt-settings {{files}}"
+        write(os.path.join(self.wt, ".claude", "settings.json"), json.dumps({"env": {"HARNESS_TEST_CMD": own_cmd}}))
+        p = self.red("check", "--worktree", self.wt, cwd=okinawa, HARNESS_SESSION_PROJECT=okinawa,
+                     HARNESS_TEST_CMD=foreign)
+        self.assertOwnRed(p, cmd=own_cmd.replace("{files}", "tests/test_calc.py"), said="own runner wt-settings")
+        self.assertFalse(os.path.exists(marker), "the other project's command ran")
+
+    def test_the_environment_test_cmd_still_wins_when_the_session_is_this_repositorys(self):
+        # HARNESS_SESSION_PROJECT naming this repository (any spelling, any worktree of it) keeps today's order: the
+        # environment's command wins over the worktree's settings, whatever CLAUDE_PROJECT_DIR says.
+        self.put("tests/test_calc.py", TEST_ADD)
+        sibling = os.path.join(self.tmp, "sibling-wt")
+        self.git(self.repo, "worktree", "add", "-q", sibling, "-b", "t/99-sibling", "origin/main")
+        link = os.path.join(self.tmp, "repo-link")
+        os.symlink(self.repo, link)
+        okinawa = self.foreign_projects()[0][1]
+        runner = self.fake_runner("AssertionError: from the environment\n", 1)
+        expected = runner["HARNESS_TEST_CMD"].replace("{files}", "tests/test_calc.py")
+        for name, session, claude_dir in (("main checkout", self.repo, None), ("this worktree", self.wt, None),
+                                          ("another worktree of it", sibling, None),
+                                          ("symlinked main checkout", link, None),
+                                          ("a folder inside the main checkout", os.path.join(self.repo, ".claude"),
+                                           None),
+                                          ("main checkout, CLAUDE_PROJECT_DIR another repository", self.repo,
+                                           okinawa),
+                                          ("this worktree, CLAUDE_PROJECT_DIR another repository", self.wt,
+                                           okinawa)):
+            with self.subTest(name):
+                extra = dict(runner, HARNESS_SESSION_PROJECT=session)
+                if claude_dir is not None:
+                    extra["CLAUDE_PROJECT_DIR"] = claude_dir
+                p = self.red("check", "--worktree", self.wt, cwd=session, **extra)
+                self.assertOwnRed(p, cmd=expected, said="AssertionError: from the environment")
+
     def test_a_command_that_cannot_start_is_an_error_not_red(self):
         # A missing manifest, script, runner module, runner file or executable: the run proves nothing, so it is
         # refused like any unproven run (exit 1, one line, nothing recorded), never reported as red.

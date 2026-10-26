@@ -149,8 +149,9 @@ class HumanMessages(unittest.TestCase):
     # ----------------------------------------------------------------- helpers
     def env(self):
         env = {k: v for k, v in os.environ.items()
-               if k not in ("CLAUDE_PROJECT_DIR", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
-        path = ([os.path.dirname(GIT)] if GIT else []) + ["/usr/bin", "/bin"]
+               if k not in ("CLAUDE_PROJECT_DIR", "HARNESS_SESSION_PROJECT", "GIT_DIR", "GIT_WORK_TREE",
+                            "GIT_INDEX_FILE")}
+        path =([os.path.dirname(GIT)] if GIT else []) + ["/usr/bin", "/bin"]
         env.update(HOME=self.home, PATH=os.pathsep.join(path), GIT_CEILING_DIRECTORIES=self.tmp,
                    GIT_CONFIG_NOSYSTEM="1")
         return env
@@ -405,7 +406,8 @@ class WorktreeSessions(unittest.TestCase):
         self.today = now.astimezone(self.tz).date()
         self.day = self.today - dt.timedelta(days=2)
         self.env = {k: v for k, v in os.environ.items()
-                    if k not in ("CLAUDE_PROJECT_DIR", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+                    if k not in ("CLAUDE_PROJECT_DIR", "HARNESS_SESSION_PROJECT", "GIT_DIR", "GIT_WORK_TREE",
+                                 "GIT_INDEX_FILE")}
         self.env.update(HOME=self.home, GIT_CEILING_DIRECTORIES=self.tmp, GIT_CONFIG_NOSYSTEM="1")
 
     # ---------------------------------------------------------------- helpers
@@ -699,8 +701,8 @@ class RunFromALinkedWorktree(unittest.TestCase):
         self.today = dt.datetime.now(UTC).astimezone(self.tz).date()
         self.day = self.today - dt.timedelta(days=2)
         self.env = {k: v for k, v in os.environ.items()
-                    if k not in ("CLAUDE_PROJECT_DIR", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
-                                 "GIT_COMMON_DIR")}
+                    if k not in ("CLAUDE_PROJECT_DIR", "HARNESS_SESSION_PROJECT", "GIT_DIR", "GIT_WORK_TREE",
+                                 "GIT_INDEX_FILE", "GIT_COMMON_DIR")}
         self.env.update(HOME=self.home, GIT_CEILING_DIRECTORIES=self.tmp, GIT_CONFIG_NOSYSTEM="1",
                         GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.com",
                         GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.com")
