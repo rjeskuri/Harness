@@ -3165,5 +3165,28 @@ class ToolsWithoutTheLib(unittest.TestCase):
                 self.assertEqual(p.stderr, "")
 
 
+class RoutingEnvironmentDoesNotLeak(unittest.TestCase):
+    """#243: tests whose expected route comes from the ticket's labels or a missing settings file pass however the
+    developer's shell sets the routing variables. Each runs in a child `python3 -m unittest` with every routing
+    variable exported to a value that changes its outcome (the labels give sonnet; ultrareview is on by default)."""
+
+    # One value per routing variable that differs from what the labels and the defaults give these tests.
+    EXPORTED = {"HARNESS_CODE_TIER": "opus", "HARNESS_CODE_EFFORT": "xhigh", "HARNESS_REVIEW_TIER": "opus",
+                "HARNESS_ULTRAREVIEW": "off", "HARNESS_WAVE_REVIEW": "opus"}
+    SENSITIVE = (
+        "test_harness_lib_cli.ToolsRunTheLib.test_board_stamps_a_fetched_ticket_through_the_lib_now_iso",
+        "test_harness_lib_cli.ToolsRunTheLib.test_pr_writes_the_ultrareview_output_through_write_text",
+    )
+
+    def test_routing_sensitive_tests_pass_with_the_routing_variables_exported(self):
+        env = {**os.environ, **self.EXPORTED, "PYTHONDONTWRITEBYTECODE": "1"}
+        for test_id in self.SENSITIVE:
+            with self.subTest(test=test_id):
+                p = subprocess.run([sys.executable, "-m", "unittest", test_id], cwd=str(TESTS), env=env,
+                                   capture_output=True, text=True, timeout=120)
+                self.assertEqual(p.returncode, 0, f"{test_id} fails with {self.EXPORTED} exported:\n{p.stderr}")
+                self.assertRegex(p.stderr, r"Ran 1 test", "the child ran no test: the test id is stale")
+
+
 if __name__ == "__main__":
     unittest.main()
