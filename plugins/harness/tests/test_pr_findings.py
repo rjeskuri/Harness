@@ -11,7 +11,10 @@ differs from origin/main and a diff against origin/main (instead of the merge-ba
 two files as touched. The command runs from the main checkout with `--worktree <wt>`, so a tool that diffed the
 cwd would see nothing touched.
 
-gh is fakegh.py behind a wrapper with an empty scenario: any gh call fails and is logged.
+gh is fakegh.py behind a wrapper whose scenario answers only `gh pr list` (no open PR, so #257's posting is
+skipped and warned about); any other gh call fails and is logged. harness-board is a stub that answers `show N`
+with the ticket under epic #249 and refuses `task create`, so the out-of-scope tickets of #257 are warnings and
+the notes lines stay as #256 wrote them (test_pr_findings_post.py covers the posting and the tickets).
 
 Expected values are derived here: the touched set from the fixture, the normalisation from the documented
 severity table (critical and blocker to high, major to medium, minor and nit to low, unknown to low; a leading
@@ -58,6 +61,16 @@ EXAMPLE = [{"path": "src/app.py", "line": 3, "severity": "high", "body": "A"},
 
 BINS = {}
 
+# harness-board: `show N` is the ticket under epic #249; anything else (task create) is refused.
+BOARD = """import json, sys
+argv = sys.argv[1:]
+if argv[:1] == ["show"] and len(argv) > 1:
+    print(json.dumps({"number": int(argv[1]), "parent": {"number": 249, "title": "Epic", "goal": ""}}))
+    sys.exit(0)
+sys.stderr.write("harness-board: refused by the test stub\\n")
+sys.exit(1)
+"""
+
 
 def write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -80,6 +93,8 @@ def setUpModule():
                f'#!/bin/sh\nprintf \'%s\\n\' "gh $*" >> "$ORDER_LOG"\nexec "{py}" "{FAKEGH}" "$@"\n')
     executable(os.path.join(fakebin, "git"),
                f'#!/bin/sh\nprintf \'%s\\n\' "git $*" >> "$ORDER_LOG"\nexec "{GIT}" "$@"\n')
+    board = write(os.path.join(root, "board.py"), BOARD)
+    executable(os.path.join(fakebin, "harness-board"), f'#!/bin/sh\nexec "{py}" "{board}" "$@"\n')
     os.symlink(py, os.path.join(fakebin, "python3"))
     BINS.update(root=root, fakebin=fakebin)
 
@@ -139,7 +154,8 @@ class FindingsTest(unittest.TestCase):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="harness-pr-findings-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home = self.mk("home")
-        self.scenario_path = write(os.path.join(self.tmp, "scenario.json"), json.dumps({"calls": []}))
+        self.scenario_path = write(os.path.join(self.tmp, "scenario.json"), json.dumps(
+            {"calls": [{"contains": ["pr", "list"], "stdout_json": []}]}))
         self.gh_log = os.path.join(self.tmp, "gh.log")
         self.order_log = os.path.join(self.tmp, "order.log")
         self.n = 0
@@ -332,7 +348,8 @@ class Split(FindingsTest):
         out = self.findings(EXAMPLE)
         head = self.head()
         self.assertEqual(set(out), {"ticket", "round", "head", "base", "review_base", "blocking", "low", "outside",
-                                    "files", "record"})
+                                    "files", "record", "pr", "review_id", "tickets"})
+        self.assertEqual((out["pr"], out["review_id"], out["tickets"]), (None, None, []))   # no PR; create refused
         self.assertEqual((out["ticket"], out["round"], out["head"], out["base"], out["review_base"]),
                          (12, 1, head, self.merge_base, head))
         self.assertEqual(out["record"], {"stage": "review", "result": "pass"})
@@ -570,20 +587,24 @@ class Latest(FindingsTest):
         p = self.pr("findings", "13", "--latest")
         self.assertEqual((p.returncode, p.stderr.strip()), (1, "no review round recorded for #13"))
 
-    def test_no_gh_call_is_made(self):
+    def test_without_a_pr_the_only_gh_call_is_the_pr_lookup_and_latest_makes_none(self):
+        # #257: findings looks up the branch's open PR (`gh pr list`); with none it posts nothing, so no other gh
+        # call is made. --latest makes no gh call at all.
         self.findings(EXAMPLE, rulings="Ruling: one.\n")
         self.findings(EXAMPLE, as_json=False)
         self.commit("src/app.py", "def app():\n    return 11\n")
         self.findings([])
         self.pr("findings", "12", "--worktree", self.wt, "--review", self.review_file("nothing\n"))
+        self.assertEqual(len(self.load_rounds()), 2)
+        calls = [json.loads(line)["argv"] for line in self.gh_calls()]
+        self.assertTrue(calls)
+        self.assertEqual([argv for argv in calls if argv[:2] != ["pr", "list"]], [], calls)
+        with open(self.gh_log, encoding="utf-8") as fh:
+            seen = len(fh.readlines())
         self.pr("findings", "12", "--latest")
         self.pr("findings", "12", "--latest", "--json")
         self.pr("findings", "13", "--latest")
-        self.assertEqual(len(self.load_rounds()), 2)
-        self.assertEqual(self.gh_calls(), [])
-        if os.path.exists(self.order_log):
-            with open(self.order_log, encoding="utf-8") as fh:
-                self.assertEqual([line for line in fh if line.startswith("gh ")], [])
+        self.assertEqual(len(self.gh_calls()), seen)
 
 
 if __name__ == "__main__":
