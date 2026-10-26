@@ -30,6 +30,7 @@ SCAFFOLD = os.path.join(PLUGIN, "bin", "harness-scaffold")
 TEMPLATES = os.path.join(PLUGIN, "templates")
 FAKEGH = os.path.join(TESTS, "fakegh.py")
 GIT = shutil.which("git")
+RUFF = shutil.which("ruff")      # the real ruff, looked up on the PATH the suite runs with, never the fakebin
 NO_RULESET = ("Branch protection is unavailable on this plan for a private repo; "
               "the local branch guard is the only block.")
 PLACEHOLDER = re.compile(r"(?<!\$)\{\{(name|pkg|stack|verify_cmd|test_cmd|tests_dirs|python_version|year)\}\}")
@@ -37,7 +38,7 @@ PLACEHOLDER = re.compile(r"(?<!\$)\{\{(name|pkg|stack|verify_cmd|test_cmd|tests_
 COMMON_FILES = ["CLAUDE.md", ".claude/settings.json", "scripts/verify.sh", ".github/workflows/ci.yml",
                 ".github/workflows/deploy.yml", ".github/pull_request_template.md",
                 ".github/ISSUE_TEMPLATE/task.md", ".github/ISSUE_TEMPLATE/epic.md", ".githooks/pre-commit",
-                ".gitignore", ".worktreeinclude"]
+                ".gitignore", ".worktreeinclude", "scripts/smoke.sh", "scripts/deploy_guard.py"]
 
 # The allow entries every render starts with (ticket #137): the twelve git, gh and verify entries, then one
 # narrow rule per harness tool in this order. The old wildcard spelling may be dropped by auto mode.
@@ -342,6 +343,57 @@ class Render(ScaffoldTest):
         self.assertNotIn("setup-node", ci)
         for rel in ("scripts/verify.sh", ".githooks/pre-commit"):
             self.assertEqual(subprocess.run(["sh", "-n", os.path.join(root, rel)]).returncode, 0, rel)
+
+    def test_ci_writes_smoke_and_deploy_guard_executable(self):
+        guard = self.read(TEMPLATES, "deploy_guard.py")
+        for stack in ("python", "node", "none"):
+            with self.subTest(stack=stack):
+                root = os.path.join(self.tmp, f"live-{stack}")
+                p = self.ok("init", root, "--name", f"live-{stack}", "--stack", stack)
+                for rel in ("scripts/smoke.sh", "scripts/deploy_guard.py"):
+                    self.assertIn(f"created {rel}", self.lines(p))
+                    self.assertExecutable(os.path.join(root, rel))
+                with open(os.path.join(root, "scripts", "deploy_guard.py"), "rb") as fh, \
+                        open(os.path.join(TEMPLATES, "deploy_guard.py"), "rb") as tmpl:
+                    self.assertEqual(fh.read(), tmpl.read())      # byte-identical: no placeholder touched
+                self.assertEqual(self.read(root, "scripts", "deploy_guard.py"), guard)
+                smoke = os.path.join(root, "scripts", "smoke.sh")
+                text = self.read(smoke)
+                self.assertTrue(text.startswith("#!/bin/sh\n"), text)
+                for piece in ("0 healthy", "1 big failure", "revert", "2 degraded"):
+                    self.assertIn(piece, text)
+                self.assertEqual(text.strip().splitlines()[-1], "exit 0")
+                self.assertEqual(subprocess.run(["sh", "-n", smoke]).returncode, 0)
+                self.assertEqual(subprocess.run([smoke], cwd=root).returncode, 0)
+                deploy = self.read(root, ".github/workflows/deploy.yml")
+                self.assertEqual(deploy, self.read(TEMPLATES, "deploy.yml"))       # v2, as is
+                self.assertIn('python3 scripts/deploy_guard.py run --sha "$GITHUB_SHA"', deploy)
+                self.assertIn("${{ github.token }}", deploy)
+
+    def test_no_ci_skips_smoke_and_deploy_guard(self):
+        root = os.path.join(self.tmp, "noci-live")
+        p = self.ok("init", root, "--name", "noci-live", "--stack", "python", "--no-ci")
+        for rel in ("scripts/smoke.sh", "scripts/deploy_guard.py", ".github/workflows/deploy.yml"):
+            self.assertFalse(os.path.exists(os.path.join(root, rel)), rel)
+            self.assertNotIn(rel, p.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(root, "scripts", "verify.sh")))
+
+    def test_existing_smoke_script_is_kept(self):
+        root = self.mk("own-smoke")
+        own = "#!/bin/sh\ncurl -fsS https://example.invalid/health\n"
+        self.write(os.path.join(root, "scripts", "smoke.sh"), own, 0o700)
+        p = self.ok("init", root, "--name", "own-smoke", "--stack", "none")
+        self.assertIn("kept scripts/smoke.sh", self.lines(p))
+        self.assertIn("created scripts/deploy_guard.py", self.lines(p))
+        self.assertEqual(self.read(root, "scripts", "smoke.sh"), own)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(root, "scripts", "smoke.sh")).st_mode), 0o700)
+
+    def test_dry_run_lists_the_new_scripts(self):
+        root = os.path.join(self.tmp, "dry-live")
+        p = self.ok("init", root, "--name", "dry-live", "--stack", "python", "--dry-run")
+        for rel in ("scripts/smoke.sh", "scripts/deploy_guard.py", ".github/workflows/deploy.yml"):
+            self.assertIn(f"would create {rel}", self.lines(p))
+        self.assertFalse(os.path.exists(root))
 
     def test_stack_detection_and_test_command(self):
         cases = [
@@ -2108,6 +2160,99 @@ class Paths(ScaffoldTest):
         self.assertOneLineError(p, "no origin remote", "--github")
         self.assertEqual(self.calls(), [])
         self.assertFalse(os.path.exists(os.path.join(root, "CLAUDE.md")))
+
+
+# =========================================================================== the python stack's own lint
+class PythonLint(ScaffoldTest):
+    """A python-stack scaffold passes the lint and format checks it sets up (ticket #152's review finding):
+    scripts/verify.sh runs `uv run ruff check .` and `uv run ruff format --check .` under the scaffolded
+    pyproject.toml, and the scaffolded .githooks/pre-commit runs ruff on the staged files."""
+
+    def pyproject_line_length(self, root):
+        """line-length under [tool.ruff] in the scaffolded pyproject.toml; ruff's default 88 when unset."""
+        section = None
+        for raw in self.read(root, "pyproject.toml").splitlines():
+            line = raw.split("#", 1)[0].strip()
+            header = re.match(r"^\[([^\]]+)\]$", line)
+            if header:
+                section = header.group(1).strip()
+                continue
+            found = re.match(r"^line-length\s*=\s*(\d+)$", line)
+            if found and section == "tool.ruff":
+                return int(found.group(1))
+        return 88
+
+    def ruff_exemption(self, root, guard):
+        """How the scaffolded project exempts scripts/deploy_guard.py from ruff, or None: the pyproject names
+        it (an exclude), or the file carries a file-level `# ruff: noqa` and `# fmt: off`."""
+        if "deploy_guard.py" in self.read(root, "pyproject.toml"):
+            return "pyproject.toml names scripts/deploy_guard.py"
+        lines = [ln.strip() for ln in guard.splitlines()]
+        if "# ruff: noqa" in lines and "# fmt: off" in lines:
+            return "file-level # ruff: noqa and # fmt: off"
+        return None
+
+    def run_ruff(self, root, *args):
+        return subprocess.run([RUFF] + list(args), cwd=root, env=self.env(), capture_output=True, text=True,
+                              timeout=120)
+
+    def test_deploy_guard_fits_the_scaffolded_line_length_or_is_exempted(self):
+        """Needs no ruff, so it holds in CI too: every line of the written scripts/deploy_guard.py is within the
+        scaffolded pyproject's [tool.ruff] line-length, unless the project exempts that file from ruff."""
+        for name in ("demo-app", "guarded"):
+            with self.subTest(name=name):
+                root = os.path.join(self.tmp, f"len-{name}")
+                self.ok("init", root, "--name", name, "--stack", "python")
+                limit = self.pyproject_line_length(root)
+                guard = self.read(root, "scripts", "deploy_guard.py")
+                if self.ruff_exemption(root, guard):
+                    continue
+                long_lines = [f"{n}: {len(line)}" for n, line in enumerate(guard.splitlines(), 1)
+                              if len(line) > limit]
+                self.assertEqual(long_lines, [], f"{len(long_lines)} lines of scripts/deploy_guard.py are over "
+                                                 f"line-length = {limit}, and no ruff exemption")
+
+    @unittest.skipUnless(RUFF, "ruff is not installed (CI may not have it); the line-length test still runs")
+    def test_a_fresh_python_scaffold_passes_its_own_ruff_check_and_format(self):
+        """Runs the real ruff (found outside the fakebin; skipped when ruff is not installed, as CI may not have
+        it) as the scaffolded scripts/verify.sh does, in the new project under its own pyproject.toml settings."""
+        root = os.path.join(self.tmp, "linted")
+        self.ok("init", root, "--name", "linted", "--stack", "python")
+        verify = self.read(root, "scripts", "verify.sh").splitlines()
+        for args in (["check", "."], ["format", "--check", "."],
+                     ["check", "scripts/deploy_guard.py"], ["format", "--check", "scripts/deploy_guard.py"]):
+            with self.subTest(ruff=" ".join(args)):
+                if args[-1] == ".":
+                    self.assertIn("uv run ruff " + " ".join(args), verify)     # what verify.sh runs
+                p = self.run_ruff(root, *(args[:-1] + ["--no-cache", args[-1]]))
+                self.assertEqual(p.returncode, 0, f"ruff {' '.join(args)}:\n{p.stdout[-3000:]}{p.stderr[-2000:]}")
+
+    @unittest.skipUnless(RUFF, "ruff is not installed (CI may not have it); the line-length test still runs")
+    def test_the_adopt_commit_passes_the_scaffolded_pre_commit_hook_with_ruff_on_path(self):
+        """With the real ruff (found outside the fakebin; skipped when ruff is not installed, as CI may not have
+        it) on PATH, the scaffolded .githooks/pre-commit checks the adoption commit's Python files and lets it
+        through."""
+        os.symlink(RUFF, os.path.join(self.fakebin, "ruff"))
+        root = self.repo_with_commit()
+        self.git(root, "remote", "add", "origin", self.bare())
+        self.git(root, "push", "-q", "-u", "origin", "main")
+        branch = "t/9-adopt-the-harness-scaffold"
+        worktree = os.path.join(root, ".claude", "worktrees", "t-9-adopt-the-harness-scaffold")
+        self.git(root, "worktree", "add", "-q", worktree, "-b", branch, "origin/main")
+        self.stub("harness-board", {"task": "#9 https://github.com/ryan/proj/issues/9\n"})
+        self.stub("harness-work", {"start": json.dumps({"number": 9, "branch": branch, "worktree": worktree,
+                                                        "tier": "sonnet", "context": "# 9"})})
+        self.stub("harness-pr", {"open": json.dumps({"number": 14, "url": "https://github.com/ryan/proj/pull/14"}),
+                                 "ready": "PR #14 ready for review\n"})
+
+        p = self.scaffold("init", root, "--name", "proj", "--stack", "python")
+
+        self.assertEqual(p.returncode, 0, (p.stdout + p.stderr)[-4000:])
+        self.assertEqual(self.git(root, "config", "--get", "core.hooksPath"), ".githooks")
+        self.assertEqual(self.git(worktree, "log", "-1", "--format=%s"), "Adopt the harness scaffold (#9)")
+        committed = self.git(worktree, "show", "--name-only", "--format=", "HEAD").splitlines()
+        for rel in ("scripts/deploy_guard.py", ".githooks/pre-commit", "pyproject.toml"):
+            self.assertIn(rel, committed)
 
 
 # =========================================================================== --github, --register, labels
