@@ -3697,38 +3697,62 @@ class SlowGit:
     clock (time.monotonic, time.perf_counter and time.time run ahead by it), or, given a
     shorter timeout, finishes JUST_IN_TIME before it: the slowest git that never times out.
     A call with no time left (a timeout under JUST_IN_TIME) is cut at its timeout and raises
-    TimeoutExpired, as subprocess.run would. A call that finishes runs the real git. No real
+    TimeoutExpired, as subprocess.run would. A call that finishes runs the real git, under a
+    real timeout of REAL_TIMEOUT instead of the fake one. The fake clock stands still between
+    git calls, and the real git's own wall time does not count either: only the fake git time
+    moves it, so a run decides the same however loaded the machine is (#285: real time on the
+    clock cut the JUST_IN_TIME margin under load).
+    `hang(argv, index)`, given, picks the calls (index counts this run's git calls from 0)
+    that never answer: each takes its whole timeout and raises TimeoutExpired. No real
     sleeping."""
 
     JUST_IN_TIME = 0.05
+    REAL_TIMEOUT = 60
 
-    def __init__(self, delay: float) -> None:
+    def __init__(self, delay: float, hang=None) -> None:
         self.delay = delay
+        self.hang = hang
         self.ahead = 0.0
         self.calls: list = []
+        self._monotonic = _REAL_MONOTONIC()
+        self._perf_counter = _REAL_PERF_COUNTER()
+        self._time = _REAL_TIME()
 
     def monotonic(self) -> float:
-        return _REAL_MONOTONIC() + self.ahead
+        return self._monotonic + self.ahead
 
     def perf_counter(self) -> float:
-        return _REAL_PERF_COUNTER() + self.ahead
+        return self._perf_counter + self.ahead
 
     def time(self) -> float:
-        return _REAL_TIME() + self.ahead
+        return self._time + self.ahead
 
     def run(self, args, *rest, **kwargs):
         argv = list(args) if isinstance(args, (list, tuple)) else [args]
-        if argv and os.path.basename(str(argv[0])) == "git":
-            timeout = kwargs.get("timeout")
-            takes = self.delay
-            if timeout is not None:
-                takes = min(takes, float(timeout) - self.JUST_IN_TIME)
-            if takes < 0:
-                self.ahead += max(float(timeout), 0.0)
-                self.calls.append((argv, "timed out"))
-                raise subprocess.TimeoutExpired(argv, timeout)
-            self.ahead += takes
-            self.calls.append((argv, "ran"))
+        if not (argv and os.path.basename(str(argv[0])) == "git"):
+            return _REAL_RUN(args, *rest, **kwargs)
+        timeout = kwargs.get("timeout")
+        if self.hang is not None and self.hang(argv, len(self.calls)):
+            # a git that never answers: subprocess.run waits out its timeout, then raises
+            if timeout is None:  # it would hang the hook itself, past hooks.json's timeout
+                self.calls.append((argv, "hung, no timeout"))
+                raise subprocess.TimeoutExpired(argv, 0)
+            self.ahead += max(float(timeout), 0.0)
+            self.calls.append((argv, "timed out"))
+            raise subprocess.TimeoutExpired(argv, timeout)
+        takes = self.delay
+        if timeout is not None:
+            takes = min(takes, float(timeout) - self.JUST_IN_TIME)
+        if takes < 0:
+            self.ahead += max(float(timeout), 0.0)
+            self.calls.append((argv, "timed out"))
+            raise subprocess.TimeoutExpired(argv, timeout)
+        self.ahead += takes
+        self.calls.append((argv, "ran"))
+        if timeout is not None:
+            # The fake clock has decided this call finishes in time; the real git gets a real
+            # timeout of its own, or under load it would be cut at the fake one (#285).
+            kwargs["timeout"] = self.REAL_TIMEOUT
         return _REAL_RUN(args, *rest, **kwargs)
 
 
@@ -4496,17 +4520,18 @@ class TestsFirstMainMergeTests(GuardTestCase):
                 self.git(wt, "reset", "-q", "--hard", head)
                 self.assertSourceAllowed(wt)
 
-    def hook_with_slow_git(self, payload: dict, delay: float):
+    def hook_with_slow_git(self, payload: dict, delay: float, hang=None):
         """(deny reason or None, seconds the hook took, git calls) for tests_first.py run as
         its own __main__, in this process, with every git call taking `delay` seconds of a
-        fake clock (SlowGit). harness_lib is imported afresh under the fake clock."""
+        fake clock (SlowGit) and the calls `hang` picks never answering. harness_lib is
+        imported afresh under the fake clock."""
         ours = ("harness_lib", "branch_guard")
         saved = {
             k: m for k, m in sys.modules.items() if k in ours or k.startswith("harness_lib.")
         }
         for k in saved:
             del sys.modules[k]
-        slow = SlowGit(delay)
+        slow = SlowGit(delay, hang)
         out, err = io.StringIO(), io.StringIO()
         stdin = io.TextIOWrapper(io.BytesIO(json.dumps(payload).encode("utf-8")), encoding="utf-8")
         try:
@@ -4585,6 +4610,115 @@ class TestsFirstMainMergeTests(GuardTestCase):
                 with self.subTest(record="current", matcher=matcher, delay=delay):
                     _, took, git_calls = self.hook_with_slow_git(payload, delay)
                     self.assertLess(took, limit, git_calls)
+
+    # ---- a git call that never answers (#285)
+
+    def source_writes(self, wt: Path) -> dict:
+        """name -> (payload, hooks.json matcher) for source writes in `wt`: Edit of a tracked
+        and of a new source file, by the main session and by the coder, and the coder's Bash
+        append to a source file."""
+        writes = {}
+        for agent in (None, "harness:coder"):
+            for rel in ("src/app.py", "src/new_module.py"):
+                tool_input = {"file_path": str(wt / rel), "old_string": "a", "new_string": "b"}
+                writes[f"Edit {rel} as {agent}"] = (
+                    self.payload("Edit", tool_input, wt, agent), "Edit|Write|NotebookEdit"
+                )
+        writes["Bash append to src/app.py as harness:coder"] = (
+            self.payload("Bash", {"command": "printf '\\n' >> src/app.py"}, wt, "harness:coder"),
+            "Bash",
+        )
+        return writes
+
+    def assertTimedOutAsPicked(self, git_calls: list) -> None:
+        """The run's git calls: at least one cut at its timeout, and every one carried one."""
+        statuses = [status for _, status in git_calls]
+        self.assertIn("timed out", statuses, git_calls)
+        self.assertNotIn("hung, no timeout", statuses, git_calls)
+
+    def assertRefusedAsTooSlow(self, reason, git_calls: list) -> None:
+        self.assertIsNotNone(reason, git_calls)  # never let through
+        self.assertIn("too slow", reason.lower(), git_calls)
+        self.assertIn("retry", reason.lower(), git_calls)
+
+    def test_a_ticket_branch_refuses_a_source_write_when_the_main_checkout_lookup_times_out(self):
+        """Once the first git call has named a ticket branch, the branch is known: the main
+        checkout's lookup (or any later git call) running out of time refuses the write, with
+        a retry, instead of letting it through (docs/design.md: only the repository lookup that
+        names the branch fails open). The record is current, so at full speed every write is
+        allowed: a refusal here is the timeout's alone."""
+        timeouts = hook_timeouts("tests_first.py")
+        repo, wt = self.ticket("slow-lookup")
+        writes = self.source_writes(wt)
+        for name, (payload, matcher) in writes.items():
+            hangs = {
+                "rev-parse --git-common-dir": lambda argv, i: "--git-common-dir" in argv,
+                "every call after the first": lambda argv, i: i >= 1,
+            }
+            limit = timeouts[matcher] - STARTUP_ALLOWANCE
+            # at full speed, and slow but in time: the current record allows the write
+            for delay in (0.0, 1.0):
+                with self.subTest(write=name, hang=None, delay=delay):
+                    reason, _, git_calls = self.hook_with_slow_git(payload, delay)
+                    self.assertIsNone(reason, git_calls)
+                    self.assertGreaterEqual(len(git_calls), 2, git_calls)
+            _, _, fast_calls = self.hook_with_slow_git(payload, 0.0)
+            # each git call after the branch lookup, alone, never answering
+            for k in range(1, len(fast_calls)):
+                hangs[f"call {k} ({' '.join(fast_calls[k][0][3:6])})"] = (
+                    lambda argv, i, k=k: i == k
+                )
+            for hang_name, hang in hangs.items():
+                for delay in (0.0, 1.0, 2.0):
+                    with self.subTest(write=name, hang=hang_name, delay=delay):
+                        reason, took, git_calls = self.hook_with_slow_git(payload, delay, hang)
+                        self.assertTimedOutAsPicked(git_calls)
+                        self.assertRefusedAsTooSlow(reason, git_calls)
+                        self.assertLess(took, limit, git_calls)
+
+    def test_the_branch_lookup_timing_out_still_allows(self):
+        """The first git call names the branch; when it does not answer the branch is unknown,
+        and the hook fails open (docs/design.md), on a ticket branch with a current record and
+        with a stale one alike."""
+        repo, wt = self.ticket("slow-branch-lookup")
+        first = lambda argv, i: i == 0  # noqa: E731
+        everything = lambda argv, i: True  # noqa: E731
+        for record in ("current", "stale"):
+            if record == "stale":  # the branch edits its own test after the red run
+                path = wt / "tests/test_app.py"
+                edited = BRANCH_LINE_5.rstrip("\n") + "  # edited\n"
+                self.write(path, replaced(path.read_text(), BRANCH_LINE_5, edited))
+                self.commit_all(wt, "the branch edits its test")
+            for name, (payload, _) in self.source_writes(wt).items():
+                for hang_name, hang in (("the first call", first), ("every call", everything)):
+                    with self.subTest(record=record, write=name, hang=hang_name):
+                        reason, _, git_calls = self.hook_with_slow_git(payload, 0.0, hang)
+                        self.assertTimedOutAsPicked(git_calls)
+                        self.assertEqual(git_calls[0][1], "timed out", git_calls)
+                        self.assertIsNone(reason, git_calls)
+
+    def test_off_a_ticket_branch_a_timed_out_main_checkout_lookup_still_allows(self):
+        """Off a ticket branch the rules do not apply, so a later git call that never answers
+        changes nothing: the write is allowed, in a linked worktree on another branch and in
+        the main checkout on main."""
+        repo = self.make_repo("slow-other")
+        wt = self.worktree(repo, branch="feature/login", name="slow-other-wt")
+        hangs = {
+            "rev-parse --git-common-dir": lambda argv, i: "--git-common-dir" in argv,
+            "every call after the first": lambda argv, i: i >= 1,
+        }
+        for where, root in (("feature/login worktree", wt), ("main checkout", repo)):
+            for name, (payload, _) in self.source_writes(root).items():
+                with self.subTest(where=where, write=name, hang=None):
+                    reason, _, git_calls = self.hook_with_slow_git(payload, 0.0)
+                    self.assertIsNone(reason, git_calls)
+                for hang_name, hang in hangs.items():
+                    for delay in (0.0, 2.0):
+                        with self.subTest(where=where, write=name, hang=hang_name, delay=delay):
+                            reason, _, git_calls = self.hook_with_slow_git(payload, delay, hang)
+                            # (a hook that skips the lookup off a ticket branch is fine too)
+                            self.assertNotIn("hung, no timeout", [s for _, s in git_calls])
+                            self.assertIsNone(reason, git_calls)
 
 
 if __name__ == "__main__":
