@@ -16,6 +16,7 @@ Usage:
     harness-pr ultra P [--post] [--force]
     harness-pr land P [--yes] [--discard] [--accept-findings]
     harness-pr gate P [--json]
+    harness-pr autoland [P] [--dry-run] [--json]
 
 ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has high
 or medium findings and no commit newer than it, naming those findings, and refuse when gh cannot tell. A finding
@@ -49,13 +50,23 @@ to stderr, in order; its other stderr stays hidden. HARNESS_POLL_SECONDS replace
 gate prints the auto-land verdict (harness_lib/autoland.py) and exits 0 whatever it is; a gh or git call that
 fails gives `wait: <call> failed: <first stderr line>`.
 
+autoland makes one pass in the cwd's repository under the lock repos/<key>/autoland.lock (held: one line, exit 0, no
+gh call); autoland off: `autoland off in <repo>`, exit 0. A cleanup_pending PR in repos/<key>/autoland.json is
+finished first (land's resume) and, while it still fails, nothing else is gated. Then P, else `gh pr list --author
+@me` (non-drafts on t/ branches, lowest first), each gated (one line `#P <verdict>: <reason>`, kept in the state) and
+the first land verdict landed through land_pr with `Landed by: autoland (gate passed at <sha7>)`, never --discard
+or --accept-findings, the land's own output on stderr: `#P landed`, a notification, a `landed` entry; a problem
+after the merge sets cleanup_pending. --dry-run says `#P would land`, merges nothing and writes no state.
+
 Exit status: 0 done; 1 a bad invocation, a failed precondition or call (one line on stderr), failed checks, or
-a land whose cleanup stopped; 8 checks still pending (as gh pr checks).
+a land whose cleanup stopped (also in autoland, or its land refused); 8 checks still pending (as gh pr checks).
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import re
@@ -1523,10 +1534,10 @@ def changed_files(repo, number, cwd):
     return paths
 
 
-def resolution_body(data, files, sha, url):
+def resolution_body(data, files, sha, url, landed_by=None):
     """The `**Resolution**` comment for a landed PR, from `gh pr view --json body,url` and its changed `files`: the
-    Summary and Notes sections, the files changed, the Definition of done as landed, the red-run and verify lines, the PR and
-    the squash sha. What the body lacks is left out."""
+    Summary and Notes sections, the files changed, the Definition of done as landed, the red-run and verify lines,
+    `Landed by: <landed_by>` when given, the PR and the squash sha. What the body lacks is left out."""
     body = data.get("body") or ""
     sections = body_sections(body)
     red, verify = evidence(without_section(body, "notes"))     # the proof lines are the Tests', not the Notes'
@@ -1541,6 +1552,7 @@ def resolution_body(data, files, sha, url):
     if sections.get("definition of done", "").strip():
         parts += ["", "Definition of done:", sections["definition of done"]]
     closing = ([red] if red else []) + ([f"Verify: {verify}"] if verify else []) \
+        + ([f"Landed by: {landed_by}"] if landed_by else []) \
         + ([f"PR: {url}"] if url else []) + ([f"Squash commit: {sha}"] if sha else [])
     if closing:
         parts += [""] + closing
@@ -1671,12 +1683,25 @@ def land_gate(repo, number, accept):
         warn("harness-pr", unaddressed(number, review, blocking, unlisted) + "; landing it (--accept-findings)")
 
 
+class CleanupStopped(Problem):
+    """land_pr stopped after the merge (or on a PR already merged): the cleanup is what is left. `landed` is what
+    land_pr would have returned."""
+
+    def __init__(self, message, landed):
+        super().__init__(message)
+        self.landed = landed
+
+
 def cmd_land(args):
+    land_pr(open_repo(), args.number, discard=args.discard, accept_findings=args.accept_findings)
+    return 0
+
+
+def land_pr(repo, number, *, discard=False, accept_findings=False, landed_by=None):
     """Merge and clean up; on a PR that is already merged (an earlier land stopped at a dirty worktree, or it
-    was merged on GitHub), skip the preconditions and the merge and finish the cleanup."""
-    repo = open_repo()
+    was merged on GitHub), skip the preconditions and the merge and finish the cleanup. `landed_by` adds
+    `Landed by: <text>` to the Resolution. {title, sha}; a Problem after the merge is CleanupStopped."""
     main = repo.main
-    number = args.number
     view = pr_view(repo, number, LAND_FIELDS, main)
     state = str(view.get("state") or "OPEN").upper()
     resume = state == "MERGED"
@@ -1689,7 +1714,7 @@ def cmd_land(args):
         raise Problem(f"PR #{number} is {state.lower()}, not open")
     else:
         view = merge_preconditions(repo, number, view)
-        land_gate(repo, number, args.accept_findings)
+        land_gate(repo, number, accept_findings)
     tickets = closing_numbers(view)
     if not tickets:
         warn("harness-pr", f"PR #{number} closes no issue (no Closes #N in its body); no ticket to close")
@@ -1720,7 +1745,7 @@ def cmd_land(args):
     else:
         if wt:
             dirty = dirty_files(wt)
-            if dirty and not args.discard:
+            if dirty and not discard:
                 print(summary[0])
                 print(f"The worktree {wt} has uncommitted changes: {listing(dirty)}")
                 print(f"To finish: harness-pr land {number} --discard (drops them and completes the cleanup),"
@@ -1728,9 +1753,9 @@ def cmd_land(args):
                 print(f"  git -C {main} worktree remove --force {wt}")
                 print(f"  git -C {main} branch -D {branch}")
                 sys.stdout.flush()
-                raise Problem(f"PR #{number} is merged, but the worktree {wt} is dirty; cleanup stopped "
-                              f"(harness-pr land {number} --discard finishes it)")
-            removed = git(main, "worktree", "remove", *(["--force"] if args.discard else []), wt)
+                raise CleanupStopped(f"PR #{number} is merged, but the worktree {wt} is dirty; cleanup stopped "
+                                     f"(harness-pr land {number} --discard finishes it)", {"title": title, "sha": sha})
+            removed = git(main, "worktree", "remove", *(["--force"] if discard else []), wt)
             if removed.returncode != 0:
                 problems.append(f"git worktree remove {wt} failed: {last_line(removed.stderr)}")
         exists = branch and git(main, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0
@@ -1800,7 +1825,7 @@ def cmd_land(args):
                                    f"{len(files)} that gh pr view returned")
             else:
                 files = listed if len(listed) >= len(files) else files
-            made["text"] = resolution_body(data, files, sha, view.get("url"))
+            made["text"] = resolution_body(data, files, sha, view.get("url"), landed_by)
         return made["text"]
 
     ticket_lines = []
@@ -1813,8 +1838,8 @@ def cmd_land(args):
     print("\n".join(summary))
     if problems:
         sys.stdout.flush()
-        raise Problem(f"PR #{number} is merged, but: " + "; ".join(problems))
-    return 0
+        raise CleanupStopped(f"PR #{number} is merged, but: " + "; ".join(problems), {"title": title, "sha": sha})
+    return {"title": title, "sha": sha}
 
 
 # --------------------------------------------------------------- gate
@@ -1838,6 +1863,163 @@ def cmd_gate(args):
     return 0
 
 
+# --------------------------------------------------------------- autoland
+LANDED_KEPT = 50             # entries of autoland.json's `landed`, newest last
+
+
+def autoland_by(head):
+    """The Resolution's `Landed by:` text for a land at the gate's `head`."""
+    return f"autoland (gate passed at {head[:7]})" if head else "autoland"
+
+
+def autoland_candidates(repo, number):
+    """[(P, title)]: P alone when given (title unknown); else the authenticated user's open, non-draft PRs on t/
+    branches, lowest number first."""
+    if number:
+        return [(number, None)]
+    listed = gh_json(["pr", "list", "--author", "@me", "--state", "open", "--json",
+                      "number,headRefName,isDraft,title"], repo.main)
+    found = {pr["number"]: pr.get("title") for pr in as_list(listed)
+             if isinstance(pr.get("number"), int) and not pr.get("isDraft")
+             and str(pr.get("headRefName") or "").startswith("t/")}
+    return sorted(found.items())
+
+
+def autoland_verdict(repo, number, settings):
+    """cmd_gate's {pr, verdict, code, reason, rule, head, ticket} for PR `number`, fail closed on a gh or git call."""
+    facts = {}
+    try:
+        facts = gather_facts(repo.main, repo.slug(), number)
+        result = evaluate(facts, settings)
+    except Problem as err:
+        facts = getattr(err, "facts", None) or facts
+        result = {"verdict": "wait", "code": "gh", "reason": one_line(err), "rule": None}
+    return dict({"pr": number}, **result, head=facts.get("head_sha"),
+                ticket=(facts.get("ticket") or {}).get("number"))
+
+
+def merged_after_all(repo, number):
+    """After a land that failed with a plain Problem: {title, sha} when GitHub says the PR is merged, else None."""
+    try:
+        view = pr_view(repo, number, "state,title,mergeCommit", repo.main)
+    except Problem:
+        return None
+    if str(view.get("state") or "").upper() != "MERGED":
+        return None
+    commit = view.get("mergeCommit")
+    return {"title": view.get("title") or "", "sha": str(commit.get("oid") or "") if isinstance(commit, dict) else ""}
+
+
+def quiet_pass(args, line):
+    """A pass that does nothing: `line` on stdout, or with --json `[]` and `line` on stderr; exit 0."""
+    if args.json:
+        print("[]")
+        print(line, file=sys.stderr)
+    else:
+        print(line)
+    return 0
+
+
+def cmd_autoland(args):
+    """One pass in the cwd's repository, holding repos/<key>/autoland.lock: finish a cleanup_pending land, else gate
+    each candidate and land the first land verdict (one land per pass). State in repos/<key>/autoland.json."""
+    repo = open_repo()
+    os.makedirs(repo.state(), exist_ok=True)
+    with open(repo.state("autoland.lock"), "a", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return quiet_pass(args, f"autoland: another pass is running in {repo.name}")
+        state = read_json(repo.state("autoland.json"))
+        state = state if isinstance(state, dict) else {}
+        fetch_origin(repo.main)
+        settings = gate_settings(repo.main)
+        if not settings["autoland"]:
+            return quiet_pass(args, f"autoland off in {repo.name}")
+        out = []
+        try:
+            code = autoland_pass(repo, args, state, settings, out)
+        finally:
+            if not args.dry_run:
+                state["updated_at"] = now_iso()
+                write_json(repo.state("autoland.json"), state, prefix=".autoland-")
+        if args.json:
+            emit(True, out, "")
+        return code
+
+
+def autoland_pass(repo, args, state, settings, out):
+    """The pass itself; each entry it reports goes in `out` and, without --json, one line on stdout. The land's own
+    output goes to stderr. 0, or 1 when a land or a cleanup stopped."""
+    def say(text, entry=None):
+        if entry is not None:
+            out.append(entry)
+        if not args.json:
+            print(text)
+            sys.stdout.flush()
+
+    if not isinstance(state.get("prs"), dict):
+        state["prs"] = {}
+    prs = state["prs"]
+    state.setdefault("cleanup_pending", None)
+    pending = state.get("cleanup_pending")
+    if isinstance(pending, int) and not isinstance(pending, bool):
+        if args.dry_run:
+            say(f"#{pending} would finish cleanup", {"pr": pending, "action": "would finish cleanup"})
+            return 0
+        head = (prs.get(str(pending)) or {}).get("head")
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                land_pr(repo, pending, landed_by=autoland_by(head if isinstance(head, str) else None))
+        except Problem as err:
+            say(f"#{pending} cleanup pending: {one_line(err)}",
+                {"pr": pending, "action": "cleanup pending", "reason": one_line(err)})
+            return 1
+        state["cleanup_pending"] = None
+        say(f"#{pending} cleanup finished", {"pr": pending, "action": "cleanup finished"})
+
+    verdicts = []
+    for number, title in autoland_candidates(repo, args.number):
+        v = dict(autoland_verdict(repo, number, settings), title=title, action=None)
+        verdicts.append(v)
+        prs[str(number)] = {"head": v["head"], "verdict": v["verdict"], "code": v["code"], "reason": v["reason"],
+                            "title": title, "ticket": v["ticket"], "at": now_iso()}
+        say(f"#{number} {v['verdict']}: {v['reason']}", v)
+    first = next((v for v in verdicts if v["verdict"] == "land"), None)
+    if first is None:
+        return 0
+    number = first["pr"]
+    if args.dry_run:
+        first["action"] = "would land"
+        say(f"#{number} would land")
+        return 0
+    error = None
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            landed = land_pr(repo, number, landed_by=autoland_by(first["head"]))
+    except CleanupStopped as err:
+        landed, error = err.landed, err
+    except Problem as err:
+        landed, error = merged_after_all(repo, number), err
+        if landed is None:
+            first["action"], first["error"] = "land failed", one_line(err)
+            say(f"#{number} land failed: {one_line(err)}")
+            return 1
+    title = landed.get("title") or first["title"] or ""
+    prs[str(number)]["title"] = first["title"] = title
+    state["landed"] = (as_list(state.get("landed")) + [{"pr": number, "ticket": first["ticket"], "title": title,
+                                                         "sha": landed.get("sha") or "", "at": now_iso()}])[-LANDED_KEPT:]
+    notify(f"{repo.name} PR #{number} auto-landed: {title}", f"harness-{repo.key}-pr-{number}")
+    first["action"] = "landed"
+    say(f"#{number} landed")
+    if error is not None:
+        state["cleanup_pending"] = number
+        first["error"] = one_line(error)
+        say(f"#{number} cleanup pending: {one_line(error)}")
+        return 1
+    return 0
+
+
 # --------------------------------------------------------------- arguments
 def number_arg(text):
     digits = text.lstrip("#")
@@ -1858,9 +2040,9 @@ def seconds_arg(text):
 
 def parser():
     ap = Parser(prog="harness-pr", description="Pull requests for tickets: open, review, findings, checks, ready, "
-                                               "comments, awaiting, ultra, land, gate.")
+                                               "comments, awaiting, ultra, land, gate, autoland.")
     sub = ap.add_subparsers(dest="cmd",
-                            metavar="{open,review,findings,checks,ready,comments,awaiting,ultra,land,gate}")
+                            metavar="{open,review,findings,checks,ready,comments,awaiting,ultra,land,gate,autoland}")
     sub.required = True
 
     op = sub.add_parser("open", help="push the ticket branch and open (or update) its draft PR")
@@ -1922,12 +2104,17 @@ def parser():
     gt.add_argument("number", type=number_arg, metavar="P")
     gt.add_argument("--json", action="store_true", help='print {"pr", "verdict", "code", "reason", "rule", '
                                                         '"head", "ticket"}')
+
+    al = sub.add_parser("autoland", help="gate this repository's ticket PRs and land the first eligible one")
+    al.add_argument("number", type=number_arg, metavar="P", nargs="?", help="only this pull request")
+    al.add_argument("--dry-run", action="store_true", help="say what would land; merge nothing, write no state")
+    al.add_argument("--json", action="store_true", help="print a list, one entry per PR")
     return ap
 
 
 COMMANDS = {"open": cmd_open, "review": cmd_review, "findings": cmd_findings, "checks": cmd_checks, "ready": cmd_ready,
             "comments": cmd_comments, "awaiting": cmd_awaiting, "ultra": cmd_ultra, "land": cmd_land,
-            "gate": cmd_gate}
+            "gate": cmd_gate, "autoland": cmd_autoland}
 
 
 def main():

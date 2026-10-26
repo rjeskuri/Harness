@@ -25,6 +25,12 @@ pushed branches.
   need a re-check, so neither the ref name nor anything but the PR's commits and their trees tells them apart.
 - compare is answered only as `compare/main...<head sha>`; the GraphQL conversation's authors carry `login`
   (bots end in `[bot]`) and `__typename`.
+
+`harness-pr autoland [P] [--dry-run] [--json]` (ticket #142) runs on the same fixture with a second eligible PR
+(#57 on t/19-fix-the-frobber): the gate's answers plus what the land reads and writes (the merge, the merge
+commit, the PR body, the ticket edit, a 404 for the ticket's parent). harness-board, harness-work and
+terminal-notifier are stubs in fakebin that log their argv to STUB_LOG, so the Resolution and the notification
+are read from there. The state file is read and written under the temporary HOME.
 """
 from __future__ import annotations
 
@@ -68,12 +74,30 @@ def write(path, text):
     return path
 
 
+# harness-board, harness-work and terminal-notifier for `harness-pr autoland`'s land: each logs its argv to STUB_LOG
+# (when set) and prints nothing.
+STUB = """import json, os, sys
+log = os.environ.get("STUB_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tool": os.path.basename(sys.argv[1]), "argv": sys.argv[2:]}) + "\\n")
+"""
+
+
+def executable(path, text):
+    write(path, text)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
 def setUpModule():
     root = os.path.realpath(tempfile.mkdtemp(prefix="harness-autoland-bin-"))
     fakebin = os.path.join(root, "fakebin")
-    gh = write(os.path.join(fakebin, "gh"), f'#!/bin/sh\nexec "{sys.executable}" "{FAKEGH}" "$@"\n')
-    os.chmod(gh, os.stat(gh).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    gh = executable(os.path.join(fakebin, "gh"), f'#!/bin/sh\nexec "{sys.executable}" "{FAKEGH}" "$@"\n')
     os.symlink(sys.executable, os.path.join(fakebin, "python3"))
+    stub = write(os.path.join(root, "stub.py"), STUB)
+    for name in ("harness-board", "harness-work", "terminal-notifier", "osascript"):
+        executable(os.path.join(fakebin, name), f'#!/bin/sh\nexec "{sys.executable}" "{stub}" "$0" "$@"\n')
     BINS.update(root=root, fakebin=fakebin, gh=gh)
 
 
@@ -994,6 +1018,329 @@ class Gate(GateFixture, unittest.TestCase):
                 self.assertEqual(facts["nontest_lines"], lines, facts)
                 self.assertEqual(facts["head_sha"], self.head)
                 self.assertEqual(sorted(facts["files"]), sorted(path for path, _, _ in rows))
+
+
+# ------------------------------------------------------------------ autoland
+SECOND = 57
+SECOND_TICKET = 19
+SECOND_BRANCH = "t/19-fix-the-frobber"
+TITLES = {PR: "Add the widget (#12)", SECOND: "Fix the frobber (#19)"}
+MERGE_SHAS = {PR: "abc123def4567890abc123def4567890abc12345", SECOND: "0123456789abcdef0123456789abcdef01234567"}
+WRITES = (["pr", "merge"], ["pr", "edit"], ["pr", "ready"], ["pr", "comment"], ["issue", "edit"],
+          ["issue", "comment"], ["issue", "close"])
+
+
+def pr_body(ticket):
+    return (f"## Summary\n\nDoes the work of #{ticket}.\n\nCloses #{ticket}\n\n## Definition of done\n\n"
+            f"- [x] It works\n\n## Tests\n\nRed run before implementation (assertion, exit 1):\n\n```\nFAILED\n```\n\n"
+            f"Verify:\n\n```\nRan 9 tests in 0.1s\n\nOK\n```\n")
+
+
+class Autoland(GateFixture, unittest.TestCase):
+    def setUp(self):
+        self.stub_log = os.devnull                     # until the fixture's tmp exists
+        super().setUp()
+        self.stub_log = os.path.join(self.tmp, "stub.log")
+        self.second = self.ticket_branch(SECOND_BRANCH, {"src/frobber.py": "X = 19\n"})
+        if LIB not in sys.path:
+            sys.path.insert(0, LIB)
+        paths = importlib.import_module("harness_lib.paths")
+        self.state_dir = os.path.join(self.home, ".claude", "harness", "repos", paths.repo_key(self.main))
+        self.state_file = os.path.join(self.state_dir, "autoland.json")
+
+    def env(self, **extra):
+        return super().env(STUB_LOG=self.stub_log, **extra)
+
+    # -------------------------------------------------------------- the scenario
+    def pr_answers(self, pr=PR, state="OPEN"):
+        """The gate's answers for #34 (ticket 12) or #57 (ticket 19), every rule passing, with a title and url."""
+        if pr == PR:
+            a = self.answers()
+        else:
+            a = self.answers(pr=SECOND, ticket=SECOND_TICKET, ref=SECOND_BRANCH, head=self.second)
+        a["pr"].update(state=state, title=TITLES[pr], url=f"https://github.com/o/r/pull/{pr}")
+        return a
+
+    def land_entries(self, a):
+        """What the land reads and writes beyond the gate's answers."""
+        n, t = a["pr"]["number"], a["ticket_number"]
+        return [
+            {"match": ["pr", "view", str(n), "--json", "mergeCommit"],
+             "stdout_json": {"mergeCommit": {"oid": MERGE_SHAS[n]}}},
+            {"match": ["pr", "view", str(n), "--json", "body,files,url"],
+             "stdout_json": {"body": pr_body(t), "files": [], "url": a["pr"]["url"]}},
+            {"match": ["pr", "merge", str(n)], "stdout": ""},
+            {"contains": [f"repos/{SLUG}/pulls/{n}/reviews/501/comments"], "stdout_json": []},
+            {"match": ["issue", "edit", str(t)], "stdout": ""},
+            {"match": ["api", f"repos/{SLUG}/issues/{t}/parent"], "stderr": "gh: Not Found (HTTP 404)\n", "exit": 1},
+        ]
+
+    def autoland_scenario(self, prs, listed=None):
+        """`prs`: the answers of each PR; `listed`: what gh pr list prints (default: each of them, highest first)."""
+        if listed is None:
+            listed = [{"number": a["pr"]["number"], "headRefName": a["pr"]["headRefName"], "isDraft": False,
+                       "title": a["pr"]["title"]} for a in reversed(prs)]
+        calls = [entry for a in prs for entry in self.land_entries(a)]
+        calls.append({"match": ["pr", "list"], "stdout_json": listed})
+        for a in prs:
+            calls += self.calls(a)
+        write(self.scenario_path, json.dumps({"calls": calls}))
+        for leftover in (self.scenario_path + ".state.json", self.gh_log, self.stub_log):
+            if os.path.exists(leftover):
+                os.unlink(leftover)
+
+    def autoland(self, *args, code=0):
+        p = self.run_tool("autoland", *args)
+        self.assertEqual(p.returncode, code, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        return p
+
+    # -------------------------------------------------------------- reading what happened
+    def merges(self):
+        return [a for a in self.gh_argv() if a[:2] == ["pr", "merge"]]
+
+    def writes(self):
+        return [a for a in self.gh_argv() if a[:2] in WRITES]
+
+    def stubs(self, tool):
+        if not os.path.exists(self.stub_log):
+            return []
+        with open(self.stub_log, encoding="utf-8") as fh:
+            return [e["argv"] for e in (json.loads(line) for line in fh if line.strip()) if e["tool"] == tool]
+
+    def state(self):
+        with open(self.state_file, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def landed_line(self, sha):
+        return f"land: gate passed at {sha[:7]}"
+
+    def dirty_worktree(self):
+        """A worktree of BRANCH next to the main checkout with an untracked file: (its path, the file)."""
+        wt = os.path.join(self.tmp, "wt-12")
+        self.git(self.main, "fetch", "-q", "origin")
+        self.git(self.main, "worktree", "add", "-q", "-b", BRANCH, wt, f"origin/{BRANCH}")
+        return wt, write(os.path.join(wt, "notes.txt"), "unsaved\n")
+
+    # -------------------------------------------------------------- the tests
+    def test_lands_the_first_eligible_pr_and_only_one_per_pass(self):
+        prs = [self.pr_answers(PR), self.pr_answers(SECOND)]
+        listed = [{"number": SECOND, "headRefName": SECOND_BRANCH, "isDraft": False, "title": TITLES[SECOND]},
+                  {"number": 60, "headRefName": "t/60-a-draft", "isDraft": True, "title": "A draft"},
+                  {"number": 61, "headRefName": "feature/not-a-ticket", "isDraft": False, "title": "Not a ticket"},
+                  {"number": PR, "headRefName": BRANCH, "isDraft": False, "title": TITLES[PR]}]
+        self.autoland_scenario(prs, listed)
+        p = self.autoland()
+        self.assertEqual(p.stdout.splitlines(), [f"#{PR} {self.landed_line(self.head)}",
+                                                 f"#{SECOND} {self.landed_line(self.second)}",
+                                                 f"#{PR} landed"], p.stdout + p.stderr)
+        self.assertEqual(self.merges(), [["pr", "merge", str(PR), "-R", SLUG, "--squash", "--delete-branch"]])
+        listing = [a for a in self.gh_argv() if a[:2] == ["pr", "list"]]
+        self.assertEqual(len(listing), 1, listing)
+        self.assertEqual(listing[0][:7], ["pr", "list", "--author", "@me", "--state", "open", "--json"])
+        self.assertLessEqual({"number", "headRefName", "isDraft"}, set(listing[0][7].split(",")))
+        viewed = {a[2] for a in self.gh_argv() if a[:2] == ["pr", "view"]}
+        self.assertEqual(viewed, {str(PR), str(SECOND)})
+        with self.subTest("--json: a list, one entry per PR"):
+            os.unlink(self.state_file)
+            self.autoland_scenario(prs, listed)
+            data = json.loads(self.autoland("--json").stdout)
+            self.assertIsInstance(data, list)
+            self.assertEqual([(d["pr"], d["verdict"]) for d in data], [(PR, "land"), (SECOND, "land")])
+            self.assertEqual(data[0]["action"], "landed")
+            self.assertIsNone(data[1]["action"])
+            self.assertEqual(len(self.merges()), 1)
+        with self.subTest("P names the one PR: no list"):
+            self.autoland_scenario(prs)
+            p = self.autoland(str(SECOND))
+            self.assertEqual(p.stdout.splitlines(), [f"#{SECOND} {self.landed_line(self.second)}",
+                                                     f"#{SECOND} landed"])
+            self.assertEqual([a for a in self.gh_argv() if a[:2] == ["pr", "list"]], [])
+            self.assertEqual(self.merges(), [["pr", "merge", str(SECOND), "-R", SLUG, "--squash", "--delete-branch"]])
+
+    def test_records_each_verdict_in_the_state_file(self):
+        earlier = [{"pr": i, "ticket": i, "title": f"Old {i}", "sha": "e" * 40, "at": "2026-10-01T00:00:00Z"}
+                   for i in range(1, 51)]
+        write(self.state_file, json.dumps({"future": {"kept": True}, "landed": earlier, "cleanup_pending": None,
+                                           "prs": {"99": {"verdict": "land"}}}))
+        risky = self.pr_answers(SECOND)
+        risky["ticket"]["labels"] = label_list("task", "size:M", "risk:high")
+        self.autoland_scenario([self.pr_answers(PR), risky])
+        p = self.autoland()
+        self.assertIn(f"#{SECOND} manual: risk risk:high, not risk:low", p.stdout.splitlines())
+        state = self.state()
+        self.assertEqual(state["future"], {"kept": True})
+        self.assertIsNone(state["cleanup_pending"])
+        self.assertTrue(state["updated_at"].endswith("Z"), state)
+        first = state["prs"][str(PR)]
+        self.assertEqual({k: first[k] for k in ("head", "verdict", "code", "reason", "title", "ticket")},
+                         {"head": self.head, "verdict": "land", "code": "land",
+                          "reason": f"gate passed at {self.head[:7]}", "title": TITLES[PR], "ticket": TICKET})
+        second = state["prs"][str(SECOND)]
+        self.assertEqual({k: second[k] for k in ("head", "verdict", "code", "reason", "title", "ticket")},
+                         {"head": self.second, "verdict": "manual", "code": "risk",
+                          "reason": "risk risk:high, not risk:low", "title": TITLES[SECOND], "ticket": SECOND_TICKET})
+        for record in (first, second):
+            self.assertTrue(record["at"].endswith("Z"), record)
+        self.assertEqual(len(state["landed"]), 50)
+        self.assertEqual(state["landed"][0]["pr"], 2)                      # the oldest went
+        newest = state["landed"][-1]
+        self.assertEqual({k: newest[k] for k in ("pr", "ticket", "title", "sha")},
+                         {"pr": PR, "ticket": TICKET, "title": TITLES[PR], "sha": MERGE_SHAS[PR]})
+        self.assertTrue(newest["at"].endswith("Z"))
+
+    def test_not_opted_in_does_nothing(self):
+        self.set_origin_settings({"HARNESS_AUTOLAND": "0"})
+        for args in ((), (str(PR),), ("--dry-run",)):
+            with self.subTest(args=args):
+                self.autoland_scenario([self.pr_answers(PR), self.pr_answers(SECOND)])
+                p = self.autoland(*args)
+                self.assertEqual(p.stdout.splitlines(), ["autoland off in proj"])
+                self.assertEqual([a for a in self.gh_argv() if a[:1] == ["pr"]], [])
+                self.assertFalse(os.path.exists(self.state_file))
+
+    def test_dry_run_merges_nothing_and_writes_no_state(self):
+        before = json.dumps({"future": 1, "prs": {}, "landed": [], "cleanup_pending": None}, indent=2) + "\n"
+        write(self.state_file, before)
+        self.autoland_scenario([self.pr_answers(PR), self.pr_answers(SECOND)])
+        p = self.autoland("--dry-run")
+        self.assertEqual(p.stdout.splitlines(), [f"#{PR} {self.landed_line(self.head)}",
+                                                 f"#{SECOND} {self.landed_line(self.second)}",
+                                                 f"#{PR} would land"])
+        with self.subTest("--json"):
+            self.autoland_scenario([self.pr_answers(PR), self.pr_answers(SECOND)])
+            data = json.loads(self.autoland("--dry-run", "--json").stdout)
+            self.assertEqual([(d["pr"], d["action"]) for d in data], [(PR, "would land"), (SECOND, None)])
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.stubs("harness-board"), [])
+        self.assertEqual(self.stubs("terminal-notifier"), [])
+        with open(self.state_file, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)
+
+    def test_held_lock_skips_the_pass(self):
+        import fcntl
+        self.autoland_scenario([self.pr_answers(PR)])
+        os.makedirs(self.state_dir, exist_ok=True)
+        with open(os.path.join(self.state_dir, "autoland.lock"), "a") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            p = self.autoland()
+            self.assertEqual(p.stdout.splitlines(), ["autoland: another pass is running in proj"])
+            self.assertEqual(self.gh_argv(), [])
+            self.assertFalse(os.path.exists(self.state_file))
+        p = self.autoland()                                       # released: the next pass runs
+        self.assertIn(f"#{PR} landed", p.stdout.splitlines())
+
+    def test_resolution_says_landed_by_autoland(self):
+        self.autoland_scenario([self.pr_answers(PR)])
+        self.autoland()
+        comments = [a for a in self.stubs("harness-board") if a[:2] == ["comment", str(TICKET)]]
+        self.assertEqual(len(comments), 2, comments)
+        resolution = comments[0][comments[0].index("--body") + 1].splitlines()
+        self.assertEqual(resolution[0], "**Resolution**")
+        at = resolution.index("Verify: OK")
+        self.assertEqual(resolution[at + 1], f"Landed by: autoland (gate passed at {self.head[:7]})")
+        self.assertEqual(resolution[at + 2], f"PR: https://github.com/o/r/pull/{PR}")
+        self.assertEqual(resolution[at + 3], f"Squash commit: {MERGE_SHAS[PR]}")
+        self.assertEqual(comments[1][comments[1].index("--body") + 1], f"Landed in {MERGE_SHAS[PR]}")
+
+    def test_notifies_on_land(self):
+        self.autoland_scenario([self.pr_answers(PR), self.pr_answers(SECOND)])
+        self.autoland()
+        calls = self.stubs("terminal-notifier")
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0][calls[0].index("-message") + 1], f"proj PR #{PR} auto-landed: {TITLES[PR]}")
+        with self.subTest("nothing landed, no notification"):
+            prs = [self.pr_answers(PR), self.pr_answers(SECOND)]
+            for a in prs:
+                a["pr"]["isDraft"] = True
+            self.autoland_scenario(prs)
+            self.autoland()
+            self.assertEqual(self.stubs("terminal-notifier"), [])
+
+    def test_open_incident_lands_nothing(self):
+        prs = [self.pr_answers(PR), self.pr_answers(SECOND)]
+        for a in prs:
+            a["incidents"] = [{"number": 40, "title": "Smoke check failed"}]
+        self.autoland_scenario(prs)
+        p = self.autoland()
+        self.assertEqual(p.stdout.splitlines(), [f"#{PR} wait: incident #40 open", f"#{SECOND} wait: incident #40 open"])
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.stubs("terminal-notifier"), [])
+        state = self.state()
+        self.assertEqual([state["prs"][str(n)]["code"] for n in (PR, SECOND)], ["incident", "incident"])
+        self.assertEqual(state.get("landed") or [], [])
+
+    def test_cleanup_pending_is_finished_before_any_new_land(self):
+        wt, dirty = self.dirty_worktree()
+        self.autoland_scenario([self.pr_answers(PR), self.pr_answers(SECOND)])
+        p = self.autoland(code=1)
+        lines = p.stdout.splitlines()
+        self.assertEqual(lines[:3], [f"#{PR} {self.landed_line(self.head)}",
+                                     f"#{SECOND} {self.landed_line(self.second)}", f"#{PR} landed"])
+        self.assertEqual(len(lines), 4, p.stdout)
+        self.assertTrue(lines[3].startswith(f"#{PR} cleanup pending: "), lines[3])
+        self.assertEqual(self.state()["cleanup_pending"], PR)
+        self.assertEqual([r["pr"] for r in self.state()["landed"]], [PR])
+
+        with self.subTest("still dirty: reported, nothing new gated or landed"):
+            merged = self.pr_answers(PR, state="MERGED")
+            self.autoland_scenario([merged, self.pr_answers(SECOND)],
+                                   listed=[{"number": SECOND, "headRefName": SECOND_BRANCH, "isDraft": False,
+                                            "title": TITLES[SECOND]}])
+            p = self.autoland(code=1)
+            lines = p.stdout.splitlines()
+            self.assertEqual(len(lines), 1, p.stdout)
+            self.assertTrue(lines[0].startswith(f"#{PR} cleanup pending: "), lines[0])
+            self.assertEqual(self.merges(), [])
+            self.assertEqual([a for a in self.gh_argv() if a[:2] == ["pr", "list"]], [])
+            self.assertEqual(self.state()["cleanup_pending"], PR)
+            self.assertTrue(os.path.exists(dirty))
+
+        os.unlink(dirty)
+        merged = self.pr_answers(PR, state="MERGED")
+        self.autoland_scenario([merged, self.pr_answers(SECOND)],
+                               listed=[{"number": SECOND, "headRefName": SECOND_BRANCH, "isDraft": False,
+                                        "title": TITLES[SECOND]}])
+        p = self.autoland()
+        self.assertEqual(p.stdout.splitlines(), [f"#{PR} cleanup finished",
+                                                 f"#{SECOND} {self.landed_line(self.second)}", f"#{SECOND} landed"])
+        self.assertEqual(self.merges(), [["pr", "merge", str(SECOND), "-R", SLUG, "--squash", "--delete-branch"]])
+        self.assertFalse(os.path.exists(wt))
+        state = self.state()
+        self.assertIsNone(state["cleanup_pending"])
+        self.assertEqual([r["pr"] for r in state["landed"]], [PR, SECOND])
+        comments = [a for a in self.stubs("harness-board") if a[:2] == ["comment", str(TICKET)]]
+        self.assertIn(f"Landed by: autoland (gate passed at {self.head[:7]})",
+                      comments[0][comments[0].index("--body") + 1].splitlines())
+
+    def test_dirty_worktree_after_merge_is_never_discarded(self):
+        wt, dirty = self.dirty_worktree()
+        self.autoland_scenario([self.pr_answers(PR)])
+        p = self.autoland(code=1)
+        self.assertIn(f"#{PR} landed", p.stdout.splitlines())
+        self.assertEqual(len(self.merges()), 1)
+        self.assertTrue(os.path.exists(dirty))
+        self.assertIn(f"worktree {wt}", self.git(self.main, "worktree", "list", "--porcelain"))
+        self.assertEqual(self.git(self.main, "rev-parse", "--verify", "--quiet", f"refs/heads/{BRANCH}"),
+                         self.head)
+        self.assertEqual(self.state()["cleanup_pending"], PR)
+        self.assertEqual(self.stubs("harness-board"), [])        # the ticket is left until the cleanup finishes
+
+    def test_never_accepts_findings(self):
+        """The gate reads the summary's counts, land's review gate the findings listed: a review listing a high
+        finding under a summary that counts none passes the gate, and land still refuses it (no --accept-findings)."""
+        a = self.pr_answers(PR)
+        a["reviews"] = [dict(harness_review(self.head, ONE_LOW),
+                             body=f"{ONE_LOW}\n\nNot on a changed line:\n- `src/widget.py` [high] Frobs once.\n\n"
+                                  f"{REVIEW_MARKER}")]
+        self.autoland_scenario([a])
+        p = self.autoland(code=1)
+        lines = p.stdout.splitlines()
+        self.assertEqual(lines[0], f"#{PR} {self.landed_line(self.head)}")
+        self.assertTrue(lines[1].startswith(f"#{PR} land failed: "), p.stdout)
+        self.assertIn("high or medium finding", lines[1])
+        self.assertEqual(self.merges(), [])
+        self.assertIsNone(self.state()["cleanup_pending"])
 
 
 if __name__ == "__main__":
