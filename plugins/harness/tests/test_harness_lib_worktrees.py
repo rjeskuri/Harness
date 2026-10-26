@@ -521,8 +521,10 @@ class OneCopyTests(unittest.TestCase):
 
     def test_land_reads_the_branchs_worktree_through_worktree_for(self):
         tree = tree_of(BIN / "harness-pr")
-        land = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "cmd_land")
-        self.assertIn("worktree_for", called_names(land))
+        # #142: cmd_land's body is land_pr (autoland lands through it too); cmd_land calls it
+        functions = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        self.assertIn("land_pr", called_names(functions["cmd_land"]))
+        self.assertIn("worktree_for", called_names(functions["land_pr"]))
 
     def test_the_tools_bind_worktree_entries_from_the_lib(self):
         for tool in TOOLS:

@@ -1924,11 +1924,17 @@ def cmd_autoland(args):
     """One pass in the cwd's repository, holding repos/<key>/autoland.lock: finish a cleanup_pending land, else gate
     each candidate and land the first land verdict (one land per pass). State in repos/<key>/autoland.json."""
     repo = open_repo()
-    os.makedirs(repo.state(), exist_ok=True)
-    with open(repo.state("autoland.lock"), "a", encoding="utf-8") as lock:
+    path = repo.state("autoland.lock")
+    if not os.path.exists(path):
+        write_text(path, "", prefix=".autoland-lock-")
+    with open(path, encoding="utf-8") as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held = False
         except OSError:
+            held = True
+        # a first pass's lock file replaced while this one opened it: the other pass holds the file in place
+        if held or os.stat(path).st_ino != os.fstat(lock.fileno()).st_ino:
             return quiet_pass(args, f"autoland: another pass is running in {repo.name}")
         state = read_json(repo.state("autoland.json"))
         state = state if isinstance(state, dict) else {}
