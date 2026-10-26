@@ -4819,7 +4819,8 @@ def fixes_high_and_medium_only(text):
 RISK_HIGH_ONLY = re.compile(r"\bonly (?:on|for|when|in|with) (?:an? |the )?`?risk:high\b"
                             r"|`?risk:high`?(?: tickets?)?,? only\b"
                             r"|\bonly (?:an? |the )?`?risk:high`?(?: tickets?)? (?:runs?|gets?|has|uses?)\b")
-EVERY_TICKET = re.compile(r"\b(?:every|all|any|each)\s+(?:other\s+)?tickets?\b|\bevery other one\b")
+EVERY_TICKET = re.compile(r"\b(?:every|all|any|each)\s+(?:other\s+)?tickets?\b|\bevery other one\b"
+                          r"|\b(?:other|remaining|lower-risk)\s+tickets?\b|\bthe others\b|\bthe rest\b")
 WIDENS = re.compile(r"\b(?:also|as well|too|included|including|runs? it|run it|runs? the breaker|before step 4)\b"
                     r"|risk:high`? included|including `?risk:high")
 GOES_ON = re.compile(r"\bskip\w*|\bfrom step 2 (?:straight )?to step 4\b|\bgoes (?:straight |on )?to step 4\b"
@@ -4843,6 +4844,56 @@ def breaker_scope_problems(text):
     for p in pieces:
         if EVERY_TICKET.search(p) and (not GOES_ON.search(p) or affirmed_matches(WIDENS, p)):
             problems.append(f"every ticket runs the breaker: {p}")
+    return problems
+
+
+# Breaker round 2 (#259, Ryan's choice b): a positive check instead of more blocked words. In the breaker's
+# sections every clause that runs or uses the breaker (or this step) names risk:high as its scope; in the findings
+# sections every clause with a work verb (fix, resolve, address, correct, handle, repair, deal with, or a hand-off
+# to the coder or the fix file) names high and medium findings as its object. "Fix round", "fix file", `#N fix` and
+# `attempt N fix` are names, not work verbs. Clauses that say a ticket skips the breaker or that low findings go to
+# the notes carry no work verb, so they need no exception.
+WORK_NOUNS = re.compile(r"`?#n fix`?|attempt\s+\S+\s+fix\b|\bfix\s+(?:rounds?|file|pass|stage)\b|stage `?fix`?")
+WORK_VERB = re.compile(r"\b(?:fix(?:e[ds]|ing)?|resolv\w*|address(?:es|ed|ing)?|correct(?:s|ed|ing)?|handl\w*"
+                       r"|repair\w*|clean(?:s|ed|ing)? up|deal(?:s|t|ing)? with|tackl\w*|work(?:s|ed|ing)? (?:on|off))\b"
+                       r"|\b(?:go(?:es)?|went|gone|sent|send|sends|hand(?:s|ed)?|pass(?:es|ed)?|return(?:s|ed)?)\s+"
+                       r"(?:\w+\s+){0,3}?(?:back\s+)?to\s+(?:the\s+)?(?:coder|`?<?findings\.json|fix file)"
+                       r"|\bcoder\b[^;]*\b(?:gets?|takes?|receives?|picks? up)\b")
+RUN_VERB = re.compile(r"\b(?:runs?|ran|running|re-?runs?|use[sd]?|using|appl(?:y|ies|ied)|launch\w*|invok\w*)\b")
+RUN_TARGET = re.compile(r"\bit\b|\bbreaker\b|\bthis step\b|\bstep 3\b|\badversary\b|\btickets?\b|risk:\w+|\blabels?\b")
+WIDE = re.compile(r"\b(?:others?|the rest|remaining|everywhere|always|otherwise|every|all|any|each)\b"
+                  r"|\bsame way\b|\blikewise\b|\bsimilarly\b")
+SAME = re.compile(r"\bthe same way\b|\blikewise\b|\bsimilarly\b|\bas well\b|\balso\b|\btoo\b(?!\s+narrow)")
+LABELS_BELOW_HIGH = re.compile(r"risk:(?:low|medium)\b")
+MINOR = re.compile(r"\b(?:minor|trivial|nits?|nitpicks?|cosmetic|small(?:er)? ones?)\b")
+
+
+def work_scope_problems(text, kind):
+    """What a lower-cased section gets wrong under the positive check; `kind` is "breaker" (step 3, principle 2,
+    the loop's test-breaker entry, the Agents test-breaker row) or "findings" (steps 5, 6, 9, the checklist item,
+    the loop's coder, fix and ready entries, the Agents reviewer row)."""
+    problems = []
+    if LABELS_BELOW_HIGH.search(text):
+        problems.append(f"names risk:low or risk:medium: {text}")
+    if kind == "findings" and MINOR.search(text):
+        problems.append(f"names minor or trivial findings: {text}")
+    for c in clauses_of(text):
+        if kind == "findings":
+            bare = WORK_NOUNS.sub(" ", c)
+            if affirmed_matches(WORK_VERB, bare) and not names_high_and_medium(bare):
+                problems.append(f"a work clause does not name high and medium findings as its object: {c}")
+            continue
+        for piece in [p for p in re.split(r":(?=\s)|[,()]", c) if p.strip()] or [c]:
+            if SAME.search(piece):
+                problems.append(f"widens the breaker's scope: {piece}")
+        runs = affirmed_matches(RUN_VERB, c)
+        if not runs or not RUN_TARGET.search(c):
+            continue
+        scoped = [m for m in re.finditer(r"risk:high", c) if not negated(c, m.start())]
+        rerun = (re.search(r"\b(?:again|second|tightened|re-?runs?)\b", c)
+                 and not re.search(r"\btickets?\b|risk:|\blabels?\b", c))
+        if not (scoped or rerun) or WIDE.search(c):
+            problems.append(f"a run clause does not scope the breaker to risk:high: {c}")
     return problems
 
 
@@ -5388,6 +5439,9 @@ class WorkSkill(unittest.TestCase):
         # Only on risk:high, said as a rule ("runs only on a risk:high ticket"), not "not only"; no clause runs it on
         # every ticket, every other ticket, also or as well.
         self.assertEqual(breaker_scope_problems(low), [], step)
+        # Round 2: every clause that runs the breaker scopes it to risk:high (or is the re-run on tightened tests),
+        # and no lower label, "the same way" or "as well" widens it.
+        self.assertEqual(work_scope_problems(low, "breaker"), [], step)
         # Every other ticket goes past it to step 4: a direction (skips, goes from step 2 to step 4), not a mention.
         self.assertTrue(any(re.search(r"\bstep 4\b", c) and GOES_ON.search(c) and not affirmed_matches(WIDENS, c)
                             and re.search(r"\b(?:every other|any other|other tickets?|otherwise|not `?risk:high"
@@ -5496,6 +5550,11 @@ class WorkSkill(unittest.TestCase):
         fixes = fixes_high_and_medium_only(text)
         self.assertTrue(fixes, "no clause in steps 5-6 says the coder fixes the findings")
         self.assertEqual([c for c, ok in fixes if not ok], [], "a fix clause does not fix only high and medium")
+        # Round 2: every clause with a work verb (fix, resolve, address, a hand-off to the coder) names high and
+        # medium findings as its object, in step 5 and in step 6, and neither names minor findings or lower labels.
+        for n in (5, 6):
+            with self.subTest(step=n):
+                self.assertEqual(work_scope_problems(steps[n].lower(), "findings"), [], steps[n])
         # `fix pass` is defined by high and medium findings, never by "found nothing".
         passes = [c for c in parts if re.search(r"re-?check", c) and re.search(r"\bpass\b`?\s+(?:when|means|if)\b", c)]
         self.assertTrue(passes, "no clause says when the fix attempt passes")
@@ -5517,6 +5576,7 @@ class WorkSkill(unittest.TestCase):
         self.assertEqual(low_clause_problems(clauses_of(low)), [], step)
         self.assertEqual(fix_leak_problems(low), [], step)
         self.assertEqual([c for c, ok in fixes_high_and_medium_only(low) if not ok], [], step)
+        self.assertEqual(work_scope_problems(low, "findings"), [], step)
 
     def test_the_checklist_findings_item_says_high_and_medium_are_fixed_and_low_go_to_the_notes(self):
         # Ticket #259: the closing checklist's Findings item says the same rule, with nothing left to choice.
@@ -5525,6 +5585,8 @@ class WorkSkill(unittest.TestCase):
         self.assertEqual(len(items), 1, checklist)
         self.assertEqual(findings_rule_problems(items[0], ready=False), [], items[0])
         self.assertEqual(permissive_words(items[0]), [], items[0])
+        self.assertEqual(work_scope_problems(items[0], "findings"), [], items[0])
+        self.assertEqual(fix_leak_problems(items[0]), [], items[0])
 
     def test_the_design_doc_loop_runs_the_breaker_only_on_risk_high(self):
         # Ticket #259, design.md: principle 2 runs the adversary on risk:high tickets; the work loop's test-breaker
@@ -5579,6 +5641,15 @@ class WorkSkill(unittest.TestCase):
         self.assertEqual(low_clause_problems(clauses_of(reviewer)), [], rows["reviewer"])
         self.assertEqual(fix_leak_problems(reviewer), [], rows["reviewer"])
         self.assertEqual([c for c, ok in fixes_high_and_medium_only(reviewer) if not ok], [], rows["reviewer"])
+        # Round 2, the positive check: the breaker's sections scope every run to risk:high and name no lower label;
+        # in the findings sections every work clause names high and medium findings as its object.
+        sections = [("principle 2", p, "breaker"), ("loop test-breaker", b, "breaker"),
+                    ("Agents test-breaker", rows["test-breaker"].lower(), "breaker"),
+                    ("Agents reviewer", reviewer, "findings")]
+        sections += [("loop " + e.split()[0], e, "findings") for e in coder + fix + ready]
+        for where, section, kind in sections:
+            with self.subTest(section=where):
+                self.assertEqual(work_scope_problems(section, kind), [], section)
 
 
 # The breaker's inverted skill: agents in the background, no waiting, the turn ends when it likes, the checks optional.
@@ -6056,6 +6127,75 @@ class SkillWording(unittest.TestCase):
                 self.assertTrue(fix_leak_problems(text) or low_clause_problems(clauses_of(text))
                                 or [c for c, ok in fixes_high_and_medium_only(text) if not ok],
                                 text)
+
+    def test_the_positive_scope_check_takes_honest_wording_and_rejects_the_round_two_cheats(self):
+        # Ticket #259, breaker round 2 (Ryan's choice b): the synonym cheats fail the positive check, honest wording
+        # of each section passes it.
+        honest = [
+            ("breaker", "3. **break** (`harness:test-breaker`, stage `breaker`): `harness-red scratch create "
+                        "--worktree <path>`; give it the scratch path, the test files, the definition of done and the "
+                        "test command. this step runs only on a `risk:high` ticket; every other ticket goes from step "
+                        "2 to step 4. `cheat passed`: record `harness-work attempt n breaker fail`, then back to the "
+                        "author with the breaker's report to tighten the tests (step 2 again, including `harness-red "
+                        "check`), and the breaker runs again on the tightened tests. the attempt answers `retry` the "
+                        "first time and `needs-input` the second: at most two rounds, and a cheat that still passes "
+                        "the second round ends the turn with needs-input, never continuing."),
+            ("breaker", "this step runs only on a `risk:high` ticket; a ticket that is not `risk:high` skips it and "
+                        "goes from step 2 to step 4."),
+            ("breaker", "2. **tests before code, proven.** a test-author writes tests from the ticket; a tool proves "
+                        "they fail against the unchanged code; only on a `risk:high` ticket does an adversary try to "
+                        "pass them with a trivial implementation; only then does a coder touch source."),
+            ("breaker", "test-breaker (tier) risk:high only: scratch copy; cheat attempt; cheat passed: author "
+                        "tightens, breaker again; a second pass: needs-input"),
+            ("breaker", "in the scratch copy, writes the cheapest implementation that could pass the new tests "
+                        "(constants, special-casing the fixtures) and runs them. if it passes, the tests are too "
+                        "narrow. runs only on risk:high tickets. denied test edits by the hook."),
+            ("findings", "a fix round runs only for high or medium findings on the ticket's files: the coder (`#n "
+                         "fix`) fixes every one of them in commits after that review; push with `git push` in the "
+                         "worktree; the reviewer (`#n fix`) re-checks the branch. after each fix round record "
+                         "`harness-work attempt n fix pass|fail`: `pass` when the re-check found no high or medium "
+                         "finding on the ticket's files. `retry` means a second fix round on the new findings."),
+            ("findings", "it refuses while the latest harness review has high or medium findings and no commit after "
+                         "it, and names them: those go back to the coder as in step 6. it sets `status:in-review` and "
+                         "notifies the user. stop."),
+            ("findings", "coder (tier) fixes every high and medium posted finding in commits after the review; push; "
+                         "the reviewer re-checks and its findings are posted again"),
+            ("findings", "reviews the branch against the ticket's definition of done; returns findings as json lines "
+                         "for the pr; high and medium ones on the ticket's files block ready, low ones go to the "
+                         "notes."),
+            ("findings", "findings: every high and medium review finding on the ticket's files was fixed in a commit "
+                         "after the review that posted it; each low finding is in the pr notes under `### low "
+                         "findings`, with no fix round."),
+            ("findings", "a low finding is not fixed: it goes into the notes file under `### low findings`."),
+        ]
+        for kind, text in honest:
+            with self.subTest(honest=text):
+                self.assertEqual(work_scope_problems(text, kind), [])
+        cheats = [
+            ("breaker", "this step runs only on a `risk:high` ticket; a ticket that is not `risk:high` skips it and "
+                        "goes from step 2 to step 4. run it on `risk:medium` and `risk:low` tickets the same way."),
+            ("breaker", "this step runs only on a `risk:high` ticket. run it on the other tickets too."),
+            ("breaker", "this step runs only on a `risk:high` ticket. run it again on the others."),
+            ("breaker", "only on a `risk:high` ticket does an adversary try to pass them, and on risk:low and "
+                        "risk:medium the same way."),
+            ("breaker", "test-breaker (tier) risk:high only, and on risk:low and risk:medium the same way: scratch copy"),
+            ("breaker", "runs only on risk:high tickets, and on the rest likewise."),
+            ("breaker", "runs on every ticket."),
+            ("findings", "a fix round runs only for high or medium findings: the coder fixes every one of them. once "
+                         "those commits are in, resolve each entry in the notes file the same way;"),
+            ("findings", "it refuses while the latest harness review has high or medium findings. before you run it, "
+                         "resolve the low ones in a commit."),
+            ("findings", "coder (tier) fixes every high and medium posted finding in commits after the review; it "
+                         "resolves the minor ones in the same commits; push"),
+            ("findings", "returns findings as json lines for the pr; every one of them is resolved before ready."),
+            ("findings", "the coder fixes every high and medium finding; the notes entries are addressed in the same "
+                         "commits."),
+            ("findings", "the notes file entries go to the coder after that."),
+            ("findings", "the coder also handles the trivial ones."),
+        ]
+        for kind, text in cheats:
+            with self.subTest(cheat=text):
+                self.assertNotEqual(work_scope_problems(text, kind), [])
 
     def test_the_dispatch_venue_check_takes_any_wording_of_the_opt_in_and_rejects_the_old_default(self):
         hint = '"[issue# | --api | --max N | --venue headless|bg | --dry-run]"'
