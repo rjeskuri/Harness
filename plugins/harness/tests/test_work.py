@@ -5006,6 +5006,27 @@ class WorkSkill(unittest.TestCase):
         self.assertGreater(step.index("--base HEAD"), step.index("harness-red check"), step)
         self.assertRegex(step.lower(), r"\btests?\b|test-author", step)
 
+    def test_the_revise_and_fix_round_steps_prove_tests_that_pass_at_head_with_reprove(self):
+        # Ticket #275: new tests that pass at HEAD (coverage of behaviour the branch already has) cannot be proven
+        # at HEAD: `check --base HEAD` answers green, or, already committed, they leave `harness-red status` at
+        # `current: no`. The revise step (10) and the fix-round step (6) prove them with `harness-red reprove
+        # --worktree <path>` before the coder's next source edit. Failures print only short snippets: harness-red
+        # reads some phrases in a run's output as an empty run (see DispatchDefaultMaxDocs).
+        revise = self.revise_step()
+        where = f"step 10 ({revise[:80]!r}...)"
+        self.assertTrue("harness-red reprove --worktree <path>" in revise,
+                        f"{where} does not name `harness-red reprove --worktree <path>`")
+        self.assertTrue(revise.index("harness-red reprove") > revise.index("--base HEAD"),
+                        f"{where} names reprove before `check --base HEAD`")
+        self.assertTrue("green" in revise.lower(), f"{where} does not say when check --base HEAD answers green")
+        self.assertTrue("current: no" in revise, f"{where} does not name status's `current: no`")
+        steps = self.loop_steps()
+        self.assertIn(6, steps, "no numbered step 6 in the loop")
+        fix_round = steps[6]
+        where = f"step 6 ({fix_round[:80]!r}...)"
+        self.assertTrue("fix round" in fix_round, f"{where} does not describe the fix round")
+        self.assertTrue("harness-red reprove" in fix_round, f"{where} does not name harness-red reprove")
+
     def loop_steps(self):
         """{n: text} of the loop's numbered steps (a step runs to the next numbered line, a heading, or the blank
         line before an unindented paragraph)."""
