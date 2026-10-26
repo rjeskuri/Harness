@@ -12,7 +12,9 @@ Each test has a temporary HOME, a bare `origin` and a clone of it (`proj`, the m
 real git. A `fakebin` folder holds `gh` (a wrapper around fakegh.py) and `claude` (a fake that logs its
 argv, cwd and environment, answers `agents --json` from $FAKECLAUDE_AGENTS, prints `backgrounded · abc123`
 for --bg, answers `stop <id>` with exit 0, or exit 1 for an id listed in $FAKECLAUDE_STOP_FAIL (comma-separated),
-and for -p sleeps briefly, then prints a canned JSON result). harness-board is the real one,
+and for -p sleeps briefly, then prints a canned JSON result; for --cloud it refuses unless its stdout is a terminal,
+logs the origin's heads and prints the create-and-exit lines with \\r\\n ends and ANSI escapes, or the failure
+$FAKECLAUDE_CLOUD names), and terminal-notifier and osascript that do nothing. harness-board is the real one,
 found next to harness-work. The fake executables are written once for the module: macOS checks a new
 executable on its first run, which costs about half a second each time.
 """
@@ -72,9 +74,44 @@ FAKE_CLAUDE = """#!{python}
 import json, os, sys, time
 argv = sys.argv[1:]
 log = os.environ.get("FAKECLAUDE_LOG")
+entry = {{"argv": argv, "cwd": os.getcwd(), "env": dict(os.environ)}}
+if "--cloud" in argv:
+    import subprocess
+    entry["tty"] = os.isatty(1)
+    entry["remote_heads"] = subprocess.run(["git", "ls-remote", "--heads", "origin"], capture_output=True,
+                                           text=True, stdin=subprocess.DEVNULL).stdout
 if log:
     with open(log, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps({{"argv": argv, "cwd": os.getcwd(), "env": dict(os.environ)}}) + "\\n")
+        fh.write(json.dumps(entry) + "\\n")
+if "--cloud" in argv:
+    if not os.isatty(1):
+        sys.stderr.write("Error: --cloud requires an interactive terminal. To start a new cloud session, run from "
+                         "a TTY.\\n")
+        sys.exit(1)
+    mode = os.environ.get("FAKECLAUDE_CLOUD", "created")
+    sid = os.environ.get("FAKECLAUDE_CLOUD_ID", "session_01FakeCloudXyz")
+    esc = "\\x1b["
+    if mode == "attached":
+        out = ("Opening the cloud session here...\\r\\n" + esc + "33mNo cloud session was created or opened: it would "
+               "open in this terminal and need the keyboard." + esc + "0m\\r\\n")
+        code = 0
+    elif mode == "fail":
+        out = "Connecting...\\r\\n" + esc + "31mError: cloud environment unavailable (HTTP 503)" + esc + "0m\\r\\n"
+        code = 1
+    elif mode == "billing":
+        out = "Connecting...\\r\\n" + esc + "31mError: your cloud session credits are used up" + esc + "0m\\r\\n"
+        code = 1
+    else:
+        out = (esc + "?25l" + esc + "1mCreated cloud session:" + esc + "0m "
+               + os.environ.get("FAKECLAUDE_TITLE", "work") + "\\r\\n" + esc + "2mView:" + esc + "0m " + esc + "4mhttps://claude.ai/code/" + sid + "?from=cli&m=0"
+               + esc + "24m\\r\\n")
+        if mode != "noresume":
+            out += "Resume with: " + esc + "36mclaude --teleport " + sid + esc + "39m\\r\\n"
+        out += esc + "?25h"
+        code = 0
+    sys.stdout.write(out)
+    sys.stdout.flush()
+    sys.exit(code)
 if argv[:1] == ["agents"]:
     sys.stdout.write(os.environ.get("FAKECLAUDE_AGENTS", "[]"))
     sys.exit(0)
@@ -160,6 +197,8 @@ def setUpModule():
     fakebin, toolbin = os.path.join(root, "fakebin"), os.path.join(root, "toolbin")
     executable(os.path.join(fakebin, "gh"), f'#!/bin/sh\nexec "{sys.executable}" "{FAKEGH}" "$@"\n')
     executable(os.path.join(fakebin, "claude"), FAKE_CLAUDE.format(python=sys.executable))
+    for name in ("terminal-notifier", "osascript"):     # harness-board needs-input (a cloud run's blocked marker)
+        executable(os.path.join(fakebin, name), "#!/bin/sh\nexit 0\n")
     os.makedirs(toolbin)
     os.symlink(GIT, os.path.join(toolbin, "git"))
     os.symlink(sys.executable, os.path.join(toolbin, "python3"))
@@ -6263,6 +6302,496 @@ class Worktrees(WorkTest):
 
     def test_remove_refuses_main(self):
         self.assertOneLineError(self.work("worktree", "remove", "main"), "refusing")
+
+
+# =========================================================================== cloud (#58)
+# `harness-work cloud N` starts the ticket, pushes its branch and runs `claude --cloud <prompt> --on-branch <branch>`
+# with its stdout on a pseudo-terminal; the fake claude refuses without one, as the real one does. The sweep closes a
+# cloud run only from a marker comment by the gh user (or a finished ticket, or 24 h of silence).
+CLOUD_DONE = "<!-- harness-cloud: done -->"
+CLOUD_BLOCKED = "<!-- harness-cloud: blocked -->"
+ME = "rjeskuri"            # what the scenario's `gh api user` prints
+IN_PROGRESS_LABELS = ("task", "status:in-progress", "size:S", "risk:low")
+
+
+def exhausted(entry):
+    """The exhausted_until of a budget entry when it is still ahead, else None."""
+    if not isinstance(entry, dict) or not entry.get("exhausted_until"):
+        return None
+    when = dt.datetime.strptime(entry["exhausted_until"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    return when if when > dt.datetime.now(dt.timezone.utc) else None
+
+
+class CloudTest(WorkTest):
+    SLUG = "acme/widgets"
+
+    def cloud_scenario(self, issues, slug=None, ready=(), failing=()):
+        """issues: the `gh issue view N` answers (comments included). failing: calls (argv prefixes) that exit 1."""
+        gone = {"stderr": "HTTP 502: Bad gateway (https://api.github.com/graphql)\n", "exit": 1}
+        calls = [dict(gone, match=list(prefix)) for prefix in failing]
+        calls += [{"match": ["issue", "view", str(i["number"])], "stdout_json": i} for i in issues]
+        calls += [
+            {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": slug or self.SLUG}},
+            {"match": ["issue", "list"], "stdout_json": list(ready)},
+            {"match": ["issue", "edit"], "stdout": ""},
+            {"match": ["issue", "comment"], "stdout": "https://github.com/acme/widgets/issues/12#issuecomment-1\n"},
+            {"match": ["pr", "list"], "stdout_json": []},
+            {"match": ["api", "user"], "stdout": ME + "\n"},
+            {"match": ["api"], "stdout_json": []},
+        ]
+        write(self.scenario_path, json.dumps({"calls": calls}))
+        state = self.scenario_path + ".state.json"
+        if os.path.exists(state):
+            os.unlink(state)
+
+    def gh_entries(self):
+        if not os.path.exists(self.gh_log):
+            return []
+        with open(self.gh_log, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def comment_bodies(self, n):
+        """The bodies of every `gh issue comment n` (--body or --body-file -)."""
+        out = []
+        for entry in self.gh_entries():
+            argv = entry["argv"]
+            if argv[:3] == ["issue", "comment", str(n)]:
+                if "--body" in argv:
+                    out.append(argv[argv.index("--body") + 1])
+                elif "--body-file" in argv:
+                    out.append(entry.get("stdin") or "")
+        return out
+
+    def added_labels(self, n):
+        edits = [a for a in self.gh_calls() if a[:3] == ["issue", "edit", str(n)]]
+        return [a[i + 1] for a in edits for i, tok in enumerate(a[:-1]) if tok == "--add-label"]
+
+    def cloud_calls(self):
+        return [c for c in self.claude_calls() if "--cloud" in c["argv"]]
+
+    def commit_settings(self, env):
+        write(os.path.join(self.repo, ".claude", "settings.json"), json.dumps({"env": env}))
+        self.git(self.repo, "add", "-A")
+        self.git(self.repo, "commit", "-q", "-m", "Settings")
+        self.git(self.repo, "push", "-q", "origin", "main")
+
+    def cloud_run(self, n, started_at, **fields):
+        sid = f"session_0{n}SweptAbc"
+        return self.write_run(n, venue="cloud", cloud_id=sid, url=f"https://claude.ai/code/{sid}?from=cli&m=0",
+                              branch=f"t/{n}-x", started_at=started_at, **fields)
+
+
+class CloudLaunch(CloudTest):
+    def launch(self, n, title, sid, settings, slug, *extra):
+        self.commit_settings(settings)
+        self.cloud_scenario([issue(n, title=title)], slug=slug)
+        env = self.env(FAKECLAUDE_CLOUD_ID=sid, FAKECLAUDE_TITLE=title, **CREDENTIALS)
+        p = self.work("cloud", str(n), *extra, env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return p
+
+    def check_launch(self, n, branch, sid, slug, verify, absent=()):
+        """The one cloud launch of ticket n: its argv, prompt, push, record, log and comments. Returns the record."""
+        wt = self.worktree_path(branch)
+        self.assertEqual(self.git(wt, "branch", "--show-current"), branch)
+        [call] = self.cloud_calls()
+        argv = call["argv"]
+        self.assertTrue(call["tty"])
+        self.assertEqual(os.path.realpath(call["cwd"]), wt)
+        prompt = argv[argv.index("--cloud") + 1]
+        self.assertFalse(prompt.startswith("-"), argv)
+        self.assertEqual(argv[argv.index("--on-branch") + 1], branch)
+        for name in CREDENTIALS:
+            self.assertNotIn(name, call["env"])
+
+        # the prompt is self-contained: repository, ticket, branch, gh api REST, both markers, the verify command
+        for needle in (slug, f"#{n}", branch, "gh api", f"repos/{slug}/issues/{n}/comments", CLOUD_DONE,
+                       CLOUD_BLOCKED, verify, "`harness-board ready` lists unblocked tickets"):
+            self.assertIn(needle, prompt)
+        for needle in absent:
+            self.assertNotIn(needle, prompt)
+
+        # pushed to origin before the launch, with an upstream
+        head = self.git(wt, "rev-parse", "HEAD")
+        self.assertIn(f"{head}\trefs/heads/{branch}", call["remote_heads"])
+        self.assertEqual(self.git(wt, "rev-parse", "--abbrev-ref", "@{u}"), f"origin/{branch}")
+
+        [record] = [r for r in self.run_records() if r["ticket"] == n and not r.get("ended_at")]
+        url = record["url"]
+        self.assertTrue(url.startswith(f"https://claude.ai/code/{sid}"), url)
+        self.assertIsNone(re.search(r"[\x00-\x20\x7f]", url), repr(url))
+        expected = {"ticket": n, "repo": os.path.realpath(self.repo), "worktree": wt, "branch": branch,
+                    "venue": "cloud", "cloud_id": sid, "ended_at": None, "exit": None, "outcome": None}
+        self.assertEqual({k: record.get(k) for k in expected}, expected)
+        self.assertTrue({"id", "log", "started_at"} <= set(record), record)
+        self.iso_close_to(record["started_at"], dt.timedelta(0))
+        log = read_text(record["log"])
+        self.assertIn("Created cloud session", log)
+        self.assertIn(sid, log)
+        self.assertNotIn("\r", log)
+        self.assertNotIn("\x1b", log)
+
+        # status in-progress with a start comment naming the venue, and the comment carrying the URL
+        self.assertIn("status:in-progress", self.added_labels(n))
+        bodies = self.comment_bodies(n)
+        self.assertTrue([b for b in bodies if b.startswith(f"Started on {branch}") and "cloud" in b], bodies)
+        self.assertTrue([b for b in bodies if f"Cloud session on {branch}: {url}" in b], bodies)
+        return record
+
+    def test_cloud_launch_end_to_end(self):
+        sid = "session_01HwXq7Kp-Lm_9"
+        p = self.launch(12, TITLE, sid, {"CLAUDE_VERIFY_CMD": "make verify-widgets",
+                                         "HARNESS_TEST_CMD": "pytest -q {files}"}, "acme/widgets")
+        record = self.check_launch(12, BRANCH, sid, "acme/widgets", "make verify-widgets", absent=("pytest -q",))
+        url = record["url"]
+        self.assertIn(f"#12 cloud on {BRANCH} ({url})", p.stdout)
+
+        # runs lists it in the cloud; --json keeps cloud_id and url; a sweep with no marker leaves it open
+        [row] = [r for r in self.ok_json("runs", "--json") if r["id"] == record["id"]]
+        self.assertEqual((row["cloud_id"], row["url"], row["state"]), (sid, url, f"in the cloud ({url})"))
+        line = next(ln for ln in self.ok("runs").stdout.splitlines() if record["id"] in ln)
+        self.assertIn("in the cloud", line)
+        [row] = [r for r in self.ok_json("runs", "--sweep", "--json") if r["id"] == record["id"]]
+        self.assertIsNone(row["ended_at"])
+        self.assertIn("api: available", self.ok("budget", "status").stdout)
+
+    def test_cloud_launch_varies_with_the_ticket_session_repository_and_verify_command(self):
+        # an ended cloud run of the ticket does not stop a new one, nor does an exhausted api budget
+        old = self.cloud_run(31, iso_ago(hours=40), ended_at=iso_ago(hours=30), outcome="ok")
+        self.write_budget("api", 5)
+        sid = "session_9zz_Other-Run2"
+        p = self.launch(31, "Cache the ready list", sid, {"HARNESS_TEST_CMD": "python3 -m pytest tests -q"},
+                        "someone/thing", "--json")
+        branch = "t/31-cache-the-ready-list"
+        record = self.check_launch(31, branch, sid, "someone/thing", "python3 -m pytest tests -q",
+                                   absent=("acme/widgets", BRANCH))
+        self.assertEqual(json.loads(p.stdout), record)
+        records = self.run_records()
+        self.assertEqual(len(records), 2)
+        self.assertIn(old, records)
+
+    def test_the_session_id_comes_from_the_view_url_without_a_resume_line(self):
+        self.commit_settings({"CLAUDE_VERIFY_CMD": "make check"})
+        self.cloud_scenario([issue()])
+        sid = "session_77NoResume_x"
+        self.ok("cloud", "12", env=self.env(FAKECLAUDE_CLOUD="noresume", FAKECLAUDE_CLOUD_ID=sid))
+        [record] = self.run_records()
+        self.assertEqual(record["cloud_id"], sid)
+        self.assertTrue(record["url"].startswith(f"https://claude.ai/code/{sid}"), record["url"])
+        self.assertIsNone(record["ended_at"])
+
+    def test_start_accepts_the_cloud_venue(self):
+        self.scenario(issues=[issue()])
+        data = self.ok_json("start", "12", "--venue", "cloud", "--json")
+        self.assertEqual(data["branch"], BRANCH)
+        comments = [c for c in self.gh_calls() if c[:3] == ["issue", "comment", "12"]]
+        self.assertTrue([c for c in comments if "cloud" in c[c.index("--body") + 1]], comments)
+        self.assertFalse(self.claude_calls())
+
+
+class CloudRefusal(CloudTest):
+    def assertNothingStarted(self, records_before):
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+        calls = self.gh_calls()
+        self.assertFalse([c for c in calls if c[:2] in (["issue", "edit"], ["issue", "comment"])], calls)
+        self.assertFalse(self.claude_calls())
+        self.assertEqual(self.run_records(), records_before)
+        self.assertEqual(self.git(self.origin, "for-each-ref", "refs/heads/t"), "")
+
+    def test_a_needs_local_ticket_is_refused_with_the_reason(self):
+        for n in (12, 40):
+            with self.subTest(ticket=n):
+                self.cloud_scenario([issue(n, labels=("task", "status:ready", "size:S", "risk:low", "needs-local"))])
+                p = self.work("cloud", str(n))
+                self.assertOneLineError(p, "needs-local", f"/harness:work {n}")
+                self.assertEqual(p.stdout, "")
+                self.assertNothingStarted([])
+
+    def test_an_exhausted_cloud_budget_is_refused(self):
+        self.write_budget("cloud", 5, reason="credits used up")
+        until = self.read_json(self.budgets_path())["cloud"]["exhausted_until"]
+        self.cloud_scenario([issue()])
+        p = self.work("cloud", "12")
+        self.assertOneLineError(p, "harness-work budget reset cloud", until)
+        self.assertNothingStarted([])
+
+    def test_an_unended_cloud_run_of_the_ticket_is_refused(self):
+        record = self.cloud_run(12, iso_ago(hours=1))
+        self.cloud_scenario([issue(labels=IN_PROGRESS_LABELS)])
+        p = self.work("cloud", "12")
+        self.assertOneLineError(p, record["id"])
+        self.assertNothingStarted([record])
+
+    def test_epic_closed_and_blocked_tickets_get_starts_refusal(self):
+        cases = [(issue(labels=("epic", "status:ready"), title="The board"), "#12 is an epic"),
+                 (issue(state="CLOSED"), "#12 is closed"),
+                 (issue(labels=("task", "status:blocked")), "status:blocked")]
+        for record, needle in cases:
+            with self.subTest(needle=needle):
+                self.cloud_scenario([record])
+                self.assertOneLineError(self.work("cloud", "12"), needle)
+                self.assertNothingStarted([])
+
+
+class CloudLaunchFailure(CloudTest):
+    def test_a_failed_launch_or_one_without_a_session_id_ends_the_record_in_error(self):
+        cases = (("fail", "Error: cloud environment unavailable (HTTP 503)"),
+                 ("attached", "No cloud session was created or opened: it would open in this terminal and need the "
+                              "keyboard."))
+        for mode, last in cases:
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.runs_dir(), True)
+                self.cloud_scenario([issue()])
+                p = self.work("cloud", "12", env=self.env(FAKECLAUDE_CLOUD=mode))
+                self.assertOneLineError(p, last)
+                self.assertNotIn("\x1b", p.stderr)
+                [record] = self.run_records()
+                self.assertEqual((record["venue"], record["outcome"]), ("cloud", "error"))
+                self.assertTrue(record["ended_at"])
+                self.assertIn(last, record.get("error") or "")
+                self.assertEqual(len(self.cloud_calls()), 1)
+                os.unlink(self.claude_log)
+        status = self.ok("budget", "status").stdout
+        self.assertIn("cloud: available", status)
+        self.assertIn("api: available", status)
+
+    def test_billing_wording_marks_the_cloud_budget_exhausted(self):
+        self.cloud_scenario([issue()])
+        p = self.work("cloud", "12", env=self.env(FAKECLAUDE_CLOUD="billing"))
+        self.assertOneLineError(p, "credits are used up")
+        [record] = self.run_records()
+        self.assertEqual(record["outcome"], "error")
+        budgets = self.read_json(self.budgets_path())
+        self.iso_close_to(budgets["cloud"]["exhausted_until"], dt.timedelta(hours=24))
+        self.assertIsNone(exhausted(budgets.get("api")))
+        # the next launch is refused by the budget, not by the ended run
+        self.assertOneLineError(self.work("cloud", "12"), "harness-work budget reset cloud")
+        self.assertEqual(len(self.cloud_calls()), 1)
+
+    def test_a_failed_push_launches_nothing(self):
+        executable(os.path.join(self.origin, "hooks", "pre-receive"),
+                   "#!/bin/sh\necho 'push refused by the test hook' >&2\nexit 1\n")
+        self.cloud_scenario([issue()])
+        p = self.work("cloud", "12")
+        self.assertOneLineError(p)
+        self.assertIn("push", p.stderr.lower())
+        self.assertTrue(os.path.isdir(self.worktree_path()))     # started first, then the push failed
+        self.assertFalse(self.cloud_calls())
+        self.assertEqual(self.git(self.origin, "for-each-ref", "refs/heads/t"), "")
+
+
+class CloudSweep(CloudTest):
+    def test_the_sweep_closes_a_cloud_run_only_on_a_marker_by_the_gh_user_after_its_start(self):
+        two = iso_ago(hours=2)
+        t = {k: iso_ago(minutes=k) for k in (10, 20, 30, 50, 60, 70, 90, 180)}
+        cases = {   # ticket: (started_at, labels, state, comments, expected outcome, expected ended_at or "now")
+            21: (two, IN_PROGRESS_LABELS, "OPEN", [comment(ME, t[60], CLOUD_DONE + "\nDid it.\nRuling: x")],
+                 "ok", t[60]),                                       # in progress, no PR: still ok, never early
+            22: (two, IN_PROGRESS_LABELS, "OPEN", [comment("drive-by-user", t[60], CLOUD_DONE)], None, None),
+            23: (two, IN_PROGRESS_LABELS, "OPEN", [comment(ME, t[180], CLOUD_DONE)], None, None),
+            24: (two, IN_PROGRESS_LABELS, "OPEN", [], None, None),
+            25: (two, IN_PROGRESS_LABELS, "OPEN", [comment(ME, t[60], "Progress so far.\n" + CLOUD_DONE)], None, None),
+            27: (iso_ago(hours=25), IN_PROGRESS_LABELS, "OPEN", [], "unknown", "now"),
+            28: (two, ("task", "status:in-review", "size:S", "risk:low"), "OPEN", [], "ok", "now"),
+            29: (two, IN_PROGRESS_LABELS, "CLOSED", [], "ok", "now"),
+            31: (two, IN_PROGRESS_LABELS, "OPEN", [comment(ME, t[90], CLOUD_BLOCKED + "\nWhich base?"),
+                                                   comment(ME, t[30], CLOUD_DONE + "\nAnswered and done.")],
+                 "ok", t[30]),
+            32: (iso_ago(hours=23), IN_PROGRESS_LABELS, "OPEN", [], None, None),
+            33: (two, IN_PROGRESS_LABELS, "OPEN", [comment(ME, t[70], CLOUD_DONE + "\nDone."),
+                                                   comment(ME, t[20], "Started on t/33-x (mac, interactive)" + MARK)],
+                 "ok", t[70]),
+            34: (two, IN_PROGRESS_LABELS, "OPEN", [comment(ME, t[50], CLOUD_DONE + "\nDone."),
+                                                   comment("drive-by-user", t[10], CLOUD_BLOCKED + "\nStop?")],
+                 "ok", t[50]),
+        }
+        records = {n: self.cloud_run(n, c[0]) for n, c in cases.items()}
+        self.cloud_scenario([issue(n, labels=c[1], state=c[2], comments=c[3]) for n, c in cases.items()])
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+        saved = {r["ticket"]: r for r in self.run_records()}
+        for n, (_, _, _, _, outcome, ended) in cases.items():
+            with self.subTest(ticket=n):
+                self.assertEqual((rows[n]["outcome"], saved[n]["outcome"]), (outcome, outcome))
+                if ended is None:
+                    self.assertIsNone(saved[n]["ended_at"])
+                    self.assertEqual(rows[n]["state"], f"in the cloud ({records[n]['url']})")
+                elif ended == "now":
+                    self.iso_close_to(saved[n]["ended_at"], dt.timedelta(0))
+                    self.assertEqual(rows[n]["state"], f"ended {outcome}")
+                else:
+                    self.assertEqual(saved[n]["ended_at"], ended)
+                    self.assertEqual(rows[n]["state"], f"ended {outcome}")
+        self.assertFalse([c for c in self.gh_calls() if c[:2] == ["issue", "edit"]])   # no needs-input here
+        self.assertIn("api: available", self.ok("budget", "status").stdout)
+
+    def test_a_blocked_marker_ends_the_run_blocked_and_asks_the_owner(self):
+        two = iso_ago(hours=2)
+        asked = {26: (iso_ago(minutes=60), "Should the cache live in ~/.cache or under the repo?"),
+                 30: (iso_ago(minutes=25), "The ticket names two verify commands; which one is right?")}
+        comments = {26: [comment(ME, asked[26][0], CLOUD_BLOCKED + "\n" + asked[26][1] + "\n")],
+                    30: [comment(ME, iso_ago(minutes=90), CLOUD_DONE + "\nFirst pass."),
+                         comment(ME, asked[30][0], CLOUD_BLOCKED + "\n" + asked[30][1])]}
+        for n in asked:
+            self.cloud_run(n, two)
+        self.cloud_scenario([issue(n, labels=IN_PROGRESS_LABELS, comments=comments[n]) for n in asked])
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+        saved = {r["ticket"]: r for r in self.run_records()}
+        for n, (when, question) in asked.items():
+            with self.subTest(ticket=n):
+                self.assertEqual((rows[n]["outcome"], saved[n]["outcome"]), ("blocked", "blocked"))
+                self.assertEqual(saved[n]["ended_at"], when)
+                self.assertEqual(rows[n]["state"], "ended blocked")
+                self.assertIn("status:needs-input", self.added_labels(n))
+                bodies = self.comment_bodies(n)
+                asking = [b for b in bodies if question in b]
+                self.assertEqual(len(asking), 1, bodies)
+                self.assertNotIn(CLOUD_BLOCKED, asking[0])
+                for m, (_, other) in asked.items():
+                    if m != n:
+                        self.assertNotIn(other, "\n".join(bodies))
+        self.assertIn("api: available", self.ok("budget", "status").stdout)
+
+    def test_a_failing_gh_call_is_one_warning_and_leaves_the_run_open(self):
+        for failing in (["issue", "view", "12"], ["api", "user"]):
+            with self.subTest(failing=failing):
+                shutil.rmtree(self.runs_dir(), True)
+                record = self.cloud_run(12, iso_ago(hours=2))
+                self.cloud_scenario([issue(labels=IN_PROGRESS_LABELS,
+                                           comments=[comment(ME, iso_ago(hours=1), CLOUD_DONE)])],
+                                    failing=[failing])
+                p = self.work("runs", "--sweep", "--json")
+                self.assertEqual(p.returncode, 0, p.stderr)
+                [row] = json.loads(p.stdout)
+                self.assertIsNone(row["ended_at"])
+                self.assertEqual(self.run_records(), [record])
+                warnings = [ln for ln in p.stderr.splitlines() if ln.startswith("harness-work:")]
+                self.assertEqual(len(warnings), 1, p.stderr)
+
+    def test_dispatch_treats_an_unended_cloud_run_as_live(self):
+        record = self.cloud_run(12, iso_ago(hours=1))
+        self.cloud_scenario([issue(labels=IN_PROGRESS_LABELS), issue(13, title="Next")],
+                            ready=[ready_row(12), ready_row(13, "Next")])
+        data = self.ok_json("dispatch", "--dry-run", "--json")
+        self.assertEqual([r["number"] for r in data["plan"]], [13])
+        self.assertIn({"number": 12, "why": f"live run {record['id']}"}, data["skipped"])
+        self.assertEqual(data["live"], [record["id"]])
+        self.assertIsNone(self.run_records()[0]["ended_at"])
+
+    def test_dispatch_sweeps_a_done_cloud_run_and_picks_the_ticket_up_again(self):
+        when = iso_ago(minutes=40)
+        self.cloud_run(12, iso_ago(hours=3))
+        self.cloud_scenario([issue(labels=IN_PROGRESS_LABELS, comments=[comment(ME, when, CLOUD_DONE + "\nDone.")])])
+        data = self.ok_json("dispatch", "--dry-run", "--json")
+        [record] = self.run_records()
+        self.assertEqual((record["outcome"], record["ended_at"]), ("ok", when))
+        self.assertEqual([(r["number"], r.get("again")) for r in data["plan"]], [(12, "ok")])
+        self.assertEqual(data["live"], [])
+
+
+# =========================================================================== start: fast-forward (#58)
+class StartFastForward(WorkTest):
+    def started_and_pushed(self):
+        self.scenario(issues=[issue()])
+        wt = self.ok_json("start", "12", "--json")["worktree"]
+        self.git(wt, "push", "-q", "-u", "origin", BRANCH)
+        return wt
+
+    def elsewhere(self):
+        """A second clone on the branch: where the cloud session pushes from."""
+        other = self.other_clone()
+        self.git(other, "switch", "-q", BRANCH)
+        return other
+
+    def commit(self, clone, name, push=True):
+        write(os.path.join(clone, name), name + "\n")
+        self.git(clone, "add", "-A")
+        self.git(clone, "commit", "-q", "-m", name)
+        if push:
+            self.git(clone, "push", "-q", "origin", BRANCH)
+        return self.git(clone, "rev-parse", "HEAD")
+
+    def branch_warnings(self, p):
+        return [ln for ln in p.stderr.splitlines() if ln.startswith("harness-work:") and BRANCH in ln]
+
+    def test_a_clean_worktree_behind_origin_is_fast_forwarded(self):
+        wt = self.started_and_pushed()
+        p = self.ok("start", "12")                                # up to date: nothing to say
+        self.assertEqual(self.branch_warnings(p), [])
+        other = self.elsewhere()
+        for name in ("CLOUD1.md", "CLOUD2.md"):
+            head = self.commit(other, name)
+            p = self.ok("start", "12")
+            self.assertEqual(self.git(wt, "rev-parse", "HEAD"), head)
+            self.assertTrue(os.path.isfile(os.path.join(wt, name)))
+            self.assertEqual(self.branch_warnings(p), [])
+            self.assertEqual(self.git(wt, "status", "--porcelain"), "")
+
+    def test_a_reused_local_branch_without_a_worktree_is_fast_forwarded(self):
+        wt = self.started_and_pushed()
+        self.git(self.repo, "worktree", "remove", wt)
+        head = self.commit(self.elsewhere(), "CLOUD.md")
+        data = self.ok_json("start", "12", "--json")
+        self.assertEqual(data["worktree"], wt)
+        self.assertEqual(self.git(wt, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git(self.repo, "rev-parse", BRANCH), head)
+
+    def test_a_diverged_branch_gets_one_warning_and_is_left_alone(self):
+        wt = self.started_and_pushed()
+        local = self.commit(wt, "LOCAL.md", push=False)
+        p = self.ok("start", "12")                                # only ahead: nothing to say, nothing changes
+        self.assertEqual(self.branch_warnings(p), [])
+        self.assertEqual(self.git(wt, "rev-parse", "HEAD"), local)
+        self.commit(self.elsewhere(), "CLOUD.md")
+        p = self.ok("start", "12")
+        self.assertEqual(len(self.branch_warnings(p)), 1, p.stderr)
+        self.assertEqual(self.git(wt, "rev-parse", "HEAD"), local)
+        self.assertFalse(os.path.exists(os.path.join(wt, "CLOUD.md")))
+
+    def test_a_dirty_worktree_behind_origin_gets_one_warning_and_is_left_alone(self):
+        wt = self.started_and_pushed()
+        before = self.git(wt, "rev-parse", "HEAD")
+        head = self.commit(self.elsewhere(), "CLOUD.md")
+        write(os.path.join(wt, "README.md"), "# proj\nedited here\n")
+        p = self.ok("start", "12")
+        self.assertEqual(len(self.branch_warnings(p)), 1, p.stderr)
+        self.assertEqual(self.git(wt, "rev-parse", "HEAD"), before)
+        self.assertEqual(read_text(os.path.join(wt, "README.md")), "# proj\nedited here\n")
+        self.git(wt, "checkout", "--", "README.md")              # clean again: the next start fast-forwards
+        p = self.ok("start", "12")
+        self.assertEqual(self.branch_warnings(p), [])
+        self.assertEqual(self.git(wt, "rev-parse", "HEAD"), head)
+
+
+# =========================================================================== cloud: skill and docs (#58)
+class CloudDocs(unittest.TestCase):
+    ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+
+    # Failures print short messages only (harness-red reads "no tests ran" in output as an empty run).
+    def doc(self, *parts):
+        return read_text(os.path.join(self.ROOT, *parts))
+
+    def test_the_cloud_skill_runs_harness_work_cloud_and_says_how_to_follow_it(self):
+        body = self.doc("plugins", "harness", "skills", "cloud", "SKILL.md")
+        self.assertTrue(body, "plugins/harness/skills/cloud/SKILL.md is missing or empty")
+        for needle in ("harness-work cloud", "runs --sweep", "/harness:work", "hook"):
+            self.assertTrue(needle in body, f"the cloud skill does not mention {needle!r}")
+
+    def test_design_states_the_verified_cloud_facts_and_the_command(self):
+        design = self.doc("docs", "design.md")
+        self.assertTrue("Cloud dispatch is out of scope" not in design, "design.md still says cloud is out of scope")
+        for needle in ("cloud N", "--on-branch", CLOUD_DONE, CLOUD_BLOCKED):
+            self.assertTrue(needle in design, f"design.md does not mention {needle!r}")
+
+    def test_the_research_note_is_dated_and_names_its_sources(self):
+        note = self.doc("docs", "research", "cloud-sessions.md")
+        self.assertTrue(note, "docs/research/cloud-sessions.md is missing or empty")
+        self.assertTrue(re.search(r"\b20\d\d-\d\d-\d\d\b", note), "the research note carries no date")
+        for needle in ("claude-code-on-the-web", "cloud-environments"):
+            self.assertTrue(needle in note, f"the research note does not name {needle!r}")
+
+    def test_the_usage_docstring_lists_cloud(self):
+        head = read_text(TOOL).split('"""', 2)[1]
+        self.assertTrue("harness-work cloud N" in head, "the harness-work usage docstring has no `cloud N` line")
 
 
 if __name__ == "__main__":
