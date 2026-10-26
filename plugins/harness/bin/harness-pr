@@ -30,9 +30,10 @@ pass in round 1, then fix pass or fail. A review with no findings array exits 1 
 prints the latest round and writes nothing (and makes no gh call). With an open PR for the branch (`gh pr list
 --head <branch> --state open`) it posts round-<k>-review.json there as `review` would (post_review) and records the
 PR and the review id; a PR head that is not the worktree's HEAD (or gh failing) refuses before anything is posted or
-recorded; no open PR records the round with a warning and posts nothing. Then each high or medium outside finding
-not ticketed yet (by path and body, kept in tickets.json) becomes a proposed bug ticket under the ticket's epic
-(`harness-board task create`, the body on stdin), its number on the notes line; a failed create is a warning.
+recorded; no open PR records the round with a warning and posts nothing. Then, with an open PR, each high or medium
+outside finding of any recorded round not ticketed yet (by path and body, kept in tickets.json) becomes a proposed
+bug ticket under the ticket's epic (`harness-board task create`, the body on stdin, naming this round's PR), its
+number on the notes line; a failed create is a warning, and the next round with a PR tries it again.
 
 ultra runs nothing (one line, exit 0) when the project's HARNESS_ULTRAREVIEW is off, unless --force; see cmd_ultra.
 
@@ -838,11 +839,12 @@ def create_ticket(repo, f, epic, pr, number):
     return n
 
 
-def ticket_outside(repo, key, number, pr, outside):
-    """A ticket for each high or medium outside finding not ticketed yet (by path and body); the new numbers."""
+def ticket_outside(repo, key, number, pr):
+    """A ticket for each high or medium outside finding of any recorded round not ticketed yet (by path and body),
+    so one whose create failed is tried again even when no later review repeats it; the new numbers."""
     recorded = {tuple(t["key"]) for t in load_tickets(key, number)}
     wanted = []
-    for f in outside:
+    for f in (f for rnd in load_rounds(key, number) for f in as_findings(rnd.get("outside"))):
         k = tuple(finding_key(f))
         if f.get("severity") in ("high", "medium") and k not in recorded:
             recorded.add(k)
@@ -912,7 +914,7 @@ def cmd_findings(args):
     write_json(files["blocking"], blocking, prefix=".findings-")
     write_json(files["review"], blocking + low, prefix=".findings-")
     all_rulings = add_rulings(key, number, rulings)
-    tickets = ticket_outside(repo, key, number, pr, outside) if pr is not None else []
+    tickets = ticket_outside(repo, key, number, pr) if pr is not None else []
     write_text(files["notes"], notes_text(load_rounds(key, number), all_rulings, load_tickets(key, number)),
                prefix=".findings-")
 

@@ -101,8 +101,14 @@ elif argv[:2] == ["task", "create"]:
             fh.write(str(n + conf.get("step", 7)))
         entry["number"] = n
         parent = int(argv[argv.index("--parent") + 1]) if "--parent" in argv else None
+        linked = not any(s in title for s in conf.get("link_fail_titles", []))
         out = json.dumps({"number": n, "url": "https://github.com/o/r/issues/%d" % n, "parent": parent,
-                          "linked": True if parent else None, "blocked_by": []})
+                          "linked": (True if linked else False) if parent else None, "blocked_by": []})
+        if not linked:     # as the real harness-board: the issue exists, its JSON is printed, the exit is 1
+            code = 1
+            err = ("harness-board: created #%d (https://github.com/o/r/issues/%d) but linking it under #%s failed: "
+                   "HTTP 502 Bad Gateway\n" % (n, n, parent))
+            entry["link_failed"] = True
 with open(os.environ["BOARD_LOG"], "a", encoding="utf-8") as fh:
     fh.write(json.dumps(entry) + "\n")
 with open(os.environ["ORDER_LOG"], "a", encoding="utf-8") as fh:
@@ -360,10 +366,11 @@ class PostTest(unittest.TestCase):
              "stdout_json": {"id": review_id, "node_id": "PRR_kwDO", "state": "COMMENTED"}},
             {"match": ["pr", "review", str(number)], "stdout": ""}])
 
-    def board_conf(self, show=None, fail_titles=()):
+    def board_conf(self, show=None, fail_titles=(), link_fail_titles=()):
         if show is None:
             show = {"12": epic_ticket(12, self.EPIC)}
         write(self.board_conf_path, json.dumps({"show": show, "fail_titles": list(fail_titles),
+                                                "link_fail_titles": list(link_fail_titles),
                                                 "first": 501, "step": 7}))
 
     def review_file(self, content):
@@ -817,6 +824,107 @@ class OutOfScope(PostTest):
         n_bad = self.number_for(norm(bad))
         self.assertIn(n_bad, out["tickets"])
         self.assertOutOfScopeNotes([(norm(good), n_good), (norm(bad), n_bad)])
+
+    # ------------------------------------------------------------- fix round #257: earlier rounds are retried
+    def assertCreatedOnce(self, f, epic, pr):
+        mine = [c for c in self.creates() if not c.get("failed")
+                and self.title_names(create_options(c["argv"]).get("title"), norm(f))]
+        self.assertEqual(len(mine), 1, [c["argv"] for c in self.creates()])
+        self.assertTicketCreate(mine[0], norm(f), epic, pr)
+        return mine[0]["number"]
+
+    def test_a_failed_create_is_retried_when_a_later_review_does_not_repeat_it(self):
+        # Round 1: two outside findings whose creates fail, one that works.
+        self.board_conf(fail_titles=["README.md", "docs/guide.md"])
+        self.open_pr(71, review_id=7101)
+        lost = {"path": "README.md", "line": 4, "severity": "high", "body": "The README documents a dead flag."}
+        repeated = {"path": "docs/guide.md", "severity": "major", "body": "The guide skips the login step."}
+        good = {"path": "src/other.py", "line": 1, "severity": "medium", "body": "Other is dead code."}
+        out, _p = self.findings([lost, repeated, good,
+                                 {"path": "src/app.py", "line": 3, "severity": "high", "body": "On the diff."}])
+        n_good = self.number_for(norm(good))
+        self.assertEqual(out["tickets"], [n_good])
+        self.assertOutOfScopeNotes([(norm(good), n_good)], plain=[norm(lost), norm(repeated)])
+
+        # Round 2, the board working: a fix-round review that repeats only one of them. Both are ticketed now,
+        # each once, and the good one is not filed again.
+        self.board_conf()
+        self.commit("src/app.py", app_text(BRANCH_CHANGES + (13,)))
+        self.open_pr(71, review_id=7102)
+        out, _p = self.findings([repeated, {"path": "src/app.py", "line": 13, "severity": "low", "body": "Nit."}])
+        n_lost = self.assertCreatedOnce(lost, self.EPIC, 71)
+        n_repeated = self.assertCreatedOnce(repeated, self.EPIC, 71)
+        self.assertEqual(len([c for c in self.creates() if not c.get("failed")]), 3)
+        self.assertEqual(sorted(out["tickets"]), sorted([n_lost, n_repeated]))
+        self.assertOutOfScopeNotes([(norm(good), n_good), (norm(lost), n_lost), (norm(repeated), n_repeated)])
+
+        # Round 3 with nothing outside: nothing more is created.
+        self.commit("src/app.py", app_text(BRANCH_CHANGES + (13, 15)))
+        self.open_pr(71, review_id=7103)
+        out, _p = self.findings([])
+        self.assertEqual(len([c for c in self.creates() if not c.get("failed")]), 3)
+        self.assertEqual(out["tickets"], [])
+
+    def test_a_round_whose_epic_lookup_failed_is_ticketed_in_a_later_round(self):
+        self.board_conf(show={})                               # harness-board show fails in round 1
+        self.open_pr(72, review_id=7201)
+        lost = {"path": "lib/x.py", "line": 2, "severity": "critical", "body": "Z is read before it is set."}
+        out, _p = self.findings([lost])
+        self.assertEqual(self.creates(), [])
+        self.assertEqual(out["tickets"], [])
+        self.assertOutOfScopeNotes([], plain=[norm(lost)])
+
+        self.board_conf()
+        self.commit("src/app.py", app_text(BRANCH_CHANGES + (11,)))
+        self.open_pr(72, review_id=7202)
+        out, _p = self.findings([])
+        n = self.assertCreatedOnce(lost, self.EPIC, 72)
+        self.assertEqual(out["tickets"], [n])
+        self.assertOutOfScopeNotes([(norm(lost), n)])
+
+    def test_a_round_without_a_pr_is_ticketed_once_a_pr_is_open(self):
+        self.no_pr()
+        lost = {"path": "README.md", "line": 2, "severity": "medium", "body": "The README omits the install step."}
+        self.findings([lost, {"path": "src/app.py", "line": 3, "severity": "high", "body": "On the diff."}])
+
+        # Round 2 with the PR open: the review does not repeat the outside finding, and it is ticketed now.
+        self.commit("src/app.py", app_text(BRANCH_CHANGES + (12,)))
+        self.open_pr(73, review_id=7301)
+        before = len(self.creates())
+        out, _p = self.findings([{"path": "src/app.py", "line": 12, "severity": "medium", "body": "Twelve."}])
+        n = self.assertCreatedOnce(lost, self.EPIC, 73)
+        self.assertEqual(len(self.creates()), before + 1)
+        self.assertEqual(out["tickets"], [n])
+        self.assertOutOfScopeNotes([(norm(lost), n)])
+
+        # Round 3: not again.
+        self.commit("src/app.py", app_text(BRANCH_CHANGES + (12, 14)))
+        self.open_pr(73, review_id=7302)
+        out, _p = self.findings([lost])
+        self.assertEqual(len(self.creates()), before + 1)
+        self.assertOutOfScopeNotes([(norm(lost), n)])
+
+    def test_a_ticket_created_whose_linking_failed_keeps_its_number(self):
+        self.board_conf(link_fail_titles=["README.md"])
+        self.open_pr(74, review_id=7401)
+        f = {"path": "README.md", "line": 1, "severity": "high", "body": "The README links a dead page."}
+        other = {"path": "src/other.py", "line": 1, "severity": "medium", "body": "Other leaks a handle."}
+        out, p = self.findings([f, other])
+        self.assertEqual(len(self.creates()), 2)
+        n = self.assertCreatedOnce(f, self.EPIC, 74)
+        n_other = self.number_for(norm(other))
+        warnings = [line for line in p.stderr.splitlines() if line.startswith("harness-pr: warning:")]
+        self.assertTrue(any(f"#{n}" in line for line in warnings), p.stderr)
+        self.assertEqual(sorted(out["tickets"]), sorted([n, n_other]))
+        self.assertOutOfScopeNotes([(norm(f), n), (norm(other), n_other)])
+
+        # A later round, the board linking again, the same finding reported again: no duplicate is filed.
+        self.board_conf()
+        self.commit("src/app.py", app_text(BRANCH_CHANGES + (16,)))
+        self.open_pr(74, review_id=7402)
+        out, _p = self.findings([f])
+        self.assertEqual(len(self.creates()), 2)
+        self.assertOutOfScopeNotes([(norm(f), n), (norm(other), n_other)])
 
 
 if __name__ == "__main__":
