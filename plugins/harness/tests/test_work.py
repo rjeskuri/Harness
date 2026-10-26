@@ -5287,6 +5287,27 @@ class WorkSkill(unittest.TestCase):
         self.assertGreater(step.index("--base HEAD"), step.index("harness-red check"), step)
         self.assertRegex(step.lower(), r"\btests?\b|test-author", step)
 
+    def test_the_revise_and_fix_round_steps_prove_tests_that_pass_at_head_with_reprove(self):
+        # Ticket #275: new tests that pass at HEAD (coverage of behaviour the branch already has) cannot be proven
+        # at HEAD: `check --base HEAD` answers green, or, already committed, they leave `harness-red status` at
+        # `current: no`. The revise step (10) and the fix-round step (6) prove them with `harness-red reprove
+        # --worktree <path>` before the coder's next source edit. Failures print only short snippets: harness-red
+        # reads some phrases in a run's output as an empty run (see DispatchDefaultMaxDocs).
+        revise = self.revise_step()
+        where = f"step 10 ({revise[:80]!r}...)"
+        self.assertTrue("harness-red reprove --worktree <path>" in revise,
+                        f"{where} does not name `harness-red reprove --worktree <path>`")
+        self.assertTrue(revise.index("harness-red reprove") > revise.index("--base HEAD"),
+                        f"{where} names reprove before `check --base HEAD`")
+        self.assertTrue("green" in revise.lower(), f"{where} does not say when check --base HEAD answers green")
+        self.assertTrue("current: no" in revise, f"{where} does not name status's `current: no`")
+        steps = self.loop_steps()
+        self.assertIn(6, steps, "no numbered step 6 in the loop")
+        fix_round = steps[6]
+        where = f"step 6 ({fix_round[:80]!r}...)"
+        self.assertTrue("fix round" in fix_round, f"{where} does not describe the fix round")
+        self.assertTrue("harness-red reprove" in fix_round, f"{where} does not name harness-red reprove")
+
     def loop_steps(self):
         """{n: text} of the loop's numbered steps (a step runs to the next numbered line, a heading, or the blank
         line before an unindented paragraph)."""
@@ -5548,9 +5569,25 @@ class WorkSkill(unittest.TestCase):
 
     def findings_steps(self):
         steps = self.loop_steps()
-        for n in (5, 6, 9):
+        for n in (5, 6):
             self.assertIn(n, steps)
         return steps
+
+    def titled_steps(self):
+        """{title: (n, text)} of the loop's numbered steps, keyed by their bold heading (`9. **Ready**` is "Ready")."""
+        out = {}
+        for n, text in self.loop_steps().items():
+            m = re.match(r"^\d+[.)]\s+\*\*([^*]+)\*\*", text)
+            if m:
+                self.assertNotIn(m.group(1).strip(), out, f"two steps titled {m.group(1)!r}")
+                out[m.group(1).strip()] = (n, text)
+        return out
+
+    def titled_step(self, title):
+        """The text of the numbered step whose bold heading is `title`, whatever its number."""
+        steps = self.titled_steps()
+        self.assertIn(title, steps, f"no step titled **{title}**: {sorted(steps)}")
+        return steps[title][1]
 
     def test_the_review_and_fix_steps_block_on_high_and_medium_and_send_low_to_the_notes(self):
         # Ticket #259, steps 5 and 6: the fix file gets the high and medium findings on the ticket's files; the
@@ -5604,8 +5641,8 @@ class WorkSkill(unittest.TestCase):
 
     def test_the_ready_step_refuses_only_on_high_and_medium_findings(self):
         # Ticket #259, step 9: `harness-pr ready` refuses while the latest harness review has high or medium
-        # findings and no commit after it; those go back to the coder.
-        step = self.findings_steps()[9]
+        # findings and no commit after it; those go back to the coder. Found by its heading: ticket #260 numbers it 10.
+        step = self.titled_step("Ready")
         low = step.lower()
         self.assertIn("harness-pr ready", step)
         refusing = [c for c in clauses_of(low) if re.search(r"\brefus\w*", c)]
@@ -5689,6 +5726,220 @@ class WorkSkill(unittest.TestCase):
         for where, section, kind in sections:
             with self.subTest(section=where):
                 self.assertEqual(work_scope_problems(section, kind), [], section)
+
+    # Ticket #260: the tests, code and fix stages run only the ticket's own tests (`harness-red run`); the full verify
+    # runs once, in its own step after Ultrareview and before Ready, and its log goes into the PR body.
+    CODER_STEPS = ("Code", "PR and findings", "CI", "Revise")
+
+    def test_stage_agents_run_the_own_tests_not_the_verify_command(self):
+        steps = self.titled_steps()
+        for title in self.CODER_STEPS:
+            with self.subTest(step=title):
+                self.assertIn(title, steps, sorted(steps))
+                text = steps[title][1]
+                low = text.lower()
+                # The coder runs the ticket's own tests, and nothing in the step hands it the verify command.
+                self.assertIn("harness-red run --worktree <path>", text, text)
+                self.assertRegex(low, r"\bcoder\b", text)
+                self.assertEqual(verify_command_mentions(low), [], text)
+        # Step 4 gives the coder the own-tests command, where it gave `CLAUDE_VERIFY_CMD`.
+        code = steps["Code"][1]
+        self.assertNotIn("CLAUDE_VERIFY_CMD", code, code)
+        # The reviewer gets the red run and the latest own-tests output, not a verify output.
+        review = steps["Review"][1].lower()
+        self.assertRegex(review, r"own[- ]tests?\b|harness-red run", steps["Review"][1])
+        self.assertNotRegex(review, r"\bverify output\b", steps["Review"][1])
+        self.assertIn("red", review)
+        # No step outside Verify names an agent beside the verify command it would run.
+        for title, (n, text) in steps.items():
+            if title == "Verify":
+                continue
+            with self.subTest(agent_step=title):
+                self.assertEqual(agent_verify_clauses(text.lower()), [], text)
+        # design.md: the work loop's coder lines run the own tests, never CLAUDE_VERIFY_CMD.
+        entries = design_loop_entries(read_design())
+        coder = [e for e in entries if e.startswith("coder")]
+        self.assertTrue(coder, entries)
+        self.assertRegex(coder[0].lower(), r"own[- ]tests?\b|harness-red run", coder[0])
+        for e in coder:
+            with self.subTest(entry=e):
+                self.assertEqual(verify_command_mentions(e.lower()), [], e)
+
+    def test_the_full_verify_runs_once_before_ready_and_waits_in_slices(self):
+        steps = self.titled_steps()
+        for title in ("Ultrareview", "Verify", "Ready"):
+            self.assertIn(title, steps, sorted(steps))
+        ultra_n, verify_n, ready_n = steps["Ultrareview"][0], steps["Verify"][0], steps["Ready"][0]
+        self.assertLess(ultra_n, verify_n, "Verify comes after Ultrareview")
+        self.assertLess(verify_n, ready_n, "Verify comes before Ready")
+        step = steps["Verify"][1]
+        low = step.lower()
+        self.assertRegex(step, r"^\d+[.)]\s+\*\*Verify\*\*[^\n]*stage `verify`", step)
+        # It runs for every ticket, not only risk:high ones.
+        self.assertIsNone(RISK_HIGH_ONLY.search(low), step)
+        self.assertNotRegex(low, r"\bonly (?:when|on|for)\b[^.;]*risk:high", step)
+        # The command waits in slices: --wait --timeout 540, under a Bash timeout of 600000 ms.
+        runs = [s for s in backticked(step) if s.startswith("harness-red verify")]
+        self.assertTrue(any("--worktree <path>" in s and re.search(r"--wait\b", s) and re.search(r"--timeout 540\b", s)
+                            for s in runs), f"no `harness-red verify --worktree <path> --wait --timeout 540`:\n{step}")
+        self.assertRegex(step, r"`?timeout:?\s*`?\s*600000\b", step)
+        self.assertNotRegex(step, r"--timeout (?!540\b)\d+", step)
+        # Exit 8: still running, run it again.
+        parts = clauses_of(low)
+        self.assertTrue(any(re.search(r"\bexit\w*\s*(?:code\s*)?`?8\b", c)
+                            and re.search(r"\bagain\b|\bre-?run\w*|\brepeat\w*", c) for c in parts),
+                        f"no clause runs it again on exit 8:\n{step}")
+        # Exit 1: the coder (`#N fix`) fixes and commits; then the own tests, a push, CI and verify again.
+        exit1 = re.search(r"\bexit\w*\s*(?:code\s*)?`?1\b", low)
+        self.assertTrue(exit1, f"the Verify step does not say what exit 1 means:\n{step}")
+        after = low[exit1.start():]
+        self.assertRegex(after, r"\bcoder\b", step)
+        self.assertIn("#n fix", after, step)
+        self.assertRegex(after, r"harness-red run|own[- ]tests?\b", step)
+        self.assertIn("git push", after, step)
+        self.assertRegex(after, r"harness-pr checks|\bci\b", step)
+        self.assertRegex(after, r"\bverify\b[^.;]*\bagain\b|\bagain\b[^.;]*\bverify\b", step)
+        runner = re.compile(r"harness-red verify|\borchestrator\b|\byou\b")
+        self.assertEqual(verify_command_mentions(after, excuse=runner), [], step)
+        # The stage is recorded.
+        self.assertRegex(step, r"harness-work attempt \S+ verify\b[^`]*\bpass\b", step)
+        self.assertRegex(step, r"harness-work attempt \S+ verify\b[^`]*\bfail\b", step)
+        # Once: no earlier stage runs the full verify.
+        for title in ("Start", "Tests", "Code", "Review", "PR and findings", "CI", "Ultrareview"):
+            if title in steps:
+                with self.subTest(earlier=title):
+                    self.assertNotIn("harness-red verify", steps[title][1], steps[title][1])
+        # design.md: a `harness-red verify` line between CI and ready, and the CLAUDE_VERIFY_CMD row says it runs
+        # once before ready, with no coder running it.
+        text = read_design()
+        entries = design_loop_entries(text)
+        starts = [e.split()[0] + " " + e.split()[1] if len(e.split()) > 1 else e for e in entries]
+        self.assertIn("harness-red verify", starts, entries)
+        self.assertIn("harness-pr ready", starts, entries)
+        self.assertIn("harness-pr checks", starts, entries)
+        self.assertLess(starts.index("harness-pr checks"), starts.index("harness-red verify"), entries)
+        self.assertLess(starts.index("harness-red verify"), starts.index("harness-pr ready"), entries)
+        rows = [ln for ln in text.splitlines() if ln.startswith("| `CLAUDE_VERIFY_CMD` |")]
+        self.assertTrue(rows, "design.md has no CLAUDE_VERIFY_CMD settings row")
+        row = rows[0].lower()
+        self.assertIn("harness-red verify", row, rows[0])
+        self.assertRegex(row, r"\bonce\b[^|]*\bbefore\b[^|]*\bready\b", rows[0])
+        self.assertEqual(affirmed_matches(re.compile(r"\bcoder\b"), row), [], rows[0])
+
+    def test_the_pr_body_gets_the_full_verify_log_before_ready(self):
+        steps = self.titled_steps()
+        for title in ("PR and findings", "Verify", "Ready"):
+            self.assertIn(title, steps, sorted(steps))
+        pr = steps["PR and findings"][1]
+        opens = [s for s in backticked(pr) if s.startswith("harness-pr open")]
+        self.assertTrue(opens, pr)
+        # The first open has no full run to show: no --verify-log flag on it, nor on any open in that step.
+        self.assertNotIn("--verify-log", opens[0], opens[0])
+        self.assertIn("--review", opens[0], opens[0])
+        for s in opens:
+            with self.subTest(open=s):
+                self.assertNotIn("--verify-log", s, s)
+        # Nor does a sentence of that step reuse a verify log ("the same --verify-log ... as the first open"),
+        # unless it points to the Verify step that adds it.
+        later = re.compile(r"\bverify\b (?:step|stage)|\bstep \d+\b|\blater\b|\bbefore\b[^.;]*\bready\b")
+        self.assertEqual([c for c in clauses_of(pr.lower()) if affirmed_matches(re.compile(r"--verify-log"), c)
+                          and not later.search(c)], [], pr)
+        # The Verify step refreshes the PR body with that run's log, after the run and before Ready.
+        step = steps["Verify"][1]
+        refresh = [s for s in backticked(step) if s.startswith("harness-pr open")]
+        self.assertTrue(any(re.match(r"harness-pr open \S+ --worktree <path>", s) and "--verify-log <" in s
+                            and "--review" in s for s in refresh),
+                        f"no `harness-pr open N --worktree <path> --verify-log <log> --review ...`:\n{step}")
+        verify_at = step.index("harness-red verify")
+        open_at = step.index(next(s for s in refresh if "--verify-log" in s))
+        self.assertLess(verify_at, open_at, step)
+        low = step.lower()
+        self.assertRegex(low, r"\blog\b[^.;]*\b(?:printed|prints|harness-red verify|that run|the run|its json)"
+                              r"|harness-red verify[^.;]*\blog\b|\bthe log it printed\b", step)
+        self.assertRegex(low[open_at:], r"\bready\b|step " + str(steps["Ready"][0]) + r"\b", step)
+        # design.md: from the `harness-red verify` line to `harness-pr ready`, `harness-pr open` is run again with
+        # --verify-log.
+        entries = design_loop_entries(read_design())
+        v = next((i for i, e in enumerate(entries) if e.startswith("harness-red verify")), None)
+        r = next((i for i, e in enumerate(entries) if e.startswith("harness-pr ready")), None)
+        self.assertIsNotNone(v, entries)
+        self.assertIsNotNone(r, entries)
+        span = " ".join(entries[v:r])
+        self.assertIn("harness-pr open", span, entries)
+        self.assertIn("--verify-log", span, entries)
+        first_open = next((e for e in entries if e.startswith("harness-pr open")), "")
+        self.assertNotIn("--verify-log", first_open, first_open)
+
+    def test_the_revise_step_runs_the_full_verify_again_before_ready(self):
+        step = self.revise_step()
+        self.assertRegex(step, r"^\d+[.)]\s+\*\*Revise\*\*", step)
+        steps = self.titled_steps()
+        self.assertIn("Verify", steps, sorted(steps))
+        verify_n = steps["Verify"][0]
+        # It keeps the red check against the branch tip for new tests.
+        self.assertIn("harness-red check --worktree <path> --base HEAD", step, step)
+        low = step.lower()
+        # The coder's fixes run the own tests; then push, checks, the Verify step again, and only then ready.
+        run_at = low.find("harness-red run --worktree <path>")
+        self.assertGreaterEqual(run_at, 0, step)
+        push_at = low.find("git push", run_at)
+        self.assertGreater(push_at, run_at, step)
+        checks_at = low.find("harness-pr checks", push_at)
+        self.assertGreater(checks_at, push_at, step)
+        ready_at = low.rfind("harness-pr ready")
+        self.assertGreater(ready_at, checks_at, step)
+        between = low[checks_at:ready_at]
+        verify = re.search(r"\bverify\b (?:step|stage)|\bstep " + str(verify_n) + r"\b|harness-red verify", between)
+        self.assertTrue(verify, f"the revise step does not run the Verify step between the checks and ready:\n{step}")
+        self.assertRegex(between, r"\bagain\b|\bre-?run\w*", step)
+        self.assertEqual(verify_command_mentions(low), [], step)
+
+    def test_the_coder_agent_runs_harness_red_run_not_the_verify_command(self):
+        text = read_repo_file(PLUGIN, "agents", "coder.md")
+        low = text.lower()
+        # Nowhere does the coder run, make green or get the verify command; the orchestrator runs it.
+        self.assertEqual(verify_command_mentions(low, excuse=re.compile(r"\borchestrator\b")), [], text)
+        inputs = md_section(text, "Inputs")
+        self.assertTrue(inputs.strip(), "coder.md has no Inputs section")
+        self.assertRegex(inputs.lower(), r"own[- ]tests? command|harness-red run", inputs)
+        self.assertNotRegex(inputs.lower(), r"\bverify command\b|claude_verify_cmd", inputs)
+        how = md_section(text, "How to work")
+        step3 = next((ln for ln in how.splitlines() if re.match(r"^3[.)]\s", ln)), "")
+        self.assertTrue(step3, how)
+        s3 = step3.lower()
+        self.assertIn("new tests", s3, step3)
+        self.assertIn("harness-red run --worktree <path>", s3, step3)
+        self.assertLess(s3.index("new tests"), s3.index("harness-red run"), step3)
+        self.assertRegex(s3, r"\b(?:never|not)\b[^.;]{0,40}\bverify\b", step3)
+        self.assertRegex(s3, r"\borchestrator\b[^.;]*\bbefore\b[^.;]*\bready\b", step3)
+        report = md_section(text, "Report")
+        self.assertRegex(report.lower(), r"own[- ]tests?\b|harness-red run", report)
+        # design.md's Agents row for the coder says the same.
+        rows = agents_table_jobs(read_design())
+        self.assertIn("coder", rows)
+        coder = rows["coder"].lower()
+        self.assertRegex(coder, r"own[- ]tests?\b|harness-red run", rows["coder"])
+        self.assertEqual(verify_command_mentions(coder, excuse=re.compile(r"\borchestrator\b")), [], rows["coder"])
+
+
+VERIFY_COMMAND = re.compile(r"\bverify command\b|claude_verify_cmd")
+AGENT = re.compile(r"\bcoder\b|\breviewer\b|test-author|test-breaker|\bagents?\b|harness:\w+")
+
+
+def backticked(text):
+    """The inline code spans of `text`."""
+    return re.findall(r"`([^`\n]+)`", text)
+
+
+def verify_command_mentions(text, excuse=None):
+    """The clauses of lower-cased `text` that name the verify command (or CLAUDE_VERIFY_CMD) not negated; a clause
+    matching `excuse` is let through."""
+    return [c for c in clauses_of(text) if affirmed_matches(VERIFY_COMMAND, c) and not (excuse and excuse.search(c))]
+
+
+def agent_verify_clauses(text):
+    """The clauses of lower-cased `text` that name an agent beside an affirmed verify command."""
+    return [c for c in verify_command_mentions(text) if AGENT.search(c)]
 
 
 # The breaker's inverted skill: agents in the background, no waiting, the turn ends when it likes, the checks optional.

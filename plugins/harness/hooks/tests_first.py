@@ -12,7 +12,7 @@ conftest.py, jest.config.*, vitest.config.*, package.json) count as tests. Then:
     whose cache (tickets/<N>.json, read as for a source edit) flags no-tests: it has no
     tests to game;
   - a source edit, by anyone, needs a red run: ~/.claude/harness/repos/<key>/red/<slug>.json
-    written by harness-red check. A ticket flagged no-tests needs none; a refactor needs a
+    written by harness-red check (or reprove). A ticket flagged no-tests needs none; a refactor needs a
     record of any kind; any other ticket needs a red record (kind assertion, import or
     error) whose test files still hash to its test_hash, or are those files with main's
     changes merged in since (harness_lib/redproof.py). Without a ticket cache
@@ -53,8 +53,9 @@ A refusal prints {"hookSpecificOutput": {"hookEventName": "PreToolUse",
 "permissionDecision": "deny", "permissionDecisionReason": "..."}} and exits 0. Allowing
 prints nothing. Fails open: any error of its own goes to stderr in one line, exit 0. But
 the whole run keeps one deadline (HOOK_BUDGET, inside hooks.json's timeout), and when the
-red proof, the check-ignore of a refused path or the file list of a wholesale rewrite
-runs out of it, the edit is refused and says why; only the repo lookup fails open then.
+red proof, the check-ignore of a refused path, the file list of a wholesale rewrite or, on
+a guarded branch, the main checkout's lookup runs out of it, the edit is refused and says
+why; only the lookup that names the branch fails open then.
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
 
@@ -108,12 +109,19 @@ CODER_ON_CONFIG = (
     "{rel} decides which tests run and how, so it is fixed for this ticket like the "
     "tests. If it has to change, stop and ask the orchestrator."
 )
-CHANGED = "Tests changed since the red run; run harness-red check again."
+CHANGED = (
+    "Tests changed since the red run; run harness-red check again, or harness-red reprove "
+    "once the branch has source changes."
+)
 UNVERIFIED = (
     "Could not check the red record for t/{number} in time (git was too slow); the edit is "
     "refused, not judged. Retry it; harness-red status checks with a longer budget."
 )
 IGNORE_UNKNOWN = "(git did not say in time whether it ignores {rel}.)"
+MAIN_UNKNOWN = (
+    "Could not find this worktree's main checkout in time (git was too slow), so the "
+    "tests-first rules were not checked; the edit is refused, not judged. Retry it."
+)
 # git stash subcommands that leave the working tree alone.
 STASH_READS = {"list", "show", "create", "store"}
 # find's primaries that run a command for each file, and its options before the paths.
@@ -178,13 +186,15 @@ def existing_dir(path: str) -> str:
 
 def repo_facts(directory: str) -> dict | None:
     """top (the worktree's top-level) and main (the main working tree, main_checkout's,
-    which moves state kept under the spelling git reports), both canonical paths, branch
-    (None when detached) and spelled (`directory`, for adopt_old_state); None outside a
-    repo. One git call gives top and HEAD's branch, main_checkout's lookup is held to one more
-    GIT_TIMEOUT (or what is left of the deadline): at worst 2 x GIT_TIMEOUT, as on main. A
-    lookup that runs out of time allows, like any failure of the hook's own (the branch is
-    unknown). Only an unborn branch (that call exits 1 with the top alone) costs a third,
-    symbolic-ref, call. The branch is spelled as
+    which moves state kept under the spelling git reports; None when its lookup ran out of
+    time), both canonical paths, branch (None when detached) and spelled (`directory`, for
+    adopt_old_state); None outside a repo. One git call gives top and HEAD's branch,
+    main_checkout's lookup is held to one more GIT_TIMEOUT (or what is left of the deadline):
+    at worst 2 x GIT_TIMEOUT, as on main. The first call running out of time allows, like any
+    failure of the hook's own (the branch is unknown); main_checkout's leaves main None, which
+    path_refusal and bulk_refusal refuse on a guarded branch (#285). Only an unborn branch
+    (that call exits 1 with the top alone) costs a third, symbolic-ref, call. The branch is
+    spelled as
     `symbolic-ref --short HEAD` (harness-red's name) spells it: `--abbrev-ref=loose` shortens
     the same way, heads/<branch> when a tag or refs/<branch> shares the name; plain
     `--abbrev-ref` is strict, and also says heads/ for a clash with refs/remotes/<branch>."""
@@ -193,7 +203,10 @@ def repo_facts(directory: str) -> dict | None:
     if out.returncode not in (0, 1) or not lines or not lines[0]:
         return None
     top = lines[0]
-    main = main_checkout(directory, timeout=min(GIT_TIMEOUT, time_left()))
+    try:
+        main = main_checkout(directory, timeout=min(GIT_TIMEOUT, time_left()), raise_timeout=True)
+    except subprocess.TimeoutExpired:
+        main = ""
     if main is None:
         return None
     if out.returncode == 0:  # the short branch name, or HEAD when detached
@@ -204,7 +217,7 @@ def repo_facts(directory: str) -> dict | None:
         branch = head.stdout.strip() if head.returncode == 0 else ""
     return {
         "top": Path(canonical_path(top)),
-        "main": Path(main),
+        "main": Path(main) if main else None,
         "branch": branch or None,
         "spelled": (directory,),
     }
@@ -363,6 +376,8 @@ def path_refusal(
     rel = relative_path(path, facts["top"])
     if rel is None:
         return None
+    if facts["main"] is None:  # what a test is, and the red record, are the main checkout's
+        return MAIN_UNKNOWN
     # What a test is comes from the main checkout's tracked .claude/settings.json only:
     # worktree files and settings.local.json are agent-editable.
     kind = classify(rel, settings_env(facts["main"], ("settings.json",)))
@@ -428,6 +443,8 @@ def bulk_refusal(directory: str | None, role: str, cache: dict) -> str | None:
     ticket = guarded(facts)
     if ticket is None:
         return None
+    if facts["main"] is None:
+        return MAIN_UNKNOWN
     top = str(facts["top"])
     try:
         out = git(top, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
