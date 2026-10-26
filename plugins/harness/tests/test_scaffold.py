@@ -37,7 +37,7 @@ PLACEHOLDER = re.compile(r"(?<!\$)\{\{(name|pkg|stack|verify_cmd|test_cmd|tests_
 COMMON_FILES = ["CLAUDE.md", ".claude/settings.json", "scripts/verify.sh", ".github/workflows/ci.yml",
                 ".github/workflows/deploy.yml", ".github/pull_request_template.md",
                 ".github/ISSUE_TEMPLATE/task.md", ".github/ISSUE_TEMPLATE/epic.md", ".githooks/pre-commit",
-                ".gitignore", ".worktreeinclude"]
+                ".gitignore", ".worktreeinclude", "scripts/smoke.sh", "scripts/deploy_guard.py"]
 
 # The allow entries every render starts with (ticket #137): the twelve git, gh and verify entries, then one
 # narrow rule per harness tool in this order. The old wildcard spelling may be dropped by auto mode.
@@ -341,6 +341,57 @@ class Render(ScaffoldTest):
         self.assertNotIn("setup-node", ci)
         for rel in ("scripts/verify.sh", ".githooks/pre-commit"):
             self.assertEqual(subprocess.run(["sh", "-n", os.path.join(root, rel)]).returncode, 0, rel)
+
+    def test_ci_writes_smoke_and_deploy_guard_executable(self):
+        guard = self.read(TEMPLATES, "deploy_guard.py")
+        for stack in ("python", "node", "none"):
+            with self.subTest(stack=stack):
+                root = os.path.join(self.tmp, f"live-{stack}")
+                p = self.ok("init", root, "--name", f"live-{stack}", "--stack", stack)
+                for rel in ("scripts/smoke.sh", "scripts/deploy_guard.py"):
+                    self.assertIn(f"created {rel}", self.lines(p))
+                    self.assertExecutable(os.path.join(root, rel))
+                with open(os.path.join(root, "scripts", "deploy_guard.py"), "rb") as fh, \
+                        open(os.path.join(TEMPLATES, "deploy_guard.py"), "rb") as tmpl:
+                    self.assertEqual(fh.read(), tmpl.read())      # byte-identical: no placeholder touched
+                self.assertEqual(self.read(root, "scripts", "deploy_guard.py"), guard)
+                smoke = os.path.join(root, "scripts", "smoke.sh")
+                text = self.read(smoke)
+                self.assertTrue(text.startswith("#!/bin/sh\n"), text)
+                for piece in ("0 healthy", "1 big failure", "revert", "2 degraded"):
+                    self.assertIn(piece, text)
+                self.assertEqual(text.strip().splitlines()[-1], "exit 0")
+                self.assertEqual(subprocess.run(["sh", "-n", smoke]).returncode, 0)
+                self.assertEqual(subprocess.run([smoke], cwd=root).returncode, 0)
+                deploy = self.read(root, ".github/workflows/deploy.yml")
+                self.assertEqual(deploy, self.read(TEMPLATES, "deploy.yml"))       # v2, as is
+                self.assertIn('python3 scripts/deploy_guard.py run --sha "$GITHUB_SHA"', deploy)
+                self.assertIn("${{ github.token }}", deploy)
+
+    def test_no_ci_skips_smoke_and_deploy_guard(self):
+        root = os.path.join(self.tmp, "noci-live")
+        p = self.ok("init", root, "--name", "noci-live", "--stack", "python", "--no-ci")
+        for rel in ("scripts/smoke.sh", "scripts/deploy_guard.py", ".github/workflows/deploy.yml"):
+            self.assertFalse(os.path.exists(os.path.join(root, rel)), rel)
+            self.assertNotIn(rel, p.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(root, "scripts", "verify.sh")))
+
+    def test_existing_smoke_script_is_kept(self):
+        root = self.mk("own-smoke")
+        own = "#!/bin/sh\ncurl -fsS https://example.invalid/health\n"
+        self.write(os.path.join(root, "scripts", "smoke.sh"), own, 0o700)
+        p = self.ok("init", root, "--name", "own-smoke", "--stack", "none")
+        self.assertIn("kept scripts/smoke.sh", self.lines(p))
+        self.assertIn("created scripts/deploy_guard.py", self.lines(p))
+        self.assertEqual(self.read(root, "scripts", "smoke.sh"), own)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(root, "scripts", "smoke.sh")).st_mode), 0o700)
+
+    def test_dry_run_lists_the_new_scripts(self):
+        root = os.path.join(self.tmp, "dry-live")
+        p = self.ok("init", root, "--name", "dry-live", "--stack", "python", "--dry-run")
+        for rel in ("scripts/smoke.sh", "scripts/deploy_guard.py", ".github/workflows/deploy.yml"):
+            self.assertIn(f"would create {rel}", self.lines(p))
+        self.assertFalse(os.path.exists(root))
 
     def test_stack_detection_and_test_command(self):
         cases = [
