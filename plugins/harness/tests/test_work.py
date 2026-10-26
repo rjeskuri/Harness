@@ -556,6 +556,17 @@ class Start(WorkTest):
                 self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
         self.assertFalse([c for c in self.gh_calls() if c[:2] == ["issue", "edit"]])
 
+    def test_refuses_a_proposed_ticket(self):
+        """#160: a proposed ticket waits for harness-board promote; start makes no branch, worktree or status change."""
+        self.scenario(issues=[issue(labels=("task", "status:proposed", "size:S", "risk:low"))])
+        branches = self.git(self.repo, "for-each-ref", "--format=%(refname)", "refs/heads")
+        p = self.work("start", "12", "--json")
+        self.assertOneLineError(p, "#12 is status:proposed; it waits for harness-board promote 12")
+        self.assertEqual(p.stdout, "")
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+        self.assertEqual(self.git(self.repo, "for-each-ref", "--format=%(refname)", "refs/heads"), branches)
+        self.assertFalse([c for c in self.gh_calls() if c[:2] in (["issue", "edit"], ["issue", "comment"])])
+
     def test_start_mirrors_in_progress_to_the_configured_project(self):
         """#64: with HARNESS_PROJECT set, the real harness-board's status change during start sets the project
         item's Status to "In progress", on the URL gh reports for the issue (not one built from the remote)."""
