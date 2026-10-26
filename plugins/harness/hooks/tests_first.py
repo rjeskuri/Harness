@@ -8,7 +8,9 @@ role rules the files that decide which tests run and how (.claude/settings.json,
 conftest.py, jest.config.*, vitest.config.*, package.json) count as tests. Then:
   - the test-author may not edit source; the coder and the test-breaker may not edit
     tests or that configuration (the part of `agent_type` after the last ":" names the
-    role);
+    role), except that the coder may edit the configuration (never a test) on a ticket
+    whose cache (tickets/<N>.json, read as for a source edit) flags no-tests: it has no
+    tests to game;
   - a source edit, by anyone, needs a red run: ~/.claude/harness/repos/<key>/red/<slug>.json
     written by harness-red check. A ticket flagged no-tests needs none; a refactor needs a
     record of any kind; any other ticket needs a red record (kind assertion, import or
@@ -31,13 +33,14 @@ restore of a directory, a glob or pathspec magic, reset --hard or --merge, stash
 pop, apply, drop and the others but list, show, create and store, and clean, unless
 stash push or clean name only files) touches every test file of its worktree: each of
 them (git ls-files, tracked or untracked and not ignored) and each piece of test
-configuration goes through the role rules, so the coder and the test-breaker are
-refused and the test-author is not; a worktree without either passes. For the
-test-author, the coder and the test-breaker on a ticket branch, writes whose paths
-cannot be seen are refused: an inline python or node program (-c, -e or a heredoc) that
-writes files, patch without a file argument or -o (the diff names the files), and find
-with -delete or an -exec, -execdir, -ok or -okdir command that writes files (as the
-walker judges a part), runs git on paths, or is a shell or an interpreter.
+configuration goes through the role rules, so the coder (but for configuration alone on
+a no-tests ticket) and the test-breaker are refused and the test-author is not; a
+worktree without either passes. For the test-author, the coder and the test-breaker on
+a ticket branch, writes whose paths cannot be seen are refused: an inline python or node
+program (-c, -e or a heredoc) that writes files, patch without a file argument or -o
+(the diff names the files), and find with -delete or an -exec, -execdir, -ok or -okdir
+command that writes files (as the walker judges a part), runs git on paths, or is a
+shell or an interpreter.
 
 <key> is the first 12 hex digits of the sha1 of the real path of the main working tree
 with each component spelled as its parent directory lists it, so a linked worktree
@@ -256,20 +259,41 @@ def role_refusal(role: str, kind: str, rel: str = "") -> str | None:
     return None
 
 
-def source_refusal(facts: dict, number: str) -> str | None:
-    """Why a source edit on ticket `number` must wait, or None when the proof is there."""
+def ticket_cache(facts: dict, number: str) -> tuple[Path, dict | None]:
+    """The repo's state directory and ticket `number`'s cache (tickets/<N>.json), None
+    when it is missing, corrupt or valid JSON that is not an object."""
     repos = harness_home() / "repos"
     state = repos / adopt_old_state(str(repos), str(facts["main"]), *facts["spelled"])
-    branch = facts["branch"]
     ticket = read_json(state / "tickets" / f"{number}.json")
     if not isinstance(ticket, dict):  # valid JSON that is not an object counts as absent
         ticket = None
+    return state, ticket
+
+
+def no_tests(ticket: dict | None) -> bool:
+    """True when the ticket cache flags no-tests: a member of its flags or labels list."""
     flags = []
     if ticket:
         for key in ("flags", "labels"):
             if isinstance(ticket.get(key), list):
                 flags.extend(str(f) for f in ticket[key])
-    if "no-tests" in flags:
+    return "no-tests" in flags
+
+
+def config_exempt(role: str, facts: dict, ticket) -> bool:
+    """True when `role` may edit test configuration after all: the coder on a ticket whose
+    cache flags no-tests, which has no tests to game (#281). Never in the breaker's scratch
+    worktree (`ticket` True), which names no ticket."""
+    if role != "coder" or ticket is True:
+        return False
+    return no_tests(ticket_cache(facts, str(int(ticket.group(1))))[1])
+
+
+def source_refusal(facts: dict, number: str) -> str | None:
+    """Why a source edit on ticket `number` must wait, or None when the proof is there."""
+    state, ticket = ticket_cache(facts, number)
+    branch = facts["branch"]
+    if no_tests(ticket):
         return None
     record_path = state / "red" / f"{branch.replace('/', '-')}.json"
     record = read_json(record_path)
@@ -344,6 +368,8 @@ def path_refusal(
     kind = classify(rel, settings_env(facts["main"], ("settings.json",)))
     kind = role_kind(rel, kind)
     why = role_refusal(role, kind, rel)
+    if why and kind == "config" and config_exempt(role, facts, ticket):
+        why = None
     if why is None and kind == "source" and ticket is not True:
         why = source_refusal(facts, str(int(ticket.group(1))))
     if why and skip_ignored and kind != "config":
@@ -394,11 +420,13 @@ def bulk_form(guard, sub: str, rest: list[str], where: str | None) -> bool:
 def bulk_refusal(directory: str | None, role: str, cache: dict) -> str | None:
     """Why `role` may not rewrite every file of the worktree at `directory`: the role
     rules for each of its test files (tracked, or untracked and not ignored) and its
-    test configuration. None off the guarded branches or without such files."""
+    test configuration (unless config_exempt). None off the guarded branches or without
+    such files."""
     if role not in ROLES or directory is None:
         return None
     facts = facts_at(directory, cache)
-    if guarded(facts) is None:
+    ticket = guarded(facts)
+    if ticket is None:
         return None
     top = str(facts["top"])
     try:
@@ -407,10 +435,11 @@ def bulk_refusal(directory: str | None, role: str, cache: dict) -> str | None:
         return f"git did not list the files of {top} in time, so this rewrite is refused; retry it."
     # The main checkout's tracked settings.json only, not settings.local.json (see path_refusal).
     file_env = settings_env(facts["main"], ("settings.json",))
+    exempt = config_exempt(role, facts, ticket)
     found = None
     for rel in sorted(set(out.stdout.split("\0")) - {""}):
         kind = role_kind(rel, classify(rel, file_env))
-        if kind not in ("test", "config"):
+        if kind not in ("test", "config") or (kind == "config" and exempt):
             continue
         why = role_refusal(role, kind, rel)
         if why and kind == "test":
