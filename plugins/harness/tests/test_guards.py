@@ -2861,6 +2861,71 @@ class TestsFirstTests(GuardTestCase):
                 with self.subTest(cache=fields, agent=agent):
                     self.assertIsNone(self.change("Edit", ".claude/settings.json", agent))
 
+    def test_no_tests_flag_comes_from_the_cache_of_the_branchs_own_ticket(self):
+        rel = ".claude/settings.json"
+        expected = CODER_ON_CONFIG.format(rel=rel)
+        command = "echo '{}' > .claude/settings.json"
+        tickets = self.state / "tickets"
+        flagless = {"type": "task", "flags": [], "labels": ["task", "status:in-progress"]}
+        # each branch's ticket is flagged its own way: in flags, in labels only, or both
+        for number, slug, flagged in (
+            (34, "x", {"type": "chore", "flags": ["no-tests"], "labels": ["chore"]}),
+            (281, "exempt-config", {"type": "chore", "flags": [], "labels": ["no-tests"]}),
+            (7, "y", {"type": "task", "flags": ["no-tests"], "labels": ["task", "no-tests"]}),
+        ):
+            wt = self.worktree(self.repo, branch=f"t/{number}-{slug}", name=f"wt{number}")
+            own, twelve = tickets / f"{number}.json", tickets / "12.json"
+            for own_fields, twelve_fields, allowed in (
+                (flagged, None, True),  # ticket 12 has no cache at all
+                (flagged, flagless, True),
+                (flagless, flagged, False),  # ticket 12's flag is not this branch's
+                (None, flagged, False),  # no cache for this branch's ticket
+            ):
+                for path, fields in ((own, own_fields), (twelve, twelve_fields)):
+                    if fields is None:
+                        if path.exists():
+                            path.unlink()
+                    else:
+                        self.write(path, json.dumps(dict(fields, number=int(path.stem))))
+                case = dict(branch=f"t/{number}-{slug}", own=own_fields, t12=twelve_fields)
+                for tool in ("Edit", "Write"):
+                    with self.subTest(tool=tool, **case):
+                        self.assertEqual(
+                            self.change(tool, rel, "harness:coder", root=wt),
+                            None if allowed else expected,
+                        )
+                with self.subTest(tool="Bash", **case):
+                    self.assertEqual(
+                        self.bash(command, "harness:coder", cwd=wt),
+                        None if allowed else refusal(command, expected),
+                    )
+        # the cache is read as JSON: an escaped spelling of the flag is the flag
+        (tickets / "12.json").unlink()
+        self.write(
+            tickets / "34.json",
+            '{"number": 34, "type": "chore", "flags": ["no\\u002dtests"], "labels": []}',
+        )
+        wt34 = self.tmp / "wt34"
+        with self.subTest(cache="escaped"):
+            self.assertIsNone(self.change("Edit", rel, "harness:coder", root=wt34))
+            self.assertIsNone(self.bash(command, "harness:coder", cwd=wt34))
+
+    def test_no_tests_config_edit_does_not_depend_on_the_red_record(self):
+        self.cache(flags=["no-tests"], type="chore")
+        rel = ".claude/settings.json"
+        command = "echo '{}' > .claude/settings.json"
+        for state in ("assertion", "green", "stale"):
+            if state == "stale":  # a red record whose tests changed since
+                self.red("assertion")
+                self.write(self.wt / "tests/test_app.py", "def test_login():\n    assert 0\n")
+            else:
+                self.red(state)
+            for tool in ("Edit", "Write"):
+                with self.subTest(red=state, tool=tool):
+                    self.assertIsNone(self.change(tool, rel, "harness:coder"))
+            with self.subTest(red=state, tool="Bash"):
+                self.assertIsNone(self.bash(command, "harness:coder"))
+
     def test_coder_may_write_test_configuration_through_bash_on_a_no_tests_ticket(self):
         outside = self.tmp / "outside"
         outside.mkdir()
@@ -2943,6 +3008,37 @@ class TestsFirstTests(GuardTestCase):
                 expected = {refusal(command, CODER_ON_CONFIG.format(rel=r)) for r in configs}
                 self.assertIn(reason, expected)
 
+    def test_bulk_git_forms_read_the_no_tests_flag_of_the_branchs_own_ticket(self):
+        files = {"README.md": "hi\n", "src/app.py": "pass\n", ".claude/settings.json": "{}\n"}
+        flagged = {"type": "chore", "flags": ["no-tests"], "labels": ["chore"]}
+        flagless = {"type": "task", "flags": [], "labels": ["task"]}
+        commands = ("git checkout -- .", "git reset --hard", "git stash")
+        expected = CODER_ON_CONFIG.format(rel=".claude/settings.json")
+        # t/34 flagged, and no cache for ticket 12 in that repo
+        own = self.other_ticket_worktree("own", files, 34, dict(flagged, number=34))
+        self.assertFalse((self.repo_state(self.tmp / "own") / "tickets/12.json").exists())
+        # t/34 flagless, ticket 12 flagged in the same repo
+        wrong = self.other_ticket_worktree("wrong", files, 34, dict(flagless, number=34))
+        self.write(
+            self.repo_state(self.tmp / "wrong") / "tickets/12.json",
+            json.dumps(dict(flagged, number=12)),
+        )
+        # t/12 whose no-tests is not a member of a flags or labels list
+        shape = {"number": 12, "flags": "no-tests", "labels": [], "status": "no-tests"}
+        misshapen = self.other_ticket_worktree("misshapen", files, 12, shape)
+        for command in commands:
+            with self.subTest(command=command, where="t/34 flagged"):
+                self.assertIsNone(self.bash(command, "harness:coder", cwd=own))
+            with self.subTest(command=command, where="t/34 flagless, t/12 flagged"):
+                self.assertEqual(
+                    self.bash(command, "harness:coder", cwd=wrong), refusal(command, expected)
+                )
+            with self.subTest(command=command, where="t/12 misshapen"):
+                self.assertEqual(
+                    self.bash(command, "harness:coder", cwd=misshapen),
+                    refusal(command, expected),
+                )
+
     def test_coder_is_refused_test_configuration_without_the_no_tests_flag(self):
         self.red()  # a current red run: only the role rules can refuse
         rels = (".claude/settings.json", "pyproject.toml", "web/package.json")
@@ -2963,6 +3059,26 @@ class TestsFirstTests(GuardTestCase):
                     self.assertEqual(
                         self.bash(command, "harness:coder"), refusal(command, expected)
                     )
+        # no-tests counts only as a member of the flags or labels list, as source_refusal
+        # reads it: not as another field's value, not as a flags or labels string or object,
+        # and not as part of a longer flag
+        rel = ".claude/settings.json"
+        expected = CODER_ON_CONFIG.format(rel=rel)
+        command = "echo '{}' > .claude/settings.json"
+        for fields in (
+            {"flags": [], "labels": ["task"], "status": "no-tests"},
+            {"flags": "no-tests", "labels": []},
+            {"flags": [], "labels": "no-tests"},
+            {"flags": {"no-tests": True}, "labels": ["task"]},
+            {"flags": [["no-tests"]], "labels": ["task"]},
+            {"flags": ["no-tests-later", "not-no-tests"], "labels": ["no-tests:skip"]},
+            {"type": "no-tests", "title": "no-tests", "flags": [], "labels": []},
+        ):
+            self.cache(**fields)
+            with self.subTest(cache=fields, tool="Edit"):
+                self.assertEqual(self.change("Edit", rel, "harness:coder"), expected)
+            with self.subTest(cache=fields, tool="Bash"):
+                self.assertEqual(self.bash(command, "harness:coder"), refusal(command, expected))
         # another ticket's no-tests flag does not reach t/12
         (self.state / "tickets/12.json").unlink()
         other = {"number": 13, "type": "chore", "flags": ["no-tests"], "labels": ["no-tests"]}
@@ -3158,21 +3274,27 @@ class TestsFirstTests(GuardTestCase):
             self.bash(f"cd lib && {part}", "harness:coder"), part, CODER_ON_TEST
         )
 
-    def other_ticket_worktree(self, name: str, files: dict) -> Path:
-        """A repo `name` holding `files`, its t/12 worktree, and a no-tests ticket cache
-        so that only the role rules can refuse there."""
+    def repo_state(self, repo: Path) -> Path:
+        """~/.claude/harness/repos/<key> for the main checkout `repo`."""
+        key = hashlib.sha1(str(repo.resolve()).encode()).hexdigest()[:12]
+        return self.home / ".claude/harness/repos" / key
+
+    def other_ticket_worktree(
+        self, name: str, files: dict, number: int = 12, ticket: dict | None = None
+    ) -> Path:
+        """A repo `name` holding `files`, its worktree on ticket `number`'s branch (t/12 is
+        BRANCH, any other t/<number>-<name>), and that ticket's cache: `ticket`, by default
+        a no-tests chore so that only the role rules can refuse there."""
         repo = self.make_repo(name, commit=False)
         for rel, text in files.items():
             self.write(repo / rel, text)
         self.git(repo, "add", "-A")
         self.git(repo, "commit", "-q", "-m", "Initial commit")
-        wt = self.worktree(repo, name=f"{name}-wt")
-        key = hashlib.sha1(str(repo.resolve()).encode()).hexdigest()[:12]
-        ticket = {"number": 12, "type": "chore", "flags": ["no-tests"]}
-        self.write(
-            self.home / ".claude/harness/repos" / key / "tickets/12.json",
-            json.dumps(ticket),
-        )
+        branch = BRANCH if number == 12 else f"t/{number}-{name}"
+        wt = self.worktree(repo, branch=branch, name=f"{name}-wt")
+        if ticket is None:
+            ticket = {"number": number, "type": "chore", "flags": ["no-tests"]}
+        self.write(self.repo_state(repo) / f"tickets/{number}.json", json.dumps(ticket))
         return wt
 
     def test_bulk_forms_reach_tests_wherever_they_live(self):
