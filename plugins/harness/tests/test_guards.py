@@ -158,6 +158,35 @@ NO_RED = (
 NO_CACHE = " There is no ticket cache either; harness-work start 12 writes it."
 CHANGED = "Tests changed since the red run; run harness-red check again."
 BRANCH = "t/12-fix-login"
+# Test configuration (tests_first's TEST_CONFIG) that the default HARNESS_TEST_PATTERNS do
+# not also call tests: on a no-tests ticket the coder may edit these (#281). conftest.py is
+# in both lists, so it stays a test.
+CONFIG_NOT_TESTS = (
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+    "pytest.ini",
+    "pyproject.toml",
+    "setup.cfg",
+    "tox.ini",
+    "jest.config.js",
+    "vitest.config.ts",
+    "package.json",
+    "web/package.json",
+    "web/jest.config.cjs",
+)
+# Ticket caches that flag no-tests, as source_refusal reads them: in flags, in labels only,
+# or beside another flag on a ticket of another type.
+NO_TESTS_CACHES = (
+    {"flags": ["no-tests"], "type": "chore"},
+    {"flags": [], "labels": ["chore", "no-tests", "status:in-progress"], "type": "chore"},
+    {"flags": ["needs-local", "no-tests"], "labels": ["task", "needs-local"], "type": "task"},
+)
+
+
+def refusal(part: str, why: str) -> str:
+    """A Bash denial as tests_first.py words it."""
+    return f'Refused "{part}": {why}'
+
 
 _SHARED: dict = {}
 
@@ -2804,6 +2833,223 @@ class TestsFirstTests(GuardTestCase):
         reads = """python3 -c "print(open('src/app.py').read())\""""
         self.assertIsNone(self.bash(reads, "harness:coder"))
         self.assertIsNone(self.bash(command, "harness:coder", cwd=self.tmp))  # no repo
+
+    # ---- test configuration on a no-tests ticket (#281)
+
+    def change(self, tool: str, rel: str, agent=None, root: Path | None = None, env=None):
+        """The deny reason for an Edit or a Write of `rel` under the worktree (or `root`)."""
+        path = str((root or self.wt) / rel)
+        if tool == "Write":
+            tool_input = {"file_path": path, "content": "{}\n"}
+        else:
+            tool_input = {"file_path": path, "old_string": "a", "new_string": "b"}
+        payload = self.payload(tool, tool_input, self.repo, agent)
+        return self.decision(self.run_hook("tests_first.py", payload, env))
+
+    def test_coder_may_edit_test_configuration_on_a_no_tests_ticket(self):
+        # no red record: test configuration is not source, and no-tests needs none anyway
+        for n, fields in enumerate(NO_TESTS_CACHES):
+            self.cache(**fields)
+            rels = CONFIG_NOT_TESTS if n == 0 else (
+                ".claude/settings.json", "pyproject.toml", "web/package.json"
+            )
+            for rel in rels:
+                for tool in ("Edit", "Write"):
+                    with self.subTest(cache=fields, rel=rel, tool=tool):
+                        self.assertIsNone(self.change(tool, rel, "harness:coder"))
+            for agent in ("coder", "someone:else:coder"):  # the role is the last part
+                with self.subTest(cache=fields, agent=agent):
+                    self.assertIsNone(self.change("Edit", ".claude/settings.json", agent))
+
+    def test_coder_may_write_test_configuration_through_bash_on_a_no_tests_ticket(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        source = self.write(outside / "settings.json", '{"env": {}}\n')
+        wt = self.wt
+        self.write(wt / "web/index.js", "module.exports = {};\n")  # web/ exists, untracked
+        commands = (
+            "echo '{}' > .claude/settings.json",
+            "printf '{}\\n' >> .claude/settings.json",
+            "cat > .claude/settings.json <<'EOF'\n{\"env\": {}}\nEOF",
+            f"cp {source} .claude/settings.json",
+            "sed -i '' 's/a/b/' .claude/settings.json",
+            "echo '[tool.pytest]' | tee pyproject.toml",
+            "touch pytest.ini",
+            "git checkout -- package.json",
+            "echo '{}' > web/package.json",
+        )
+        for fields in NO_TESTS_CACHES[:2]:
+            self.cache(**fields)
+            for command in commands:
+                with self.subTest(cache=fields, command=command):
+                    self.assertIsNone(self.bash(command, "harness:coder"))
+            # through cd, and by absolute path, from the main checkout
+            for cwd, command in (
+                (self.repo, f"cd {wt} && echo '{{}}' > .claude/settings.json"),
+                (self.repo, f"echo '{{}}' > {wt}/.claude/settings.json"),
+                (wt, "cd web && echo '{}' > package.json"),
+            ):
+                with self.subTest(cache=fields, command=command, cwd=str(cwd)):
+                    self.assertIsNone(self.bash(command, "harness:coder", cwd=cwd))
+
+    def test_bulk_git_forms_over_test_configuration_follow_the_no_tests_flag(self):
+        files = {
+            "README.md": "hi\n",
+            "src/app.py": "def login():\n    return None\n",
+            ".claude/settings.json": "{}\n",
+            "pyproject.toml": "[project]\nname = 'p'\n",
+            "package.json": "{}\n",
+        }
+        commands = (
+            "git stash",
+            "git stash pop",
+            "git reset --hard",
+            "git checkout -- .",
+            "git restore .",
+            "git clean -fd",
+        )
+        # a no-tests ticket whose worktree holds test configuration and no tests
+        bare = self.other_ticket_worktree("configonly", files)
+        for command in commands:
+            with self.subTest(command=command, agent="harness:coder"):
+                self.assertIsNone(self.bash(command, "harness:coder", cwd=bare))
+            with self.subTest(command=command, agent="harness:test-breaker"):
+                self.assertEqual(
+                    self.bash(command, "harness:test-breaker", cwd=bare),
+                    refusal(command, BREAKER_ON_TEST),
+                )
+            with self.subTest(command=command, agent="harness:test-author"):
+                self.assertIsNone(self.bash(command, "harness:test-author", cwd=bare))
+        # a test file beside the configuration is still the coder's to leave alone
+        test = {"tests/test_app.py": "def test_login():\n    pass\n"}
+        mixed = self.other_ticket_worktree("mixed", dict(files, **test))
+        for command in commands:
+            with self.subTest(command=command, where="mixed"):
+                self.assertEqual(
+                    self.bash(command, "harness:coder", cwd=mixed),
+                    refusal(command, CODER_ON_TEST),
+                )
+        # the same worktree on a ticket without no-tests stays refused, as today
+        flagless = self.other_ticket_worktree("flagless", files)
+        key = hashlib.sha1(str((self.tmp / "flagless").resolve()).encode()).hexdigest()[:12]
+        ticket = {"number": 12, "type": "task", "flags": [], "labels": ["task"]}
+        self.write(
+            self.home / ".claude/harness/repos" / key / "tickets/12.json", json.dumps(ticket)
+        )
+        configs = (".claude/settings.json", "pyproject.toml", "package.json")
+        for command in commands:
+            with self.subTest(command=command, where="flagless"):
+                reason = self.bash(command, "harness:coder", cwd=flagless)
+                expected = {refusal(command, CODER_ON_CONFIG.format(rel=r)) for r in configs}
+                self.assertIn(reason, expected)
+
+    def test_coder_is_refused_test_configuration_without_the_no_tests_flag(self):
+        self.red()  # a current red run: only the role rules can refuse
+        rels = (".claude/settings.json", "pyproject.toml", "web/package.json")
+        for fields in (
+            {},  # a task without flags
+            {"type": "chore"},
+            {"flags": ["needs-local", "priority:high"], "labels": ["task", "needs-local"]},
+            {"title": "Drop the no-tests flag from the scaffold"},
+        ):
+            self.cache(**fields)
+            for rel in rels:
+                expected = CODER_ON_CONFIG.format(rel=rel)
+                for tool in ("Edit", "Write"):
+                    with self.subTest(cache=fields, rel=rel, tool=tool):
+                        self.assertEqual(self.change(tool, rel, "harness:coder"), expected)
+                command = f"echo '{{}}' > {rel}"
+                with self.subTest(cache=fields, rel=rel, tool="Bash"):
+                    self.assertEqual(
+                        self.bash(command, "harness:coder"), refusal(command, expected)
+                    )
+        # another ticket's no-tests flag does not reach t/12
+        (self.state / "tickets/12.json").unlink()
+        other = {"number": 13, "type": "chore", "flags": ["no-tests"], "labels": ["no-tests"]}
+        self.write(self.state / "tickets/13.json", json.dumps(other))
+        rel = ".claude/settings.json"
+        self.assertEqual(
+            self.change("Edit", rel, "harness:coder"), CODER_ON_CONFIG.format(rel=rel)
+        )
+
+    def test_coder_is_still_refused_test_files_on_a_no_tests_ticket(self):
+        for fields in NO_TESTS_CACHES[:2]:
+            self.cache(**fields)
+            for rel in (
+                "tests/test_app.py",
+                "tests/test_new.py",
+                "tests/conftest.py",
+                "conftest.py",  # test configuration that the default patterns call a test
+                "src/pkg/test_thing.py",
+                "tests/fixtures/data.json",
+                "web/app.test.js",
+            ):
+                for tool in ("Edit", "Write"):
+                    with self.subTest(cache=fields, rel=rel, tool=tool):
+                        self.assertEqual(self.change(tool, rel, "harness:coder"), CODER_ON_TEST)
+                command = f"echo x > {rel}"
+                with self.subTest(cache=fields, rel=rel, tool="Bash"):
+                    self.assertEqual(
+                        self.bash(command, "harness:coder"), refusal(command, CODER_ON_TEST)
+                    )
+        # a configuration write passes and the test write beside it is refused
+        command = "echo '{}' > .claude/settings.json && echo x > tests/test_app.py"
+        with self.subTest(command=command):
+            self.assertEqual(
+                self.bash(command, "harness:coder"),
+                refusal("echo x > tests/test_app.py", CODER_ON_TEST),
+            )
+        # configuration that the project's own patterns call tests is a test
+        env = {"HARNESS_TEST_PATTERNS": "checks/**,pyproject.toml"}
+        for rel, expected in (
+            ("pyproject.toml", CODER_ON_TEST),
+            ("checks/check_app.py", CODER_ON_TEST),
+            (".claude/settings.json", None),
+        ):
+            with self.subTest(rel=rel, env=env):
+                self.assertEqual(self.change("Edit", rel, "harness:coder", env=env), expected)
+
+    def test_coder_is_refused_test_configuration_without_a_ticket_cache(self):
+        cache = self.state / "tickets/12.json"
+        rels = (".claude/settings.json", "pytest.ini", "package.json")
+        # no cache, a corrupt one, and JSON that is not a ticket object: all count as absent
+        for content in (None, "{not json", json.dumps(["no-tests"]), json.dumps("no-tests")):
+            if content is not None:
+                self.write(cache, content)
+            self.assertEqual(cache.exists(), content is not None)
+            for rel in rels:
+                expected = CODER_ON_CONFIG.format(rel=rel)
+                for tool in ("Edit", "Write"):
+                    with self.subTest(content=content, rel=rel, tool=tool):
+                        self.assertEqual(self.change(tool, rel, "harness:coder"), expected)
+                command = f"echo '{{}}' > {rel}"
+                with self.subTest(content=content, rel=rel, tool="Bash"):
+                    self.assertEqual(
+                        self.bash(command, "harness:coder"), refusal(command, expected)
+                    )
+
+    def test_breaker_and_author_keep_their_rules_on_a_no_tests_ticket(self):
+        self.cache(flags=["no-tests"], type="chore")
+        for rel in (".claude/settings.json", "pyproject.toml", "package.json", "tests/test_app.py"):
+            command = f"echo x > {rel}"
+            with self.subTest(rel=rel, agent="harness:test-breaker"):
+                for tool in ("Edit", "Write"):
+                    self.assertEqual(self.change(tool, rel, "harness:test-breaker"), BREAKER_ON_TEST)
+                self.assertEqual(
+                    self.bash(command, "harness:test-breaker"), refusal(command, BREAKER_ON_TEST)
+                )
+            with self.subTest(rel=rel, agent="harness:test-author"):
+                self.assertIsNone(self.change("Edit", rel, "harness:test-author"))
+                self.assertIsNone(self.bash(command, "harness:test-author"))
+        self.assertEqual(self.change("Edit", "src/app.py", "harness:test-author"), AUTHOR_ON_SOURCE)
+        # the breaker's scratch worktree names no ticket: configuration stays fixed there
+        scratch = self.state / "scratch" / "t-12-fix-login"
+        scratch.parent.mkdir(parents=True)
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(scratch), BRANCH)
+        self.assertEqual(
+            self.change("Edit", ".claude/settings.json", "harness:test-breaker", root=scratch),
+            BREAKER_ON_TEST,
+        )
 
     # ---- forms that touch every test file, and writers whose paths cannot be seen
 
