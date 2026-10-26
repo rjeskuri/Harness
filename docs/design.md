@@ -116,7 +116,7 @@ Per project, in `.claude/settings.json` under `env` (read by hooks and tools the
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `CLAUDE_VERIFY_CMD` | the whole suite plus lint; verify-on-stop and the coder run it | none (verify-on-stop off) |
+| `CLAUDE_VERIFY_CMD` | the whole suite plus lint, which `harness-red verify` runs once before ready; verify-on-stop runs it too | none (verify-on-stop off) |
 | `HARNESS_TEST_CMD` | runs named test files; `{files}` is replaced by space-separated repo-relative paths | detected: `uv run pytest -q {files}` when `uv.lock` exists, `python3 -m pytest -q {files}` when `pyproject.toml` or `pytest.ini` names pytest, `python3 -m unittest {files}` for other `test_*.py` or `*_test.py`, `npm test -- {files}` when `package.json` has a `test` script, `node --test {files}` for `*.test.js` |
 | `HARNESS_TEST_MAP` | comma-separated `SOURCE_GLOB=TEST_GLOB` pairs (globs as `HARNESS_TEST_PATTERNS` reads them) that `harness-red files` and `run` add to the name rule: a changed path matching SOURCE_GLOB adds every runnable test module matching TEST_GLOB; an entry without `=` is skipped with a warning | unset (the name rule only) |
 | `HARNESS_TEST_PATTERNS` | comma-separated globs that mark a path as a test file | `tests/**,test/**,**/test_*.py,**/*_test.py,**/conftest.py,**/*_test.js,**/*.test.js,**/*.test.ts,**/*_test.ts,spec/**` |
@@ -277,7 +277,7 @@ Everything above the Cost block is the PR's and the same on each ticket it close
 | `planner` | opus, xhigh | Read, Grep, Glob, Bash (read-only guard) | Turns an interviewed request into an epic and tasks in the templates, with sizes, risks, flags and blocked-by, under the size cap. Returns a proposal; creates nothing. |
 | `test-author` | opus (tier override per call), effort inherited unless `HARNESS_CODE_EFFORT` is set or the route gives xhigh (size:L, risk:high, `escalate opus xhigh`) | all | Writes the tests the ticket names, broad behavior first, against the public interface, and runs them to show them red. The tests-first hook denies it any source edit. |
 | `test-breaker` | opus (tier override), inherited unless `HARNESS_CODE_EFFORT` is set or the route gives xhigh (size:L, risk:high, `escalate opus xhigh`) | all | In the scratch copy, writes the cheapest implementation that could pass the new tests (constants, special-casing the fixtures) and runs them. If it passes, the tests are too narrow. Runs only on `risk:high` tickets. Denied test edits by the hook. |
-| `coder` | opus (tier override), inherited unless `HARNESS_CODE_EFFORT` is set or the route gives xhigh (size:L, risk:high, `escalate opus xhigh`) | all | Makes the tests and the verify command green with the smallest coherent change, commits on the ticket branch, reports evidence. Denied test edits by the hook; stops and reports when the change outgrows the size cap. |
+| `coder` | opus (tier override), inherited unless `HARNESS_CODE_EFFORT` is set or the route gives xhigh (size:L, risk:high, `escalate opus xhigh`) | all | Makes the new tests and the ticket's own tests (`harness-red run`) green with the smallest coherent change, commits on the ticket branch, reports evidence. Denied test edits by the hook; stops and reports when the change outgrows the size cap. |
 | `reviewer` | opus (xhigh for risk:high), unless the project sets `HARNESS_REVIEW_TIER` (`fable` there carries xhigh) | Read, Grep, Glob, Bash (read-only guard) | Reviews the branch against the ticket's definition of done; returns findings as JSON lines for the PR; high and medium ones on the ticket's files block ready, low ones go to the notes. |
 | `researcher` | opus, inherited | WebFetch, WebSearch, Read, Grep, Glob, Bash (read-only guard) | Primary-source fact checking, as in v1. |
 | `quick` | sonnet, inherited | all | Trivial mechanical tasks outside the ticket loop, as in v1. |
@@ -306,12 +306,12 @@ test-author (tier)              tests only; must show them red
 harness-red check               proof: tests fail, source untouched; record written
 test-breaker (tier)             risk:high only: scratch copy; cheat attempt; cheat passed: author tightens,
                                 breaker again; a second pass: needs-input
-coder (tier)                    source only; new tests and CLAUDE_VERIFY_CMD green; commits
+coder (tier)                    source only; new tests and its own tests (harness-red run) green; commits
 reviewer (opus; xhigh if risk:high) findings JSON; split by severity and the ticket's files: high and medium on them
                                 to the fix file, low ones to the notes, high and medium outside them new tickets;
                                 model and effort from harness-board tier N --stage review --json (HARNESS_REVIEW_TIER
                                 when set, else the labels)
-harness-pr open N [--notes F]   push, draft PR from the template (Closes #N, DoD, red proof, verify tail); --notes adds a `## Notes` section (second pass, out-of-scope file) that the Resolution repeats
+harness-pr open N [--notes F]   push, draft PR from the template (Closes #N, DoD, red proof; no verify log yet); --notes adds a `## Notes` section (second pass, out-of-scope file) that the Resolution repeats
 harness-pr review P --findings  inline review comments from the high and medium findings on the ticket's files and
                                 the low ones
 coder (tier)                    fixes every high and medium posted finding in commits after the review;
@@ -322,6 +322,9 @@ harness-work attempt N fix      after each fix round: pass when the re-check fou
 harness-pr checks P --wait      CI; failures go back to the coder (max 2 rounds)
 [harness-pr ultra P]            when risk:high: ultrareview, posted to the PR; with HARNESS_ULTRAREVIEW=off one line,
                                 nothing run
+harness-red verify --wait       CLAUDE_VERIFY_CMD once, every ticket: --timeout 540 slices, exit 8 runs it again;
+                                exit 1 to the coder, own tests, push, CI, verify again; attempt N verify
+harness-pr open N --verify-log  the PR body refreshed with that run's log
 harness-pr ready P              refused while the latest harness review has high or medium findings and no newer
                                 commit; low ones only warn;
                                 ready for review, status in-review, notification
@@ -333,7 +336,7 @@ A ticket whose `flags` (from `harness-board show N --json`) hold `no-tests` skip
 
 Failure policy, enforced by `harness-work attempt`: the first failure of a stage retries at the same tier and effort; the second re-runs one step up the ladder (sonnet goes to opus, opus goes to opus at effort xhigh), except that a second failure at opus xhigh or max, or on an explicitly set Fable, goes straight to needs-input, since nothing is above it; the third calls `harness-board needs-input` with the evidence and stops. No escalation goes to Fable. `fix` and `breaker` have their own rule, two rounds each: the first failure retries at the same tier and the second calls `needs-input`, with no escalation. A stage is `tests` (red cannot be reached), `breaker` (the cheat still passes after the second round: needs-input), `code` (verify not green), `review` (the reviewer returned no usable findings; a findings array of any length, empty included, passes), `fix` (high or medium findings on the ticket's files still open after a fix round's re-check), `ci` (checks red), `verify` (the full verify before ready is red). Each stage counts its own failures: a run of failures ends at that stage's next pass, and another stage's result neither adds to it nor resets it.
 
-Every Agent call the work skill makes carries the description `#N <stage>`, which `harness-work cost` reads (`^#(\d+)\b` and the word after it): `tests` for the test-author (in a revise pass too), `breaker`, `code` for the coder until the first review, `review` for the first review, and `fix` for every coder or reviewer run after the first review (its findings, CI failures, ultrareview findings, the owner's comments). A continued (SendMessage) agent's transcript is split at the coordinator's continuation entries into segments, each its own round, and a code or review segment starting after the end of the ticket's first review counts as `fix`, except segment 1 of an agent whose description names its stage. Any question the agents cannot answer from the ticket, the epic or the code also ends in `needs-input`. A revisit of a ticket with `status:needs-input` and a newer comment by the repository owner passes that comment to the agents as the answer. A revisit of a ticket in `status:in-review` with unresolved review threads from the owner runs the coder on those comments only, then checks and ready again.
+Every Agent call the work skill makes carries the description `#N <stage>`, which `harness-work cost` reads (`^#(\d+)\b` and the word after it): `tests` for the test-author (in a revise pass too), `breaker`, `code` for the coder until the first review, `review` for the first review, and `fix` for every coder or reviewer run after the first review (its findings, CI failures, ultrareview findings, verify failures, the owner's comments). A continued (SendMessage) agent's transcript is split at the coordinator's continuation entries into segments, each its own round, and a code or review segment starting after the end of the ticket's first review counts as `fix`, except segment 1 of an agent whose description names its stage. Any question the agents cannot answer from the ticket, the epic or the code also ends in `needs-input`. A revisit of a ticket with `status:needs-input` and a newer comment by the repository owner passes that comment to the agents as the answer. A revisit of a ticket in `status:in-review` with unresolved review threads from the owner runs the coder on those comments only, then checks and ready again.
 
 ## Hooks
 
