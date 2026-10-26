@@ -8,6 +8,13 @@ argv and answers `already ...` with exit 1 when a command repeats, as the real o
 install) and HARNESS_LAUNCHCTL pointing at a fake `launchctl` that logs its argv. PATH is the fake folder
 and the system folders, so the settings merge and harness-digest run on the system python3. Nothing here
 touches the real ~/.claude or loads a LaunchAgent. The fakes are written once for the module.
+
+Two more modes of the fake `claude`, for the concurrent-install test (#244): with CLAUDE_FAIL_STEP set to a
+`plugin` subcommand (`marketplace` or `install`) that step writes CLAUDE_FAIL_MESSAGE to stderr and exits 1;
+with CLAUDE_NESTED set to a folder and CLAUDE_NESTED_STEP naming a step, that step, after writing its own answer
+and before exiting, runs the installer named by CLAUDE_INSTALL to completion in that folder with a fresh HOME,
+state and logs (and neither mode), recording its output in `out.txt` and its exit code in `rc` there. That is a
+second install running at the same moment, between the outer step's write of its output and the installer's read.
 """
 from __future__ import annotations
 
@@ -32,19 +39,41 @@ TEMPLATE = os.path.join(REPO, "plugins", "harness", "templates", "settings.json"
 LABEL = "com.ryaneskuri.harness-digest"
 W = {}
 
-FAKE_CLAUDE = """import hashlib, json, os, sys
+FAKE_CLAUDE = """import hashlib, json, os, subprocess, sys
 args = sys.argv[1:]
 with open(os.environ["CLAUDE_LOG"], "a", encoding="utf-8") as fh:
     fh.write(json.dumps(args) + "\\n")
 if args == ["--version"]:
     print("9.9.9 (Claude Code, fake)")
     sys.exit(0)
+step = args[1] if len(args) > 1 else ""
 marker = os.path.join(os.environ["CLAUDE_STATE"], hashlib.sha1(json.dumps(args).encode()).hexdigest())
-if os.path.exists(marker):
+if step and step == os.environ.get("CLAUDE_FAIL_STEP"):
+    sys.stderr.write(os.environ["CLAUDE_FAIL_MESSAGE"] + "\\n")
+    code = 1
+elif os.path.exists(marker):
     print("already " + " ".join(args[:2]))
-    sys.exit(1)
-open(marker, "w").close()
-print("ok")
+    code = 1
+else:
+    open(marker, "w").close()
+    print("ok")
+    code = 0
+sys.stdout.flush()
+sys.stderr.flush()
+folder = os.environ.get("CLAUDE_NESTED")
+if folder and step == os.environ.get("CLAUDE_NESTED_STEP"):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("CLAUDE_NESTED", "CLAUDE_NESTED_STEP", "CLAUDE_FAIL_STEP", "CLAUDE_FAIL_MESSAGE")}
+    env.update(HOME=os.path.join(folder, "home"), CLAUDE_STATE=os.path.join(folder, "state"),
+               CLAUDE_LOG=os.path.join(folder, "claude.log"), LAUNCHCTL_LOG=os.path.join(folder, "launchctl.log"))
+    os.makedirs(env["HOME"], exist_ok=True)
+    os.makedirs(env["CLAUDE_STATE"], exist_ok=True)
+    with open(os.path.join(folder, "out.txt"), "w", encoding="utf-8") as out:
+        rc = subprocess.run(["sh", os.environ["CLAUDE_INSTALL"]], cwd=folder, env=env, stdin=subprocess.DEVNULL,
+                            stdout=out, stderr=subprocess.STDOUT).returncode
+    with open(os.path.join(folder, "rc"), "w", encoding="utf-8") as fh:
+        fh.write(str(rc))
+sys.exit(code)
 """
 
 FAKE_LAUNCHCTL = """import json, os, sys
@@ -704,6 +733,57 @@ class Install(unittest.TestCase):
         merged = read_json(self.settings)
         self.assertEqual(merged["model"], "opus")
         self.assertEqual(merged["enabledPlugins"], {})
+
+    # #244: install.sh wrote every `claude plugin ...` step's output to one fixed path and then read it back, so a
+    # second install running at the same moment (parallel test runs, two terminals) overwrote it in between and the
+    # first install judged its step by the other's output. The fake runs a whole second install inside the step,
+    # after the step has written its own answer, so the check is deterministic rather than a race.
+
+    def test_concurrent_install_keeps_each_step_output_its_own(self):
+        labels = {"marketplace": ("marketplace ryan: already added", "marketplace ryan: add failed:"),
+                  "install": ("plugin harness@ryan: already installed", "plugin harness@ryan: install failed:")}
+        for step in ("marketplace", "install"):
+            for outcome in ("already", "fails"):
+                with self.subTest(step=step, outcome=outcome):
+                    case = os.path.join(self.tmp, f"{step}-{outcome}")
+                    home, state, nested = (os.path.join(case, n) for n in ("home", "state", "nested"))
+                    for folder in (home, state, nested):
+                        os.makedirs(folder)
+                    own = dict(HOME=home, CLAUDE_STATE=state, CLAUDE_LOG=os.path.join(case, "claude.log"),
+                               LAUNCHCTL_LOG=os.path.join(case, "launchctl.log"))
+                    if outcome == "already":                                # a first install, alone
+                        p = self.install(**own)
+                        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    message = f"error: {step} refused ({os.urandom(6).hex()})"
+                    extra = dict(own, CLAUDE_NESTED=nested, CLAUDE_NESTED_STEP=step, CLAUDE_INSTALL=INSTALL)
+                    if outcome == "fails":
+                        extra.update(CLAUDE_FAIL_STEP=step, CLAUDE_FAIL_MESSAGE=message)
+                    p = self.install(**extra)
+                    out = p.stdout + p.stderr
+
+                    # The second install ran inside the step, alone and to a clean finish.
+                    with open(os.path.join(nested, "rc"), encoding="utf-8") as fh:
+                        self.assertEqual(fh.read(), "0", out)
+                    with open(os.path.join(nested, "out.txt"), encoding="utf-8") as fh:
+                        nested_out = fh.read()
+                    self.assertIn(f"marketplace ryan: added from {REPO}", nested_out)
+                    self.assertIn("plugin harness@ryan: installed (user scope)", nested_out)
+
+                    # The first install judged its step by its own output, not the second one's.
+                    already, failed = labels[step]
+                    if outcome == "already":
+                        self.assertEqual(p.returncode, 0, out)
+                        self.assertIn(already, p.stdout)
+                        self.assertNotIn("failed:", p.stdout)
+                        self.assertIn("plugin harness@ryan: already installed", p.stdout)
+                    else:
+                        self.assertEqual(p.returncode, 1, out)
+                        lines = p.stdout.splitlines()
+                        self.assertIn(failed, lines, out)
+                        self.assertEqual(lines[lines.index(failed) + 1:], [message], out)
+                        self.assertNotIn(already, p.stdout)
+                        steps = [a[:2] for a in self.lines(own["CLAUDE_LOG"]) if a[:1] == ["plugin"]]
+                        self.assertEqual(steps[-1], ["plugin", step], "the install went on past its failed step")
 
 
 if __name__ == "__main__":
