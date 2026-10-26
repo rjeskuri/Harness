@@ -484,6 +484,74 @@ class SettingTests(unittest.TestCase):
         self.assertEqual(self.value("env", tracked), "env")
 
 
+class ProjectSettingTests(unittest.TestCase):
+    """Ticket #205: a session started in another project carries that project's settings in its
+    environment; other_project tells it apart from this repository's own sessions, and then
+    project_setting reads the settings files alone (setting_from)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.lib = load_settings()
+
+    def setUp(self) -> None:
+        self.name = "HARNESS_T205_" + uuid.uuid4().hex[:10].upper()
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="harness-project-setting-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.git_env = dict(os.environ, **GIT_IDENTITY)
+
+    def git(self, cwd: str, *args: str) -> None:
+        subprocess.run(["git", "-C", cwd, *args], env=self.git_env, check=True, capture_output=True)
+
+    def repository(self, name: str) -> str:
+        path = os.path.join(self.tmp, name)
+        os.makedirs(path)
+        self.git(path, "init", "-q")
+        self.git(path, "commit", "-q", "--allow-empty", "-m", "init")
+        return path
+
+    def foreign(self, project, main: str) -> bool:
+        """other_project(main) with CLAUDE_PROJECT_DIR set to `project` (None: unset)."""
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": project or ""}):
+            if project is None:
+                del os.environ["CLAUDE_PROJECT_DIR"]
+            return self.lib.other_project(main)
+
+    def test_setting_from_reads_the_file_alone(self):
+        with mock.patch.dict(os.environ, {self.name: "from env"}):
+            self.assertEqual(self.lib.setting_from(self.name, {self.name: " from file "}), "from file")
+            self.assertIsNone(self.lib.setting_from(self.name, {}))
+            self.assertIsNone(self.lib.setting_from(self.name, {self.name: True}))
+            self.assertEqual(self.lib.setting_from(self.name, {self.name: 30}), "30")
+
+    def test_this_repositorys_own_sessions_are_not_another_projects(self):
+        main = self.repository("main")
+        wt = os.path.join(self.tmp, "wt")
+        self.git(main, "worktree", "add", "-q", wt, "-b", "t/1-x")
+        os.makedirs(os.path.join(main, "sub"))
+        link = os.path.join(self.tmp, "link")
+        os.symlink(main, link)
+        for name, project in (("unset", None), ("blank", "  "), ("main", main), ("symlink", link),
+                              ("subdirectory", os.path.join(main, "sub")), ("worktree", wt)):
+            with self.subTest(name):
+                self.assertFalse(self.foreign(project, main))
+
+    def test_another_repository_or_no_repository_is_another_project(self):
+        main = self.repository("main")
+        other = self.repository("OkinawaDream")
+        plain = os.path.join(self.tmp, "notes")
+        os.makedirs(plain)
+        for name, project in (("another repository", other), ("no repository", plain), ("the parent", self.tmp),
+                              ("missing", os.path.join(self.tmp, "gone"))):
+            with self.subTest(name):
+                self.assertTrue(self.foreign(project, main))
+
+    def test_project_setting(self):
+        with mock.patch.dict(os.environ, {self.name: "from env"}):
+            self.assertEqual(self.lib.project_setting(self.name, {self.name: "from file"}, False), "from env")
+            self.assertEqual(self.lib.project_setting(self.name, {self.name: "from file"}, True), "from file")
+            self.assertIsNone(self.lib.project_setting(self.name, {}, True))
+
+
 class PatternsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

@@ -1570,6 +1570,28 @@ class RedHelpers(unittest.TestCase):
             self.assertEqual(self.red.setting("HARNESS_TEST_CMD", file_env), "from env")
             self.assertEqual(self.red.test_timeout(file_env), 300.0)
 
+    def test_cannot_start_is_the_runners_own_complaint_alone(self):
+        # Ticket #205: npm's lines alone, or the interpreter's one line, mean the runner never started. A test that
+        # itself runs npm or python3 and fails quotes those lines among its own output: that run is still red.
+        npm = ("npm error code ENOENT\nnpm error enoent Could not read package.json: Error: ENOENT: no such file "
+               "or directory, open '/w/package.json'\nnpm error A complete log of this run can be found in: /l\n")
+        npm_old = "npm WARN config x\nnpm ERR! enoent ENOENT: no such file or directory, open '/w/package.json'\n\n"
+        script = 'npm error Missing script: "test"\nnpm error\nnpm error To see a list of scripts, run:\n'
+        module = "/usr/bin/python3: No module named nosuchrunner\n"
+        for output, want in [(npm, "npm error enoent Could not read package.json"), (npm_old, "npm ERR! enoent ENOENT"),
+                             (script, 'npm error Missing script: "test"'), (module, module.strip()),
+                             ("python3: can't open file '/x/r.py': [Errno 2] No such file or directory\n",
+                              "python3: can't open file '/x/r.py'")]:
+            with self.subTest(want=want):
+                self.assertTrue((self.red.cannot_start(output) or "").startswith(want), output)
+        quoted = [f"FAIL: test_npm (test_x.T)\nAssertionError: 0 != 1 : red (error)\n{npm}\nFAILED (failures=1)\n",
+                  f"Traceback (most recent call last):\n{module}AssertionError: refused\n",
+                  "ModuleNotFoundError: No module named 'slugify_text'\n",
+                  "npm error code E401\nnpm error Unable to authenticate\n", ""]
+        for output in quoted:
+            with self.subTest(output=output[:40]):
+                self.assertIsNone(self.red.cannot_start(output))
+
     def test_runs_that_prove_nothing(self):
         cases = [
             (5, "", "no tests ran"), (5, PYTEST_NONE, "no tests ran"), (1, UNITTEST_NONE, "no tests ran"),
