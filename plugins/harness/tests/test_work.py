@@ -4756,34 +4756,276 @@ def sentences_of(text):
     return [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
 
-def findings_rule_problems(para):
-    """What the first paragraph (lower-cased) gets wrong about review findings; [] when it says that every finding
-    on the ticket's files is fixed before `harness-pr ready` whatever its severity, that only a finding outside them
-    becomes a new ticket, and that the PR body names it and says why."""
+# Ticket #259: the severity rule. High and medium findings on the ticket's files block `harness-pr ready` and get fix
+# rounds; low findings go into the PR notes with no fix round; only high or medium findings outside the ticket's files
+# become new tickets. `risk:high` and `risk:low` are labels, not severities.
+SEV_HIGH = re.compile(r"(?<![:\w])high\b")
+SEV_MEDIUM = re.compile(r"(?<![:\w])medium\b")
+SEV_LOW = re.compile(r"(?<![:\w])low\b")
+FIX_WORD = re.compile(r"\bfix(?:e[ds]|ing)?\b|\bblock(?:s|ed|ing)?\b")
+ANY_SEVERITY = re.compile(r"\b(?:whatever|regardless of|irrespective of)\s+(?:its|their|the)?\s*severit"
+                          r"|\b(?:any|every|all)\s+severit")
+OUTSIDE = re.compile(r"\b(?:outside|out of scope|out-of-scope|beyond|other files|off (?:the|those|its) files"
+                     r"|not (?:on|in) (?:the |those )?(?:ticket's )?files)\b")
+NEW_TICKET = re.compile(r"\b(?:new|follow-up|separate) (?:tickets?|issues?|tasks?)\b|task create")
+
+
+def clauses_of(text):
+    """`text` split at sentence ends, semicolons and newlines: the unit a severity rule is stated in."""
+    return [c.strip() for c in re.split(r"(?<=[.!?;])\s+|;|\n", text) if c.strip()]
+
+
+def denied(text, at):
+    """negated(), or the word follows 'instead of', 'rather than', 'but not' or 'and not' in its clause."""
+    if negated(text, at):
+        return True
+    before = CLAUSE_END.split(text[:at])[-1]
+    return bool(re.search(r"\b(?:instead of|rather than|but not|and not)\s+(?:[a-z'`#-]+\s+){0,3}$", before))
+
+
+def affirmed_matches(pattern, text):
+    return [m for m in pattern.finditer(text) if not denied(text, m.start())]
+
+
+def names_high_and_medium(text):
+    return bool(SEV_HIGH.search(text) and SEV_MEDIUM.search(text))
+
+
+def low_clause_problems(clauses):
+    """What the clauses about low findings get wrong: a clause naming 'low' (and not high and medium, which is the
+    blocking rule's own clause) that says, not negated, that it is fixed, blocks, gets a fix round or becomes a new
+    ticket; checked from that clause to the end of its sentence, so 'it gets a fix round too' after it counts."""
     problems = []
-    sentences = sentences_of(para)
-
-    def fixes_all(s):
-        fixed = [m for m in re.finditer(r"\bfix(?:e[ds])?\b|\bfixing\b", s) if not negated(s, m.start())]
-        return (re.search(r"\bfindings?\b", s) and fixed
-                and re.search(r"\b(?:whatever|regardless of|of any|any|every|all)\b(?:\s+[a-z']+){0,2}\s+severit", s)
-                and re.search(r"\b(?:files?|touch\w*|chang\w*|diff)\b", s)
-                and re.search(r"\bbefore\b[^.!?]*harness-pr ready|harness-pr ready[^.!?]*\bafter\b", s))
-    if not any(fixes_all(s) for s in sentences):
-        problems.append("no sentence: every finding on the ticket's files is fixed before harness-pr ready, "
-                        "whatever its severity")
-    outside = [i for i, s in enumerate(sentences)
-               if re.search(r"\b(?:outside|out of scope|beyond|other files|not (?:on|in) the (?:ticket's )?files)\b", s)
-               and re.search(r"\b(?:new|follow-up|separate) (?:ticket|issue)\b", s)
-               and re.search(r"\b(?:only|except|exception)\b", s)]
-    if not outside:
-        problems.append("no sentence: only a finding outside the ticket's files becomes a new ticket")
-
-    def names_why(s):
-        return re.search(r"\b(?:pr|pull request) (?:body|description)\b", s) and re.search(r"\b(?:why|reasons?)\b", s)
-    if not any(names_why(s) for i in outside for s in sentences[i:i + 2]):
-        problems.append("no sentence: the PR body names the out-of-scope finding and says why")
+    for i, c in enumerate(clauses):
+        if not SEV_LOW.search(c) or names_high_and_medium(c):
+            continue
+        run = [c]
+        for nxt in clauses[i + 1:]:
+            if re.search(r"[.!?]$", run[-1]) or names_high_and_medium(nxt):
+                break
+            run.append(nxt)
+        for part in run:
+            if affirmed_matches(FIX_WORD, part):
+                problems.append(f"a low finding is fixed, blocks or gets a fix round: {part}")
+            if affirmed_matches(NEW_TICKET, part):
+                problems.append(f"a low finding becomes a new ticket: {part}")
     return problems
+
+
+# Breaker round 1 (#259): words that widen a fix past the high and medium findings without naming "low".
+LEAK = re.compile(r"\b(?:remainder|the rest|as well|too|all of them|every entry|everything|the others"
+                  r"|any other findings?|other findings)\b")
+NOTES = re.compile(r"\bnotes?\b|### low findings")
+NOTE_VERB = re.compile(r"\b(?:go(?:es)?|are|is|stays?|land\w*|written|listed|kept|recorded|noted|put)\b")
+FIXER = re.compile(r"\bfix(?:e[ds]|ing)?\b|\bblock(?:s|ed|ing)?\b|\bcoder\b")
+
+
+def fix_leak_problems(text):
+    """What a lower-cased text gets wrong by widening a fix past the high and medium findings: a clause (split at
+    sentence ends and semicolons) that says, not negated, fix, block or coder must not also carry a word such as
+    'the rest', 'as well', 'too', 'all of them' or 'every entry', and names the notes (or `### Low findings`) only
+    in a comma piece of its own that says where something goes and fixes nothing ("low ones go to the notes")."""
+    problems = []
+    for c in clauses_of(text):
+        if not affirmed_matches(FIXER, c):
+            continue
+        for m in affirmed_matches(LEAK, c):
+            problems.append(f"a fix reaches past high and medium ({m.group(0)!r}): {c}")
+        if NOTES.search(c):
+            pieces = re.split(r",|:(?=\s)|\(|\)|—", c)
+            if not any(NOTES.search(p) and NOTE_VERB.search(p) and not affirmed_matches(FIXER, p)
+                       and not re.match(r"\s*(?:and|then|plus)\b", p) for p in pieces):
+                problems.append(f"a fix reaches the notes file: {c}")
+    return problems
+
+
+def fixes_high_and_medium_only(text):
+    """The clauses of a lower-cased text where something fixes findings ("fixes", "fixing"), each with True when it
+    names high and medium findings as what is fixed and adds nothing after them."""
+    out = []
+    for c in clauses_of(text):
+        for m in affirmed_matches(re.compile(r"\bfix(?:es|ing)\b"), c):
+            rest = c[m.end():]
+            ok = (names_high_and_medium(c[:m.start()] + rest)
+                  and not re.search(r"\b(?:then|plus|also)\b|\band (?:the|every|all|each|any)\b", rest)
+                  and not LEAK.search(rest) and not affirmed_matches(SEV_LOW, rest))
+            out.append((c, ok))
+    return out
+
+
+# Breaker round 1 (#259): the breaker's scope. "Only" tied to risk:high in the running sense, and no clause that
+# runs it on every ticket.
+RISK_HIGH_ONLY = re.compile(r"\bonly (?:on|for|when|in|with) (?:an? |the )?`?risk:high\b"
+                            r"|`?risk:high`?(?: tickets?)?,? only\b"
+                            r"|\bonly (?:an? |the )?`?risk:high`?(?: tickets?)? (?:runs?|gets?|has|uses?)\b")
+EVERY_TICKET = re.compile(r"\b(?:every|all|any|each)\s+(?:other\s+)?tickets?\b|\bevery other one\b"
+                          r"|\b(?:other|remaining|lower-risk)\s+tickets?\b|\bthe others\b|\bthe rest\b")
+WIDENS = re.compile(r"\b(?:also|as well|too|included|including|runs? it|run it|runs? the breaker|before step 4)\b"
+                    r"|risk:high`? included|including `?risk:high")
+GOES_ON = re.compile(r"\bskip\w*|\bfrom step 2 (?:straight )?to step 4\b|\bgoes (?:straight |on )?to step 4\b"
+                     r"|\bgo (?:straight |on )?to step 4\b|\bnever runs?\b|\bdoes not run\b|\bwithout (?:the )?breaker\b")
+
+
+def breaker_scope_problems(text):
+    """What a lower-cased text gets wrong about the breaker running only on risk:high: [] when a clause ties 'only' to
+    risk:high in the running sense, and every clause naming every (other) ticket sends it past the breaker."""
+    problems = []
+    parts = clauses_of(text)
+    pieces = [p for c in parts for p in re.split(r":(?=\s)|[,()]", c) if p.strip()]       # risk:high stays whole
+    if not any(RISK_HIGH_ONLY.search(p) and not NOT_ONLY.search(p) and not EVERY_TICKET.search(p)
+               and not negated(p, RISK_HIGH_ONLY.search(p).start()) for p in pieces):
+        problems.append("no clause: the breaker runs only on a risk:high ticket")
+    for c in parts:
+        if NOT_ONLY.search(c) and "risk:high" in c:
+            problems.append(f"'not only' risk:high: {c}")
+        if re.search(r"risk:high`? included|including `?risk:high", c):
+            problems.append(f"risk:high included: {c}")
+    for p in pieces:
+        if EVERY_TICKET.search(p) and (not GOES_ON.search(p) or affirmed_matches(WIDENS, p)):
+            problems.append(f"every ticket runs the breaker: {p}")
+    return problems
+
+
+# Breaker round 2 (#259, Ryan's choice b): a positive check instead of more blocked words. In the breaker's
+# sections every clause that runs or uses the breaker (or this step) names risk:high as its scope; in the findings
+# sections every clause with a work verb (fix, resolve, address, correct, handle, repair, deal with, or a hand-off
+# to the coder or the fix file) names high and medium findings as its object. "Fix round", "fix file", `#N fix` and
+# `attempt N fix` are names, not work verbs. Clauses that say a ticket skips the breaker or that low findings go to
+# the notes carry no work verb, so they need no exception.
+WORK_NOUNS = re.compile(r"`?#n fix`?|attempt\s+\S+\s+fix\b|\bfix\s+(?:rounds?|file|pass|stage)\b|stage `?fix`?")
+WORK_VERB = re.compile(r"\b(?:fix(?:e[ds]|ing)?|resolv\w*|address(?:es|ed|ing)?|correct(?:s|ed|ing)?|handl\w*"
+                       r"|repair\w*|clean(?:s|ed|ing)? up|deal(?:s|t|ing)? with|tackl\w*|work(?:s|ed|ing)? (?:on|off))\b"
+                       r"|\b(?:go(?:es)?|went|gone|sent|send|sends|hand(?:s|ed)?|pass(?:es|ed)?|return(?:s|ed)?)\s+"
+                       r"(?:\w+\s+){0,3}?(?:back\s+)?to\s+(?:the\s+)?(?:coder|`?<?findings\.json|fix file)"
+                       r"|\bcoder\b[^;]*\b(?:gets?|takes?|receives?|picks? up)\b")
+RUN_VERB = re.compile(r"\b(?:runs?|ran|running|re-?runs?|use[sd]?|using|appl(?:y|ies|ied)|launch\w*|invok\w*)\b")
+RUN_TARGET = re.compile(r"\bit\b|\bbreaker\b|\bthis step\b|\bstep 3\b|\badversary\b|\btickets?\b|risk:\w+|\blabels?\b")
+WIDE = re.compile(r"\b(?:others?|the rest|remaining|everywhere|always|otherwise|every|all|any|each)\b"
+                  r"|\bsame way\b|\blikewise\b|\bsimilarly\b")
+SAME = re.compile(r"\bthe same way\b|\blikewise\b|\bsimilarly\b|\bas well\b|\balso\b|\btoo\b(?!\s+narrow)")
+LABELS_BELOW_HIGH = re.compile(r"risk:(?:low|medium)\b")
+MINOR = re.compile(r"\b(?:minor|trivial|nits?|nitpicks?|cosmetic|small(?:er)? ones?)\b")
+
+
+def work_scope_problems(text, kind):
+    """What a lower-cased section gets wrong under the positive check; `kind` is "breaker" (step 3, principle 2,
+    the loop's test-breaker entry, the Agents test-breaker row) or "findings" (steps 5, 6, 9, the checklist item,
+    the loop's coder, fix and ready entries, the Agents reviewer row)."""
+    problems = []
+    if LABELS_BELOW_HIGH.search(text):
+        problems.append(f"names risk:low or risk:medium: {text}")
+    if kind == "findings" and MINOR.search(text):
+        problems.append(f"names minor or trivial findings: {text}")
+    for c in clauses_of(text):
+        if kind == "findings":
+            bare = WORK_NOUNS.sub(" ", c)
+            if affirmed_matches(WORK_VERB, bare) and not names_high_and_medium(bare):
+                problems.append(f"a work clause does not name high and medium findings as its object: {c}")
+            continue
+        for piece in [p for p in re.split(r":(?=\s)|[,()]", c) if p.strip()] or [c]:
+            if SAME.search(piece):
+                problems.append(f"widens the breaker's scope: {piece}")
+        runs = affirmed_matches(RUN_VERB, c)
+        if not runs or not RUN_TARGET.search(c):
+            continue
+        scoped = [m for m in re.finditer(r"risk:high", c) if not negated(c, m.start())]
+        rerun = (re.search(r"\b(?:again|second|tightened|re-?runs?)\b", c)
+                 and not re.search(r"\btickets?\b|risk:|\blabels?\b", c))
+        if not (scoped or rerun) or WIDE.search(c):
+            problems.append(f"a run clause does not scope the breaker to risk:high: {c}")
+    return problems
+
+
+def findings_rule_problems(para, ready=True):
+    """What a lower-cased statement of the findings rule gets wrong; [] when it says that every high and medium
+    finding on the ticket's files is fixed (with `ready`: before `harness-pr ready`, or it blocks it), that low
+    findings go into the PR notes with no fix round, and that only a high or medium finding outside the ticket's
+    files becomes a new ticket, which the PR body names with the reason."""
+    problems = []
+    clauses = clauses_of(para)
+    for c in clauses:
+        if re.search(r"\bfindings?\b", c) and ANY_SEVERITY.search(c) and affirmed_matches(FIX_WORD, c):
+            problems.append(f"findings are fixed whatever their severity: {c}")
+
+    def blocking(c):
+        return (names_high_and_medium(c) and re.search(r"\bfindings?\b", c) and affirmed_matches(FIX_WORD, c)
+                and re.search(r"\b(?:files?|touch\w*|chang\w*|diff)\b", c) and not OUTSIDE.search(c)
+                and (not ready or re.search(r"\b(?:before|until)\b[^;]*harness-pr ready"
+                                            r"|harness-pr ready[^;]*\b(?:after|until|once)\b"
+                                            r"|\b(?:block\w*|refus\w*)\b[^;]*harness-pr ready", c)))
+    rules = [c for c in clauses if blocking(c)]
+    if not rules:
+        problems.append("no clause: every high and medium finding on the ticket's files is fixed"
+                        + (" before harness-pr ready" if ready else ""))
+    for c in rules:
+        if affirmed_matches(SEV_LOW, c):
+            problems.append(f"the blocking rule takes low findings too: {c}")
+    if not any(SEV_LOW.search(c) and re.search(r"\bnotes?\b", c)
+               and any(denied(c, m.start()) for m in FIX_WORD.finditer(c)) for c in clauses):
+        problems.append("no clause: a low finding goes into the PR notes with no fix round")
+    problems += low_clause_problems(clauses)
+    outside = [i for i, c in enumerate(clauses)
+               if OUTSIDE.search(c) and affirmed_matches(NEW_TICKET, c)
+               and (not ready or re.search(r"\b(?:only|except\w*)\b", c))]
+    if not outside:
+        problems.append("no clause: only a finding outside the ticket's files becomes a new ticket")
+    elif not any(names_high_and_medium(clauses[i]) for i in outside):
+        problems.append("the out-of-scope rule does not say only high and medium findings become new tickets")
+
+    def names_why(c):
+        return re.search(r"\b(?:pr|pull request) (?:body|description)\b", c) and re.search(r"\b(?:why|reasons?)\b", c)
+    if not any(names_why(c) for i in outside for c in clauses[i:i + 3]):
+        problems.append("no clause: the PR body names the out-of-scope finding and says why")
+    return problems
+
+
+DESIGN = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "docs", "design.md")
+
+
+def read_design():
+    with open(DESIGN, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def design_loop_lines(text):
+    """(the lines of the code block under `### The work loop`, the lines after its closing fence)."""
+    lines = text.splitlines()
+    head = next((i for i, ln in enumerate(lines) if re.match(r"^###\s+The work loop\b", ln)), None)
+    if head is None:
+        return [], []
+    opening = next((i for i in range(head + 1, len(lines)) if lines[i].startswith("```")), None)
+    if opening is None:
+        return [], []
+    closing = next((i for i in range(opening + 1, len(lines)) if lines[i].startswith("```")), len(lines))
+    return lines[opening + 1:closing], lines[closing + 1:]
+
+
+def design_loop_entries(text):
+    """The work loop block's entries: a line starting at column 0 and the indented lines that continue it, joined."""
+    entries = []
+    for ln in design_loop_lines(text)[0]:
+        if ln[:1].isspace() and entries:
+            entries[-1] += " " + ln.strip()
+        elif ln.strip():
+            entries.append(ln.strip())
+    return entries
+
+
+def design_loop_paragraph(text):
+    """The first paragraph after the work loop block that names findings."""
+    rest = "\n".join(design_loop_lines(text)[1]).split("\n#", 1)[0]
+    return next((p.strip() for p in re.split(r"\n\s*\n", rest) if re.search(r"(?i)\bfindings?\b", p)), "")
+
+
+def agents_table_jobs(text):
+    """{agent: its Job cell} from the `## Agents` table."""
+    jobs = {}
+    for ln in md_section(text, "Agents").splitlines():
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        m = re.match(r"^`([\w-]+)`$", cells[0]) if cells else None
+        if m and len(cells) >= 4:
+            jobs[m.group(1)] = cells[3]
+    return jobs
 
 
 def foreground_stance(text):
@@ -5211,13 +5453,242 @@ class WorkSkill(unittest.TestCase):
         self.assertRegex(front, r"(?m)^description: .*\bticket\b.*\bdispatch\b")
         self.assertIn("/harness:work", front)
 
-    def test_the_first_paragraph_says_every_finding_on_the_tickets_files_is_fixed_before_ready(self):
-        # The owner's scope addition (11:59): in the same first paragraph, every review finding on the files the
-        # ticket touched is fixed before `harness-pr ready`, whatever its severity; only a finding outside the
-        # ticket's files becomes a new ticket, and the PR body names it and says why.
+    def test_the_first_paragraph_states_the_blocking_severities_and_where_low_findings_go(self):
+        # Ticket #259: in the same first paragraph, every high or medium finding on the files the ticket touched is
+        # fixed before `harness-pr ready`; a low finding goes into the PR notes with no fix round; only a high or
+        # medium finding outside the ticket's files becomes a new ticket, and the PR body names it and says why. The
+        # checker is proven on right and wrong text in SkillWording.
         para = first_paragraph()
         self.assertEqual(findings_rule_problems(para), [], para)
         self.assertEqual(first_paragraph_problems(para), [], para)          # and the one-turn rule still holds
+        self.assertEqual(permissive_words(para), [], para)
+
+    def test_the_breaker_step_runs_only_on_risk_high_with_two_rounds_then_needs_input(self):
+        # Ticket #259: step 3 runs only on a risk:high ticket; every other ticket goes from step 2 to step 4. On
+        # `cheat passed` the author tightens the tests (step 2 again, `harness-red check` included) and the breaker
+        # runs again; `harness-work attempt N breaker fail` answers retry, then needs-input; a cheat still passing
+        # the second round ends the turn with needs-input and never continues.
+        steps = self.loop_steps()
+        step = steps[3]
+        low = step.lower()
+        parts = clauses_of(low)
+        self.assertRegex(step, r"^3[.)]\s+\*\*Break\*\*", step)
+        self.assertIn("harness:test-breaker", step)
+        self.assertIn("harness-red scratch create", step)
+        # Only on risk:high, said as a rule ("runs only on a risk:high ticket"), not "not only"; no clause runs it on
+        # every ticket, every other ticket, also or as well.
+        self.assertEqual(breaker_scope_problems(low), [], step)
+        # Round 2: every clause that runs the breaker scopes it to risk:high (or is the re-run on tightened tests),
+        # and no lower label, "the same way" or "as well" widens it.
+        self.assertEqual(work_scope_problems(low, "breaker"), [], step)
+        # Every other ticket goes past it to step 4: a direction (skips, goes from step 2 to step 4), not a mention.
+        self.assertTrue(any(re.search(r"\bstep 4\b", c) and GOES_ON.search(c) and not affirmed_matches(WIDENS, c)
+                            and re.search(r"\b(?:every other|any other|other tickets?|otherwise|not `?risk:high"
+                                          r"|without `?risk:high)\b", c)
+                            for c in parts), f"step 3 does not send every other ticket past it to step 4:\n{step}")
+        # cheat passed: the author tightens (step 2 again with the red check), then the breaker runs again.
+        self.assertIn("cheat passed", low, step)
+        cheat_at = low.index("cheat passed")
+        after = low[cheat_at:]
+        self.assertRegex(after, r"\b(?:test-)?author\b", step)
+        self.assertRegex(after, r"\bstep 2\b", step)
+        self.assertIn("harness-red check", after, step)
+        self.assertRegex(after, r"\bbreaker\b[^.;]*\b(?:again|a second time|re-?runs?)\b"
+                                r"|\b(?:again|re-?runs?)\b[^.;]*\bbreaker\b", step)
+        # The attempt record: breaker fail answers retry the first time, needs-input the second.
+        attempt = re.search(r"harness-work attempt\s+\S+\s+breaker\b[^`]*\bfail\b", step)
+        self.assertTrue(attempt, f"step 3 does not record `harness-work attempt N breaker fail`:\n{step}")
+        rest = low[attempt.start():]
+        self.assertRegex(rest, r"\bretry\b", step)
+        self.assertRegex(rest, r"needs-input", step)
+        self.assertLess(re.search(r"\bretry\b", rest).start(), rest.index("needs-input"), step)
+        # At most two rounds, and the second round's pass ends the turn with needs-input.
+        self.assertRegex(low, r"\b(?:at most|max(?:imum)?(?: of)?)\s+(?:two|2)\s+(?:breaker\s+)?rounds?\b"
+                              r"|\bsecond round\b", step)
+        second = [c for c in parts if re.search(r"\bsecond\b|\b(?:two|2) rounds?\b", c)]
+        self.assertTrue(any("needs-input" in c and re.search(r"\b(?:pass\w*|cheat)\b", c) for c in second),
+                        f"no clause says a cheat passing the second round is needs-input:\n{step}")
+        self.assertTrue(any("needs-input" in c and re.search(r"\b(?:stop\w*|ends?|ending)\b|paragraph after the steps",
+                                                            c) for c in parts),
+                        f"step 3 does not end the turn at needs-input:\n{step}")
+        for c in second:
+            with self.subTest(clause=c):
+                self.assertEqual(affirmed_matches(re.compile(r"\bcontinu\w*|\bmov(?:e|es|ing) on\b|\bproceed\w*"
+                                                             r"|\bgo(?:es)? on\b|\bcarr(?:y|ies) on\b"), c), [],
+                                 f"the second round still continues: {c}")
+        # The no-tests sentence still names the breaker, and the next steps keep their agents.
+        self.assertIn("harness:coder", steps[4])
+        self.assertIn("harness:reviewer", steps[5])
+
+    def test_no_sentence_outside_ultrareview_fixes_findings_whatever_their_severity(self):
+        # Ticket #259: outside step 8 (ultrareview, unchanged), nothing in the skill or design.md says review
+        # findings are fixed (or sent to the fix file or the coder, or block ready) whatever their severity.
+        steps = self.loop_steps()
+        self.assertIn(8, steps)
+        self.assertRegex(steps[8].lower(), r"\bultrareview\b|harness-pr ultra", steps[8])
+        body = skill_body().replace(steps[8], "")
+        design = read_design()
+        bad = re.compile(r"\bfix\w*|\bcoder\b|findings\.json|\bblock\w*|before `?harness-pr ready")
+
+        def offending(text, excuse=None):
+            out = []
+            for c in clauses_of(text.lower()):
+                if excuse and excuse.search(c):
+                    continue
+                if re.search(r"\bfindings?\b", c) and ANY_SEVERITY.search(c) and affirmed_matches(bad, c):
+                    out.append(c)
+            return out
+        self.assertEqual(offending(body), [], "the skill, step 8 left out")
+        self.assertEqual(offending(design, re.compile(r"\bultra")), [], "design.md, ultrareview left out")
+        # The check itself sees the old wording.
+        self.assertTrue(offending("every review finding on the files the ticket touched is fixed before "
+                                  "`harness-pr ready`, whatever its severity."))
+        self.assertTrue(offending("the findings on them go to `<findings.json>`, whatever their severity."))
+        self.assertEqual(offending("`harness-pr review` posts every finding, whatever its severity."), [])
+
+    def findings_steps(self):
+        steps = self.loop_steps()
+        for n in (5, 6, 9):
+            self.assertIn(n, steps)
+        return steps
+
+    def test_the_review_and_fix_steps_block_on_high_and_medium_and_send_low_to_the_notes(self):
+        # Ticket #259, steps 5 and 6: the fix file gets the high and medium findings on the ticket's files; the
+        # notes file gets the low ones, on or off those files, under `### Low findings`, and they are still posted
+        # with the review; high or medium findings outside the files become new tickets; a fix round runs only for
+        # high or medium findings, and `fix pass` means the re-check found no high or medium finding on the files.
+        steps = self.findings_steps()
+        self.assertRegex(steps[5], r"^5[.)]\s+\*\*Review\*\*", steps[5])
+        self.assertIn("--stage review --json", steps[5])
+        text = (steps[5] + "\n" + steps[6]).lower()
+        parts = clauses_of(text)
+        self.assertIn("### low findings", text, "steps 5-6 do not name the `### Low findings` heading")
+        self.assertTrue(any(names_high_and_medium(c) and re.search(r"findings\.json|fix file|\bcoder\b|fix round", c)
+                            and not affirmed_matches(SEV_LOW, c) and not OUTSIDE.search(c) for c in parts),
+                        "no clause sends the high and medium findings on the ticket's files to the fix")
+        self.assertTrue(any(SEV_LOW.search(c) and re.search(r"\bnotes?\b", c) for c in parts),
+                        "no clause puts the low findings in the notes file")
+        self.assertTrue(any(SEV_LOW.search(c) and affirmed_matches(re.compile(r"\bpost\w*|harness-pr review"), c)
+                            for c in parts), "no clause says the low findings are still posted with the review")
+        self.assertEqual(low_clause_problems(parts), [])
+        self.assertTrue(any(OUTSIDE.search(c) and affirmed_matches(NEW_TICKET, c) and names_high_and_medium(c)
+                            for c in parts), "no clause makes the high and medium findings outside new tickets")
+        self.assertFalse([c for c in parts if OUTSIDE.search(c) and affirmed_matches(NEW_TICKET, c)
+                          and re.search(r"\b(?:becom\w*|go(?:es)? to|turns? into)\s+(?:a\s+)?(?:new|follow-up|separate)"
+                                        r"\s+(?:tickets?|issues?|tasks?)", c)
+                          and not names_high_and_medium(c) and not SEV_LOW.search(c)],
+                         "a clause makes every finding outside the files a new ticket")
+        # A fix round runs only for high or medium findings (or: low findings alone get none).
+        self.assertTrue(any(re.search(r"\bfix rounds?\b", c) and (
+            (names_high_and_medium(c) and re.search(r"\bonly\b", c))
+            or (SEV_LOW.search(c) and any(denied(c, m.start()) for m in re.finditer(r"\bfix rounds?\b", c))))
+            for c in parts), "no clause says a fix round runs only for high or medium findings")
+        # Nothing widens the fix past high and medium without saying "low": no "the rest", "as well", "too", "every
+        # entry in the notes file"; the coder's fix names high and medium as its object and adds nothing after it.
+        self.assertEqual(fix_leak_problems(text), [])
+        fixes = fixes_high_and_medium_only(text)
+        self.assertTrue(fixes, "no clause in steps 5-6 says the coder fixes the findings")
+        self.assertEqual([c for c, ok in fixes if not ok], [], "a fix clause does not fix only high and medium")
+        # Round 2: every clause with a work verb (fix, resolve, address, a hand-off to the coder) names high and
+        # medium findings as its object, in step 5 and in step 6, and neither names minor findings or lower labels.
+        for n in (5, 6):
+            with self.subTest(step=n):
+                self.assertEqual(work_scope_problems(steps[n].lower(), "findings"), [], steps[n])
+        # `fix pass` is defined by high and medium findings, never by "found nothing".
+        passes = [c for c in parts if re.search(r"re-?check", c) and re.search(r"\bpass\b`?\s+(?:when|means|if)\b", c)]
+        self.assertTrue(passes, "no clause says when the fix attempt passes")
+        for c in passes:
+            with self.subTest(clause=c):
+                self.assertTrue(names_high_and_medium(c), c)
+                self.assertNotRegex(c, r"\bfound nothing\b")
+
+    def test_the_ready_step_refuses_only_on_high_and_medium_findings(self):
+        # Ticket #259, step 9: `harness-pr ready` refuses while the latest harness review has high or medium
+        # findings and no commit after it; those go back to the coder.
+        step = self.findings_steps()[9]
+        low = step.lower()
+        self.assertIn("harness-pr ready", step)
+        refusing = [c for c in clauses_of(low) if re.search(r"\brefus\w*", c)]
+        self.assertTrue(any(names_high_and_medium(c) and not affirmed_matches(SEV_LOW, c) for c in refusing), step)
+        self.assertRegex(low, r"\bcoder\b", step)
+        # Nothing else goes to the coder: no low findings, and no "the rest", "as well" or "too".
+        self.assertEqual(low_clause_problems(clauses_of(low)), [], step)
+        self.assertEqual(fix_leak_problems(low), [], step)
+        self.assertEqual([c for c, ok in fixes_high_and_medium_only(low) if not ok], [], step)
+        self.assertEqual(work_scope_problems(low, "findings"), [], step)
+
+    def test_the_checklist_findings_item_says_high_and_medium_are_fixed_and_low_go_to_the_notes(self):
+        # Ticket #259: the closing checklist's Findings item says the same rule, with nothing left to choice.
+        prose, checklist = self.closing_section()
+        items = [i for i in checklist if re.match(r"\W*findings?\b", i)]
+        self.assertEqual(len(items), 1, checklist)
+        self.assertEqual(findings_rule_problems(items[0], ready=False), [], items[0])
+        self.assertEqual(permissive_words(items[0]), [], items[0])
+        self.assertEqual(work_scope_problems(items[0], "findings"), [], items[0])
+        self.assertEqual(fix_leak_problems(items[0]), [], items[0])
+
+    def test_the_design_doc_loop_runs_the_breaker_only_on_risk_high(self):
+        # Ticket #259, design.md: principle 2 runs the adversary on risk:high tickets; the work loop's test-breaker
+        # line runs it only on risk:high, sends a passed cheat back to the author and then to the breaker again, and
+        # makes a second pass needs-input; the coder fixes every high and medium posted finding; the fix attempt
+        # passes on no high or medium finding; ready refuses on high or medium; the paragraph after the loop states
+        # the severity rule; the Agents table's test-breaker and reviewer rows say the same.
+        text = read_design()
+        principle = next((ln for ln in md_section(text, "Principles").splitlines() if re.match(r"^2\.\s", ln)), "")
+        self.assertTrue(principle, "no principle 2")
+        p = principle.lower()
+        self.assertTrue(any(re.search(r"\b(?:adversary|breaker)\b", c) and RISK_HIGH_ONLY.search(c)
+                            for c in clauses_of(p)), principle)
+        self.assertEqual(breaker_scope_problems(p), [], principle)
+        entries = design_loop_entries(text)
+        breaker = [e for e in entries if e.startswith("test-breaker")]
+        self.assertEqual(len(breaker), 1, entries)
+        b = breaker[0].lower()
+        self.assertEqual(breaker_scope_problems(b), [], b)
+        self.assertRegex(b, r"\bauthor\b", b)
+        self.assertRegex(b, r"\bbreaker\b[^;]*\bagain\b|\bagain\b[^;]*\bbreaker\b", b)
+        self.assertRegex(b, r"\bsecond\b[^;]*needs-input|needs-input[^;]*\bsecond\b", b)
+        coder = [e.lower() for e in entries if e.startswith("coder") and "finding" in e]
+        self.assertTrue(coder, entries)
+        for e in coder:
+            with self.subTest(entry=e):
+                self.assertTrue(names_high_and_medium(e), e)
+                self.assertNotRegex(e, ANY_SEVERITY)
+                self.assertEqual(affirmed_matches(SEV_LOW, e), [], e)
+                self.assertEqual(fix_leak_problems(e), [], e)
+                fixes = fixes_high_and_medium_only(e)
+                self.assertTrue(fixes, e)
+                self.assertEqual([c for c, ok in fixes if not ok], [], e)
+        fix = [e.lower() for e in entries if e.startswith("harness-work attempt") and re.search(r"\bfix\b", e)]
+        self.assertTrue(fix, entries)
+        for e in fix:
+            with self.subTest(entry=e):
+                self.assertTrue(names_high_and_medium(e), e)
+                self.assertNotRegex(e, r"\bfound nothing\b")
+        ready = [e.lower() for e in entries if e.startswith("harness-pr ready")]
+        self.assertEqual(len(ready), 1, entries)
+        self.assertTrue(names_high_and_medium(ready[0]), ready[0])
+        para = design_loop_paragraph(text)
+        self.assertEqual(findings_rule_problems(para.lower()), [], para)
+        rows = agents_table_jobs(text)
+        self.assertIn("test-breaker", rows)
+        self.assertIn("reviewer", rows)
+        self.assertEqual(breaker_scope_problems(rows["test-breaker"].lower()), [], rows["test-breaker"])
+        reviewer = rows["reviewer"].lower()
+        self.assertTrue(names_high_and_medium(reviewer), rows["reviewer"])
+        self.assertNotRegex(reviewer, ANY_SEVERITY)
+        self.assertEqual(low_clause_problems(clauses_of(reviewer)), [], rows["reviewer"])
+        self.assertEqual(fix_leak_problems(reviewer), [], rows["reviewer"])
+        self.assertEqual([c for c, ok in fixes_high_and_medium_only(reviewer) if not ok], [], rows["reviewer"])
+        # Round 2, the positive check: the breaker's sections scope every run to risk:high and name no lower label;
+        # in the findings sections every work clause names high and medium findings as its object.
+        sections = [("principle 2", p, "breaker"), ("loop test-breaker", b, "breaker"),
+                    ("Agents test-breaker", rows["test-breaker"].lower(), "breaker"),
+                    ("Agents reviewer", reviewer, "findings")]
+        sections += [("loop " + e.split()[0], e, "findings") for e in coder + fix + ready]
+        for where, section, kind in sections:
+            with self.subTest(section=where):
+                self.assertEqual(work_scope_problems(section, kind), [], section)
 
 
 # The breaker's inverted skill: agents in the background, no waiting, the turn ends when it likes, the checks optional.
@@ -5538,36 +6009,232 @@ class SkillWording(unittest.TestCase):
                 self.assertNotEqual(first_paragraph_problems((para + " " + sentence).lower()), [])
                 self.assertNotEqual(closing_problems(lines + ["- " + sentence]), [])
 
-    def test_the_findings_rule_check_takes_any_wording_of_the_rule_and_rejects_a_weaker_one(self):
+    def test_the_findings_rule_check_takes_the_severity_rule_and_rejects_the_old_one(self):
+        # Ticket #259: the severity rule in the outline's words and in other wordings passes, with no permissive
+        # word needed; the old "whatever its severity" rule, a rule that blocks on low and one that sends low
+        # findings to a fix round all fail, as do rules missing a part.
         rules = [
-            "Every review finding on the files the ticket touched is fixed before `harness-pr ready`, whatever its "
-            "severity; only a finding outside the ticket's files becomes a new ticket, and the PR body names it and "
-            "says why.",
-            "Fix all review findings in the files this ticket changed before `harness-pr ready`, whatever their "
-            "severity. Only findings outside those files go to a new ticket. The PR body lists each one and the "
-            "reason.",
-            "`harness-pr ready` runs only after every finding on the touched files is fixed, regardless of severity. "
-            "A finding out of scope is the one exception: it becomes a new issue, and the pull request body names it "
-            "and says why it was left.",
+            "Every high or medium finding on the files the ticket touched is fixed before `harness-pr ready`; a low "
+            "finding goes into the PR notes for the owner, with no fix round; only a high or medium finding outside "
+            "the ticket's files becomes a new ticket, and the PR body names it and says why.",
+            "High and medium review findings on the ticket's files block `harness-pr ready` until they are fixed. "
+            "Low findings, on or off those files, go under `### Low findings` in the PR notes and never get a fix "
+            "round. Only high or medium findings outside the touched files become new tickets; the PR body lists "
+            "each and the reason.",
+            "`harness-pr ready` runs only after every high- and medium-severity finding on the touched files is "
+            "fixed. A low-severity finding is not fixed: it goes into the PR's notes for the owner. Only a high or "
+            "medium finding out of scope becomes a new issue, and the pull request body names it and says why it "
+            "was left.",
         ]
+        para = first_paragraph()
         for text in rules:
             with self.subTest(rule=text):
                 self.assertEqual(findings_rule_problems(text.lower()), [])
-        weaker = [
-            "Fix the high and medium review findings on the ticket's files before `harness-pr ready`; only a finding "
-            "outside the ticket's files becomes a new ticket, and the PR body names it and says why.",
-            "Fix all high-severity findings on the touched files before `harness-pr ready`. Only a finding outside "
-            "the ticket's files becomes a new ticket, and the PR body names it and says why.",
-            "Findings on the ticket's files need not be fixed before `harness-pr ready`, whatever their severity; "
-            "only a finding outside the ticket's files becomes a new ticket, and the PR body names it and says why.",
-            "Every review finding on the files the ticket touched is fixed before `harness-pr ready`, whatever its "
-            "severity, and any finding you would rather not fix becomes a new ticket.",
-            "Every review finding on the files the ticket touched is fixed before `harness-pr ready`, whatever its "
-            "severity; only a finding outside the ticket's files becomes a new ticket.",
+                self.assertEqual(permissive_words(text.lower()), [])
+                self.assertEqual(first_paragraph_problems((para + " " + text).lower()), [])
+        old = ("Every review finding on the files the ticket touched is fixed before `harness-pr ready`, whatever its "
+               "severity; only a finding outside the ticket's files becomes a new ticket, and the PR body names it "
+               "and says why.")
+        blocks_on_low = [
+            "Every high, medium or low finding on the files the ticket touched is fixed before `harness-pr ready`; "
+            "a low finding also goes into the PR notes for the owner, with no fix round of its own; only a high or "
+            "medium finding outside the ticket's files becomes a new ticket, and the PR body names it and says why.",
+            "Every high or medium finding on the files the ticket touched is fixed before `harness-pr ready`; a low "
+            "finding goes into the PR notes, with no fix round, and still blocks `harness-pr ready`; only a high or "
+            "medium finding outside the ticket's files becomes a new ticket, and the PR body names it and says why.",
         ]
-        for text in weaker:
-            with self.subTest(weaker=text):
+        low_to_fix_round = [
+            "Every high or medium finding on the files the ticket touched is fixed before `harness-pr ready`; a low "
+            "finding goes into the PR notes for the owner and gets a fix round too; only a high or medium finding "
+            "outside the ticket's files becomes a new ticket, and the PR body names it and says why.",
+            "Every high or medium finding on the files the ticket touched is fixed before `harness-pr ready`. A low "
+            "finding goes into the PR notes, with no fix round of its own; it is fixed in the next fix round. Only a "
+            "high or medium finding outside the ticket's files becomes a new ticket, and the PR body names it and "
+            "says why.",
+        ]
+        weaker = [
+            # high only
+            "Every high finding on the files the ticket touched is fixed before `harness-pr ready`; a low finding "
+            "goes into the PR notes for the owner, with no fix round; only a high or medium finding outside the "
+            "ticket's files becomes a new ticket, and the PR body names it and says why.",
+            # not fixed before ready
+            "Every high or medium finding on the files the ticket touched is reported; a low finding goes into the PR "
+            "notes for the owner, with no fix round; only a high or medium finding outside the ticket's files becomes "
+            "a new ticket, and the PR body names it and says why.",
+            # high and medium are never fixed
+            "High or medium findings on the files the ticket touched are never fixed before `harness-pr ready`; a "
+            "low finding goes into the PR notes for the owner, with no fix round; only a high or medium finding "
+            "outside the ticket's files becomes a new ticket, and the PR body names it and says why.",
+            # low findings go nowhere
+            "Every high or medium finding on the files the ticket touched is fixed before `harness-pr ready`; a low "
+            "finding gets no fix round; only a high or medium finding outside the ticket's files becomes a new "
+            "ticket, and the PR body names it and says why.",
+            # every outside finding, low ones too, becomes a ticket
+            "Every high or medium finding on the files the ticket touched is fixed before `harness-pr ready`; a low "
+            "finding goes into the PR notes for the owner, with no fix round; only a finding outside the ticket's "
+            "files becomes a new ticket, and the PR body names it and says why.",
+            # a low finding becomes a ticket
+            "Every high or medium finding on the files the ticket touched is fixed before `harness-pr ready`; a low "
+            "finding goes into the PR notes for the owner, with no fix round, and becomes a new ticket; only a high "
+            "or medium finding outside the ticket's files becomes a new ticket, and the PR body names it and says why.",
+            # no reason in the PR body
+            "Every high or medium finding on the files the ticket touched is fixed before `harness-pr ready`; a low "
+            "finding goes into the PR notes for the owner, with no fix round; only a high or medium finding outside "
+            "the ticket's files becomes a new ticket.",
+        ]
+        cases = ([("old", old)] + [("blocks on low", t) for t in blocks_on_low]
+                 + [("low to a fix round", t) for t in low_to_fix_round] + [("weaker", t) for t in weaker])
+        for kind, text in cases:
+            with self.subTest(kind=kind, text=text):
                 self.assertNotEqual(findings_rule_problems(text.lower()), [])
+        # Each of the three named failures fails for its own reason.
+        self.assertTrue(any("whatever their severity" in p for p in findings_rule_problems(old.lower())),
+                        findings_rule_problems(old.lower()))
+        for text in blocks_on_low:
+            with self.subTest(blocks_on_low=text):
+                problems = findings_rule_problems(text.lower())
+                self.assertTrue(any("takes low findings" in p or "low finding is fixed, blocks" in p for p in problems),
+                                problems)
+        for text in low_to_fix_round:
+            with self.subTest(low_to_fix_round=text):
+                problems = findings_rule_problems(text.lower())
+                self.assertTrue(any("low finding is fixed, blocks or gets a fix round" in p for p in problems),
+                                problems)
+        # Without `ready` (the checklist item) the blocking clause need not name `harness-pr ready`.
+        item = ("findings: every high and medium review finding on the ticket's files was fixed in a commit after the "
+                "review that posted it; each low finding is in the pr notes under `### low findings`, with no fix "
+                "round; each high or medium finding outside them is a new ticket that the pr body names with the "
+                "reason.")
+        self.assertEqual(findings_rule_problems(item, ready=False), [])
+        self.assertNotEqual(findings_rule_problems(item), [])
+        self.assertNotEqual(findings_rule_problems(item.replace("every high and medium", "every"), ready=False), [])
+
+    def test_the_breaker_scope_and_fix_reach_checks_take_honest_wording_and_reject_the_round_one_cheats(self):
+        # Ticket #259, breaker round 1: the cheats that passed the first tests fail these checks, and honest wording
+        # of each rule passes them.
+        scope_ok = [
+            "This step runs only on a `risk:high` ticket; every other ticket goes from step 2 to step 4.",
+            "Only a `risk:high` ticket runs the breaker: every other ticket skips this step and goes to step 4.",
+            "test-breaker (tier) risk:high only: scratch copy; cheat attempt; cheat passed: author tightens, breaker "
+            "again; a second pass: needs-input",
+            "A test-author writes tests from the ticket; a tool proves they fail; only on a `risk:high` ticket does "
+            "an adversary try to pass them with a trivial implementation.",
+            "In the scratch copy, writes the cheapest implementation. Runs only on risk:high tickets.",
+        ]
+        for text in scope_ok:
+            with self.subTest(scope_ok=text):
+                self.assertEqual(breaker_scope_problems(text.lower()), [])
+        scope_cheats = [
+            "3. **Break** (`harness:test-breaker`, stage `breaker`), on every ticket: every other ticket runs it "
+            "before step 4 as well, and only a `risk:high` ticket records its rounds.",
+            "test-breaker (tier) cheat attempt on every ticket, not only risk:high; cheat passed: author tightens, "
+            "breaker again; a second pass: needs-input",
+            "A tool proves they fail; an adversary tries to pass them (on every ticket, risk:high included).",
+            "In the scratch copy, writes the cheapest implementation. Runs on every ticket, risk:high included.",
+            "This step runs only on a `risk:high` ticket; every other ticket also runs it before step 4.",
+        ]
+        for text in scope_cheats:
+            with self.subTest(scope_cheat=text):
+                self.assertNotEqual(breaker_scope_problems(text.lower()), [])
+        reach_ok = [
+            "a fix round runs only for high or medium findings on the ticket's files: the coder (`#n fix`) fixes "
+            "every one of them in commits after that review.",
+            "it refuses while the latest harness review has high or medium findings and no commit after it, and "
+            "names them: those go back to the coder as in step 6.",
+            "coder (tier) fixes every high and medium posted finding in commits after the review; push",
+            "returns findings as json lines for the pr; high and medium ones on the ticket's files block ready, low "
+            "ones go to the notes.",
+        ]
+        for text in reach_ok:
+            with self.subTest(reach_ok=text):
+                self.assertEqual(fix_leak_problems(text), [])
+                self.assertEqual(low_clause_problems(clauses_of(text)), [])
+                self.assertEqual([c for c, ok in fixes_high_and_medium_only(text) if not ok], [])
+        reach_cheats = [
+            "a fix round runs only for high or medium findings: the coder (`#n fix`) fixes every one of them, and "
+            "every entry in the notes file too, in commits after that review.",
+            "it refuses while the latest harness review has high or medium findings. before you run it, the coder "
+            "fixes the low ones as well.",
+            "coder (tier) fixes every posted high and medium finding, then the remainder as well, in commits after "
+            "the review; push",
+            "returns findings as json lines for the pr, each graded high, medium or low; all of them go to the coder.",
+            "the coder fixes every high and medium finding and the entries of the notes file.",
+            "the coder fixes every high and medium finding, and the low ones in the notes.",
+        ]
+        for text in reach_cheats:
+            with self.subTest(reach_cheat=text):
+                self.assertTrue(fix_leak_problems(text) or low_clause_problems(clauses_of(text))
+                                or [c for c, ok in fixes_high_and_medium_only(text) if not ok],
+                                text)
+
+    def test_the_positive_scope_check_takes_honest_wording_and_rejects_the_round_two_cheats(self):
+        # Ticket #259, breaker round 2 (Ryan's choice b): the synonym cheats fail the positive check, honest wording
+        # of each section passes it.
+        honest = [
+            ("breaker", "3. **break** (`harness:test-breaker`, stage `breaker`): `harness-red scratch create "
+                        "--worktree <path>`; give it the scratch path, the test files, the definition of done and the "
+                        "test command. this step runs only on a `risk:high` ticket; every other ticket goes from step "
+                        "2 to step 4. `cheat passed`: record `harness-work attempt n breaker fail`, then back to the "
+                        "author with the breaker's report to tighten the tests (step 2 again, including `harness-red "
+                        "check`), and the breaker runs again on the tightened tests. the attempt answers `retry` the "
+                        "first time and `needs-input` the second: at most two rounds, and a cheat that still passes "
+                        "the second round ends the turn with needs-input, never continuing."),
+            ("breaker", "this step runs only on a `risk:high` ticket; a ticket that is not `risk:high` skips it and "
+                        "goes from step 2 to step 4."),
+            ("breaker", "2. **tests before code, proven.** a test-author writes tests from the ticket; a tool proves "
+                        "they fail against the unchanged code; only on a `risk:high` ticket does an adversary try to "
+                        "pass them with a trivial implementation; only then does a coder touch source."),
+            ("breaker", "test-breaker (tier) risk:high only: scratch copy; cheat attempt; cheat passed: author "
+                        "tightens, breaker again; a second pass: needs-input"),
+            ("breaker", "in the scratch copy, writes the cheapest implementation that could pass the new tests "
+                        "(constants, special-casing the fixtures) and runs them. if it passes, the tests are too "
+                        "narrow. runs only on risk:high tickets. denied test edits by the hook."),
+            ("findings", "a fix round runs only for high or medium findings on the ticket's files: the coder (`#n "
+                         "fix`) fixes every one of them in commits after that review; push with `git push` in the "
+                         "worktree; the reviewer (`#n fix`) re-checks the branch. after each fix round record "
+                         "`harness-work attempt n fix pass|fail`: `pass` when the re-check found no high or medium "
+                         "finding on the ticket's files. `retry` means a second fix round on the new findings."),
+            ("findings", "it refuses while the latest harness review has high or medium findings and no commit after "
+                         "it, and names them: those go back to the coder as in step 6. it sets `status:in-review` and "
+                         "notifies the user. stop."),
+            ("findings", "coder (tier) fixes every high and medium posted finding in commits after the review; push; "
+                         "the reviewer re-checks and its findings are posted again"),
+            ("findings", "reviews the branch against the ticket's definition of done; returns findings as json lines "
+                         "for the pr; high and medium ones on the ticket's files block ready, low ones go to the "
+                         "notes."),
+            ("findings", "findings: every high and medium review finding on the ticket's files was fixed in a commit "
+                         "after the review that posted it; each low finding is in the pr notes under `### low "
+                         "findings`, with no fix round."),
+            ("findings", "a low finding is not fixed: it goes into the notes file under `### low findings`."),
+        ]
+        for kind, text in honest:
+            with self.subTest(honest=text):
+                self.assertEqual(work_scope_problems(text, kind), [])
+        cheats = [
+            ("breaker", "this step runs only on a `risk:high` ticket; a ticket that is not `risk:high` skips it and "
+                        "goes from step 2 to step 4. run it on `risk:medium` and `risk:low` tickets the same way."),
+            ("breaker", "this step runs only on a `risk:high` ticket. run it on the other tickets too."),
+            ("breaker", "this step runs only on a `risk:high` ticket. run it again on the others."),
+            ("breaker", "only on a `risk:high` ticket does an adversary try to pass them, and on risk:low and "
+                        "risk:medium the same way."),
+            ("breaker", "test-breaker (tier) risk:high only, and on risk:low and risk:medium the same way: scratch copy"),
+            ("breaker", "runs only on risk:high tickets, and on the rest likewise."),
+            ("breaker", "runs on every ticket."),
+            ("findings", "a fix round runs only for high or medium findings: the coder fixes every one of them. once "
+                         "those commits are in, resolve each entry in the notes file the same way;"),
+            ("findings", "it refuses while the latest harness review has high or medium findings. before you run it, "
+                         "resolve the low ones in a commit."),
+            ("findings", "coder (tier) fixes every high and medium posted finding in commits after the review; it "
+                         "resolves the minor ones in the same commits; push"),
+            ("findings", "returns findings as json lines for the pr; every one of them is resolved before ready."),
+            ("findings", "the coder fixes every high and medium finding; the notes entries are addressed in the same "
+                         "commits."),
+            ("findings", "the notes file entries go to the coder after that."),
+            ("findings", "the coder also handles the trivial ones."),
+        ]
+        for kind, text in cheats:
+            with self.subTest(cheat=text):
+                self.assertNotEqual(work_scope_problems(text, kind), [])
 
     def test_the_dispatch_venue_check_takes_any_wording_of_the_opt_in_and_rejects_the_old_default(self):
         hint = '"[issue# | --api | --max N | --venue headless|bg | --dry-run]"'
