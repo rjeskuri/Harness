@@ -1264,16 +1264,40 @@ def destination_exempt(state: dict, path: str | None, top: Path) -> bool:
     return written_exempt(state, path, top)
 
 
+def in_notes(path: str, top: Path) -> bool:
+    """True when the absolute `path` is docs/agent of the repo `top` or under it."""
+    rel = repo_relative(path, top)
+    return rel is not None and (rel + "/").startswith(NOTES_DIR)
+
+
 def links_out(state: dict, directory: str, top: Path, deep: bool) -> bool:
-    """True when a symlink in `directory` (or anywhere under it, when `deep`) is not
-    written_exempt: a copy into the directory may write through it."""
-    for root, dirs, files in os.walk(directory):
-        for name in dirs + files:
-            entry = os.path.join(root, name)
-            if os.path.islink(entry) and not written_exempt(state, entry, top):
-                return True
-        if not deep:
-            break
+    """True when a symlink in `directory` is not written_exempt: a copy into the
+    directory may write through it. When `deep` (a recursive copy), any symlink at any
+    depth that resolves outside docs/agent/ counts, ignored or outside every repo,
+    since the copy writes on through whatever links lie beyond it; a link to a
+    directory that stays in docs/agent/ is walked as well."""
+    pending, seen = [directory], set()
+    while pending:
+        start = pending.pop()
+        if start in seen:
+            continue
+        seen.add(start)
+        for root, dirs, files in os.walk(start):
+            for name in dirs + files:
+                entry = os.path.join(root, name)
+                if not os.path.islink(entry):
+                    continue
+                if not deep:
+                    if not written_exempt(state, entry, top):
+                        return True
+                    continue
+                target = os.path.realpath(entry)
+                if not in_notes(target, top):
+                    return True
+                if os.path.isdir(target):
+                    pending.append(target)
+            if not deep:
+                return False
     return False
 
 
@@ -1287,8 +1311,7 @@ def into_notes(
     recursive copy, or a source the shell expands (glob, brace, $ or `) and so names
     no file that lands, checks every link in the directory, at any depth when
     recursive (BSD `cp -R src/ dest` copies the contents of src)."""
-    rel = repo_relative(real, top)
-    if rel is None or not (rel + "/").startswith(NOTES_DIR):
+    if not in_notes(real, top):
         return False
     if recursive or any(expanded(s, globbing) or "$" in s or "`" in s for s in sources):
         return not links_out(state, real, top, recursive)

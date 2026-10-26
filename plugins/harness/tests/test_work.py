@@ -556,6 +556,17 @@ class Start(WorkTest):
                 self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
         self.assertFalse([c for c in self.gh_calls() if c[:2] == ["issue", "edit"]])
 
+    def test_refuses_a_proposed_ticket(self):
+        """#160: a proposed ticket waits for harness-board promote; start makes no branch, worktree or status change."""
+        self.scenario(issues=[issue(labels=("task", "status:proposed", "size:S", "risk:low"))])
+        branches = self.git(self.repo, "for-each-ref", "--format=%(refname)", "refs/heads")
+        p = self.work("start", "12", "--json")
+        self.assertOneLineError(p, "#12 is status:proposed; it waits for harness-board promote 12")
+        self.assertEqual(p.stdout, "")
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+        self.assertEqual(self.git(self.repo, "for-each-ref", "--format=%(refname)", "refs/heads"), branches)
+        self.assertFalse([c for c in self.gh_calls() if c[:2] in (["issue", "edit"], ["issue", "comment"])])
+
     def test_start_mirrors_in_progress_to_the_configured_project(self):
         """#64: with HARNESS_PROJECT set, the real harness-board's status change during start sets the project
         item's Status to "In progress", on the URL gh reports for the issue (not one built from the remote)."""
@@ -7710,6 +7721,226 @@ class CloudDocs(unittest.TestCase):
     def test_the_usage_docstring_lists_cloud(self):
         head = read_text(TOOL).split('"""', 2)[1]
         self.assertTrue("harness-work cloud N" in head, "the harness-work usage docstring has no `cloud N` line")
+
+
+# =========================================================================== waves (#180)
+WAVE_ID_RE = r"^w\d{14}(?:-\d+)?$"
+
+
+class Waves(WorkTest):
+    """#180: with HARNESS_WAVE_REVIEW set, dispatch records the tickets one call launched as a wave
+    (harness_lib/waves.py) and stamps each run record with its id; `waves` shows where each wave stands from the
+    ticket caches, `--refresh` asking gh once per waiting ticket; `wave drop` takes a stuck ticket out."""
+
+    def waves_dir(self):
+        return os.path.join(self.home, ".claude", "harness", "repos", self.key, "waves")
+
+    def wave_files(self):
+        folder = self.waves_dir()
+        if not os.path.isdir(folder):
+            return []
+        return [self.read_json(os.path.join(folder, n)) for n in sorted(os.listdir(folder)) if n.endswith(".json")]
+
+    def write_wave(self, wave_id, tickets, review=None, created_at="2026-10-20T10:00:00Z", dropped=()):
+        wave = {"id": wave_id, "repo": os.path.realpath(self.repo), "created_at": created_at,
+                "tickets": list(tickets), "dropped": list(dropped), "tier": "fable", "effort": "xhigh",
+                "review": review}
+        write(os.path.join(self.waves_dir(), wave_id + ".json"), json.dumps(wave))
+        return wave
+
+    def write_cache(self, n, status):
+        write(self.cache_path(n), json.dumps({"number": n, "title": f"Ticket {n}", "status": status}))
+
+    def wave_env(self, tier="fable"):
+        return self.env(HARNESS_WAVE_REVIEW=tier)
+
+    def test_dispatch_groups_the_launched_tickets_into_one_wave(self):
+        self.scenario(issues=[issue(), issue(13, title="Second")], ready=[ready_row(12), ready_row(13, "Second")])
+        p = self.ok("dispatch", env=self.wave_env())
+        [wave] = self.wave_files()
+        self.assertRegex(wave["id"], WAVE_ID_RE)
+        self.assertEqual((wave["tickets"], wave["dropped"], wave["tier"], wave["effort"], wave["review"]),
+                         ([12, 13], [], "fable", "xhigh", None))
+        self.assertEqual(wave["repo"], os.path.realpath(self.repo))
+        self.assertIn(f"wave {wave['id']}: #12, #13 (reviewed together once all are in review)",
+                      p.stdout.splitlines())
+        records = self.run_records()
+        self.assertEqual(sorted(r["ticket"] for r in records), [12, 13])
+        for record in records:
+            self.assertEqual(record["wave"], wave["id"])
+        self.assertFalse([c for c in self.gh_calls() if c[:2] == ["issue", "view"] and "state,labels" in c])
+
+    def test_dispatch_json_names_the_wave(self):
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        data = self.ok_json("dispatch", "--json", env=self.wave_env("opus"))
+        [wave] = self.wave_files()
+        self.assertEqual(data["wave"], wave["id"])
+        self.assertEqual((wave["tier"], wave["effort"]), ("opus", "xhigh"))
+        self.assertEqual([r["wave"] for r in data["launched"]], [wave["id"]])
+
+    def test_without_the_setting_no_wave_is_written(self):
+        for value in (None, "off"):
+            with self.subTest(HARNESS_WAVE_REVIEW=value):
+                self.setUp()
+                self.scenario(issues=[issue(), issue(13, title="Second")],
+                              ready=[ready_row(12), ready_row(13, "Second")])
+                env = self.env() if value is None else self.env(HARNESS_WAVE_REVIEW=value)
+                p = self.ok("dispatch", env=env)
+                self.assertFalse(os.path.exists(self.waves_dir()))
+                self.assertNotIn("wave", p.stdout)
+                self.assertEqual(sorted(p.stdout.splitlines()),
+                                 sorted([f"#12 bg on {BRANCH} (id abc123)",
+                                         "#13 bg on t/13-second (id abc123)"]))
+                for record in self.run_records():
+                    self.assertNotIn("wave", record)
+                self.setUp()
+                self.scenario(issues=[issue()], ready=[ready_row(12)])
+                data = self.ok_json("dispatch", "--json", env=env)
+                self.assertNotIn("wave", data)
+                self.assertNotIn("wave", data["launched"][0])
+                dry = self.ok_json("dispatch", "--dry-run", "--json", env=env)
+                self.assertNotIn("wave", dry)
+                self.assertNotIn("group", self.ok("dispatch", "--dry-run", env=env).stdout)
+
+    def test_a_redispatched_ticket_keeps_its_wave(self):
+        old = self.write_wave("w20261020100000", [12])
+        self.write_run(12, pid=self.dead_pid(), branch=BRANCH, started_at=iso_ago(hours=2),
+                       ended_at=iso_ago(hours=1), outcome="early")
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS), issue(13, title="Second")], ready=[ready_row(13, "Second")])
+        p = self.ok("dispatch", env=self.wave_env())
+        waves = {w["id"]: w for w in self.wave_files()}
+        self.assertEqual(len(waves), 2, waves)
+        self.assertEqual(waves[old["id"]]["tickets"], [12])             # untouched
+        [new] = [w for w in waves.values() if w["id"] != old["id"]]
+        self.assertEqual(new["tickets"], [13])                           # 12 joins no new wave
+        self.assertIn(f"wave {new['id']}: #13 (reviewed together once all are in review)", p.stdout.splitlines())
+        launched = {r["ticket"]: r for r in self.run_records() if r.get("ended_at") is None}
+        self.assertEqual(launched[12]["wave"], old["id"])
+        self.assertEqual(launched[13]["wave"], new["id"])
+
+    def test_a_dispatch_of_only_redispatched_tickets_makes_no_wave(self):
+        old = self.write_wave("w20261020100000", [12])
+        self.write_run(12, pid=self.dead_pid(), branch=BRANCH, started_at=iso_ago(hours=2),
+                       ended_at=iso_ago(hours=1), outcome="early")
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS)])
+        data = self.ok_json("dispatch", "--json", env=self.wave_env())
+        self.assertEqual([w["id"] for w in self.wave_files()], [old["id"]])
+        self.assertIsNone(data["wave"])
+        self.assertEqual([r["wave"] for r in data["launched"]], [old["id"]])
+
+    def test_a_ticket_whose_wave_was_reviewed_joins_a_new_one(self):
+        old = self.write_wave("w20261020100000", [12], review={"launched_at": "2026-10-21T10:00:00Z", "run": "r1",
+                                                                "reviewed_at": "2026-10-21T11:00:00Z"})
+        self.write_run(12, pid=self.dead_pid(), branch=BRANCH, started_at=iso_ago(hours=2),
+                       ended_at=iso_ago(hours=1), outcome="early")
+        self.scenario(issues=[issue(12, labels=IN_PROGRESS)])
+        data = self.ok_json("dispatch", "--json", env=self.wave_env())
+        [new] = [w for w in self.wave_files() if w["id"] != old["id"]]
+        self.assertEqual((data["wave"], new["tickets"]), (new["id"], [12]))
+
+    def test_dry_run_names_the_grouping_and_writes_nothing(self):
+        self.write_wave("w20261020100000", [14])
+        self.write_run(14, pid=self.dead_pid(), branch="t/14-x", started_at=iso_ago(hours=2),
+                       ended_at=iso_ago(hours=1), outcome="early")
+        self.scenario(issues=[issue(), issue(13, title="Second"), issue(14, labels=IN_PROGRESS, title="Third")],
+                      ready=[ready_row(12), ready_row(13, "Second")])
+        before = self.wave_files()
+        p = self.ok("dispatch", "--dry-run", env=self.wave_env())
+        self.assertIn("would group #12, #13 into a wave", p.stdout.splitlines())
+        self.assertIn("would start #14 Third (again after early) and launch bg", p.stdout)
+        data = self.ok_json("dispatch", "--dry-run", "--json", env=self.wave_env())
+        self.assertEqual(data["wave"], {"id": None, "tickets": [12, 13]})
+        self.assertEqual(self.wave_files(), before)
+        self.assertEqual(self.claude_calls(), [])
+        self.assertEqual(len(self.run_records()), 1)
+
+    def test_waves_lists_progress_from_the_caches_without_gh(self):
+        self.write_wave("w20261020100000", [12, 13], created_at="2026-10-20T10:00:00Z")
+        self.write_wave("w20261020110000", [14], created_at="2026-10-20T11:00:00Z")
+        self.write_wave("w20261020120000", [15], created_at="2026-10-20T12:00:00Z",
+                        review={"launched_at": "2026-10-21T10:00:00Z", "run": "run-77", "reviewed_at": None})
+        self.write_wave("w20261020130000", [16], created_at="2026-10-20T13:00:00Z",
+                        review={"launched_at": "2026-10-21T10:00:00Z", "run": "run-78",
+                                "reviewed_at": "2026-10-21T11:30:00Z"})
+        self.write_wave("w20261020140000", [17], created_at="2026-10-20T14:00:00Z")   # no ticket cache
+        for n, status in ((12, "in-review"), (13, "in-progress"), (14, "in-review"), (15, "in-review"),
+                          (16, "closed")):
+            self.write_cache(n, status)
+        text = self.ok("waves").stdout
+        lines = text.splitlines()
+        self.assertEqual(lines[0].split(), ["ID", "TICKETS", "STATE", "DETAIL"])
+        rows = {ln.split()[0]: ln for ln in lines[1:]}
+        self.assertEqual(sorted(rows), ["w20261020100000", "w20261020110000", "w20261020120000",
+                                        "w20261020140000"])          # 16 is closed: hidden without --all
+        self.assertIn("#12, #13", rows["w20261020100000"])
+        self.assertIn("working", rows["w20261020100000"])
+        self.assertIn("1 of 2 in review; waiting for #13 (in-progress)", rows["w20261020100000"])
+        self.assertIn("due", rows["w20261020110000"])
+        self.assertIn("reviewing (run run-77)", rows["w20261020120000"])
+        self.assertIn("waiting for #17 (", rows["w20261020140000"])
+        every = {ln.split()[0]: ln for ln in self.ok("waves", "--all").stdout.splitlines()[1:]}
+        self.assertIn("reviewed 2026-10-21T11:30:00Z", every["w20261020130000"])
+        data = self.ok_json("waves", "--json")
+        first = data[0]
+        self.assertEqual((first["id"], first["state"], first["done"], first["waiting"]),
+                         ("w20261020100000", "working", [12], [{"number": 13, "status": "in-progress"}]))
+        self.assertEqual([w["id"] for w in data], sorted(rows))
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_waves_with_none_says_so(self):
+        p = self.ok("waves")
+        self.assertIn("No open waves", p.stdout)
+        self.assertEqual(self.ok_json("waves", "--json"), [])
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_waves_refresh_asks_gh_once_per_waiting_ticket(self):
+        self.write_wave("w20261020100000", [12, 13, 14], created_at="2026-10-20T10:00:00Z")
+        self.write_wave("w20261020110000", [13, 15], created_at="2026-10-20T11:00:00Z")
+        self.write_cache(12, "in-review")
+        self.write_cache(13, "in-progress")
+        self.write_cache(15, "in-progress")
+        self.scenario(issues=[issue(13, labels=IN_REVIEW), issue(14, labels=IN_PROGRESS),
+                              issue(15, labels=IN_PROGRESS, state="CLOSED")])
+        data = {w["id"]: w for w in self.ok_json("waves", "--refresh", "--json")}
+        views = [c for c in self.gh_calls() if c[:2] == ["issue", "view"]]
+        self.assertEqual(sorted(c[2] for c in views), ["13", "14", "15"])
+        for call in views:
+            self.assertEqual(call[3:], ["--json", "state,labels"])
+        self.assertEqual(data["w20261020100000"]["waiting"], [{"number": 14, "status": "in-progress"}])
+        self.assertEqual(data["w20261020110000"]["state"], "due")
+        self.assertEqual(len(self.gh_calls()), 3)
+        self.assertEqual(self.read_json(self.cache_path(13))["status"], "in-progress")   # the caches are not written
+
+    def test_wave_drop_makes_the_wave_due(self):
+        self.write_wave("w20261020100000", [12, 13])
+        self.write_cache(12, "in-review")
+        self.write_cache(13, "in-progress")
+        p = self.ok("wave", "drop", "w20261020100000", "13")
+        self.assertEqual(p.stdout.strip(), "dropped #13 from wave w20261020100000")
+        [wave] = self.wave_files()
+        self.assertEqual((wave["tickets"], wave["dropped"]), ([12], [13]))
+        [row] = self.ok("waves").stdout.splitlines()[1:]
+        self.assertIn("due", row)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_wave_drop_refuses_an_unknown_wave_or_ticket_and_a_launched_review(self):
+        self.write_wave("w20261020100000", [12, 13])
+        self.write_wave("w20261020110000", [14, 15],
+                        review={"launched_at": "2026-10-21T10:00:00Z", "run": "run-77", "reviewed_at": None})
+        before = self.wave_files()
+        self.assertOneLineError(self.work("wave", "drop", "w20261020120000", "12"), "w20261020120000")
+        self.assertOneLineError(self.work("wave", "drop", "nonsense", "12"), "nonsense")
+        self.assertOneLineError(self.work("wave", "drop", "w20261020100000", "14"), "#14", "w20261020100000")
+        self.assertOneLineError(self.work("wave", "drop", "w20261020110000", "14"), "w20261020110000", "launched")
+        self.assertEqual(self.wave_files(), before)
+
+    def test_the_docs_name_the_wave_commands(self):
+        head = read_text(TOOL).split('"""', 2)[1]
+        for needle in ("harness-work waves", "harness-work wave drop"):
+            self.assertIn(needle, head)
+        design = read_text(DESIGN)
+        for needle in ("`waves [--all] [--refresh]", "`wave drop <id> N", "would group"):
+            self.assertIn(needle, design)
 
 
 if __name__ == "__main__":

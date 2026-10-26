@@ -2254,6 +2254,71 @@ class BranchGuardBashExemptions(GuardTestCase):
             )
         )
 
+    # ---- #237: a recursive copy into docs/agent/ through chained symlinks
+
+    def test_recursive_copy_into_docs_agent_through_chained_symlink_refused(self):
+        """BSD `cp -R /tmp/r/ docs/agent/` writes /tmp/r/c/app.py through docs/agent/c ->
+        ../../cache (ignored) and cache/app.py -> ../src/app.py into the tracked
+        src/app.py. A recursive copy into docs/agent/ is refused when any symlink under
+        the destination resolves outside docs/agent/, ignored or not; without such a link,
+        and for a named destination, it stays allowed."""
+        repo = self.repo
+        source = self.tmp / "r"
+        self.write(source / "c/app.py", "clobbered\n")
+        os.symlink("../../cache", repo / "docs/agent/c")
+        os.symlink("../src/app.py", repo / "cache/app.py")
+        self.assertEqual(
+            os.path.realpath(repo / "docs/agent/c/app.py"), str(repo / "src/app.py")
+        )
+        for command in (
+            f"cp -R {source}/ docs/agent/",
+            f"cp -a {source}/ docs/agent",
+            f"rsync -a {source}/ docs/agent/",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        command = f"cp -R {source}/ {repo}/docs/agent/"
+        self.assertRefusedPart(self.bash(command, cwd=self.outside), command)
+        # no symlink under the destination, and a named destination: allowed
+        self.write(self.outside / "notes.md", "notes\n")
+        self.assertAllowed(
+            (
+                f"cp -R {source}/ docs/agent/specs/",
+                "cp notes.md docs/agent/handoff.md",
+                f"cp {self.outside}/notes.md docs/agent/handoff.md",
+            )
+        )
+        os.unlink(repo / "docs/agent/c")
+        self.assertAllowed((f"cp -R {source}/ docs/agent/",))
+
+    def test_recursive_copy_into_docs_agent_through_outside_link_refused(self):
+        """The same through a link out of every repo: docs/agent/ext -> <tmp>/ext and
+        <tmp>/ext/app.py -> <repo>/src/app.py. A link outside every repo no longer counts
+        as exempt for a recursive copy into docs/agent/."""
+        repo = self.repo
+        source, ext = self.tmp / "r", self.tmp / "ext"
+        self.write(source / "ext/app.py", "clobbered\n")
+        ext.mkdir()
+        os.symlink(str(repo / "src/app.py"), ext / "app.py")
+        os.symlink(str(ext), repo / "docs/agent/ext")
+        self.assertEqual(
+            os.path.realpath(repo / "docs/agent/ext/app.py"), str(repo / "src/app.py")
+        )
+        for command in (
+            f"cp -R {source}/ docs/agent/",
+            f"cp -r {source}/ docs/agent/",
+            f"rsync -a {source}/ docs/agent/",
+        ):
+            with self.subTest(command=command):
+                self.assertRefusedPart(self.bash(command), command)
+        # not recursive, and a named destination: the #162 rules, unchanged
+        self.assertAllowed(
+            (
+                f"cp {self.outside}/notes.md docs/agent/",
+                "cp notes.md docs/agent/handoff.md",
+            )
+        )
+
     def test_ln_no_dereference_onto_an_ignored_symlink_to_an_outside_directory_allowed(self):
         """ln -n and -h treat a destination that is a symlink to a directory as a named
         file, not a directory to link into: `ln -sfn ../.venv .venv` replaces the ignored
