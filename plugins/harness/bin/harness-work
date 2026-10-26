@@ -5,7 +5,8 @@ of a headless or background session per ready ticket, the run records, the budge
 
 Usage:
     harness-work start N [--venue interactive|headless|bg]
-    harness-work attempt N tests|breaker|code|review|fix|ci pass|fail [--tier sonnet|opus|fable]
+    harness-work attempt N tests|breaker|code|review|fix|ci|verify pass|fail [--tier sonnet|opus|fable]
+                         [--effort low|medium|high|xhigh|max]
     harness-work cost N [--pr P] [--json | --markdown]
     harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]
     harness-work runs [--sweep] [--all]
@@ -19,6 +20,16 @@ State, under ~/.claude/harness: repos/<repo-key>/tickets/<N>.json (the ticket ca
 writes; start adds branch, worktree and started_at, attempt adds to attempts), repos/<repo-key>/cost/<N>.json (the
 record `cost` writes), runs/<repo-key>-<N>-<stamp>.json and .log (one dispatched run), budgets.json
 ({"api"|"cloud": {"exhausted_until", "reason"}}).
+
+attempt: appends {stage, tier, effort, result, at} to the ticket cache's attempts and prints the failure policy's
+answer. The tier is --tier, else the stage's route (harness_lib.routing: review_route for review, code_route for the
+other stages, from the cache's labels and the current settings), except that a coding stage keeps a cached sonnet or
+opus (a cached fable is the pre-#239 rubric's and yields to the route; a cache without labels routes from its tier
+as `harness-board tier` does, a cached fable reading as opus xhigh). The
+effort is --effort, else the route's effort when the attempt ran at the route's tier, else none (null). The second
+failure in a row escalates: sonnet prints `escalate opus`, opus with no effort or below xhigh `escalate opus xhigh`;
+a stage already at opus xhigh or max, or on an explicitly named fable, gets needs-input instead. No escalation goes to
+fable. fix and breaker never escalate: retry, then needs-input. --json adds effort, next_tier and next_effort.
 
 cost: ticket N's tokens and model time per stage and model from the repository's transcripts (harness_lib/cost.py's
 ticket_usage), its labels and rounds from the ticket cache (the attempts replayed with attempt's rule; null without
@@ -52,11 +63,12 @@ headless, only with --venue headless or its alias --api (--api with --venue bg i
 reaches a command line or the environment). headless while the api budget is exhausted (judged after the sweep,
 which can be what exhausts it) is refused, --dry-run too: nothing starts, the exit is non-zero and the message
 names the time and `harness-work budget reset api`.
-Effort: dispatch reads HARNESS_CODE_EFFORT once per command through harness_lib.routing.load_routing (environment,
-else the main checkout's .claude/settings.json) and launches every session, redispatched ones too, with `--effort
-<level>` (bg: before the prompt; headless: last), writing `effort` to the run record. Unset, nothing changes: no flag,
-no key. An invalid value is one `harness-work:` warning on stderr per command (a dry run and an empty board too) and
-launches without the flag. The dispatcher's own CLAUDE_EFFORT is never inherited. --dry-run's first line names the
+Effort: dispatch reads the routing settings once per command through harness_lib.routing.load_routing (environment,
+else the main checkout's .claude/settings.json) and launches each session, redispatched ones too, at its ticket's
+code route effort: HARNESS_CODE_EFFORT when set, else xhigh for a size:L or risk:high ticket (unless HARNESS_CODE_TIER
+replaces the labels), as `--effort <level>` (bg: before the prompt; headless: last), writing `effort` to the run
+record. With no effort: no flag, no key. An invalid value is one `harness-work:` warning on stderr per command (a dry
+run and an empty board too) and is ignored. The dispatcher's own CLAUDE_EFFORT is never inherited. --dry-run's first line names the
 effort when set (`Dry run: venue bg, effort xhigh, ...`); every --json result has a top-level `effort` (null when unset).
 
 runs --sweep: closes the records of runs that ended and classifies each (ok, error, billing, auth; a bg run by its
@@ -89,7 +101,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
-    from harness_lib.routing import load_routing
+    from harness_lib.routing import EFFORTS, cached_code_route, code_route, load_routing, next_route, review_route
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, patterns, setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
     from harness_lib import cost
@@ -100,9 +112,8 @@ except Exception as exc:  # no state key can be guessed without the lib: one lin
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-STAGES = ("tests", "breaker", "code", "review", "fix", "ci")
+STAGES = ("tests", "breaker", "code", "review", "fix", "ci", "verify")
 TIERS = ("sonnet", "opus", "fable")
-NEXT_TIER = {"sonnet": "opus", "opus": "fable", "fable": "fable"}
 DEFAULT_TIER = "opus"
 VENUES = ("headless", "bg")
 BUDGETS = ("api", "cloud")
@@ -522,7 +533,8 @@ def start_ticket(repo, number, venue, draft_pr=None):
     tier = record.get("tier") if record.get("tier") in TIERS else DEFAULT_TIER
     return {"number": number, "branch": branch, "worktree": worktree, "tier": tier,
             "title": record.get("title") or "", "previous_status": previous, "answers": answers,
-            "waiting": waiting, "draft_pr": draft_pr}
+            "waiting": waiting, "draft_pr": draft_pr,
+            "type": record.get("type"), "size": record.get("size"), "risk": record.get("risk")}
 
 
 # --------------------------------------------------------------- budgets
@@ -1087,14 +1099,43 @@ def cmd_start(repo, args):
     emit(wants_json(args), data, text)
 
 
+def stage_route(repo, cache, stage):
+    """(route tier, route effort, default tier) for `stage`: the route harness_lib.routing gives it from the cache's
+    labels and the current settings (review_route for review, code_route for every other stage), and the tier an
+    attempt without --tier ran at. That is the route's tier, except that a coding stage keeps a cached sonnet or opus
+    (the effective tier harness-board wrote); a cached fable is the pre-#239 rubric's and yields to the route. A
+    cache without labels routes from its cached tier (opus when it has none) as `harness-board tier` does
+    (cached_code_route: a cached fable reads as opus xhigh, and the code settings still decide); the review stage
+    reads it the same way without the code settings."""
+    cached = cache.get("tier") if cache.get("tier") in TIERS else None
+    labels = cache.get("labels")
+    routing = load_routing(repo.main)
+    for problem in routing["problems"]:
+        warn(problem)
+    if not isinstance(labels, list):
+        route = cached_code_route(cached or DEFAULT_TIER, {} if stage == "review" else routing)
+        return route["tier"], route["effort"], route["tier"]
+    names = [x.get("name") if isinstance(x, dict) else x for x in labels]
+    kind = cost.label_fields([x for x in names if isinstance(x, str)])
+    if stage == "review":
+        route = review_route(kind["risk"], routing)
+    else:
+        route = code_route(kind["type"], kind["size"], kind["risk"], routing)
+        if cached in ("sonnet", "opus"):
+            return route["tier"], route["effort"], cached
+    return route["tier"], route["effort"], route["tier"]
+
+
 def cmd_attempt(repo, args):
     n = args.number
     cache = read_cache(repo, n)
     if cache is None:
         raise Problem(f"no ticket cache for #{n} ({repo.ticket_path(n)}); run harness-work start {n} first")
-    tier = args.tier or (cache.get("tier") if cache.get("tier") in TIERS else DEFAULT_TIER)
+    route_tier, route_effort, default_tier = stage_route(repo, cache, args.stage)
+    tier = args.tier or default_tier
+    effort = args.effort or (route_effort if tier == route_tier else None)
     attempts = cache.get("attempts") if isinstance(cache.get("attempts"), list) else []
-    attempts.append({"stage": args.stage, "tier": tier, "result": args.result, "at": iso(now())})
+    attempts.append({"stage": args.stage, "tier": tier, "effort": effort, "result": args.result, "at": iso(now())})
     cache["attempts"] = attempts
     write_json(repo.ticket_path(n), cache)
     failures = 0
@@ -1102,11 +1143,15 @@ def cmd_attempt(repo, args):
         if entry.get("result") != "fail":
             break
         failures += 1
-    action = cost.attempt_action(args.stage, args.result, failures)     # fix: at most two rounds, never escalates
-    next_tier = NEXT_TIER[tier] if action == "escalate" else None
-    emit(wants_json(args), {"number": n, "stage": args.stage, "result": args.result, "tier": tier, "failures": failures,
-                "action": action, "next_tier": next_tier},
-         f"{action} {next_tier}" if next_tier else action)
+    action = cost.attempt_action(args.stage, args.result, failures)     # fix, breaker: two rounds, never escalate
+    nxt = next_route(tier, effort) if action == "escalate" else None
+    if action == "escalate" and nxt is None:
+        action = "needs-input"          # nothing above opus xhigh or an explicit fable
+    next_tier, next_effort = nxt or (None, None)
+    emit(wants_json(args), {"number": n, "stage": args.stage, "result": args.result, "tier": tier, "effort": effort,
+                            "failures": failures, "action": action, "next_tier": next_tier,
+                            "next_effort": next_effort},
+         " ".join(x for x in (action, next_tier, next_effort) if x))
 
 
 PR_FIELDS = "number,url,createdAt,mergedAt,headRefName"
@@ -1267,7 +1312,8 @@ def cmd_dispatch(repo, args):
             ticket = start_ticket(repo, n, venue, row.get("draft_pr"))
             if not ticket["title"]:
                 ticket["title"] = row.get("title") or ""
-            record = launch(repo, ticket, venue, effort)
+            route = code_route(ticket["type"], ticket["size"], ticket["risk"], routing)
+            record = launch(repo, ticket, venue, route["effort"])
         except Problem as err:
             failures.append({"number": n, "error": one_line(err)})
             if not args.json:
@@ -1440,12 +1486,16 @@ def parser():
                        help="named in the start comment (dispatch passes its own)")
 
     attempt = sub.add_parser("attempt", parents=[with_repo, with_json],
-                             help="record a stage's result; prints done, retry, escalate <tier> or needs-input "
-                                  "(fix: retry, then needs-input; it never escalates)")
+                             help="record a stage's result; prints done, retry, escalate <tier> [<effort>] or "
+                                  "needs-input (escalate opus, then escalate opus xhigh, then needs-input; fix and "
+                                  "breaker retry, then needs-input; they never escalate)")
     attempt.add_argument("number", type=issue_number, metavar="N")
     attempt.add_argument("stage", choices=STAGES)
     attempt.add_argument("result", choices=("pass", "fail"))
-    attempt.add_argument("--tier", choices=TIERS, help="the tier this attempt ran at (default: the ticket's)")
+    attempt.add_argument("--tier", choices=TIERS, help="the tier this attempt ran at (default: the stage's route)")
+    attempt.add_argument("--effort", choices=EFFORTS,
+                         help="the effort this attempt ran at (default: the stage route's effort when it ran at that "
+                              "route's tier, else none)")
 
     cost_ = sub.add_parser("cost", parents=[with_repo],
                            help="a ticket's tokens and model time per stage and model, with its rounds; "

@@ -7,28 +7,46 @@ Runs in a ticket worktree (the cwd, or --worktree PATH). The record is written t
 {"branch", "base_sha", "test_files", "run_files", "test_hash", "cmd", "exit", "kind", "tail", "at"}.
 `test_files` (hashed into `test_hash`) is every changed file matching HARNESS_TEST_PATTERNS, fixtures and
 conftest.py included; `run_files`, the ones the command runs, are those whose basename names a test module.
+The files' bytes go to the side file red-files/<branch-slug>.json beside red/, so the record stays current
+across a merge of main that only brings in main's edits to those files (harness_lib/redproof.py); a test
+change of the branch's own makes it stale.
 
 Usage:
     harness-red check [--base origin/main]   # run the branch's changed tests; red exits 0, anything else 1
                                              # (no tests ran, or they failed to load: refused, nothing recorded)
     harness-red status                       # the record for this branch, and current: yes|no
+    harness-red files [--base origin/main]   # the branch's own test files: its changed runnable tests, plus the
+                                             # test modules each other changed path names or HARNESS_TEST_MAP adds
+    harness-red run [--base origin/main]     # HARNESS_TEST_CMD on those files: exit 0 when it passes, else 1;
+                                             # no files runs nothing (exit 0); writes no record
     harness-red scratch create               # a detached worktree of HEAD for the test-breaker; prints its path
     harness-red scratch run                  # the record's tests in the scratch: cheat passed (0) or cheat failed (1)
     harness-red scratch remove
-    check and status take --json; every subcommand takes --worktree PATH.
+    harness-red verify [--wait] [--timeout 540] [--rerun]
+                                             # CLAUDE_VERIFY_CMD at HEAD in the background, in its own session;
+                                             # reuses a finished run for this HEAD and command; exit 0 passed,
+                                             # 1 failed or timed out (with the log's tail), 8 still running
+    check, status, files and verify take --json; every subcommand takes --worktree PATH.
 
 Settings: HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT (comma-separated globs) come from the
 environment, then `env` in the main checkout's tracked .claude/settings.json only, as in tests_first;
 the others come from the environment, then `env` in the worktree's .claude/settings.json, with
 .claude/settings.local.json over it: HARNESS_TEST_CMD ({files} becomes the test files, shell-quoted; detected when unset) and
-HARNESS_TEST_TIMEOUT (seconds, default 300).
+HARNESS_TEST_TIMEOUT (seconds, default 300) and HARNESS_TEST_MAP (comma-separated SOURCE_GLOB=TEST_GLOB pairs:
+a changed path matching SOURCE_GLOB adds the test modules matching TEST_GLOB to `files`), and for verify
+CLAUDE_VERIFY_CMD and HARNESS_VERIFY_TIMEOUT (seconds, default 3600).
+
+The verify record is ~/.claude/harness/repos/<repo-key>/verify/<branch-slug>.json: {"branch", "head", "cmd",
+"state": "running|passed|failed|timeout", "pid", "started_at", "finished_at", "exit", "log"}, the output going
+to verify/<branch-slug>.log. A supervisor in a session of its own writes it: `pid` is the supervisor, whose
+process group the command shares, so the run outlives the call that started it, a stop kills the whole group,
+and a running record whose pid is gone or started after `started_at` counts as dead.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import fnmatch
-import hashlib
 import json
 import os
 import re
@@ -37,18 +55,20 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, repo_key
+    from harness_lib.redproof import read_files, record_current, save_red_files, tests_hash
     from harness_lib.repo import NotARepository, RepoError, repo_facts
     from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
     from harness_lib.settings import DEFAULT_TEST_PATTERNS as TEST_PATTERNS  # also read by tests/test_red.py
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT as SOURCE_EXEMPT  # also read by tests/test_red.py
-    from harness_lib.cli import Parser, Problem, run_main  # Problem also caught by tests/test_red.py
-    from harness_lib.text import last_line, write_json
+    from harness_lib.cli import Parser, Problem, run_main, warn  # Problem also caught by tests/test_red.py
+    from harness_lib.text import last_line, now_iso, parse_iso_seconds, read_json, write_json
 except Exception as exc:  # one line, exit 1, like the __main__ wrapper below
     sys.exit(f"harness-red: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -69,6 +89,7 @@ NO_TESTS, NOT_LOADED = "no tests ran", "tests failed to load"
 GREEN = "Tests pass before the implementation; they do not test this change."
 RUNNABLE = ("test_*.py", "*_test.py", "*.test.js", "*_test.js", "*.test.ts", "*_test.ts", "*.test.mjs",
             "*.spec.js", "*.spec.ts")      # basenames passed as {files}; other test files are hashed, not run
+NOTHING_RUN = "no own test files for this branch's changes; nothing run"
 
 
 # --------------------------------------------------------------- globs and settings
@@ -158,6 +179,8 @@ class Repo:
         state = os.path.join(repos, self.key)
         self.record_path = os.path.join(state, "red", self.slug + ".json")
         self.scratch = os.path.join(state, "scratch", self.slug)
+        self.verify_record = os.path.join(state, "verify", self.slug + ".json")
+        self.verify_log = os.path.join(state, "verify", self.slug + ".log")
         self.env = settings_env(self.top)
         # What counts as a test is decided by the main checkout's tracked settings.json only, as in
         # tests_first: the worktree's files and settings.local.json are agent-editable.
@@ -201,31 +224,25 @@ class Repo:
         return sorted(paths)
 
 
+def runnable_name(path):
+    """The RUNNABLE pattern the basename of `path` matches, or None."""
+    name = path.rsplit("/", 1)[-1]
+    return next((p for p in RUNNABLE if fnmatch.fnmatch(name, p)), None)
+
+
 def runnable(files):
     """The test files the command runs: a test module's basename, not a fixture, helper or conftest.py.
     None runnable is a failed precondition."""
-    run = [f for f in files if any(fnmatch.fnmatch(f.rsplit("/", 1)[-1], p) for p in RUNNABLE)]
+    run = [f for f in files if runnable_name(f)]
     if not run:
         raise Problem(f"No runnable test files among the test changes: {', '.join(files)}. "
                       f"A runnable test file is named {', '.join(RUNNABLE)}.")
     return run
 
 
-def test_hash(root, files):
-    """sha256 over, for each file in sorted path order, the path, a newline and its bytes. Raises OSError."""
-    h = hashlib.sha256()
-    for f in sorted(files):
-        h.update(f.encode("utf-8", "surrogateescape") + b"\n")
-        with open(os.path.join(root, f), "rb") as fh:
-            h.update(fh.read())
-    return h.hexdigest()
-
-
-def current(root, record):
-    try:
-        return test_hash(root, record["test_files"]) == record.get("test_hash")
-    except OSError:
-        return False
+def current(repo, record):
+    """The files hash to test_hash, or are the red-time files with main's merged changes (redproof.py)."""
+    return record_current(repo.top, record, repo.record_path)
 
 
 # --------------------------------------------------------------- records
@@ -324,6 +341,72 @@ def run_tests(repo, files, cwd):
     return cmd, code, output, None
 
 
+# --------------------------------------------------------------- own test files
+def normalise(text):
+    """Lower case, each run of characters outside [a-z0-9] one `_`, no leading or trailing `_`."""
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def subject(path):
+    """The normalised basename of a runnable test file without its test affix and extension:
+    test_X.py, X_test.py, X.test.js, X.spec.ts and the rest of RUNNABLE give X."""
+    pattern = runnable_name(path)
+    if not pattern:
+        return ""
+    prefix, suffix = pattern.split("*")
+    name = path.rsplit("/", 1)[-1]
+    return normalise(name[len(prefix):len(name) - len(suffix)])
+
+
+def name_keys(path):
+    """The subjects that name `path`: each `_`-token suffix of its normalised path without the last
+    extension, and the normalised name of each of its directories."""
+    *dirs, base = path.split("/")
+    tokens = normalise("/".join(dirs + [os.path.splitext(base)[0]])).split("_")
+    keys = {"_".join(tokens[i:]) for i in range(len(tokens))} | {normalise(d) for d in dirs}
+    keys.discard("")
+    return keys
+
+
+def test_map(repo):
+    """HARNESS_TEST_MAP as (source glob, test glob) pairs; an entry without `=` is skipped with a warning."""
+    pairs = []
+    for entry in patterns(setting("HARNESS_TEST_MAP", repo.env) or ""):
+        source, eq, test = entry.partition("=")
+        if not eq:
+            warn("harness-red", f"HARNESS_TEST_MAP entry {entry!r} has no '=' (SOURCE_GLOB=TEST_GLOB); skipped")
+            continue
+        pairs.append((source.strip(), test.strip()))
+    return pairs
+
+
+def own_files(repo, base):
+    """{"base", "files", "changed_tests", "mapped", "unmapped"}: the changed runnable test files, and for
+    every other changed path the runnable test modules its name rule or HARNESS_TEST_MAP gives."""
+    pairs = test_map(repo)
+    changed = repo.changed_paths(merge_base_of(repo, base))
+    listed = git(repo.top, "ls-files", "-z", "--cached", "--others", "--exclude-standard").stdout
+    candidates = {p: subject(p) for p in sorted(set(listed.split("\0")))
+                  if p and repo.classify(p) == "test" and runnable_name(p)
+                  and os.path.isfile(os.path.join(repo.top, p))}
+    changed_tests, mapped, unmapped = [], {}, []
+    for path in changed:
+        if repo.classify(path) == "test":
+            if path in candidates:
+                changed_tests.append(path)
+            continue
+        keys = name_keys(path)
+        map_tests = [t for s, t in pairs if glob_match(s, path)]
+        hits = [c for c, subj in candidates.items()
+                if (subj and subj in keys) or any(glob_match(t, c) for t in map_tests)]
+        if hits:
+            mapped[path] = hits
+        else:
+            unmapped.append(path)
+    files = sorted(set(changed_tests).union(*mapped.values()))
+    return {"base": base, "files": files, "changed_tests": changed_tests, "mapped": mapped, "unmapped": unmapped}
+
+
 # --------------------------------------------------------------- commands
 def no_tests_message(repo):
     """`(N, "ticket N is no-tests: no red run needed")` when the ticket cache of this t/<n>- branch carries the
@@ -351,16 +434,21 @@ def print_no_tests(note, as_json):
         print(message)
 
 
+def merge_base_of(repo, base):
+    mb = git(repo.top, "merge-base", "HEAD", base, check=False)
+    merge_base = mb.stdout.strip()
+    if mb.returncode != 0 or not merge_base:
+        raise Problem(f"HEAD and {base} have no common ancestor")
+    return merge_base
+
+
 def cmd_check(repo, args):
     note = no_tests_message(repo)
     if note:
         print_no_tests(note, args.json)
         return 0
     base = repo.resolve_base(args.base)
-    mb = git(repo.top, "merge-base", "HEAD", base, check=False)
-    merge_base = mb.stdout.strip()
-    if mb.returncode != 0 or not merge_base:
-        raise Problem(f"HEAD and {base} have no common ancestor")
+    merge_base = merge_base_of(repo, base)
     changed = repo.changed_paths(merge_base)
     tests = [p for p in changed if repo.classify(p) == "test" and os.path.isfile(os.path.join(repo.top, p))]
     if not tests:
@@ -370,7 +458,8 @@ def cmd_check(repo, args):
         raise Problem(f"Source already changed before the red run: {', '.join(sources)}. "
                       "Revert them or move them to the coder step.")
     run_files = runnable(tests)
-    digest = test_hash(repo.top, tests)
+    contents = read_files(repo.top, tests)         # the bytes the run proves, hashed and kept beside the record
+    digest = tests_hash(contents)
     cmd, code, output, timed_out = run_tests(repo, run_files, repo.top)
     if timed_out:
         raise Problem(f"{cmd} timed out after {timed_out:g}s and was stopped; no red run recorded. "
@@ -390,6 +479,7 @@ def cmd_check(repo, args):
     record = {"branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
               "test_hash": digest, "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),
               "at": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
+    save_red_files(repo.record_path, contents)       # first: a record never names files the side file lacks
     write_json(repo.record_path, record, prefix=".red-")
     if args.json:
         print(json.dumps(record, indent=2, ensure_ascii=False))
@@ -410,7 +500,7 @@ def cmd_status(repo, args):
         print_no_tests(note, args.json)
         return 0
     record = load_record(repo)
-    fresh = current(repo.top, record)
+    fresh = current(repo, record)
     if args.json:
         print(json.dumps(dict(record, current=fresh), indent=2, ensure_ascii=False))
         return 0
@@ -423,6 +513,29 @@ def cmd_status(repo, args):
     print(f"run files: {', '.join(record.get('run_files') or [])}")
     print(f"current: {'yes' if fresh else 'no'}")
     return 0
+
+
+def cmd_files(repo, args):
+    own = own_files(repo, repo.resolve_base(args.base))
+    if args.json:
+        print(json.dumps(own, indent=2, ensure_ascii=False))
+    else:
+        sys.stdout.write("".join(f + "\n" for f in own["files"]))
+    return 0
+
+
+def cmd_run(repo, args):
+    files = own_files(repo, repo.resolve_base(args.base))["files"]
+    if not files:
+        print(NOTHING_RUN)
+        return 0
+    cmd, code, output, timed_out = run_tests(repo, files, repo.top)
+    if timed_out:
+        print(f"own tests: {len(files)} files, {cmd} {output}")
+        return 1
+    print(f"own tests: {len(files)} files, exit {code}")
+    print(tail(output))
+    return 0 if code == 0 else 1
 
 
 def cmd_scratch_create(repo, args):
@@ -475,6 +588,207 @@ def cmd_scratch_remove(repo, args):
     return 0
 
 
+# --------------------------------------------------------------- verify: the full verify command at HEAD
+VERIFY_TIMEOUT = 3600.0            # HARNESS_VERIFY_TIMEOUT's default: the run is stopped after this many seconds
+VERIFY_WAIT = 540.0                # --wait's default slice, inside a 600 s Bash call
+VERIFY_TAIL = 60
+RUNNING_EXIT = 8
+FINISHED = ("passed", "failed", "timeout")
+VERIFY_KEYS = ("state", "head", "cmd", "exit", "log", "started_at", "finished_at")
+SUPERVISE = "--verify-supervisor"  # the hidden first argument of the detached side of a run
+REGISTER_WAIT = 15.0               # seconds a call waits for a new supervisor to record its run
+STOP_WAIT = 10.0                   # seconds a call waits for a stopped run's processes to be gone
+START_SLACK = 5                    # seconds: a process that began later than its record's started_at by more
+#                                    is a recycled pid, not the supervisor
+POLL = 0.5
+UNSET_CMD = "no verify command (CLAUDE_VERIFY_CMD unset); nothing run"
+
+
+def verify_timeout(file_env):
+    raw = setting("HARNESS_VERIFY_TIMEOUT", file_env)
+    try:
+        value = float(raw) if raw is not None else VERIFY_TIMEOUT
+    except ValueError:
+        value = VERIFY_TIMEOUT
+    return value if 0 < value < float("inf") else VERIFY_TIMEOUT       # also catches nan
+
+
+def elapsed_seconds(text):
+    """Seconds from ps's etime ([[dd-]hh:]mm:ss), or None; as harness-work reads it."""
+    days, _, clock = text.strip().rpartition("-")
+    try:
+        parts = [int(p) for p in clock.split(":")]
+        day_count = int(days) if days else 0
+    except ValueError:
+        return None
+    if not 1 <= len(parts) <= 3:
+        return None
+    hours, minutes, seconds = [0] * (3 - len(parts)) + parts
+    return day_count * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def run_alive(record):
+    """Whether the record's pid is still the supervisor that wrote it: ours, running, not a zombie, and not a
+    recycled pid (a process that began more than START_SLACK seconds after `started_at`), as harness-work's
+    pid_alive checks a launch."""
+    pid = record.get("pid")
+    started = parse_iso_seconds(record.get("started_at"))
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or started is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (OSError, OverflowError):            # gone, or another user's process: not our supervisor
+        return False
+    try:
+        done = subprocess.run([shutil.which("ps") or "/bin/ps", "-o", "stat=,etime=", "-p", str(pid)],
+                              capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return True                             # cannot tell better than kill did
+    fields = done.stdout.split()
+    if done.returncode != 0 or not fields or fields[0].startswith("Z"):
+        return False
+    elapsed = elapsed_seconds(fields[1]) if len(fields) > 1 else None
+    return elapsed is None or time.time() - elapsed <= started + START_SLACK
+
+
+def stop_run(record):
+    """Kill a live run's process group (the supervisor leads it; the command and its subshells share it) and
+    wait, bounded, for the supervisor to be gone."""
+    pid = record["pid"]
+    try:
+        group = os.getpgid(pid)
+        if group == pid and group != os.getpgrp():
+            os.killpg(group, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    deadline = time.monotonic() + STOP_WAIT
+    while run_alive(record) and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+
+def supervise(spec_text):
+    """The detached side of a verify run, in a session of its own: record the run, run the command through the
+    shell in this process group with its output to the log, and record how it ended. HARNESS_VERIFY_TIMEOUT is
+    enforced here, so it holds with nobody waiting."""
+    spec = json.loads(spec_text)
+    path = spec["record"]
+    record = {"branch": spec["branch"], "head": spec["head"], "cmd": spec["cmd"], "state": "running",
+              "pid": os.getpid(), "started_at": now_iso(), "finished_at": None, "exit": None, "log": spec["log"]}
+    write_json(path, record, prefix=".verify-")
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    try:
+        proc = subprocess.Popen(spec["cmd"], shell=True, cwd=spec["cwd"], stdin=subprocess.DEVNULL, env=env)
+    except OSError as err:
+        print(f"harness-red: could not start {spec['cmd']}: {err.strerror or err}", flush=True)
+        write_json(path, dict(record, state="failed", exit=127, finished_at=now_iso()), prefix=".verify-")
+        return 1
+    try:
+        code = proc.wait(timeout=spec["timeout"])
+    except subprocess.TimeoutExpired:
+        print(f"harness-red: verify timed out after {spec['timeout']:g}s and was stopped", flush=True)
+        write_json(path, dict(record, state="timeout", finished_at=now_iso()), prefix=".verify-")
+        os.killpg(os.getpgrp(), signal.SIGKILL)  # the command, everything it started, and this process
+        return 1
+    state = "passed" if code == 0 else "failed"
+    write_json(path, dict(record, state=state, exit=code, finished_at=now_iso()), prefix=".verify-")
+    return 0
+
+
+def start_run(repo, cmd, head, timeout):
+    """Launch the supervisor in a session of its own, so the run survives this call, and wait (bounded) for it
+    to record the run. The log is truncated here; the supervisor and the command write to it."""
+    spec = {"record": repo.verify_record, "log": repo.verify_log, "branch": repo.branch, "head": head,
+            "cmd": cmd, "cwd": repo.top, "timeout": timeout}
+    os.makedirs(os.path.dirname(repo.verify_log), exist_ok=True)
+    with open(repo.verify_log, "wb") as log:
+        sup = subprocess.Popen([sys.executable, os.path.realpath(__file__), SUPERVISE, json.dumps(spec)],
+                               cwd=repo.top, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                               start_new_session=True)
+    deadline = time.monotonic() + REGISTER_WAIT
+    while True:
+        exited = sup.poll() is not None
+        record = read_json(repo.verify_record)
+        if (isinstance(record, dict) and record.get("pid") == sup.pid and record.get("head") == head
+                and record.get("cmd") == cmd):
+            return record
+        if exited:
+            raise Problem(f"the verify supervisor exited {sup.returncode} before recording its run; "
+                          f"see {repo.verify_log}")
+        if time.monotonic() >= deadline:
+            kill_group(sup)
+            raise Problem(f"the verify supervisor (pid {sup.pid}) did not record its run within "
+                          f"{REGISTER_WAIT:g}s and was stopped; see {repo.verify_log}")
+        time.sleep(0.05)
+
+
+def wait_run(repo, record, seconds):
+    """The record once the run leaves `running`, or as it stands when `seconds` have passed."""
+    deadline = time.monotonic() + seconds
+    while record.get("state") == "running" and time.monotonic() < deadline:
+        time.sleep(min(POLL, max(0.0, deadline - time.monotonic())))
+        now = read_json(repo.verify_record)
+        if not (isinstance(now, dict) and now.get("pid") == record.get("pid")
+                and now.get("started_at") == record.get("started_at")):
+            raise Problem("the verify run was replaced by another call's; run harness-red verify again")
+        if now.get("state") == "running" and not run_alive(now):
+            again = read_json(repo.verify_record)       # it may have finished between the read and the check
+            if not isinstance(again, dict) or again.get("state") == "running":
+                raise Problem(f"the verify run (pid {now.get('pid')}) died without a result; "
+                              "run harness-red verify again")
+            now = again
+        record = now
+    return record
+
+
+def verify_report(record, as_json):
+    """Print the run's state; 0 passed, 1 failed or timed out (with the log's tail), 8 still running."""
+    state = record.get("state")
+    log_tail = tail(read_text(record["log"]), VERIFY_TAIL) if isinstance(record.get("log"), str) else ""
+    code = 0 if state == "passed" else RUNNING_EXIT if state == "running" else 1
+    if as_json:
+        print(json.dumps(dict({k: record.get(k) for k in VERIFY_KEYS}, tail=log_tail), indent=2,
+                         ensure_ascii=False))
+        return code
+    head = str(record.get("head") or "")[:12]
+    if state == "running":
+        started = parse_iso_seconds(record.get("started_at"))
+        seconds = max(0, int(time.time() - started)) if started is not None else 0
+        print(f"verify running for {seconds} s; run harness-red verify --wait again")
+    elif state == "passed":
+        print(f"verify passed at {head}")
+    else:
+        print(f"verify timed out at {head} and was stopped" if state == "timeout"
+              else f"verify failed at {head} (exit {record.get('exit')})")
+        print(log_tail)
+    return code
+
+
+def cmd_verify(repo, args):
+    cmd = setting("CLAUDE_VERIFY_CMD", repo.env)
+    if not cmd:
+        if args.json:
+            print(json.dumps(dict(dict.fromkeys(VERIFY_KEYS), state="none", tail=""), indent=2))
+        else:
+            print(UNSET_CMD)
+        return 0
+    if git(repo.top, "status", "--porcelain").stdout.strip():
+        raise Problem(f"uncommitted changes in {repo.top}; commit them first")
+    head = git(repo.top, "rev-parse", "HEAD").stdout.strip()
+    record = read_json(repo.verify_record)
+    record = record if isinstance(record, dict) else None
+    live = record is not None and record.get("state") == "running" and run_alive(record)
+    same = record is not None and record.get("head") == head and record.get("cmd") == cmd
+    if not (same and not args.rerun and (live or record.get("state") in FINISHED)):
+        if live:                                # a dead record's pid may be someone else's now: never killed
+            stop_run(record)
+        record = start_run(repo, cmd, head, verify_timeout(repo.env))
+    if args.wait:
+        record = wait_run(repo, record, args.timeout)
+    return verify_report(record, args.json)
+
+
 def parser():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--worktree", metavar="PATH", default=argparse.SUPPRESS,
@@ -483,33 +797,46 @@ def parser():
     as_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
     ap = Parser(prog="harness-red", description="Proves a ticket's tests fail before the implementation exists.")
     ap.add_argument("--worktree", metavar="PATH", help="the ticket worktree (default: the cwd)")
-    ap.add_argument("--json", action="store_true", help="print JSON (check, status)")
-    sub = ap.add_subparsers(dest="cmd", metavar="{check,status,scratch}")
+    ap.add_argument("--json", action="store_true", help="print JSON (check, status, files, verify)")
+    sub = ap.add_subparsers(dest="cmd", metavar="{check,status,files,run,scratch,verify}")
     check = sub.add_parser("check", parents=[common, as_json], help="run the branch's test changes and record red")
     check.add_argument("--base", metavar="REF", help="default: origin/main when it exists, else main")
     sub.add_parser("status", parents=[common, as_json], help="the red record for this branch")
+    files = sub.add_parser("files", parents=[common, as_json], help="the branch's own test files")
+    files.add_argument("--base", metavar="REF", help="default: origin/main when it exists, else main")
+    run = sub.add_parser("run", parents=[common], help="run the branch's own test files; writes no record")
+    run.add_argument("--base", metavar="REF", help="default: origin/main when it exists, else main")
     scratch = sub.add_parser("scratch", parents=[common], help="the test-breaker's working copy")
     ssub = scratch.add_subparsers(dest="scratch_cmd", metavar="{create,run,remove}")
     ssub.add_parser("create", parents=[common], help="a detached worktree of HEAD plus uncommitted tests")
     ssub.add_parser("run", parents=[common], help="the record's tests in the scratch copy")
     ssub.add_parser("remove", parents=[common], help="remove the scratch copy")
+    verify = sub.add_parser("verify", parents=[common, as_json],
+                            help="the full verify command at HEAD, run in the background")
+    verify.add_argument("--wait", action="store_true", help="wait for the result, at most --timeout seconds")
+    verify.add_argument("--timeout", metavar="SECONDS", type=float, default=VERIFY_WAIT,
+                        help=f"how long --wait waits (default {VERIFY_WAIT:g})")
+    verify.add_argument("--rerun", action="store_true", help="start a fresh run even when one finished at this HEAD")
     return ap
 
 
 def main():
+    if sys.argv[1:2] == [SUPERVISE]:                       # the detached side of harness-red verify
+        sys.exit(supervise(sys.argv[2]))
     ap = parser()
     args = ap.parse_args()
     if not args.cmd:
-        ap.error("choose a subcommand: check, status or scratch")
+        ap.error("choose a subcommand: check, status, files, run, scratch or verify")
     if args.cmd == "scratch" and not args.scratch_cmd:
         ap.error("choose scratch create, run or remove")
     for sig in (signal.SIGTERM, signal.SIGHUP):             # unwind, so a running test command is killed too
         signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
-    commands = {"check": cmd_check, "status": cmd_status, "create": cmd_scratch_create, "run": cmd_scratch_run,
-                "remove": cmd_scratch_remove}
+    commands = {"check": cmd_check, "status": cmd_status, "files": cmd_files, "run": cmd_run,
+                "scratch create": cmd_scratch_create, "scratch run": cmd_scratch_run,
+                "scratch remove": cmd_scratch_remove, "verify": cmd_verify}
     try:
         repo = Repo(args.worktree or os.getcwd())
-        code = commands[args.scratch_cmd if args.cmd == "scratch" else args.cmd](repo, args)
+        code = commands[f"scratch {args.scratch_cmd}" if args.cmd == "scratch" else args.cmd](repo, args)
     except Problem as err:
         sys.stdout.flush()
         sys.exit(f"harness-red: {err}")

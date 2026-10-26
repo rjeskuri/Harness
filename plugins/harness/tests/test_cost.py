@@ -10,7 +10,7 @@ The contract under test (the ticket's Context):
   call failing (CostCommand's default scenario), lines, ci, needs_input and landed_at are null and elapsed holds
   no PR or ready time, so the Cost block gains no line.
 - Rounds: per stage, in attempt order, a fail extends that stage's run of failures; its first fail is a retry,
-  the second an escalate, the third and later needs-input (fix: retry, then needs-input), as `harness-work
+  the second an escalate, the third and later needs-input (fix and breaker: retry, then needs-input), as `harness-work
   attempt` answers; a pass ends the run; each stage counts on its own. breaker_rerounds = breaker fails,
   fix_rounds = fix attempts.
 - Number formats: tokens below 1,000 as the integer, below 1,000,000 as 12.3k, else 12.3M; durations 45s, 12m,
@@ -609,11 +609,13 @@ class CostCommand(CostBase):
                  ("review", "fail"), ("review", "fail"), ("review", "fail"), ("review", "fail"), ("ci", "fail"),
                  ("tests", "pass")]
         cases = [
-            (82, "opus", seq82, {"stages": {"tests": stage_counts(3), "breaker": stage_counts(3, 3, 1, 1, 1),
+            # #252: the breaker never escalates; its second and third fails are needs-input
+            (82, "opus", seq82, {"stages": {"tests": stage_counts(3),
+                                            "breaker": stage_counts(3, 3, retry=1, needs_input=2),
                                             "code": stage_counts(1), "review": stage_counts(1),
                                             "ci": stage_counts(1)},
                                  "breaker_rerounds": 3, "fix_rounds": 0},
-             "Rounds: breaker re-rounds 3, fix rounds 0; retries 1, escalations 1, needs-input 1"),
+             "Rounds: breaker re-rounds 3, fix rounds 0; retries 1, escalations 0, needs-input 2"),
             (83, "sonnet", seq83, {"stages": {"fix": stage_counts(2, 2, retry=1, needs_input=1),
                                               "code": stage_counts(3, 2, retry=2),
                                               "review": stage_counts(4, 4, 1, 1, 2), "ci": stage_counts(1, 1, 1),
@@ -629,7 +631,7 @@ class CostCommand(CostBase):
                 answers = [self.attempt(n, stage, result) for stage, result in seq]
                 if n == 82:
                     self.assertEqual([a for (s, _), a in zip(seq, answers) if s == "breaker"],
-                                     ["retry", "escalate fable", "needs-input"])
+                                     ["retry", "needs-input", "needs-input"])     # #252
                 self.assertEqual(tally(seq, answers), expected, "fixture: the attempt answers")
                 record = json.loads(self.cost(n, "--json"))
                 self.assertEqual(record["rounds"], expected)
@@ -641,6 +643,90 @@ class CostCommand(CostBase):
                 self.assertEqual(len(rounds), 1, text)
                 for piece in line[len("Rounds: "):].replace(";", ",").split(", "):
                     self.assertIn(piece, rounds[0])
+
+    def test_rounds_replay_the_top_of_the_ladder_as_needs_input(self):
+        # #239: a record that carries an `effort` key (written by #239's attempt) and has nothing above its tier and
+        # effort (opus xhigh or max, or fable) replays its second failure as needs-input, as attempt answered. A
+        # record with effort null at opus still escalates; a pre-#239 record (no `effort` key) replays as before.
+        def entry(i, stage, result, tier, **effort):
+            return dict({"stage": stage, "tier": tier, "result": result, "at": "2026-10-25T%02d:00:00Z" % (9 + i)},
+                        **effort)
+
+        cases = [
+            # (ticket, attempts' tier and effort fields, expected code-stage counts)
+            (601, ("opus", {"effort": "xhigh"}), stage_counts(2, 2, retry=1, needs_input=1)),
+            (602, ("opus", {"effort": "max"}), stage_counts(2, 2, retry=1, needs_input=1)),
+            (603, ("fable", {"effort": None}), stage_counts(2, 2, retry=1, needs_input=1)),
+            (604, ("fable", {"effort": "xhigh"}), stage_counts(2, 2, retry=1, needs_input=1)),
+            (605, ("opus", {"effort": None}), stage_counts(2, 2, retry=1, escalate=1)),
+            (606, ("opus", {"effort": "high"}), stage_counts(2, 2, retry=1, escalate=1)),
+            (607, ("sonnet", {"effort": None}), stage_counts(2, 2, retry=1, escalate=1)),
+            (608, ("fable", {}), stage_counts(2, 2, retry=1, escalate=1)),     # pre-#239: no effort key
+            (609, ("opus", {}), stage_counts(2, 2, retry=1, escalate=1)),
+        ]
+        for n, (tier, effort), counts in cases:
+            with self.subTest(ticket=n, tier=tier, effort=effort):
+                self.write_cache(n, tier=tier)
+                path = self.state("tickets", f"{n}.json")
+                with open(path, encoding="utf-8") as fh:
+                    cache = json.load(fh)
+                cache["attempts"] = [entry(0, "code", "fail", tier, **effort), entry(1, "code", "fail", tier, **effort)]
+                write(path, json.dumps(cache))
+                record = json.loads(self.cost(n, "--json"))
+                self.assertEqual(record["rounds"]["stages"], {"code": counts})
+
+    def test_rounds_count_a_second_breaker_fail_as_needs_input(self):
+        # #252: the breaker never escalates: replayed, its first fail in a run is a retry and the second and later
+        # needs-input, whatever the tier and effort, in records written by attempt and in older ones without an
+        # `effort` key. breaker_rerounds is still the breaker's fails; code beside it still escalates.
+        seq = [("breaker", "fail"), ("tests", "pass"), ("breaker", "fail"), ("code", "fail"), ("breaker", "fail"),
+               ("code", "fail"), ("breaker", "pass"), ("breaker", "fail"), ("breaker", "fail")]
+        n = 701
+        self.own_session(n, "rounds", agents=[("harness:coder", f"#{n} code", [
+            Msg(f"msg_{n}_1", T("09:00:00.000"), T("09:00:45.000"), (1, 98, 0, 900))])])
+        self.write_cache(n, size="S", tier="sonnet")
+        answers = [self.attempt(n, stage, result) for stage, result in seq]
+        self.assertEqual(answers, ["retry", "done", "needs-input", "retry", "needs-input", "escalate opus", "done",
+                                   "retry", "needs-input"])
+        expected = {"stages": {"breaker": stage_counts(6, 5, retry=2, needs_input=3), "tests": stage_counts(1),
+                               "code": stage_counts(2, 2, retry=1, escalate=1)},
+                    "breaker_rerounds": 5, "fix_rounds": 0}
+        record = json.loads(self.cost(n, "--json"))
+        self.assertEqual(record["rounds"], expected)
+        line = "Rounds: breaker re-rounds 5, fix rounds 0; retries 3, escalations 1, needs-input 3"
+        md = self.cost(n, "--markdown")
+        self.assertEqual(md.strip("\n"), block([("code", "opus-5-5", "1", "999", "98", "45s", "45s")],
+                                               ("999", "98", "45s"), line))
+        text = self.cost(n)
+        rounds = [x for x in text.splitlines() if "re-rounds" in x]
+        self.assertEqual(len(rounds), 1, text)
+        for piece in line[len("Rounds: "):].replace(";", ",").split(", "):
+            self.assertIn(piece, rounds[0])
+
+        # records written by hand: with and without an `effort` key, at tiers that would escalate under the default
+        def entry(i, result, tier, **effort):
+            return dict({"stage": "breaker", "tier": tier, "result": result,
+                         "at": "2026-10-25T%02d:00:00Z" % (9 + i)}, **effort)
+
+        cases = [
+            (711, "sonnet", {"effort": None}, ["fail", "fail"], stage_counts(2, 2, retry=1, needs_input=1)),
+            (712, "opus", {"effort": None}, ["fail", "fail", "fail"], stage_counts(3, 3, retry=1, needs_input=2)),
+            (713, "opus", {"effort": "high"}, ["fail", "fail"], stage_counts(2, 2, retry=1, needs_input=1)),
+            (714, "sonnet", {}, ["fail", "fail"], stage_counts(2, 2, retry=1, needs_input=1)),     # pre-#239
+            (715, "opus", {}, ["fail", "fail", "pass", "fail"], stage_counts(4, 3, retry=2, needs_input=1)),
+            (716, "fable", {}, ["fail", "fail", "fail", "fail"], stage_counts(4, 4, retry=1, needs_input=3)),
+        ]
+        for n, tier, effort, results, counts in cases:
+            with self.subTest(ticket=n, tier=tier, effort=effort):
+                self.write_cache(n, tier=tier)
+                path = self.state("tickets", f"{n}.json")
+                with open(path, encoding="utf-8") as fh:
+                    cache = json.load(fh)
+                cache["attempts"] = [entry(i, r, tier, **effort) for i, r in enumerate(results)]
+                write(path, json.dumps(cache))
+                record = json.loads(self.cost(n, "--json"))
+                self.assertEqual(record["rounds"], {"stages": {"breaker": counts},
+                                                    "breaker_rerounds": counts["fails"], "fix_rounds": 0})
 
     # ----------------------------------------------------------- sessions
     def test_session_total_line_only_for_own_sessions(self):
