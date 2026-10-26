@@ -16,6 +16,7 @@ Usage:
     harness-work waves [--all] [--refresh]
     harness-work wave drop ID N
     harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
+    harness-work budget calls [--hours 24] [--json]
     harness-work worktrees [--stale DAYS]
     harness-work worktree remove BRANCH [--discard]
     start, attempt, stage, cost, dispatch, cloud, waves, wave, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR,
@@ -163,6 +164,7 @@ try:
     from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
     from harness_lib.text import write_json as _write_json
     from harness_lib import gh as ghlib
+    from harness_lib import ghlimit
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -182,6 +184,8 @@ REDISPATCH_WINDOW = dt.timedelta(days=7)   # an ended run older than this is not
 REDISPATCH_MAX = 3            # ended runs of a ticket within the window after which dispatch skips it
 UNCOUNTED = ("billing", "auth")   # outcomes of runs that do not count toward REDISPATCH_MAX: the budget's fault
 EXHAUST_HOURS = 24.0
+CALLS_HOURS = 24.0            # budget calls: the default window
+CALLS_TOP = 15                # budget calls: rows of the text COMMAND table
 REASON_MAX = 200
 DIRTY_SHOWN = 10
 GIT_TIMEOUT = 120
@@ -1888,7 +1892,97 @@ def cmd_runs(args):
         print(table(rows))
 
 
+def count(groups, key, item, kind):
+    """Add one call of `kind` to the row of `groups` under `key`, made from `item` on its first call."""
+    row = groups.setdefault(key, dict(item, calls=0, graphql=0, rest=0, refused=0))
+    row["calls"] += 1
+    if kind in ("graphql", "rest"):
+        row[kind] += 1
+    return row
+
+
+def ranked(groups, keys):
+    """The rows of `groups` by calls descending, then by group key, each with only `keys`."""
+    return [{k: row[k] for k in keys} for _, row in sorted(groups.items(), key=lambda kv: (-kv[1]["calls"], kv[0]))]
+
+
+def cmd_budget_calls(args):
+    """The gh call log of the last --hours hours (ghlimit.read_calls): totals, by tool, command, ticket and hour,
+    and the busiest minute. Reads the log only; no gh call."""
+    try:
+        hours = float(args.hours)
+    except ValueError:
+        hours = float("nan")
+    until = now().replace(microsecond=0)
+    try:
+        if not 0 < hours < float("inf"):
+            raise OverflowError
+        since = until - dt.timedelta(hours=hours)
+    except OverflowError:
+        raise Problem(f"--hours must be a number more than 0, not {args.hours!r}") from None
+    lines = ghlimit.read_calls(since)
+    totals = {"graphql": 0, "rest": 0, "refused": 0, "failed": 0}
+    waited_ms = 0
+    tools, commands, tickets, by_hour, minutes = {}, {}, {}, {}, {}
+    for line in lines:
+        at = parse_iso(line["at"]).astimezone(dt.timezone.utc)
+        kind = line.get("kind")
+        refused = line.get("refused") is True
+        if kind in ("graphql", "rest"):
+            totals[kind] += 1
+        totals["refused"] += refused
+        totals["failed"] += line.get("exit") != 0 and not refused
+        waited = line.get("waited_ms")
+        if isinstance(waited, (int, float)) and not isinstance(waited, bool) and abs(waited) < float("inf"):
+            waited_ms += waited
+        tool = str(line.get("tool") or "")
+        count(tools, tool, {"tool": tool}, kind)["refused"] += refused
+        cmd = str(line.get("cmd") or "")
+        count(commands, (cmd, str(kind)), {"cmd": cmd, "kind": kind}, kind)
+        ticket = line.get("ticket")
+        if isinstance(ticket, int) and not isinstance(ticket, bool):
+            repo = str(line.get("repo") or "")
+            count(tickets, (repo, ticket), {"repo": repo, "ticket": ticket}, kind)
+        hour = at.strftime("%Y-%m-%dT%H:00:00Z")
+        count(by_hour, hour, {"hour": hour}, kind)
+        minute = at.strftime("%Y-%m-%dT%H:%M:00Z")
+        minutes[minute] = minutes.get(minute, 0) + 1
+    peak = min(minutes.items(), key=lambda kv: (-kv[1], kv[0])) if minutes else None
+    data = {"since": iso(since), "until": iso(until), "hours": hours, "total": len(lines),
+            "graphql": totals["graphql"], "rest": totals["rest"], "refused": totals["refused"],
+            "failed": totals["failed"], "waited_seconds": waited_ms / 1000,
+            "peak_minute": {"minute": peak[0], "calls": peak[1]} if peak else None,
+            "by_tool": ranked(tools, ("tool", "calls", "graphql", "rest", "refused")),
+            "by_command": ranked(commands, ("cmd", "kind", "calls")),
+            "by_ticket": ranked(tickets, ("repo", "ticket", "calls", "graphql")),
+            "by_hour": [{k: row[k] for k in ("hour", "calls", "graphql", "rest")}
+                        for _, row in sorted(by_hour.items())]}
+    if wants_json(args):
+        emit(True, data, "")
+        return
+    window = str(int(hours)) if hours.is_integer() else repr(hours)   # 24, 0.5, 1234567: never 1.23457e+06
+    if not lines:
+        print(f"No gh calls logged in the last {window} h.")
+        return
+    parts = [f"gh calls in the last {window} h: {data['total']} (graphql {data['graphql']}, rest {data['rest']}), "
+             f"{data['refused']} refused, {data['failed']} failed, {int(data['waited_seconds'])} s waiting; "
+             f"peak {peak[1]} in one minute ({peak[0][:16]}Z)",
+             table([("TOOL", "CALLS", "GRAPHQL", "REST", "REFUSED")]
+                   + [(r["tool"], str(r["calls"]), str(r["graphql"]), str(r["rest"]), str(r["refused"]))
+                      for r in data["by_tool"]]),
+             table([("COMMAND", "KIND", "CALLS")]
+                   + [(r["cmd"], str(r["kind"]), str(r["calls"])) for r in data["by_command"][:CALLS_TOP]])]
+    if data["by_ticket"]:
+        parts.append(table([("TICKET", "CALLS", "GRAPHQL")]
+                           + [(f"{r['repo']} #{r['ticket']}", str(r["calls"]), str(r["graphql"]))
+                              for r in data["by_ticket"]]))
+    print("\n\n".join(parts))
+
+
 def cmd_budget(args):
+    if args.action == "calls":
+        cmd_budget_calls(args)
+        return
     budgets = load_budgets()
     action = args.action or "status"
     if action == "exhaust":
@@ -2075,7 +2169,7 @@ def parser():
     drop.add_argument("number", type=issue_number, metavar="N")
 
     budget = sub.add_parser("budget", parents=[with_json], help="the api and cloud budgets")
-    budget_sub = budget.add_subparsers(dest="action", metavar="{status,exhaust,reset}")
+    budget_sub = budget.add_subparsers(dest="action", metavar="{status,exhaust,reset,calls}")
     budget_sub.add_parser("status", parents=[nested_json], help="each budget's state (the default)")
     ex = budget_sub.add_parser("exhaust", parents=[nested_json], help="mark a budget exhausted")
     ex.add_argument("name", choices=BUDGETS)
@@ -2083,6 +2177,10 @@ def parser():
     ex.add_argument("--hours", type=float, default=EXHAUST_HOURS, help="default 24")
     reset = budget_sub.add_parser("reset", parents=[nested_json], help="mark a budget available")
     reset.add_argument("name", choices=BUDGETS)
+    calls = budget_sub.add_parser("calls", parents=[nested_json],
+                                  help="the gh call log: totals by tool, command, ticket and hour, the busiest minute")
+    calls.add_argument("--hours", default=str(CALLS_HOURS), metavar="H",
+                       help="the window, default 24 (checked by the command: a bad value is one line, exit 1)")
 
     wts = sub.add_parser("worktrees", parents=[with_repo, with_json],
                          help="the ticket worktrees with age, PR state and the stale flag")
