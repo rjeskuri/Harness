@@ -14,6 +14,9 @@ change of the branch's own makes it stale.
 Usage:
     harness-red check [--base origin/main]   # run the branch's changed tests; red exits 0, anything else 1
                                              # (no tests ran, or they failed to load: refused, nothing recorded)
+    harness-red reprove [--base origin/main] # check for a branch that has source: its test files as they are now,
+                                             # run against main's code at the merge base in a temporary worktree;
+                                             # only red replaces the record (green or no proof: refused, kept)
     harness-red status                       # the record for this branch, and current: yes|no
     harness-red files [--base origin/main]   # the branch's own test files: its changed runnable tests, plus the
                                              # test modules each other changed path names or HARNESS_TEST_MAP adds
@@ -26,7 +29,7 @@ Usage:
                                              # CLAUDE_VERIFY_CMD at HEAD in the background, in its own session;
                                              # reuses a finished run for this HEAD and command; exit 0 passed,
                                              # 1 failed or timed out (with the log's tail), 8 still running
-    check, status, files and verify take --json; every subcommand takes --worktree PATH.
+    check, reprove, status, files and verify take --json; every subcommand takes --worktree PATH.
 
 Settings: HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT (comma-separated globs) come from the
 environment, then `env` in the main checkout's tracked .claude/settings.json only, as in tests_first;
@@ -55,6 +58,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
@@ -442,42 +446,47 @@ def merge_base_of(repo, base):
     return merge_base
 
 
-def cmd_check(repo, args):
-    note = no_tests_message(repo)
-    if note:
-        print_no_tests(note, args.json)
-        return 0
-    base = repo.resolve_base(args.base)
-    merge_base = merge_base_of(repo, base)
+def test_changes(repo, base):
+    """(merge base, changed paths, test files): the branch's changes against `base` (resolved as check does) and
+    the test files among them that exist; none is refused."""
+    merge_base = merge_base_of(repo, repo.resolve_base(base))
     changed = repo.changed_paths(merge_base)
     tests = [p for p in changed if repo.classify(p) == "test" and os.path.isfile(os.path.join(repo.top, p))]
     if not tests:
         raise Problem("No test changes on this branch; write the tests first.")
-    sources = [p for p in changed if repo.classify(p) == "source"]
-    if sources:
-        raise Problem(f"Source already changed before the red run: {', '.join(sources)}. "
-                      "Revert them or move them to the coder step.")
-    run_files = runnable(tests)
-    contents = read_files(repo.top, tests)         # the bytes the run proves, hashed and kept beside the record
-    digest = tests_hash(contents)
-    cmd, code, output, timed_out = run_tests(repo, run_files, repo.top)
+    return merge_base, changed, tests
+
+
+def print_refused(args, why, tests, cmd, code, output):
+    if args.json:
+        print(json.dumps({"refused": why, "cmd": cmd, "exit": code, "tail": tail(output)}, indent=2,
+                         ensure_ascii=False))
+    else:
+        print(f"{why}: {len(tests)} test files, exit {code}")
+        print(tail(output))
+
+
+def run_red(repo, args, tests, run_files, cwd, again):
+    """(cmd, exit, output) of the test command on `run_files` in `cwd`. A timeout or a run that proves nothing is
+    refused with nothing recorded; the refusal says to run `harness-red <again>` again."""
+    cmd, code, output, timed_out = run_tests(repo, run_files, cwd)
     if timed_out:
         raise Problem(f"{cmd} timed out after {timed_out:g}s and was stopped; no red run recorded. "
                       "Raise HARNESS_TEST_TIMEOUT or fix the hang.")
     why = unproven(code, output)
     if why:
-        if args.json:
-            print(json.dumps({"refused": why, "cmd": cmd, "exit": code, "tail": tail(output)}, indent=2,
-                             ensure_ascii=False))
-        else:
-            print(f"{why}: {len(tests)} test files, exit {code}")
-            print(tail(output))
+        print_refused(args, why, tests, cmd, code, output)
         fix = ("make the test files define tests the command collects" if why == NO_TESTS
                else "fix the error its output shows")
-        raise Problem(f"no red run recorded: {why} (exit {code}); {fix}, then run harness-red check again.")
+        raise Problem(f"no red run recorded: {why} (exit {code}); {fix}, then run harness-red {again} again.")
+    return cmd, code, output
+
+
+def save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output):
+    """Write the side file, then the record, of this run; print it. Returns its kind."""
     kind = kind_of(code, output)
     record = {"branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
-              "test_hash": digest, "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),
+              "test_hash": tests_hash(contents), "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),
               "at": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
     save_red_files(repo.record_path, contents)       # first: a record never names files the side file lacks
     write_json(repo.record_path, record, prefix=".red-")
@@ -489,8 +498,62 @@ def cmd_check(repo, args):
     else:
         print(f"red ({kind}): {len(tests)} test files, exit {code}")
         print(record["tail"])
-    if kind == "green":
+    return kind
+
+
+def cmd_check(repo, args):
+    note = no_tests_message(repo)
+    if note:
+        print_no_tests(note, args.json)
+        return 0
+    merge_base, changed, tests = test_changes(repo, args.base)
+    sources = [p for p in changed if repo.classify(p) == "source"]
+    if sources:
+        raise Problem(f"Source already changed before the red run: {', '.join(sources)}. "
+                      "Revert them or move them to the coder step.")
+    run_files = runnable(tests)
+    contents = read_files(repo.top, tests)         # the bytes the run proves, hashed and kept beside the record
+    cmd, code, output = run_red(repo, args, tests, run_files, repo.top, "check")
+    if save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output) == "green":
         raise Problem(GREEN)
+    return 0
+
+
+def cmd_reprove(repo, args):
+    """check for a branch that already has source: the branch's test files as they are now, run against main's
+    code at the merge base in a temporary detached worktree. Only a red run replaces the record."""
+    note = no_tests_message(repo)
+    if note:
+        print_no_tests(note, args.json)
+        return 0
+    load_record(repo)                              # it re-proves a red run; without one, check comes first
+    merge_base, changed, tests = test_changes(repo, args.base)
+    run_files = runnable(tests)
+    contents = read_files(repo.top, tests)
+    gone = [p for p in changed if repo.classify(p) == "test" and not os.path.lexists(os.path.join(repo.top, p))]
+    tmp = tempfile.mkdtemp(prefix="harness-red-reprove-")
+    path = os.path.join(tmp, repo.slug)
+    try:
+        git(repo.top, "worktree", "add", "--detach", path, merge_base)
+        for name, data in contents.items():        # the bytes hashed are the bytes run
+            dst = os.path.join(path, name)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as fh:
+                fh.write(data)
+        for name in gone:                          # test files the branch deleted are gone there too
+            if os.path.lexists(os.path.join(path, name)):
+                os.remove(os.path.join(path, name))
+        cmd, code, output = run_red(repo, args, tests, run_files, path, "reprove")
+    finally:
+        if git(repo.top, "worktree", "remove", "--force", path, check=False).returncode != 0:
+            shutil.rmtree(path, ignore_errors=True)
+            git(repo.top, "worktree", "prune", check=False)
+        shutil.rmtree(tmp, ignore_errors=True)
+    if code == 0:
+        print_refused(args, "green", tests, cmd, code, output)
+        raise Problem(f"Tests pass against main's code at the merge base {merge_base[:12]}: they prove nothing; "
+                      "the red record is kept.")
+    save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output)
     return 0
 
 
@@ -797,10 +860,13 @@ def parser():
     as_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
     ap = Parser(prog="harness-red", description="Proves a ticket's tests fail before the implementation exists.")
     ap.add_argument("--worktree", metavar="PATH", help="the ticket worktree (default: the cwd)")
-    ap.add_argument("--json", action="store_true", help="print JSON (check, status, files, verify)")
-    sub = ap.add_subparsers(dest="cmd", metavar="{check,status,files,run,scratch,verify}")
+    ap.add_argument("--json", action="store_true", help="print JSON (check, reprove, status, files, verify)")
+    sub = ap.add_subparsers(dest="cmd", metavar="{check,reprove,status,files,run,scratch,verify}")
     check = sub.add_parser("check", parents=[common, as_json], help="run the branch's test changes and record red")
     check.add_argument("--base", metavar="REF", help="default: origin/main when it exists, else main")
+    reprove = sub.add_parser("reprove", parents=[common, as_json],
+                             help="re-prove the branch's test files against main's code at the merge base")
+    reprove.add_argument("--base", metavar="REF", help="default: origin/main when it exists, else main")
     sub.add_parser("status", parents=[common, as_json], help="the red record for this branch")
     files = sub.add_parser("files", parents=[common, as_json], help="the branch's own test files")
     files.add_argument("--base", metavar="REF", help="default: origin/main when it exists, else main")
@@ -826,12 +892,12 @@ def main():
     ap = parser()
     args = ap.parse_args()
     if not args.cmd:
-        ap.error("choose a subcommand: check, status, files, run, scratch or verify")
+        ap.error("choose a subcommand: check, reprove, status, files, run, scratch or verify")
     if args.cmd == "scratch" and not args.scratch_cmd:
         ap.error("choose scratch create, run or remove")
     for sig in (signal.SIGTERM, signal.SIGHUP):             # unwind, so a running test command is killed too
         signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
-    commands = {"check": cmd_check, "status": cmd_status, "files": cmd_files, "run": cmd_run,
+    commands = {"check": cmd_check, "reprove": cmd_reprove, "status": cmd_status, "files": cmd_files, "run": cmd_run,
                 "scratch create": cmd_scratch_create, "scratch run": cmd_scratch_run,
                 "scratch remove": cmd_scratch_remove, "verify": cmd_verify}
     try:
