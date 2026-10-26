@@ -2550,8 +2550,12 @@ class ToolsRunTheLib(unittest.TestCase):
         board = load_tool(BIN / "harness-board")
         board.gh_json = lambda repo, args: copy.deepcopy(issue)
         self.spy(board, self.text.now_iso, "now_iso")
+        # a blank routing variable counts as unset, so the developer's own HARNESS_CODE_TIER cannot replace the labels
+        routing = {k: "" for k in ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER",
+                                   "HARNESS_ULTRAREVIEW", "HARNESS_WAVE_REVIEW")}
         before = int(time.time())
-        record = board.fetch_record(None, 7)
+        with mock.patch.dict(os.environ, routing):
+            record = board.fetch_record(None, 7)
         after = int(time.time())
         self.assertEqual(len(self.called("now_iso")), 1)
         stamp = record["fetched_at"]
