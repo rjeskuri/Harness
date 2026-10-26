@@ -74,7 +74,7 @@ On GitHub you see the work in two places. The ticket gets comments as it moves: 
 
 ## Your two jobs
 
-**Answer needs-input tickets.** When the agents cannot answer a question from the ticket, the epic or the code, they stop and ask. The ticket gets `status:needs-input` and a comment headed **Needs your input** with the question and the evidence, and you get a notification. Reply in a comment on the issue. `/harness:work N` reads your newest comment as the answer and carries on.
+**Answer needs-input tickets.** The agents stop and ask only when the ticket, the epic and the code cannot answer a question that is about product behavior, is hard to undo, or touches security, credentials or personal data. A reversible implementation choice the ticket leaves open is decided and recorded as a `Ruling:` line under `### Rulings` in the PR's Notes; overrule one in a review comment on the PR. For a question, the ticket gets `status:needs-input` and a comment headed **Needs your input** with the question and the evidence, and you get a notification. Reply in a comment on the issue. `/harness:work N` reads your newest comment as the answer and carries on.
 
 **Review pull requests.** Agents open PRs under your GitHub account, so GitHub will not let you approve them; landing is the approval. Read the PR, leave review comments where something should change, and run `/harness:work N` again: it gives the coder your unresolved threads, pushes, waits for checks and answers each thread with what changed. When it is right, `/harness:land <P>`.
 
