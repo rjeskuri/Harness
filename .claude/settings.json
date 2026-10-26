@@ -1,7 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "env": {
-    "CLAUDE_VERIFY_CMD": "python3 -m unittest discover -s plugins/harness/tests"
+    "CLAUDE_VERIFY_CMD": "python3 -m unittest discover -s plugins/harness/tests",
+    "HARNESS_ULTRAREVIEW": "off"
   },
   "permissions": {
     "allow": [
