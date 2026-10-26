@@ -70,7 +70,7 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
-    from harness_lib.cli import Parser, Problem, emit, run_main, table, warn
+    from harness_lib.cli import Parser, Problem, emit, exit_problem, run_main, table, warn
     from harness_lib.text import (as_list, first_line, harness_home, home, last_line, one_line, parse_iso, read_json,
                                   now_iso, read_text, write_json, write_text)
     from harness_lib.notify import notify
@@ -1936,7 +1936,7 @@ def main():
         code = COMMANDS[args.cmd](args)
     except Problem as err:
         sys.stdout.flush()
-        sys.exit(f"harness-pr: {one_line(err)}")
+        exit_problem("harness-pr", err)
     sys.exit(code)
 
 

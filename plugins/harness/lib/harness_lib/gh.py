@@ -1,6 +1,7 @@
 """The gh helpers the bin tools share (and session_brief's gh lookup and environment): which gh to
 run, the environment it runs in, an origin URL as a `gh -R` slug, the sequential wrappers
-harness-board, harness-pr and harness-work run gh through (describe, gh_run, gh, gh_json), and
+harness-board, harness-pr and harness-work run gh through (describe, gh_run, gh, gh_json; gh_run waits out a
+rate-limit pause and runs a refused call again, ghlimit), rate_limits (one `gh api rate_limit`), and
 GhBatch, the gh calls harness-standup and harness-digest start side by side under one deadline.
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
@@ -17,7 +18,7 @@ import subprocess
 import time
 
 from harness_lib.cli import Problem
-from harness_lib.ghlimit import log_call, ms_since
+from harness_lib.ghlimit import log_call, ms_since, pause_info, record_refusal, refused, wait_for_clear
 from harness_lib.text import first_line
 
 GH_ENV = {"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"}
@@ -98,24 +99,66 @@ def _text(texts, key, args, describe, exe, **fields):
 def gh_run(args, cwd, stdin=None, timeout=60, *, errors="replace", env=None, describe=describe, texts=None):
     """Run gh_exe() with `args` in `cwd` (None: the current directory), `stdin` as its input (None: /dev/null), in
     os.environ plus `env` (None: prompts disabled). The CompletedProcess, output decoded as utf-8 with `errors`,
-    whatever the exit; Problem when gh is missing, cannot start or runs past `timeout` seconds. A call that ran
-    is logged (ghlimit), with exit null when it timed out."""
+    whatever the exit; Problem when gh is missing, cannot start or runs past `timeout` seconds. It first waits
+    while a pause is ahead (ghlimit); a call GitHub refuses for a rate limit records a pause (probing rate_limits
+    when none is ahead yet), waits it out and runs the same argv again; GhPaused when a pause outlasts what this
+    process may still wait. Each attempt that ran is logged (ghlimit) with its waited_ms and refused, with exit
+    null when it timed out."""
     exe = gh_exe()
     io = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
     extra = env if env is not None else {"GH_PROMPT_DISABLED": "1"}
+    waited = wait_for_clear()
+    while True:
+        started = time.monotonic()
+        try:
+            done = subprocess.run([exe] + list(args), cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+                                  errors=errors, timeout=timeout, env=dict(os.environ, **extra), **io)
+        except FileNotFoundError:
+            raise Problem(_text(texts, "not_found", args, describe, exe)) from None
+        except OSError as err:
+            raise Problem(_text(texts, "cannot_run", args, describe, exe, why=err.strerror or err)) from None
+        except subprocess.TimeoutExpired:
+            log_call(args, cwd=cwd, exit=None, ms=ms_since(started), waited_ms=waited * 1000)
+            raise Problem(_text(texts, "timed_out", args, describe, exe, timeout=timeout)) from None
+        refusal = done.returncode != 0 and refused(done.stderr)
+        log_call(args, cwd=cwd, exit=done.returncode, ms=ms_since(started), waited_ms=waited * 1000, refused=refusal)
+        if not refusal:
+            return done
+        ahead = pause_info()
+        probed = rate_limits(cwd) if ahead is None or ahead["until_s"] <= time.time() else None
+        waited = wait_for_clear(at_least=record_refusal(done.stderr, probed))
+
+
+def rate_limits(cwd=None):
+    """{"graphql": {"remaining", "limit", "reset"}, "core": {...}} (ints, reset in epoch seconds) from one
+    `gh api rate_limit` with prompts disabled and a 10 s timeout, run outside gh_run's waiting and logged; None
+    on any failure or another shape."""
+    args = ["api", "rate_limit"]
     started = time.monotonic()
     try:
-        done = subprocess.run([exe] + list(args), cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-                              errors=errors, timeout=timeout, env=dict(os.environ, **extra), **io)
-    except FileNotFoundError:
-        raise Problem(_text(texts, "not_found", args, describe, exe)) from None
-    except OSError as err:
-        raise Problem(_text(texts, "cannot_run", args, describe, exe, why=err.strerror or err)) from None
+        done = subprocess.run([gh_exe()] + args, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=10, stdin=subprocess.DEVNULL,
+                              env=dict(os.environ, GH_PROMPT_DISABLED="1"))
     except subprocess.TimeoutExpired:
         log_call(args, cwd=cwd, exit=None, ms=ms_since(started))
-        raise Problem(_text(texts, "timed_out", args, describe, exe, timeout=timeout)) from None
+        return None
+    except OSError:
+        return None
     log_call(args, cwd=cwd, exit=done.returncode, ms=ms_since(started))
-    return done
+    if done.returncode != 0:
+        return None
+    try:
+        resources = json.loads(done.stdout).get("resources")
+        out = {}
+        for bucket in ("graphql", "core"):
+            part = resources[bucket]
+            values = {key: part[key] for key in ("remaining", "limit", "reset")}
+            if not all(isinstance(v, int) and not isinstance(v, bool) for v in values.values()):
+                return None
+            out[bucket] = values
+        return out
+    except (ValueError, AttributeError, KeyError, TypeError):
+        return None
 
 
 def gh(args, cwd, stdin=None, timeout=60, *, pick=first_line, errors="replace", env=None, describe=describe,

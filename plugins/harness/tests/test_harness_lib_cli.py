@@ -59,7 +59,7 @@ TEXT_PY = LIB / "harness_lib" / "text.py"
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 UTC = dt.timezone.utc
 
-CLI_NAMES = ("Problem", "Parser", "run_main", "emit", "table", "issue_number", "warn")
+CLI_NAMES = ("Problem", "Parser", "run_main", "exit_problem", "emit", "table", "issue_number", "warn")
 TEXT_NAMES = (
     "one_line", "first_line", "last_line", "as_list", "read_text", "read_json", "write_json",
     "write_text", "home", "harness_home", "now_iso", "parse_iso", "parse_iso_seconds",
@@ -74,12 +74,13 @@ MOVED = (
 USED = {
     "harness-board": {
         "Problem": "cli", "Parser": "cli", "table": "cli", "emit": "cli", "issue_number": "cli", "warn": "cli",
+        "exit_problem": "cli",
         "one_line": "text", "first_line": "text", "home": "text", "now_iso": "text",
         "parse_iso": "text", "as_list": "text", "read_text": "text", "write_json": "text",
         "read_json": "text", "harness_home": "text",
     },
     "harness-pr": {
-        "Problem": "cli", "Parser": "cli", "table": "cli", "warn": "cli", "emit": "cli",
+        "Problem": "cli", "Parser": "cli", "table": "cli", "warn": "cli", "emit": "cli", "exit_problem": "cli",
         "one_line": "text", "first_line": "text", "last_line": "text", "home": "text",
         "parse_iso": "text", "as_list": "text", "read_text": "text", "write_text": "text",
         "read_json": "text", "harness_home": "text", "write_json": "text",
@@ -1780,6 +1781,11 @@ def execute(label, entry):
         sys.exit(f"{label}: {type(e).__name__}: {squash(e)}")
     sys.exit(0)
 ''',
+    "exit_problem": r'''
+def bail(label, e):
+    print(f"{label}: {squash(e)}", file=sys.stderr)
+    sys.exit(getattr(e, "exit_code", 1))
+''',
     "emit": r'''
 def show(flag, payload, words):
     print(json.dumps(payload, indent=2, ensure_ascii=False) if flag else words)
@@ -2645,9 +2651,20 @@ class ToolsRunTheLib(unittest.TestCase):
 
     def test_board_main_ends_a_problem_as_one_line(self):
         """main() is the zero-argument callable run_main takes; a Problem under it ends as `harness-board: <one
-        line>` either in main (through the lib's one_line) or by reaching run_main as the lib's Problem."""
+        line>` on stderr with the Problem's exit code (1) either in main (through the lib's exit_problem and
+        one_line, #189) or by reaching run_main as the lib's Problem."""
         board = load_tool(BIN / "harness-board")
         self.spy(board, self.text.one_line, "one_line")
+        calls, lib_one_line = self.calls, self.text.one_line
+
+        def recorder(*args, **kwargs):          # the shared cli module: patched for this test only
+            calls.append(("one_line", args, kwargs))
+            return lib_one_line(*args, **kwargs)
+
+        patcher = mock.patch.object(self.cli, "one_line", recorder)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.spy(board, self.cli.exit_problem, "exit_problem")
         missing = os.path.join(self.tmp, "no such\nrepo")
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
@@ -2656,7 +2673,9 @@ class ToolsRunTheLib(unittest.TestCase):
                 board.main()
         self.assertEqual(out.getvalue(), "")
         if isinstance(ctx.exception, SystemExit):
-            self.assertEqual(ctx.exception.code, f"harness-board: not a directory: {' '.join(missing.split())}")
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertEqual(err.getvalue(), f"harness-board: not a directory: {' '.join(missing.split())}\n")
+            self.assertEqual(self.given("exit_problem"), ["harness-board"], self.calls)
             self.assertTrue(any(isinstance(given, self.cli.Problem) for given in self.given("one_line")), self.calls)
         else:
             self.assertEqual(str(ctx.exception), f"not a directory: {missing}")

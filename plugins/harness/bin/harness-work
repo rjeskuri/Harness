@@ -138,7 +138,7 @@ try:
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
     from harness_lib.routing import EFFORTS, cached_code_route, code_route, load_routing, next_route, review_route
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, patterns, setting, settings_env
-    from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
+    from harness_lib.cli import Parser, Problem, emit, exit_problem, issue_number, run_main, table
     from harness_lib import cost, reviews
     from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
     from harness_lib.text import write_json as _write_json
@@ -1954,7 +1954,7 @@ def main():
                        "cloud": cmd_cloud, "worktrees": cmd_worktrees, "worktree": cmd_worktree_remove}[args.cmd]
             command(open_repo(args.repo), args)
     except Problem as err:
-        sys.exit(f"harness-work: {one_line(err)}")
+        exit_problem("harness-work", err)
 
 
 if __name__ == "__main__":

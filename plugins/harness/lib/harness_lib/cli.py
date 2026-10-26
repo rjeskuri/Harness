@@ -1,6 +1,7 @@
 """The command-line boilerplate every harness tool shares: one Problem, one Parser, the
 `__main__` tail (run_main), warnings, JSON-or-text output, tables and issue-number arguments.
-A tool's contract (docs/design.md): a failure is one line on stderr and exit 1, never a traceback.
+A tool's contract (docs/design.md): a failure is one line on stderr and exit 1 (a Problem's own exit_code, 75 for
+a gh pause), never a traceback.
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -17,7 +18,9 @@ from harness_lib.text import one_line
 
 
 class Problem(Exception):
-    """A bad invocation, a failed precondition or a failed call: printed as one line, exit 1."""
+    """A bad invocation, a failed precondition or a failed call: printed as one line, exit `exit_code`."""
+
+    exit_code = 1
 
 
 class Parser(argparse.ArgumentParser):
@@ -28,8 +31,8 @@ class Parser(argparse.ArgumentParser):
 
 
 def run_main(prog: str, main: Callable[[], object]) -> NoReturn:
-    """Run a tool's main(): a Problem is `<prog>: <one line>`, any other Exception
-    `<prog>: <TypeName>: <one line>`, both exit 1; Ctrl-C exits 130; a reader that went away
+    """Run a tool's main(): a Problem is `<prog>: <one line>` and exits with its exit_code, any other Exception
+    `<prog>: <TypeName>: <one line>` and exits 1; Ctrl-C exits 130; a reader that went away
     (`| head`) stops it quietly with exit 1. SystemExit passes through."""
     try:
         main()
@@ -39,10 +42,16 @@ def run_main(prog: str, main: Callable[[], object]) -> NoReturn:
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         sys.exit(1)
     except Problem as err:
-        sys.exit(f"{prog}: {one_line(err)}")
+        exit_problem(prog, err)
     except Exception as err:                     # never a traceback: one line, exit 1
         sys.exit(f"{prog}: {type(err).__name__}: {one_line(err)}")
     sys.exit(0)
+
+
+def exit_problem(prog: str, err: Problem) -> NoReturn:
+    """`<prog>: <err on one line>` on stderr, then exit with the error's exit_code (1 unless it says otherwise)."""
+    print(f"{prog}: {one_line(err)}", file=sys.stderr)
+    sys.exit(getattr(err, "exit_code", 1))
 
 
 def warn(prog, message):

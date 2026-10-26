@@ -58,7 +58,7 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
-    from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table, warn
+    from harness_lib.cli import Parser, Problem, emit, exit_problem, issue_number, run_main, table, warn
     from harness_lib.text import (as_list, first_line, harness_home, home, now_iso, one_line, parse_iso, read_json,
                                   read_text, write_json)
     from harness_lib.notify import notify
@@ -1215,7 +1215,7 @@ def main():
             sys.exit(PROJECT_COMMANDS[name](args))
         COMMANDS[name](open_repo(getattr(args, "repo", None)), args)
     except Problem as err:
-        sys.exit(f"harness-board: {one_line(err)}")
+        exit_problem("harness-board", err)
 
 
 if __name__ == "__main__":
