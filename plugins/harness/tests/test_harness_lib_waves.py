@@ -203,7 +203,8 @@ class Base(unittest.TestCase):
         create_wave(key, main, [its number], "opus", "high", at=when). Returns the records they print."""
         gate = Path(tempfile.mkdtemp(prefix="gate-", dir=str(self.tmp)))
         go = gate / "go"
-        env = dict(os.environ, HOME=self.home, PYTHONDONTWRITEBYTECODE="1")
+        env = dict({k: v for k, v in os.environ.items() if k != "HARNESS_SESSION_PROJECT"},
+                   HOME=self.home, PYTHONDONTWRITEBYTECODE="1")
         procs = []
         try:
             for n in range(1, count + 1):

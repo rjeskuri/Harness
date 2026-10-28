@@ -189,7 +189,8 @@ class Drift(unittest.TestCase):
 
     def setUp(self):
         self.saved = {n: getattr(settings, n) for n in DEFAULTS}
-        self.env = {k: os.environ.pop(k) for k in ("HARNESS_TEST_PATTERNS", "HARNESS_SOURCE_EXEMPT")
+        self.env = {k: os.environ.pop(k) for k in ("HARNESS_TEST_PATTERNS", "HARNESS_SOURCE_EXEMPT",
+                                                   "HARNESS_SESSION_PROJECT")
                     if k in os.environ}
         settings.DEFAULT_SOURCE_EXEMPT = SENTINEL_EXEMPT
         settings.DEFAULT_TEST_PATTERNS = SENTINEL_TEST

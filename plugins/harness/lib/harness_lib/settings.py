@@ -1,7 +1,8 @@
 """Settings and globs every harness tool and hook reads: the `env` object of a project's
 .claude settings files (or of the settings.json committed at a ref), one setting from the
-environment or that object, a comma-separated pattern list, and the repo-relative glob matcher
-behind HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT. See docs/design.md (harness_lib).
+environment or that object (or from the object alone when the session is another project's),
+a comma-separated pattern list, and the repo-relative glob matcher behind HARNESS_TEST_PATTERNS
+and HARNESS_SOURCE_EXEMPT. See docs/design.md (harness_lib).
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -12,6 +13,9 @@ import fnmatch
 import json
 import os
 import subprocess
+
+from harness_lib.paths import canonical_path
+from harness_lib.repo import main_checkout
 
 GIT_TIMEOUT = 10  # seconds committed_env's git show may take
 # The defaults of HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT when a project sets none: the one
@@ -64,11 +68,44 @@ def setting(name, file_env):
     value = os.environ.get(name)
     if value is not None and value.strip():
         return value.strip()
+    return setting_from(name, file_env)
+
+
+def setting_from(name, file_env):
+    """The settings files' `env` alone (a string or number, never a bool); stripped, and None
+    when unset or blank."""
     value = file_env.get(name)
     if isinstance(value, (str, int, float)) and not isinstance(value, bool):
         text = str(value).strip()
         return text or None
     return None
+
+
+def claude_project_dir():
+    """CLAUDE_PROJECT_DIR, the session's project as Claude Code gives it to a hook process, never
+    the event's cwd; None when unset or empty."""
+    return os.environ.get("CLAUDE_PROJECT_DIR") or None
+
+
+def other_project(main):
+    """Is the session another project's? The session's project is HARNESS_SESSION_PROJECT (which
+    session_brief exports through CLAUDE_ENV_FILE to the session's Bash calls), else
+    CLAUDE_PROJECT_DIR (set for hook processes only), a blank one counting as unset. True when
+    it names a folder whose main checkout is not `main` (a canonical main checkout, as repo_facts
+    gives it): another repository, a folder outside any repository, or one git cannot read. Both
+    unset or blank, the main checkout itself (any spelling), a worktree of it or a folder inside
+    one: False."""
+    project = ((os.environ.get("HARNESS_SESSION_PROJECT") or "").strip()
+               or (os.environ.get("CLAUDE_PROJECT_DIR") or "").strip())
+    if not project or canonical_path(project) == main:
+        return False
+    return main_checkout(project) != main
+
+
+def project_setting(name, file_env, foreign):
+    """setting(), except that in another project's session (`foreign`, from other_project) the
+    environment carries that project's settings, so only this repository's `env` counts."""
+    return setting_from(name, file_env) if foreign else setting(name, file_env)
 
 
 def patterns(text):

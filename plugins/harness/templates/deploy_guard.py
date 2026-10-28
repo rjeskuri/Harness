@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Written by the harness: the project's ruff lint and format rules skip it.
+# ruff: noqa
+# ruff: noqa: PGH004
+# fmt: off
 """
 The deploy guard: deploy a merge to main and check it live; when the live smoke check fails, revert the merge,
 redeploy, check again and tell the owner.
