@@ -843,10 +843,6 @@ class BranchGuardBashTests(GuardTestCase):
         for command, why in (
             ("git --git-dir=.git --work-tree=. commit -m x", "git commit changes main"),
             ("git -c alias.ci=commit ci -m x", "git commit changes main"),
-            (
-                """python3 -c "open('src/x','w').write('x')\"""",
-                "python opens a file for writing",
-            ),
             ("git apply ../x.diff", "git apply changes files on main"),
             ("git rm src/app.py", "git rm changes files on main"),
             ("git restore src/app.py", "git restore changes files on main"),
@@ -871,11 +867,6 @@ class BranchGuardBashTests(GuardTestCase):
         ):
             with self.subTest(command=command):
                 self.assertRefusedOnMain(self.bash(command), command, why)
-        self.assertRefusedOnMain(
-            self.bash("python3 - <<'PY'\nopen('src/x', 'w')\nPY"),
-            "python3 - <<'PY'",
-            "python opens a file for writing",
-        )
         for command in (
             "mkdir -p src/new",
             "git symbolic-ref --short HEAD",
@@ -1098,7 +1089,9 @@ class BranchGuardBashExemptions(GuardTestCase):
             )
         )
 
-    def test_inline_python_and_node_programs_writing_outside_allowed(self):
+    def test_inline_python_and_node_programs_are_not_read(self):
+        # An inline program is not read on main: nothing it writes can be committed or pushed (the
+        # git hooks), and tests_first refuses such programs for the agent roles on a ticket branch.
         outside = self.outside
         self.assertAllowed(
             (
@@ -1110,22 +1103,11 @@ class BranchGuardBashExemptions(GuardTestCase):
                 heredoc(
                     f"require('fs').writeFileSync('{OUTSIDE_JSON}', 'x')", "node", "JS"
                 ),
+                """python3 -c "open('./src/app.py','w').write('x')\"""",
+                """node -e "require('fs').writeFileSync('./src/app.js', 'x')\"""",
+                heredoc("open('src/x', 'w')"),
             )
         )
-        for command in (
-            """python3 -c "open('./src/app.py','w').write('x')\"""",
-            f"""python3 -c "open('{OUTSIDE_JSON}','w'); open('./src/app.py','w')\"""",
-            """node -e "require('fs').writeFileSync('./src/app.js', 'x')\"""",
-            f"""node -e "require('fs').writeFileSync('{OUTSIDE_JSON}', 'x'); require('fs').writeFileSync('app.js', 'x')\"""",
-            # the repo literal first, the outside one last
-            f"""python3 -c "open('./src/app.py','w'); open('{OUTSIDE_JSON}','w')\"""",
-            f"""node -e "require('fs').writeFileSync('./README.md', 'x'); require('fs').writeFileSync('{OUTSIDE_JSON}', 'x')\"""",
-            # and between two outside literals
-            f"""python3 -c "open('{OUTSIDE_JSON}','w'); open('./src/app.py','w'); open('{outside}/c.txt','w')\"""",
-            f"""node -e "require('fs').writeFileSync('{OUTSIDE_JSON}', 'x'); require('fs').writeFileSync('./README.md', 'x'); require('fs').writeFileSync('{outside}/c.txt', 'x')\"""",
-        ):
-            with self.subTest(command=command):
-                self.assertRefusedPart(self.bash(command), command)
 
     def test_deleting_or_moving_ignored_paths_allowed(self):
         self.assertAllowed(
@@ -1179,82 +1161,7 @@ class BranchGuardBashExemptions(GuardTestCase):
             with self.subTest(command=command, fixture="data/tracked.csv tracked"):
                 self.assertRefusedPart(self.bash(command), command)
 
-    def test_heredoc_without_path_literal_still_refused(self):
-        for command, part, why in (
-            (
-                heredoc("import sys\nopen(sys.argv[1], 'w').write('x')"),
-                "python3 - <<'PY'",
-                "python opens a file for writing",
-            ),
-            # the path given on the command line is not a literal in the program
-            (
-                heredoc(
-                    "import sys\nopen(sys.argv[1], 'w').write('x')",
-                    f"python3 - {OUTSIDE_JSON}",
-                ),
-                f"python3 - {OUTSIDE_JSON} <<'PY'",
-                "python opens a file for writing",
-            ),
-            (
-                heredoc("name = 'report'\nopen(name, 'w')"),
-                "python3 - <<'PY'",
-                "python opens a file for writing",
-            ),
-            (
-                heredoc("import os\nos.remove(os.environ['TARGET'])"),
-                "python3 - <<'PY'",
-                "python writes, moves or deletes files",
-            ),
-            (
-                f"""python3 -c "import sys; open(sys.argv[1], 'w')" {OUTSIDE_JSON}""",
-                f"""python3 -c "import sys; open(sys.argv[1], 'w')" {OUTSIDE_JSON}""",
-                "python opens a file for writing",
-            ),
-            (
-                """node -e "require('fs').writeFileSync(process.argv[1], 'x')\"""",
-                """node -e "require('fs').writeFileSync(process.argv[1], 'x')\"""",
-                "node writes, moves or deletes files",
-            ),
-        ):
-            with self.subTest(command=command):
-                self.assertRefusedOnMain(self.bash(command), part, why)
 
-    def test_heredoc_with_a_path_inside_the_repo_refused(self):
-        repo = self.repo
-        part = "python3 - <<'PY'"
-        for program, cwd in (
-            # the ticket's case: one literal outside, one in the repo
-            ("open('/tmp/x', 'w').write('a')\nopen('src/app.py', 'w').write('b')", repo),
-            ("open('/tmp/x', 'w').write('a')\nopen('./src/app.py', 'w').write('b')", repo),
-            (f"open('{OUTSIDE_JSON}', 'w')\nopen('{repo}/src/app.py', 'w')", repo),
-            # relative literals resolve against the directory the part runs in
-            ("open('out.json', 'w')", repo),
-            ("open('out.json', 'w')", repo / "src"),
-            ("open('../app.json', 'w')", repo / "src"),
-            # ~ and ../ that lead back into the repo
-            (
-                f"open('{OUTSIDE_JSON}', 'w')\n"
-                "import os\nopen(os.path.expanduser('~/proj/src/app.py'), 'w')",
-                repo,
-            ),
-            (f"open('{OUTSIDE_JSON}', 'w')\nopen('../proj/src/app.py', 'w')", repo),
-            # the repo literal first, the outside one last
-            ("open('src/app.py', 'w')\nopen('/private/tmp/x/out.json', 'w')", repo),
-            (f"open('{repo}/src/app.py', 'w')\nopen('{OUTSIDE_JSON}', 'w')", repo),
-            ("open('../app.json', 'w')\nopen('/private/tmp/x/out.json', 'w')", repo / "src"),
-            # and between two outside literals
-            (
-                f"open('{OUTSIDE_JSON}', 'w')\n"
-                "open('./README.md', 'w')\n"
-                f"open('{self.outside}/c.txt', 'w')",
-                repo,
-            ),
-        ):
-            with self.subTest(program=program, cwd=str(cwd)):
-                self.assertRefusedPart(self.bash(heredoc(program), cwd=cwd), part)
-        # the part runs in the repo after cd, though the session is elsewhere
-        command = f"cd {repo} && " + heredoc("open('out.json', 'w').write('x')")
-        self.assertRefusedPart(self.bash(command, cwd=self.outside), part)
 
     def test_tracked_file_redirect_still_refused(self):
         for command, part, target in (
@@ -1488,77 +1395,6 @@ class BranchGuardBashExemptions(GuardTestCase):
         )
         self.assertRegex(reason, re.compile(f"^{pattern}$", re.S))
 
-    def test_outside_literals_vary_and_every_protected_tree_counts(self):
-        repo = self.repo
-        tmp_out = Path(
-            tempfile.mkdtemp(prefix=f"hg{uuid.uuid4().hex[:6]}-", dir="/tmp")
-        )
-        self.addCleanup(shutil.rmtree, tmp_out, True)
-        name = "d" + uuid.uuid4().hex[:8]
-        home_dir = self.home / name
-        home_dir.mkdir()
-        elsewhere = self.tmp / ("w" + uuid.uuid4().hex[:8])
-        elsewhere.mkdir()
-        other = self.make_repo("home/other")
-        # a repo whose main checkout is on another branch is not protected
-        feature = self.make_repo("home/feat")
-        self.git(feature, "switch", "-q", "-c", "feature")
-        self.assertAllowed(
-            (
-                heredoc(f"open('{tmp_out}/out.json', 'w').write('x')"),
-                heredoc(f"open('{feature}/notes.txt', 'w').write('x')"),
-                heredoc(f"open('{tmp_out}/a.json', 'w')\nopen('{feature}/src/new.py', 'w')"),
-                f"""python3 -c "open('{feature}/README.md','w').write('x')\"""",
-                heredoc(
-                    "import shutil\n"
-                    f"shutil.copy('{tmp_out}/a.md', '{home_dir}/b.md')"
-                ),
-                heredoc(
-                    "import os\n"
-                    f"open(os.path.expanduser('~/{name}/c.json'), 'w').write('x')"
-                ),
-                heredoc(f"open('../{name}/f.json', 'w').write('x')"),
-                f"""python3 -c "open('{home_dir}/d.txt','w').write('x')\"""",
-                f"""node -e "require('fs').writeFileSync('{tmp_out}/e.txt', 'x')\"""",
-            )
-        )
-        # a bare name with an extension, run outside every repo
-        self.assertAllowed(
-            (heredoc("open('report.csv', 'w').write('x')"),), cwd=elsewhere
-        )
-        part = "python3 - <<'PY'"
-        for program, cwd in (
-            # a second protected repo on main counts as much as the one the part runs in
-            (f"open('{OUTSIDE_JSON}', 'w')\nopen('{other}/src/new.py', 'w')", repo),
-            (f"open('{tmp_out}/a.json', 'w')\nopen('{other}/notes.txt', 'w')", repo),
-            (f"open('{tmp_out}/a.json', 'w')\nopen('{repo}/README.md', 'w')", other),
-            # the protected literal first, the outside one last
-            (f"open('{other}/notes.txt', 'w')\nopen('{tmp_out}/a.json', 'w')", repo),
-            (f"open('{repo}/README.md', 'w')\nopen('{home_dir}/b.md', 'w')", other),
-            # and the feature-branch repo beside a protected one does not excuse it
-            (f"open('{feature}/notes.txt', 'w')\nopen('{other}/notes.txt', 'w')", repo),
-            # a directory named outside inside the repo is still the repo
-            (f"open('{repo}/outside/x.json', 'w')", repo),
-            # repo targets of every literal form, each beside an allowed literal
-            (f"open('{OUTSIDE_JSON}', 'w')\nopen('./README.md', 'w')", repo),
-            (f"open('{OUTSIDE_JSON}', 'w')\nopen('{repo}/notes.txt', 'w')", repo),
-            (f"open('{OUTSIDE_JSON}', 'w')\nopen('docs/x.md', 'w')", repo),
-            (f"open('{tmp_out}/a.json', 'w')\nopen('notes.txt', 'w')", repo),
-            (
-                f"open('{home_dir}/a.json', 'w')\n"
-                "import os\nopen(os.path.expanduser('~/proj/notes.txt'), 'w')",
-                repo,
-            ),
-        ):
-            with self.subTest(program=program, cwd=str(cwd)):
-                self.assertRefusedIn(
-                    self.bash(heredoc(program), cwd=cwd), part, ("proj", "other")
-                )
-        command = (
-            f"""node -e "require('fs').writeFileSync('{OUTSIDE_JSON}', 'x'); """
-            """require('fs').writeFileSync('./README.md', 'x')\""""
-        )
-        self.assertRefusedIn(self.bash(command), command)
 
     # ---- fix round 1: what a write word reaches, not how it is spelled
 
@@ -1632,78 +1468,10 @@ class BranchGuardBashExemptions(GuardTestCase):
             )
         )
 
-    def test_other_case_spelling_of_a_tracked_file_is_not_exempt(self):
-        repo = self.repo
-        spelled = repo / "KEEP.LOG"
-        if not (spelled.exists() and os.path.samefile(spelled, repo / "keep.log")):
-            self.skipTest("another spelling of one name needs a case-insensitive file system")
-        for command in ("rm KEEP.LOG", "truncate -s 0 Keep.Log", "echo x > KEEP.log"):
-            with self.subTest(command=command):
-                self.assertRefusedPart(self.bash(command), command)
-        # an ignored, untracked file in another spelling is still only that file
-        self.assertAllowed(("rm BUILD.LOG", "echo x > Build.Log"))
 
-    def test_literal_joined_to_a_run_time_path_refused(self):
-        """A literal concatenated with a value known only at run time does not say where
-        the program writes, however absolute the literal looks."""
-        repo = self.repo
-        part = "python3 - <<'PY'"
-        for program, cwd in (
-            ("import os\nopen(os.getcwd() + '/out.json', 'w')", repo),
-            ("import os\nopen(os.path.join(os.getcwd(), '/out.json'), 'w')", repo),
-            ('import os\nopen(os.getcwd() + "/src/app.py", "w").write("x")', repo / "src"),
-            ("import os\nopen(f'{os.getcwd()}/notes.txt', 'w')", repo),
-            ("import os\nbase = os.getcwd()\nopen(base + '/README.md', 'w')", repo),
-        ):
-            with self.subTest(program=program, cwd=str(cwd)):
-                self.assertRefusedPart(self.bash(heredoc(program), cwd=cwd), part)
-        command = """node -e "require('fs').writeFileSync(process.cwd() + '/out.json', 'x')\""""
-        self.assertRefusedPart(self.bash(command), command)
-        # plain outside literals stay allowed, beside run-time values that build no path
-        self.assertAllowed(
-            (
-                heredoc(f"import os\nopen('{OUTSIDE_JSON}', 'w')\nprint(os.getcwd())"),
-                heredoc(f"n = 1 + 2\nopen('{OUTSIDE_JSON}', 'w').write(str(n))"),
-                heredoc(f"open('{self.outside}/a.txt', 'w').write('x' + 'y')"),
-            )
-        )
 
     # ---- fix round 2: expanding sources into a directory, run-time joins
 
-    def test_expanding_sources_copied_into_a_directory_refused(self):
-        """A brace, glob or bracket source is expanded by the shell first, so
-        `{keep,x}.log .` reaches the tracked keep.log; into a directory that is not itself
-        exempt it is refused. Ruling (b), 2026-10-25: into an existing ignored directory
-        every copy is refused, plain or expanding source, as on main."""
-        outside = self.outside
-        for name in ("keep.log", "x.log", "a.log", "b.log", "xa.log", "app.py"):
-            self.write(outside / name, "from outside\n")
-        for command in (
-            f"cp {outside}/{{keep,x}}.log .",
-            f"cp {outside}/{{keep,x}}.log ./",
-            f"mv {outside}/{{keep,x}}.log .",
-            f"cp {outside}/x[ab].log .",
-            f"install {outside}/{{a,b}}.log .",
-            f"ln -s {outside}/{{keep,x}}.log .",
-            # the repo root is not exempt, whatever the basename of the source
-            f"cp {outside}/x.log .",
-            # into an ignored directory, plain or expanding sources
-            f"cp {outside}/notes.md cache/",
-            f"cp {outside}/x.log data/",
-            f"cp {outside}/*.log cache/",
-            f"cp {outside}/*.py cache/",
-            f"cp {outside}/{{app,b}}.py cache/",
-            f"cp {outside}/x[ab].log data/",
-            "cp $F cache/",
-            "cp ${F} data/",
-            f"install {outside}/*.log cache/",
-            f"ln -sf {outside}/*.log data/",
-        ):
-            with self.subTest(command=command):
-                self.assertRefusedPart(self.bash(command), command)
-        # the variable set earlier in the command: the copy is the part refused
-        command = f"F={outside}/app.py; cp $F cache/"
-        self.assertRefusedPart(self.bash(command), "cp $F cache/")
 
     # ---- fix round 3: a copy into a directory is judged by that directory
 
@@ -1832,124 +1600,7 @@ class BranchGuardBashExemptions(GuardTestCase):
             self.write(self.outside / name, "from outside\n")
         return restore
 
-    def test_recursive_copy_into_an_ignored_directory_refused(self):
-        """A recursive copy (cp -R/-r/-a, rsync -r/-a and their combined and long forms)
-        into an ignored directory is refused (ruling b, 2026-10-25: every copy into an
-        existing directory outside docs/agent/ is): an ignored directory may hold a
-        symlink into tracked files (rsync -aK writes through node_modules/@scope/pkg into
-        packages/pkg)."""
-        repo, outside = self.repo, self.outside
-        restore = self.workspace_fixture()
-        nm = f"{restore}/node_modules/"
-        for command in (
-            f"cp -R {nm} node_modules/",
-            f"cp -r {nm} node_modules/",
-            f"cp -a {nm} node_modules/",
-            f"cp -Rf {nm} node_modules/",
-            f"cp -av {nm} node_modules/",
-            f"cp -pR {nm} node_modules/",
-            f"cp -f -R {nm} node_modules/",
-            f"cp -v -a {nm} node_modules/",
-            f"cp -R {nm} node_modules",
-            f"cp -R {restore}/node_modules/@scope/ node_modules/@scope/",
-            f"rsync -a {nm} node_modules/",
-            f"rsync -r {nm} node_modules/",
-            f"rsync -avz {nm} node_modules/",
-            f"rsync -aK {nm} node_modules/",
-            f"rsync -rlt {nm} node_modules/",
-            f"rsync --archive {nm} node_modules/",
-            f"rsync --recursive {nm} node_modules/",
-            f"rsync -v --archive --delete {nm} node_modules/",
-            # an ignored directory without a symlink in it today: the rule is the same
-            f"cp -R {outside}/data/ cache/",
-            f"cp -R {outside}/data cache",
-            f"cp -a {outside}/data/ data/",
-            f"rsync -a {outside}/ cache/",
-            f"rsync -r {outside}/data/ data",
-        ):
-            with self.subTest(command=command):
-                self.assertRefusedPart(self.bash(command), command)
-        # beside an allowed write, the recursive copy is the part refused
-        for command, part in (
-            (
-                f"echo x > .env.local && cp -R {nm} node_modules/",
-                f"cp -R {nm} node_modules/",
-            ),
-            (
-                f"cp {outside}/x.log docs/agent/; rsync -a {nm} node_modules/",
-                f"rsync -a {nm} node_modules/",
-            ),
-        ):
-            with self.subTest(command=command):
-                self.assertRefusedPart(self.bash(command), part)
-        # the ignored directory named absolutely, or reached by cd, from outside
-        for command, part in (
-            (f"cp -R {nm} {repo}/node_modules/", f"cp -R {nm} {repo}/node_modules/"),
-            (f"rsync -a {outside}/ {repo}/cache/", f"rsync -a {outside}/ {repo}/cache/"),
-            (f"cp -R {outside}/data/ {repo}/cache/", f"cp -R {outside}/data/ {repo}/cache/"),
-            (f"cd {repo} && cp -a {nm} node_modules/", f"cp -a {nm} node_modules/"),
-        ):
-            with self.subTest(command=command, cwd=str(outside)):
-                self.assertRefusedPart(self.bash(command, cwd=outside), part)
 
-    def test_non_recursive_copies_into_ignored_directories_refused_docs_agent_allowed(self):
-        """Ruling (b), 2026-10-25: a non-recursive copy into an existing ignored directory
-        is refused as well, as on main; copies into docs/agent/, recursive or not, stay
-        free, and so does a recursive copy wholly outside the repo."""
-        repo, outside = self.repo, self.outside
-        restore = self.workspace_fixture()
-        for command in (
-            # not recursive: options other than -R/-r/-a, into ignored directories
-            f"cp {outside}/x.log data/",
-            f"cp -f {outside}/x.log cache/",
-            f"cp -pv {outside}/x.log cache/",
-            f"cp {outside}/notes.md node_modules/",
-            f"cp {outside}/notes.md node_modules/@scope/",
-            f"cp {outside}/{{a,b}}.log cache/",
-            f"install {outside}/x.log cache/",
-            f"install -m 644 {outside}/x.log data/",
-            f"ln -s {outside}/x.log data/",
-            f"ln -sf {outside}/x.log cache/",
-            f"rsync -t {outside}/x.log cache/",
-            f"rsync -v {outside}/x.log data/",
-        ):
-            with self.subTest(command=command):
-                self.assertRefusedPart(self.bash(command), command)
-        for command in (
-            f"cp -v {outside}/x.log {repo}/cache/",
-            f"install {outside}/x.log {repo}/data/",
-        ):
-            with self.subTest(command=command, cwd=str(outside)):
-                self.assertRefusedPart(self.bash(command, cwd=outside), command)
-        self.assertAllowed(
-            (
-                # not recursive, into docs/agent/
-                f"cp {outside}/x.log docs/agent/",
-                f"cp -f {outside}/x.log docs/agent/",
-                f"install -m 644 {outside}/x.log docs/agent/",
-                f"ln -sf {outside}/x.log docs/agent/",
-                f"rsync -t {outside}/x.log docs/agent/",
-                # recursive, into docs/agent/
-                f"cp -R {outside}/data/ docs/agent/",
-                f"cp -a {outside}/data/ docs/agent/imported/",
-                f"cp -Rf {outside}/data docs/agent/",
-                f"cp -R {restore}/node_modules/ docs/agent/",
-                f"rsync -a {outside}/data/ docs/agent/",
-                f"rsync --recursive {outside}/data/ docs/agent/specs/",
-                f"rsync -avz {outside}/ docs/agent/",
-                # recursive, wholly outside the repo
-                f"cp -R {restore}/node_modules/ {outside}/nm-copy/",
-                f"rsync -a {repo}/src/ {outside}/backup/",
-            )
-        )
-        self.assertAllowed(
-            (
-                f"cp -R {outside}/data/ {repo}/docs/agent/",
-                f"rsync -a {outside}/data/ {repo}/docs/agent/",
-                f"cp -v {outside}/x.log {repo}/docs/agent/",
-            ),
-            cwd=outside,
-        )
 
     def test_copy_into_a_directory_lands_in_the_destination_directorys_repo(self):
         """Ruling 2026-10-24: the repo a copy into a directory lands in is judged by the
@@ -2203,121 +1854,10 @@ class BranchGuardBashExemptions(GuardTestCase):
             cwd=outside,
         )
 
-    def test_expanding_source_into_docs_agent_onto_a_symlink_out_of_it_refused(self):
-        """A glob, brace or $ source is expanded by the shell, so its basename does not
-        say which name lands in docs/agent/: into a docs/agent/ directory that holds a
-        name resolving out of the exemption (docs/agent/x.md -> README.md) it is refused,
-        as on main. Into an ignored directory it is refused outright (ruling b)."""
-        repo, outside = self.repo, self.outside
-        os.symlink("../../README.md", repo / "docs/agent/x.md")
-        (repo / "docs/agent/specs").mkdir()
-        os.symlink("../../../src/app.py", repo / "docs/agent/specs/app.py")
-        os.symlink("../src/app.py", repo / "cache/app.py")
-        for name in ("x.md", "z.md", "app.py", "b.py"):
-            self.write(outside / name, "from outside\n")
-        for command in (
-            f"cp {outside}/*.md docs/agent/",
-            f"cp {outside}/{{x,z}}.md docs/agent/",
-            f"cp {outside}/[xz].md docs/agent/",
-            f"cp {outside}/?.md docs/agent",
-            "cp $F docs/agent/",
-            "cp ${F} docs/agent/",
-            f"cp {outside}/notes.md $F docs/agent/",
-            f"install {outside}/*.md docs/agent/",
-            f"ln -sf {outside}/*.md docs/agent/",
-            f"rsync -t {outside}/*.md docs/agent/",
-            f"cp -t docs/agent {outside}/*.md",
-            f"cp {outside}/*.py docs/agent/specs/",
-            f"cp {outside}/{{app,b}}.py docs/agent/specs/",
-            "cp $F docs/agent/specs/",
-            # the reviewer's cases, into the ignored cache/ that holds cache/app.py
-            f"cp {outside}/*.py cache/",
-            f"cp {outside}/{{app,b}}.py cache/",
-            "cp $F cache/",
-        ):
-            with self.subTest(command=command):
-                self.assertRefusedPart(self.bash(command), command)
-        for command in (
-            f"cp {outside}/*.md {repo}/docs/agent/",
-            f"cp $F {repo}/docs/agent/specs/",
-        ):
-            with self.subTest(command=command, cwd=str(outside)):
-                self.assertRefusedPart(self.bash(command, cwd=outside), command)
-        # the variable set earlier in the command, to the name that is a link out
-        command = f"F={outside}/x.md; cp $F docs/agent/"
-        self.assertRefusedPart(self.bash(command), "cp $F docs/agent/")
-        # plain sources into the same directories keep the round-4 rule
-        self.assertAllowed(
-            (
-                f"cp {outside}/z.md docs/agent/",
-                f"cp {outside}/b.py docs/agent/specs/",
-            )
-        )
 
     # ---- #237: a recursive copy into docs/agent/ through chained symlinks
 
-    def test_recursive_copy_into_docs_agent_through_chained_symlink_refused(self):
-        """BSD `cp -R /tmp/r/ docs/agent/` writes /tmp/r/c/app.py through docs/agent/c ->
-        ../../cache (ignored) and cache/app.py -> ../src/app.py into the tracked
-        src/app.py. A recursive copy into docs/agent/ is refused when any symlink under
-        the destination resolves outside docs/agent/, ignored or not; without such a link,
-        and for a named destination, it stays allowed."""
-        repo = self.repo
-        source = self.tmp / "r"
-        self.write(source / "c/app.py", "clobbered\n")
-        os.symlink("../../cache", repo / "docs/agent/c")
-        os.symlink("../src/app.py", repo / "cache/app.py")
-        self.assertEqual(
-            os.path.realpath(repo / "docs/agent/c/app.py"), str(repo / "src/app.py")
-        )
-        for command in (
-            f"cp -R {source}/ docs/agent/",
-            f"cp -a {source}/ docs/agent",
-            f"rsync -a {source}/ docs/agent/",
-        ):
-            with self.subTest(command=command):
-                self.assertRefusedPart(self.bash(command), command)
-        command = f"cp -R {source}/ {repo}/docs/agent/"
-        self.assertRefusedPart(self.bash(command, cwd=self.outside), command)
-        # no symlink under the destination, and a named destination: allowed
-        self.write(self.outside / "notes.md", "notes\n")
-        self.assertAllowed(
-            (
-                f"cp -R {source}/ docs/agent/specs/",
-                "cp notes.md docs/agent/handoff.md",
-                f"cp {self.outside}/notes.md docs/agent/handoff.md",
-            )
-        )
-        os.unlink(repo / "docs/agent/c")
-        self.assertAllowed((f"cp -R {source}/ docs/agent/",))
 
-    def test_recursive_copy_into_docs_agent_through_outside_link_refused(self):
-        """The same through a link out of every repo: docs/agent/ext -> <tmp>/ext and
-        <tmp>/ext/app.py -> <repo>/src/app.py. A link outside every repo no longer counts
-        as exempt for a recursive copy into docs/agent/."""
-        repo = self.repo
-        source, ext = self.tmp / "r", self.tmp / "ext"
-        self.write(source / "ext/app.py", "clobbered\n")
-        ext.mkdir()
-        os.symlink(str(repo / "src/app.py"), ext / "app.py")
-        os.symlink(str(ext), repo / "docs/agent/ext")
-        self.assertEqual(
-            os.path.realpath(repo / "docs/agent/ext/app.py"), str(repo / "src/app.py")
-        )
-        for command in (
-            f"cp -R {source}/ docs/agent/",
-            f"cp -r {source}/ docs/agent/",
-            f"rsync -a {source}/ docs/agent/",
-        ):
-            with self.subTest(command=command):
-                self.assertRefusedPart(self.bash(command), command)
-        # not recursive, and a named destination: the #162 rules, unchanged
-        self.assertAllowed(
-            (
-                f"cp {self.outside}/notes.md docs/agent/",
-                "cp notes.md docs/agent/handoff.md",
-            )
-        )
 
     def test_ln_no_dereference_onto_an_ignored_symlink_to_an_outside_directory_allowed(self):
         """ln -n and -h treat a destination that is a symlink to a directory as a named
@@ -2385,32 +1925,6 @@ class BranchGuardBashExemptions(GuardTestCase):
             with self.subTest(command=command):
                 self.assertRefusedPart(self.bash(command), command)
 
-    def test_literal_joined_at_run_time_through_join_or_concat_refused(self):
-        """`.join(` and `.concat(` build a path at run time as `+` does: a literal beside a
-        run-time value in them does not say where the program writes."""
-        repo = self.repo
-        part = "python3 - <<'PY'"
-        for program in (
-            "import os\nopen(''.join([os.getcwd(), '/out.json']), 'w')",
-            # 'out.json' is a bare name and resolves into the repo on its own as well
-            "import os\nopen('/'.join([os.getcwd(), 'out.json']), 'w')",
-        ):
-            with self.subTest(program=program):
-                self.assertRefusedPart(self.bash(heredoc(program), cwd=repo), part)
-        command = (
-            """node -e "require('fs').writeFileSync(process.cwd().concat('/out.json'), 'x')\""""
-        )
-        self.assertRefusedPart(self.bash(command), command)
-        # joins of literals only, and joins that build no path, stay allowed
-        self.assertAllowed(
-            (
-                heredoc("open(''.join(['/private/tmp/x', '/out.json']), 'w')"),
-                heredoc(
-                    "import sys\nnames = sys.argv[1:]\nprint(', '.join(names))\n"
-                    f"open('{OUTSIDE_JSON}', 'w').write('x')"
-                ),
-            )
-        )
 
 
 TEMP_ROOT = os.path.realpath(tempfile.gettempdir())

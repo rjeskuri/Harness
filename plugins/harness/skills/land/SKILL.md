@@ -23,4 +23,4 @@ Awaiting you:
   3. On merge: `harness-pr land P` (add `--discard` only when the user passed it, to drop a dirty worktree). It merges, removes the worktree and branch, fast-forwards main, closes the ticket and checks the epic. It refuses a PR whose latest harness review has findings and no commit after it, naming them: show them and stop. Add `--accept-findings` only when the user passed it.
   4. Report the merge commit, the ticket closed, the epic state, and what is awaiting next. On a billable project remind the user of `/harness:worklog`.
 
-Never merge without the confirmation, never force, never bypass red checks. The user lands every PR, with `/harness:land` or by approving the land prompt; `harness-pr autoland` for eligible ones (risk:low, size S or M, review and checks green at head, no protected path) is the epic #132 plan.
+Never merge without the confirmation and never bypass red checks. The user lands every PR, with `/harness:land` or by approving the land prompt; `harness-pr autoland` for eligible ones is the epic #132 plan.

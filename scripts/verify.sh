@@ -4,6 +4,6 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-python3 -m unittest discover -s plugins/harness/tests
+python3 scripts/run_suite.py
 
 echo VERIFY OK

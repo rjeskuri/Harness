@@ -2042,6 +2042,7 @@ def revert_landed(repo, sha, reason, evidence):
     ticket's epic, reopen the ticket as needs-input and notify; each step skipped when an earlier run did it.
     `evidence` is text (or None). Returns {pr, sha, revert, ticket, bug, summary}; Problem on a refusal."""
     main = repo.main
+    os.environ["HARNESS_ALLOW_MAIN"] = "1"  # the revert commit and its push: the git hooks refuse main otherwise
     ready_main_checkout(main)
     full = git(main, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}").stdout.strip()
     if not full:

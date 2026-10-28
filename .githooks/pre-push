@@ -1,0 +1,25 @@
+#!/bin/sh
+# Refuses a push to main or master, a push that is not a fast-forward (a force push rewrites history)
+# and a push that deletes a branch (git config core.hooksPath .githooks). main and master change only
+# through a pull request, which GitHub merges. HARNESS_ALLOW_MAIN=1 skips every check, as it does the
+# branch guard hook; harness-pr revert and the scaffold's first push set it. Runs whatever the push
+# command was spelled as. Skip once with: git push --no-verify
+[ "${HARNESS_ALLOW_MAIN:-}" = 1 ] && exit 0
+zero=0000000000000000000000000000000000000000
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$remote_ref" in
+        refs/heads/main|refs/heads/master)
+            echo "pre-push: refused: $remote_ref changes only through a pull request (harness-pr open <issue#>)." >&2
+            status=1
+            continue ;;
+    esac
+    if [ "$local_sha" = "$zero" ]; then
+        echo "pre-push: refused: deleting $remote_ref; a landed ticket branch is removed by harness-pr land." >&2
+        status=1
+    elif [ "$remote_sha" != "$zero" ] && ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+        echo "pre-push: refused: $remote_ref would not fast-forward (a force push rewrites history); merge origin/$(echo "$remote_ref" | sed 's,^refs/heads/,,') instead." >&2
+        status=1
+    fi
+done
+exit $status
