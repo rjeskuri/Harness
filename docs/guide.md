@@ -86,7 +86,7 @@ The PR body is laid out the same way every time:
 | Summary | What changed |
 | Definition of done | The ticket's checklist |
 | Tests | The tests added, then the red run: its kind, exit code and the tail of the failing output |
-| Verify | Empty unless a `harness-red verify` log was attached by hand; CI runs the whole suite on the pull request |
+| Verify | Empty unless a log was attached with `harness-pr open --verify-log`; CI runs the whole suite on the pull request |
 | Review | Finding counts by severity and the high findings |
 | Risks | Filled for `risk:high` tickets |
 

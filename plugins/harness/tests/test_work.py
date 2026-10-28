@@ -820,10 +820,9 @@ class Attempt(WorkTest):
         self.assertEqual((data["action"], data["failures"], data["tier"], data["next_tier"]),
                          ("needs-input", 2, "sonnet", None))
 
-    def test_verify_stage_answers_like_ci_and_counts_apart(self):
-        """#252: `verify` (the full verify run just before ready) is a stage of its own after ci, answered by the
-        default rule as ci is: retry, escalate, needs-input; a pass ends its run. verify's failures and ci's count
-        apart, and neither counts for code."""
+    def test_ci_and_tests_answer_by_the_default_rule_and_count_apart(self):
+        """`ci` and `tests` are answered by the default rule: retry, escalate, needs-input; a pass ends the run.
+        Their failures count apart, and neither counts for code."""
         sequence = [
             (["fail"], "retry"),
             (["fail"], "escalate opus"),
@@ -840,7 +839,7 @@ class Attempt(WorkTest):
             (["fail", "--tier", "fable"], "needs-input"),
         ]
         answers = {}
-        for stage in ("ci", "verify"):
+        for stage in ("ci", "tests"):
             write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
             answers[stage] = []
             for argv, expected in sequence:
@@ -851,10 +850,10 @@ class Attempt(WorkTest):
             attempts = self.read_json(self.cache_path())["attempts"]
             self.assertEqual([(a["stage"], a["result"]) for a in attempts], [(stage, argv[0]) for argv, _ in sequence])
             self.assertEqual(set(attempts[0]), {"stage", "tier", "effort", "result", "at"})
-        self.assertEqual(answers["verify"], answers["ci"])
+        self.assertEqual(answers["tests"], answers["ci"])
 
-        # --json: verify's escalation names the next tier as ci's does
-        for stage in ("ci", "verify"):
+        # --json: tests' escalation names the next tier as ci's does
+        for stage in ("ci", "tests"):
             write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
             first = self.ok_json("attempt", "12", stage, "fail", "--json")
             self.assertEqual((first["stage"], first["action"], first["failures"], first["next_tier"]),
@@ -866,18 +865,18 @@ class Attempt(WorkTest):
         # interleaved: each stage keeps its own run
         write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
         interleaved = [
-            (["verify", "fail"], "retry"),
-            (["ci", "fail"], "retry"),                       # verify's failure is not ci's
-            (["verify", "fail"], "escalate opus"),           # ci's failure did not reset verify
+            (["tests", "fail"], "retry"),
+            (["ci", "fail"], "retry"),                       # tests' failure is not ci's
+            (["tests", "fail"], "escalate opus"),           # ci's failure did not reset verify
             (["code", "fail"], "retry"),                     # nor does either count for code
             (["ci", "pass"], "done"),
-            (["verify", "fail"], "needs-input"),             # a ci pass does not end verify's run
+            (["tests", "fail"], "needs-input"),             # a ci pass does not end tests' run
             (["ci", "fail"], "retry"),
-            (["verify", "pass"], "done"),
-            (["ci", "fail"], "escalate opus"),               # a verify pass does not end ci's run
-            (["verify", "fail"], "retry"),
+            (["tests", "pass"], "done"),
+            (["ci", "fail"], "escalate opus"),               # a tests pass does not end ci's run
+            (["tests", "fail"], "retry"),
             (["ci", "fail"], "needs-input"),
-            (["verify", "fail", "--tier", "opus"], "escalate opus xhigh"),
+            (["tests", "fail", "--tier", "opus"], "escalate opus xhigh"),
         ]
         for argv, expected in interleaved:
             with self.subTest(interleaved=argv):

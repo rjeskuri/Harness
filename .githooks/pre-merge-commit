@@ -1,0 +1,10 @@
+#!/bin/sh
+# Before a merge commit on main or master (git config core.hooksPath .githooks): refused, as a commit is.
+# A fast-forward merge makes no commit and runs no hook; the push is the gate. Git leaves a refused
+# merge in progress, so the message says how to undo it.
+. "$(dirname "$0")/lib.sh"
+if ! (harness_refuse_on_main pre-merge-commit); then
+    echo "pre-merge-commit: the merge was left in progress; git merge --abort undoes it." >&2
+    exit 1
+fi
+exit 0
