@@ -60,6 +60,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -152,6 +153,18 @@ def verify_timeout(file_env: dict) -> float:
 
 
 # ---------- what changed ----------
+
+
+def ticket_branch(git_root: Path | None) -> bool:
+    """Whether the checkout is on a ticket branch (`t/<issue>-...`), which the work loop's
+    own tests and CI verify; a failed or slow git answers False."""
+    if git_root is None:
+        return False
+    try:
+        out = git(git_root, "symbolic-ref", "--short", "HEAD", timeout=MAIN_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return out.returncode == 0 and re.match(r"t/\d+-", out.stdout.strip()) is not None
 
 
 def current_head(git_root: Path | None) -> str:
@@ -307,6 +320,8 @@ def main() -> int:
     cmd = setting("CLAUDE_VERIFY_CMD", file_env)
     if not cmd:
         return 0
+    if ticket_branch(git_root):
+        return 0  # the work loop's own tests and CI verify a ticket branch
 
     session = SessionState.for_repo(root, data)
     try:

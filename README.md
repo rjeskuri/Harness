@@ -51,7 +51,7 @@ Then register your projects: `harness-projects discover`, and `harness-projects 
 | `planner` | Opus, xhigh | Turns an interviewed request into an epic and tasks; creates nothing |
 | `test-author` | tier | Writes the tests a ticket names and shows them red; may not edit source |
 | `test-breaker` | tier | Tries to pass the new tests with a cheat in a scratch copy; may not edit tests |
-| `coder` | tier | Makes the tests and the verify command green, commits; may not edit tests |
+| `coder` | tier | Makes the ticket's tests green, commits; may not edit tests |
 | `reviewer` | Opus (xhigh for risk:high), unless the project sets `HARNESS_REVIEW_TIER` | Reviews the branch against the definition of done; findings go on the PR |
 | `researcher` | Opus | Answers from primary sources |
 | `quick` | Sonnet | Trivial mechanical tasks outside the ticket loop |
@@ -78,8 +78,9 @@ The main session runs Opus 5.5 at high effort. `harness-board tier N` picks the 
 | notify | permission prompt, idle, a background agent needs input or finished | A macOS notification naming the repo |
 | session brief | start, resume, compaction | Branch and last commit; on a ticket branch the ticket, its definition of done and the red run; otherwise the board counts; exhausted budgets |
 | secret scan | after every edit and Bash call | Flags a high-confidence secret in a changed file so Claude removes it |
-| verify on stop | when Claude ends a turn after edits | Runs `CLAUDE_VERIFY_CMD` and hands failures back, at most twice |
-| branch guard | before edits and Bash | Refuses edits, commits and pushes on main or master; refuses force pushes everywhere |
+| verify on stop | when Claude ends a turn after edits on main or master | Runs `CLAUDE_VERIFY_CMD` and hands failures back, at most twice; a ticket branch is verified by its own tests and CI instead |
+| branch guard | before edits and Bash | Refuses edits, commits and pushes on main or master and force pushes everywhere, in the session, with the way forward |
+| git hooks (`.githooks/`, installed by the scaffold) | commit, push | `pre-commit` refuses a commit on main or master; `pre-push` refuses a push to either, a push that is not a fast-forward and a branch deletion, whatever the command was spelled as |
 | tests first | before edits | On a `t/N-` branch, refuses source edits until a current red run exists; the test-author edits tests only, the coder and breaker never edit tests |
 | read-only guard | before Bash | Keeps planner, reviewer and researcher from changing files |
 
@@ -105,7 +106,7 @@ Under `env` in the project's `.claude/settings.json`; `.claude/settings.local.js
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `CLAUDE_VERIFY_CMD` | Whole suite plus lint; verify on stop and the coder run it | none, verify on stop off |
+| `CLAUDE_VERIFY_CMD` | Whole suite plus lint; verify on stop runs it on main, CI on every pull request | none, verify on stop off |
 | `HARNESS_TEST_CMD` | Runs named test files; `{files}` becomes the paths | detected from `uv.lock`, `pyproject.toml`, `package.json` |
 | `HARNESS_TEST_PATTERNS` | Globs that mark a path as a test | `tests/**`, `test_*.py`, `*.test.js` and similar |
 | `HARNESS_SOURCE_EXEMPT` | Globs tests-first never gates | docs, markdown, config, lock files |

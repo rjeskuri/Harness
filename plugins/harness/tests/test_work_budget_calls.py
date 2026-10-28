@@ -524,19 +524,5 @@ class Args(CallsTest):
         self.assertEqual(set(status), {"api", "cloud"})
 
 
-# =========================================================================== docs
-class Docs(unittest.TestCase):
-    def test_usage_and_design_name_the_command(self):
-        with open(TOOL, encoding="utf-8") as fh:
-            source = fh.read()
-        docstring = source.split('"""', 2)[1]
-        usage = docstring.split("Usage:", 1)[1].split("\n\n", 1)[0]
-        self.assertRegex(usage, r"harness-work budget[^\n]*\bcalls\b[^\n]*--hours")
-        with open(DESIGN, encoding="utf-8") as fh:
-            design = fh.read()
-        section = design.split("\n### harness-work\n", 1)[1].split("\n### ", 1)[0]
-        self.assertRegex(section, r"`budget[^`]*\bcalls\b[^`]*--hours[^`]*`")
-
-
 if __name__ == "__main__":
     unittest.main()

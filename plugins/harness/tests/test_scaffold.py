@@ -38,7 +38,7 @@ PLACEHOLDER = re.compile(r"(?<!\$)\{\{(name|pkg|stack|verify_cmd|test_cmd|tests_
 COMMON_FILES = ["CLAUDE.md", ".claude/settings.json", "scripts/verify.sh", ".github/workflows/ci.yml",
                 ".github/workflows/deploy.yml", ".github/pull_request_template.md",
                 ".github/ISSUE_TEMPLATE/task.md", ".github/ISSUE_TEMPLATE/epic.md", ".githooks/pre-commit",
-                ".gitignore", ".worktreeinclude", "scripts/smoke.sh", "scripts/deploy_guard.py"]
+                ".githooks/pre-push", ".gitignore", ".worktreeinclude", "scripts/smoke.sh", "scripts/deploy_guard.py"]
 
 # The allow entries every render starts with (ticket #137): the twelve git, gh and verify entries, then one
 # narrow rule per harness tool in this order. The old wildcard spelling may be dropped by auto mode.
@@ -211,8 +211,8 @@ class Render(ScaffoldTest):
         claude = self.read(root, "CLAUDE.md")
         self.assertIn("# demo-app", claude)
         self.assertIn("`scripts/verify.sh`", claude)
-        self.assertIn("harness-work start <issue#>", claude)
-        self.assertIn("## Compact Instructions", claude)
+        self.assertIn(".githooks/", claude)
+        self.assertNotIn("harness-work start", claude)  # the loop's rules live in ~/.claude/CLAUDE.md
         self.assertLess(len(claude.splitlines()), 50)
 
         pyproject = self.read(root, "pyproject.toml")
@@ -281,7 +281,7 @@ class Render(ScaffoldTest):
         env = data["env"]
         self.assertEqual(set(env), {"CLAUDE_VERIFY_CMD", "HARNESS_TEST_MAP", "HARNESS_ULTRAREVIEW"})
         self.assertEqual(env["HARNESS_ULTRAREVIEW"], "off")
-        self.assertEqual(env["CLAUDE_VERIFY_CMD"], "python3 -m unittest discover -s plugins/harness/tests")
+        self.assertEqual(env["CLAUDE_VERIFY_CMD"], "python3 scripts/run_suite.py")
         pairs = env["HARNESS_TEST_MAP"].split(",")
         for pair in ("plugins/harness/hooks/branch_guard.py=plugins/harness/tests/test_guards.py",
                      "plugins/harness/skills/**=plugins/harness/tests/test_work.py"):
@@ -330,7 +330,7 @@ class Render(ScaffoldTest):
         self.assertIn("Bash(npm test:*)", self.settings(root)["permissions"]["allow"])
         self.assertIn("# Web-App", self.read(root, "CLAUDE.md"))
         self.assertTrue(any(line.startswith("note: npm is not on PATH") for line in self.lines(p)), p.stdout)
-        for rel in ("scripts/verify.sh", ".githooks/pre-commit"):
+        for rel in ("scripts/verify.sh", ".githooks/pre-commit", ".githooks/pre-push"):
             self.assertEqual(subprocess.run(["sh", "-n", os.path.join(root, rel)]).returncode, 0, rel)
 
     def test_none_render(self):
@@ -1226,7 +1226,8 @@ class Rules(ScaffoldTest):
         root = os.path.join(self.tmp, "twice")
         self.ok("init", root, "--name", "twice", "--stack", "python")
         self.write(os.path.join(root, "CLAUDE.md"), "edited by hand\n")
-        self.git(root, "commit", "-qam", "Edit CLAUDE.md")
+        # the owner's own edit on main: the scaffolded pre-commit hook refuses main, so skip it once
+        self.git(root, "commit", "--no-verify", "-qam", "Edit CLAUDE.md")
         self.stub("harness-board")
         p = self.ok("init", root, "--name", "twice", "--stack", "python")
         written = [ln for ln in self.lines(p) if re.match(r"^(created|updated) ", ln)]
