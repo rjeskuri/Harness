@@ -270,18 +270,22 @@ class Render(ScaffoldTest):
         self.assertEqual(template, BASE_ALLOW + HARNESS_NINE)
 
     def test_harness_own_settings_allow_the_nine_not_the_wildcard(self):
-        """Harness's own .claude/settings.json follows the template: the nine rules, no wildcard."""
+        """Harness's own .claude/settings.json follows the template: the nine rules, no wildcard.
+
+        Its env holds exactly the verify command, the test map (#264) and ultrareview off (#283); any other
+        key fails."""
         data = json.loads(self.read(REPO, ".claude", "settings.json"))
         allow = data["permissions"]["allow"]
         self.assertNotIn(WILDCARD, allow)
         self.assertEqual(allow, BASE_ALLOW + HARNESS_NINE)
-        self.assertEqual(
-            data["env"],
-            {
-                "CLAUDE_VERIFY_CMD": "python3 -m unittest discover -s plugins/harness/tests",
-                "HARNESS_ULTRAREVIEW": "off",
-            },
-        )
+        env = data["env"]
+        self.assertEqual(set(env), {"CLAUDE_VERIFY_CMD", "HARNESS_TEST_MAP", "HARNESS_ULTRAREVIEW"})
+        self.assertEqual(env["HARNESS_ULTRAREVIEW"], "off")
+        self.assertEqual(env["CLAUDE_VERIFY_CMD"], "python3 -m unittest discover -s plugins/harness/tests")
+        pairs = env["HARNESS_TEST_MAP"].split(",")
+        for pair in ("plugins/harness/hooks/branch_guard.py=plugins/harness/tests/test_guards.py",
+                     "plugins/harness/skills/**=plugins/harness/tests/test_work.py"):
+            self.assertIn(pair, pairs)
 
     def test_issue_templates_carry_the_ticket_bodies(self):
         root = os.path.join(self.tmp, "demo")
