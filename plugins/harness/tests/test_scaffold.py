@@ -273,7 +273,13 @@ class Render(ScaffoldTest):
         allow = data["permissions"]["allow"]
         self.assertNotIn(WILDCARD, allow)
         self.assertEqual(allow, BASE_ALLOW + HARNESS_NINE)
-        self.assertEqual(data["env"], {"CLAUDE_VERIFY_CMD": "python3 -m unittest discover -s plugins/harness/tests"})
+        self.assertEqual(
+            data["env"],
+            {
+                "CLAUDE_VERIFY_CMD": "python3 -m unittest discover -s plugins/harness/tests",
+                "HARNESS_ULTRAREVIEW": "off",
+            },
+        )
 
     def test_issue_templates_carry_the_ticket_bodies(self):
         root = os.path.join(self.tmp, "demo")
