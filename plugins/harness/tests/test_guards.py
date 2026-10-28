@@ -4142,6 +4142,48 @@ class TestsFirstMainMergeTests(GuardTestCase):
         self.assertEqual(self.status(wt), "current: yes")
         self.assertSourceAllowed(wt)
 
+    # ---- #309: a branch brought home from a cloud session, re-proved with no record
+
+    def test_harness_red_reprove_on_a_branch_with_tests_and_source_and_no_record_allows_source(self):
+        # A cloud session (no harness hooks) pushes the tests and the source in one commit
+        # and never runs harness-red: there is no record. Every source edit is denied,
+        # check refuses (source changed); reprove proves the tests against main's code at
+        # the merge base and writes a record tests_first accepts.
+        repo = self.make_repo("cloud")
+        key = hashlib.sha1(str(repo.resolve()).encode()).hexdigest()[:12]
+        ticket = {"number": 12, "title": "Fix login", "type": "task", "flags": []}
+        ticket["labels"] = ["task", "status:in-progress"]
+        self.write(
+            self.home / ".claude/harness/repos" / key / "tickets/12.json",
+            json.dumps(ticket),
+        )
+        wt = self.worktree(repo, name="cloud-wt")
+        self.write(wt / "tests/test_app.py", "def test_login():\n" + BRANCH_LINE_5)
+        self.write(wt / "src/app.py", "def login():\n    return 'ok'\n")
+        self.commit_all(wt, "login and its test, from a cloud session")
+        self.assertFalse(self.record_file(repo).exists())
+        for agent in (None, "harness:coder"):
+            with self.subTest(agent=agent, before="reprove"):
+                self.assertEqual(self.edit(wt, "src/app.py", agent), NO_RED)
+                self.assertEqual(self.edit(wt, "src/new_module.py", agent), NO_RED)
+        reason = self.bash(wt, "printf '\\n' >> src/app.py", "harness:coder")
+        self.assertIsNotNone(reason)
+        self.assertIn(NO_RED, reason)
+        r = self.harness_red(wt, "check")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("Source already changed before the red run", r.stderr)
+
+        r = self.harness_red(wt, "reprove")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("red (assertion)", r.stdout)
+        record = json.loads(self.record_file(repo).read_bytes())
+        self.assertEqual(record["base_sha"], self.git(wt, "merge-base", "HEAD", "main"))
+        self.assertEqual(record["test_files"], ["tests/test_app.py"])
+        self.assertEqual(record["test_hash"], content_hash(wt, record["test_files"]))
+        self.assertIn(record["kind"], RED_KINDS)
+        self.assertEqual(self.status(wt), "current: yes")
+        self.assertSourceAllowed(wt)
+
     # ---- DoD 3: a merge resolution that changes the branch's own test lines denies
 
     def test_a_conflict_resolution_changing_the_branchs_test_lines_denies_source(self):

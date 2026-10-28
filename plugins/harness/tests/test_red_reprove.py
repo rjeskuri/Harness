@@ -9,6 +9,12 @@ files as they are now against main's code at the merge base, in a temporary deta
 worktree, and writes the side file and the record exactly as `check` does; a run that passes there, or proves
 nothing, is refused and the old record is kept byte for byte.
 
+#309: a branch brought home from a cloud session (no harness hooks there) carries its tests and its source in the
+same commits and has no red record, so tests_first refuses every source edit, a merge-conflict resolution included,
+and `check` refuses (source already changed). `reprove` no longer needs an earlier record: red at the merge base
+writes the record and the side file as above; green, or a run that proves nothing, leaves no record and no side
+file. A corrupt record does not block it either: a red run replaces it.
+
 Every case builds, with real git under a temporary folder, a bare "origin", a clone with `main` (calc.py, whose
 `add` is not built yet), and the branch t/12-slug in a linked worktree at <clone>/.claude/worktrees/t-12-slug.
 HOME and TMPDIR are temporary, so records and temporary worktrees land under them. The test command is
@@ -39,6 +45,7 @@ PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(PLUGIN, "bin", "harness-red")
 HOOK = os.path.join(PLUGIN, "hooks", "tests_first.py")
 DESIGN = os.path.join(os.path.dirname(os.path.dirname(PLUGIN)), "docs", "design.md")
+WORK_SKILL = os.path.join(PLUGIN, "skills", "work", "SKILL.md")
 GIT = shutil.which("git")
 BRANCH, SLUG = "t/12-slug", "t-12-slug"
 RECORD_KEYS = {"branch", "base_sha", "test_files", "run_files", "test_hash", "cmd", "exit", "kind", "tail", "at"}
@@ -64,6 +71,16 @@ TEST_SUB = ("import unittest\n\nimport calc\n\n\nclass SubTest(unittest.TestCase
 TEST_HANG = ("import time\nimport unittest\n\n\nclass HangTest(unittest.TestCase):\n"
              "    def test_hang(self):\n        time.sleep(60)\n")
 TEST_SYNTAX = "import unittest\n\nimport calc\n\n\ndef test_add(:\n    assert calc.add(2, 3) == 5\n"
+# #309: passes against main's code only (add is not built there), so it fails at HEAD once add is built.
+TEST_ADD_UNBUILT = ("import unittest\n\nimport calc\n\n\nclass UnbuiltTest(unittest.TestCase):\n"
+                    "    def test_add_is_not_built(self):\n        self.assertIsNone(calc.add(2, 3))\n")
+# Main's later edit of add's own line: a branch that built add conflicts with it in calc.py.
+CALC_MAIN_EDIT = CALC.replace("    return None\n", '    """The sum of a and b."""\n    return None  # not built\n')
+CALC_RESOLVED = CALC.replace("    return None\n", '    """The sum of a and b."""\n    return a + b\n')
+# tests_first's denial of a source edit on a ticket branch with no red record (its cache present).
+NO_RED_HOOK = "Tests first on t/{n}: write the tests, then run harness-red check. (No red run recorded.)"
+TESTS_FIXED = ("Tests are fixed for this ticket. If a test is wrong, stop and report it; the orchestrator sends it "
+               "back to the test-author.")
 
 # harness-red reads some phrases in a run's output as a run that proves nothing (bin/harness-red: NO_TESTS_RE,
 # COLLECTED_NONE_RE, BAD_SYNTAX_RE, LOAD_ERROR_RE), and `harness-red check` runs this module before reprove exists.
@@ -351,6 +368,29 @@ class Fixture(unittest.TestCase):
             "stash": self.git(self.repo, "stash", "list"),
         }
 
+    def cloud_commit(self, files, root=None, message="tests and source, from a cloud session"):
+        """What a cloud session pushes (#309): the tests and the source in one commit, no harness-red run, no
+        record."""
+        for rel, text in files.items():
+            self.put(rel, text, root=root)
+        self.commit(message, root=root)
+
+    def ticket_worktree(self, number, slug):
+        """(worktree, record path, side file path) of a further ticket branch t/<number>-<slug> off origin/main,
+        with its ticket cache."""
+        self.cache(number)
+        wt = os.path.join(self.repo, ".claude", "worktrees", f"t-{number}-{slug}")
+        self.git(self.repo, "worktree", "add", "-q", wt, "-b", f"t/{number}-{slug}", "origin/main")
+        return (wt, os.path.join(self.state, "red", f"t-{number}-{slug}.json"),
+                os.path.join(self.state, "red-files", f"t-{number}-{slug}.json"))
+
+    def assertNoRecordAnywhere(self):
+        """No red record and no side file under any name: nothing tests_first could accept."""
+        for folder in ("red", "red-files"):
+            path = os.path.join(self.state, folder)
+            left = [n for n in os.listdir(path) if not n.startswith(".")] if os.path.isdir(path) else []
+            self.assertEqual(left, [], f"{folder}/ holds {left}")
+
 
 class ReproveTest(Fixture):
 
@@ -424,6 +464,143 @@ class ReproveTest(Fixture):
         self.assertEqual(self.status_line(), "current: yes")
         self.assertIsNone(self.hook("calc.py"))
         self.assertEqual(self.git(self.wt, "status", "--porcelain"), "?? tests/test_more.py")   # still uncommitted
+
+    # ------------------------------------------------------------ #309: a branch brought home from a cloud session
+    def test_a_branch_brought_home_with_tests_and_source_and_no_record_is_reproved_and_unlocks_source(self):
+        self.cache()
+        self.cloud_commit({"tests/test_calc.py": TEST_ADD, "calc.py": CALC_BUILT})
+        self.assertEqual(self.git(self.wt, "show", "--name-only", "--format=", "HEAD").split(),
+                         ["calc.py", "tests/test_calc.py"])                 # one commit holds both
+        branch_point = self.merge_base()
+        # Main edits add's own line meanwhile, so merging main conflicts in calc.py: a source file.
+        self.on_main({"calc.py": CALC_MAIN_EDIT})
+        merge = subprocess.run([GIT, "-C", self.wt, "merge", "--no-edit", "origin/main"], env=self.env,
+                               capture_output=True, text=True)
+        self.assertNotEqual(merge.returncode, 0, "the merge of main must conflict")
+        self.assertEqual(self.git(self.wt, "diff", "--name-only", "--diff-filter=U"), "calc.py")
+        # The premise: no record, so the resolution cannot be written; check refuses, status has nothing.
+        self.assertEqual(self.kept(), (None, None))
+        for agent in ("harness:coder", None):
+            with self.subTest(agent=agent, before="reprove"):
+                self.assertEqual(self.hook("calc.py", agent), NO_RED_HOOK.format(n=12))
+        self.assertOneLineError(self.red("check"), "Source already changed before the red run: calc.py.")
+        self.assertOneLineError(self.red("status"), NO_RECORD)
+
+        p = self.red("reprove")
+        self.assertRed(p, 1)
+        files = ["tests/test_calc.py"]
+        rec = self.record()
+        self.assertEqual(set(rec), RECORD_KEYS)
+        self.assertEqual(rec["branch"], BRANCH)
+        self.assertEqual(rec["base_sha"], branch_point)                     # the merge base, mid-merge
+        self.assertNotEqual(rec["base_sha"], self.git(self.repo, "rev-parse", "origin/main"))
+        self.assertEqual((rec["test_files"], rec["run_files"]), (files, files))
+        self.assertEqual(rec["test_hash"], expected_hash(self.wt, files))
+        self.assertEqual(rec["cmd"], "python3 -m unittest tests/test_calc.py")
+        self.assertEqual((rec["exit"], rec["kind"]), (1, "assertion"))
+        self.assertInText("None != 5", rec["tail"], "the tail")              # main's add, not the branch's
+        self.assertTrue(rec["tail"] in p.stdout, "the tail is not printed after the red line")
+        self.assertIsNotNone(dt.datetime.fromisoformat(rec["at"]).tzinfo)
+        self.assertEqual(json.loads(read(self.side_path)), expected_side_file(self.wt, files))
+        self.assertEqual(self.status_line(), "current: yes")
+
+        # The conflict resolution in source is allowed now, for the coder and the main session alike...
+        for agent in ("harness:coder", None):
+            with self.subTest(agent=agent, after="reprove"):
+                self.assertIsNone(self.hook("calc.py", agent))
+        self.put("calc.py", CALC_RESOLVED)
+        self.git(self.wt, "add", "calc.py")
+        self.git(self.wt, "commit", "-q", "--no-edit")
+        self.assertEqual(len(self.git(self.wt, "rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+        self.assertEqual(self.unittest_exit(self.wt, "tests/test_calc.py"), 0)
+        # ...and so is a later fix, while the role rules still hold.
+        self.assertEqual(self.status_line(), "current: yes")
+        self.assertIsNone(self.hook("calc.py"))
+        self.assertIsNone(self.hook("util.py"))
+        self.assertEqual(self.hook("tests/test_calc.py"), TESTS_FIXED)
+
+    def test_branches_brought_home_in_other_shapes_get_their_own_red_record(self):
+        # Each its own ticket branch, worktree and record: (name, ticket, the cloud commit, main's move, merged?,
+        # test files, run files, failures in the tail, failures that must not be there).
+        shapes = [
+            ("two modules, a fixture and new source in one commit", 21,
+             {"tests/test_calc.py": TEST_ADD_COVERED, "tests/test_more.py": TEST_MORE,
+              "tests/fixtures/data.json": '{"n": 2}\n', "calc.py": CALC_BUILT, "util.py": "HELPER = 1\n"},
+             None, False,
+             ["tests/fixtures/data.json", "tests/test_calc.py", "tests/test_more.py"],
+             ["tests/test_calc.py", "tests/test_more.py"], ["None != 5", "None != 9", "None != 15"], []),
+            ("main merged in since", 22,
+             {"tests/test_more.py": TEST_MORE, "calc.py": CALC_BUILT},
+             {"mathx.py": "def double(x):\n    return 2 * x\n"}, True,
+             ["tests/test_more.py"], ["tests/test_more.py"], ["None != 15"], ["None != 5"]),
+            ("main moved on, not merged", 23,
+             {"tests/test_calc.py": TEST_ADD, "calc.py": CALC_BUILT},
+             {"README.md": "# calc, moved on\n"}, False,
+             ["tests/test_calc.py"], ["tests/test_calc.py"], ["None != 5"], ["None != 15"]),
+        ]
+        for name, number, commit, main_move, merged, files, run_files, failures, absent in shapes:
+            with self.subTest(name):
+                wt, record_path, side_path = self.ticket_worktree(number, "cloud")
+                self.cloud_commit(commit, root=wt)
+                if main_move:
+                    self.on_main(main_move)
+                if merged:
+                    self.git(wt, "merge", "-q", "--no-edit", "origin/main")
+                base = self.git(wt, "merge-base", "HEAD", "origin/main")
+                tip = self.git(self.repo, "rev-parse", "origin/main")
+                self.assertEqual(base == tip, merged or not main_move, "the shape's merge base")
+                self.assertFalse(os.path.exists(record_path) or os.path.exists(side_path))
+                self.assertEqual(self.hook("calc.py", root=wt), NO_RED_HOOK.format(n=number))
+
+                p = self.red("reprove", cwd=wt)
+                self.assertRed(p, len(files))
+                with open(record_path, encoding="utf-8") as fh:
+                    rec = json.load(fh)
+                self.assertEqual(set(rec), RECORD_KEYS)
+                self.assertEqual(rec["branch"], f"t/{number}-cloud")
+                self.assertEqual(rec["base_sha"], base)
+                self.assertEqual((rec["test_files"], rec["run_files"]), (files, run_files))
+                self.assertEqual(rec["test_hash"], expected_hash(wt, files))
+                self.assertEqual(rec["cmd"], "python3 -m unittest " + " ".join(run_files))
+                self.assertEqual((rec["exit"], rec["kind"]), (1, "assertion"))
+                for failure in failures:
+                    self.assertInText(failure, rec["tail"], "the tail")
+                for failure in absent:
+                    self.assertFalse(failure in rec["tail"], quiet(rec["tail"]))
+                self.assertEqual(json.loads(read(side_path)), expected_side_file(wt, files))
+                status = self.red("status", cwd=wt)
+                self.assertEqual(status.returncode, 0, quiet(status.stdout + status.stderr))
+                self.assertEqual(status.stdout.splitlines()[-1], "current: yes")
+                self.assertIsNone(self.hook("calc.py", root=wt))
+                self.assertIsNone(self.hook("util.py", root=wt))
+        self.assertEqual(self.kept(), (None, None))                # t/12-slug was never touched
+
+    def test_a_corrupt_record_does_not_block_reprove_and_a_red_run_replaces_it(self):
+        self.cache()
+        self.cloud_commit({"tests/test_calc.py": TEST_ADD, "calc.py": CALC_BUILT})
+        files = ["tests/test_calc.py"]
+        corrupt = [
+            ("not JSON", "{not json\n"),
+            ("no test_files", json.dumps({"branch": BRANCH, "kind": "assertion", "exit": 1}) + "\n"),
+            ("empty test_files", json.dumps({"branch": BRANCH, "test_files": []}) + "\n"),
+            ("test_files not a list", json.dumps({"branch": BRANCH, "test_files": "tests/test_calc.py"}) + "\n"),
+        ]
+        for name, text in corrupt:
+            with self.subTest(name):
+                write(self.record_path, text)
+                if os.path.exists(self.side_path):
+                    os.remove(self.side_path)
+                self.assertIsNotNone(self.hook("calc.py"))           # the corrupt record allows nothing
+                p = self.red("reprove")
+                self.assertRed(p, 1)
+                rec = self.record()
+                self.assertEqual(set(rec), RECORD_KEYS)
+                self.assertEqual(rec["base_sha"], self.merge_base())
+                self.assertEqual((rec["test_files"], rec["kind"]), (files, "assertion"))
+                self.assertEqual(rec["test_hash"], expected_hash(self.wt, files))
+                self.assertEqual(json.loads(read(self.side_path)), expected_side_file(self.wt, files))
+                self.assertEqual(self.status_line(), "current: yes")
+                self.assertIsNone(self.hook("calc.py"))
 
     # ------------------------------------------------------------ where the run happens
     def test_the_run_is_at_the_merge_base_with_the_test_files_as_they_are_now(self):
@@ -617,7 +794,9 @@ class ReproveTest(Fixture):
         self.assertEqual(self.kept(), kept)
         self.assertEqual(self.status_line(), "current: no")
 
-    def test_without_a_red_record_it_is_refused(self):
+    def test_without_a_red_record_it_runs_and_a_red_run_writes_one(self):
+        # #309 changed this on purpose: without an earlier record reprove used to be refused with NO_RECORD and run
+        # nothing; now it runs, and red writes the record. Tests and source in two commits, no check between.
         self.cache()
         self.put("tests/test_calc.py", TEST_ADD)
         self.commit("tests for add")
@@ -625,10 +804,91 @@ class ReproveTest(Fixture):
         self.commit("add")
         env, marker = self.marker_env()
         worktrees = self.worktrees()
+        self.assertEqual(self.kept(), (None, None))
+        p = self.red("reprove", **env)
+        self.assertRed(p, 1)
+        self.assertTrue(os.path.exists(marker), "the test command did not run")
+        rec = self.record()
+        self.assertEqual(rec["base_sha"], self.merge_base())
+        self.assertEqual(rec["test_files"], ["tests/test_calc.py"])
+        self.assertEqual(rec["cmd"], env["HARNESS_TEST_CMD"].replace("{files}", "tests/test_calc.py"))
+        self.assertEqual(json.loads(read(self.side_path)), expected_side_file(self.wt, ["tests/test_calc.py"]))
+        self.assertEqual(self.worktrees(), worktrees)
+        self.assertEqual(self.status_line(), "current: yes")
+        self.assertIsNone(self.hook("calc.py"))
+
+    def test_without_a_red_record_tests_that_pass_against_mains_code_leave_no_record(self):
+        # The cloud shape whose tests prove nothing at the merge base: no record, not even a green one, and no
+        # side file, so tests-first still refuses source. The second case fails at HEAD and passes only against
+        # main's code: the judging is of the merge base's run.
+        self.cache()
+        cases = [
+            ("sub, which main has", {"tests/test_calc.py": TEST_SUB, "calc.py": CALC_BUILT}, 0),
+            ("add unbuilt, which only main's code passes", {"tests/test_calc.py": TEST_ADD_UNBUILT}, 1),
+            ("two more files, all passing there",
+             {"tests/test_sub.py": TEST_SUB, "tests/test_unbuilt.py": TEST_ADD_UNBUILT}, 1),
+        ]
+        for name, commit, exit_at_head in cases:
+            with self.subTest(name):
+                self.cloud_commit(commit)
+                tests = sorted(p for p in commit if p.startswith("tests/"))
+                self.assertEqual(self.unittest_exit(self.wt, *tests) != 0, bool(exit_at_head))
+                snapshot = self.snapshot()
+                p = self.red("reprove")
+                self.assertOneLineError(p, "merge base", "prove nothing")
+                self.assertEqual(self.kept(), (None, None))
+                self.assertNoRecordAnywhere()
+                self.assertEqual(self.snapshot(), snapshot)
+                self.assertOneLineError(self.red("status"), NO_RECORD)
+                self.assertEqual(self.hook("calc.py"), NO_RED_HOOK.format(n=12))
+        p = self.red("reprove", "--json")
+        self.assertOneLineError(p, "merge base", "prove nothing")
+        self.assertEqual(json.loads(p.stdout).get("refused"), "green")
+        self.assertEqual(self.kept(), (None, None))
+
+    def test_without_a_red_record_runs_that_prove_nothing_leave_no_record(self):
+        self.cache()
+        self.cloud_commit({"tests/test_calc.py": TEST_ADD, "calc.py": CALC_BUILT})
+        snapshot = self.snapshot()
+        cases = [
+            ("empty run", {}, self.fake_runner(PYTEST_NONE, 5), [f"no red run recorded: {EMPTY_RUN} (exit 5)"]),
+            ("failed to load", {"tests/test_bad.py": TEST_SYNTAX}, {},
+             ["no red run recorded: tests failed to load (exit 1)"]),
+            ("timeout", {"tests/test_hang.py": TEST_HANG}, {"HARNESS_TEST_TIMEOUT": "1"},
+             ["timed out after 1s", "no red run recorded"]),
+            ("cannot start", {}, {"HARNESS_TEST_CMD": "no-such-test-runner-309 {files}"}, ["could not start"]),
+        ]
+        for name, files, env, needles in cases:
+            with self.subTest(name):
+                for rel, text in files.items():
+                    self.put(rel, text)
+                try:
+                    started = time.monotonic()
+                    p = self.red("reprove", **env)
+                    self.assertLess(time.monotonic() - started, 30)
+                    self.assertOneLineError(p, *needles)
+                    self.assertEqual(self.kept(), (None, None))
+                    self.assertNoRecordAnywhere()
+                    self.assertEqual(self.worktrees(), snapshot["worktrees"])   # removed whatever the outcome
+                finally:
+                    for rel in files:
+                        os.remove(os.path.join(self.wt, rel))
+        self.assertEqual(self.snapshot(), snapshot)
+        self.assertEqual(self.hook("calc.py"), NO_RED_HOOK.format(n=12))
+        # The same branch with a run that proves something: red, so the refusals above were the runs'.
+        self.assertRed(self.red("reprove"), 1)
+        self.assertEqual(self.status_line(), "current: yes")
+
+    def test_without_a_red_record_or_test_changes_it_is_refused_as_check_refuses(self):
+        self.cache()
+        self.cloud_commit({"calc.py": CALC_BUILT}, message="source only, from a cloud session")
+        self.put("docs/notes.md", "notes\n")                        # exempt, uncommitted
+        env, marker = self.marker_env()
+        worktrees = self.worktrees()
         p = self.red("reprove", **env)
         self.assertEqual(p.returncode, 1, quiet(p.stdout + p.stderr))
-        self.assertEqual(quiet(p.stderr.strip()), "harness-red: " + NO_RECORD)
-        self.assertFalse(os.path.exists(marker), "the test command ran without a red record")
+        self.assertEqual(quiet(p.stderr.strip()), "harness-red: " + NO_TEST_CHANGES)
+        self.assertFalse(os.path.exists(marker), "the test command ran without test changes")
         self.assertEqual(self.kept(), (None, None))
         self.assertEqual(self.worktrees(), worktrees)
 
@@ -774,6 +1034,26 @@ class ReproveDocs(unittest.TestCase):
         text = "\n".join(design_lines())
         self.assertTrue(CHANGED in text, f"docs/design.md does not state tests_first's denial {CHANGED!r}")
         self.assertFalse(OLD_CHANGED in text, f"docs/design.md still states the old denial {OLD_CHANGED!r}")
+
+    # #309: the phrases each doc must carry, kept few so the prose is the coder's.
+    CLOUD_PHRASES = ("cloud session", "no record", "harness-red reprove")
+
+    def test_the_reprove_entry_needs_no_earlier_record_and_serves_a_branch_from_a_cloud_session(self):
+        section = design_section(design_lines(), "### harness-red")
+        entries = [line for line in section if re.match(r"^- `reprove\b", line)]
+        self.assertEqual(len(entries), 1, "want one `- `reprove ...`` entry in the harness-red section")
+        entry = entries[0]
+        for refusal in ("Without a record it is refused", "No red run recorded for <branch>"):
+            self.assertFalse(refusal in entry, f"the reprove entry still says it is refused without a record: "
+                                               f"{refusal!r}")
+        for phrase in ("cloud session", "no record"):
+            self.assertTrue(phrase in entry, f"the reprove entry does not say {phrase!r}")
+
+    def test_the_work_skill_reproves_a_branch_from_a_cloud_session_before_a_source_edit(self):
+        text = re.sub(r"<!--.*?-->", "", read(WORK_SKILL), flags=re.DOTALL)
+        body = text.split("\n---\n", 1)[1] if text.startswith("---\n") else text      # past the front matter
+        hits = [line for line in body.splitlines() if all(p in line for p in self.CLOUD_PHRASES)]
+        self.assertTrue(hits, f"no paragraph of the work skill holds all of {self.CLOUD_PHRASES}")
 
 
 if __name__ == "__main__":
