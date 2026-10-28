@@ -331,6 +331,285 @@ class RedTest(unittest.TestCase):
         self.assertOneLineError(p, "no red run recorded: tests failed to load (exit 2)")
         self.assertFalse(os.path.exists(self.record_path))
 
+    # ------------------------------------------------------------ another project's session (ticket #205)
+    # A session started in project A carries A's settings env (HARNESS_TEST_CMD, CLAUDE_PROJECT_DIR=A). When it
+    # runs harness-red on a worktree of another repository B, B's own settings decide the test command (else the
+    # detected default), never A's environment. A session of B's own (CLAUDE_PROJECT_DIR is B's main checkout or a
+    # worktree of B, or unset) keeps today's order: the environment, then the worktree's settings.
+    OWN_CMD = "python3 -m unittest tests/test_calc.py"     # the fixture's own HARNESS_TEST_CMD, on the test file
+
+    def foreign_cmd(self):
+        """(command, marker): a test command that appends to `marker` when it runs and fails like a red run."""
+        marker = os.path.join(self.tmp, "foreign-ran.txt")
+        script = write(os.path.join(self.tmp, "foreign_runner.py"),
+                       "import sys\nwith open(sys.argv[1], 'a') as fh:\n    fh.write('ran\\n')\n"
+                       "print('AssertionError: the foreign runner ran')\nsys.exit(1)\n")
+        return f"python3 {shlex.quote(script)} {shlex.quote(marker)} {{files}}", marker
+
+    def fake_npm(self):
+        """An `npm` on PATH that behaves like the real one: with no package.json in its cwd it prints npm's ENOENT
+        (FAKE_NPM_STYLE=old: npm 6-9's `npm ERR!`, else npm 10's `npm error`) and exits 254; with a package.json
+        and no test script, `Missing script: "test"`, exit 1; with one, FAKE_NPM_OUTPUT and exit 1. Every run
+        appends its cwd to the returned log."""
+        log = os.path.join(self.tmp, "npm-ran.txt")
+        script = write(os.path.join(self.tmp, "fakebin", "npm"), f"""#!/bin/sh
+echo "$PWD" >> {shlex.quote(log)}
+if [ -f package.json ]; then
+  if grep -q '"test"' package.json; then printf '%s\\n' "$FAKE_NPM_OUTPUT"; exit 1; fi
+  echo 'npm error Missing script: "test"' >&2
+  echo 'npm error' >&2
+  echo 'npm error To see a list of scripts, run:' >&2
+  echo 'npm error   npm run' >&2
+  exit 1
+fi
+if [ "$FAKE_NPM_STYLE" = old ]; then
+  cat >&2 <<EOF
+npm ERR! code ENOENT
+npm ERR! syscall open
+npm ERR! path $PWD/package.json
+npm ERR! errno -2
+npm ERR! enoent ENOENT: no such file or directory, open '$PWD/package.json'
+npm ERR! enoent This is related to npm not being able to find a file.
+npm ERR! enoent
+
+npm ERR! A complete log of this run can be found in:
+npm ERR!     $HOME/.npm/_logs/2026-10-26T09_00_00_000Z-debug-0.log
+EOF
+else
+  cat >&2 <<EOF
+npm error code ENOENT
+npm error syscall open
+npm error path $PWD/package.json
+npm error errno -2
+npm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open '$PWD/package.json'
+npm error enoent This is related to npm not being able to find a file.
+npm error enoent
+npm error A complete log of this run can be found in: $HOME/.npm/_logs/2026-10-26T09_00_00_000Z-debug-0.log
+EOF
+fi
+exit 254
+""")
+        os.chmod(script, 0o755)
+        return log
+
+    def foreign_projects(self):
+        """Folders another session may have started in: a repository with settings of its own, a folder outside
+        any repository, and the folder holding this repository."""
+        okinawa = os.path.join(self.tmp, "OkinawaDream")
+        os.makedirs(okinawa)
+        self.git(okinawa, "init", "-q")
+        write(os.path.join(okinawa, "package.json"), json.dumps({"scripts": {"test": "vitest run"}}))
+        write(os.path.join(okinawa, ".claude", "settings.json"),
+              json.dumps({"env": {"HARNESS_TEST_CMD": "npm test -- {files}", "CLAUDE_VERIFY_CMD": "npm run verify"}}))
+        plain = os.path.join(self.tmp, "notes")
+        os.makedirs(plain)
+        return [("another repository", okinawa), ("a folder outside any repository", plain),
+                ("the folder above this repository", self.tmp)]
+
+    def assertOwnRed(self, p, cmd=OWN_CMD, said="AssertionError: None != 5"):
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout.splitlines()[0], "red (assertion): 1 test files, exit 1", p.stdout)
+        rec = self.record()
+        self.assertEqual(rec["cmd"], cmd)
+        self.assertIn(said, rec["tail"])
+
+    def test_another_projects_test_cmd_in_the_environment_does_not_reach_this_worktree(self):
+        self.put("tests/test_calc.py", TEST_ADD)
+        foreign, marker = self.foreign_cmd()
+        npm_log = self.fake_npm()
+        for name, project in self.foreign_projects():
+            for env_cmd in (foreign, "npm test -- {files}", "python3 -m nosuchrunner_205 {files}"):
+                for how, cwd, args in (("--worktree from the other project", project, ("--worktree", self.wt)),
+                                       ("run in the worktree", self.wt, ())):
+                    with self.subTest(project=name, env_cmd=env_cmd, how=how):
+                        if os.path.exists(self.record_path):
+                            os.remove(self.record_path)
+                        p = self.red("check", *args, cwd=cwd, CLAUDE_PROJECT_DIR=project, HARNESS_TEST_CMD=env_cmd)
+                        self.assertOwnRed(p)
+                        self.assertFalse(os.path.exists(marker), "the other project's command ran")
+                        self.assertFalse(os.path.exists(npm_log), "the other project's npm ran")
+
+    def test_the_worktrees_own_settings_decide_under_another_projects_session(self):
+        # The worktree's settings.json, then its settings.local.json over it, then the detected default: each
+        # wins over the other project's environment.
+        self.put("tests/test_calc.py", TEST_ADD)
+        foreign, marker = self.foreign_cmd()
+        okinawa = self.foreign_projects()[0][1]
+        own = write(os.path.join(self.tmp, "own_runner.py"),
+                    "import sys\nprint('AssertionError: own runner', sys.argv[1], sys.argv[2:])\nsys.exit(1)\n")
+
+        def own_cmd(tag):
+            return f"python3 {shlex.quote(own)} {tag} {{files}}"
+        tracked = os.path.join(self.wt, ".claude", "settings.json")
+        local = os.path.join(self.wt, ".claude", "settings.local.json")
+        cases = [("worktree settings.json", {"HARNESS_TEST_CMD": own_cmd("tracked")}, None,
+                  own_cmd("tracked").replace("{files}", "tests/test_calc.py"), "own runner tracked"),
+                 ("worktree settings.local.json over it", {"HARNESS_TEST_CMD": own_cmd("tracked")},
+                  {"HARNESS_TEST_CMD": own_cmd("local")},
+                  own_cmd("local").replace("{files}", "tests/test_calc.py"), "own runner local"),
+                 ("no test command: the detected default", {}, None, self.OWN_CMD, "AssertionError: None != 5")]
+        for name, env, local_env, expected, said in cases:
+            with self.subTest(name):
+                write(tracked, json.dumps({"env": env}))
+                if local_env is None:
+                    if os.path.exists(local):
+                        os.remove(local)
+                else:
+                    write(local, json.dumps({"env": local_env}))
+                p = self.red("check", "--worktree", self.wt, cwd=okinawa, CLAUDE_PROJECT_DIR=okinawa,
+                             HARNESS_TEST_CMD=foreign)
+                self.assertOwnRed(p, cmd=expected, said=said)
+                self.assertFalse(os.path.exists(marker), "the other project's command ran")
+
+    def test_the_environment_test_cmd_still_wins_in_its_own_projects_session(self):
+        # As today: a session of this repository (its main checkout, this worktree, another worktree of it, a
+        # symlinked spelling of the main checkout, or no CLAUDE_PROJECT_DIR) runs the environment's command.
+        self.put("tests/test_calc.py", TEST_ADD)
+        sibling = os.path.join(self.tmp, "sibling-wt")
+        self.git(self.repo, "worktree", "add", "-q", sibling, "-b", "t/99-sibling", "origin/main")
+        link = os.path.join(self.tmp, "repo-link")
+        os.symlink(self.repo, link)
+        runner = self.fake_runner("AssertionError: from the environment\n", 1)
+        expected = runner["HARNESS_TEST_CMD"].replace("{files}", "tests/test_calc.py")
+        for name, project in (("unset", None), ("main checkout", self.repo), ("this worktree", self.wt),
+                              ("another worktree of it", sibling), ("symlinked main checkout", link)):
+            with self.subTest(name):
+                extra = dict(runner)
+                if project is not None:
+                    extra["CLAUDE_PROJECT_DIR"] = project
+                p = self.red("check", "--worktree", self.wt, cwd=project or self.wt, **extra)
+                self.assertOwnRed(p, cmd=expected, said="AssertionError: from the environment")
+
+    # Claude Code sets CLAUDE_PROJECT_DIR for hook processes only, never for a session's Bash calls: there the
+    # session's project is HARNESS_SESSION_PROJECT, which the harness's SessionStart hook exports through
+    # CLAUDE_ENV_FILE. self.env carries neither, so each case below names exactly what it sets.
+    def test_another_projects_test_cmd_does_not_reach_this_worktree_from_a_sessions_bash(self):
+        self.put("tests/test_calc.py", TEST_ADD)
+        foreign, marker = self.foreign_cmd()
+        npm_log = self.fake_npm()
+        projects = self.foreign_projects()
+        cases = [(name, project, None) for name, project in projects]
+        # A stale or inherited CLAUDE_PROJECT_DIR naming this repository does not outweigh the session's project.
+        cases.append(("another repository, CLAUDE_PROJECT_DIR this repository", projects[0][1], self.repo))
+        for name, project, claude_dir in cases:
+            for env_cmd in (foreign, "npm test -- {files}"):
+                for how, cwd, args in (("--worktree from the other project", project, ("--worktree", self.wt)),
+                                       ("run in the worktree", self.wt, ())):
+                    with self.subTest(project=name, env_cmd=env_cmd, how=how):
+                        if os.path.exists(self.record_path):
+                            os.remove(self.record_path)
+                        extra = {"HARNESS_SESSION_PROJECT": project, "HARNESS_TEST_CMD": env_cmd}
+                        if claude_dir is not None:
+                            extra["CLAUDE_PROJECT_DIR"] = claude_dir
+                        p = self.red("check", *args, cwd=cwd, **extra)
+                        self.assertOwnRed(p)
+                        self.assertFalse(os.path.exists(marker), "the other project's command ran")
+                        self.assertFalse(os.path.exists(npm_log), "the other project's npm ran")
+
+    def test_the_worktrees_own_settings_decide_from_another_sessions_bash(self):
+        # The worktree's own HARNESS_TEST_CMD runs, not the one the other project's session exported.
+        self.put("tests/test_calc.py", TEST_ADD)
+        foreign, marker = self.foreign_cmd()
+        okinawa = self.foreign_projects()[0][1]
+        own = write(os.path.join(self.tmp, "own_runner.py"),
+                    "import sys\nprint('AssertionError: own runner', sys.argv[1], sys.argv[2:])\nsys.exit(1)\n")
+        own_cmd = f"python3 {shlex.quote(own)} wt-settings {{files}}"
+        write(os.path.join(self.wt, ".claude", "settings.json"), json.dumps({"env": {"HARNESS_TEST_CMD": own_cmd}}))
+        p = self.red("check", "--worktree", self.wt, cwd=okinawa, HARNESS_SESSION_PROJECT=okinawa,
+                     HARNESS_TEST_CMD=foreign)
+        self.assertOwnRed(p, cmd=own_cmd.replace("{files}", "tests/test_calc.py"), said="own runner wt-settings")
+        self.assertFalse(os.path.exists(marker), "the other project's command ran")
+
+    def test_the_environment_test_cmd_still_wins_when_the_session_is_this_repositorys(self):
+        # HARNESS_SESSION_PROJECT naming this repository (any spelling, any worktree of it) keeps today's order: the
+        # environment's command wins over the worktree's settings, whatever CLAUDE_PROJECT_DIR says.
+        self.put("tests/test_calc.py", TEST_ADD)
+        sibling = os.path.join(self.tmp, "sibling-wt")
+        self.git(self.repo, "worktree", "add", "-q", sibling, "-b", "t/99-sibling", "origin/main")
+        link = os.path.join(self.tmp, "repo-link")
+        os.symlink(self.repo, link)
+        okinawa = self.foreign_projects()[0][1]
+        runner = self.fake_runner("AssertionError: from the environment\n", 1)
+        expected = runner["HARNESS_TEST_CMD"].replace("{files}", "tests/test_calc.py")
+        for name, session, claude_dir in (("main checkout", self.repo, None), ("this worktree", self.wt, None),
+                                          ("another worktree of it", sibling, None),
+                                          ("symlinked main checkout", link, None),
+                                          ("a folder inside the main checkout", os.path.join(self.repo, ".claude"),
+                                           None),
+                                          ("main checkout, CLAUDE_PROJECT_DIR another repository", self.repo,
+                                           okinawa),
+                                          ("this worktree, CLAUDE_PROJECT_DIR another repository", self.wt,
+                                           okinawa)):
+            with self.subTest(name):
+                extra = dict(runner, HARNESS_SESSION_PROJECT=session)
+                if claude_dir is not None:
+                    extra["CLAUDE_PROJECT_DIR"] = claude_dir
+                p = self.red("check", "--worktree", self.wt, cwd=session, **extra)
+                self.assertOwnRed(p, cmd=expected, said="AssertionError: from the environment")
+
+    def test_a_command_that_cannot_start_is_an_error_not_red(self):
+        # A missing manifest, script, runner module, runner file or executable: the run proves nothing, so it is
+        # refused like any unproven run (exit 1, one line, nothing recorded), never reported as red.
+        self.put("tests/test_calc.py", TEST_ADD)
+        npm_log = self.fake_npm()
+        notexec = write(os.path.join(self.tmp, "notexec.sh"), "#!/bin/sh\nexit 1\n")
+        missing_file = os.path.join(self.tmp, "missing", "runner.py")
+        cases = [("npm 10, no package.json", "npm test -- {files}", {}, None),
+                 ("npm 6-9, no package.json", "npm test -- {files}", {"FAKE_NPM_STYLE": "old"}, None),
+                 ("npm, no test script", "npm test -- {files}", {}, json.dumps({"name": "calc", "scripts": {}})),
+                 ("python3 -m on a missing runner module", "python3 -m nosuchrunner_205 {files}", {}, None),
+                 ("python3 on a missing runner file", f"python3 {shlex.quote(missing_file)} {{files}}", {}, None),
+                 ("missing executable", "nosuchtool_205 {files}", {}, None),
+                 ("not executable", f"{shlex.quote(notexec)} {{files}}", {}, None)]
+        package = os.path.join(self.wt, "package.json")
+        for name, cmd, extra, manifest in cases:
+            for via in ("environment", "worktree settings"):
+                with self.subTest(name, via=via):
+                    if os.path.exists(self.record_path):        # a failed case before must not decide this one
+                        os.remove(self.record_path)
+                    if manifest is None:
+                        if os.path.exists(package):
+                            os.remove(package)
+                    else:
+                        write(package, manifest)
+                    if via == "environment":
+                        env = dict(extra, HARNESS_TEST_CMD=cmd)
+                    else:
+                        env = dict(extra)
+                        write(os.path.join(self.wt, ".claude", "settings.json"),
+                              json.dumps({"env": {"HARNESS_TEST_CMD": cmd}}))
+                    for args in ((), ("--json",)):
+                        p = self.red("check", *args, **env)
+                        self.assertOneLineError(p)
+                        self.assertFalse(p.stdout.startswith("red"), p.stdout)
+                        self.assertNotIn('"kind"', p.stdout)
+                        self.assertFalse(os.path.exists(self.record_path), f"{name}: recorded as red")
+        self.assertTrue(os.path.exists(npm_log), "the fake npm never ran: the npm cases proved nothing")
+
+    def test_a_runner_that_starts_and_fails_is_still_red(self):
+        # The other side of the line: npm with a package.json and a test script, failing on an assertion or on the
+        # module under test not existing yet, is red; so is python3 -m unittest on a test importing a missing module.
+        npm_log = self.fake_npm()
+        write(os.path.join(self.wt, "package.json"), json.dumps({"scripts": {"test": "node --test"}}))
+        self.put("tests/test_calc.py", TEST_ADD)
+        cases = [("assertion", "not ok 1 - add\n  AssertionError: expected 5, got undefined\n# fail 1"),
+                 ("import", "Error: Cannot find module '../src/calc'\n  code: 'MODULE_NOT_FOUND'\n# fail 1")]
+        for kind, output in cases:
+            with self.subTest(kind):
+                p = self.red("check", HARNESS_TEST_CMD="npm test -- {files}", FAKE_NPM_OUTPUT=output)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(p.stdout.splitlines()[0], f"red ({kind}): 1 test files, exit 1")
+                self.assertEqual((self.record()["kind"], self.record()["cmd"]),
+                                 (kind, "npm test -- tests/test_calc.py"))
+        self.assertTrue(os.path.exists(npm_log))
+        os.remove(os.path.join(self.wt, "package.json"))
+        os.remove(os.path.join(self.wt, "tests", "test_calc.py"))
+        self.put("tests/test_slug.py", TEST_IMPORT)
+        p = self.red("check", HARNESS_TEST_CMD="python3 -m unittest {files}")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout.splitlines()[0], "red (import): 1 test files, exit 1")
+        self.assertIn("No module named 'slugify_text'", self.record()["tail"])
+
     def test_only_runnable_files_run_but_all_are_hashed(self):
         self.put("tests/fixtures/data.json", '{"a": 2, "b": 3}\n')
         self.put("tests/conftest.py", "import sys\n")
@@ -1357,6 +1636,28 @@ class RedHelpers(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HARNESS_TEST_CMD": "from env", "HARNESS_TEST_TIMEOUT": "junk"}):
             self.assertEqual(self.red.setting("HARNESS_TEST_CMD", file_env), "from env")
             self.assertEqual(self.red.test_timeout(file_env), 300.0)
+
+    def test_cannot_start_is_the_runners_own_complaint_alone(self):
+        # Ticket #205: npm's lines alone, or the interpreter's one line, mean the runner never started. A test that
+        # itself runs npm or python3 and fails quotes those lines among its own output: that run is still red.
+        npm = ("npm error code ENOENT\nnpm error enoent Could not read package.json: Error: ENOENT: no such file "
+               "or directory, open '/w/package.json'\nnpm error A complete log of this run can be found in: /l\n")
+        npm_old = "npm WARN config x\nnpm ERR! enoent ENOENT: no such file or directory, open '/w/package.json'\n\n"
+        script = 'npm error Missing script: "test"\nnpm error\nnpm error To see a list of scripts, run:\n'
+        module = "/usr/bin/python3: No module named nosuchrunner\n"
+        for output, want in [(npm, "npm error enoent Could not read package.json"), (npm_old, "npm ERR! enoent ENOENT"),
+                             (script, 'npm error Missing script: "test"'), (module, module.strip()),
+                             ("python3: can't open file '/x/r.py': [Errno 2] No such file or directory\n",
+                              "python3: can't open file '/x/r.py'")]:
+            with self.subTest(want=want):
+                self.assertTrue((self.red.cannot_start(output) or "").startswith(want), output)
+        quoted = [f"FAIL: test_npm (test_x.T)\nAssertionError: 0 != 1 : red (error)\n{npm}\nFAILED (failures=1)\n",
+                  f"Traceback (most recent call last):\n{module}AssertionError: refused\n",
+                  "ModuleNotFoundError: No module named 'slugify_text'\n",
+                  "npm error code E401\nnpm error Unable to authenticate\n", ""]
+        for output in quoted:
+            with self.subTest(output=output[:40]):
+                self.assertIsNone(self.red.cannot_start(output))
 
     def test_runs_that_prove_nothing(self):
         cases = [

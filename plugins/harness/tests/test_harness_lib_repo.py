@@ -1136,23 +1136,31 @@ class HookTimeoutTests(SlowGitMixin, RepoCase):
 
     def test_a_hung_common_dir_holds_each_hook_to_its_own_timeout(self):
         """With the lib's real main_checkout and a git whose --git-common-dir hangs, the lookup
-        each hook makes gives up after the hook's own timeout (the old single call's)."""
+        each hook makes gives up after the hook's own timeout (the old single call's). session_brief
+        then has no state directory; tests_first knows the branch but not the main checkout, which
+        it refuses on a guarded branch (#285)."""
         repo = self.make_repo("hang-hooks")
         wt = self.add_worktree(repo, os.path.join(self.tmp, "hang-hooks-wt"), BRANCH)
         self.on_path(self.slow_git(common=60.0))
         brief = load_with_loader(HOOKS / "session_brief.py")
         guard = load_with_loader(HOOKS / "tests_first.py")
+
+        def guard_lookup():
+            facts = guard.repo_facts(os.path.join(wt, "src"))
+            return facts and (facts["branch"], facts["main"])
+
         runs = (
             ("session_brief.py", brief.EXTRA_GIT_TIMEOUT,
              lambda: brief.repo_state_dir(Path(repo), Path(repo, "src"))),
-            ("tests_first.py", guard.GIT_TIMEOUT, lambda: guard.repo_facts(os.path.join(wt, "src"))),
+            ("tests_first.py", guard.GIT_TIMEOUT, guard_lookup),
         )
+        expected = {"session_brief.py": None, "tests_first.py": (BRANCH, None)}
         for hook, own, lookup in runs:
             with self.subTest(hook=hook):
                 began = time.monotonic()
                 result = lookup()
                 took = time.monotonic() - began
-                self.assertIsNone(result)
+                self.assertEqual(result, expected[hook])
                 self.assertLess(took, min(own + SLACK, hooks_json_timeout(hook)),
                                 f"{hook}'s main-checkout lookup took {took:.2f} s against its {own} s")
 

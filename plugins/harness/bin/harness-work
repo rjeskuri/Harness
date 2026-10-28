@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
 """
 Ticket work: a branch and worktree per ticket, the failure policy (retry, escalate, needs-input), dispatch
-of a headless or background session per ready ticket, the run records, the budgets and the worktree list.
+of a headless or background session per ready ticket, a Claude cloud session on one ticket, the run records, the
+budgets and the worktree list.
 
 Usage:
-    harness-work start N [--venue interactive|headless|bg]
+    harness-work start N [--venue interactive|headless|bg|cloud]
+    harness-work cloud N
     harness-work attempt N tests|breaker|code|review|fix|ci|verify pass|fail [--tier sonnet|opus|fable]
                          [--effort low|medium|high|xhigh|max]
     harness-work stage N <stage> pass|fail [--tier T] [--effort E]
     harness-work cost N [--pr P] [--json | --markdown]
     harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]
     harness-work runs [--sweep] [--all]
+    harness-work waves [--all] [--refresh]
+    harness-work wave drop ID N
     harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
+    harness-work budget calls [--hours 24] [--json]
     harness-work worktrees [--stale DAYS]
     harness-work worktree remove BRANCH [--discard]
-    start, attempt, stage, cost, dispatch, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR, else the
-    cwd's repository); every subcommand except worktree remove takes --json.
+    start, attempt, stage, cost, dispatch, cloud, waves, wave, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR,
+    else the cwd's repository); every subcommand except worktree remove takes --json.
 
 State, under ~/.claude/harness: repos/<repo-key>/tickets/<N>.json (the ticket cache that `harness-board show`
 writes; start adds branch, worktree and started_at, attempt adds to attempts), repos/<repo-key>/cost/<N>.json (the
-record `cost` writes), runs/<repo-key>-<N>-<stamp>.json and .log (one dispatched run), budgets.json
+record `cost` writes), repos/<repo-key>/waves/<id>.json (a wave, harness_lib/waves.py), runs/<repo-key>-<N>-<stamp>.json
+and .log (one dispatched run), budgets.json
 ({"api"|"cloud": {"exhausted_until", "reason"}}).
 
 attempt: appends {stage, tier, effort, result, at} to the ticket cache's attempts and prints the failure policy's
@@ -50,13 +56,14 @@ Code's session total for N's own sessions, the rounds, the Lines, Elapsed, CI an
 sessions whose orchestrator is not counted, the lower-bound note and the saved path; --json prints the record,
 --markdown the Cost block of the Resolution. Tokens and time only, no dollar figure.
 
-start: refuses an epic, a closed issue, status:blocked and open blockers; fetches origin; reuses a worktree
-already on t/N-*, else a branch origin/t/N-*, else a local t/N-*, else creates t/N-<slug> from origin/main
-(main without an origin) in <main>/.claude/worktrees/t-N-<slug>; a new worktree gets HARNESS_WORKTREE_SETUP
+start: refuses an epic, a closed issue, status:blocked, status:proposed and open blockers; fetches origin;
+reuses a worktree already on t/N-*, else a branch origin/t/N-*, else a local t/N-*, else creates t/N-<slug> from
+origin/main (main without an origin) in <main>/.claude/worktrees/t-N-<slug>; a new worktree gets HARNESS_WORKTREE_SETUP
 (environment, then the project's .claude/settings.local.json, then .claude/settings.json) or the detected
 setup (uv sync, npm ci); gitignored files of the main checkout matching .worktreeinclude are copied when
-missing; the ticket goes to status:in-progress, except from status:in-review (a revision pass keeps its label)
-and from status:needs-input while the owner has not answered. For a needs-input ticket, `harness-board answers N`
+missing; a clean worktree, or a reused local branch, behind origin/<branch> is fast-forwarded to it, while a diverged
+branch or a dirty worktree behind it gets one warning and is left alone; the ticket goes to status:in-progress,
+except from status:in-review (a revision pass keeps its label) and from status:needs-input while the owner has not answered. For a needs-input ticket, `harness-board answers N`
 runs first, before anything refreshes the ticket cache. --json prints previous_status (the status before start),
 answers (the owner's replies; [] unless the ticket was needs-input) and waiting (needs-input with no answer).
 
@@ -80,6 +87,23 @@ replaces the labels), as `--effort <level>` (bg: before the prompt; headless: la
 record. With no effort: no flag, no key. An invalid value is one `harness-work:` warning on stderr per command (a dry
 run and an empty board too) and is ignored. The dispatcher's own CLAUDE_EFFORT is never inherited. --dry-run's first line names the
 effort when set (`Dry run: venue bg, effort xhigh, ...`); every --json result has a top-level `effort` (null when unset).
+Waves (#180): with HARNESS_WAVE_REVIEW set (load_routing's wave_tier), the tickets one dispatch launched that are in no
+unreviewed wave become one new wave (waves.create_wave, at that tier and effort xhigh), printed as `wave <id>: #12, #13
+(reviewed together once all are in review)`; a redispatched ticket keeps its unreviewed wave, so a dispatch that
+launches only those makes none. Every launched run record gets `wave` (its id) and every --json result a top-level
+`wave` (the new id, or null). --dry-run prints `would group #12, #13 into a wave` and its JSON has `"wave": {"id":
+null, "tickets": [...]}` (null when nothing would be grouped); it writes no wave. Without the setting nothing changes:
+no wave, no `wave` key.
+
+waves: this repository's waves (those with a ticket not closed; --all every one) as ID, TICKETS, STATE (empty,
+working, due, reviewing, reviewed) and DETAIL (`1 of 2 in review; waiting for #13 (in-progress)`, `due`, `reviewing
+(run <id>)`, `reviewed <time>`), the statuses from the ticket caches with no gh call; --refresh asks `gh issue view N
+--json state,labels` once per waiting ticket and uses its status (a failing call is one warning; the caches are not
+written). --json prints each wave record plus state, done, waiting and detail.
+
+wave drop ID N: moves ticket N from the wave's tickets to dropped (waves.drop_ticket), so a wave with a stuck ticket
+can become due; refused, one line and exit 1, for an unknown wave, a ticket the wave does not list and a wave whose
+review was launched.
 
 runs --sweep: closes the records of runs that ended and classifies each (ok, error, billing, auth; a bg run by its
 `claude agents` state, done being ok). An `ok` run, headless or bg, whose issue is OPEN and still status:in-progress
@@ -87,6 +111,22 @@ with no ready pull request of its branch in any state (none, or only drafts) end
 `ended early (draft PR #N)` naming the open draft, else `ended early (no PR)`, even when the run has an exit code.
 A bg failed or stopped run is never early. When gh cannot tell, or the record names no repository, it stays `ok`
 with a warning. One command asks gh once per ticket and branch.
+A cloud run ends on the latest marker comment (first line `<!-- harness-cloud: done -->` or `<!-- harness-cloud:
+blocked -->`) by the gh user after the run's start, at that comment's time: done is `ok` (never early), blocked is
+`blocked` and asks the owner (`harness-board needs-input` with the comment's other lines); else, when its ticket is
+finished, `ok`; else, 24 h after its start, `unknown`. A failing gh call is one warning and leaves it open. An unended
+cloud run is live.
+
+cloud: refuses, before anything starts, a needs-local ticket (run it here with /harness:work N), an exhausted cloud
+budget, an unended cloud run of the ticket, and what start refuses; then starts the ticket (venue cloud), pushes its
+branch with upstream (a failed push launches nothing) and runs `claude --cloud <prompt> --on-branch <branch>` in the
+worktree with its stdout on a pseudo-terminal (claude starts a new cloud session only from a terminal), without the
+credentials above. The prompt is self-contained: repository, ticket, branch, the verify command (CLAUDE_VERIFY_CMD,
+else HARNESS_TEST_CMD), `gh api` REST for comments and the two markers; the session loads no harness plugin, hooks or
+tests-first gate. claude's output without ANSI escapes and carriage returns is the run's log; the session id comes
+from its claude.ai/code URL. The run record gets venue cloud, cloud_id and url, and the URL is commented on the
+ticket. A failed launch, or one without a session id, ends the record in error with claude's last line; billing
+wording there marks the cloud budget exhausted for 24 h.
 
 A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through to stderr, in order,
 except a routing problem dispatch already printed (those children load the same settings; REPORTED); its other
@@ -98,12 +138,18 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import fcntl
 import os
+import pty
 import re
+import select
 import shutil
 import socket
+import struct
 import subprocess
 import sys
+import termios
+import time
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 if _LIB not in sys.path:
@@ -114,10 +160,11 @@ try:
     from harness_lib.routing import EFFORTS, cached_code_route, code_route, load_routing, next_route, review_route
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, patterns, setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
-    from harness_lib import cost, reviews
+    from harness_lib import cost, reviews, waves
     from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
     from harness_lib.text import write_json as _write_json
     from harness_lib import gh as ghlib
+    from harness_lib import ghlimit
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -137,6 +184,8 @@ REDISPATCH_WINDOW = dt.timedelta(days=7)   # an ended run older than this is not
 REDISPATCH_MAX = 3            # ended runs of a ticket within the window after which dispatch skips it
 UNCOUNTED = ("billing", "auth")   # outcomes of runs that do not count toward REDISPATCH_MAX: the budget's fault
 EXHAUST_HOURS = 24.0
+CALLS_HOURS = 24.0            # budget calls: the default window
+CALLS_TOP = 15                # budget calls: rows of the text COMMAND table
 REASON_MAX = 200
 DIRTY_SHOWN = 10
 GIT_TIMEOUT = 120
@@ -146,7 +195,18 @@ LAUNCH_TIMEOUT = 120          # claude --bg returns once the session is handed t
 AGENTS_TIMEOUT = 30
 STOP_TIMEOUT = 30             # claude stop <id> of a finished ticket's session
 GH_TIMEOUT = 60
-BILLING_RE = re.compile(r"credit balance|insufficient.*credit|billing_error|payment required|\b402\b", re.I)
+BILLING_WORDS = r"credit balance|insufficient.*credit|billing_error|payment required|\b402\b"
+BILLING_RE = re.compile(BILLING_WORDS, re.I)
+CLOUD_BILLING_RE = re.compile(BILLING_WORDS + r"|credits? (?:are |is )?(?:used up|exhausted)|out of credits", re.I)
+CLOUD_DONE = "<!-- harness-cloud: done -->"
+CLOUD_BLOCKED = "<!-- harness-cloud: blocked -->"
+CLOUD_SILENCE = dt.timedelta(hours=24)    # a cloud run with no marker this long after its start ends `unknown`
+CLOUD_TIMEOUT = 300           # claude --cloud returns once the session is created
+CLOUD_WINSIZE = (50, 400)     # the pseudo-terminal's rows and columns: wide, so the session URL is never wrapped
+CLOUD_URL_RE = re.compile(r"https://claude\.ai/code/([A-Za-z0-9_-]+)[^\s\x00-\x20\x7f]*")
+# CSI and OSC sequences and two-byte escapes; then the control characters a terminal leaves besides \n and \t
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-Z\\-_]")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 AUTH_RE = re.compile(r"invalid.*api.key|authentication_error|\b401\b", re.I)
 # A log line that is an API error from claude itself: without a JSON result (a crash before one), only these lines
 # are searched for billing and auth wording.
@@ -360,6 +420,8 @@ def refusal(record):
         return f"#{n} is closed"
     if record.get("status") == "blocked":
         return f"#{n} is status:blocked; read its comments, then harness-board status {n} ready"
+    if record.get("status") == "proposed":
+        return f"#{n} is status:proposed; it waits for harness-board promote {n}"
     blockers = [f"#{b.get('number')}" for b in record.get("blocked_by") or []
                 if isinstance(b, dict) and str(b.get("state", "")).upper() != "CLOSED"]
     if blockers:
@@ -437,6 +499,29 @@ def make_worktree(repo, number, title):
     os.makedirs(repo.worktrees_dir, exist_ok=True)
     git_ok(repo.main, *cmd)
     return branch, os.path.realpath(path), True
+
+
+def catch_up(branch, worktree):
+    """Fast-forward a clean worktree on `branch` that is behind origin/<branch> (a cloud session pushed there); a
+    diverged branch or a dirty worktree behind it gets one warning and is left alone."""
+    upstream = f"origin/{branch}"
+    counts = git(worktree, "rev-list", "--left-right", "--count", f"HEAD...refs/remotes/{upstream}")
+    if counts.returncode != 0:                              # no such branch on origin: nothing to catch up with
+        return
+    ahead, behind = (int(x) for x in counts.stdout.split())
+    if not behind:
+        return
+    if ahead:
+        warn(f"{branch} has diverged from {upstream} ({ahead} ahead, {behind} behind); left alone, merge or rebase "
+             f"it by hand")
+        return
+    status = git(worktree, "status", "--porcelain")
+    if status.returncode != 0 or status.stdout.strip():
+        warn(f"{branch} is {behind} behind {upstream} but {worktree} has uncommitted changes; left alone")
+        return
+    done = git(worktree, "merge", "--ff-only", "--quiet", upstream)
+    if done.returncode != 0:
+        warn(f"cannot fast-forward {branch} to {upstream}: {last_line(done.stderr) or f'exit {done.returncode}'}")
 
 
 def run_setup(repo, worktree):
@@ -524,6 +609,7 @@ def start_ticket(repo, number, venue, draft_pr=None):
     fetch_origin(repo)
     ensure_exclude(repo)
     branch, worktree, created = make_worktree(repo, number, record.get("title"))
+    catch_up(branch, worktree)
     if created:
         run_setup(repo, worktree)
     copy_includes(repo, worktree)
@@ -687,9 +773,15 @@ def state_ended(state):
     return bool(state) and state not in LIVE_STATES
 
 
+def is_cloud(record):
+    return record.get("venue") == "cloud"
+
+
 def run_live(record, agents):
     if record.get("ended_at"):
         return False
+    if is_cloud(record):
+        return True                                     # until the sweep reads its marker, it is running out there
     if is_bg(record):
         listing = agents.get()
         if listing is None:
@@ -788,9 +880,12 @@ def mtime_iso(path):
 def sweep(records, agents, as_json=False):
     """Close the records whose run has ended; a billing or auth failure marks the api budget. A listed bg session
     whose ticket is finished has ended whatever its state says: it is stopped and its record closed. Saves."""
-    repos = {}
+    repos, logins = {}, {}
     for record in records:
         if record.get("ended_at"):
+            continue
+        if is_cloud(record):
+            sweep_cloud(record, repos, logins)
             continue
         finished = False                    # None: the ticket could not be read, warned once
         if is_bg(record):
@@ -830,6 +925,76 @@ def sweep(records, agents, as_json=False):
         if outcome in ("billing", "auth") and not is_bg(record):
             exhaust(load_budgets(), "api", f"{outcome}: {reason}", EXHAUST_HOURS)
         save_run(record)
+
+
+def gh_login(repo, logins):
+    """The gh user's login, asked once per command (a failure too); Problem when gh cannot say."""
+    if "login" not in logins:
+        try:
+            logins["login"] = ghlib.gh(["api", "user", "--jq", ".login"], repo.main, pick=last_line,
+                                       timeout=GH_TIMEOUT, describe=lambda a: " ".join(a[:2]),
+                                       texts=WORK_GH_TEXTS).strip() or Problem("gh api user printed no login")
+        except Problem as err:
+            logins["login"] = err
+    if isinstance(logins["login"], Problem):
+        raise logins["login"]
+    return logins["login"]
+
+
+def cloud_marker(issue, login, since):
+    """(marker, time, the comment's other lines) of the newest comment by `login` at or after `since` whose first
+    line is a cloud marker, or None."""
+    found = None
+    for item in issue.get("comments") or []:
+        if not isinstance(item, dict):
+            continue
+        author = item.get("author") if isinstance(item.get("author"), dict) else {}
+        when = parse_iso(item.get("createdAt"))
+        first, _, rest = str(item.get("body") or "").strip().partition("\n")
+        if author.get("login") != login or when is None or when < since or first.strip() not in (CLOUD_DONE,
+                                                                                                 CLOUD_BLOCKED):
+            continue
+        if found is None or when >= found[1]:
+            found = (first.strip(), when, rest.strip())
+    return found
+
+
+def sweep_cloud(record, repos, logins):
+    """Close a cloud run from its ticket: the newest marker comment by the gh user since the start (done: ok;
+    blocked: blocked, the owner asked through harness-board needs-input), else a finished ticket (ok), else 24 h
+    since the start (unknown). A failing gh call is one warning and leaves the run open. Saves when it closes."""
+    n = record.get("ticket")
+    if not isinstance(n, int):
+        return
+    started = parse_iso(record.get("started_at")) or now()
+    try:
+        repo = record_repo(record, repos)
+        issue = gh_json(repo, ["issue", "view", str(n), "--json", "number,title,state,labels,comments"])
+        if not isinstance(issue, dict):
+            raise Problem(f"gh issue view {n} printed no issue")
+        marker = cloud_marker(issue, gh_login(repo, logins), started)
+    except Problem as err:
+        warn(f"#{n}: cannot read how its cloud run is doing: {err}")
+        return
+    if marker is not None:
+        kind, when, rest = marker
+        if kind == CLOUD_BLOCKED:
+            question = rest or (f"The cloud session on {record.get('branch')} stopped blocked without a question; "
+                                f"see {record.get('url')}")
+            try:
+                board(repo, "needs-input", n, "--question", question)
+            except Problem as err:
+                warn(f"#{n}: its cloud run is blocked, but the question could not be asked: {err}")
+                return
+        outcome, ended = ("blocked" if kind == CLOUD_BLOCKED else "ok"), iso(when)
+    elif issue_finished(issue):
+        outcome, ended = "ok", iso(now())
+    elif now() - started >= CLOUD_SILENCE:
+        outcome, ended = "unknown", iso(now())
+    else:
+        return
+    record.update(ended_at=ended, outcome=outcome)
+    save_run(record)
 
 
 def ended_early(record, repos):
@@ -905,6 +1070,8 @@ def run_state(record, agents):
         if exit_code is not None:
             return f"exited {exit_code}"
         return f"ended {record.get('outcome') or '?'}"
+    if is_cloud(record):
+        return f"in the cloud ({record.get('url')})"
     if is_bg(record):
         listing = agents.get()
         entry = listing.get(str(record.get("bg_id"))) if listing else None
@@ -984,6 +1151,123 @@ def failed(record, why):
     record.update(ended_at=iso(now()), outcome="error", error=one_line(why))
     save_run(record)
     raise Problem(why)
+
+
+def on_pty(argv, cwd, env, timeout):
+    """(exit code, output) of `argv` with its stdout and stderr on a pseudo-terminal and stdin on /dev/null: the
+    output without ANSI escapes, carriage returns and other control characters; the exit code None when it ran past
+    `timeout` seconds and was killed. Problem when it cannot start."""
+    master, slave = pty.openpty()
+    try:
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", CLOUD_WINSIZE[0], CLOUD_WINSIZE[1], 0, 0))
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=slave, stderr=slave,
+                                start_new_session=True)
+    except OSError as err:
+        os.close(master)
+        raise Problem(f"cannot launch {argv[0]}: {err.strerror or err}") from None
+    finally:
+        os.close(slave)
+    chunks, deadline, timed_out = [], time.monotonic() + timeout, False
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                timed_out = True
+                break
+            if not select.select([master], [], [], min(left, 1.0))[0]:
+                if proc.poll() is not None:             # exited, while something it started holds the terminal
+                    break
+                continue
+            try:
+                data = os.read(master, 65536)
+            except OSError:                             # EIO: every writer has closed the terminal
+                break
+            if not data:
+                break
+            chunks.append(data)
+    finally:
+        os.close(master)
+    if timed_out:
+        proc.kill()
+    try:
+        code = proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        code = proc.wait()
+    text = ANSI_RE.sub("", b"".join(chunks).decode("utf-8", errors="replace")).replace("\r", "")
+    return (None if timed_out else code), CONTROL_RE.sub("", text)
+
+
+def cloud_prompt(slug, ticket, verify, context):
+    """The whole instruction a cloud session gets: it loads no harness plugin, so nothing else tells it how to work."""
+    n, branch = ticket["number"], ticket["branch"]
+    api = f"repos/{slug}/issues/{n}/comments"
+    check = f"`{verify}`" if verify else "that the project's CLAUDE.md names"
+    return f"""Work ticket #{n} of the GitHub repository {slug} on the branch {branch}, as a plain worker. The harness \
+plugin, its hooks, skills and tools (harness-board, harness-pr, harness-red) are not loaded here and nothing enforces \
+tests first, so this prompt is the whole process. Review, the pull request, CI and landing happen later on the \
+owner's Mac.
+
+1. First check that `git remote get-url origin` works and that `git push --dry-run origin {branch}` succeeds. If \
+either fails, stop and say so: a session cloned from a seed bundle (no Claude GitHub integration) can never push.
+2. Stay on {branch}: never commit to, push or merge main, and open no pull request.
+3. Tests first: write the tests the ticket names, run them and see them fail, then change the source until they pass. \
+Never delete, skip or loosen a test.
+4. Run the verify command {check} until it passes, commit with a message that names #{n}, and push {branch} to origin.
+5. `gh issue` and `gh pr` do not work here (GraphQL is blocked); use `gh api` REST. Read the ticket's comments with \
+`gh api {api}`; comment with `gh api {api} -F body=@<file>`.
+6. Done and pushed: comment with `{CLOUD_DONE}` as the first line, then what changed, the tail of the verify output \
+and one `Ruling: <choice>, because <reason>` line per choice you made that the ticket left open.
+7. Blocked by a question about product behavior, something hard to undo, or security, credentials or personal data: \
+push what you have, then comment with `{CLOUD_BLOCKED}` as the first line and the question on the lines after it, \
+and stop. Do not guess.
+
+The ticket:
+
+{context.strip()}
+"""
+
+
+def launch_cloud(repo, ticket, prompt):
+    """`claude --cloud <prompt> --on-branch <branch>` for a started, pushed ticket, on a pseudo-terminal; the run
+    record (venue cloud, cloud_id, url). A failure, or output without a session URL, ends the record in error; billing
+    wording there marks the cloud budget exhausted."""
+    n = ticket["number"]
+    started = now()
+    rid = f"{repo.key}-{n}-{started.strftime('%Y%m%d%H%M%S')}"
+    log = os.path.join(runs_dir(), f"{rid}.log")
+    os.makedirs(runs_dir(), exist_ok=True)
+    record = {"id": rid, "ticket": n, "repo": repo.main, "worktree": ticket["worktree"], "branch": ticket["branch"],
+              "venue": "cloud", "log": log, "started_at": iso(started), "ended_at": None, "exit": None,
+              "outcome": None}
+    argv = [claude_exe(), "--cloud", prompt, "--on-branch", ticket["branch"]]
+    try:
+        code, text = on_pty(argv, ticket["worktree"], child_env(), CLOUD_TIMEOUT)
+    except Problem as err:
+        failed(record, str(err))
+    try:
+        with open(log, "a", encoding="utf-8") as out:
+            out.write(text)
+    except OSError:
+        pass
+    found = CLOUD_URL_RE.search(text)
+    if code != 0 or found is None:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        last = lines[-1] if lines else ""
+        if code is None:
+            why = f"claude --cloud timed out after {CLOUD_TIMEOUT} s" + (f": {last}" if last else "")
+        elif code != 0:
+            why = f"claude --cloud failed: {last or f'exit {code}'}"
+        else:
+            why = f"claude --cloud started no session: {last or 'no output'}"
+        billing = matched_line(lines, CLOUD_BILLING_RE)
+        if billing:
+            exhaust(load_budgets(), "cloud", f"billing: {billing}", EXHAUST_HOURS)
+            why += f"; the cloud budget is marked exhausted for {EXHAUST_HOURS:g} h"
+        failed(record, why)
+    record.update(cloud_id=found.group(1), url=found.group(0))
+    save_run(record)
+    return record
 
 
 ISSUES = {}         # (main checkout, ticket): the issue or the Problem, read once per command
@@ -1107,6 +1391,43 @@ def cmd_start(repo, args):
         bodies = [str(a.get("body") or "").strip() if isinstance(a, dict) else str(a) for a in ticket["answers"]]
         text += "\n\n## Answers\n\n" + "\n\n".join(b for b in bodies if b)
     emit(wants_json(args), data, text)
+
+
+def cmd_cloud(repo, args):
+    n = args.number
+    until = exhausted_until(load_budgets()["cloud"])
+    if until:
+        raise Problem(f"the cloud budget is exhausted until {iso(until)}; nothing started. Run #{n} here with "
+                      f"/harness:work {n}, or `harness-work budget reset cloud` once cloud sessions work again")
+    unended = [r for r in load_runs() if r.get("ticket") == n and is_cloud(r) and not r.get("ended_at")
+               and of_repo(r, repo)]
+    if unended:
+        raise Problem(f"#{n} already has a cloud run that has not ended: {unended[0].get('id')} "
+                      f"({unended[0].get('url')}); follow it with harness-work runs --sweep")
+    if "needs-local" in issue_labels(repo, n):
+        raise Problem(f"#{n} is labelled needs-local: it needs this machine; run it here with /harness:work {n}")
+    if shutil.which(claude_exe()) is None:
+        raise Problem(f"claude not found ({claude_exe()}); nothing started")
+    found = gh_json(repo, ["repo", "view", "--json", "nameWithOwner"])
+    slug = found.get("nameWithOwner") if isinstance(found, dict) else None
+    if not isinstance(slug, str) or "/" not in slug:
+        raise Problem("gh repo view printed no owner/name; nothing started")
+    file_env = settings_env(repo.main)
+    verify = setting("CLAUDE_VERIFY_CMD", file_env) or setting("HARNESS_TEST_CMD", file_env)
+    ticket = start_ticket(repo, n, "cloud")
+    branch = ticket["branch"]
+    pushed = git(ticket["worktree"], "push", "-u", "origin", branch)
+    if pushed.returncode != 0:
+        why = last_line(pushed.stderr) or f"exit {pushed.returncode}"
+        raise Problem(f"git push of {branch} to origin failed ({why}); no cloud session launched")
+    context = board(repo, "show", n, "--markdown")
+    record = launch_cloud(repo, ticket, cloud_prompt(slug, ticket, verify, context))
+    try:
+        board(repo, "comment", n, "--body", f"Cloud session on {branch}: {record['url']}")
+    except Problem as err:
+        warn(f"#{n}: cannot comment the session URL on the ticket: {err}")
+    emit(wants_json(args), record, f"#{n} cloud on {branch} ({record['url']})\nFollow it with `harness-work runs "
+                                   f"--sweep`; once it is done, bring it home here with /harness:work {n}.")
 
 
 def stage_route(repo, cache, stage):
@@ -1360,28 +1681,38 @@ def cmd_dispatch(repo, args):
             detail += f", draft PR #{row['draft_pr']}"
         return f"#{row['number']} {row.get('title') or ''} ({detail})"
 
+    wave_tier = routing["wave_tier"]
+    extra = {"wave": None} if wave_tier else {}     # without HARNESS_WAVE_REVIEW the output is as before #180
     if args.dry_run:
         shown = f"effort {effort}, " if effort else ""
         lines = [f"Dry run: venue {venue}, {shown}{len(live)} live, {max(0, slots)} of {args.max} slots free."]
         lines += [f"would start {describe(row)} and launch {venue}" for row in plan]
+        group = [row["number"] for row in plan if open_wave(repo, row["number"]) is None] if wave_tier else []
+        if group:
+            lines.append(f"would group {tickets_text(group)} into a wave")
+            extra["wave"] = {"id": None, "tickets": sorted(group)}
         lines += [f"skip #{s['number']}: {s['why']}" for s in skipped]
         if not candidates:
             lines.append("No ready tickets.")
-        emit(wants_json(args), {"venue": venue, "effort": effort, "dry_run": True, "live": [r["id"] for r in live.values()],
-                    "plan": plan, "skipped": skipped}, "\n".join(lines))
+        emit(wants_json(args), dict({"venue": venue, "effort": effort, "dry_run": True,
+                                     "live": [r["id"] for r in live.values()], "plan": plan, "skipped": skipped},
+                                    **extra), "\n".join(lines))
         return
     if not args.json:
         for s in capped:
             print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
-        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped}, "No ready tickets.")
+        emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
+                                     "skipped": skipped}, **extra), "No ready tickets.")
         return
     if slots <= 0:
-        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped},
+        emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
+                                     "skipped": skipped}, **extra),
              f"{len(live)} live runs; --max {args.max} reached, nothing launched.")
         return
     if not plan:
-        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped},
+        emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
+                                     "skipped": skipped}, **extra),
              "Nothing to launch: " + "; ".join(f"#{s['number']} has a {s['why']}" for s in skipped
                                                if s not in capped) + ".")
         return
@@ -1407,11 +1738,124 @@ def cmd_dispatch(repo, args):
         if not args.json:
             where = f"pid {record['pid']}, log {record['log']}" if venue == "headless" else f"id {record['bg_id']}"
             print(f"#{n} {venue} on {record['branch']} ({where})", flush=True)
+    if wave_tier and launched:
+        extra["wave"] = group_wave(repo, launched, wave_tier, routing["wave_effort"], args.json)
     if args.json:
-        emit(wants_json(args), {"venue": venue, "effort": effort, "launched": launched, "failed": failures,
-                                "skipped": skipped}, "")
+        emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": launched, "failed": failures,
+                                     "skipped": skipped}, **extra), "")
     if failures:
         sys.exit(1)
+
+
+def tickets_text(numbers):
+    return ", ".join(f"#{n}" for n in sorted(numbers))
+
+
+def open_wave(repo, n):
+    """Ticket n's newest wave (waves.wave_of) while its review has not finished, else None: a redispatched ticket
+    stays in that wave, and one whose wave was reviewed joins a new one."""
+    wave = waves.wave_of(repo.key, n)
+    review = wave.get("review") if wave else None
+    if wave is None or (isinstance(review, dict) and review.get("reviewed_at")):
+        return None
+    return wave
+
+
+def group_wave(repo, launched, tier, effort, as_json):
+    """Stamp each launched run record with its wave: a ticket already in an unreviewed wave keeps it, the rest form
+    one new wave (waves.create_wave), announced on stdout. The new wave's id, or None when every ticket had one."""
+    kept, fresh = {}, []
+    for record in launched:
+        wave = open_wave(repo, record["ticket"])
+        if wave is None:
+            fresh.append(record)
+        else:
+            kept[record["id"]] = wave["id"]
+    new = waves.create_wave(repo.key, repo.main, [r["ticket"] for r in fresh], tier, effort) if fresh else None
+    for record in launched:
+        record["wave"] = kept.get(record["id"]) or new["id"]
+        save_run(record)
+    if new is None:
+        return None
+    if not as_json:
+        print(f"wave {new['id']}: {tickets_text(new['tickets'])} (reviewed together once all are in review)",
+              flush=True)
+    return new["id"]
+
+
+def issue_status(issue):
+    """The board status of a `gh issue view --json state,labels` answer: closed for a CLOSED issue, else the name
+    after `status:` of its first status label, else None."""
+    if not isinstance(issue, dict):
+        return None
+    if str(issue.get("state", "")).upper() == "CLOSED":
+        return "closed"
+    for label in issue.get("labels") or []:
+        name = label.get("name") if isinstance(label, dict) else label
+        if isinstance(name, str) and name.startswith("status:"):
+            return name[len("status:"):]
+    return None
+
+
+def wave_detail(wave, state, prog):
+    if state == "working":
+        total = len(prog["done"]) + len(prog["waiting"])
+        waiting = ", ".join(f"#{w['number']} ({w['status'] or 'no status'})" for w in prog["waiting"])
+        return f"{len(prog['done'])} of {total} in review; waiting for {waiting}"
+    review = wave.get("review") if isinstance(wave.get("review"), dict) else {}
+    if state == "reviewing":
+        return f"reviewing (run {review.get('run')})"
+    if state == "reviewed":
+        return f"reviewed {review.get('reviewed_at')}"
+    return "no tickets" if state == "empty" else state
+
+
+def cmd_waves(repo, args):
+    """This repository's waves with their state and what each waits for, from the ticket caches; --refresh asks gh
+    once per waiting ticket."""
+    every = waves.load_waves(repo.key)
+    numbers = sorted({n for w in every for n in w.get("tickets") or [] if isinstance(n, int)})
+    statuses = waves.ticket_statuses(repo.key, numbers)
+    if args.refresh:
+        for n in numbers:
+            if statuses[n] in waves.DONE:
+                continue
+            try:
+                found = gh_json(repo, ["issue", "view", str(n), "--json", "state,labels"])
+            except Problem as err:
+                warn(f"#{n}: cannot refresh its status; the cache's stands: {err}")
+                continue
+            statuses[n] = issue_status(found)
+    rows = []
+    for wave in every:
+        tickets = [n for n in wave.get("tickets") or [] if isinstance(n, int)]
+        if not args.all and all(statuses.get(n) == "closed" for n in tickets):
+            continue
+        prog = waves.progress(wave, statuses)
+        state = waves.wave_state(wave, statuses)
+        rows.append(dict(wave, state=state, done=prog["done"], waiting=prog["waiting"],
+                         detail=wave_detail(wave, state, prog)))
+    if args.json:
+        emit(True, rows, "")
+    elif not rows:
+        print("No waves." if args.all else "No open waves (--all lists every wave).")
+    else:
+        lines = [("ID", "TICKETS", "STATE", "DETAIL")]
+        lines += [(r["id"], tickets_text(r.get("tickets") or []) or "-", r["state"], r["detail"]) for r in rows]
+        print(table(lines))
+
+
+def cmd_wave_drop(repo, args):
+    wave = waves.load_wave(repo.key, args.id)
+    if wave is None:
+        raise Problem(f"no wave {args.id} in this repository; harness-work waves --all lists them")
+    review = wave.get("review")
+    if isinstance(review, dict) and review.get("launched_at"):
+        raise Problem(f"wave {args.id}'s review was launched at {review['launched_at']}; nothing dropped")
+    if args.number not in (wave.get("tickets") or []):
+        raise Problem(f"#{args.number} is not in wave {args.id}")
+    wave = waves.drop_ticket(repo.key, args.id, args.number)
+    emit(wants_json(args), wave, f"dropped #{args.number} from wave {args.id}")
 
 
 def cmd_runs(args):
@@ -1448,7 +1892,97 @@ def cmd_runs(args):
         print(table(rows))
 
 
+def count(groups, key, item, kind):
+    """Add one call of `kind` to the row of `groups` under `key`, made from `item` on its first call."""
+    row = groups.setdefault(key, dict(item, calls=0, graphql=0, rest=0, refused=0))
+    row["calls"] += 1
+    if kind in ("graphql", "rest"):
+        row[kind] += 1
+    return row
+
+
+def ranked(groups, keys):
+    """The rows of `groups` by calls descending, then by group key, each with only `keys`."""
+    return [{k: row[k] for k in keys} for _, row in sorted(groups.items(), key=lambda kv: (-kv[1]["calls"], kv[0]))]
+
+
+def cmd_budget_calls(args):
+    """The gh call log of the last --hours hours (ghlimit.read_calls): totals, by tool, command, ticket and hour,
+    and the busiest minute. Reads the log only; no gh call."""
+    try:
+        hours = float(args.hours)
+    except ValueError:
+        hours = float("nan")
+    until = now().replace(microsecond=0)
+    try:
+        if not 0 < hours < float("inf"):
+            raise OverflowError
+        since = until - dt.timedelta(hours=hours)
+    except OverflowError:
+        raise Problem(f"--hours must be a number more than 0, not {args.hours!r}") from None
+    lines = ghlimit.read_calls(since)
+    totals = {"graphql": 0, "rest": 0, "refused": 0, "failed": 0}
+    waited_ms = 0
+    tools, commands, tickets, by_hour, minutes = {}, {}, {}, {}, {}
+    for line in lines:
+        at = parse_iso(line["at"]).astimezone(dt.timezone.utc)
+        kind = line.get("kind")
+        refused = line.get("refused") is True
+        if kind in ("graphql", "rest"):
+            totals[kind] += 1
+        totals["refused"] += refused
+        totals["failed"] += line.get("exit") != 0 and not refused
+        waited = line.get("waited_ms")
+        if isinstance(waited, (int, float)) and not isinstance(waited, bool) and abs(waited) < float("inf"):
+            waited_ms += waited
+        tool = str(line.get("tool") or "")
+        count(tools, tool, {"tool": tool}, kind)["refused"] += refused
+        cmd = str(line.get("cmd") or "")
+        count(commands, (cmd, str(kind)), {"cmd": cmd, "kind": kind}, kind)
+        ticket = line.get("ticket")
+        if isinstance(ticket, int) and not isinstance(ticket, bool):
+            repo = str(line.get("repo") or "")
+            count(tickets, (repo, ticket), {"repo": repo, "ticket": ticket}, kind)
+        hour = at.strftime("%Y-%m-%dT%H:00:00Z")
+        count(by_hour, hour, {"hour": hour}, kind)
+        minute = at.strftime("%Y-%m-%dT%H:%M:00Z")
+        minutes[minute] = minutes.get(minute, 0) + 1
+    peak = min(minutes.items(), key=lambda kv: (-kv[1], kv[0])) if minutes else None
+    data = {"since": iso(since), "until": iso(until), "hours": hours, "total": len(lines),
+            "graphql": totals["graphql"], "rest": totals["rest"], "refused": totals["refused"],
+            "failed": totals["failed"], "waited_seconds": waited_ms / 1000,
+            "peak_minute": {"minute": peak[0], "calls": peak[1]} if peak else None,
+            "by_tool": ranked(tools, ("tool", "calls", "graphql", "rest", "refused")),
+            "by_command": ranked(commands, ("cmd", "kind", "calls")),
+            "by_ticket": ranked(tickets, ("repo", "ticket", "calls", "graphql")),
+            "by_hour": [{k: row[k] for k in ("hour", "calls", "graphql", "rest")}
+                        for _, row in sorted(by_hour.items())]}
+    if wants_json(args):
+        emit(True, data, "")
+        return
+    window = str(int(hours)) if hours.is_integer() else repr(hours)   # 24, 0.5, 1234567: never 1.23457e+06
+    if not lines:
+        print(f"No gh calls logged in the last {window} h.")
+        return
+    parts = [f"gh calls in the last {window} h: {data['total']} (graphql {data['graphql']}, rest {data['rest']}), "
+             f"{data['refused']} refused, {data['failed']} failed, {int(data['waited_seconds'])} s waiting; "
+             f"peak {peak[1]} in one minute ({peak[0][:16]}Z)",
+             table([("TOOL", "CALLS", "GRAPHQL", "REST", "REFUSED")]
+                   + [(r["tool"], str(r["calls"]), str(r["graphql"]), str(r["rest"]), str(r["refused"]))
+                      for r in data["by_tool"]]),
+             table([("COMMAND", "KIND", "CALLS")]
+                   + [(r["cmd"], str(r["kind"]), str(r["calls"])) for r in data["by_command"][:CALLS_TOP]])]
+    if data["by_ticket"]:
+        parts.append(table([("TICKET", "CALLS", "GRAPHQL")]
+                           + [(f"{r['repo']} #{r['ticket']}", str(r["calls"]), str(r["graphql"]))
+                              for r in data["by_ticket"]]))
+    print("\n\n".join(parts))
+
+
 def cmd_budget(args):
+    if args.action == "calls":
+        cmd_budget_calls(args)
+        return
     budgets = load_budgets()
     action = args.action or "status"
     if action == "exhaust":
@@ -1560,13 +2094,15 @@ def parser():
     nested_json = argparse.ArgumentParser(add_help=False)     # never resets a --json given before the action
     nested_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
     ap = Parser(prog="harness-work", description="Ticket worktrees, attempts, dispatch, runs and budgets.")
-    sub = ap.add_subparsers(dest="cmd", metavar="{start,attempt,stage,cost,dispatch,runs,budget,worktrees,worktree}")
+    sub = ap.add_subparsers(dest="cmd",
+                            metavar="{start,attempt,stage,cost,dispatch,cloud,runs,waves,wave,budget,worktrees,"
+                                    "worktree}")
     sub.required = True
 
     start = sub.add_parser("start", parents=[with_repo, with_json],
                            help="branch and worktree for a ticket, status in-progress, its context and answers")
     start.add_argument("number", type=issue_number, metavar="N")
-    start.add_argument("--venue", default="interactive", choices=("interactive",) + VENUES,
+    start.add_argument("--venue", default="interactive", choices=("interactive",) + VENUES + ("cloud",),
                        help="named in the start comment (dispatch passes its own)")
 
     attempt = sub.add_parser("attempt", parents=[with_repo, with_json],
@@ -1610,12 +2146,30 @@ def parser():
                           help="alias for --venue headless: runs headless, billed to the API key")
     dispatch.add_argument("--dry-run", action="store_true", help="print the plan; start and launch nothing")
 
+    cloud = sub.add_parser("cloud", parents=[with_repo, with_json],
+                           help="start a ticket, push its branch and launch a Claude cloud session on it")
+    cloud.add_argument("number", type=issue_number, metavar="N")
+
     runs = sub.add_parser("runs", parents=[with_json], help="dispatched runs, alive or ended in the last 24 h")
     runs.add_argument("--sweep", action="store_true", help="close ended runs and classify their outcome")
     runs.add_argument("--all", action="store_true", help="every run on record")
 
+    waves_ = sub.add_parser("waves", parents=[with_repo, with_json],
+                            help="this repository's waves (the tickets one dispatch launched) and where each stands")
+    waves_.add_argument("--all", action="store_true", help="every wave, those whose tickets are all closed too")
+    waves_.add_argument("--refresh", action="store_true",
+                        help="ask gh for each waiting ticket's status instead of trusting its cache")
+
+    wave = sub.add_parser("wave", help="one wave")
+    wave_sub = wave.add_subparsers(dest="action", metavar="{drop}")
+    wave_sub.required = True
+    drop = wave_sub.add_parser("drop", parents=[with_repo, with_json],
+                               help="take a ticket out of a wave whose review was not launched")
+    drop.add_argument("id", metavar="ID")
+    drop.add_argument("number", type=issue_number, metavar="N")
+
     budget = sub.add_parser("budget", parents=[with_json], help="the api and cloud budgets")
-    budget_sub = budget.add_subparsers(dest="action", metavar="{status,exhaust,reset}")
+    budget_sub = budget.add_subparsers(dest="action", metavar="{status,exhaust,reset,calls}")
     budget_sub.add_parser("status", parents=[nested_json], help="each budget's state (the default)")
     ex = budget_sub.add_parser("exhaust", parents=[nested_json], help="mark a budget exhausted")
     ex.add_argument("name", choices=BUDGETS)
@@ -1623,6 +2177,10 @@ def parser():
     ex.add_argument("--hours", type=float, default=EXHAUST_HOURS, help="default 24")
     reset = budget_sub.add_parser("reset", parents=[nested_json], help="mark a budget available")
     reset.add_argument("name", choices=BUDGETS)
+    calls = budget_sub.add_parser("calls", parents=[nested_json],
+                                  help="the gh call log: totals by tool, command, ticket and hour, the busiest minute")
+    calls.add_argument("--hours", default=str(CALLS_HOURS), metavar="H",
+                       help="the window, default 24 (checked by the command: a bad value is one line, exit 1)")
 
     wts = sub.add_parser("worktrees", parents=[with_repo, with_json],
                          help="the ticket worktrees with age, PR state and the stale flag")
@@ -1651,7 +2209,8 @@ def main():
             cmd_budget(args)
         else:
             command = {"start": cmd_start, "attempt": cmd_attempt, "stage": cmd_stage, "cost": cmd_cost, "dispatch": cmd_dispatch,
-                       "worktrees": cmd_worktrees, "worktree": cmd_worktree_remove}[args.cmd]
+                       "cloud": cmd_cloud, "waves": cmd_waves, "wave": cmd_wave_drop, "worktrees": cmd_worktrees,
+                       "worktree": cmd_worktree_remove}[args.cmd]
             command(open_repo(args.repo), args)
     except Problem as err:
         sys.exit(f"harness-work: {one_line(err)}")

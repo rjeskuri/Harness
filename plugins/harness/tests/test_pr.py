@@ -661,6 +661,27 @@ class Review(PrTest):
                 body = self.posted_body("--model", model)
                 self.assertTrue(body.startswith(f"Harness review ({model}): 2 findings, "), body)
 
+    def test_review_summary_parses_with_autoland_to_the_counts_it_declares(self):
+        """#280: the summary line `harness-pr review` posts is one autoland.review_counts (the single parser of the
+        per-severity counts) reads back as the high, medium and low it declared, for several mixes and models."""
+        if LIB not in sys.path:
+            sys.path.insert(0, LIB)
+        from harness_lib import autoland
+        mixes = [{"high": 1, "medium": 0, "low": 0}, {"high": 0, "medium": 3, "low": 1},
+                 {"high": 2, "medium": 1, "low": 4}, {"high": 0, "medium": 0, "low": 2}]
+        for model in ("fable", "opus", "sonnet"):
+            for mix in mixes:
+                with self.subTest(model=model, **mix):
+                    sevs = [sev for sev in mix for _ in range(mix[sev])]
+                    data = [{"path": "widget.py", "line": 2 + i, "severity": sev, "body": f"Finding {sev} {i}."}
+                            for i, sev in enumerate(sevs)]
+                    self.scenario([REPO_VIEW, {"match": ["pr", "diff", "34"], "stdout": DIFF},
+                                   {"match": ["api", "-X", "POST", "repos/o/r/pulls/34/reviews"], "stdout": "{}"}])
+                    self.ok("review", "34", "--findings", self.findings(data), "--model", model)
+                    posts = [c for c in self.gh_calls() if c["argv"][0] == "api"]
+                    body = json.loads(posts[-1]["stdin"])["body"]
+                    self.assertEqual(autoland.review_counts(body), mix, body)
+
     def test_review_with_no_findings_posts_a_plain_comment_review(self):
         self.scenario([{"match": ["pr", "review", "34"], "stdout": ""}])
         self.ok("review", "34", "--findings", self.findings([]), "--checked", "the red tests and the DoD")
@@ -887,6 +908,23 @@ GATE_CASES = {
     "no summary line, a high listed": (
         [harness_review(101, at(10), inline=[TOKEN], body_only=[TYPO], summary="")],
         [pr_commit("a", at(9))], [TOKEN], [TYPO]),
+    # #280: the per-severity counts are the ones autoland.review_counts reads, so a summary line it rejects (no final
+    # period, text after the counts) has none: the total less the findings listed counts as high (fail closed).
+    "a summary without the final period, only low findings listed": (
+        [harness_review(101, at(10), body_only=[NOTES],
+                        summary="Harness review (opus): 3 findings, 0 high, 0 medium, 3 low")],
+        [pr_commit("a", at(9))], [], [NOTES]),
+    "a summary with text after the counts, only low findings listed": (
+        [harness_review(101, at(10), inline=[OLD_NIT], body_only=[TYPO],
+                        summary="Harness review (sonnet): 4 findings, 0 high, 0 medium, 4 low. Checked the diff.")],
+        [pr_commit("a", at(9))], [], [OLD_NIT, TYPO]),
+    "a summary without the final period, a high listed": (
+        [harness_review(101, at(10), inline=[FROBS], body_only=[NOTES],
+                        summary="Harness review (fable): 3 findings, 1 high, 0 medium, 2 low")],
+        [pr_commit("a", at(9))], [FROBS], [NOTES]),
+    "a one-finding summary without the final period, none listed": (
+        [harness_review(101, at(10), summary="Harness review (opus): 1 finding, 0 high, 0 medium, 1 low")],
+        [pr_commit("a", at(9))], [], []),
 }
 # The refused cases whose summary declares more high plus medium findings than the review lists: how many more.
 GATE_NOT_LISTED = {
@@ -894,6 +932,10 @@ GATE_NOT_LISTED = {
     "only low findings listed, the summary counts a medium": 1,
     "the summary counts one high, none listed": 1,
     "an older summary counting more findings than are listed": 2,
+    "a summary without the final period, only low findings listed": 2,
+    "a summary with text after the counts, only low findings listed": 2,
+    "a summary without the final period, a high listed": 1,
+    "a one-finding summary without the final period, none listed": 1,
 }
 # Refused cases: (name, the latest harness review's submitted_at, n) where n in "has <n> high or medium finding(s)"
 # counts the high and medium findings listed plus the GATE_NOT_LISTED count.
@@ -908,6 +950,10 @@ GATE_REFUSAL_COUNTS = [
     ("the summary counts more high than are listed", at(10), 2),
     ("an older summary without per-severity counts", at(10), 2),
     ("an older summary counting more findings than are listed", at(10), 2),
+    ("a summary without the final period, only low findings listed", at(10), 2),
+    ("a summary with text after the counts, only low findings listed", at(10), 2),
+    ("a summary without the final period, a high listed", at(10), 2),
+    ("a one-finding summary without the final period, none listed", at(10), 1),
 ]
 # The proceed cases in which ready has nothing to warn about: a newer commit cleared the findings, the latest harness
 # review is clean, or there is no harness review. Ready prints nothing on stderr for them.

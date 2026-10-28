@@ -14,6 +14,9 @@ change of the branch's own makes it stale.
 Usage:
     harness-red check [--base origin/main]   # run the branch's changed tests; red exits 0, anything else 1
                                              # (no tests ran, or they failed to load: refused, nothing recorded)
+    harness-red reprove [--base origin/main] # check for a branch that has source: its test files as they are now,
+                                             # run against main's code at the merge base in a temporary worktree;
+                                             # only red replaces the record (green or no proof: refused, kept)
     harness-red status                       # the record for this branch, and current: yes|no
     harness-red files [--base origin/main]   # the branch's own test files: its changed runnable tests, plus the
                                              # test modules each other changed path names or HARNESS_TEST_MAP adds
@@ -26,7 +29,7 @@ Usage:
                                              # CLAUDE_VERIFY_CMD at HEAD in the background, in its own session;
                                              # reuses a finished run for this HEAD and command; exit 0 passed,
                                              # 1 failed or timed out (with the log's tail), 8 still running
-    check, status, files and verify take --json; every subcommand takes --worktree PATH.
+    check, reprove, status, files and verify take --json; every subcommand takes --worktree PATH.
 
 Settings: HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT (comma-separated globs) come from the
 environment, then `env` in the main checkout's tracked .claude/settings.json only, as in tests_first;
@@ -34,7 +37,11 @@ the others come from the environment, then `env` in the worktree's .claude/setti
 .claude/settings.local.json over it: HARNESS_TEST_CMD ({files} becomes the test files, shell-quoted; detected when unset) and
 HARNESS_TEST_TIMEOUT (seconds, default 300) and HARNESS_TEST_MAP (comma-separated SOURCE_GLOB=TEST_GLOB pairs:
 a changed path matching SOURCE_GLOB adds the test modules matching TEST_GLOB to `files`), and for verify
-CLAUDE_VERIFY_CMD and HARNESS_VERIFY_TIMEOUT (seconds, default 3600).
+CLAUDE_VERIFY_CMD and HARNESS_VERIFY_TIMEOUT (seconds, default 3600). In a session of another project
+(CLAUDE_PROJECT_DIR names a folder whose main checkout is not this repository's) the environment holds that
+project's settings, so these come from the worktree's settings alone. A test command that cannot start (exit 126
+or 127, or output that is only npm's complaint of no package.json or no test script, or only python3's of a
+missing -m module or script) is refused, never red.
 
 The verify record is ~/.claude/harness/repos/<repo-key>/verify/<branch-slug>.json: {"branch", "head", "cmd",
 "state": "running|passed|failed|timeout", "pid", "started_at", "finished_at", "exit", "log"}, the output going
@@ -55,6 +62,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
@@ -65,6 +73,7 @@ try:
     from harness_lib.redproof import read_files, record_current, save_red_files, tests_hash
     from harness_lib.repo import NotARepository, RepoError, repo_facts
     from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
+    from harness_lib.settings import other_project, project_setting
     from harness_lib.settings import DEFAULT_TEST_PATTERNS as TEST_PATTERNS  # also read by tests/test_red.py
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT as SOURCE_EXEMPT  # also read by tests/test_red.py
     from harness_lib.cli import Parser, Problem, run_main, warn  # Problem also caught by tests/test_red.py
@@ -75,6 +84,14 @@ except Exception as exc:  # one line, exit 1, like the __main__ wrapper below
 DEFAULT_TIMEOUT = 300.0
 TAIL_LINES = 40
 CANNOT_START = (126, 127)          # the shell's "not executable" and "command not found"
+# The runner itself did not start, whatever its exit, when the whole output is its own complaint: npm's lines alone,
+# one saying it found no package.json (ENOENT) or no test script, or the interpreter's one line for a missing -m
+# module or script file (a test importing a missing module is red: its traceback says `ModuleNotFoundError: No
+# module named 'x'`, never `python3: No module named x`). Output a test printed (a test that runs npm) is not that.
+NPM_LINE_RE = re.compile(r"npm (?:ERR!|error|warn|WARN)(?:\s|$)")
+NPM_CANNOT_START_RE = re.compile(r"npm (?:ERR!|error) (?:enoent .*package\.json|missing script: )", re.I)
+PYTHON_CANNOT_START_RE = re.compile(r"[^:]*python[\w.]*: (?:No module named |can't open file |"
+                                    r"Error while finding module specification for )", re.I)
 IMPORT_RE = re.compile(r"ModuleNotFoundError|ImportError|No module named|Cannot find module|ERR_MODULE_NOT_FOUND")
 ASSERTION_RE = re.compile(r"AssertionError|assert |FAILED|failed|✗|not ok")
 # A run that proves nothing: no record. Exit 5 is pytest's and (3.12+) unittest's "no tests ran".
@@ -128,8 +145,8 @@ def detect_test_cmd(root, files):
     return None
 
 
-def test_timeout(file_env):
-    raw = setting("HARNESS_TEST_TIMEOUT", file_env)
+def test_timeout(file_env, foreign=False):
+    raw = project_setting("HARNESS_TEST_TIMEOUT", file_env, foreign)
     try:
         value = float(raw) if raw is not None else DEFAULT_TIMEOUT
     except ValueError:
@@ -182,6 +199,9 @@ class Repo:
         self.verify_record = os.path.join(state, "verify", self.slug + ".json")
         self.verify_log = os.path.join(state, "verify", self.slug + ".log")
         self.env = settings_env(self.top)
+        # A session of another project carries that project's settings in the environment: then the worktree's
+        # settings alone decide the settings read through worktree_setting.
+        self.foreign = other_project(self.main)
         # What counts as a test is decided by the main checkout's tracked settings.json only, as in
         # tests_first: the worktree's files and settings.local.json are agent-editable.
         classify_env = settings_env(self.main, ("settings.json",))
@@ -196,8 +216,13 @@ class Repo:
             return "exempt"
         return "source"
 
+    def worktree_setting(self, name):
+        """A worktree setting: the environment, then the worktree's settings; the settings alone in another
+        project's session."""
+        return project_setting(name, self.env, self.foreign)
+
     def test_command(self, files):
-        cmd = setting("HARNESS_TEST_CMD", self.env) or detect_test_cmd(self.top, files)
+        cmd = self.worktree_setting("HARNESS_TEST_CMD") or detect_test_cmd(self.top, files)
         if not cmd:
             raise Problem("no test command for these files: set HARNESS_TEST_CMD under env in "
                           ".claude/settings.json ({files} becomes the test files)")
@@ -325,10 +350,20 @@ def kind_of(code, output):
     return "error"
 
 
+def cannot_start(output):
+    """The line saying the runner never started (its own complaint alone, see NPM_LINE_RE), or None."""
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    if lines and all(NPM_LINE_RE.match(ln) for ln in lines):
+        return next((ln for ln in lines if NPM_CANNOT_START_RE.match(ln)), None)
+    if len(lines) == 1 and PYTHON_CANNOT_START_RE.match(lines[0]):
+        return lines[0]
+    return None
+
+
 def run_tests(repo, files, cwd):
     """(cmd, exit, output, timed out) for the test files run in `cwd`; refuses a command that cannot start."""
     cmd = repo.test_command(files)
-    timeout = test_timeout(repo.env)
+    timeout = test_timeout(repo.env, repo.foreign)
     try:
         code, output = run_command(cmd, cwd, timeout)
     except subprocess.TimeoutExpired:
@@ -338,6 +373,9 @@ def run_tests(repo, files, cwd):
     if code in CANNOT_START:
         said = [ln.strip() for ln in output.splitlines() if ln.strip()]
         raise Problem(f"could not start {cmd}: {said[-1] if said else f'exit {code}'}; set HARNESS_TEST_CMD")
+    said = cannot_start(output) if code else None
+    if said:
+        raise Problem(f"could not start {cmd}: {said} (exit {code}); set HARNESS_TEST_CMD")
     return cmd, code, output, None
 
 
@@ -371,7 +409,7 @@ def name_keys(path):
 def test_map(repo):
     """HARNESS_TEST_MAP as (source glob, test glob) pairs; an entry without `=` is skipped with a warning."""
     pairs = []
-    for entry in patterns(setting("HARNESS_TEST_MAP", repo.env) or ""):
+    for entry in patterns(repo.worktree_setting("HARNESS_TEST_MAP") or ""):
         source, eq, test = entry.partition("=")
         if not eq:
             warn("harness-red", f"HARNESS_TEST_MAP entry {entry!r} has no '=' (SOURCE_GLOB=TEST_GLOB); skipped")
@@ -442,42 +480,47 @@ def merge_base_of(repo, base):
     return merge_base
 
 
-def cmd_check(repo, args):
-    note = no_tests_message(repo)
-    if note:
-        print_no_tests(note, args.json)
-        return 0
-    base = repo.resolve_base(args.base)
-    merge_base = merge_base_of(repo, base)
+def test_changes(repo, base):
+    """(merge base, changed paths, test files): the branch's changes against `base` (resolved as check does) and
+    the test files among them that exist; none is refused."""
+    merge_base = merge_base_of(repo, repo.resolve_base(base))
     changed = repo.changed_paths(merge_base)
     tests = [p for p in changed if repo.classify(p) == "test" and os.path.isfile(os.path.join(repo.top, p))]
     if not tests:
         raise Problem("No test changes on this branch; write the tests first.")
-    sources = [p for p in changed if repo.classify(p) == "source"]
-    if sources:
-        raise Problem(f"Source already changed before the red run: {', '.join(sources)}. "
-                      "Revert them or move them to the coder step.")
-    run_files = runnable(tests)
-    contents = read_files(repo.top, tests)         # the bytes the run proves, hashed and kept beside the record
-    digest = tests_hash(contents)
-    cmd, code, output, timed_out = run_tests(repo, run_files, repo.top)
+    return merge_base, changed, tests
+
+
+def print_refused(args, why, tests, cmd, code, output):
+    if args.json:
+        print(json.dumps({"refused": why, "cmd": cmd, "exit": code, "tail": tail(output)}, indent=2,
+                         ensure_ascii=False))
+    else:
+        print(f"{why}: {len(tests)} test files, exit {code}")
+        print(tail(output))
+
+
+def run_red(repo, args, tests, run_files, cwd, again):
+    """(cmd, exit, output) of the test command on `run_files` in `cwd`. A timeout or a run that proves nothing is
+    refused with nothing recorded; the refusal says to run `harness-red <again>` again."""
+    cmd, code, output, timed_out = run_tests(repo, run_files, cwd)
     if timed_out:
         raise Problem(f"{cmd} timed out after {timed_out:g}s and was stopped; no red run recorded. "
                       "Raise HARNESS_TEST_TIMEOUT or fix the hang.")
     why = unproven(code, output)
     if why:
-        if args.json:
-            print(json.dumps({"refused": why, "cmd": cmd, "exit": code, "tail": tail(output)}, indent=2,
-                             ensure_ascii=False))
-        else:
-            print(f"{why}: {len(tests)} test files, exit {code}")
-            print(tail(output))
+        print_refused(args, why, tests, cmd, code, output)
         fix = ("make the test files define tests the command collects" if why == NO_TESTS
                else "fix the error its output shows")
-        raise Problem(f"no red run recorded: {why} (exit {code}); {fix}, then run harness-red check again.")
+        raise Problem(f"no red run recorded: {why} (exit {code}); {fix}, then run harness-red {again} again.")
+    return cmd, code, output
+
+
+def save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output):
+    """Write the side file, then the record, of this run; print it. Returns its kind."""
     kind = kind_of(code, output)
     record = {"branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
-              "test_hash": digest, "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),
+              "test_hash": tests_hash(contents), "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),
               "at": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
     save_red_files(repo.record_path, contents)       # first: a record never names files the side file lacks
     write_json(repo.record_path, record, prefix=".red-")
@@ -489,8 +532,62 @@ def cmd_check(repo, args):
     else:
         print(f"red ({kind}): {len(tests)} test files, exit {code}")
         print(record["tail"])
-    if kind == "green":
+    return kind
+
+
+def cmd_check(repo, args):
+    note = no_tests_message(repo)
+    if note:
+        print_no_tests(note, args.json)
+        return 0
+    merge_base, changed, tests = test_changes(repo, args.base)
+    sources = [p for p in changed if repo.classify(p) == "source"]
+    if sources:
+        raise Problem(f"Source already changed before the red run: {', '.join(sources)}. "
+                      "Revert them or move them to the coder step.")
+    run_files = runnable(tests)
+    contents = read_files(repo.top, tests)         # the bytes the run proves, hashed and kept beside the record
+    cmd, code, output = run_red(repo, args, tests, run_files, repo.top, "check")
+    if save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output) == "green":
         raise Problem(GREEN)
+    return 0
+
+
+def cmd_reprove(repo, args):
+    """check for a branch that already has source: the branch's test files as they are now, run against main's
+    code at the merge base in a temporary detached worktree. Only a red run replaces the record."""
+    note = no_tests_message(repo)
+    if note:
+        print_no_tests(note, args.json)
+        return 0
+    load_record(repo)                              # it re-proves a red run; without one, check comes first
+    merge_base, changed, tests = test_changes(repo, args.base)
+    run_files = runnable(tests)
+    contents = read_files(repo.top, tests)
+    gone = [p for p in changed if repo.classify(p) == "test" and not os.path.lexists(os.path.join(repo.top, p))]
+    tmp = tempfile.mkdtemp(prefix="harness-red-reprove-")
+    path = os.path.join(tmp, repo.slug)
+    try:
+        git(repo.top, "worktree", "add", "--detach", path, merge_base)
+        for name, data in contents.items():        # the bytes hashed are the bytes run
+            dst = os.path.join(path, name)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as fh:
+                fh.write(data)
+        for name in gone:                          # test files the branch deleted are gone there too
+            if os.path.lexists(os.path.join(path, name)):
+                os.remove(os.path.join(path, name))
+        cmd, code, output = run_red(repo, args, tests, run_files, path, "reprove")
+    finally:
+        if git(repo.top, "worktree", "remove", "--force", path, check=False).returncode != 0:
+            shutil.rmtree(path, ignore_errors=True)
+            git(repo.top, "worktree", "prune", check=False)
+        shutil.rmtree(tmp, ignore_errors=True)
+    if code == 0:
+        print_refused(args, "green", tests, cmd, code, output)
+        raise Problem(f"Tests pass against main's code at the merge base {merge_base[:12]}: they prove nothing; "
+                      "the red record is kept.")
+    save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output)
     return 0
 
 
@@ -604,8 +701,8 @@ POLL = 0.5
 UNSET_CMD = "no verify command (CLAUDE_VERIFY_CMD unset); nothing run"
 
 
-def verify_timeout(file_env):
-    raw = setting("HARNESS_VERIFY_TIMEOUT", file_env)
+def verify_timeout(file_env, foreign=False):
+    raw = project_setting("HARNESS_VERIFY_TIMEOUT", file_env, foreign)
     try:
         value = float(raw) if raw is not None else VERIFY_TIMEOUT
     except ValueError:
@@ -766,7 +863,7 @@ def verify_report(record, as_json):
 
 
 def cmd_verify(repo, args):
-    cmd = setting("CLAUDE_VERIFY_CMD", repo.env)
+    cmd = repo.worktree_setting("CLAUDE_VERIFY_CMD")
     if not cmd:
         if args.json:
             print(json.dumps(dict(dict.fromkeys(VERIFY_KEYS), state="none", tail=""), indent=2))
@@ -783,7 +880,7 @@ def cmd_verify(repo, args):
     if not (same and not args.rerun and (live or record.get("state") in FINISHED)):
         if live:                                # a dead record's pid may be someone else's now: never killed
             stop_run(record)
-        record = start_run(repo, cmd, head, verify_timeout(repo.env))
+        record = start_run(repo, cmd, head, verify_timeout(repo.env, repo.foreign))
     if args.wait:
         record = wait_run(repo, record, args.timeout)
     return verify_report(record, args.json)
@@ -797,10 +894,13 @@ def parser():
     as_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
     ap = Parser(prog="harness-red", description="Proves a ticket's tests fail before the implementation exists.")
     ap.add_argument("--worktree", metavar="PATH", help="the ticket worktree (default: the cwd)")
-    ap.add_argument("--json", action="store_true", help="print JSON (check, status, files, verify)")
-    sub = ap.add_subparsers(dest="cmd", metavar="{check,status,files,run,scratch,verify}")
+    ap.add_argument("--json", action="store_true", help="print JSON (check, reprove, status, files, verify)")
+    sub = ap.add_subparsers(dest="cmd", metavar="{check,reprove,status,files,run,scratch,verify}")
     check = sub.add_parser("check", parents=[common, as_json], help="run the branch's test changes and record red")
     check.add_argument("--base", metavar="REF", help="default: origin/main when it exists, else main")
+    reprove = sub.add_parser("reprove", parents=[common, as_json],
+                             help="re-prove the branch's test files against main's code at the merge base")
+    reprove.add_argument("--base", metavar="REF", help="default: origin/main when it exists, else main")
     sub.add_parser("status", parents=[common, as_json], help="the red record for this branch")
     files = sub.add_parser("files", parents=[common, as_json], help="the branch's own test files")
     files.add_argument("--base", metavar="REF", help="default: origin/main when it exists, else main")
@@ -826,12 +926,12 @@ def main():
     ap = parser()
     args = ap.parse_args()
     if not args.cmd:
-        ap.error("choose a subcommand: check, status, files, run, scratch or verify")
+        ap.error("choose a subcommand: check, reprove, status, files, run, scratch or verify")
     if args.cmd == "scratch" and not args.scratch_cmd:
         ap.error("choose scratch create, run or remove")
     for sig in (signal.SIGTERM, signal.SIGHUP):             # unwind, so a running test command is killed too
         signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
-    commands = {"check": cmd_check, "status": cmd_status, "files": cmd_files, "run": cmd_run,
+    commands = {"check": cmd_check, "reprove": cmd_reprove, "status": cmd_status, "files": cmd_files, "run": cmd_run,
                 "scratch create": cmd_scratch_create, "scratch run": cmd_scratch_run,
                 "scratch remove": cmd_scratch_remove, "verify": cmd_verify}
     try:

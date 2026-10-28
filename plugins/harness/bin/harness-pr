@@ -16,6 +16,12 @@ Usage:
     harness-pr ultra P [--post] [--force]
     harness-pr land P [--yes] [--discard] [--accept-findings]
     harness-pr gate P [--json]
+    harness-pr revert P|SHA [--reason TEXT] [--evidence-file F] [--json]
+
+revert undoes a landed PR on main through the main checkout (on main, no tracked changes, no commit origin/main lacks
+but this revert; fetched and fast-forwarded first): `git revert --no-edit` of its merge commit and `git push origin main` (a rejected push gets one
+`git pull --rebase`), an incident bug under the ticket's epic, the ticket reopened as needs-input, a notification.
+A step an earlier run did is skipped. autoland calls revert_landed() in-process; the work loop never runs it.
 
 ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has high
 or medium findings and no commit newer than it, naming those findings, and refuse when gh cannot tell. A finding
@@ -62,6 +68,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -77,7 +84,7 @@ try:
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
     from harness_lib.autoland import (CONVERSATION, check_entries as lib_check_entries, evaluate, fetch_origin,
-                                      gate_settings, gather_facts, overall)
+                                      gate_settings, gather_facts, overall, review_counts)
     from harness_lib.routing import load_routing
     from harness_lib.reviews import (add_rulings, add_ticket, finding_key, latest_round, load_rounds, load_tickets,
                                      reviews_dir, save_round)
@@ -89,8 +96,7 @@ TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 TICKET_BRANCH = re.compile(r"^t/(\d+)-")
 MARKER = "<!-- harness-review -->"
 BODY_FINDING = re.compile(r"^- (`[^`]*`|\(no path\)) \[(\w+)\] (.*)$")     # a finding listed in a review's body
-REVIEW_COUNT = re.compile(r"^Harness review \([^)]*\): (\d+) findings?\b"          # a review's summary line, with
-                          r"(?:, (\d+) high, (\d+) medium, (\d+) low\b)?")           # or without per-severity counts
+REVIEW_COUNT = re.compile(r"^Harness review \([^)]*\): (\d+) findings?\b")       # a review's summary line: the total only
 INLINE_SEVERITY = re.compile(r"^\[(\w+)\]")                                        # an inline finding's prefix
 LANDED = "Landed in"
 RESOLUTION = "**Resolution**"
@@ -129,6 +135,11 @@ OUTSIDE_NOTE = "(outside the files this ticket changed)"
 SENTENCE_END = re.compile(r"[.!?](?= |$)")
 TITLE_SENTENCE = 60          # an out-of-scope ticket's title: at most this much of the finding's first sentence
 AWAIT_FIELDS = "number,title,isDraft,createdAt,url,headRefName,closingIssuesReferences,statusCheckRollup"
+SHA_TEXT = re.compile(r"[0-9a-fA-F]{7,40}")
+INCIDENT = "incident"
+NEEDS_INPUT = "**Needs your input**"     # harness-board's needs-input comments start with it
+DEFAULT_REASON = "no reason given"
+EVIDENCE_TAIL_LINES = 40
 
 
 def plural(n, word):
@@ -1049,8 +1060,9 @@ def gate_severity(value):
 def review_findings(repo, slug, number, review):
     """([(severity, "path:line [severity] body")], unlisted) of a harness review: the body's list and the inline
     comments, [] when it says "no findings"; a finding without a recognisable severity is high. unlisted is how
-    many more high plus medium findings the summary line counts than are listed (a summary without per-severity
-    counts: how many more findings of any severity, each counted as high)."""
+    many more high plus medium findings the summary line counts than are listed, the counts read by
+    autoland.review_counts (a summary it cannot read: how many more findings of any severity the total counts,
+    each as high)."""
     body = review.get("body") or ""
     if body.startswith("Harness review: no findings."):
         return [], 0
@@ -1067,13 +1079,12 @@ def review_findings(repo, slug, number, review):
         place = f"{c.get('path') or '(no path)'}" + (f":{line}" if line else "")
         m = INLINE_SEVERITY.match(text)
         found.append((gate_severity(m.group(1) if m else None), f"{place} {short(text)}"))
+    counts = review_counts(body)
+    if counts is not None:
+        listed = sum(1 for sev, _ in found if sev != "low")
+        return found, max(counts["high"] + counts["medium"] - listed, 0)
     m = REVIEW_COUNT.match(body)
-    if not m:
-        return found, 0
-    if m.group(2) is None:
-        return found, max(int(m.group(1)) - len(found), 0)
-    listed = sum(1 for sev, _ in found if sev != "low")
-    return found, max(int(m.group(2)) + int(m.group(3)) - listed, 0)
+    return found, max(int(m.group(1)) - len(found), 0) if m else 0
 
 
 def review_gate(repo, number):
@@ -1818,6 +1829,274 @@ def cmd_land(args):
     return 0
 
 
+# --------------------------------------------------------------- revert
+def revert_target(text):
+    """A PR number (`#` allowed, under 7 digits) or a commit sha (7 to 40 hex digits): ("pr", n) or ("sha", s)."""
+    bare = text.strip().lstrip("#")
+    if bare.isdigit() and len(bare) < 7 and int(bare) > 0:
+        return "pr", int(bare)
+    if SHA_TEXT.fullmatch(text.strip()):
+        return "sha", text.strip().lower()
+    raise argparse.ArgumentTypeError(f"not a PR number or a commit sha: {text!r}")
+
+
+def merged_pr_sha(repo, number):
+    """The merge commit of PR `number`; Problem unless it is merged."""
+    view = pr_view(repo, number, "state,mergeCommit", repo.main)
+    state = str(view.get("state") or "").upper()
+    if state != "MERGED":
+        why = "closed without being merged" if state == "CLOSED" else f"{state.lower() or 'not merged'}, not merged"
+        raise Problem(f"PR #{number} is {why}; nothing to revert")
+    merged = view.get("mergeCommit")
+    sha = str(merged.get("oid") or "") if isinstance(merged, dict) else ""
+    if not sha:
+        raise Problem(f"PR #{number} is merged, but gh names no merge commit")
+    return sha
+
+
+def ready_main_checkout(main):
+    """Refuse unless the main checkout is on main with no tracked changes; then fetch origin."""
+    on = current_branch(main)
+    if on != "main":
+        raise Problem(f"the main checkout {main} is on {on or 'a detached HEAD'}, not main; nothing reverted")
+    out = git_ok(main, "status", "--porcelain=v1", "--untracked-files=no")
+    changed = [line[3:] for line in out.splitlines() if len(line) > 3]
+    if changed:
+        raise Problem(f"the main checkout {main} has tracked changes: {listing(changed)}; nothing reverted")
+    git_ok(main, "fetch", "origin", timeout=PUSH_TIMEOUT)
+
+
+def local_only(main):
+    """The commits on main that origin/main lacks, newest first."""
+    return git_ok(main, "rev-list", "origin/main..HEAD").split()
+
+
+def reverts(main, commit, sha):
+    return f"This reverts commit {sha}" in git_ok(main, "log", "-1", "--format=%B", commit)
+
+
+def sync_main(main, sha):
+    """Refuse unless main has no commit that origin/main lacks, or only one: a pending revert of `sha` (an earlier
+    run whose pushes failed), so a push of main publishes nothing but the revert; else fast-forward main."""
+    local = local_only(main)
+    if len(local) == 1 and reverts(main, local[0], sha):
+        return
+    if local:
+        other = next((c for c in local if not reverts(main, c, sha)), local[0])
+        raise Problem(f"main in {main} has {len(local)} commit(s) not on origin/main, {other[:7]} among them; a push "
+                      f"would publish them with the revert; nothing reverted")
+    git_ok(main, "pull", "--ff-only", timeout=PUSH_TIMEOUT)
+
+
+def existing_revert(main, sha):
+    """The newest commit on main (local or pushed) saying `This reverts commit <sha>`, or None."""
+    out = git(main, "log", "--format=%H", "--fixed-strings", f"--grep=This reverts commit {sha}", "HEAD").stdout
+    found = out.split()
+    return found[0] if found else None
+
+
+def pushed(main, commit):
+    return git(main, "merge-base", "--is-ancestor", commit, "origin/main").returncode == 0
+
+
+def push_main(main, sha):
+    """Push main, which holds the revert of `sha` as its one commit not on origin/main; a rejected push gets one
+    `git pull --rebase` and one more push, only while the revert is still the one local commit. The pushed HEAD;
+    Problem when the second push fails too, naming the revert commit left local."""
+    if git(main, "push", "origin", "main", timeout=PUSH_TIMEOUT).returncode == 0:
+        return git_ok(main, "rev-parse", "HEAD").strip()
+    rebased = git(main, "pull", "--rebase", "origin", "main", timeout=PUSH_TIMEOUT)
+    if rebased.returncode != 0:
+        git(main, "rebase", "--abort")
+    else:
+        local = local_only(main)
+        if len(local) != 1 or not reverts(main, local[0], sha):
+            raise Problem(f"after git pull --rebase, main in {main} has {len(local)} commit(s) not on origin/main, "
+                          f"not just the revert of {sha[:7]}; nothing pushed")
+        if git(main, "push", "origin", "main", timeout=PUSH_TIMEOUT).returncode == 0:
+            return git_ok(main, "rev-parse", "HEAD").strip()
+    head = git_ok(main, "rev-parse", "HEAD").strip()
+    raise Problem(f"git push origin main was rejected, also after one git pull --rebase; the revert commit "
+                  f"{head[:7]} is local and unpushed in {main}")
+
+
+def revert_on_main(main, sha):
+    """(the revert commit on origin/main, whether this run made or pushed it)."""
+    found = existing_revert(main, sha)
+    if found and pushed(main, found):
+        return found, False
+    if not found:
+        done = git(main, "revert", "--no-edit", sha)
+        if done.returncode != 0:
+            files = nul_fields(git(main, "diff", "--name-only", "--diff-filter=U", "-z").stdout)
+            git(main, "revert", "--abort")
+            if files:
+                raise Problem(f"reverting {sha[:7]} gives a conflict in {listing(files)}; aborted, main unchanged")
+            why = last_line(done.stderr) or last_line(done.stdout) or f"exit {done.returncode}"
+            raise Problem(f"git revert {sha[:7]} failed: {why}; main unchanged")
+    return push_main(main, sha), True
+
+
+def landed_pr(repo, sha):
+    """The PR that merged `sha` (`gh api repos/O/R/commits/<sha>/pulls`: its merge commit, else a merged one) as
+    its `gh pr view`, or None."""
+    pulls = [p for p in as_list(gh_json(["api", f"repos/{repo.slug()}/commits/{sha}/pulls"], repo.main))
+             if isinstance(p.get("number"), int)]
+    pr = next((p for p in pulls if p.get("merge_commit_sha") == sha), None) \
+        or next((p for p in pulls if p.get("merged_at")), None)
+    if pr is None:
+        return None
+    view = pr_view(repo, pr["number"], "number,title,url,headRefName,closingIssuesReferences", repo.main)
+    return dict({"number": pr["number"], "title": pr.get("title") or "", "url": pr.get("html_url") or ""},
+                **{k: v for k, v in view.items() if v})
+
+
+def open_incident(repo, sha):
+    """The open issue whose body has the line `Merge commit: <sha>`: an `incident` one, else any (a bug filed by an
+    earlier run whose label edit failed, labelled `incident` now); its number, or None."""
+    line = f"Merge commit: {sha}"
+    for label in ([INCIDENT], []):
+        flags = ["--label"] + label if label else []
+        issues = gh_json(["issue", "list"] + flags + ["--state", "open", "--limit", "200", "--json", "number,body"],
+                         repo.main)
+        for issue in as_list(issues):
+            if isinstance(issue.get("number"), int) and any(row.strip() == line
+                                                            for row in (issue.get("body") or "").splitlines()):
+                if not label:
+                    gh(["issue", "edit", str(issue["number"]), "--add-label", INCIDENT], repo.main)
+                return issue["number"]
+    return None
+
+
+def bug_body(sha, revert, pr, ticket, reason, evidence):
+    """The incident bug, in templates/ticket_task.md's headings; `Merge commit: <sha>` on a line of its own, as
+    deploy_guard writes it, so either finds the other's."""
+    what = f"PR #{pr['number']} ({pr.get('title') or 'no title'})" if pr else f"Commit {sha[:7]}"
+    lines = ["## Request", f"{what} was reverted on main in {revert[:7]}: {reason}.", "",
+             "## Outline",
+             "1. Read the evidence below and find the cause.",
+             "2. Fix it, with a test that would have caught it.",
+             "3. Land the change again.", "",
+             "## Definition of done",
+             "- [ ] The cause is fixed and the change lands again.", "",
+             "## Tests that must pass",
+             "- A test that would have caught it: red before the fix, green after.",
+             "The existing suite stays green.", "",
+             "## Context"]
+    if pr:
+        lines.append(f"PR: #{pr['number']} {pr.get('url') or ''}".rstrip())
+    lines += [f"Merge commit: {sha}", f"Revert commit: {revert}"]
+    if ticket:
+        lines.append(f"Ticket: #{ticket}")
+    shown = tail(evidence, EVIDENCE_TAIL_LINES) if evidence else ""
+    if shown:
+        lines += ["", f"Evidence (the last {EVIDENCE_TAIL_LINES} lines at most):", "```", fence_safe(shown), "```"]
+    return "\n".join(lines) + "\n"
+
+
+def file_bug(repo, title, body, epic):
+    """`harness-board task create` for the incident bug, then the `incident` label; its number."""
+    args = (["task", "create", "--type", "bug", "--risk", "high", "--size", "S"]
+            + (["--parent", str(epic)] if epic else []) + ["--title", title, "--body-file", "-", "--json"])
+    done = board_run(repo, args, check=False, stdin=body)
+    try:
+        data = json.loads(done.stdout)
+    except ValueError:
+        data = None
+    n = data.get("number") if isinstance(data, dict) else None
+    n = n if isinstance(n, int) and not isinstance(n, bool) else None
+    why = one_line(done.stderr) or f"exit {done.returncode}"
+    if n is None:
+        raise Problem(f"harness-board task create {'failed: ' + why if done.returncode else 'printed no number'}")
+    if done.returncode != 0:
+        warn("harness-pr", f"bug #{n} was created, but: {why}")
+    gh(["issue", "edit", str(n), "--add-label", INCIDENT], repo.main)
+    return n
+
+
+def ask_ticket(repo, number, question, evidence):
+    """Reopen the ticket when it is closed and ask `question` there, unless it is already the newest needs-input
+    question; what was done."""
+    info = gh_json(["issue", "view", str(number), "--json", "state,comments"], repo.main)
+    info = info if isinstance(info, dict) else {}
+    done = []
+    if str(info.get("state") or "").upper() != "OPEN":
+        gh(["issue", "reopen", str(number)], repo.main)
+        done.append("reopened")
+    asked = [b for b in ((c.get("body") or "").lstrip() for c in as_list(info.get("comments")))
+             if b.startswith(NEEDS_INPUT)]
+    if asked and question in asked[-1]:
+        return done + ["already asked"]
+    args = ["needs-input", str(number), "--question", question]
+    with tempfile.TemporaryDirectory(prefix="harness-revert-") as folder:
+        if evidence and evidence.strip():
+            path = os.path.join(folder, "evidence.log")
+            write_text(path, evidence, prefix=".harness-pr-")
+            args += ["--evidence-file", path]
+        board(repo, *args)
+    return done + ["asked"]
+
+
+def revert_landed(repo, sha, reason, evidence):
+    """Revert the landed commit `sha` on main through the main checkout and push it, file the incident bug under the
+    ticket's epic, reopen the ticket as needs-input and notify; each step skipped when an earlier run did it.
+    `evidence` is text (or None). Returns {pr, sha, revert, ticket, bug, summary}; Problem on a refusal."""
+    main = repo.main
+    ready_main_checkout(main)
+    full = git(main, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}").stdout.strip()
+    if not full:
+        raise Problem(f"{sha} is not a commit in {main} (after git fetch origin); nothing reverted")
+    if not pushed(main, full):
+        raise Problem(f"{full[:7]} is not on origin/main; nothing reverted")
+    sha, reason = full, one_line(reason) or DEFAULT_REASON
+    sync_main(main, sha)
+    pr = landed_pr(repo, sha)
+    ticket = None
+    if pr:
+        numbers = closing_numbers(pr)
+        m = TICKET_BRANCH.match(pr.get("headRefName") or "")
+        ticket = numbers[0] if numbers else int(m.group(1)) if m else None
+    title = pr.get("title") if pr else ""
+    title = title or first_line(git_ok(main, "log", "-1", "--format=%s", sha)) or sha[:7]
+    revert, made = revert_on_main(main, sha)
+    acted = made
+    what = f'PR #{pr["number"]} "{title}"' if pr else f'{sha[:7]} "{title}"'
+    summary = [(f"Reverted {what} in {revert[:7]} and pushed it to main." if made
+                else f"origin/main already reverts {what} in {revert[:7]}.")]
+
+    bug = open_incident(repo, sha)
+    if bug:
+        summary.append(f"Bug: #{bug} already open.")
+    else:
+        epic = ticket_parent(repo, ticket) if ticket else None
+        bug = file_bug(repo, f"Reverted: {title}", bug_body(sha, revert, pr, ticket, reason, evidence), epic)
+        acted = True
+        summary.append(f"Bug: #{bug} filed" + (f" under #{epic}" if epic else "") + ", labelled incident.")
+
+    if ticket:
+        question = f"Reverted in {revert[:7]}: {reason}. Bug #{bug} tracks the fix."
+        done = ask_ticket(repo, ticket, question, evidence)
+        acted = acted or done != ["already asked"]
+        summary.append(f"Ticket: #{ticket} {', '.join(done)}.")
+    else:
+        summary.append("Ticket: none (no PR names one).")
+    if acted:
+        target = f"PR #{pr['number']}" if pr else sha[:7]
+        notify(f"{repo.name} reverted {target}: {reason}", f"harness-{repo.key}-revert-{sha[:12]}")
+    return {"pr": pr["number"] if pr else None, "sha": sha, "revert": revert, "ticket": ticket, "bug": bug,
+            "summary": summary}
+
+
+def cmd_revert(args):
+    repo = open_repo()
+    kind, target = args.target
+    evidence = read_text(args.evidence_file, "evidence file") if args.evidence_file else None
+    sha = merged_pr_sha(repo, target) if kind == "pr" else target
+    result = revert_landed(repo, sha, args.reason, evidence)
+    emit(args.json, {k: result[k] for k in ("pr", "sha", "revert", "ticket", "bug")}, "\n".join(result["summary"]))
+    return 0
+
+
 # --------------------------------------------------------------- gate
 def cmd_gate(args):
     """The auto-land verdict for PR P: `<verdict>: <reason>`, or with --json {pr, verdict, code, reason, rule, head,
@@ -1859,9 +2138,9 @@ def seconds_arg(text):
 
 def parser():
     ap = Parser(prog="harness-pr", description="Pull requests for tickets: open, review, findings, checks, ready, "
-                                               "comments, awaiting, ultra, land, gate.")
+                                               "comments, awaiting, ultra, land, gate, revert.")
     sub = ap.add_subparsers(dest="cmd",
-                            metavar="{open,review,findings,checks,ready,comments,awaiting,ultra,land,gate}")
+                            metavar="{open,review,findings,checks,ready,comments,awaiting,ultra,land,gate,revert}")
     sub.required = True
 
     op = sub.add_parser("open", help="push the ticket branch and open (or update) its draft PR")
@@ -1923,12 +2202,18 @@ def parser():
     gt.add_argument("number", type=number_arg, metavar="P")
     gt.add_argument("--json", action="store_true", help='print {"pr", "verdict", "code", "reason", "rule", '
                                                         '"head", "ticket"}')
+
+    rt = sub.add_parser("revert", help="revert a landed PR on main, file an incident bug, reopen the ticket")
+    rt.add_argument("target", type=revert_target, metavar="P|SHA", help="a merged PR, or the commit it landed as")
+    rt.add_argument("--reason", metavar="TEXT", default=DEFAULT_REASON, help="why, for the ticket and the bug")
+    rt.add_argument("--evidence-file", metavar="F", help="the failing check's output, for the ticket and the bug")
+    rt.add_argument("--json", action="store_true", help='print {"pr", "sha", "revert", "ticket", "bug"}')
     return ap
 
 
 COMMANDS = {"open": cmd_open, "review": cmd_review, "findings": cmd_findings, "checks": cmd_checks, "ready": cmd_ready,
             "comments": cmd_comments, "awaiting": cmd_awaiting, "ultra": cmd_ultra, "land": cmd_land,
-            "gate": cmd_gate}
+            "gate": cmd_gate, "revert": cmd_revert}
 
 
 def main():

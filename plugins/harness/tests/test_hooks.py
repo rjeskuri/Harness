@@ -19,6 +19,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -463,6 +464,271 @@ class SessionBriefTests(HookTestCase):
             "session_brief.py", "{not json", {"CLAUDE_PROJECT_DIR": str(self.tmp)}
         )
         self.assertEqual(r.returncode, 0)
+
+
+class SessionProjectExportTests(HookTestCase):
+    """Ticket #205: Claude Code sets CLAUDE_PROJECT_DIR for hook processes only, never for the
+    session's Bash calls, so the SessionStart hook appends `export HARNESS_SESSION_PROJECT=<the
+    project dir, shell-quoted>` to the file CLAUDE_ENV_FILE names, which every later Bash call
+    sources first. Checked by what a shell that sources the file sees, never by the hook's code."""
+
+    EARLIER = "export EARLIER_HOOK_VALUE='kept'\n"
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Shells that source the file: bash always, zsh (the macOS login shell) and sh when present.
+        self.shells = [s for s in ("/bin/bash", "/bin/zsh", "/bin/sh") if os.path.exists(s)]
+        self.assertIn("/bin/bash", self.shells)
+
+    def project(self, name: str) -> Path:
+        path = self.tmp / name
+        path.mkdir(parents=True)
+        return path
+
+    def projects(self) -> list[Path]:
+        """Project folders whose names a careless quoting would break or expand."""
+        return [
+            self.project("plain"),
+            self.project("my project"),
+            self.project("it's a \"quoted\" dir"),
+            self.project("$HOME and `id`; echo pwned & $(touch gotcha)"),
+            self.project("tab\there back\\slash"),
+            self.project("ünïcødé prøject"),
+        ]
+
+    def env_file(self, text: str = EARLIER) -> Path:
+        path = self.tmp / "envfiles" / f"env-{len(list(self.tmp.glob('envfiles/*')))}.sh"
+        return self.write(path, text)
+
+    def payload(self, cwd: Path, source: str = "startup") -> dict:
+        return {
+            "session_id": "sess-1",
+            "transcript_path": "/dev/null",
+            "cwd": str(cwd),
+            "permission_mode": "default",
+            "hook_event_name": "SessionStart",
+            "source": source,
+        }
+
+    def brief_of(self, r) -> str:
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "SessionStart")
+        return out["additionalContext"]
+
+    def sourced(self, env_file: Path, shell: str = "/bin/bash") -> dict:
+        """What a fresh `shell` that sources `env_file` exports to a child process: the two values
+        these tests set, read back by the interpreter as it sees its own environment."""
+        probe = (
+            "import json, os; print(json.dumps({k: os.environ.get(k) for k in "
+            "('HARNESS_SESSION_PROJECT', 'EARLIER_HOOK_VALUE')}))"
+        )
+        env = {k: v for k, v in self.env.items() if k != "HARNESS_SESSION_PROJECT"}
+        r = subprocess.run(
+            [shell, "-c", '. "$1" && exec "$2" -c "$3"', "sh", str(env_file), sys.executable, probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(self.tmpdir),
+            timeout=30,
+        )
+        self.assertEqual(r.returncode, 0, f"{shell} could not source {env_file}: {r.stderr}")
+        return json.loads(r.stdout)
+
+    def assertOneExportAppended(self, env_file: Path, before: str, project: Path) -> None:
+        after = env_file.read_text(encoding="utf-8")
+        self.assertTrue(after.startswith(before), f"earlier content was not kept: {after!r}")
+        added = after[len(before):]
+        self.assertEqual(added.count("\n"), 1, f"not exactly one line appended: {added!r}")
+        self.assertTrue(added.endswith("\n"), added)
+        self.assertTrue(added.startswith("export HARNESS_SESSION_PROJECT="), added)
+        for shell in self.shells:
+            with self.subTest(shell=shell):
+                self.assertEqual(
+                    self.sourced(env_file, shell),
+                    {"HARNESS_SESSION_PROJECT": str(project), "EARLIER_HOOK_VALUE": "kept"},
+                )
+        self.assertFalse((self.tmpdir / "gotcha").exists(), "sourcing the file ran a command")
+
+    # ---- broad: the export, for every kind of project path, and the brief unchanged
+
+    def test_appends_one_export_of_the_project_dir(self):
+        for project in self.projects():
+            with self.subTest(project=project.name):
+                plain = self.run_hook("session_brief.py", self.payload(project),
+                                      {"CLAUDE_PROJECT_DIR": str(project)})
+                env_file = self.env_file()
+                r = self.run_hook(
+                    "session_brief.py",
+                    self.payload(project),
+                    {"CLAUDE_PROJECT_DIR": str(project), "CLAUDE_ENV_FILE": str(env_file)},
+                )
+                self.assertOneExportAppended(env_file, self.EARLIER, project)
+                # The brief is the one the session gets without an env file.
+                self.assertEqual(self.brief_of(r), self.brief_of(plain))
+
+    def test_the_value_is_claude_project_dir_not_the_payload_cwd(self):
+        project = self.project("the project")
+        sub = self.project("the project/src/pkg")
+        env_file = self.env_file()
+        r = self.run_hook(
+            "session_brief.py",
+            self.payload(sub),
+            {"CLAUDE_PROJECT_DIR": str(project), "CLAUDE_ENV_FILE": str(env_file)},
+        )
+        self.brief_of(r)
+        self.assertOneExportAppended(env_file, self.EARLIER, project)
+
+    def test_appends_on_each_source_and_never_truncates(self):
+        # One line per session start, resume or compaction, each after what was there before.
+        project = self.project("proj one")
+        env_file = self.env_file()
+        before = self.EARLIER
+        for source in ("startup", "resume", "compact"):
+            with self.subTest(source):
+                r = self.run_hook(
+                    "session_brief.py",
+                    self.payload(project, source),
+                    {"CLAUDE_PROJECT_DIR": str(project), "CLAUDE_ENV_FILE": str(env_file)},
+                )
+                self.assertTrue(self.brief_of(r).startswith("## Session brief: proj one"))
+                self.assertOneExportAppended(env_file, before, project)
+                before = env_file.read_text(encoding="utf-8")
+
+    def test_an_empty_or_unterminated_env_file(self):
+        # The file Claude Code hands over may be empty, or end in a line another hook left unterminated: the
+        # export still parses on its own line and the earlier value survives.
+        project = self.project("p q")
+        for name, text, expected_earlier in (
+            ("empty", "", None),
+            ("unterminated", "export EARLIER_HOOK_VALUE=kept", "kept"),
+        ):
+            with self.subTest(name):
+                env_file = self.env_file(text)
+                r = self.run_hook(
+                    "session_brief.py",
+                    self.payload(project),
+                    {"CLAUDE_PROJECT_DIR": str(project), "CLAUDE_ENV_FILE": str(env_file)},
+                )
+                self.brief_of(r)
+                self.assertTrue(env_file.read_text(encoding="utf-8").startswith(text))
+                for shell in self.shells:
+                    self.assertEqual(
+                        self.sourced(env_file, shell),
+                        {"HARNESS_SESSION_PROJECT": str(project), "EARLIER_HOOK_VALUE": expected_earlier},
+                        shell,
+                    )
+
+    def test_exports_even_when_the_project_has_its_own_session_start_hook(self):
+        # The brief steps aside for a project's own SessionStart hook; the export is a guard for harness-red's
+        # settings, so it does not.
+        project = self.project("own hook")
+        self.write(
+            project / ".claude/settings.json",
+            json.dumps({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}]}}),
+        )
+        env_file = self.env_file()
+        r = self.run_hook(
+            "session_brief.py",
+            self.payload(project),
+            {"CLAUDE_PROJECT_DIR": str(project), "CLAUDE_ENV_FILE": str(env_file)},
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Session brief", r.stdout)
+        self.assertOneExportAppended(env_file, self.EARLIER, project)
+
+    # ---- no file to write: nothing written, the brief as always
+
+    def test_without_a_writable_env_file_the_brief_still_works(self):
+        project = self.project("proj")
+        expected = self.brief_of(
+            self.run_hook("session_brief.py", self.payload(project), {"CLAUDE_PROJECT_DIR": str(project)})
+        )
+        self.assertTrue(expected.startswith("## Session brief: proj"))
+        missing_dir = self.tmp / "no-such-dir" / "env.sh"
+        a_dir = self.project("a-directory")
+        readonly = self.env_file()
+        readonly.chmod(0o444)
+        self.addCleanup(readonly.chmod, 0o644)
+        # With nothing to export (CLAUDE_PROJECT_DIR unset or blank), a writable env file is left as it was.
+        writable = self.env_file()
+        cases = [("unset", None, str(project)), ("blank", "", str(project)),
+                 ("missing directory", missing_dir, str(project)), ("a directory", a_dir, str(project)),
+                 ("CLAUDE_PROJECT_DIR unset", writable, None), ("CLAUDE_PROJECT_DIR blank", writable, " ")]
+        if os.geteuid() != 0:  # root writes through 0444
+            cases.append(("read-only file", readonly, str(project)))
+        for name, target, project_dir in cases:
+            with self.subTest(name):
+                env = {}
+                if project_dir is not None:
+                    env["CLAUDE_PROJECT_DIR"] = project_dir
+                if target is not None:
+                    env["CLAUDE_ENV_FILE"] = str(target)
+                r = self.run_hook("session_brief.py", self.payload(project), env)
+                self.assertEqual(self.brief_of(r), expected)
+                self.assertFalse(missing_dir.parent.exists(), "a folder was created for the env file")
+                self.assertEqual(list(a_dir.iterdir()), [])
+                self.assertEqual(readonly.read_text(encoding="utf-8"), self.EARLIER)
+                self.assertEqual(writable.read_text(encoding="utf-8"), self.EARLIER)
+
+    # ---- the registration: every source a Bash call can follow gets the export
+
+    def registered(self, source: str) -> list[list[str]]:
+        """argv of every SessionStart hook hooks.json runs for `source` (matcher as a full-match regex;
+        empty, `*` or absent matches all), as Claude Code would expand ${CLAUDE_PLUGIN_ROOT}."""
+        root = str(HOOKS.parent)
+        data = json.loads((HOOKS / "hooks.json").read_text(encoding="utf-8"))
+        argvs = []
+        for entry in data["hooks"].get("SessionStart", []):
+            matcher = entry.get("matcher")
+            if matcher not in (None, "", "*") and not re.fullmatch(matcher, source):
+                continue
+            for hook in entry.get("hooks", []):
+                self.assertEqual(hook.get("type"), "command", hook)
+                if "args" in hook:
+                    cmd = sys.executable if hook["command"] == "python3" else hook["command"]
+                    argvs.append([cmd, *(a.replace("${CLAUDE_PLUGIN_ROOT}", root) for a in hook["args"])])
+                else:
+                    argvs.append(["/bin/sh", "-c", hook["command"]])
+        return argvs
+
+    def test_hooks_json_exports_on_startup_resume_clear_compact_and_fork(self):
+        project = self.project("registered proj")
+        bindir = self.project("bin")
+        shim = self.write(bindir / "python3", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
+        shim.chmod(0o755)
+        for source in ("startup", "resume", "clear", "compact", "fork"):
+            with self.subTest(source):
+                argvs = self.registered(source)
+                self.assertTrue(argvs, f"no SessionStart hook runs on {source}")
+                env_file = self.env_file()
+                env = dict(
+                    self.env,
+                    PATH=f"{bindir}:{SYSTEM_PATH}",
+                    CLAUDE_PLUGIN_ROOT=str(HOOKS.parent),
+                    CLAUDE_PROJECT_DIR=str(project),
+                    CLAUDE_ENV_FILE=str(env_file),
+                )
+                briefs = []
+                for argv in argvs:
+                    r = subprocess.run(
+                        argv,
+                        input=json.dumps(self.payload(project, source)),
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        cwd=str(self.tmp),
+                        timeout=60,
+                    )
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    if r.stdout.strip():
+                        ctx = json.loads(r.stdout).get("hookSpecificOutput", {}).get("additionalContext", "")
+                        briefs.append(ctx)
+                self.assertOneExportAppended(env_file, self.EARLIER, project)
+                if source not in ("clear", "fork"):  # after /clear or a fork the brief may or may not be printed
+                    self.assertTrue(
+                        any(b.startswith("## Session brief: registered proj") for b in briefs), briefs
+                    )
 
 
 class BriefSourcesTests(unittest.TestCase):
