@@ -37,8 +37,8 @@ PLACEHOLDER = re.compile(r"(?<!\$)\{\{(name|pkg|stack|verify_cmd|test_cmd|tests_
 
 COMMON_FILES = ["CLAUDE.md", ".claude/settings.json", "scripts/verify.sh", ".github/workflows/ci.yml",
                 ".github/workflows/deploy.yml", ".github/pull_request_template.md",
-                ".github/ISSUE_TEMPLATE/task.md", ".github/ISSUE_TEMPLATE/epic.md", ".githooks/pre-commit",
-                ".githooks/pre-push", ".gitignore", ".worktreeinclude", "scripts/smoke.sh", "scripts/deploy_guard.py"]
+                ".github/ISSUE_TEMPLATE/task.md", ".github/ISSUE_TEMPLATE/epic.md", ".githooks/lib.sh",
+                ".githooks/pre-commit", ".githooks/pre-merge-commit", ".githooks/pre-push", ".gitignore", ".worktreeinclude", "scripts/smoke.sh", "scripts/deploy_guard.py"]
 
 # The allow entries every render starts with (ticket #137): the twelve git, gh and verify entries, then one
 # narrow rule per harness tool in this order. The old wildcard spelling may be dropped by auto mode.
@@ -330,7 +330,8 @@ class Render(ScaffoldTest):
         self.assertIn("Bash(npm test:*)", self.settings(root)["permissions"]["allow"])
         self.assertIn("# Web-App", self.read(root, "CLAUDE.md"))
         self.assertTrue(any(line.startswith("note: npm is not on PATH") for line in self.lines(p)), p.stdout)
-        for rel in ("scripts/verify.sh", ".githooks/pre-commit", ".githooks/pre-push"):
+        for rel in ("scripts/verify.sh", ".githooks/lib.sh", ".githooks/pre-commit", ".githooks/pre-merge-commit",
+                    ".githooks/pre-push"):
             self.assertEqual(subprocess.run(["sh", "-n", os.path.join(root, rel)]).returncode, 0, rel)
 
     def test_none_render(self):

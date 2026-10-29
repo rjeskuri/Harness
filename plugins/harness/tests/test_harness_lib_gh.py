@@ -489,6 +489,13 @@ class ExistsOnceTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------- the tools use the lib
+def remote_url(repo: str) -> str:
+    """The origin URL as git reports it: a url.<base>.insteadOf rewrite (a proxying sandbox) changes it."""
+    env = clean_env(GIT_CONFIG_NOSYSTEM="1", HOME=os.path.dirname(repo))
+    return subprocess.run([GIT, "-C", repo, "remote", "get-url", "origin"], env=env, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
 def git_repo(root: str, origin: str) -> str:
     repo = os.path.join(root, "repo")
     env = clean_env(GIT_CONFIG_NOSYSTEM="1", HOME=root)
@@ -563,7 +570,7 @@ class ToolsUseTheLibTests(unittest.TestCase):
                 self.assertEqual(made["gh"], "/recorded/gh")
                 self.assertEqual(made["kwargs"].get("budget_seconds"), budget, made)
                 self.assertEqual([c[-2:] for c in made["calls"]], [["-R", slug]] * 4)
-                self.assertEqual([u.strip() for u in urls], ["git@github.com:acme/widget.git"])
+                self.assertEqual([u.strip() for u in urls], [remote_url(self.repo)])
 
     def test_digest_passes_its_own_gh_budget_and_slug(self):
         tool = load(DIGEST, "harness_digest_gh_budget")
@@ -578,7 +585,7 @@ class ToolsUseTheLibTests(unittest.TestCase):
                 self.assertEqual(len(rec.made), 1)
                 self.assertEqual(rec.made[0]["gh"], "/recorded/gh")
                 self.assertEqual(rec.made[0]["kwargs"].get("budget_seconds"), budget, rec.made[0])
-                self.assertEqual(urls, ["git@github.com:acme/widget.git"])
+                self.assertEqual(urls, [remote_url(self.repo)])
 
     def test_the_libs_problem_is_the_tools_one_error_line(self):
         cli = lib("cli")

@@ -6,7 +6,7 @@
   needs-input;
 - done: tests -> breaker (risk:high) or code; breaker -> code; code -> review; review and fix -> fix while the
   latest review round (harness_lib.reviews.latest_round) has blocking findings, else ci; ci -> `ultra, then ready`
-  (risk:high) or ready; verify -> ready;
+  (risk:high) or ready;
 - refused, exit 1, nothing recorded: review or fix with no review round; fix pass while the latest round has
   blocking findings and fix fail while it has none; tests or breaker on a no-tests ticket; breaker on a ticket that
   is not risk:high.
@@ -199,10 +199,6 @@ class Stage(tw.WorkTest):
                 n = self.put_ticket(risk)
                 self.assertEqual(self.stage(n, "ci", "pass"), ("done", "ultra, then ready" if high else "ready"))
 
-            with self.subTest(risk=risk, row="verify pass"):
-                n = self.put_ticket(risk)
-                self.assertEqual(self.stage(n, "verify", "pass"), ("done", "ready"))
-
         # the risk the step depends on is the ticket's own: a high and a low ticket side by side
         low, high = self.put_ticket("low", size="S"), self.put_ticket("high", size="L")
         for stage, low_next, high_next in (("tests", "code", "breaker"), ("ci", "ready", "ultra, then ready")):
@@ -221,7 +217,7 @@ class Stage(tw.WorkTest):
         }
         seen = set()
         for kind, size, risk in specs:
-            stages = ["tests", "code", "review", "fix", "ci", "verify"] + (["breaker"] if risk == "high" else [])
+            stages = ["tests", "code", "review", "fix", "ci"] + (["breaker"] if risk == "high" else [])
             for stage in stages:
                 with self.subTest(kind=kind, size=size, risk=risk, stage=stage):
                     n = self.put_ticket(risk, size=size, kind=kind)
@@ -254,9 +250,9 @@ class Stage(tw.WorkTest):
         n = self.put_ticket("high", size="L")
         self.assertEqual(self.stage(n, "code", "fail", "--tier", "sonnet"), ("retry", "code"))
         self.assertEqual(self.stage(n, "code", "fail", "--tier", "sonnet"), ("escalate opus", "code"))
-        self.assertEqual(self.stage(n, "verify", "fail", "--tier", "opus", "--effort", "high"), ("retry", "verify"))
-        self.assertEqual(self.stage(n, "verify", "fail", "--tier", "opus", "--effort", "high"),
-                         ("escalate opus xhigh", "verify"))
+        self.assertEqual(self.stage(n, "ci", "fail", "--tier", "opus", "--effort", "high"), ("retry", "ci"))
+        self.assertEqual(self.stage(n, "ci", "fail", "--tier", "opus", "--effort", "high"),
+                         ("escalate opus xhigh", "ci"))
         self.assertEqual(self.stage(n, "breaker", "fail", "--tier", "sonnet"), ("retry", "tests"))
         self.assertEqual(self.stage(n, "tests", "pass"), ("done", "breaker"))      # the tightened tests
         self.assertEqual(self.stage(n, "breaker", "fail", "--tier", "sonnet"), ("needs-input", "needs-input"))
@@ -269,14 +265,12 @@ class Stage(tw.WorkTest):
             (["code", "fail", "--tier", "opus", "--effort", "high"], None),
             (["code", "pass", "--tier", "opus", "--effort", "xhigh"], None), (["review", "pass"], 2),
             (["fix", "fail"], None), (["fix", "fail", "--tier", "sonnet"], None), (["fix", "pass"], 0),
-            (["ci", "fail"], None), (["ci", "pass", "--tier", "fable"], None),
-            (["verify", "fail", "--effort", "max"], None), (["verify", "pass"], None),
+            (["ci", "fail"], None), (["ci", "fail", "--effort", "max"], None), (["ci", "pass", "--tier", "fable"], None),
         ]
         low = [
             (["tests", "pass"], None), (["code", "fail"], None), (["code", "fail"], None),
             (["code", "pass", "--tier", "opus"], None), (["review", "fail"], 1), (["review", "pass"], None),
             (["fix", "fail", "--effort", "medium"], None), (["fix", "pass"], 0), (["ci", "pass"], None),
-            (["verify", "fail"], None), (["verify", "fail", "--tier", "fable"], None), (["verify", "pass"], None),
         ]
         for name, (risk, size, kind), sequence in (("high", ("high", "M", "task"), high),
                                                    ("low", ("low", "S", "task"), low),
@@ -449,9 +443,8 @@ class Stage(tw.WorkTest):
             (["review", "pass"], 2, "fix"),
             (["fix", "fail"], None, "fix"),
             (["fix", "pass"], 0, "ci"),
+            (["ci", "fail"], None, "ci"),
             (["ci", "pass"], None, "ultra, then ready"),
-            (["verify", "fail"], None, "verify"),
-            (["verify", "pass"], None, "ready"),
         ]
         low = [
             (["tests", "pass"], None, "code"),
@@ -460,7 +453,6 @@ class Stage(tw.WorkTest):
             (["code", "fail"], None, "needs-input"),
             (["review", "pass"], 0, "ci"),
             (["ci", "pass"], None, "ready"),
-            (["verify", "pass"], None, "ready"),
         ]
         actions = set()
         for name, (risk, size), sequence in (("high", ("high", "M"), high), ("low", ("low", "S"), low)):

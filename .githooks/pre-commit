@@ -1,15 +1,7 @@
 #!/bin/sh
 # Checks before each commit (git config core.hooksPath .githooks). Add project checks after the
 # branch check and exit non-zero listing the files that fail. Skip once with: git commit --no-verify
-# No commits on main or master: work happens on a ticket branch and lands through a pull request.
-# HARNESS_ALLOW_MAIN=1 skips this check, as it does the branch guard hook; a repository with no commit
-# yet is free (the scaffold's first commit).
-if [ "${HARNESS_ALLOW_MAIN:-}" != 1 ] && git rev-parse --verify -q HEAD >/dev/null 2>&1; then
-    branch=$(git symbolic-ref --short -q HEAD)
-    case "$branch" in
-        main|master)
-            echo "pre-commit: refused: on $branch. Commit on a ticket branch (harness-work start <issue#>) and land through a pull request." >&2
-            exit 1 ;;
-    esac
-fi
+# No commits on main or master (lib.sh): work happens on a ticket branch and lands through a pull request.
+. "$(dirname "$0")/lib.sh"
+harness_refuse_on_main pre-commit
 exit 0

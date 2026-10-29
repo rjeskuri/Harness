@@ -664,6 +664,8 @@ class Install(unittest.TestCase):
                 self.assertIn("Done, except the settings merge, which failed", p.stdout)
 
         with self.subTest(case="unreadable"):
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                self.skipTest("root reads a mode-0 file")
             before = self.reset({"permissions": {"allow": ["Bash(ls:*)"]}})
             os.chmod(self.settings, 0)
             self.addCleanup(os.chmod, self.settings, 0o600)

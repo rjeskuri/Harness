@@ -1,8 +1,10 @@
-"""The git hooks the scaffold installs (templates/pre-commit*, templates/pre-push) and Harness's own
-(.githooks/): the deterministic never-on-main layer git runs whatever the command was spelled as.
+"""The git hooks the scaffold installs (templates/githooks-lib.sh as .githooks/lib.sh, pre-commit*,
+pre-merge-commit, pre-push) and Harness's own (.githooks/): the deterministic never-on-main layer
+git runs whatever the command was spelled as.
 
-- pre-commit refuses a commit on main or master, lets a ticket branch commit, lets a repository with
-  no commit yet make its first one, and skips the check with HARNESS_ALLOW_MAIN=1.
+- pre-commit and pre-merge-commit (both through lib.sh's harness_refuse_on_main) refuse a commit or
+  a merge commit on main or master, let a ticket branch commit, let a repository with no commit yet
+  make its first one, and skip the check with HARNESS_ALLOW_MAIN=1.
 - pre-push refuses a push to main or master, a non-fast-forward push and a branch deletion, lets a
   fast-forward push of a ticket branch through, and skips every check with HARNESS_ALLOW_MAIN=1.
 
@@ -24,11 +26,17 @@ ROOT = PLUGIN.parent.parent
 TEMPLATES = PLUGIN / "templates"
 OWN = ROOT / ".githooks"
 
+
+def template_set(pre_commit: str) -> dict:
+    return {"lib.sh": TEMPLATES / "githooks-lib.sh", "pre-commit": TEMPLATES / pre_commit,
+            "pre-merge-commit": TEMPLATES / "pre-merge-commit", "pre-push": TEMPLATES / "pre-push"}
+
+
 HOOK_SETS = {
-    "template plain": (TEMPLATES / "pre-commit", TEMPLATES / "pre-push"),
-    "template python": (TEMPLATES / "pre-commit-python", TEMPLATES / "pre-push"),
-    "template node": (TEMPLATES / "pre-commit-node", TEMPLATES / "pre-push"),
-    "harness own": (OWN / "pre-commit", OWN / "pre-push"),
+    "template plain": template_set("pre-commit"),
+    "template python": template_set("pre-commit-python"),
+    "template node": template_set("pre-commit-node"),
+    "harness own": {name: OWN / name for name in ("lib.sh", "pre-commit", "pre-merge-commit", "pre-push")},
 }
 
 
@@ -53,18 +61,19 @@ class GitHookCase(unittest.TestCase):
             self.assertEqual(p.returncode, 0, f"git {' '.join(args)}: {p.stderr}")
         return p
 
-    def repo(self, pre_commit: Path, pre_push: Path, first_commit: bool = True, name: str = "proj") -> Path:
-        """A repo on main with a bare origin, the two hooks installed through core.hooksPath."""
+    def repo(self, hooks: dict, first_commit: bool = True, name: str = "proj") -> Path:
+        """A repo on main with a bare origin, the hooks installed through core.hooksPath."""
         origin = self.tmp / f"{name}-origin.git"
         self.git(self.tmp, "init", "-q", "--bare", "-b", "main", str(origin))
         repo = self.tmp / name
         repo.mkdir()
         self.git(repo, "init", "-q", "-b", "main")
-        hooks = repo / ".githooks"
-        hooks.mkdir()
-        for src, name in ((pre_commit, "pre-commit"), (pre_push, "pre-push")):
-            shutil.copy(src, hooks / name)
-            os.chmod(hooks / name, 0o755)
+        where = repo / ".githooks"
+        where.mkdir()
+        for hook, src in hooks.items():
+            shutil.copy(src, where / hook)
+            if hook != "lib.sh":
+                os.chmod(where / hook, 0o755)
         self.git(repo, "config", "core.hooksPath", ".githooks")
         self.git(repo, "remote", "add", "origin", str(origin))
         if first_commit:
@@ -78,12 +87,16 @@ class GitHookCase(unittest.TestCase):
         (repo / name).write_text("x\n")
         self.git(repo, "add", "-A")
 
+    def commits(self, repo: Path) -> int:
+        return self.git(repo, "rev-list", "--count", "HEAD").stdout.strip() and int(
+            self.git(repo, "rev-list", "--count", "HEAD").stdout)
+
 
 class PreCommitTests(GitHookCase):
     def test_refuses_main_and_master_lets_a_ticket_branch_commit(self):
-        for label, (pre_commit, pre_push) in HOOK_SETS.items():
+        for label, hooks in HOOK_SETS.items():
             with self.subTest(hooks=label):
-                repo = self.repo(pre_commit, pre_push, name=label.replace(' ', '-'))
+                repo = self.repo(hooks, name=label.replace(" ", "-"))
                 self.change(repo)
                 p = self.git(repo, "commit", "-q", "-m", "on main", check=False)
                 self.assertEqual(p.returncode, 1, p.stderr)
@@ -93,36 +106,58 @@ class PreCommitTests(GitHookCase):
                 self.assertEqual(self.git(repo, "commit", "-q", "-m", "x", check=False).returncode, 1)
                 self.git(repo, "switch", "-q", "-c", "t/12-widget")
                 self.git(repo, "commit", "-q", "-m", "on a ticket branch")
-                self.assertEqual(self.git(repo, "log", "--oneline").stdout.count("\n"), 2)
+                self.assertEqual(self.commits(repo), 2)
 
     def test_first_commit_and_harness_allow_main_pass(self):
-        pre_commit, pre_push = HOOK_SETS["template plain"]
-        repo = self.repo(pre_commit, pre_push, first_commit=False)
+        repo = self.repo(HOOK_SETS["template plain"], first_commit=False)
         (repo / "README.md").write_text("# proj\n")
         self.git(repo, "add", "-A")
         self.git(repo, "commit", "-q", "-m", "First")  # no commit yet: allowed
         self.change(repo)
         self.assertEqual(self.git(repo, "commit", "-q", "-m", "x", check=False).returncode, 1)
         self.git(repo, "commit", "-q", "-m", "x", env={"HARNESS_ALLOW_MAIN": "1"})
-        self.assertEqual(self.git(repo, "log", "--oneline").stdout.count("\n"), 2)
+        self.assertEqual(self.commits(repo), 2)
 
     def test_project_checks_still_run_after_the_branch_check(self):
         # The python and node templates' own checks come after the branch check: on a ticket branch
         # with no staged .py or .js file they exit 0 before looking for ruff or npm.
         for label in ("template python", "template node"):
             with self.subTest(hooks=label):
-                pre_commit, pre_push = HOOK_SETS[label]
-                repo = self.repo(pre_commit, pre_push, name=label.replace(' ', '-'))
+                repo = self.repo(HOOK_SETS[label], name=label.replace(" ", "-"))
                 self.git(repo, "switch", "-q", "-c", "t/3-x")
                 self.change(repo)
                 self.git(repo, "commit", "-q", "-m", "x")
 
 
+class PreMergeCommitTests(GitHookCase):
+    def test_refuses_a_merge_commit_on_main_lets_one_on_a_ticket_branch(self):
+        for label, hooks in HOOK_SETS.items():
+            with self.subTest(hooks=label):
+                repo = self.repo(hooks, name=label.replace(" ", "-"))
+                self.git(repo, "switch", "-q", "-c", "t/5-x")
+                self.change(repo, "a.txt")
+                self.git(repo, "commit", "-q", "-m", "a")
+                self.git(repo, "switch", "-q", "main")
+                p = self.git(repo, "merge", "-q", "--no-ff", "--no-edit", "t/5-x", check=False)
+                self.assertEqual(p.returncode, 1, p.stderr)
+                self.assertIn("pre-merge-commit: refused: on main", p.stderr)
+                self.assertIn("git merge --abort undoes it", p.stderr)
+                self.assertEqual(self.commits(repo), 1)
+                self.git(repo, "merge", "--abort")  # git left the refused merge in progress
+                self.git(repo, "merge", "-q", "--no-ff", "--no-edit", "t/5-x", env={"HARNESS_ALLOW_MAIN": "1"})
+                self.assertEqual(self.commits(repo), 3)
+                # on a ticket branch a merge of main (the loop's way to update a branch) passes
+                self.git(repo, "switch", "-q", "-c", "t/6-y", "t/5-x")
+                self.change(repo, "b.txt")
+                self.git(repo, "commit", "-q", "-m", "b")
+                self.git(repo, "merge", "-q", "--no-ff", "--no-edit", "main")
+
+
 class PrePushTests(GitHookCase):
     def test_refuses_main_force_and_delete_lets_a_ticket_branch_through(self):
-        for label, (pre_commit, pre_push) in HOOK_SETS.items():
+        for label, hooks in HOOK_SETS.items():
             with self.subTest(hooks=label):
-                repo = self.repo(pre_commit, pre_push, name=label.replace(' ', '-'))
+                repo = self.repo(hooks, name=label.replace(" ", "-"))
                 # a commit on main through the bypass, then a plain push of main: refused
                 self.change(repo)
                 self.git(repo, "commit", "-q", "-m", "x", env={"HARNESS_ALLOW_MAIN": "1"})
@@ -149,8 +184,7 @@ class PrePushTests(GitHookCase):
                 self.git(repo, "push", "-q", "origin", "main", env={"HARNESS_ALLOW_MAIN": "1"})
 
     def test_a_new_branch_and_a_fast_forward_after_a_merge_of_main_pass(self):
-        pre_commit, pre_push = HOOK_SETS["harness own"]
-        repo = self.repo(pre_commit, pre_push)
+        repo = self.repo(HOOK_SETS["harness own"])
         self.git(repo, "switch", "-q", "-c", "t/5-x")
         self.change(repo, "a.txt")
         self.git(repo, "commit", "-q", "-m", "a")

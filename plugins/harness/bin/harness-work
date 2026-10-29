@@ -7,7 +7,7 @@ budgets and the worktree list.
 Usage:
     harness-work start N [--venue interactive|headless|bg|cloud]
     harness-work cloud N
-    harness-work attempt N tests|breaker|code|review|fix|ci|verify pass|fail [--tier sonnet|opus|fable]
+    harness-work attempt N tests|breaker|code|review|fix|ci pass|fail [--tier sonnet|opus|fable]
                          [--effort low|medium|high|xhigh|max]
     harness-work stage N <stage> pass|fail [--tier T] [--effort E]
     harness-work cost N [--pr P] [--json | --markdown]
@@ -42,7 +42,7 @@ stage: records as attempt does (the same code, store and answer), then prints `n
 (--json: attempt's object plus "next"). retry and escalate repeat the stage, a breaker failure going back to tests;
 needs-input names needs-input; done goes tests -> breaker (risk:high) or code, breaker -> code, code -> review,
 review and fix -> fix while the latest review round (harness_lib.reviews) has blocking findings, else ci,
-ci -> `ultra, then ready` (risk:high) or ready, verify -> ready. Risk and flags come from the ticket cache (risk,
+ci -> `ultra, then ready` (risk:high) or ready. Risk and flags come from the ticket cache (risk,
 flags, labels). Refused, exit 1 and nothing recorded: tests or breaker on a no-tests ticket, breaker on one that is
 not risk:high, review or fix with no review round, fix pass while the latest round has blocking findings and fix
 fail while it has none.
@@ -169,7 +169,7 @@ except Exception as exc:  # no state key can be guessed without the lib: one lin
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-STAGES = ("tests", "breaker", "code", "review", "fix", "ci", "verify")
+STAGES = ("tests", "breaker", "code", "review", "fix", "ci")
 TIERS = ("sonnet", "opus", "fable")
 DEFAULT_TIER = "opus"
 VENUES = ("headless", "bg")
@@ -1540,7 +1540,7 @@ def next_step(data, marks, found):
         return "fix" if found else "ci"
     high = "risk:high" in marks
     return {"tests": "breaker" if high else "code", "breaker": "code", "code": "review",
-            "ci": "ultra, then ready" if high else "ready", "verify": "ready"}[stage]
+            "ci": "ultra, then ready" if high else "ready"}[stage]
 
 
 def cmd_stage(repo, args):
