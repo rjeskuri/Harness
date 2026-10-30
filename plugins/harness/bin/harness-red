@@ -25,29 +25,18 @@ Usage:
     harness-red scratch create               # a detached worktree of HEAD for the test-breaker; prints its path
     harness-red scratch run                  # the record's tests in the scratch: cheat passed (0) or cheat failed (1)
     harness-red scratch remove
-    harness-red verify [--wait] [--timeout 540] [--rerun]
-                                             # CLAUDE_VERIFY_CMD at HEAD in the background, in its own session;
-                                             # reuses a finished run for this HEAD and command; exit 0 passed,
-                                             # 1 failed or timed out (with the log's tail), 8 still running
-    check, reprove, status, files and verify take --json; every subcommand takes --worktree PATH.
+    check, reprove, status and files take --json; every subcommand takes --worktree PATH.
 
 Settings: HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT (comma-separated globs) come from the
 environment, then `env` in the main checkout's tracked .claude/settings.json only, as in tests_first;
 the others come from the environment, then `env` in the worktree's .claude/settings.json, with
 .claude/settings.local.json over it: HARNESS_TEST_CMD ({files} becomes the test files, shell-quoted; detected when unset) and
 HARNESS_TEST_TIMEOUT (seconds, default 300) and HARNESS_TEST_MAP (comma-separated SOURCE_GLOB=TEST_GLOB pairs:
-a changed path matching SOURCE_GLOB adds the test modules matching TEST_GLOB to `files`), and for verify
-CLAUDE_VERIFY_CMD and HARNESS_VERIFY_TIMEOUT (seconds, default 3600). In a session of another project
+a changed path matching SOURCE_GLOB adds the test modules matching TEST_GLOB to `files`). In a session of another project
 (CLAUDE_PROJECT_DIR names a folder whose main checkout is not this repository's) the environment holds that
 project's settings, so these come from the worktree's settings alone. A test command that cannot start (exit 126
 or 127, or output that is only npm's complaint of no package.json or no test script, or only python3's of a
 missing -m module or script) is refused, never red.
-
-The verify record is ~/.claude/harness/repos/<repo-key>/verify/<branch-slug>.json: {"branch", "head", "cmd",
-"state": "running|passed|failed|timeout", "pid", "started_at", "finished_at", "exit", "log"}, the output going
-to verify/<branch-slug>.log. A supervisor in a session of its own writes it: `pid` is the supervisor, whose
-process group the command shares, so the run outlives the call that started it, a stop kills the whole group,
-and a running record whose pid is gone or started after `started_at` counts as dead.
 """
 from __future__ import annotations
 
@@ -63,7 +52,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 if _LIB not in sys.path:
@@ -196,8 +184,6 @@ class Repo:
         state = os.path.join(repos, self.key)
         self.record_path = os.path.join(state, "red", self.slug + ".json")
         self.scratch = os.path.join(state, "scratch", self.slug)
-        self.verify_record = os.path.join(state, "verify", self.slug + ".json")
-        self.verify_log = os.path.join(state, "verify", self.slug + ".log")
         self.env = settings_env(self.top)
         # A session of another project carries that project's settings in the environment: then the worktree's
         # settings alone decide the settings read through worktree_setting.
@@ -685,207 +671,6 @@ def cmd_scratch_remove(repo, args):
     return 0
 
 
-# --------------------------------------------------------------- verify: the full verify command at HEAD
-VERIFY_TIMEOUT = 3600.0            # HARNESS_VERIFY_TIMEOUT's default: the run is stopped after this many seconds
-VERIFY_WAIT = 540.0                # --wait's default slice, inside a 600 s Bash call
-VERIFY_TAIL = 60
-RUNNING_EXIT = 8
-FINISHED = ("passed", "failed", "timeout")
-VERIFY_KEYS = ("state", "head", "cmd", "exit", "log", "started_at", "finished_at")
-SUPERVISE = "--verify-supervisor"  # the hidden first argument of the detached side of a run
-REGISTER_WAIT = 15.0               # seconds a call waits for a new supervisor to record its run
-STOP_WAIT = 10.0                   # seconds a call waits for a stopped run's processes to be gone
-START_SLACK = 5                    # seconds: a process that began later than its record's started_at by more
-#                                    is a recycled pid, not the supervisor
-POLL = 0.5
-UNSET_CMD = "no verify command (CLAUDE_VERIFY_CMD unset); nothing run"
-
-
-def verify_timeout(file_env, foreign=False):
-    raw = project_setting("HARNESS_VERIFY_TIMEOUT", file_env, foreign)
-    try:
-        value = float(raw) if raw is not None else VERIFY_TIMEOUT
-    except ValueError:
-        value = VERIFY_TIMEOUT
-    return value if 0 < value < float("inf") else VERIFY_TIMEOUT       # also catches nan
-
-
-def elapsed_seconds(text):
-    """Seconds from ps's etime ([[dd-]hh:]mm:ss), or None; as harness-work reads it."""
-    days, _, clock = text.strip().rpartition("-")
-    try:
-        parts = [int(p) for p in clock.split(":")]
-        day_count = int(days) if days else 0
-    except ValueError:
-        return None
-    if not 1 <= len(parts) <= 3:
-        return None
-    hours, minutes, seconds = [0] * (3 - len(parts)) + parts
-    return day_count * 86400 + hours * 3600 + minutes * 60 + seconds
-
-
-def run_alive(record):
-    """Whether the record's pid is still the supervisor that wrote it: ours, running, not a zombie, and not a
-    recycled pid (a process that began more than START_SLACK seconds after `started_at`), as harness-work's
-    pid_alive checks a launch."""
-    pid = record.get("pid")
-    started = parse_iso_seconds(record.get("started_at"))
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or started is None:
-        return False
-    try:
-        os.kill(pid, 0)
-    except (OSError, OverflowError):            # gone, or another user's process: not our supervisor
-        return False
-    try:
-        done = subprocess.run([shutil.which("ps") or "/bin/ps", "-o", "stat=,etime=", "-p", str(pid)],
-                              capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return True                             # cannot tell better than kill did
-    fields = done.stdout.split()
-    if done.returncode != 0 or not fields or fields[0].startswith("Z"):
-        return False
-    elapsed = elapsed_seconds(fields[1]) if len(fields) > 1 else None
-    return elapsed is None or time.time() - elapsed <= started + START_SLACK
-
-
-def stop_run(record):
-    """Kill a live run's process group (the supervisor leads it; the command and its subshells share it) and
-    wait, bounded, for the supervisor to be gone."""
-    pid = record["pid"]
-    try:
-        group = os.getpgid(pid)
-        if group == pid and group != os.getpgrp():
-            os.killpg(group, signal.SIGKILL)
-        else:
-            os.kill(pid, signal.SIGKILL)
-    except OSError:
-        pass
-    deadline = time.monotonic() + STOP_WAIT
-    while run_alive(record) and time.monotonic() < deadline:
-        time.sleep(0.1)
-
-
-def supervise(spec_text):
-    """The detached side of a verify run, in a session of its own: record the run, run the command through the
-    shell in this process group with its output to the log, and record how it ended. HARNESS_VERIFY_TIMEOUT is
-    enforced here, so it holds with nobody waiting."""
-    spec = json.loads(spec_text)
-    path = spec["record"]
-    record = {"branch": spec["branch"], "head": spec["head"], "cmd": spec["cmd"], "state": "running",
-              "pid": os.getpid(), "started_at": now_iso(), "finished_at": None, "exit": None, "log": spec["log"]}
-    write_json(path, record, prefix=".verify-")
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    try:
-        proc = subprocess.Popen(spec["cmd"], shell=True, cwd=spec["cwd"], stdin=subprocess.DEVNULL, env=env)
-    except OSError as err:
-        print(f"harness-red: could not start {spec['cmd']}: {err.strerror or err}", flush=True)
-        write_json(path, dict(record, state="failed", exit=127, finished_at=now_iso()), prefix=".verify-")
-        return 1
-    try:
-        code = proc.wait(timeout=spec["timeout"])
-    except subprocess.TimeoutExpired:
-        print(f"harness-red: verify timed out after {spec['timeout']:g}s and was stopped", flush=True)
-        write_json(path, dict(record, state="timeout", finished_at=now_iso()), prefix=".verify-")
-        os.killpg(os.getpgrp(), signal.SIGKILL)  # the command, everything it started, and this process
-        return 1
-    state = "passed" if code == 0 else "failed"
-    write_json(path, dict(record, state=state, exit=code, finished_at=now_iso()), prefix=".verify-")
-    return 0
-
-
-def start_run(repo, cmd, head, timeout):
-    """Launch the supervisor in a session of its own, so the run survives this call, and wait (bounded) for it
-    to record the run. The log is truncated here; the supervisor and the command write to it."""
-    spec = {"record": repo.verify_record, "log": repo.verify_log, "branch": repo.branch, "head": head,
-            "cmd": cmd, "cwd": repo.top, "timeout": timeout}
-    os.makedirs(os.path.dirname(repo.verify_log), exist_ok=True)
-    with open(repo.verify_log, "wb") as log:
-        sup = subprocess.Popen([sys.executable, os.path.realpath(__file__), SUPERVISE, json.dumps(spec)],
-                               cwd=repo.top, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                               start_new_session=True)
-    deadline = time.monotonic() + REGISTER_WAIT
-    while True:
-        exited = sup.poll() is not None
-        record = read_json(repo.verify_record)
-        if (isinstance(record, dict) and record.get("pid") == sup.pid and record.get("head") == head
-                and record.get("cmd") == cmd):
-            return record
-        if exited:
-            raise Problem(f"the verify supervisor exited {sup.returncode} before recording its run; "
-                          f"see {repo.verify_log}")
-        if time.monotonic() >= deadline:
-            kill_group(sup)
-            raise Problem(f"the verify supervisor (pid {sup.pid}) did not record its run within "
-                          f"{REGISTER_WAIT:g}s and was stopped; see {repo.verify_log}")
-        time.sleep(0.05)
-
-
-def wait_run(repo, record, seconds):
-    """The record once the run leaves `running`, or as it stands when `seconds` have passed."""
-    deadline = time.monotonic() + seconds
-    while record.get("state") == "running" and time.monotonic() < deadline:
-        time.sleep(min(POLL, max(0.0, deadline - time.monotonic())))
-        now = read_json(repo.verify_record)
-        if not (isinstance(now, dict) and now.get("pid") == record.get("pid")
-                and now.get("started_at") == record.get("started_at")):
-            raise Problem("the verify run was replaced by another call's; run harness-red verify again")
-        if now.get("state") == "running" and not run_alive(now):
-            again = read_json(repo.verify_record)       # it may have finished between the read and the check
-            if not isinstance(again, dict) or again.get("state") == "running":
-                raise Problem(f"the verify run (pid {now.get('pid')}) died without a result; "
-                              "run harness-red verify again")
-            now = again
-        record = now
-    return record
-
-
-def verify_report(record, as_json):
-    """Print the run's state; 0 passed, 1 failed or timed out (with the log's tail), 8 still running."""
-    state = record.get("state")
-    log_tail = tail(read_text(record["log"]), VERIFY_TAIL) if isinstance(record.get("log"), str) else ""
-    code = 0 if state == "passed" else RUNNING_EXIT if state == "running" else 1
-    if as_json:
-        print(json.dumps(dict({k: record.get(k) for k in VERIFY_KEYS}, tail=log_tail), indent=2,
-                         ensure_ascii=False))
-        return code
-    head = str(record.get("head") or "")[:12]
-    if state == "running":
-        started = parse_iso_seconds(record.get("started_at"))
-        seconds = max(0, int(time.time() - started)) if started is not None else 0
-        print(f"verify running for {seconds} s; run harness-red verify --wait again")
-    elif state == "passed":
-        print(f"verify passed at {head}")
-    else:
-        print(f"verify timed out at {head} and was stopped" if state == "timeout"
-              else f"verify failed at {head} (exit {record.get('exit')})")
-        print(log_tail)
-    return code
-
-
-def cmd_verify(repo, args):
-    cmd = repo.worktree_setting("CLAUDE_VERIFY_CMD")
-    if not cmd:
-        if args.json:
-            print(json.dumps(dict(dict.fromkeys(VERIFY_KEYS), state="none", tail=""), indent=2))
-        else:
-            print(UNSET_CMD)
-        return 0
-    if git(repo.top, "status", "--porcelain").stdout.strip():
-        raise Problem(f"uncommitted changes in {repo.top}; commit them first")
-    head = git(repo.top, "rev-parse", "HEAD").stdout.strip()
-    record = read_json(repo.verify_record)
-    record = record if isinstance(record, dict) else None
-    live = record is not None and record.get("state") == "running" and run_alive(record)
-    same = record is not None and record.get("head") == head and record.get("cmd") == cmd
-    if not (same and not args.rerun and (live or record.get("state") in FINISHED)):
-        if live:                                # a dead record's pid may be someone else's now: never killed
-            stop_run(record)
-        record = start_run(repo, cmd, head, verify_timeout(repo.env, repo.foreign))
-    if args.wait:
-        record = wait_run(repo, record, args.timeout)
-    return verify_report(record, args.json)
-
-
 def parser():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--worktree", metavar="PATH", default=argparse.SUPPRESS,
@@ -894,8 +679,8 @@ def parser():
     as_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print JSON")
     ap = Parser(prog="harness-red", description="Proves a ticket's tests fail before the implementation exists.")
     ap.add_argument("--worktree", metavar="PATH", help="the ticket worktree (default: the cwd)")
-    ap.add_argument("--json", action="store_true", help="print JSON (check, reprove, status, files, verify)")
-    sub = ap.add_subparsers(dest="cmd", metavar="{check,reprove,status,files,run,scratch,verify}")
+    ap.add_argument("--json", action="store_true", help="print JSON (check, reprove, status, files)")
+    sub = ap.add_subparsers(dest="cmd", metavar="{check,reprove,status,files,run,scratch}")
     check = sub.add_parser("check", parents=[common, as_json], help="run the branch's test changes and record red")
     check.add_argument("--base", metavar="REF", help="default: origin/main when it exists, else main")
     reprove = sub.add_parser("reprove", parents=[common, as_json],
@@ -911,29 +696,21 @@ def parser():
     ssub.add_parser("create", parents=[common], help="a detached worktree of HEAD plus uncommitted tests")
     ssub.add_parser("run", parents=[common], help="the record's tests in the scratch copy")
     ssub.add_parser("remove", parents=[common], help="remove the scratch copy")
-    verify = sub.add_parser("verify", parents=[common, as_json],
-                            help="the full verify command at HEAD, run in the background")
-    verify.add_argument("--wait", action="store_true", help="wait for the result, at most --timeout seconds")
-    verify.add_argument("--timeout", metavar="SECONDS", type=float, default=VERIFY_WAIT,
-                        help=f"how long --wait waits (default {VERIFY_WAIT:g})")
-    verify.add_argument("--rerun", action="store_true", help="start a fresh run even when one finished at this HEAD")
     return ap
 
 
 def main():
-    if sys.argv[1:2] == [SUPERVISE]:                       # the detached side of harness-red verify
-        sys.exit(supervise(sys.argv[2]))
     ap = parser()
     args = ap.parse_args()
     if not args.cmd:
-        ap.error("choose a subcommand: check, reprove, status, files, run, scratch or verify")
+        ap.error("choose a subcommand: check, reprove, status, files, run or scratch")
     if args.cmd == "scratch" and not args.scratch_cmd:
         ap.error("choose scratch create, run or remove")
     for sig in (signal.SIGTERM, signal.SIGHUP):             # unwind, so a running test command is killed too
         signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
     commands = {"check": cmd_check, "reprove": cmd_reprove, "status": cmd_status, "files": cmd_files, "run": cmd_run,
                 "scratch create": cmd_scratch_create, "scratch run": cmd_scratch_run,
-                "scratch remove": cmd_scratch_remove, "verify": cmd_verify}
+                "scratch remove": cmd_scratch_remove}
     try:
         repo = Repo(args.worktree or os.getcwd())
         code = commands[f"scratch {args.scratch_cmd}" if args.cmd == "scratch" else args.cmd](repo, args)

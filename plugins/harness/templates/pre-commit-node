@@ -1,6 +1,9 @@
 #!/bin/sh
 # Lint before each commit (git config core.hooksPath .githooks): `npm run lint` when package.json
 # has that script. Skip once with: git commit --no-verify
+# No commits on main or master (lib.sh): work happens on a ticket branch and lands through a pull request.
+. "$(dirname "$0")/lib.sh"
+harness_refuse_on_main pre-commit
 set -f
 IFS='
 '

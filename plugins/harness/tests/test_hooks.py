@@ -1239,6 +1239,18 @@ class VerifyOnStopTests(HookTestCase):
             "since the last check; fix it or run it by hand."
         }
 
+    def test_skips_ticket_branches_where_the_loop_and_ci_verify(self):
+        self.git(self.repo, "switch", "-q", "-c", "t/12-widget")
+        self.edit()
+        self.assertIsNone(self.stop(self.touch(self.marker)))
+        self.assertFalse(self.marker.exists())
+        # Back on main the same edits run the command as before.
+        self.git(self.repo, "switch", "-q", "main")
+        self.assertEqual(
+            self.stop(self.touch(self.marker)),
+            {"systemMessage": f"verify_on_stop: {self.touch(self.marker)} passed."},
+        )
+
     def test_silent_without_edits_or_without_a_command(self):
         self.assertIsNone(self.stop(self.touch(self.marker)))  # no dirty file yet
         self.assertFalse(self.marker.exists())
@@ -1754,15 +1766,15 @@ class VerifyOnStopTests(HookTestCase):
         self.assertFalse(self.marker.exists())
 
     def test_a_worktree_reads_the_main_checkouts_settings(self):
-        # The ticket branch forked before the main checkout's settings.json gained
+        # The branch (not a ticket branch, which the hook skips) forked before the main checkout's settings.json gained
         # HARNESS_SOURCE_EXEMPT, so the worktree's own copy has no such setting.
         cmd = self.touch(self.marker)
         self.baseline()
-        self.git(self.repo, "branch", "t/1-ticket")
+        self.git(self.repo, "branch", "wt/1-settings")
         own = {"env": {"HARNESS_SOURCE_EXEMPT": "assets/**,**/*.md"}}
         self.baseline(settings=own)
         worktree = self.tmp / "proj-t1"
-        self.git(self.repo, "worktree", "add", "-q", str(worktree), "t/1-ticket")
+        self.git(self.repo, "worktree", "add", "-q", str(worktree), "wt/1-settings")
         self.assertFalse((worktree / ".claude/settings.json").exists())
         self.repo, self.src = worktree, worktree / "app.py"
         self.change("assets/logo.svg")

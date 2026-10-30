@@ -305,24 +305,6 @@ class Labels(BoardTest):
         for name, text in AUTOLAND_DESCRIPTIONS.items():
             self.assertEqual(descriptions.get(name), text, name)
 
-    def test_design_md_label_table_lists_exactly_the_spec_labels_and_colors(self):
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "docs", "design.md")
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
-        start = next(i for i, line in enumerate(lines) if line.startswith("Labels (name, color, meaning)"))
-        rows = []
-        for line in lines[start + 1:]:
-            if line.startswith("|"):
-                rows.append(line)
-            elif rows:                                              # the first non-table line after the table
-                break
-        self.assertGreaterEqual(len(rows), 3, rows)                 # header, separator and at least one group
-        documented = {}
-        for row in rows[2:]:
-            for name, color in re.findall(r"`([^`\s]+)` ([0-9A-Fa-f]{6})\b", row):
-                self.assertNotIn(name, documented, f"{name} is listed twice in design.md")
-                documented[name] = color.upper()
-        self.assertEqual(documented, SPEC_COLORS)
 
     def test_a_failed_create_is_one_line_with_ghs_error(self):
         self.scenario([{"match": ["label", "create"], "stderr": "HTTP 403: Resource not accessible\nmore\n",
@@ -3514,17 +3496,6 @@ class TierRouting(BoardTest):
         p = self.ok("tier", "12", cwd=worktree)
         self.assertEqual(p.stdout, "fable\n")
 
-    def test_design_md_names_the_routing_settings_in_the_tier_rubric_and_bullet(self):
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "docs", "design.md")
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
-        rubric_line = next(line for line in lines if line.startswith("Tier rubric"))
-        bullet = next(line for line in lines if line.startswith("- `tier N"))
-        for needle in ("HARNESS_CODE_TIER", "HARNESS_REVIEW_TIER"):
-            self.assertIn(needle, rubric_line)
-            self.assertIn(needle, bullet)
-        for key in ("stage", "from", "labels_tier", "effort"):
-            self.assertIn(f"`{key}`", bullet)
 
 
 # ======================================================================= tier: no automatic Fable (#239)

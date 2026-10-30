@@ -1062,11 +1062,6 @@ def turned_away(sentences_):
 
 class ReproveDocs(unittest.TestCase):
 
-    def test_the_harness_red_section_documents_reprove(self):
-        section = design_section(design_lines(), "### harness-red")
-        entries = [line for line in section if re.match(r"^- `reprove\b", line)]
-        self.assertEqual(len(entries), 1, "want one `- `reprove ...`` entry in the harness-red section")
-        self.assertTrue("merge base" in entries[0], "the reprove entry does not say it runs at the merge base")
 
     def test_the_recovery_from_a_false_not_current_names_reprove(self):
         para = paragraph_starting(design_lines(), 'Recovering from a false "not current"')

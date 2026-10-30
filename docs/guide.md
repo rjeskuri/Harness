@@ -53,7 +53,7 @@ One session per project. `claude agents` in a terminal lists every session, incl
 | Tests | `test-author` at the ticket's tier | Writes the tests the ticket names, broad behavior first, and runs them |
 | Red proof | `harness-red check` | Runs the new tests against unchanged source. They must fail; the record is written |
 | Break | `test-breaker` | In a scratch copy, tries to pass the tests with a cheat. If it can, the tests go back to the author, at most twice |
-| Code | `coder` at the tier | Changes source only, until the new tests and `CLAUDE_VERIFY_CMD` pass, and commits |
+| Code | `coder` at the tier | Changes source only, until the new tests and the ticket's own tests pass, and commits |
 | Review | `reviewer`, Opus (xhigh for risk:high), unless the project sets `HARNESS_REVIEW_TIER` | Checks the branch against the definition of done. High and medium findings go back to the coder, at most twice |
 | PR | `harness-pr open`, `harness-pr review` | Pushes the branch, opens a draft PR, posts the findings as a review |
 | CI | `harness-pr checks <P> --wait` | Waits for checks. Failures go back to the coder, at most twice |
@@ -66,7 +66,7 @@ The hooks refuse three kinds of action, so the rules hold even when a prompt is 
 
 | Hook | Refuses | Why |
 | --- | --- | --- |
-| Branch guard | Edits, commits, merges, resets and pushes to main in a repo on main or master. Force pushes on any branch | GitHub Free does not protect branches on private repos, so this is the only block. `docs/agent/` and gitignored files stay editable on main |
+| Branch guard | Edits, commits, merges, resets and pushes to main in a repo on main or master. Force pushes on any branch | GitHub Free does not protect branches on private repos. The git hooks the scaffold installs (`.githooks/pre-commit`, `pre-push`) are the block git enforces; this hook refuses earlier, in the session, with the way forward. `docs/agent/` and gitignored files stay editable on main |
 | Tests first | On a `t/N-` branch: any source edit before a current red run; the test-author editing source; the coder or breaker editing tests | The tests are the contract, written and proven before the code. A `no-tests` ticket is exempt; a `refactor` ticket accepts a green record |
 | Read-only guard | Writes from the planner, reviewer and researcher | They advise; they never change files |
 
@@ -86,7 +86,7 @@ The PR body is laid out the same way every time:
 | Summary | What changed |
 | Definition of done | The ticket's checklist |
 | Tests | The tests added, then the red run: its kind, exit code and the tail of the failing output |
-| Verify | The tail of `CLAUDE_VERIFY_CMD` on the finished branch |
+| Verify | Empty unless a log was attached with `harness-pr open --verify-log`; CI runs the whole suite on the pull request |
 | Review | Finding counts by severity and the high findings |
 | Risks | Filled for `risk:high` tickets |
 

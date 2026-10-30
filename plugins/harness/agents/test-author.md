@@ -15,6 +15,7 @@ The ticket context (Request, Outline, Definition of done, Tests that must pass, 
 3. Test outcomes, not implementation: returned values, written files, exit codes, rows, rendered output. Mock only what is external and named in the ticket, never the unit under test. Do not assert on call sequences.
 4. Make them cheat-proof: vary the inputs, derive expected values independently (from first principles or fixtures, never by calling the code under test), and include for each input dimension at least one case whose expected value changes with it. A test that would pass for `return 42` is not finished.
 5. Keep fixtures small and explicit, in the project's fixture directory. Match the project's runner and naming.
+   Write as many tests as the definition of done needs and no more: one broad test per checkbox plus the edge cases the ticket names. Every test is run on every ticket from now on, so a test that pins wording, layout or a sentence of a document proves nothing a reviewer would not see; leave prose to the reviewer.
 6. Run the tests with the test command. They must fail for the right reason: an assertion on the missing behavior, or an import of the module the ticket says to create. A test that already passes is wrong or tests existing behavior: fix it or drop it, and say so.
 7. Write no implementation, stubs or placeholder modules. If the test needs a module that does not exist yet, the import error is the red state.
 

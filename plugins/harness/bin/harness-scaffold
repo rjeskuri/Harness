@@ -457,7 +457,10 @@ def plan(root, stack, values, ci, verify=None, layout=()):
          render_text(read_template("pull_request_template.md", stack), values), 0o644),
         (".github/ISSUE_TEMPLATE/task.md", issue_template("ticket_task.md", stack, "task.md", values), 0o644),
         (".github/ISSUE_TEMPLATE/epic.md", issue_template("ticket_epic.md", stack, "epic.md", values), 0o644),
+        (".githooks/lib.sh", render_text(read_template("githooks-lib.sh", stack), values), 0o644),
         (".githooks/pre-commit", render_text(read_template("pre-commit", stack), values), 0o755),
+        (".githooks/pre-merge-commit", render_text(read_template("pre-merge-commit", stack), values), 0o755),
+        (".githooks/pre-push", render_text(read_template("pre-push", stack), values), 0o755),
         (".gitignore", render_text(read_template("gitignore", stack), values), 0o644),
         (".worktreeinclude", render_text(read_template("worktreeinclude", stack), values), 0o644),
     ]
@@ -766,7 +769,9 @@ def github(root, name, create, push, dry):
         if dry:
             say("would run: git push -u origin main")
         else:
-            run(["git", "-C", str(root), "push", "-u", "origin", "main"], timeout=600)
+            # the first push of main itself; the pre-push hook refuses main otherwise
+            run(["git", "-C", str(root), "push", "-u", "origin", "main"], timeout=600,
+                env=dict(os.environ, HARNESS_ALLOW_MAIN="1"))
             say("pushed main to origin")
     if dry:
         say("would run: harness-board labels ensure")
