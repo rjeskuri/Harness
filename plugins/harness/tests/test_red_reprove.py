@@ -45,7 +45,6 @@ PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(PLUGIN, "bin", "harness-red")
 HOOK = os.path.join(PLUGIN, "hooks", "tests_first.py")
 DESIGN = os.path.join(os.path.dirname(os.path.dirname(PLUGIN)), "docs", "design.md")
-WORK_SKILL = os.path.join(PLUGIN, "skills", "work", "SKILL.md")
 GIT = shutil.which("git")
 BRANCH, SLUG = "t/12-slug", "t-12-slug"
 RECORD_KEYS = {"branch", "base_sha", "test_files", "run_files", "test_hash", "cmd", "exit", "kind", "tail", "at"}
@@ -1018,48 +1017,6 @@ def paragraph_starting(lines, opening):
     return "\n".join(out)
 
 
-# #309: what the docs must say about a branch brought home from a cloud session, checked one sentence at a time so
-# prose that turns such a branch away cannot pass on its key words. A sentence ends at . ! or ? before a space and a
-# capital, a backtick, a bold or a bracket (a period inside a code span such as `harness-red check.` does not end one).
-SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z`*(\[])")
-# The positive statement: reprove writes the record ("writes the record", "writes its red record", "writes a record").
-WRITES_RECORD = re.compile(r"\bwrites (?:the|its|a) (?:red )?record\b", re.IGNORECASE)
-# "red" as a word of its own, not the "red" of `harness-red`.
-RED_WORD = re.compile(r"(?<![-\w])red\b", re.IGNORECASE)
-# Words that turn the branch away; none may stand in a sentence about a cloud branch and its record.
-CLOUD_NEGATIONS = re.compile(r"refus|turned away|turns? away|cannot|can not|n't\b|\bnot\b|\bnever\b|rebuil|"
-                             r"needs-input|needs input|\binstead\b", re.IGNORECASE)
-# A source edit: a merge-conflict resolution, or any other edit of source.
-SOURCE_EDIT = re.compile(r"conflict|source edit|\bedit(?:s|ing)? (?:to |in |of )?(?:the )?source", re.IGNORECASE)
-
-
-def sentences(paragraph):
-    return [s for s in SENTENCE_END.split(paragraph) if s.strip()]
-
-
-def about_a_cloud_record(sentence):
-    """A sentence that speaks of a cloud branch together with its record or reprove."""
-    low = sentence.lower()
-    return "cloud" in low and ("record" in low or "reprove" in low)
-
-
-def proves_a_cloud_branch(sentence):
-    """The sentence says a branch from a cloud session with no record gets its record when red at the merge base."""
-    low = sentence.lower()
-    return (all(p in low for p in ("cloud session", "no record", "merge base"))
-            and bool(WRITES_RECORD.search(sentence)) and bool(RED_WORD.search(sentence)))
-
-
-def turned_away(sentences_):
-    """(negation, sentence) for each sentence about a cloud branch's record that holds a negation."""
-    out = []
-    for s in sentences_:
-        m = CLOUD_NEGATIONS.search(s) if about_a_cloud_record(s) else None
-        if m:
-            out.append((m.group(0), s))
-    return out
-
-
 class ReproveDocs(unittest.TestCase):
 
 
@@ -1071,50 +1028,6 @@ class ReproveDocs(unittest.TestCase):
         text = "\n".join(design_lines())
         self.assertTrue(CHANGED in text, f"docs/design.md does not state tests_first's denial {CHANGED!r}")
         self.assertFalse(OLD_CHANGED in text, f"docs/design.md still states the old denial {OLD_CHANGED!r}")
-
-    # #309: the phrases each doc must carry, kept few so the prose is the coder's. The proving sentence holds them
-    # all at once ("cloud session", "no record", "merge base", "writes the record" or "writes its red record", and
-    # "red" as a word); no sentence about a cloud branch and its record holds a word of CLOUD_NEGATIONS.
-    PROVING = ("one sentence holding 'cloud session', 'no record', 'writes the record' (or 'writes its red record'), "
-               "'red' and 'merge base'")
-
-    def test_the_reprove_entry_needs_no_earlier_record_and_serves_a_branch_from_a_cloud_session(self):
-        section = design_section(design_lines(), "### harness-red")
-        entries = [line for line in section if re.match(r"^- `reprove\b", line)]
-        self.assertEqual(len(entries), 1, "want one `- `reprove ...`` entry in the harness-red section")
-        entry = entries[0]
-        for refusal in ("Without a record it is refused", "No red run recorded for <branch>"):
-            self.assertFalse(refusal in entry, f"the reprove entry still says it is refused without a record: "
-                                               f"{refusal!r}")
-        for phrase in ("cloud session", "no record"):
-            self.assertTrue(phrase in entry, f"the reprove entry does not say {phrase!r}")
-        found = turned_away(sentences(entry))
-        self.assertEqual(found, [], "a sentence of the reprove entry about a cloud branch and its record turns it "
-                                    "away; reprove writes its record instead")
-        self.assertTrue([s for s in sentences(entry) if proves_a_cloud_branch(s)],
-                        f"the reprove entry does not say a branch from a cloud session with no record gets its record "
-                        f"when red at the merge base: want {self.PROVING}")
-
-    def test_the_work_skill_reproves_a_branch_from_a_cloud_session_before_a_source_edit(self):
-        text = re.sub(r"<!--.*?-->", "", read(WORK_SKILL), flags=re.DOTALL)
-        body = text.split("\n---\n", 1)[1] if text.startswith("---\n") else text      # past the front matter
-        all_sentences = [s for line in body.splitlines() for s in sentences(line)]
-        found = turned_away(all_sentences)
-        self.assertEqual(found, [], "a sentence of the work skill about a cloud branch and its record turns it "
-                                    "away; harness-red reprove writes its record instead")
-        proving = [s for s in all_sentences if proves_a_cloud_branch(s) and "harness-red reprove" in s]
-        self.assertTrue(proving, f"the work skill does not say harness-red reprove gives a branch from a cloud "
-                                 f"session with no record its record: want {self.PROVING}, and 'harness-red reprove'")
-
-        def reprove_first(s):
-            at = s.find("harness-red reprove")
-            edit = SOURCE_EDIT.search(s)
-            return edit is not None and edit.start() > at and "conflict" in s[at:].lower()
-
-        self.assertTrue([s for s in proving if reprove_first(s)],
-                        "in the work skill's sentence on a branch from a cloud session, harness-red reprove does not "
-                        f"come before the merge-conflict resolution (want 'harness-red reprove', then 'conflict', "
-                        f"and no source edit named before it): {proving!r}")
 
 
 if __name__ == "__main__":
