@@ -27,6 +27,10 @@ Choices the ticket leaves open, fixed here:
   item's path is the path given, made absolute, never a symlink's target.
 - A dangling symlink is an existing symlink (copied as a link); a symlink at an original path, dangling or not,
   is an existing path for the restore refusal.
+- The manifest's `sensitive` (ruling on #326): true when at least one item's path, taken relative to its own
+  working tree (not the cwd, not the main checkout for a worktree file), matches a pattern; false otherwise, also
+  in a project with patterns, whose every snapshot still goes in its own store. The snapshot restore --force
+  takes is the snapshot's repository's like any other: repo is the main checkout, in that project's store.
 - `--json` with no snapshots prints []. The unknown-id line names the id; an id that climbs out of the store
   (`..`, an absolute path) is unknown.
 - --force snapshots only the item paths that exist (a missing one is not replaced); a replaced directory comes
@@ -494,6 +498,8 @@ class Restore(BackupTest):
         with self.lib() as backups:
             taken = backups.find(main, new_id)
         self.assertIsNotNone(taken, "the --force snapshot cannot be found")
+        self.assertEqual(taken["repo"], main)
+        self.assertIn(new_id, [x["id"] for x in self.ok_json("backup", "list", cwd=main)])
         self.assertEqual(sorted(i["path"] for i in taken["items"]), sorted([f, d, lnk]))
         snap = os.path.join(self.global_store(), new_id)
         for item in taken["items"]:
@@ -620,19 +626,21 @@ class Stores(BackupTest):
     def test_sensitive_project_keeps_snapshots_inside_its_git_dir(self):
         main = self.make_repo("vault")
         wt = self.add_worktree(main, "t-1-wt")             # from the first commit: no settings file in it
-        self.commit_settings(main, {"HARNESS_SENSITIVE_PATHS": "secrets/**, *.pem"})
+        # The last pattern matches a worktree file only when its path is taken relative to the main checkout.
+        self.commit_settings(main, {"HARNESS_SENSITIVE_PATHS": "secrets/**, *.pem, .claude/worktrees/*/inner/**"})
         self.assertFalse(os.path.exists(os.path.join(wt, ".claude", "settings.json")))
         store = self.project_store(main)
+        mine = [".claude/worktrees/*/inner/**", "*.pem", "secrets/**"]
         with self.lib() as backups:
-            self.assertEqual(sorted(backups.sensitive_patterns(main)), ["*.pem", "secrets/**"])
+            self.assertEqual(sorted(backups.sensitive_patterns(main)), mine)
             self.assertEqual(real(backups.store_dir(main)), real(store))
         with self.lib({"HARNESS_SENSITIVE_PATHS": "extra/**"}) as backups:
-            self.assertEqual(sorted(backups.sensitive_patterns(main)), ["*.pem", "extra/**", "secrets/**"])
+            self.assertEqual(sorted(backups.sensitive_patterns(main)), sorted(mine + ["extra/**"]))
 
         key, notes = os.path.join(main, "secrets", "key.txt"), os.path.join(main, "notes.txt")
         key_bytes = self.put(key, size=64, mode=0o600)
-        self.put(notes)
-        m1 = self.create([key, notes], main=main, cwd=main, now=self.ago(hours=2))
+        notes_bytes = self.put(notes)
+        m1 =self.create([key, notes], main=main, cwd=main, now=self.ago(hours=2))
         # secrets/** matches token.txt only relative to the worktree's own root; plain.txt matches nothing.
         token, plain_txt = os.path.join(wt, "secrets", "token.txt"), os.path.join(wt, "plain.txt")
         token_bytes = self.put(token, size=64, mode=0o600)
@@ -646,23 +654,73 @@ class Stores(BackupTest):
             with open(os.path.join(store, m["id"], "manifest.json"), encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh), m)
             self.assertEqual(m["repo"], main)
-        self.assertTrue(m1["sensitive"])
-        self.assertTrue(m2["sensitive"])
         self.assertEqual(m2["cwd"], wt)
+
+        # `sensitive` (ruling on #326): some item's path, relative to its own working tree, matches a pattern.
+        loose_wt = os.path.join(wt, "loose.txt")                         # matches nothing
+        inner = os.path.join(wt, "inner", "data.txt")                    # matches relative to main only
+        deep = os.path.join(wt, "secrets", "deep", "t2.txt")             # relative to the cwd it would not match
+        main_secret = os.path.join(main, "secrets", "x.txt")             # its own tree is main, not the cwd's
+        for path in (loose_wt, inner, deep, main_secret):
+            self.put(path)
+        m4 = self.create([loose_wt], main=main, cwd=wt, now=self.ago(hours=3))
+        m5 = self.create([inner], main=main, cwd=wt, now=self.ago(hours=4))
+        m6 = self.create([deep], main=main, cwd=os.path.join(wt, "secrets"), now=self.ago(hours=5))
+        m7 = self.create([main_secret], main=main, cwd=wt, now=self.ago(hours=6))
+        cases = (("m1 main secrets/key.txt + notes.txt", m1, True),
+                 ("m2 worktree secrets/token.txt + plain.txt", m2, True),
+                 ("m3 main README.md", m3, False),
+                 ("m4 worktree loose.txt", m4, False),
+                 ("m5 worktree inner/data.txt", m5, False),
+                 ("m6 worktree secrets/deep/t2.txt, cwd secrets/", m6, True),
+                 ("m7 main secrets/x.txt, cwd the worktree", m7, True))
+        self.assertEqual({label: m["sensitive"] for label, m, _ in cases},
+                         {label: want for label, _, want in cases})
+        for m in (m4, m5, m6, m7):                                       # the project's store either way
+            self.assertTrue(os.path.isfile(os.path.join(store, m["id"], "manifest.json")), m["id"])
+
         wt_git_dir = os.path.join(wt, self.git(wt, "rev-parse", "--git-dir"))
         self.assertFalse(os.path.lexists(os.path.join(wt_git_dir, "harness-backups")))
         self.assertGlobalStoreEmpty()
         for secret in (key_bytes, token_bytes, plain_bytes):
             self.assertFalse(holds(self.home, secret), "a sensitive project's copy left the project")
 
+        older = [m["id"] for m in (m3, m2, m1, m4, m5, m6, m7)]
         listed = self.ok_json("backup", "list", cwd=wt)
-        self.assertEqual([x["id"] for x in listed], [m3["id"], m2["id"], m1["id"]])
+        self.assertEqual([x["id"] for x in listed], older)
         remove(token)
         remove(plain_txt)
         p = self.ok("backup", "restore", m2["id"], cwd=wt)
         self.assertEqual(self.restored(p), {token, plain_txt})
         self.assertEqual({q: tree(q) for q in (token, plain_txt)}, wt_before)
         self.assertGlobalStoreEmpty()
+
+        # restore --force from the main checkout and from the worktree: what it replaces stays in the project.
+        forced, new_bytes = [], []
+        for snap, cwd, paths, originals in ((m1, main, (key, notes), (key_bytes, notes_bytes)),
+                                            (m2, wt, (token, plain_txt), (token_bytes, plain_bytes))):
+            fresh = [self.put(path, size=96, mode=0o600) for path in paths]
+            new_bytes += fresh
+            p = self.ok("backup", "restore", snap["id"], "--force", cwd=cwd)
+            new_ids = [i for i in ID_RE.findall(p.stdout) if i != snap["id"]]
+            self.assertEqual(len(set(new_ids)), 1, p.stdout)
+            new_id = new_ids[0]
+            forced.append(new_id)
+            with open(os.path.join(store, new_id, "manifest.json"), encoding="utf-8") as fh:
+                taken = json.load(fh)
+            self.assertEqual((taken["id"], taken["repo"], taken["sensitive"]), (new_id, main, True), cwd)
+            self.assertEqual(sorted(i["path"] for i in taken["items"]), sorted(paths))
+            for data in fresh:
+                self.assertTrue(holds(os.path.join(store, new_id), data), "the --force snapshot lacks a replaced file")
+            for path, data in zip(paths, originals):
+                with open(path, "rb") as fh:
+                    self.assertEqual(fh.read(), data, path)
+        self.assertGlobalStoreEmpty()
+        for data in new_bytes:
+            self.assertFalse(holds(self.home, data), "restore --force copied a sensitive project's file out of it")
+        ids = [x["id"] for x in self.ok_json("backup", "list", cwd=main)]
+        self.assertEqual(set(ids[:2]), set(forced), ids)
+        self.assertEqual(ids[2:], older)
 
         # The pattern in the environment does the same for a project with no settings file.
         other = self.make_repo("envproj")
