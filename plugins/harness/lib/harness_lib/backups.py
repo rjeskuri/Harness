@@ -180,24 +180,26 @@ def _copy_here(src, dst, skip):
 
 
 def _remove(path):
-    """Delete the file, link or folder tree at `path`, never following a link; read-only folders are opened first."""
-    if not os.path.lexists(path):
-        return
-    if not stat.S_ISDIR(os.lstat(path).st_mode):
-        os.unlink(path)
-        return
+    """Delete the file, link or folder tree at `path` (nothing there is nothing to do), never following a link; a
+    tree's read-only folders are opened first, or rmtree could not empty them."""
     try:
-        shutil.rmtree(path)
+        mode = os.lstat(path).st_mode
     except OSError:
+        return
+    if stat.S_ISDIR(mode):
         _open_up(path)
         shutil.rmtree(path)
+    else:
+        os.unlink(path)
 
 
-def _open_up(path):
-    st = os.lstat(path)
-    if stat.S_ISDIR(st.st_mode):
-        os.chmod(path, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
-        for entry in os.scandir(path):
+def _open_up(folder):
+    """Give the owner rwx on `folder` and on every folder inside it, links not followed."""
+    mode = stat.S_IMODE(os.lstat(folder).st_mode)
+    if (mode & stat.S_IRWXU) != stat.S_IRWXU:
+        os.chmod(folder, mode | stat.S_IRWXU)
+    for entry in os.scandir(folder):
+        if entry.is_dir(follow_symlinks=False):
             _open_up(entry.path)
 
 
