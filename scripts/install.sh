@@ -45,7 +45,9 @@ cp "$HERE/user/CLAUDE.md" "$HOME/.claude/CLAUDE.md" && echo "~/.claude/CLAUDE.md
 # Settings: model and effortLevel come from the snippet, modelSettings is merged per model id (the snippet's
 # entries set or override theirs, other model ids stay), permissions.allow, permissions.ask,
 # autoMode.environment and autoMode.allow gain each snippet entry they lack (their own entries stay, in order;
-# "$defaults" leads each autoMode list exactly once), every other key stays (permissions.deny,
+# "$defaults" leads each autoMode list exactly once) and lose every copy of each string the snippet's "retired"
+# lists under them; in autoMode.environment the first entry sharing a label (the text before its first ":") with
+# a snippet entry becomes that entry and later ones with the label go; every other key stays (permissions.deny,
 # permissions.defaultMode and autoMode.soft_deny included), and the retired companion plugin is dropped. A dated
 # backup is kept when anything changes. A failure (an unreadable file, or a wrong-typed object or list) leaves
 # the file unchanged; the remaining steps still run and the installer exits with the failure at the end.
@@ -98,28 +100,49 @@ for obj, key in LISTS:                      # checked before anything changes: a
     if key in current and not (isinstance(entries, list) and all(isinstance(e, str) for e in entries)):
         sys.exit(f"{name}: left unchanged, {obj}.{key} is not a list of strings; "
                  "merge user/settings.snippet.json by hand")
-added, sentinel = [], []
+
+
+def label(entry):                           # the text before the first ":" ("$defaults" has none)
+    return entry.split(":", 1)[0] if ":" in entry else None
+
+
+retired = snippet.get("retired") or {}      # {"obj.key": [string, ...]}: the merge's own, never copied
+added, removed, replaced, sentinel = [], [], [], []
 for obj, key in LISTS:
-    wanted = (snippet.get(obj) or {}).get(key)
-    if not wanted:
-        continue
+    wanted = (snippet.get(obj) or {}).get(key) or []
+    gone = retired.get(f"{obj}.{key}") or []    # retired even when the snippet adds nothing to this list
     before = settings.get(obj, {}).get(key, [])
-    lead = DEFAULTS in wanted               # the sentinel leads the list exactly once, the rest keeps its order
-    after = [DEFAULTS] if lead else []
-    after += [e for e in before if not (lead and e == DEFAULTS)]
+    after = [e for e in before if e not in gone]                      # every copy, exact match
+    cut = len(before) - len(after)
+    if DEFAULTS in wanted:                  # the sentinel leads the list exactly once, the rest keeps its order
+        after = [DEFAULTS] + [e for e in after if e != DEFAULTS]
+    swapped = 0
+    if (obj, key) == ("autoMode", "environment"):   # one entry per snippet label: the snippet's, where the first stood
+        for entry in wanted:
+            tag = label(entry)
+            at = [i for i, e in enumerate(after) if tag is not None and label(e) == tag]
+            if not at:
+                continue
+            swapped += after[at[0]] != entry
+            after[at[0]] = entry
+            for i in reversed(at[1:]):
+                del after[i]
+            cut += len(at) - 1
     new = [e for e in wanted if e not in after]
     after += new
-    if after != before:
-        settings.setdefault(obj, {})[key] = after
-        if new:
-            added.append(f"{len(new)} {obj}.{key}")
-        else:
-            sentinel.append(f"{obj}.{key}")
+    if after == before:
+        continue
+    settings.setdefault(obj, {})[key] = after
+    for counted, n in ((added, len(new)), (removed, cut), (replaced, swapped)):
+        if n:
+            counted.append(f"{n} {obj}.{key}")
+    if not (new or cut or swapped):         # only "$defaults" moved
+        sentinel.append(f"{obj}.{key}")
 plugins = settings.get("enabledPlugins")
 dropped = isinstance(plugins, dict) and "companion@ryan" in plugins
 if dropped:
     del plugins["companion@ryan"]
-if not changed and not models and not added and not sentinel and not dropped:
+if not (changed or models or added or removed or replaced or sentinel or dropped):
     print(f"{name}: already up to date (model, effortLevel, modelSettings, "
           f"{', '.join(f'{obj}.{key}' for obj, key in LISTS)})")
     sys.exit(0)
@@ -135,6 +158,8 @@ with open(target, "w", encoding="utf-8") as fh:          # in place: a symlinked
 what = [f"set {', '.join(changed)}"] if changed else []
 what += [f"set modelSettings for {', '.join(models)}"] if models else []
 what += [f"added {', '.join(added)}"] if added else []
+what += [f"removed {', '.join(removed)}"] if removed else []
+what += [f"replaced {', '.join(replaced)}"] if replaced else []
 what += [f"put $defaults first in {', '.join(sentinel)}"] if sentinel else []
 what += ['removed enabledPlugins["companion@ryan"]'] if dropped else []
 print(f"{name}: {'; '.join(what)}" + (f" (backup {os.path.basename(backup)})" if backup else " (created)"))
