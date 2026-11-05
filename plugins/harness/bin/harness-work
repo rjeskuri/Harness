@@ -136,8 +136,8 @@ snapshot in ~/.claude/harness/backups/, and outside a repository list acts as --
 none is `No backups.`. backup restore ID: every item back at its path (`restored <path>` each), or with --path only
 those at or under P, or with --to under DIR at its path relative to the snapshot's repository (else to its own
 working tree, else its basename). Every target is checked first: an unknown id, or a target that exists, is one line,
-exit 1 and nothing written; --force first snapshots the existing targets into the snapshot's store and prints that
-snapshot's id. --path and --to are taken from the cwd. --json prints {id, restored, replaced, saved} at the end.
+exit 1 and nothing written; --force first snapshots the existing targets (into the snapshot's project store when it
+sat in one, else where its repository's snapshots go now) and prints that snapshot's id. --path and --to are taken from the cwd. --json prints {id, restored, replaced, saved} at the end.
 
 A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through to stderr, in order,
 except a routing problem dispatch already printed (those children load the same settings; REPORTED); its other

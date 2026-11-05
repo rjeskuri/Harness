@@ -793,6 +793,60 @@ class Stores(BackupTest):
             self.assertEqual(real(backups.store_dir(plain)), real(self.global_store()))
             self.assertEqual(real(backups.store_dir(None)), real(self.global_store()))
 
+    def test_force_snapshot_follows_the_projects_marking_now(self):
+        """PR #333 review: restore --force stores what it replaces where the project's snapshots go now (its own
+        store once it marks paths sensitive, by settings or environment), and never moves a snapshot of a project
+        store's out of it; the restore itself still runs."""
+        def force(snap, paths, originals, env=None):
+            fresh = [self.put(path, size=96, mode=0o600) for path in paths]
+            p = self.ok("backup", "restore", snap["id"], "--force", cwd=snap["repo"], env=env)
+            self.assertEqual(self.restored(p), set(paths))
+            for path, data in zip(paths, originals):
+                with open(path, "rb") as fh:
+                    self.assertEqual(fh.read(), data, path)
+            new_ids = [i for i in ID_RE.findall(p.stdout) if i != snap["id"]]
+            self.assertEqual(len(set(new_ids)), 1, p.stdout)
+            return new_ids[0], fresh
+
+        def assertInProjectStore(main, new_id, fresh):
+            manifest = os.path.join(self.project_store(main), new_id, "manifest.json")
+            self.assertTrue(os.path.isfile(manifest), f"the --force snapshot {new_id} is not in {main}'s own store")
+            with open(manifest, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["repo"], main)
+            for data in fresh:
+                self.assertFalse(holds(self.home, data), "restore --force copied a marked project's file out of it")
+
+        global_ids = []
+        # Marked by its tracked settings after the snapshot was taken in the global store.
+        by_settings = self.make_repo("marked-later")
+        key, notes = os.path.join(by_settings, "secrets", "key.txt"), os.path.join(by_settings, "notes.txt")
+        originals = [self.put(key, mode=0o600), self.put(notes)]
+        snap = self.create([key, notes], main=by_settings, cwd=by_settings)
+        self.assertTrue(os.path.isdir(os.path.join(self.global_store(), snap["id"])))
+        global_ids.append(snap["id"])
+        self.commit_settings(by_settings, {"HARNESS_SENSITIVE_PATHS": "secrets/**"})
+        assertInProjectStore(by_settings, *force(snap, [key, notes], originals))
+        self.assertEqual(sorted(os.listdir(self.global_store())), sorted(global_ids))
+
+        # Marked by the environment after the snapshot was taken in the global store.
+        by_env = self.make_repo("env-later")
+        idfile = os.path.join(by_env, "id.key")
+        originals = [self.put(idfile, mode=0o600)]
+        snap = self.create([idfile], main=by_env, cwd=by_env)
+        global_ids.append(snap["id"])
+        assertInProjectStore(by_env, *force(snap, [idfile], originals,
+                                            env=self.env(HARNESS_SENSITIVE_PATHS="*.key")))
+        self.assertEqual(sorted(os.listdir(self.global_store())), sorted(global_ids))
+
+        # The reverse: a snapshot in a project store whose marking is gone keeps its --force snapshot there.
+        unmarked = self.make_repo("unmarked-later")
+        pem = os.path.join(unmarked, "server.pem")
+        originals = [self.put(pem, mode=0o600)]
+        snap = self.create([pem], main=unmarked, cwd=unmarked, env={"HARNESS_SENSITIVE_PATHS": "*.pem"})
+        self.assertTrue(os.path.isdir(os.path.join(self.project_store(unmarked), snap["id"])))
+        assertInProjectStore(unmarked, *force(snap, [pem], originals))
+        self.assertEqual(sorted(os.listdir(self.global_store())), sorted(global_ids))
+
     def test_store_folders_are_private(self):
         main = self.make_repo("proj")
         f = os.path.join(main, "f.txt")

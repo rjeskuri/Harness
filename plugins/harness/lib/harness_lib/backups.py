@@ -418,7 +418,8 @@ def restore(main, snapshot_id, *, only=None, to=None, force=False, cwd=None, com
     """Put snapshot `snapshot_id`'s items back: each at its original path, or under `to` (see _target); with `only`,
     the items at or under it. `only` and `to` are taken from `cwd` (default: the process's). Every target is checked
     before anything is written; an existing one refuses the restore unless `force`, which first snapshots the
-    existing targets into the snapshot's own store with its repo. `progress(kind, value)` hears ("saved", that
+    existing targets with the snapshot's repo: into its project store when the snapshot sat in one, else into the
+    store that repo's snapshots go to now (store_dir). `progress(kind, value)` hears ("saved", that
     snapshot's manifest) and ("restored", target) as each happens. Returns {id, restored, replaced, saved}."""
     found = _locate(main, snapshot_id)
     if found is None:
@@ -446,8 +447,11 @@ def restore(main, snapshot_id, *, only=None, to=None, force=False, cwd=None, com
         raise BackupError(f"{existing[0]} exists{more}; backup {sid} restores over it only with --force")
     saved = None
     if existing:
-        taken = _take(os.path.dirname(folder), repo, existing, sensitive_patterns(repo), cwd=cwd, command=command,
-                      session=session, now=None)
+        # A project store's snapshot keeps it there; one from the global store goes where `repo`'s go now.
+        pats, store = sensitive_patterns(repo), os.path.dirname(folder)
+        if store == str(global_store()):
+            store = _store(repo, pats)
+        taken = _take(store, repo, existing, pats, cwd=cwd, command=command, session=session, now=None)
         saved = taken["id"]
         if progress:
             progress("saved", taken)
