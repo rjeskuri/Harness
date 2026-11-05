@@ -13,8 +13,9 @@ destructive command's snapshot goes into, and the commands that list and restore
 - `harness-work backup restore ID [--path P] [--to DIR] [--force]`: every item back at its path, `restored <path>`
   each; an unknown id, or an existing path without --force, is one line, exit 1 and nothing written; --force
   snapshots what it replaces first and prints that id; --path picks the items at or under P; --to restores under
-  DIR at the path relative to the snapshot's repository (the basename without one). Bytes, modes and link
-  targets come back.
+  DIR at the path relative to the snapshot's repository (the basename without one), never its cwd and never
+  outside DIR, and with --force snapshots what it replaces there. Bytes, file and folder modes (empty folders
+  too) and link targets come back.
 
 Fixtures: a temporary HOME per test (the module's own one for the whole process, so nothing here can reach the
 real ~/.claude), real temporary git repositories and a linked worktree made with `git worktree add`, random file
@@ -95,7 +96,7 @@ def tearDownModule():
 
 # ================================================================ helpers
 def tree(path):
-    """Every entry at and under `path`, links never followed: relative path -> ("dir",),
+    """Every entry at and under `path`, links never followed: relative path -> ("dir", mode),
     ("file", sha256, size, mode) or ("link", target)."""
     out = {}
 
@@ -104,7 +105,7 @@ def tree(path):
         if stat.S_ISLNK(st.st_mode):
             out[rel] = ("link", os.readlink(p))
         elif stat.S_ISDIR(st.st_mode):
-            out[rel] = ("dir",)
+            out[rel] = ("dir", stat.S_IMODE(st.st_mode))
             for name in sorted(os.listdir(p)):
                 walk(os.path.join(p, name), name if rel == "." else rel + "/" + name)
         else:
@@ -401,8 +402,12 @@ class Restore(BackupTest):
         self.put(os.path.join(cache, "sub", "b.txt"), mode=0o775)
         self.put(os.path.join(cache, "sub", "deeper", "c.dat"), mode=0o640)
         os.makedirs(os.path.join(cache, "sub", "empty"))
+        os.makedirs(os.path.join(cache, "open-empty"))
         os.symlink(os.path.join(outside, "target"), os.path.join(cache, "sub", "out"))
         os.symlink("deeper/c.dat", os.path.join(cache, "sub", "rel"))
+        for rel, m_ in (("sub/empty", 0o750), ("sub/deeper", 0o700), ("sub", 0o750), ("open-empty", 0o775),
+                        (".", 0o700)):                       # folders come back with their own modes
+            os.chmod(os.path.join(cache, rel), m_)
         report = os.path.join(main, "gen", "out", "x", "report.txt")     # its folders go with it
         self.put(report, mode=0o660)
         latest = os.path.join(main, "latest")
@@ -557,6 +562,9 @@ class Restore(BackupTest):
         data = os.path.join(main, "data")
         self.put(os.path.join(data, "x.bin"), mode=0o600)
         self.put(os.path.join(data, "deep", "y.bin"), mode=0o775)
+        os.makedirs(os.path.join(data, "empty"))
+        for rel, m_ in (("empty", 0o700), ("deep", 0o750), (".", 0o750)):
+            os.chmod(os.path.join(data, rel), m_)
         paths = [src, lnk, data]
         before = {p: tree(p) for p in paths}
         m = self.create(paths, main=main, cwd=main)          # the originals stay where they are
@@ -567,15 +575,48 @@ class Restore(BackupTest):
                          {"src/a.txt": before[src], "lnk": before[lnk], "data": before[data]})
         self.assertEqual({p: tree(p) for p in paths}, before, "--to touched an original")
 
+        # Relative to the snapshot's repository, not its cwd; nothing lands outside DIR.
+        m_src = self.create([src, data], main=main, cwd=os.path.join(main, "src"))
+        out_src = self.mk("out-src")
+        def worktree_files():
+            return {k: v for k, v in tree(main).items() if k != ".git" and not k.startswith(".git/")}
+
+        tmp_before, main_before = sorted(os.listdir(self.tmp)), worktree_files()
+        self.ok("backup", "restore", m_src["id"], "--to", out_src, cwd=main)
+        self.assertEqual(sorted(os.listdir(out_src)), ["data", "src"])
+        self.assertEqual({rel: tree(os.path.join(out_src, rel)) for rel in ("src/a.txt", "data")},
+                         {"src/a.txt": before[src], "data": before[data]})
+        self.assertEqual(sorted(os.listdir(self.tmp)), tmp_before, "--to wrote outside DIR")
+        self.assertEqual(worktree_files(), main_before, "--to wrote into the repository")
+
         # An existing path under DIR refuses the whole restore.
         out3 = self.mk("out3")
         blocker = os.path.join(out3, "data")
-        self.put(blocker)
+        blocker_bytes = self.put(blocker)
         blocker_before = tree(blocker)
         p = self.work("backup", "restore", m["id"], "--to", out3, cwd=main)
         self.assertRefused(p, blocker)
         self.assertEqual(sorted(os.listdir(out3)), ["data"])
         self.assertEqual(tree(blocker), blocker_before)
+
+        # --to with --force snapshots the blocker first, at its path under DIR, then restores.
+        p = self.ok("backup", "restore", m["id"], "--to", out3, "--force", cwd=main)
+        new_ids = [i for i in ID_RE.findall(p.stdout) if i not in (m["id"], m_src["id"])]
+        self.assertEqual(len(set(new_ids)), 1, p.stdout)
+        new_id = new_ids[0]
+        first_restored = p.stdout.find("restored ")
+        self.assertGreaterEqual(first_restored, 0, p.stdout)
+        self.assertLess(p.stdout.find(new_id), first_restored, "the --force snapshot's id comes first")
+        snap_dirs = [os.path.join(s, new_id) for s in (self.global_store(), self.project_store(main))
+                     if os.path.isfile(os.path.join(s, new_id, "manifest.json"))]
+        self.assertEqual(len(snap_dirs), 1, f"no store holds {new_id}")
+        with open(os.path.join(snap_dirs[0], "manifest.json"), encoding="utf-8") as fh:
+            taken = json.load(fh)
+        self.assertEqual([i["path"] for i in taken["items"]], [blocker])
+        self.assertEqual(tree(os.path.join(snap_dirs[0], taken["items"][0]["copy"])), blocker_before)
+        self.assertTrue(holds(snap_dirs[0], blocker_bytes))
+        self.assertEqual({rel: tree(os.path.join(out3, rel)) for rel in ("src/a.txt", "lnk", "data")},
+                         {"src/a.txt": before[src], "lnk": before[lnk], "data": before[data]})
 
         # With --path, only the chosen items go under DIR.
         out5 = self.mk("out5")
@@ -630,7 +671,7 @@ class Stores(BackupTest):
         self.commit_settings(main, {"HARNESS_SENSITIVE_PATHS": "secrets/**, *.pem, .claude/worktrees/*/inner/**"})
         self.assertFalse(os.path.exists(os.path.join(wt, ".claude", "settings.json")))
         store = self.project_store(main)
-        mine = [".claude/worktrees/*/inner/**", "*.pem", "secrets/**"]
+        mine = sorted([".claude/worktrees/*/inner/**", "*.pem", "secrets/**"])
         with self.lib() as backups:
             self.assertEqual(sorted(backups.sensitive_patterns(main)), mine)
             self.assertEqual(real(backups.store_dir(main)), real(store))
@@ -721,6 +762,19 @@ class Stores(BackupTest):
         ids = [x["id"] for x in self.ok_json("backup", "list", cwd=main)]
         self.assertEqual(set(ids[:2]), set(forced), ids)
         self.assertEqual(ids[2:], older)
+
+        # A linked worktree outside the main checkout: git, not the folder layout, names an item's working tree.
+        elsewhere = os.path.join(self.tmp, "elsewhere-wt")
+        self.git(main, "worktree", "add", "-q", "-b", "t/elsewhere", elsewhere)
+        far = os.path.join(elsewhere, "secrets", "t.txt")
+        far_bytes = self.put(far, size=64, mode=0o600)
+        m8 = self.create([far], main=main, cwd=os.path.join(elsewhere, "secrets"))
+        self.assertEqual((m8["repo"], m8["sensitive"]), (main, True))
+        with open(os.path.join(store, m8["id"], "manifest.json"), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), m8)
+        self.assertTrue(holds(os.path.join(store, m8["id"]), far_bytes), "the copy is not in the project's store")
+        self.assertGlobalStoreEmpty()
+        self.assertFalse(holds(self.home, far_bytes))
 
         # The pattern in the environment does the same for a project with no settings file.
         other = self.make_repo("envproj")
