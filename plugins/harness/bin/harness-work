@@ -19,14 +19,16 @@ Usage:
     harness-work budget calls [--hours 24] [--json]
     harness-work worktrees [--stale DAYS]
     harness-work worktree remove BRANCH [--discard]
-    start, attempt, stage, cost, dispatch, cloud, waves, wave, worktrees and worktree take --repo PATH (default: CLAUDE_PROJECT_DIR,
-    else the cwd's repository); every subcommand except worktree remove takes --json.
+    harness-work backup list [--all]
+    harness-work backup restore ID [--path P] [--to DIR] [--force]
+    start, attempt, stage, cost, dispatch, cloud, waves, wave, worktrees, worktree and backup take --repo PATH (default:
+    CLAUDE_PROJECT_DIR, else the cwd's repository); every subcommand except worktree remove takes --json.
 
 State, under ~/.claude/harness: repos/<repo-key>/tickets/<N>.json (the ticket cache that `harness-board show`
 writes; start adds branch, worktree and started_at, attempt adds to attempts), repos/<repo-key>/cost/<N>.json (the
 record `cost` writes), repos/<repo-key>/waves/<id>.json (a wave, harness_lib/waves.py), runs/<repo-key>-<N>-<stamp>.json
 and .log (one dispatched run), budgets.json
-({"api"|"cloud": {"exhausted_until", "reason"}}).
+({"api"|"cloud": {"exhausted_until", "reason"}}), backups/<id>/ (a snapshot, read by backup list and restore).
 
 attempt: appends {stage, tier, effort, result, at} to the ticket cache's attempts and prints the failure policy's
 answer. The tier is --tier, else the stage's route (harness_lib.routing: review_route for review, code_route for the
@@ -128,6 +130,15 @@ from its claude.ai/code URL. The run record gets venue cloud, cloud_id and url, 
 ticket. A failed launch, or one without a session id, ends the record in error with claude's last line; billing
 wording there marks the cloud budget exhausted for 24 h.
 
+backup list: this repository's snapshots (harness_lib/backups.py: its project store, <git common dir>/harness-backups/,
+and its own in ~/.claude/harness/backups/), newest first, as ID, AGE, ITEMS, SIZE and COMMAND; --all adds every
+snapshot in ~/.claude/harness/backups/, and outside a repository list acts as --all; --json prints the manifests;
+none is `No backups.`. backup restore ID: every item back at its path (`restored <path>` each), or with --path only
+those at or under P, or with --to under DIR at its path relative to the snapshot's repository (else to its own
+working tree, else its basename). Every target is checked first: an unknown id, or a target that exists, is one line,
+exit 1 and nothing written; --force first snapshots the existing targets (into the snapshot's project store when it
+sat in one, else where its repository's snapshots go now) and prints that snapshot's id. --path and --to are taken from the cwd. --json prints {id, restored, replaced, saved} at the end.
+
 A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through to stderr, in order,
 except a routing problem dispatch already printed (those children load the same settings; REPORTED); its other
 stderr stays hidden. Siblings (harness-board) are found on PATH, else next to this script. gh is HARNESS_GH when set, else `gh`;
@@ -143,6 +154,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import socket
 import struct
@@ -156,12 +168,13 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
-    from harness_lib.repo import RepoError, repo_facts, worktree_entries
+    from harness_lib.repo import NotARepository, RepoError, repo_facts, worktree_entries
     from harness_lib.routing import EFFORTS, cached_code_route, code_route, load_routing, next_route, review_route
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, patterns, setting, settings_env
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
-    from harness_lib import cost, reviews, waves
-    from harness_lib.text import harness_home, last_line, one_line, parse_iso, read_json
+    from harness_lib import backups, cost, reviews, waves
+    from harness_lib.text import age_text as ago_text
+    from harness_lib.text import harness_home, last_line, one_line, parse_iso, parse_iso_seconds, read_json
     from harness_lib.text import write_json as _write_json
     from harness_lib import gh as ghlib
     from harness_lib import ghlimit
@@ -2056,6 +2069,74 @@ def cmd_worktrees(repo, args):
     print(table(lines))
 
 
+# --------------------------------------------------------------- backups
+def backup_main(args):
+    """The main checkout backup acts for: --repo (which must be in a repository), else CLAUDE_PROJECT_DIR, else the
+    cwd's; None outside a repository."""
+    try:
+        return repo_facts(args.repo or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(), git, last_line)[2]
+    except NotARepository as exc:
+        if args.repo:
+            raise Problem(str(exc)) from None
+        return None
+    except RepoError as exc:
+        raise Problem(str(exc)) from None
+
+
+def size_text(count):
+    """Bytes in decimal units, as Finder shows them: 512 B, 3.4 kB, 1.2 MB."""
+    if count < 1000:
+        return f"{count} B"
+    for unit in ("kB", "MB", "GB", "TB"):
+        count /= 1000
+        if count < 999.95 or unit == "TB":
+            return f"{count:.1f} {unit}"
+
+
+def cmd_backup_list(main, args):
+    found = backups.snapshots(main, everything=args.all or main is None)
+    if args.json:
+        emit(True, found, "")
+        return
+    if not found:
+        print("No backups.")
+        return
+    current, rows = time.time(), [("ID", "AGE", "ITEMS", "SIZE", "COMMAND")]
+    for manifest in found:
+        then = parse_iso_seconds(manifest.get("at"))
+        items = [i for i in manifest["items"] if isinstance(i, dict)]
+        size = sum(i["bytes"] for i in items if isinstance(i.get("bytes"), int) and not isinstance(i["bytes"], bool))
+        rows.append((manifest["id"], ago_text(then, current) if then is not None else "?", str(len(items)),
+                     size_text(size), one_line(manifest.get("command") or "")))
+    print(table(rows))
+
+
+def cmd_backup_restore(main, args):
+    def progress(kind, value):
+        if args.json:
+            return
+        if kind == "saved":
+            count = len(value["items"])
+            print(f"backup {value['id']} holds the {count} path{'' if count == 1 else 's'} this restore replaces",
+                  flush=True)
+        else:
+            print(f"restored {value}", flush=True)
+
+    result = backups.restore(main, args.id, only=args.path, to=args.to, force=args.force, cwd=os.getcwd(),
+                             command=" ".join(["harness-work"] + [shlex.quote(a) for a in sys.argv[1:]]),
+                             progress=progress)
+    if args.json:
+        emit(True, result, "")
+
+
+def cmd_backup(args):
+    main = backup_main(args)
+    try:
+        (cmd_backup_list if args.action == "list" else cmd_backup_restore)(main, args)
+    except backups.BackupError as err:
+        raise Problem(str(err)) from None
+
+
 def cmd_worktree_remove(repo, args):
     branch = args.branch[len("refs/heads/"):] if args.branch.startswith("refs/heads/") else args.branch
     if branch in ("main", "master"):
@@ -2096,7 +2177,7 @@ def parser():
     ap = Parser(prog="harness-work", description="Ticket worktrees, attempts, dispatch, runs and budgets.")
     sub = ap.add_subparsers(dest="cmd",
                             metavar="{start,attempt,stage,cost,dispatch,cloud,runs,waves,wave,budget,worktrees,"
-                                    "worktree}")
+                                    "worktree,backup}")
     sub.required = True
 
     start = sub.add_parser("start", parents=[with_repo, with_json],
@@ -2192,6 +2273,20 @@ def parser():
     rm = wt_sub.add_parser("remove", parents=[with_repo], help="remove a worktree and delete its branch")
     rm.add_argument("branch")
     rm.add_argument("--discard", action="store_true", help="remove it even with uncommitted changes")
+
+    backup = sub.add_parser("backup", help="the snapshots taken before destructive commands, and their restore")
+    backup_sub = backup.add_subparsers(dest="action", metavar="{list,restore}")
+    backup_sub.required = True
+    blist = backup_sub.add_parser("list", parents=[with_repo, with_json],
+                                  help="this repository's snapshots, newest first")
+    blist.add_argument("--all", action="store_true", help="every snapshot in ~/.claude/harness/backups/ too")
+    brestore = backup_sub.add_parser("restore", parents=[with_repo, with_json],
+                                     help="put a snapshot's items back; refused over an existing path without --force")
+    brestore.add_argument("id", metavar="ID")
+    brestore.add_argument("--path", metavar="P", help="only the items at or under P")
+    brestore.add_argument("--to", metavar="DIR", help="under DIR instead of at the original paths")
+    brestore.add_argument("--force", action="store_true",
+                          help="snapshot the existing paths it replaces first, then replace them")
     return ap
 
 
@@ -2207,6 +2302,8 @@ def main():
             cmd_runs(args)
         elif args.cmd == "budget":
             cmd_budget(args)
+        elif args.cmd == "backup":
+            cmd_backup(args)
         else:
             command = {"start": cmd_start, "attempt": cmd_attempt, "stage": cmd_stage, "cost": cmd_cost, "dispatch": cmd_dispatch,
                        "cloud": cmd_cloud, "waves": cmd_waves, "wave": cmd_wave_drop, "worktrees": cmd_worktrees,
