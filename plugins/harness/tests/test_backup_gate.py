@@ -68,6 +68,12 @@ Choices the ticket leaves open, fixed here:
 - The session's project is the main checkout of CLAUDE_PROJECT_DIR (a worktree's names its main checkout), else
   of the event's cwd; a worktree outside the main checkout's folder is inside the project.
 - A store the snapshot cannot be written to is the hook's own error: one stderr line, exit 0, no decision.
+- The directory a removal runs in (review finding on #327): an unconditional cd or pushd into an existing folder
+  moves it, whatever separator follows. It is unknown, so no decision and no snapshot, after a cd that can fail (a
+  missing folder, a regular file) when the removal runs anyway (after ;, || or a newline); after a cd to a word the
+  shell expands and the walker cannot (~+, ~0, ~+/sub, a glob); and after a cd that may not run (after && or ||,
+  inside if), whichever way its condition goes. A missing folder joined to the removal by && alone is left open.
+  Each such case is also run by a real shell (zsh, else bash) in the same worktree, to show what it removes.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p test_backup_gate.py -v
 """
@@ -95,6 +101,7 @@ HOOKS_JSON = os.path.join(HOOKS_DIR, "hooks.json")
 TOOL = os.path.join(PLUGIN, "bin", "harness-work")
 GIT = shutil.which("git") or "/usr/bin/git"
 PATH = os.pathsep.join([os.path.dirname(GIT), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+SHELL = shutil.which("zsh", path=PATH) or shutil.which("bash", path=PATH) or "/bin/bash"   # as the Bash tool runs
 ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}")
 REBUILDABLE = ("node_modules", ".venv", "venv", "dist", "build", "__pycache__", ".pytest_cache", ".mypy_cache",
                ".ruff_cache", ".tox")
@@ -179,6 +186,14 @@ def holds(root, data):
 
 def real(path):
     return os.path.realpath(str(path))
+
+
+def entries(root):
+    """Every path under `root`, relative to it, links not followed."""
+    out = set()
+    for folder, dirs, files in os.walk(root):
+        out.update(os.path.relpath(os.path.join(folder, n), root) for n in dirs + files)
+    return out
 
 
 def remove(path):
@@ -1010,6 +1025,109 @@ class Nothing(GateTest):
                 p = self.run_raw(stdin, main)
                 self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "", ""), stdin[:60])
                 self.assertEqual(self.snapshots() - before, set())
+
+
+# ================================================================ the directory a removal runs in
+class Directory(GateTest):
+    """Where a removal runs after a cd. Each case runs the hook, then a real shell on the same worktree: an allow
+    must never come with something the shell removes and the snapshot lacks."""
+
+    def scene(self):
+        main = self.make_project()
+        wt = self.add_worktree(main, "t-1-x", "t/1-x")
+        names = {"sub": "sub-" + self.word(), "nope": "nope-" + self.word(), "x": f"x-{self.word()}.txt",
+                 "y": f"y-{self.word()}.txt", "d": "d-" + self.word()}
+        return main, wt, names
+
+    def refresh(self, wt, n):
+        """x, y and the folder d both in the worktree and in sub/, and docs/a.md, src/util.py and README.md (tracked),
+        all with fresh contents."""
+        for where in ("", n["sub"]):
+            for key in ("x", "y"):
+                self.put(os.path.join(wt, where, n[key]))
+            remove(os.path.join(wt, where, n["d"]))
+            self.fill(os.path.join(wt, where, n["d"]), files=2)
+        for rel in ("docs/a.md", "src/util.py", "README.md"):
+            self.put(os.path.join(wt, rel))
+
+    def shell_removes(self, command, cwd, wt):
+        """What a real shell running `command` in `cwd` removes from `wt`: the topmost removed paths, relative."""
+        before = entries(wt)
+        argv = [SHELL, "-f", "-c", command] if os.path.basename(SHELL) == "zsh" else [SHELL, "-c", command]
+        subprocess.run(argv, cwd=cwd, env=self.env(), capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+        gone = before - entries(wt)
+        return {g for g in gone if os.path.dirname(g) not in gone}
+
+    def each(self, cases, check):
+        """check(main, wt, command, cwd, what the shell removes) per case, in its own subtest, the worktree
+        refreshed before each."""
+        main, wt, n = self.scene()
+        for shape, where, removed in cases:
+            command = shape.format(wt=wt, **n)
+            cwd = os.path.join(wt, where.format(**n)) if where else wt
+            with self.subTest(command=command, cwd=cwd):
+                self.refresh(wt, n)
+                check(main, wt, command, cwd, {r.format(**n) for r in removed})
+
+    def expect_unknown(self, cases):
+        def check(main, wt, command, cwd, want):
+            before, there = self.snapshots(), entries(wt)
+            p = self.run_gate(command, cwd, main)
+            self.assertEqual(entries(wt), there, f"{command!r}: the hook itself changed the worktree")
+            self.assertEqual(self.shell_removes(command, cwd, wt), want, f"{command!r}: what {SHELL} removes")
+            self.expect_nothing(p, before, command)
+
+        self.each(cases, check)
+
+    def test_a_cd_that_can_fail_leaves_what_runs_anyway_unknown(self):
+        self.expect_unknown((
+            ("cd {nope} && true; rm -f docs/a.md", "", ["docs/a.md"]),
+            ("cd {nope} && rm -rf a\nrm -rf {d}", "", ["{d}"]),
+            ("cd {nope} && ls || rm -f src/util.py", "", ["src/util.py"]),
+            ("pushd {nope}/deeper && true; rm -f {x}", "", ["{x}"]),
+            ("cd docs/a.md && ls; rm -f src/util.py", "", ["src/util.py"]),         # a regular file
+            ("cd README.md && pwd\nrm -f {x} {y}", "", ["{x}", "{y}"]),
+        ))
+
+    def test_a_cd_to_a_word_the_shell_expands_leaves_the_directory_unknown(self):
+        self.expect_unknown((
+            ("cd ~+ && rm -f {x}", "", ["{x}"]),
+            ("cd ~0 && rm -f {y}", "", ["{y}"]),
+            ("cd ~+/{sub} && rm -f {x}", "", ["{sub}/{x}"]),
+            ("cd sub-* && rm -f {x}", "", ["{sub}/{x}"]),
+            ("cd sub-???????? && rm -rf {d}", "", ["{sub}/{d}"]),
+        ))
+
+    def test_a_cd_that_may_not_run_leaves_the_directory_unknown(self):
+        # x and y are both in the worktree and in sub/: which one goes depends on the condition, either way.
+        self.expect_unknown((
+            ("[ -f {nope} ] && cd {sub}; rm -f {x}", "", ["{x}"]),
+            ("test -d {sub} && cd {sub}; rm -f {x}", "", ["{sub}/{x}"]),
+            ("if [ -f {nope} ]; then cd {sub}; fi; rm -f {x}", "", ["{x}"]),
+            ("[ -e {nope} ] && cd {sub}\nrm -rf {d}", "", ["{d}"]),
+        ))
+
+    def test_an_unconditional_cd_into_an_existing_folder_is_still_backed_up(self):
+        cases = (
+            ("cd {sub} && rm -rf {d}", "", ["{sub}/{d}"]),
+            ("cd {sub}; rm -rf {d}", "", ["{sub}/{d}"]),
+            ("cd {sub} && true; rm -f {y}", "", ["{sub}/{y}"]),
+            ("cd {sub}\nrm -f {x}", "", ["{sub}/{x}"]),
+            ("cd {sub} && ls; rm -rf {x} {d}", "", ["{sub}/{x}", "{sub}/{d}"]),
+            ("cd {wt}/{sub}; rm -f {y}", "", ["{sub}/{y}"]),
+            ("cd .. && rm -f {x}", "{sub}", ["{x}"]),
+        )
+        def check(main, wt, command, cwd, want):
+            targets = [os.path.join(wt, r) for r in sorted(want)]
+            before, there, was = self.snapshots(), entries(wt), {t: tree(t) for t in targets}
+            p = self.run_gate(command, cwd, main)
+            self.assertEqual(entries(wt), there, f"{command!r}: the hook itself changed the worktree")
+            self.assertEqual(self.shell_removes(command, cwd, wt), want, f"{command!r}: what {SHELL} removes")
+            sid = self.expect_backup(p, before, self.global_store(), targets, command)
+            self.restore(sid, cwd)
+            self.assertEqual({t: tree(t) for t in targets}, was, f"restored from {sid} (seed {self.seed})")
+
+        self.each(cases, check)
 
 
 # ================================================================ failing open

@@ -11,12 +11,24 @@ in the main checkout's .claude/settings.json and settings.local.json); a command
 refuses (its own decision, bash_refusal; unlink and rmdir count as rm of the same word from the
 same directory); an unknown target: a word with $, a backtick, a brace expansion, **, ^, #, an
 inner ~, a leading =, a bracket form fnmatch reads otherwise ([^, [[:), a word running on into
-a parenthesis, xargs, an unknown directory (cd -, cd to a $ or backtick word, anything after
-popd), a glob matching nothing; a target outside the session's project (the main checkout of
-CLAUDE_PROJECT_DIR, else of the event's cwd, and its worktrees: the working tree git names from
-the target's folder must be one of them); /, $HOME or a folder holding it, the main checkout, a
-worktree, any repository root or a folder holding a project root, a .git directory or anything
-in one, and anything under .claude/, .githooks/ or .github/ relative to its own working tree.
+a parenthesis, xargs, an unknown directory (below), a glob matching nothing; a target outside
+the session's project (the main checkout of CLAUDE_PROJECT_DIR, else of the event's cwd, and its
+worktrees: the working tree git names from the target's folder must be one of them); /, $HOME
+or a folder holding it, the main checkout, a worktree, any repository root or a folder holding a
+project root, a .git directory or anything in one, and anything under .claude/, .githooks/ or
+.github/ relative to its own working tree.
+
+The directory is the walker's after a cd or pushd only when that cd surely runs, in this shell,
+before what follows, and lands where the walker says: first in the command or after ;, & or a
+newline, followed by ;, &&, a newline or the end of its subshell, outside if, loops, case and
+{ }, behind no keyword, assignment or wrapper but builtin or command; cd's options at most -L
+and -P, pushd's none; one operand, a word with nothing the shell expands but a leading ~ or ~/;
+CDPATH unset or not consulted; an existing folder it may enter, its logical and physical paths
+the same, that no removal in the command removes (nor a folder above it). Otherwise, and after
+popd, the directory is unknown until the subshell or child shell holding the cd ends. Also
+unknown: a removal inside a loop, one whose directory is not an existing folder, and every
+removal when the command holds both a command or process substitution (the walker runs those
+last) and a cd, pushd or popd.
 
 Each existing target, by its path relative to its own working tree: secret-shaped (.env,
 .env.*, *.pem, *.key, credentials/ and under) or sensitive (a HARNESS_SENSITIVE_PATHS match, or
@@ -45,6 +57,7 @@ Standard library only; works with the python3 from Xcode's command line tools (3
 from __future__ import annotations
 
 import fnmatch
+import itertools
 import math
 import os
 import re
@@ -81,9 +94,14 @@ REBUILDABLE = frozenset(
     "node_modules .venv venv dist build __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox".split()
 )
 GUARDED = {".claude", ".githooks", ".github"}
+OPENERS = {"if", "while", "until", "for", "select", "case", "{"}
+CLOSERS = {"fi", "done", "esac", "}"}
+LOOPS = {"while", "until", "for", "select"}
+RESERVED = KEYWORDS | OPENERS | CLOSERS
 RM_WORD = re.compile(r"\b(?:rm|unlink|rmdir)\b")
 GLOB = re.compile(r"[*?[]")
 UNREAD = re.compile(r"[$`^#]|\*\*|\[\^|\[\[[:=.]|(?<=.)~(?=.)|\A=|\{[^{}]*(?:,|\.\.)[^{}]*\}")
+SUBSTITUTION = re.compile(r"\$\(|`|[<>]\(")
 QUIET = re.compile(r"/dev/(?:null|stdout|stderr|fd/\d+)\Z")
 
 
@@ -118,18 +136,80 @@ def git(cwd, *args):
 # ---------- the command ----------
 
 
-def steps(guard, command, cwd):
-    """(part, name, args, its directory or None, run by xargs) for each simple command. cd or pushd to a word with
-    $ or a backtick, and popd, leave the directory unknown (the walker reads $ from this process's environment)."""
+def steps(guard, command, cwd, moves):
+    """(part, name, args, its directory or None, run by xargs) for each simple command, in the walker's order. After
+    a cd or pushd the walker's directory is kept only where `landing` gives it (each such folder goes into `moves`);
+    otherwise, and after popd, it is unknown until the subshell or child shell holding the cd ends. A removal inside
+    a loop is unknown too: a later pass may run it elsewhere."""
     state = {"cwd": cwd, "repos": {}}
-    lost = False
+    before, opened = "", []  # the operator before this part; the compound commands open around it
     for part, name, args in guard.walk(state, command):
-        if lost:
-            state["cwd"], lost = None, False
+        for word in itertools.takewhile(lambda w: w in RESERVED, part.words):
+            if word in OPENERS:
+                opened.append(word)
+            elif word in CLOSERS and opened:
+                opened.pop()
+        here = None if name in REMOVERS and LOOPS.intersection(opened) else state["cwd"]
         wrappers = part.words[: max(len(part.words) - len(args) - 1, 0)]
-        yield part, name, args, state["cwd"], any(os.path.basename(w) == "xargs" for w in wrappers)
-        first = guard.plain_args(args)[:1]
-        lost = name == "popd" or (name in ("cd", "pushd") and any(c in w for w in first for c in "$`"))
+        yield part, name, args, here, any(os.path.basename(w) == "xargs" for w in wrappers)
+        if name in ("cd", "pushd", "popd"):
+            folder = landing(part, name, args, here, before, opened, wrappers)
+            if folder is None:
+                state["cwd"] = None  # the walker's cd_target(None, ...) keeps it None
+            else:
+                moves.append(folder)
+        before = part.sep
+
+
+def landing(part, name, args, here, before, opened, wrappers):
+    """The folder a cd or pushd surely leaves this shell in, the walker's own; None unless it runs whenever what
+    follows it does (first, or after ;, & or a newline; then ;, &&, a newline or the subshell's end; outside every
+    if, loop, case and { }; behind no keyword or wrapper but builtin or command) and cannot fail or land elsewhere
+    (cd's options at most -L and -P, pushd's none; one operand, a plain word, ~ or ~/... alone expanded; CDPATH
+    unset or not used; an existing folder it may enter, as the logical and the physical path name it)."""
+    surely = not opened and before in ("", ";", "&") and part.sep in ("", ";", "&&", ")")
+    if here is None or name == "popd" or not surely or any(w not in ("builtin", "command") for w in wrappers):
+        return None
+    k = 0
+    while k < len(args) and args[k].startswith("-") and args[k] != "-":
+        k += 1
+        if args[k - 1] == "--":
+            break
+        if name == "pushd" or args[k - 1] not in ("-L", "-P"):
+            return None
+    rest = args[k:] or (["~"] if name == "cd" else [])
+    if len(rest) != 1:
+        return None
+    word = rest[0]
+    if not word or word[0] in "+-" or UNREAD.search(word) or GLOB.search(word):
+        return None  # +N and -N name the directory stack in zsh
+    if word.startswith("~"):
+        if word != "~" and not word.startswith("~/"):
+            return None  # ~+, ~-, ~0, ~user and zsh's named directories
+        word = os.path.expanduser(word)
+    if os.environ.get("CDPATH") and not word.startswith("/") and word.split("/")[0] not in (".", ".."):
+        return None
+    path = os.path.normpath(os.path.join(here, word))
+    if not (os.path.isdir(path) and os.access(path, os.X_OK)):
+        return None
+    return path if os.path.realpath(path) == os.path.realpath(os.path.join(here, word)) else None
+
+
+def lineage(folder):
+    """(st_dev, st_ino) of `folder` and of each folder above it, as spelled (a link on the way counted itself) and
+    resolved: a removal of any of them makes a cd into `folder` fail."""
+    found = set()
+    for path in (folder, os.path.realpath(folder)):
+        while True:
+            try:
+                st = os.lstat(path)
+                found.add((st.st_dev, st.st_ino))
+            except OSError:
+                pass
+            if os.path.dirname(path) == path:
+                break
+            path = os.path.dirname(path)
+    return found
 
 
 def operands(name, args):
@@ -423,12 +503,16 @@ def decide(data, command):
     if switch is not None and switch.lower() == "off":
         return None
     guard = branch_guard()
-    parts = list(steps(guard, command, cwd))
+    moves = []
+    parts = list(steps(guard, command, cwd, moves))
     paths, removals = [], [step for step in parts if step[1] in REMOVERS]
     if not removals:
         return None
+    if SUBSTITUTION.search(command) and any(step[1] in ("cd", "pushd", "popd") for step in parts):
+        return None  # the walker runs what a substitution holds after the whole command, where its cds left it
     for part, name, args, here, xargs in removals:
-        if here is None or xargs or part.sep == "(":  # ( after the words: a zsh glob qualifier or an extglob
+        # ( after the words: a zsh glob qualifier or an extglob
+        if here is None or not os.path.isdir(here) or xargs or part.sep == "(":
             return None
         words = operands(name, args)
         for word in words:
@@ -448,6 +532,14 @@ def decide(data, command):
         if rel is None:
             return None
         places[loc] = rel
+    entered = set().union(*map(lineage, moves))
+    for loc in places:  # removing a folder a cd enters, or one above it, makes that cd fail
+        try:
+            st = os.lstat(loc)
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) in entered:
+            return None
     folders = [loc for loc in places if os.path.isdir(loc) and not os.path.islink(loc)]
     pats, items, leave, total = backups.sensitive_patterns(main), [], [], 0
     for loc, rel in places.items():
