@@ -15,5 +15,5 @@ Ryan's Claude Code harness: one plugin (agents, skills, hooks, command-line tool
 - `.githooks/`: `pre-commit` (format and lint on staged files, no commits on main) and `pre-push` (no pushes to main, no force pushes).
 
 ## Conventions
-- python3 standard library only, 3.9-compatible (`from __future__ import annotations`); tests are standalone unittest modules that drive the tools as subprocesses. Tests pin behavior, never the wording of a document, skill or agent.
+- python3 standard library only, 3.9-compatible (`from __future__ import annotations`); tests are unittest modules that drive the tools as subprocesses, and a suite split across several `test_<x>*.py` modules keeps its fixtures in `<x>_support.py` beside them (not collected). Tests pin behavior, never the wording of a document, skill or agent.
 - A change to a hook or tool updates its contract in `docs/design.md` in the same pull request.
