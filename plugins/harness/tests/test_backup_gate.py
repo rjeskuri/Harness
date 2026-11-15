@@ -74,6 +74,9 @@ Choices the ticket leaves open, fixed here:
   shell expands and the walker cannot (~+, ~0, ~+/sub, a glob); and after a cd that may not run (after && or ||,
   inside if), whichever way its condition goes. A missing folder joined to the removal by && alone is left open.
   Each such case is also run by a real shell (zsh, else bash) in the same worktree, to show what it removes.
+  Also unknown (review round 2): a cd behind `command` (zsh runs the external cd, bash the builtin) or spelled as
+  a path (a child process in every shell), and a cd joined by && or || to an arithmetic command or to a part that
+  only redirects input. A cd behind `builtin`, or bare after ; or a newline, still moves the directory.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p test_backup_gate.py -v
 """
@@ -102,6 +105,7 @@ TOOL = os.path.join(PLUGIN, "bin", "harness-work")
 GIT = shutil.which("git") or "/usr/bin/git"
 PATH = os.pathsep.join([os.path.dirname(GIT), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
 SHELL = shutil.which("zsh", path=PATH) or shutil.which("bash", path=PATH) or "/bin/bash"   # as the Bash tool runs
+CD = shutil.which("cd", path=PATH)                     # the executable cd (macOS /usr/bin/cd), when there is one
 ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}")
 REBUILDABLE = ("node_modules", ".venv", "venv", "dist", "build", "__pycache__", ".pytest_cache", ".mypy_cache",
                ".ruff_cache", ".tox")
@@ -1106,6 +1110,59 @@ class Directory(GateTest):
             ("if [ -f {nope} ]; then cd {sub}; fi; rm -f {x}", "", ["{x}"]),
             ("[ -e {nope} ] && cd {sub}\nrm -rf {d}", "", ["{d}"]),
         ))
+
+    def test_a_cd_behind_command_leaves_the_directory_unknown(self):
+        # zsh's `command` runs the external cd or pushd (a child process, or not found), so the directory stays;
+        # bash's runs the builtin. The hook cannot know which shell runs it: unknown either way.
+        zsh = os.path.basename(SHELL) == "zsh"
+        self.expect_unknown((
+            ("command cd {sub}; rm -f {x}", "", ["{x}"] if zsh else ["{sub}/{x}"]),
+            ("command cd {sub}\nrm -rf {d}", "", ["{d}"] if zsh else ["{sub}/{d}"]),
+            ("command pushd {sub}; rm -f {y}", "", ["{y}"] if zsh else ["{sub}/{y}"]),
+        ))
+
+    @unittest.skipUnless(CD, "no cd executable on PATH")
+    def test_a_cd_spelled_as_a_path_leaves_the_directory_unknown(self):
+        # The executable cd runs in a child process: in every shell the directory stays.
+        self.expect_unknown((
+            (CD + " {sub}; rm -f {x}", "", ["{x}"]),
+            (CD + " {sub}\nrm -rf {d}", "", ["{d}"]),
+        ))
+
+    def test_a_cd_after_an_arithmetic_or_a_bare_redirect_and_or_may_not_run(self):
+        # (( )) and a part that only redirects input are commands with a status: the && or || after one makes the
+        # cd conditional, wherever it stands in the command.
+        self.expect_unknown((
+            ("(( 0 )) && cd {sub}; rm -f {x}", "", ["{x}"]),
+            ("true\n(( 0 )) && cd {sub}; rm -f {x}", "", ["{x}"]),
+            ("((0)) && cd {sub}\nrm -rf {d}", "", ["{d}"]),
+            ("(( 1 )) || cd {sub}; rm -f {y}", "", ["{y}"]),
+            ("< {nope} && cd {sub}; rm -f {x}", "", ["{x}"]),
+            ("< docs/a.md || cd {sub}; rm -f {y}", "", ["{y}"]),
+        ))
+
+    def test_a_builtin_or_bare_cd_that_surely_runs_is_still_backed_up(self):
+        self.expect_moved((
+            ("builtin cd {sub}; rm -f {x}", "", ["{sub}/{x}"]),
+            ("builtin cd {sub}\nrm -rf {d}", "", ["{sub}/{d}"]),
+            ("builtin pushd {sub}; rm -f {y}", "", ["{sub}/{y}"]),
+            ("true; cd {sub}; rm -f {x}", "", ["{sub}/{x}"]),
+            ("pwd\ncd {sub} && rm -rf {d}", "", ["{sub}/{d}"]),
+        ))
+
+    def expect_moved(self, cases):
+        """Allow, with one snapshot holding exactly what the shell removes, and a restore that brings it back."""
+        def check(main, wt, command, cwd, want):
+            targets = [os.path.join(wt, r) for r in sorted(want)]
+            before, there, was = self.snapshots(), entries(wt), {t: tree(t) for t in targets}
+            p = self.run_gate(command, cwd, main)
+            self.assertEqual(entries(wt), there, f"{command!r}: the hook itself changed the worktree")
+            self.assertEqual(self.shell_removes(command, cwd, wt), want, f"{command!r}: what {SHELL} removes")
+            sid = self.expect_backup(p, before, self.global_store(), targets, command)
+            self.restore(sid, cwd)
+            self.assertEqual({t: tree(t) for t in targets}, was, f"restored from {sid} (seed {self.seed})")
+
+        self.each(cases, check)
 
     def test_an_unconditional_cd_into_an_existing_folder_is_still_backed_up(self):
         cases = (

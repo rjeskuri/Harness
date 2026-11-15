@@ -19,16 +19,19 @@ project root, a .git directory or anything in one, and anything under .claude/, 
 .github/ relative to its own working tree.
 
 The directory is the walker's after a cd or pushd only when that cd surely runs, in this shell,
-before what follows, and lands where the walker says: first in the command or after ;, & or a
-newline, followed by ;, &&, a newline or the end of its subshell, outside if, loops, case and
-{ }, behind no keyword, assignment or wrapper but builtin or command; cd's options at most -L
-and -P, pushd's none; one operand, a word with nothing the shell expands but a leading ~ or ~/;
-CDPATH unset or not consulted; an existing folder it may enter, its logical and physical paths
-the same, that no removal in the command removes (nor a folder above it). Otherwise, and after
-popd, the directory is unknown until the subshell or child shell holding the cd ends. Also
-unknown: a removal inside a loop, one whose directory is not an existing folder, and every
-removal when the command holds both a command or process substitution (the walker runs those
-last) and a cd, pushd or popd.
+before what follows, and lands where the walker says: first in the command or its subshell, or
+right after ;, & or a newline (an arithmetic command or a part that only redirects input is a
+command too, so a cd after its && or || may not run), followed by ;, &&, a newline or the end of
+its subshell, outside if, loops, case and { }; the command word cd or pushd itself, not a path
+(the executable runs in a child process), behind no keyword, assignment or wrapper but builtin
+(zsh's command runs the executable as well); cd's options at most -L and -P, pushd's none; one
+operand, a word with nothing the shell expands but a leading ~ or ~/; CDPATH unset or not
+consulted; an existing folder it may enter, its logical and physical paths the same, that no
+removal in the command removes (nor a folder above it). Otherwise, and after popd, the
+directory is unknown until the subshell or child shell holding the cd ends. Also unknown: a
+removal inside a loop, one whose directory is not an existing folder, and every removal when
+the command holds both a command or process substitution (the walker runs those last) and a
+cd, pushd or popd.
 
 Each existing target, by its path relative to its own working tree: secret-shaped (.env,
 .env.*, *.pem, *.key, credentials/ and under) or sensitive (a HARNESS_SENSITIVE_PATHS match, or
@@ -142,7 +145,7 @@ def steps(guard, command, cwd, moves):
     otherwise, and after popd, it is unknown until the subshell or child shell holding the cd ends. A removal inside
     a loop is unknown too: a later pass may run it elsewhere."""
     state = {"cwd": cwd, "repos": {}}
-    before, opened = "", []  # the operator before this part; the compound commands open around it
+    opened = []  # the compound commands open around this part
     for part, name, args in guard.walk(state, command):
         for word in itertools.takewhile(lambda w: w in RESERVED, part.words):
             if word in OPENERS:
@@ -153,22 +156,25 @@ def steps(guard, command, cwd, moves):
         wrappers = part.words[: max(len(part.words) - len(args) - 1, 0)]
         yield part, name, args, here, any(os.path.basename(w) == "xargs" for w in wrappers)
         if name in ("cd", "pushd", "popd"):
-            folder = landing(part, name, args, here, before, opened, wrappers)
+            folder = landing(part, name, args, here, opened, wrappers)
             if folder is None:
                 state["cwd"] = None  # the walker's cd_target(None, ...) keeps it None
             else:
                 moves.append(folder)
-        before = part.sep
 
 
-def landing(part, name, args, here, before, opened, wrappers):
+def landing(part, name, args, here, opened, wrappers):
     """The folder a cd or pushd surely leaves this shell in, the walker's own; None unless it runs whenever what
-    follows it does (first, or after ;, & or a newline; then ;, &&, a newline or the subshell's end; outside every
-    if, loop, case and { }; behind no keyword or wrapper but builtin or command) and cannot fail or land elsewhere
-    (cd's options at most -L and -P, pushd's none; one operand, a plain word, ~ or ~/... alone expanded; CDPATH
-    unset or not used; an existing folder it may enter, as the logical and the physical path name it)."""
-    surely = not opened and before in ("", ";", "&") and part.sep in ("", ";", "&&", ")")
-    if here is None or name == "popd" or not surely or any(w not in ("builtin", "command") for w in wrappers):
+    follows it does (first in the command or its subshell, or right after ;, & or a newline, as the splitter's
+    Part.lead has it, so an arithmetic command or a bare redirect before && or || counts; then ;, &&, a newline or
+    the subshell's end; outside every if, loop, case and { }; the command word cd or pushd itself, not a path, behind
+    no keyword, assignment or wrapper but builtin) and cannot fail or land elsewhere (cd's options at most -L and -P,
+    pushd's none; one operand, a plain word, ~ or ~/... alone expanded; CDPATH unset or not used; an existing folder
+    it may enter, as the logical and the physical path name it)."""
+    first = part.lead in ("", ";", "&") or part.lead.endswith("(")
+    surely = not opened and first and part.sep in ("", ";", "&&", ")")
+    spelled = part.words[len(wrappers)]  # the command word as written: /usr/bin/cd runs in a child process
+    if here is None or name == "popd" or not surely or spelled != name or any(w != "builtin" for w in wrappers):
         return None
     k = 0
     while k < len(args) and args[k].startswith("-") and args[k] != "-":
