@@ -510,7 +510,9 @@ def render(template, values):
     return PLACEHOLDER.sub(lambda m: values.get(m.group(1), m.group(0)), template)
 
 
-def pr_body(number, ticket, red, verify_text, findings, notes=None):
+def pr_body(number, ticket, red, verify_text, findings, notes=None, review=None):
+    """The PR body from the template; `review`, when given, is an open PR's Review section text, kept in place of
+    the summary of `findings`."""
     sections = ticket.get("sections") if isinstance(ticket.get("sections"), dict) else {}
     dod = [str(x).strip() for x in sections.get("definition_of_done") or [] if str(x).strip()]
     tests = [str(x).strip() for x in sections.get("tests") or [] if str(x).strip()]
@@ -527,7 +529,7 @@ def pr_body(number, ticket, red, verify_text, findings, notes=None):
         else fence_safe(tail(red.get("tail"), RED_TAIL_LINES)) if red else "No red run recorded on this branch.",
         "verify_tail": fence_safe(tail(verify_text, VERIFY_TAIL_LINES)) if verify_text is not None
         else "No verify log attached.",
-        "review_summary": review_summary(findings),
+        "review_summary": review if review is not None else review_summary(findings),
         "risks": HIGH_RISK if risky else NO_RISK,
     }
     path = TEMPLATES / "pr_body.md"
@@ -564,18 +566,24 @@ def cmd_open(args):
                       "use `###` or put it in a code fence")
     findings = load_findings(args.review) if args.review else None
     ticket = show_ticket(repo, number)
-    body = pr_body(number, ticket, red_record(repo), verify_text, findings, notes)
+    red = red_record(repo)
     title = f"{ticket.get('title') or f'Ticket {number}'} (#{number})"
 
     push = git(repo.root, "push", "-u", "origin", branch, timeout=PUSH_TIMEOUT)
     if push.returncode != 0:
         raise Problem(f"git push -u origin {branch} failed: {last_line(push.stderr) or f'exit {push.returncode}'}")
-    existing = gh_json(["pr", "list", "--head", branch, "--state", "open", "--json", "number,url"], repo.root)
+    existing = gh_json(["pr", "list", "--head", branch, "--state", "open", "--json", "number,url,body"], repo.root)
     existing = [p for p in existing if isinstance(p, dict) and p.get("number")] if isinstance(existing, list) else []
     if existing:
         pr, url = int(existing[0]["number"]), existing[0].get("url") or ""
+        kept = body_sections(existing[0].get("body"))      # an absent --review / --notes keeps the PR's section
+        review = None if args.review else kept.get("review") or None
+        if not args.notes:
+            notes = kept.get("notes") or None
+        body = pr_body(number, ticket, red, verify_text, findings, notes, review)
         gh(["pr", "edit", str(pr), "--body-file", "-"], repo.root, stdin=body)
     else:
+        body = pr_body(number, ticket, red, verify_text, findings, notes)
         out = gh(["pr", "create", "--draft", "--base", "main", "--head", branch, "--title", title, "--body-file", "-"],
                  repo.root, stdin=body)
         pr, url = created_pr(out)

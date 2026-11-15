@@ -41,10 +41,13 @@ class Open(WorktreeTest):
         p = self.ok("open", "12", "--verify-log", self.verify_log, "--review", self.review, cwd=self.wt)
         self.assertEqual(p.stdout, f"#34 {PR_URL}\n")
         self.assertEqual(self.remote_head(), self.git(self.wt, "rev-parse", "HEAD"))
-        self.assertEqual(self.gh_argv(), [
-            ["pr", "list", "--head", BRANCH, "--state", "open", "--json", "number,url"],
-            ["pr", "create", "--draft", "--base", "main", "--head", BRANCH, "--title", "Add the widget (#12)",
-             "--body-file", "-"]])
+        argv = self.gh_argv()
+        self.assertEqual(len(argv), 2, argv)
+        # #291: the list may also ask for the body (kept on an existing PR); the rest of the call is fixed.
+        self.assertEqual(argv[0][:-1], ["pr", "list", "--head", BRANCH, "--state", "open", "--json"])
+        self.assertLessEqual({"number", "url"}, set(argv[0][-1].split(",")))
+        self.assertEqual(argv[1], ["pr", "create", "--draft", "--base", "main", "--head", BRANCH, "--title",
+                                   "Add the widget (#12)", "--body-file", "-"])
         self.assertLess(self.position(f"git -C {self.wt} push -u origin {BRANCH}"), self.position("gh pr create"))
         body = self.gh_calls()[1]["stdin"]
         lines = body.splitlines()
@@ -75,14 +78,16 @@ class Open(WorktreeTest):
     def test_open_edits_the_existing_pr_and_prints_json(self):
         self.outputs(**{"harness-board": {"show": {"stdout": json.dumps(board_ticket("low"))}},
                         "harness-red": {"status": {"stderr": "harness-red: No red run recorded\n", "exit": 1}}})
-        self.scenario([{"match": ["pr", "list"], "stdout_json": [{"number": 34, "url": PR_URL}]},
+        self.scenario([{"match": ["pr", "list"], "stdout_json": [{"number": 34, "url": PR_URL, "body": ""}]},
+                       {"match": ["pr", "view"], "stdout_json": {"number": 34, "url": PR_URL, "body": ""}},
                        {"match": ["pr", "edit", "34"], "stdout": PR_URL + "\n"}])
         p = self.ok("open", "#12", "--json", cwd=self.wt)
         self.assertEqual(json.loads(p.stdout), {"number": 34, "url": PR_URL})
         argv = self.gh_argv()
-        self.assertEqual(argv[1], ["pr", "edit", "34", "--body-file", "-"])
+        # #291: open may read the existing body (`pr view`) between the list and the edit.
+        self.assertEqual([a for a in argv if a[:2] == ["pr", "edit"]], [["pr", "edit", "34", "--body-file", "-"]])
         self.assertFalse(any(a[:2] == ["pr", "create"] for a in argv))
-        body = self.gh_calls()[1]["stdin"]
+        body = next(c for c in self.gh_calls() if c["argv"][:2] == ["pr", "edit"])["stdin"]
         self.assertTrue(body.startswith("Closes #12\n"))
         self.assertIn("Red run before implementation (none, exit -):", body)
         self.assertIn("No red run recorded on this branch.", body)
@@ -148,6 +153,163 @@ class Open(WorktreeTest):
         self.assertIn(["issue", "comment", "12", "--body", f"Pull request: {PR_URL}\n\n<!-- harness -->"],
                       [c["argv"] for c in calls])
         self.assertTrue(os.path.isfile(self.state_path("tickets", "12.json")))
+
+
+def sections_of(body):
+    """([`## ` headings in order], {heading: its text without surrounding blank lines}); a `## ` line inside a
+    code fence is not a heading."""
+    order, sections, current, fenced = [], {}, None, False
+    for line in body.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        elif not fenced and line.startswith("## "):
+            current = line[3:].strip()
+            order.append(current)
+            sections[current] = []
+            continue
+        if current is not None:
+            sections[current].append(line)
+    return order, {k: "\n".join(v).strip("\n") for k, v in sections.items()}
+
+
+def prior_body(review, notes=None):
+    """A body an earlier `open` wrote, with stale ticket parts that a refresh must rebuild."""
+    notes_part = f"## Notes\n{notes}\n\n" if notes else ""
+    return ("Closes #12\n\n## Summary\nA stale summary the ticket no longer says.\n\n" + notes_part +
+            "## Definition of done\n- [ ] A stale item dropped from the ticket\n\n"
+            "## Tests\n- `tests/test_stale.py::test_gone`: gone\n\n"
+            "Red run before implementation (assertion, exit 1):\n```\nSTALE RED TAIL\n```\n\n"
+            "Verify:\n```\nSTALE VERIFY TAIL\n```\n\n"
+            f"## Review\n{review}\n\n## Risks\nStale risk text.\n")
+
+
+STALE = ("A stale summary", "A stale item", "test_stale.py", "STALE RED TAIL", "STALE VERIFY TAIL", "Stale risk text")
+OLD_REVIEWS = (
+    "3 findings: 1 high, 1 medium, 1 low.\n\nHigh:\n- `widget.py:7`: Drops the second frob on an empty list.",
+    "2 findings: 0 high, 2 medium, 0 low.\n\nRe-reviewed the diff since abc1234; both medium findings are fixed.",
+)
+OLD_NOTES = (
+    "### Low findings\n- `README.md:1`: Mention the widget.\n\n### Rulings\n- Ruling: frob returns 2, not a list.\n"
+    "- Ruling: empty input frobs zero times.",
+    "### Rulings\n- Ruling: the cache is per process.\n\n### Out of scope\n- #77 Rename the frobber\n\n"
+    "```\n## not a heading, inside a fence\n```\n\n### Low findings\n- `docs/x.md:3`: Typo in the guide.",
+)
+NEW_FINDINGS = [{"path": "lib/frob.py", "line": 4, "severity": "high", "body": "Frob loops forever on None."},
+                {"path": "widget.py", "line": 3, "severity": "low", "body": "Rename x."}]
+NEW_NOTES = "### Rulings\n- Ruling: retries cap at three.\n\n### Low findings\n- `widget.py:3`: Rename x."
+
+
+class OpenKeepsReviewAndNotes(WorktreeTest):
+    """#291: `open` on a branch with an open PR keeps that PR body's `## Review` and `## Notes` content when
+    `--review` / `--notes` are absent; an explicit flag replaces its section; everything else is rebuilt."""
+
+    def setUp(self):
+        super().setUp()
+        self.verify_log = write(os.path.join(self.tmp, "verify.log"), "fresh verify line\nFRESH VERIFY OK\n")
+        self.new_review = write(os.path.join(self.tmp, "new-findings.json"), json.dumps(NEW_FINDINGS))
+        self.new_notes = write(os.path.join(self.tmp, "new-notes.md"), NEW_NOTES + "\n")
+
+    def refresh(self, prior, *flags):
+        """Run `open 12` against an open PR #34 whose body is `prior`; the body sent to `gh pr edit`."""
+        self.outputs(**{"harness-board": {"show": {"stdout": json.dumps(board_ticket("low"))}},
+                        "harness-red": {"status": {"stderr": "harness-red: No red run recorded\n", "exit": 1}}})
+        pr = {"number": 34, "url": PR_URL, "body": prior}
+        self.scenario([{"match": ["pr", "list"], "stdout_json": [pr]},
+                       {"match": ["pr", "view"], "stdout_json": dict(pr, headRefName=BRANCH, state="OPEN")},
+                       {"match": ["pr", "edit", "34"], "stdout": PR_URL + "\n"}])
+        p = self.ok("open", "12", "--verify-log", self.verify_log, "--json", *flags, cwd=self.wt)
+        self.assertEqual(json.loads(p.stdout), {"number": 34, "url": PR_URL})
+        self.assertFalse(any(a[:2] == ["pr", "create"] for a in self.gh_argv()))
+        edits = [c for c in self.gh_calls() if c["argv"][:2] == ["pr", "edit"]]
+        self.assertEqual([c["argv"] for c in edits], [["pr", "edit", "34", "--body-file", "-"]])
+        return edits[0]["stdin"]
+
+    def assertRebuilt(self, body):
+        """The parts that come from the ticket, the red record and the verify log are fresh."""
+        lines = body.splitlines()
+        self.assertEqual(lines[0], "Closes #12")
+        order, sections = sections_of(body)
+        self.assertEqual(sections["Summary"], "Add a widget that frobs. It must frob twice.")
+        self.assertEqual(sections["Definition of done"], "- [ ] The widget frobs twice\n- [x] The docs mention it")
+        self.assertIn("- `tests/test_widget.py::test_frob`: frobs twice", lines)
+        self.assertIn("FRESH VERIFY OK", lines)
+        self.assertIn("No red run recorded on this branch.", lines)
+        self.assertEqual(lines[-1], "None noted.")
+        for stale in STALE:
+            self.assertNotIn(stale, body)
+        for heading in set(order):
+            self.assertEqual(order.count(heading), 1, order)
+        self.assertNotIn("{{", body)
+
+    def test_no_flags_keep_the_review_and_notes_of_the_open_pr(self):
+        for review, notes in ((OLD_REVIEWS[0], OLD_NOTES[0]), (OLD_REVIEWS[1], OLD_NOTES[1])):
+            with self.subTest(review=review[:20], notes=notes[:20]):
+                body = self.refresh(prior_body(review, notes))
+                order, sections = sections_of(body)
+                self.assertEqual(sections.get("Review"), review)
+                self.assertEqual(sections.get("Notes"), notes)
+                self.assertNotIn("No review attached.", body)
+                self.assertLess(order.index("Notes"), order.index("Review"))
+                self.assertRebuilt(body)
+
+    def test_both_flags_replace_the_review_and_notes_of_the_open_pr(self):
+        body = self.refresh(prior_body(OLD_REVIEWS[0], OLD_NOTES[0]),
+                            "--review", self.new_review, "--notes", self.new_notes)
+        _, sections = sections_of(body)
+        review = sections["Review"].splitlines()
+        self.assertIn("2 findings: 1 high, 0 medium, 1 low.", review)
+        self.assertIn("- `lib/frob.py:4`: Frob loops forever on None.", review)
+        self.assertEqual(sections.get("Notes"), NEW_NOTES)
+        for old in ("3 findings", "Drops the second frob", "frob returns 2", "empty input frobs zero times",
+                    "Mention the widget"):
+            self.assertNotIn(old, body)
+        self.assertRebuilt(body)
+
+    def test_review_flag_alone_keeps_the_notes(self):
+        for notes in OLD_NOTES:
+            with self.subTest(notes=notes[:20]):
+                body = self.refresh(prior_body(OLD_REVIEWS[1], notes), "--review", self.new_review)
+                _, sections = sections_of(body)
+                self.assertEqual(sections.get("Notes"), notes)
+                self.assertIn("2 findings: 1 high, 0 medium, 1 low.", sections["Review"].splitlines())
+                self.assertNotIn("Re-reviewed the diff since abc1234", body)
+                self.assertNotIn("2 findings: 0 high, 2 medium, 0 low.", body)
+                self.assertRebuilt(body)
+
+    def test_notes_flag_alone_keeps_the_review(self):
+        for review in OLD_REVIEWS:
+            with self.subTest(review=review[:20]):
+                body = self.refresh(prior_body(review, OLD_NOTES[0]), "--notes", self.new_notes)
+                _, sections = sections_of(body)
+                self.assertEqual(sections.get("Review"), review)
+                self.assertEqual(sections.get("Notes"), NEW_NOTES)
+                for old in ("frob returns 2", "empty input frobs zero times", "Mention the widget"):
+                    self.assertNotIn(old, body)
+                self.assertRebuilt(body)
+
+    def test_an_open_pr_without_notes_gets_none_added(self):
+        for review in ("No review attached.", OLD_REVIEWS[0]):
+            with self.subTest(review=review[:20]):
+                body = self.refresh(prior_body(review))
+                order, sections = sections_of(body)
+                self.assertNotIn("Notes", order)
+                self.assertEqual(sections.get("Review"), review)
+                self.assertRebuilt(body)
+
+    def test_the_create_path_without_flags_has_no_notes_and_no_review(self):
+        """No open PR: nothing to keep, so the absent flags read as they always have."""
+        self.outputs(**{"harness-board": {"show": {"stdout": json.dumps(board_ticket("low"))},
+                                          "comment": {"stdout": "https://github.com/o/r/issues/12#c1\n"}},
+                        "harness-red": {"status": {"stderr": "harness-red: No red run recorded\n", "exit": 1}}})
+        self.scenario([{"match": ["pr", "list"], "stdout_json": []},
+                       {"match": ["pr", "create"], "stdout": PR_URL + "\n"}])
+        self.ok("open", "12", "--verify-log", self.verify_log, cwd=self.wt)
+        self.assertEqual([a[:2] for a in self.gh_argv()], [["pr", "list"], ["pr", "create"]])
+        body = next(c for c in self.gh_calls() if c["argv"][:2] == ["pr", "create"])["stdin"]
+        order, sections = sections_of(body)
+        self.assertNotIn("Notes", order)
+        self.assertEqual(sections.get("Review"), "No review attached.")
+        self.assertRebuilt(body)
 
 
 class OpenNoTests(WorktreeTest):
