@@ -972,20 +972,28 @@ def cloud_marker(issue, login, since):
     return found
 
 
-def branch_merged(repo, branch):
-    """Whether a pull request of `branch` (in any state) has merged; False when the run names no branch."""
+def branch_merged(repo, branch, since):
+    """Whether a pull request of `branch` (in any state) merged at or after `since`; False when the run names no
+    branch. Branch names are reused (a reverted ticket starts a new run on the same t/<n>-x), so one merged before
+    the run started is an earlier run's, and one without a readable mergedAt does not count (#295)."""
     if not branch:
         return False
-    prs = gh_json(repo, ["pr", "list", "--head", str(branch), "--state", "all", "--json", "number,state",
+    prs = gh_json(repo, ["pr", "list", "--head", str(branch), "--state", "all", "--json", "number,state,mergedAt",
                          "--limit", str(PR_ROWS)])
     rows = prs if isinstance(prs, list) else []
-    return any(isinstance(pr, dict) and str(pr.get("state", "")).upper() == "MERGED" for pr in rows)
+    for pr in rows:
+        if not isinstance(pr, dict) or str(pr.get("state", "")).upper() != "MERGED":
+            continue
+        when = parse_iso(pr.get("mergedAt"))
+        if when is not None and when >= since:
+            return True
+    return False
 
 
 def sweep_cloud(record, repos, logins):
     """Close a cloud run from its ticket: the newest marker comment by the gh user since the start (done: ok;
-    blocked: blocked, the owner asked through harness-board needs-input), else a closed ticket or a merged pull
-    request of its branch (ok), else 24 h since the start (unknown). Its status label never ends it: a cloud session
+    blocked: blocked, the owner asked through harness-board needs-input), else a closed ticket or a pull request of
+    its branch merged since the start (ok), else 24 h since the start (unknown). Its status label never ends it: a cloud session
     can still be working on a ticket left needs-input or ready (#295). A failing gh call is one warning and leaves
     the run open. Saves when it closes."""
     n = record.get("ticket")
@@ -1016,7 +1024,7 @@ def sweep_cloud(record, repos, logins):
         outcome, ended = "ok", iso(now())
     else:
         try:
-            merged = branch_merged(repo, record.get("branch"))
+            merged = branch_merged(repo, record.get("branch"), started)
         except Problem as err:
             warn(f"#{n}: cannot tell whether a pull request of its cloud run merged: {err}")
             return

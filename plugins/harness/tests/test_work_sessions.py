@@ -927,6 +927,44 @@ class CloudSweep(CloudTest):
                 self.assertEqual(saved[n]["outcome"], c[4])
                 self.assertEqual(saved[n]["ended_at"] is None, c[4] is None)
 
+    def test_only_a_pr_merged_since_the_runs_start_ends_it(self):
+        """#295: branch names are reused (a reverted ticket, answered, starts a new cloud run on the same t/<n>-x),
+        so a pull request of the branch that merged before the run started is an earlier run's, not an end of this
+        one; only one merged at or after its start ends it ok."""
+        start = parse_utc(iso_ago(hours=2))
+        at = lambda **d: (start + dt.timedelta(**d)).strftime("%Y-%m-%dT%H:%M:%SZ")   # noqa: E731
+        row = lambda n, when: {"number": n, "state": "MERGED", "isDraft": False, "mergedAt": when}  # noqa: E731
+        answered = [comment(ME, at(hours=-6), QUESTION), comment(ME, at(minutes=-5), "Use main.")]
+        cases = {   # ticket: (labels, comments, pr rows, expected outcome or None for open)
+            # the revert shape: the old PR merged a day ago, the ticket was reopened needs-input and answered
+            71: (NEEDS_INPUT, answered, [row(171, at(hours=-24))], None),
+            72: (IN_PROGRESS_LABELS, [], [row(172, at(hours=-3))], None),
+            73: (READY, [], [row(173, at(minutes=-1))], None),                       # a minute before the start
+            74: (IN_REVIEW, [], [row(174, at(hours=-30))] + ready_pr(274), None),    # old merged, new one open
+            75: (IN_REVIEW, [], [row(175, at(hours=-30)), row(275, at(minutes=-10))], None),   # two old ones
+            # merged since the start, alone or beside an old one, in either order
+            81: (NEEDS_INPUT, answered, [row(181, at(hours=-24)), row(281, at(minutes=90))], "ok"),
+            82: (IN_REVIEW, [], [row(282, at(minutes=1)), row(182, at(hours=-5))], "ok"),
+            83: (READY, [], [row(183, at(minutes=100))], "ok"),
+        }
+        records = {n: self.cloud_run(n, start.strftime("%Y-%m-%dT%H:%M:%SZ")) for n in cases}
+        self.cloud_scenario([issue(n, labels=c[0], comments=c[1]) for n, c in cases.items()])
+        self.with_prs({records[n]["branch"]: c[2] for n, c in cases.items()})
+        for sweep in (1, 2):
+            rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+            saved = {r["ticket"]: r for r in self.run_records()}
+            for n, (labels, _, prs, outcome) in cases.items():
+                with self.subTest(sweep=sweep, ticket=n, merged=[p.get("mergedAt") for p in prs]):
+                    self.assertEqual((rows[n]["outcome"], saved[n]["outcome"]), (outcome, outcome))
+                    if outcome is None:
+                        self.assertIsNone(saved[n]["ended_at"])
+                        self.assertEqual(rows[n]["state"], f"in the cloud ({records[n]['url']})")
+                    else:
+                        ended = parse_utc(saved[n]["ended_at"])
+                        self.assertTrue(start <= ended <= parse_utc(iso_ago(seconds=-60)), saved[n]["ended_at"])
+                        self.assertEqual(rows[n]["state"], "ended ok")
+        self.assertFalse([c for c in self.gh_calls() if c[:2] == ["issue", "edit"]])
+
     def test_dispatch_keeps_a_cloud_run_live_whatever_its_tickets_label(self):
         """#295: a cloud run whose ticket is not labelled in-progress is still a live run for dispatch, so the
         ticket is not picked up again beside it."""
