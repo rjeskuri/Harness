@@ -661,6 +661,33 @@ class CloudLaunch(CloudTest):
         self.assertTrue(record["url"].startswith(f"https://claude.ai/code/{sid}"), record["url"])
         self.assertIsNone(record["ended_at"])
 
+    def test_a_needs_input_ticket_with_an_owner_answer_after_its_question_launches_in_progress(self):
+        """#295: an answer since the newest needs-input question (harness-board answers) lets the launch go on, and
+        the ticket leaves needs-input for in-progress."""
+        cases = ((12, "session_01Answered_a", [comment(ME, iso_ago(hours=5), "Earlier thought."),
+                                               comment(ME, iso_ago(hours=3), QUESTION),
+                                               comment(ME, iso_ago(hours=1), "Use main.")]),
+                 (40, "session_02Answered-b", [comment(ME, iso_ago(hours=9), QUESTION),
+                                               comment("drive-by-user", iso_ago(hours=8), "Me too"),
+                                               comment(ME, iso_ago(hours=6), QUESTION.replace("Which base?",
+                                                                                              "Which flag?")),
+                                               comment(ME.upper(), iso_ago(minutes=5), "The --fast one.")]))
+        for n, sid, comments in cases:
+            with self.subTest(ticket=n):
+                shutil.rmtree(self.runs_dir(), True)
+                for path in (self.gh_log, self.claude_log):
+                    if os.path.exists(path):
+                        os.unlink(path)
+                self.cloud_scenario([issue(n, labels=NEEDS_INPUT, comments=comments)])
+                p = self.work("cloud", str(n), env=self.env(FAKECLAUDE_CLOUD_ID=sid))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(len(self.cloud_calls()), 1)
+                [record] = self.run_records()
+                self.assertEqual((record["ticket"], record["cloud_id"], record["ended_at"]), (n, sid, None))
+                self.assertIn("status:in-progress", self.added_labels(n))
+                edits = [a for a in self.gh_calls() if a[:3] == ["issue", "edit", str(n)]]
+                self.assertTrue([a for a in edits if "status:in-progress" in a and "status:needs-input" in a], edits)
+
     def test_start_accepts_the_cloud_venue(self):
         self.scenario(issues=[issue()])
         data = self.ok_json("start", "12", "--venue", "cloud", "--json")
@@ -685,6 +712,31 @@ class CloudRefusal(CloudTest):
                 self.cloud_scenario([issue(n, labels=("task", "status:ready", "size:S", "risk:low", "needs-local"))])
                 p = self.work("cloud", str(n))
                 self.assertOneLineError(p, "needs-local", f"/harness:work {n}")
+                self.assertEqual(p.stdout, "")
+                self.assertNothingStarted([])
+
+    def test_a_needs_input_ticket_without_an_answer_since_its_question_is_refused(self):
+        """#295: no owner answer after the newest needs-input question (none at all, only older ones, only the
+        harness's own comments or someone else's) refuses the launch with one line: no worktree, label change,
+        comment, push, cloud session or run record."""
+        q = QUESTION
+        cases = {
+            12: [comment(ME, iso_ago(hours=3), q)],
+            40: [comment(ME, iso_ago(hours=6), "Use main."), comment(ME, iso_ago(hours=3), q)],
+            41: [comment(ME, iso_ago(hours=8), q), comment(ME, iso_ago(hours=7), "Use main."),
+                 comment(ME, iso_ago(hours=2), q.replace("Which base?", "Which flag?"))],
+            # jotform-glow-sync #146: the answer reached the ticket as a harness comment, so it is not an answer
+            42: [comment(ME, iso_ago(hours=3), q),
+                 comment(ME, iso_ago(minutes=20), "Ryan answered in chat: use main." + MARK)],
+            43: [comment(ME, iso_ago(hours=3), q), comment("drive-by-user", iso_ago(hours=1), "Use main.")],
+        }
+        for n, comments in cases.items():
+            with self.subTest(ticket=n):
+                if os.path.exists(self.gh_log):
+                    os.unlink(self.gh_log)
+                self.cloud_scenario([issue(n, labels=NEEDS_INPUT, comments=comments)])
+                p = self.work("cloud", str(n), env=self.env(FAKECLAUDE_CLOUD_ID=f"session_0{n}Refused"))
+                self.assertOneLineError(p, "needs-input", f"#{n}")
                 self.assertEqual(p.stdout, "")
                 self.assertNothingStarted([])
 
@@ -761,6 +813,11 @@ class CloudLaunchFailure(CloudTest):
         self.assertEqual(self.git(self.origin, "for-each-ref", "refs/heads/t"), "")
 
 
+def parse_utc(text):
+    """An ISO-8601 UTC time as the records and comments write it."""
+    return dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+
+
 class CloudSweep(CloudTest):
     def test_the_sweep_closes_a_cloud_run_only_on_a_marker_by_the_gh_user_after_its_start(self):
         two = iso_ago(hours=2)
@@ -773,7 +830,8 @@ class CloudSweep(CloudTest):
             24: (two, IN_PROGRESS_LABELS, "OPEN", [], None, None),
             25: (two, IN_PROGRESS_LABELS, "OPEN", [comment(ME, t[60], "Progress so far.\n" + CLOUD_DONE)], None, None),
             27: (iso_ago(hours=25), IN_PROGRESS_LABELS, "OPEN", [], "unknown", "now"),
-            28: (two, ("task", "status:in-review", "size:S", "risk:low"), "OPEN", [], "ok", "now"),
+            # #295: a label other than in-progress is not an end; only a marker, a closed ticket or a merged PR is
+            28: (two, ("task", "status:in-review", "size:S", "risk:low"), "OPEN", [], None, None),
             29: (two, IN_PROGRESS_LABELS, "CLOSED", [], "ok", "now"),
             31: (two, IN_PROGRESS_LABELS, "OPEN", [comment(ME, t[90], CLOUD_BLOCKED + "\nWhich base?"),
                                                    comment(ME, t[30], CLOUD_DONE + "\nAnswered and done.")],
@@ -804,6 +862,124 @@ class CloudSweep(CloudTest):
                     self.assertEqual(rows[n]["state"], f"ended {outcome}")
         self.assertFalse([c for c in self.gh_calls() if c[:2] == ["issue", "edit"]])   # no needs-input here
         self.assertIn("api: available", self.ok("budget", "status").stdout)
+
+    def with_prs(self, prs):
+        """Put {branch: `gh pr list --head <branch>` rows} ahead of the scenario's empty pr list."""
+        with open(self.scenario_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["calls"][:0] = [{"contains": ["pr", "list", "--head", branch], "stdout_json": rows}
+                             for branch, rows in prs.items()]
+        write(self.scenario_path, json.dumps(data))
+
+    def test_a_status_label_alone_never_ends_a_live_cloud_run(self):
+        """#295: the sweep ends a cloud run `ok` only on a done marker by the gh user after its start, a closed
+        ticket or a merged pull request of its branch; a ticket labelled needs-input, ready, in-review, blocked or
+        with no status, with none of those, keeps its run open (in the cloud), whatever else the ticket holds."""
+        two = iso_ago(hours=2)
+        harness_note = comment(ME, iso_ago(minutes=50), "Started on t/0-x (mac, cloud)" + MARK)
+        merged = lambda n: [{"number": 100 + n, "state": "MERGED", "isDraft": False,   # noqa: E731
+                             "mergedAt": iso_ago(minutes=15)}]
+        cases = {   # ticket: (labels, state, comments, pr rows, expected outcome or None for open)
+            # the jotform-glow-sync #146 shape: needs-input kept, harness comments only, ten minutes in
+            51: (NEEDS_INPUT, "OPEN", [comment(ME, iso_ago(hours=3), QUESTION), harness_note], [], None),
+            52: (READY, "OPEN", [harness_note], [], None),
+            53: (IN_REVIEW, "OPEN", [], ready_pr(153), None),                # a ready PR, not merged
+            54: (IN_REVIEW, "OPEN", [], draft(154), None),
+            55: (BLOCKED_STATUS, "OPEN", [], [], None),
+            56: (NO_STATUS, "OPEN", [comment("drive-by-user", iso_ago(minutes=30), CLOUD_DONE)], [], None),
+            57: (NEEDS_INPUT, "OPEN", [comment(ME, iso_ago(hours=3), CLOUD_DONE)], [], None),   # before its start
+            58: (IN_REVIEW, "OPEN", [{"author": {"login": ME}, "createdAt": iso_ago(minutes=40),
+                                      "body": "Closing in on it.", "url": "u"}], [], None),
+            # the positive ends, under labels that are not in-progress too
+            61: (NEEDS_INPUT, "OPEN", [comment(ME, iso_ago(minutes=40), CLOUD_DONE + "\nDone.")], [], "ok"),
+            62: (READY, "OPEN", [comment(ME, iso_ago(minutes=35), CLOUD_DONE + "\nDone.")], [], "ok"),
+            63: (NEEDS_INPUT, "CLOSED", [], [], "ok"),
+            64: (READY, "CLOSED", [], [], "ok"),
+            65: (IN_PROGRESS_LABELS, "OPEN", [], merged(65), "ok"),
+            66: (IN_REVIEW, "OPEN", [], merged(66), "ok"),
+            67: (NEEDS_INPUT, "OPEN", [], merged(67), "ok"),
+        }
+        records = {n: self.cloud_run(n, two) for n in cases}
+        self.cloud_scenario([issue(n, labels=c[0], state=c[1], comments=c[2]) for n, c in cases.items()])
+        self.with_prs({records[n]["branch"]: c[3] for n, c in cases.items()})
+        rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+        saved = {r["ticket"]: r for r in self.run_records()}
+        start = parse_utc(two)
+        for n, (labels, state, comments, prs, outcome) in cases.items():
+            with self.subTest(ticket=n, labels=labels, state=state):
+                self.assertEqual((rows[n]["outcome"], saved[n]["outcome"]), (outcome, outcome))
+                if outcome is None:
+                    self.assertIsNone(saved[n]["ended_at"])
+                    self.assertEqual(rows[n]["state"], f"in the cloud ({records[n]['url']})")
+                else:
+                    ended = parse_utc(saved[n]["ended_at"])
+                    self.assertTrue(start <= ended <= parse_utc(iso_ago(seconds=-60)), saved[n]["ended_at"])
+                    self.assertEqual(rows[n]["state"], "ended ok")
+        for n in (61, 62):
+            self.assertEqual(saved[n]["ended_at"], cases[n][2][0]["createdAt"])     # at the marker's time
+        self.assertFalse([c for c in self.gh_calls() if c[:2] == ["issue", "edit"]])
+
+        # a second sweep, as ten minutes later on #146, still leaves the open ones open
+        self.ok_json("runs", "--sweep", "--json")
+        saved = {r["ticket"]: r for r in self.run_records()}
+        for n, c in cases.items():
+            with self.subTest(again=n):
+                self.assertEqual(saved[n]["outcome"], c[4])
+                self.assertEqual(saved[n]["ended_at"] is None, c[4] is None)
+
+    def test_only_a_pr_merged_since_the_runs_start_ends_it(self):
+        """#295: branch names are reused (a reverted ticket, answered, starts a new cloud run on the same t/<n>-x),
+        so a pull request of the branch that merged before the run started is an earlier run's, not an end of this
+        one; only one merged at or after its start ends it ok."""
+        start = parse_utc(iso_ago(hours=2))
+        at = lambda **d: (start + dt.timedelta(**d)).strftime("%Y-%m-%dT%H:%M:%SZ")   # noqa: E731
+        row = lambda n, when: {"number": n, "state": "MERGED", "isDraft": False, "mergedAt": when}  # noqa: E731
+        answered = [comment(ME, at(hours=-6), QUESTION), comment(ME, at(minutes=-5), "Use main.")]
+        cases = {   # ticket: (labels, comments, pr rows, expected outcome or None for open)
+            # the revert shape: the old PR merged a day ago, the ticket was reopened needs-input and answered
+            71: (NEEDS_INPUT, answered, [row(171, at(hours=-24))], None),
+            72: (IN_PROGRESS_LABELS, [], [row(172, at(hours=-3))], None),
+            73: (READY, [], [row(173, at(minutes=-1))], None),                       # a minute before the start
+            74: (IN_REVIEW, [], [row(174, at(hours=-30))] + ready_pr(274), None),    # old merged, new one open
+            75: (IN_REVIEW, [], [row(175, at(hours=-30)), row(275, at(minutes=-10))], None),   # two old ones
+            # merged since the start, alone or beside an old one, in either order
+            81: (NEEDS_INPUT, answered, [row(181, at(hours=-24)), row(281, at(minutes=90))], "ok"),
+            82: (IN_REVIEW, [], [row(282, at(minutes=1)), row(182, at(hours=-5))], "ok"),
+            83: (READY, [], [row(183, at(minutes=100))], "ok"),
+        }
+        records = {n: self.cloud_run(n, start.strftime("%Y-%m-%dT%H:%M:%SZ")) for n in cases}
+        self.cloud_scenario([issue(n, labels=c[0], comments=c[1]) for n, c in cases.items()])
+        self.with_prs({records[n]["branch"]: c[2] for n, c in cases.items()})
+        for sweep in (1, 2):
+            rows = {r["ticket"]: r for r in self.ok_json("runs", "--sweep", "--json")}
+            saved = {r["ticket"]: r for r in self.run_records()}
+            for n, (labels, _, prs, outcome) in cases.items():
+                with self.subTest(sweep=sweep, ticket=n, merged=[p.get("mergedAt") for p in prs]):
+                    self.assertEqual((rows[n]["outcome"], saved[n]["outcome"]), (outcome, outcome))
+                    if outcome is None:
+                        self.assertIsNone(saved[n]["ended_at"])
+                        self.assertEqual(rows[n]["state"], f"in the cloud ({records[n]['url']})")
+                    else:
+                        ended = parse_utc(saved[n]["ended_at"])
+                        self.assertTrue(start <= ended <= parse_utc(iso_ago(seconds=-60)), saved[n]["ended_at"])
+                        self.assertEqual(rows[n]["state"], "ended ok")
+        self.assertFalse([c for c in self.gh_calls() if c[:2] == ["issue", "edit"]])
+
+    def test_dispatch_keeps_a_cloud_run_live_whatever_its_tickets_label(self):
+        """#295: a cloud run whose ticket is not labelled in-progress is still a live run for dispatch, so the
+        ticket is not picked up again beside it."""
+        for n, labels in ((12, NEEDS_INPUT), (13, READY)):
+            with self.subTest(ticket=n):
+                shutil.rmtree(self.runs_dir(), True)
+                record = self.cloud_run(n, iso_ago(minutes=10))
+                self.cloud_scenario([issue(n, labels=labels, comments=[comment(ME, iso_ago(hours=1), QUESTION)]),
+                                     issue(14, title="Next")],
+                                    ready=[ready_row(n), ready_row(14, "Next")])
+                data = self.ok_json("dispatch", "--dry-run", "--json")
+                self.assertEqual([r["number"] for r in data["plan"]], [14])
+                self.assertEqual(data["live"], [record["id"]])
+                [saved] = self.run_records()
+                self.assertIsNone(saved["ended_at"])
 
     def test_a_blocked_marker_ends_the_run_blocked_and_asks_the_owner(self):
         two = iso_ago(hours=2)
