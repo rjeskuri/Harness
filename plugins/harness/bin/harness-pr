@@ -2,7 +2,7 @@
 """
 Pull requests for tickets: open a draft PR from a ticket worktree, post the reviewer's findings inline, wait on
 the checks, mark it ready, read the comments, list the PRs awaiting the user, run ultrareview, and land it
-(squash merge, then the worktree, the branch, the main checkout and the ticket).
+(squash merge, then the worktree, the branch, the main checkout, the ticket and the project's canary).
 
 Usage:
     harness-pr open N [--worktree PATH] [--verify-log F] [--review F] [--notes F] [--json]
@@ -21,7 +21,12 @@ Usage:
 revert undoes a landed PR on main through the main checkout (on main, no tracked changes, no commit origin/main lacks
 but this revert; fetched and fast-forwarded first): `git revert --no-edit` of its merge commit and `git push origin main` (a rejected push gets one
 `git pull --rebase`), an incident bug under the ticket's epic, the ticket reopened as needs-input, a notification.
-A step an earlier run did is skipped. autoland calls revert_landed() in-process; the work loop never runs it.
+A step an earlier run did is skipped. autoland, and land after a failed canary, call revert_landed() in-process.
+
+land, once it has pulled the main checkout, runs that checkout's scripts/smoke.sh there when it is an executable
+file, under HARNESS_SMOKE_TIMEOUT seconds (the environment, else the main checkout's .claude/settings.json `env`, else
+300), its whole process group killed at the limit. Exit 0 lands as before; 2 or the limit is one warning and a
+comment on each ticket; any other exit reverts the merge (revert_landed) and the land exits 1 naming the revert.
 
 ready refuses a PR whose latest harness review (the newest review carrying the harness marker) has high or
 medium findings and no commit newer than it, naming those findings, and refuses when gh cannot tell. land judges
@@ -66,9 +71,11 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -91,6 +98,7 @@ try:
     from harness_lib.routing import load_routing
     from harness_lib.reviews import (add_rulings, add_ticket, finding_key, latest_round, load_rounds, load_tickets,
                                      reviews_dir, save_round)
+    from harness_lib.settings import setting, settings_env
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -143,6 +151,8 @@ INCIDENT = "incident"
 NEEDS_INPUT = "**Needs your input**"     # harness-board's needs-input comments start with it
 DEFAULT_REASON = "no reason given"
 EVIDENCE_TAIL_LINES = 40
+SMOKE = "scripts/smoke.sh"   # the project's canary, run in the main checkout after a land
+SMOKE_TIMEOUT = 300.0        # seconds it may take (HARNESS_SMOKE_TIMEOUT)
 
 
 def plural(n, word):
@@ -1732,6 +1742,97 @@ def land_gate(repo, number, view, accept):
     warn("harness-pr", said + "; landing it (--accept-findings)")
 
 
+def smoke_limit(main):
+    """HARNESS_SMOKE_TIMEOUT in seconds: the environment, else `env` in the main checkout's .claude/settings.json
+    (never the cwd's: a land may run from the ticket worktree it removes), else 300. A value that is not a positive
+    finite number is one warning and the default."""
+    raw = setting("HARNESS_SMOKE_TIMEOUT", settings_env(main, ("settings.json",)))
+    if raw is None:
+        return SMOKE_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if value > 0 and math.isfinite(value):
+        return value
+    warn("harness-pr", f"HARNESS_SMOKE_TIMEOUT={raw!r} is not a positive number of seconds; using {SMOKE_TIMEOUT:g}")
+    return SMOKE_TIMEOUT
+
+
+def run_canary(main, limit):
+    """Run the main checkout's scripts/smoke.sh there when it is an executable file: stdin closed, stdout and stderr
+    together into a temporary file (so a child left holding them cannot keep the land waiting), in a session of its
+    own so that past `limit` seconds its whole process group, children too, is killed. (verdict, what it did, its
+    output): `healthy` for exit 0, `degraded` for exit 2 or the limit, `failed` for any other exit or a script that
+    cannot be started. None when there is no executable script."""
+    path = os.path.join(main, SMOKE)
+    if not os.path.isfile(path) or not os.access(path, os.X_OK):
+        return None
+    with tempfile.TemporaryFile() as out:
+        try:
+            proc = subprocess.Popen([path], cwd=main, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        except OSError as err:
+            return "failed", f"could not be started ({err.strerror or err})", ""
+        try:
+            code = proc.wait(timeout=limit)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+            code = None
+        out.seek(0)
+        output = out.read().decode("utf-8", "replace")
+    if code is None:
+        return "degraded", f"ran past its {limit:g} s time limit and was stopped", output
+    said = f"exited {code}" if code >= 0 else f"was killed by signal {-code}"
+    return ("healthy" if code == 0 else "degraded" if code == 2 else "failed"), said, output
+
+
+def land_canary(repo, number, sha, tickets):
+    """The canary after a land that pulled the main checkout (run_canary): healthy changes nothing; degraded is one
+    warning and a comment on each ticket, nothing reverted; failed reverts the merge `sha` on main as `revert` does
+    (revert_landed, the canary's output as the evidence). (summary lines, problems): a revert is a problem, so the
+    land exits 1 naming it."""
+    ran = run_canary(repo.main, smoke_limit(repo.main))
+    if ran is None:
+        return [], []
+    verdict, said, output = ran
+    if verdict == "healthy":
+        return [f"Canary: {SMOKE} {said}."], []
+    if verdict == "degraded":
+        warn("harness-pr", f"{SMOKE} {said} after PR #{number} landed: degraded, nothing reverted")
+        landed = f"landed in {sha[:7]}" if sha else "landed"
+        body = f"`{SMOKE}` {said} in the main checkout after PR #{number} {landed}: degraded, nothing reverted."
+        shown = tail(output, EVIDENCE_TAIL_LINES)
+        if shown:
+            body += f"\n\n```\n{fence_safe(shown)}\n```"
+        problems = []
+        for n in tickets:
+            try:
+                board(repo, "comment", str(n), "--body", body)
+            except Problem as err:
+                problems.append(f"ticket #{n}: the canary comment failed: {err}")
+        return [f"Canary: {SMOKE} {said}: degraded, nothing reverted."], problems
+    if not sha:
+        return ([f"Canary: {SMOKE} {said}; nothing reverted."],
+                [f"{SMOKE} {said}, but the merge commit is unknown, so nothing was reverted; "
+                 f"harness-pr revert {number}"])
+    try:
+        result = revert_landed(repo, sha, f"{SMOKE} {said} in the main checkout after the land", output or None)
+    except Problem as err:
+        return ([f"Canary: {SMOKE} {said}; the revert failed."],
+                [f"{SMOKE} {said}, and reverting {sha[:7]} failed: {err}; harness-pr revert {number} once that is "
+                 "fixed"])
+    revert, ticket = result["revert"], result["ticket"]
+    asked = f", ticket #{ticket} needs input" if ticket else ""
+    return ([f"Canary: {SMOKE} {said}, so the land was reverted:"] + [f"  {line}" for line in result["summary"]],
+            [f"{SMOKE} {said} in the main checkout, so the merge was reverted in {revert[:7]} "
+             f"(bug #{result['bug']}{asked})"])
+
+
 def cmd_land(args):
     """Merge and clean up; on a PR that is already merged (an earlier land stopped at a dirty worktree, or it
     was merged on GitHub), skip the preconditions and the merge and finish the cleanup."""
@@ -1812,6 +1913,7 @@ def cmd_land(args):
         problems.append(f"git fetch --prune failed: {last_line(fetched.stderr)}")
     on = current_branch(main)
     cleaned = []
+    pulled_main = False                       # the main checkout now holds the landed content: the canary runs
     if on == "main":
         # what the pull brings in: main's upstream after the fetch, else the merge commit; no sha, no comparison
         identical, blocking, restored = [], [], None
@@ -1837,6 +1939,7 @@ def cmd_land(args):
             pulled = git(main, "pull", "--ff-only", timeout=PUSH_TIMEOUT)
             if pulled.returncode != 0:
                 problems.append(f"git pull --ff-only failed: {last_line(pulled.stderr)}")
+            pulled_main = pulled.returncode == 0
             main_line = "fetched and fast-forwarded main" if pulled.returncode == 0 else "fetched; main not pulled"
     else:
         main_line = f"fetched; on {on or 'a detached HEAD'}, so main was not pulled"
@@ -1871,6 +1974,10 @@ def cmd_land(args):
         if error:
             problems.append(f"ticket #{n}: {error}")
     summary.append("Ticket: " + ("; ".join(ticket_lines) if ticket_lines else "none linked") + ".")
+    if pulled_main:                           # after the ticket steps: a revert reopens the ticket they closed
+        lines, trouble = land_canary(repo, number, sha, tickets)
+        summary.extend(lines)
+        problems.extend(trouble)
     print("\n".join(summary))
     if problems:
         sys.stdout.flush()
