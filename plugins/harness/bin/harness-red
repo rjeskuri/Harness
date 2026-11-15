@@ -16,7 +16,8 @@ Usage:
                                              # (no tests ran, or they failed to load: refused, nothing recorded)
     harness-red reprove [--base origin/main] # check for a branch that has source: its test files as they are now,
                                              # run against main's code at the merge base in a temporary worktree;
-                                             # only red replaces the record (green or no proof: refused, kept)
+                                             # only red writes the record, with or without an earlier one
+                                             # (green or no proof: refused, nothing recorded)
     harness-red status                       # the record for this branch, and current: yes|no
     harness-red files [--base origin/main]   # the branch's own test files: its changed runnable tests, plus the
                                              # test modules each other changed path names or HARNESS_TEST_MAP adds
@@ -590,12 +591,12 @@ def cmd_check(repo, args):
 
 def cmd_reprove(repo, args):
     """check for a branch that already has source: the branch's test files as they are now, run against main's
-    code at the merge base in a temporary detached worktree. Only a red run replaces the record."""
+    code at the merge base in a temporary detached worktree. Only a red run writes the record; it needs no earlier
+    one (a branch brought home from a cloud session has none) and ignores a corrupt one."""
     note = no_tests_message(repo)
     if note:
         print_no_tests(note, args.json)
         return 0
-    load_record(repo)                              # it re-proves a red run; without one, check comes first
     merge_base, changed, tests = test_changes(repo, args.base)
     run_files = runnable(tests)
     contents = read_files(repo.top, tests)
@@ -621,13 +622,13 @@ def cmd_reprove(repo, args):
     if code == 0:
         print_refused(args, "green", tests, cmd, code, output)
         raise Problem(f"Tests pass against main's code at the merge base {merge_base[:12]}: they prove nothing; "
-                      "the red record is kept.")
+                      "no red run recorded.")
     missing = environment_dependencies(repo, output)
     if missing:
         print_refused(args, "cannot import " + ", ".join(m for m, _ in missing), tests, cmd, code, output)
         raise Problem(f"The run against main's code could not import {', '.join(m for m, _ in missing)}, which "
                       f"this worktree has untracked or ignored ({missing[0][1]}) and the temporary worktree lacks: "
-                      "it proves nothing; the red record is kept. Point HARNESS_TEST_CMD at that environment by "
+                      "it proves nothing; no red run recorded. Point HARNESS_TEST_CMD at that environment by "
                       "absolute path, then run harness-red reprove again.")
     save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output)
     return 0
