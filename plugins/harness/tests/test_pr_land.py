@@ -9,19 +9,205 @@ from __future__ import annotations
 
 import unittest
 
+import pr_support
 from pr_support import *  # noqa: F401,F403
+
+# ------------------------------------------------------------------ the land fixtures of the head checks (#337)
+# pr_support.py counts as source to the tests-first hook, so the fixtures the head checks need live here and shadow
+# pr_support's names in this module.
+# What `land` reads of the PR before merging; headRefOid is the head the checks judge.
+LAND_FIELDS = "isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state"
+# The PR's head in the fake-only land fixtures: the commit pr_support's harness reviews are of, so by default the
+# latest harness review is at the head.
+HEAD_SHA = harness_review(1, at(1))[0]["commit_id"]
+
+
+def land_view(**over):
+    """pr_support's land view with the head's sha: HEAD_SHA unless `over` names another."""
+    return pr_support.land_view(**dict({"headRefOid": HEAD_SHA}, **over))
+
+
+def compare_calls(head, behind):
+    """fakegh entries for `gh api repos/o/r/compare/main...<head>`: `behind` commits of main the head lacks. Only the
+    head's sha is answered (asked by the branch name, the fake has no answer), through `--jq .behind_by` or as the
+    whole comparison."""
+    endpoint = f"repos/o/r/compare/main...{head}"
+    return [{"contains": ["api", endpoint, "--jq"], "stdout": f"{behind}\n"},
+            {"contains": ["api", endpoint], "stdout_json": {"behind_by": behind, "ahead_by": 1,
+                                                            "status": "diverged" if behind else "ahead"}}]
+
+
+def gate_calls(reviews=(), commits=(), pull=PULL, head=HEAD_SHA, behind=0):
+    """pr_support's gate reads (the reviews, their inline comments, the PR's commits), after the compare of main with
+    `head` and the authenticated account (the one the harness reviews are by, should the land judge reviews by it as
+    `harness-pr gate` does)."""
+    return compare_calls(head, behind) + [
+        {"match": ["api", "user"], "contains": ["--jq"], "stdout": "rjeskuri\n"},
+        {"match": ["api", "user"], "stdout_json": {"login": "rjeskuri", "type": "User"}},
+    ] + pr_support.gate_calls(reviews, commits, pull)
+
+
+def compare_failure(head=HEAD_SHA):
+    """The compare of main with `head` failing; placed first in a scenario so it wins."""
+    return gate_failure({"contains": ["api", f"repos/o/r/compare/main...{head}"]})
+
+
+def review_of(sha, *inline, when=None):
+    """The latest harness review (review, its inline comments), of commit `sha`, at(10) unless `when`, with these
+    inline findings; none gives `Harness review: no findings.`"""
+    review, comments = harness_review(101, when or at(10), inline=inline)
+    return dict(review, commit_id=sha), comments
+
+
+class BranchHistory:
+    """Real history on the ticket branch, for the land checks that read git in the main checkout (a WorktreeTest
+    mixin): the branch pushed to the bare origin; origin's main moved on from a second clone, as other PRs landing
+    move it; main merged into the branch in the ticket worktree (`git merge origin/main` after a fetch, as a session
+    updating its branch does), cleanly or not; and the PR's commits as GitHub's commits endpoint lists them."""
+
+    def branch_head(self):
+        return self.git(self.wt, "rev-parse", "HEAD")
+
+    def push_branch(self):
+        """Push the worktree's HEAD to origin's ticket branch (forced: a reset rewrites it); the head's sha."""
+        self.git(self.wt, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
+        self.git(self.wt, "fetch", "-q", "origin")
+        return self.branch_head()
+
+    def elsewhere(self):
+        """The second clone of origin, on main and up to date."""
+        clone = os.path.join(self.tmp, "elsewhere")
+        if not os.path.isdir(clone):
+            subprocess.run([GIT, "clone", "-q", self.origin, clone], env=self.env(), check=True, capture_output=True)
+        self.git(clone, "switch", "-q", "main")
+        self.git(clone, "pull", "-q", "--ff-only")
+        return clone
+
+    def advance_main(self, n=1):
+        """`n` new commits on origin's main, the k-th move adding elsewhere/change_<k>.py (`CHANGE = <k>`), fetched
+        into the shared repository (the worktree's and the main checkout's origin/main); origin/main's new sha."""
+        self.moves = getattr(self, "moves", 0)
+        for _ in range(n):
+            self.moves += 1
+            self.main_commit({f"elsewhere/change_{self.moves}.py": f"CHANGE = {self.moves}\n"},
+                             f"Another PR lands ({self.moves})")
+        return self.git(self.wt, "rev-parse", "origin/main")
+
+    def main_commit(self, files, message):
+        """One commit of `files` (path: text) on origin's main, fetched into the shared repository; its sha."""
+        clone = self.elsewhere()
+        for path, text in files.items():
+            write(os.path.join(clone, path), text)
+        self.git(clone, "add", "-A")
+        self.git(clone, "commit", "-q", "-m", message)
+        self.git(clone, "push", "-q", "origin", "main")
+        self.git(self.wt, "fetch", "-q", "origin")
+        return self.git(self.wt, "rev-parse", "origin/main")
+
+    def merge_main(self):
+        """Merge origin/main into the ticket branch, changing nothing else; pushed; the merge's sha."""
+        self.git(self.wt, "fetch", "-q", "origin")
+        self.git(self.wt, "merge", "-q", "--no-ff", "--no-edit", "origin/main")
+        return self.push_branch()
+
+    def evil_merge(self, path="widget.py", text="def frob():\n    return 99  # never reviewed\n"):
+        """Merge origin/main with `path` written as `text` in the merge commit (a change of the branch's own folded
+        into it); pushed; its sha."""
+        self.git(self.wt, "fetch", "-q", "origin")
+        self.git(self.wt, "merge", "-q", "--no-ff", "--no-commit", "origin/main")
+        write(os.path.join(self.wt, path), text)
+        self.git(self.wt, "add", "-A")
+        self.git(self.wt, "commit", "-q", "--no-edit")
+        return self.push_branch()
+
+    def conflict_merge(self, resolution):
+        """Merge origin/main, which conflicts, resolved by hand as `resolution` (path: text); pushed; its sha."""
+        self.git(self.wt, "fetch", "-q", "origin")
+        merge = subprocess.run([GIT, "-C", self.wt, "-c", "commit.gpgsign=false", "merge", "-q", "--no-ff",
+                                "--no-edit", "origin/main"], env=self.env(), capture_output=True, text=True)
+        self.assertNotEqual(merge.returncode, 0, "the fixture should conflict with main")
+        for path, text in resolution.items():
+            write(os.path.join(self.wt, path), text)
+        self.git(self.wt, "add", "-A")
+        self.git(self.wt, "commit", "-q", "--no-edit")
+        return self.push_branch()
+
+    def rebase_onto_main(self):
+        """The branch rebased onto origin/main: the same changes, new commits on main's tip; pushed; the head."""
+        self.git(self.wt, "fetch", "-q", "origin")
+        self.git(self.wt, "rebase", "-q", "origin/main")
+        return self.push_branch()
+
+    def merge_into_main(self, sha):
+        """The branch as origin/main with `sha` merged into it: main the first parent, `sha` the second; pushed."""
+        self.git(self.wt, "fetch", "-q", "origin")
+        self.git(self.wt, "reset", "-q", "--hard", "origin/main")
+        self.git(self.wt, "merge", "-q", "--no-ff", "--no-edit", sha)
+        return self.push_branch()
+
+    def revert_head(self):
+        """`git revert` of the branch's head commit; pushed; the revert's sha."""
+        self.git(self.wt, "revert", "--no-edit", "HEAD")
+        return self.push_branch()
+
+    def tree(self, sha):
+        return self.git(self.wt, "rev-parse", f"{sha}^{{tree}}")
+
+    def merged_tree(self, sha):
+        """The tree of a clean merge of origin/main into `sha`, as git merge-tree makes it."""
+        return self.git(self.wt, "merge-tree", "--write-tree", sha, "origin/main").splitlines()[0]
+
+    def side_merge(self):
+        """Merge a branch that is not main (a commit origin/main never had) into the ticket branch; pushed; its sha."""
+        clone = self.elsewhere()
+        self.git(clone, "switch", "-q", "-C", "side")
+        write(os.path.join(clone, "side.py"), "SIDE = 1\n")
+        self.git(clone, "add", "-A")
+        self.git(clone, "commit", "-q", "-m", "A side branch, never on main")
+        self.git(clone, "push", "-q", "-f", "origin", "side")
+        self.git(clone, "switch", "-q", "main")
+        self.git(self.wt, "fetch", "-q", "origin")
+        self.git(self.wt, "merge", "-q", "--no-ff", "--no-edit", "origin/side")
+        return self.push_branch()
+
+    def plain_commit(self, text="def frob():\n    return 3\n", path="widget.py"):
+        """An ordinary (one-parent) commit on the ticket branch writing `path` as `text`; pushed; its sha."""
+        write(os.path.join(self.wt, path), text)
+        self.git(self.wt, "add", "-A")
+        self.git(self.wt, "commit", "-q", "-m", "Not reviewed")
+        return self.push_branch()
+
+    def reset_to(self, sha):
+        self.git(self.wt, "reset", "-q", "--hard", sha)
+        return self.push_branch()
+
+    def pr_commits(self, reviewed):
+        """The PR's commits as GitHub lists them (origin/main..head, oldest first, with their parents): the reviewed
+        commit and its ancestors dated at(9), before the review at(10); every later one at(11), after it."""
+        out = self.git(self.wt, "rev-list", "--reverse", "--parents", "origin/main..HEAD")
+        before = set(self.git(self.wt, "rev-list", reviewed).split())
+        commits = []
+        for line in out.splitlines():
+            sha, *parents = line.split()
+            when = at(9) if sha in before else at(11)
+            commits.append({"sha": sha, "parents": [{"sha": p} for p in parents],
+                            "commit": {"message": f"Commit {sha[:7]}", "author": {"name": "Test", "date": when},
+                                       "committer": {"name": "Test", "date": when}}})
+        return commits
 
 
 class Land(WorktreeTest):
-    def land_calls(self, views=None, issue_state="OPEN", comments=(), reviews=(), commits=None):
+    def land_calls(self, views=None, issue_state="OPEN", comments=(), reviews=(), commits=None, head=HEAD_SHA,
+                   behind=0):
         """The land conversation: the review gate's reads first (no harness review by default, so the gate
-        passes), then the land; the last entries answer the PR's body and files, the ticket's other fields and a
-        comment posted straight through gh, so the land may read and post the Resolution either way."""
-        views = views or [land_view()]
+        passes; `head` and `behind` the compare of main with the head), then the land; the last entries answer the
+        PR's body and files, the ticket's other fields and a comment posted straight through gh, so the land may
+        read and post the Resolution either way."""
+        views = views or [land_view(headRefOid=head)]
         commits = [pr_commit("a", at(9))] if commits is None else commits
         issue = {"state": issue_state, "labels": [{"name": "task"}, {"name": "status:in-review"}],
                  "comments": list(comments)}
-        return gate_calls(reviews, commits) + [
+        return gate_calls(reviews, commits, head=head, behind=behind) + [
                 {"match": ["pr", "view", "34", "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": SHA}}},
                 {"match": ["pr", "view", "34", "--json", LAND_FIELDS],
                  "responses": [{"stdout_json": v} for v in views]},
@@ -1062,7 +1248,9 @@ class LandResolution(Land):
         self.assertLess(index, landed[0][0], "the Resolution goes before Landed in")
 
 
-class LandRefusals(PrTest):
+class LandRefusals(WorktreeTest):
+    """A real origin (WorktreeTest), so a land that fetches before its checks can."""
+
     def test_land_refuses_before_merging(self):
         cases = [("draft", land_view(isDraft=True), "is a draft"),
                  ("conflicting", land_view(mergeable="CONFLICTING"), "conflicts with main"),
@@ -1082,8 +1270,9 @@ class LandRefusals(PrTest):
 
 
 class LandGate(GateAsserts, WorktreeTest):
-    """`harness-pr land P` refuses a PR whose latest harness review has findings and no commit after it, unless
-    --accept-findings; it lands the PR when a commit is newer, the latest harness review is clean, or there is none."""
+    """`harness-pr land P` refuses a PR whose latest harness review, at the head (HEAD_SHA here), has high or medium
+    findings, unless --accept-findings; it lands the PR when that review is clean or has only low findings, or there
+    is no harness review. A review of another commit than the head: LandAtHead."""
 
     def setUp(self):
         super().setUp()
@@ -1147,8 +1336,8 @@ class LandGate(GateAsserts, WorktreeTest):
         p, _, _ = self.land_case(proceeds)
         self.assertLanded(p)
 
-    def test_land_proceeds_when_a_commit_is_newer_than_the_findings(self):
-        self.assertTwins("findings and no commit since", "a commit after the findings")
+    # #337 (R4): a commit after a review with findings no longer lets the land through by its date; the review must
+    # cover the head (LandAtHead.test_a_review_of_an_earlier_commit_than_the_head_is_refused).
 
     def test_land_proceeds_when_the_latest_harness_review_is_clean(self):
         self.assertTwins("an older clean review, the latest with findings (listed newest first)",
@@ -1164,14 +1353,18 @@ class LandGate(GateAsserts, WorktreeTest):
         self.assertLanded(p)
 
     def failing_land(self, failing, *flags):
-        # The PR would land (a commit after the findings), so only the failed read can refuse it.
-        reviews, commits, named, _ = GATE_CASES["a commit after the findings"]
+        # The PR would land (the latest harness review at the head, with only low findings, so its inline comments
+        # are read), so only the failed read can refuse it.
+        reviews, commits, named, _ = GATE_CASES["only low findings and no commit since"]
         self.assertIsNone(named)
         self.scenario([failing] + Land.land_calls(self, reviews=reviews, commits=commits))
         return self.pr("land", "34", *flags, cwd=self.main)
 
     def test_land_fails_closed_when_a_gate_read_fails(self):
-        for what, failing in GATE_READ_FAILURES.items():
+        # The compare of main with the head is a read of the gate now (#337). The PR's commits are not needed for a
+        # review at the head; LandAtHead fails closed on them where they are.
+        failures = dict({k: v for k, v in GATE_READ_FAILURES.items() if k != "commits"}, compare=compare_failure())
+        for what, failing in failures.items():
             with self.subTest(what):
                 p = self.failing_land(failing)
                 self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
@@ -1183,17 +1376,273 @@ class LandGate(GateAsserts, WorktreeTest):
                 self.assertTrue(os.path.isdir(self.wt))
                 self.assertTrue(self.branch_exists())
 
-    def test_accept_findings_lands_through_a_failed_gate_read_with_a_warning(self):
-        # gh repo view is left out: the merge itself needs the repository's name, so no flag can land without it.
-        for i, (what, failing) in enumerate(GATE_API_FAILURES.items()):
-            with self.subTest(what):
-                if i:
-                    self.setUp()                                  # a fresh repository and worktree for each case
-                self.assertNotEqual(self.failing_land(failing).returncode, 0)          # refused without the flag
-                self.assertTrue(os.path.isdir(self.wt))
-                p = self.failing_land(failing, "--accept-findings")
-                self.assertLanded(p)
-                self.assertIn(GATE_FAILURE_TEXT, p.stderr)                           # the warning names the failure
+    def test_accept_findings_lands_through_a_failed_findings_read_with_a_warning(self):
+        # #337 (R3): only a read the findings alone need, the review's inline comments. A read the head checks need
+        # (the reviews, the PR's commits, the compare of main with the head) refuses whatever the flags (LandAtHead),
+        # and gh repo view too: the merge itself needs the repository's name.
+        failing = GATE_API_FAILURES["review comments"]
+        self.assertNotEqual(self.failing_land(failing).returncode, 0)          # refused without the flag
+        self.assertTrue(os.path.isdir(self.wt))
+        p = self.failing_land(failing, "--accept-findings")
+        self.assertLanded(p)
+        self.assertIn(GATE_FAILURE_TEXT, p.stderr)                           # the warning names the failure
+
+
+class LandAtHead(GateAsserts, BranchHistory, WorktreeTest):
+    """#337: before merging, `land` checks that the PR's CI and its latest harness review cover the head being merged
+    with today's main: the head not behind main (the compare of main with the head's sha answers behind_by 0), the
+    review at the head (of the head itself, or of a commit the head adds only clean merges of main to: real commits
+    here, judged by git in the main checkout), and green checks at the head. A refusal merges nothing and leaves the
+    worktree, the branch and the ticket as they were; --accept-findings skips none of these checks."""
+
+    def setUp(self):
+        super().setUp()
+        self.outputs(**{"harness-board": {"epic-check": {"stdout": EPIC_SAID}}})
+        write(self.state_path("tickets", "12.json"),
+              json.dumps({"number": 12, "parent": {"number": 3, "title": "Widgets", "goal": ""}}))
+        self.reviewed = self.push_branch()               # the commit the harness review is of, unless a case says
+
+    def land(self, *flags, review="clean", behind=0, checks=None, mergeable="MERGEABLE", first=()):
+        """`harness-pr land 34` at the branch's head as origin has it now. `review`: the latest harness review (a
+        review_of pair), None for no harness review, "clean" for one without findings of self.reviewed; `behind` what
+        the compare of main with the head answers; `checks` the head's statusCheckRollup (green by default); `first`
+        fakegh entries ahead of the rest (a failing read, or an answer about another commit)."""
+        head = self.branch_head()
+        if review == "clean":
+            review = review_of(self.reviewed)
+        view = land_view(headRefOid=head, mergeable=mergeable, statusCheckRollup=GREEN if checks is None else checks)
+        self.scenario(list(first) + Land.land_calls(self, views=[view], reviews=[review] if review else [],
+                                                    commits=self.pr_commits(self.reviewed), head=head, behind=behind))
+        return self.pr("land", "34", *flags, cwd=self.main)
+
+    def assertRefused(self, p, *needles):
+        """Refused before the merge, naming each needle: exit 1, no gh pr merge, no harness-board call, the worktree
+        and the branch kept."""
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        for needle in needles:
+            self.assertIn(needle, p.stderr)
+        self.assertFalse([a for a in self.gh_argv() if a[:2] == ["pr", "merge"]], self.gh_argv())
+        self.assertEqual(self.stub_calls("harness-board"), [])
+        self.assertFalse(any("worktree remove" in line or "branch -D" in line for line in self.order()))
+        self.assertTrue(os.path.isdir(self.wt))
+        self.assertTrue(Land.branch_exists(self))
+
+    def assertLanded(self, p):
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn(["pr", "merge", "34", "-R", "o/r", "--squash", "--delete-branch"], self.gh_argv())
+        self.assertFalse(os.path.exists(self.wt))
+        self.assertIn(["close", "12", "--repo", self.main], self.stub_calls("harness-board"))
+
+    # ------------------------------------------------------------------ behind main
+    def test_a_head_behind_main_is_refused_and_lands_once_main_is_merged_in_and_green(self):
+        """Reviewed at the head and green, but main has two commits the head lacks: refused (`behind main by 2`),
+        --accept-findings or not. Main merged in: refused while the checks at the new head run or fail, landed once
+        they pass. The compare of main with the reviewed commit still answers 2, so asking about anything but the
+        new head refuses."""
+        self.advance_main(2)
+        for flags in ((), ("--accept-findings",)):
+            with self.subTest("behind main by 2", flags=flags):
+                self.assertRefused(self.land(*flags, behind=2), "behind main by 2")
+        merged = self.merge_main()
+        self.assertNotEqual(merged, self.reviewed)
+        stale = compare_calls(self.reviewed, 2)
+        with self.subTest("main merged in, the checks at the new head still running"):
+            self.assertRefused(self.land(checks=PENDING, first=stale), "still running")
+        with self.subTest("main merged in, a check failed at the new head"):
+            self.assertRefused(self.land(checks=[check_run("test", conclusion="FAILURE"), check_run("lint")],
+                                         first=stale), "checks are red")
+        with self.subTest("main merged in and green at the new head"):
+            self.assertLanded(self.land(first=stale))
+
+    def test_the_refusal_says_how_far_behind_main_the_head_is(self):
+        """Main moves on by 1, then 2, then 4 more commits; each time the land is refused with the count the compare
+        gives, with the review at the head and with no harness review at all (that proceeds only past the review
+        rule)."""
+        total = 0
+        for n, review in ((1, "clean"), (2, None), (4, "clean")):
+            total += n
+            self.advance_main(n)
+            with self.subTest(behind=total, review=review):
+                self.assertRefused(self.land(review=review, behind=total), f"behind main by {total}")
+
+    # ------------------------------------------------------------------ the review at the head
+    def test_a_review_of_an_earlier_commit_than_the_head_is_refused(self):
+        """The latest harness review is of the reviewed commit and the head adds an ordinary commit to it: refused,
+        naming the review's and the head's short shas, whatever the review found and with --accept-findings too (R4:
+        a commit dated after a review with findings no longer counts as addressing them). Re-reviewed at the head,
+        the same PR lands."""
+        head = self.plain_commit()
+        for name, review in (("a clean review", review_of(self.reviewed)),
+                             ("a review with a high finding", review_of(self.reviewed, FROBS)),
+                             ("a review with only a low finding", review_of(self.reviewed, OLD_NIT))):
+            for flags in ((), ("--accept-findings",)):
+                with self.subTest(name, flags=flags):
+                    self.assertRefused(self.land(*flags, review=review), self.reviewed[:7], head[:7])
+        with self.subTest("re-reviewed at the head"):
+            self.assertLanded(self.land(review=review_of(head, when=at(12))))
+
+    def test_a_review_counts_through_clean_merges_of_main(self):
+        """The head adds two merges of main to the reviewed commit (of an older and of a newer main), each changing
+        nothing else: the review covers it and the PR lands. With an ordinary commit between the merges it does not:
+        refused first."""
+        self.advance_main(1)
+        once = self.merge_main()
+        self.plain_commit()
+        self.advance_main(1)
+        head = self.merge_main()
+        with self.subTest("an ordinary commit among the merges"):
+            self.assertRefused(self.land(), self.reviewed[:7], head[:7])
+        self.reset_to(once)
+        self.advance_main(1)
+        twice = self.merge_main()
+        self.assertEqual(len(self.git(self.wt, "rev-list", "--parents", "-n1", twice).split()), 3, "a merge commit")
+        with self.subTest("two clean merges of main"):
+            self.assertLanded(self.land())
+
+    def test_findings_on_the_reviewed_commit_refuse_through_a_merge_of_main(self):
+        """R4, findings are judged at the head: a high and a low finding on the reviewed commit, the head that commit
+        plus a clean merge of main dated after the review. Refused, naming the high finding and not the low one;
+        --accept-findings lands it."""
+        self.advance_main(1)
+        self.merge_main()
+        review = review_of(self.reviewed, FROBS, OLD_NIT)
+        p = self.land(review=review)
+        self.assertRefused(p)
+        self.assertNamesFindings(p, [FROBS], [OLD_NIT])
+        self.assertLanded(self.land("--accept-findings", review=review))
+
+    def test_a_merge_that_is_not_a_clean_merge_of_main_is_refused(self):
+        """A merge of main with a change folded in, and a clean merge of a branch that is not main: the review of the
+        commit before either does not cover it (--accept-findings or not). The same main merged with nothing else
+        lands."""
+        self.advance_main(1)
+        evil = self.evil_merge()
+        for flags in ((), ("--accept-findings",)):
+            with self.subTest("a merge of main with a change folded in", flags=flags):
+                self.assertRefused(self.land(*flags), self.reviewed[:7], evil[:7])
+        self.reset_to(self.reviewed)
+        side = self.side_merge()
+        with self.subTest("a clean merge of a branch that is not main"):
+            self.assertRefused(self.land(), self.reviewed[:7], side[:7])
+        self.reset_to(self.reviewed)
+        clean = self.merge_main()
+        self.assertNotIn(clean, (evil, side))
+        with self.subTest("the same main merged with nothing else"):
+            self.assertLanded(self.land())
+
+    # Each head below changes, after the reviewed commit, only files main changed too, so comparing the names of the
+    # files changed with main's own would call it covered. Only the parents (every commit after the review a merge
+    # whose second parent is on main, the reviewed commit on the head's first-parent line) and the trees (each such
+    # merge's tree the one git makes of its two parents) tell that the review does not cover it.
+    def test_a_merge_of_main_that_changes_a_file_main_changed_is_refused(self):
+        """A merge of main with a different body folded into the very file main brings in, and a merge whose conflict
+        with main (both added widget.py) was resolved by hand: neither is a clean merge of main."""
+        self.advance_main(1)
+        mine = f"elsewhere/change_{self.moves}.py"
+        evil = self.evil_merge(mine, "CHANGE = 'hand-made'\n")
+        self.assertNotEqual(self.tree(evil), self.merged_tree(self.reviewed))
+        with self.subTest("a different body for a file of main's"):
+            self.assertRefused(self.land(), self.reviewed[:7], evil[:7])
+        self.reset_to(self.reviewed)
+        self.main_commit({"widget.py": "def frob():\n    return 'main'\n"}, "Main adds a widget of its own")
+        resolved = self.conflict_merge({"widget.py": "def frob():\n    return 'both'\n"})
+        with self.subTest("a conflict with main resolved by hand"):
+            self.assertRefused(self.land(), self.reviewed[:7], resolved[:7])
+
+    def test_an_ordinary_commit_to_a_file_main_changed_is_refused_with_or_without_a_merge_after_it(self):
+        """An ordinary commit after the review editing a file main changed: as the head, then under a clean merge of
+        main; and one adding the very file main adds, byte for byte, under a clean merge of main (its tree is then
+        the reviewed commit's plus main's)."""
+        self.advance_main(1)
+        self.merge_main()
+        ordinary = self.plain_commit("CHANGE = 'branch'\n", f"elsewhere/change_{self.moves}.py")
+        with self.subTest("the ordinary commit is the head"):
+            self.assertRefused(self.land(), self.reviewed[:7], ordinary[:7])
+        self.advance_main(1)
+        head = self.merge_main()
+        with self.subTest("a clean merge of main after the ordinary commit"):
+            self.assertRefused(self.land(), self.reviewed[:7], head[:7])
+        self.reset_to(self.reviewed)
+        self.advance_main(1)
+        self.plain_commit(f"CHANGE = {self.moves}\n", f"elsewhere/change_{self.moves}.py")
+        head = self.merge_main()
+        self.assertEqual(self.tree(head), self.merged_tree(self.reviewed))
+        with self.subTest("main's own change committed by hand, then main merged"):
+            self.assertRefused(self.land(), self.reviewed[:7], head[:7])
+
+    def test_a_head_off_the_reviewed_commits_first_parent_line_is_refused(self):
+        """The branch rebased onto the new main with the same content (the reviewed commit no longer in the head's
+        history), and main merged the other way round (main the first parent, the reviewed commit the second): each
+        head's tree is the reviewed commit's plus main's, and neither is covered."""
+        self.advance_main(1)
+        rebased = self.rebase_onto_main()
+        self.assertEqual(self.tree(rebased), self.merged_tree(self.reviewed))
+        with self.subTest("rebased onto main"):
+            self.assertRefused(self.land(), self.reviewed[:7], rebased[:7])
+        backwards = self.merge_into_main(self.reviewed)
+        self.assertEqual(self.tree(backwards), self.merged_tree(self.reviewed))
+        with self.subTest("the reviewed commit merged into main"):
+            self.assertRefused(self.land(), self.reviewed[:7], backwards[:7])
+
+    def test_an_ordinary_commit_and_its_revert_are_refused_with_or_without_a_merge_after_them(self):
+        """An ordinary commit after the review and its revert: the head's tree is the reviewed commit's, then, under a
+        clean merge of main, the reviewed commit's plus main's. Refused both times: no commit after the review but
+        clean merges of main."""
+        self.plain_commit()
+        reverted = self.revert_head()
+        self.assertEqual(self.tree(reverted), self.tree(self.reviewed))
+        with self.subTest("the revert is the head"):
+            self.assertRefused(self.land(), self.reviewed[:7], reverted[:7])
+        self.advance_main(1)
+        head = self.merge_main()
+        self.assertEqual(self.tree(head), self.merged_tree(self.reviewed))
+        with self.subTest("a clean merge of main after the revert"):
+            self.assertRefused(self.land(), self.reviewed[:7], head[:7])
+
+    # ------------------------------------------------------------------ failed reads (R3)
+    def test_a_failed_read_the_head_checks_need_refuses_whatever_the_flags(self):
+        """The reviews list and the compare of main with the head, at the reviewed head; the PR's commits once the
+        head is the reviewed commit plus a merge of main. Each failing refuses, naming gh's error, --accept-findings
+        or not; the same PR lands once every read answers."""
+        for what, failing in (("reviews", GATE_API_FAILURES["reviews"]), ("compare", compare_failure(self.reviewed))):
+            for flags in ((), ("--accept-findings",)):
+                with self.subTest(what, flags=flags):
+                    self.assertRefused(self.land(*flags, first=[failing]), GATE_FAILURE_TEXT)
+        self.advance_main(1)
+        self.merge_main()
+        for flags in ((), ("--accept-findings",)):
+            with self.subTest("commits", flags=flags):
+                self.assertRefused(self.land(*flags, first=[GATE_API_FAILURES["commits"]]), GATE_FAILURE_TEXT)
+        with self.subTest("every read answering"):
+            self.assertLanded(self.land())
+
+    # ------------------------------------------------------------------ what stays as today (R2)
+    # The gate's _checks and _mergeable answer manual and wait for these; land keeps its own behaviour.
+    def test_no_checks_registered_still_warns_and_lands(self):
+        p = self.land(checks=[])
+        self.assertLanded(p)
+        self.assertIn(WARNING, p.stderr)
+
+    def test_mergeability_github_has_not_worked_out_still_warns_and_lands(self):
+        p = self.land(mergeable="UNKNOWN")
+        self.assertLanded(p)
+        self.assertIn(WARNING, p.stderr)
+
+    def test_a_merged_pr_finishes_its_cleanup_whatever_its_head(self):
+        """Already merged (an earlier land stopped at the cleanup, or GitHub merged it): no check of the head runs, so
+        main having moved on, a review of an older commit with a high finding and pending checks change nothing."""
+        head = self.plain_commit()
+        self.advance_main(3)
+        view = land_view(headRefOid=head, state="MERGED", statusCheckRollup=PENDING)
+        self.scenario(Land.land_calls(self, views=[view], reviews=[review_of(self.reviewed, FROBS)],
+                                      commits=self.pr_commits(self.reviewed), head=head, behind=3))
+        p = self.ok("land", "34", cwd=self.main)
+        self.assertEqual(p.stdout.splitlines()[0], "already merged, finishing cleanup")
+        self.assertFalse(any(a[:2] == ["pr", "merge"] for a in self.gh_argv()))
+        self.assertFalse(os.path.exists(self.wt))
+        self.assertIn(["close", "12", "--repo", self.main], self.stub_calls("harness-board"))
 
 
 class OpenNotes(WorktreeTest):
