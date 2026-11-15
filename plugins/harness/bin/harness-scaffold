@@ -37,6 +37,14 @@ stack's template that no allow rule covers (an allow rule Bash(harness-*:*), whi
 a ':*' rule is a literal prefix, gets one line naming the template's harness-<tool> rules in place of
 theirs) and each env key of it that is absent, with the value to add; a file that is not usable
 settings gets one warn line.
+The scaffolded ci.yml runs on pull requests and by hand only (no push to main). Run again on a project whose
+ci.yml has the old template's `on:` mapping exactly (push on main, pull_request, workflow_dispatch, nothing
+else in it), init drops the two push lines and no other byte, reports `updated .github/workflows/ci.yml` and a
+line naming the dropped push trigger, and on the adopt path counts it as a changed file, rewritten from the
+worktree's own ci.yml; any other `on:` is kept. A run that would leave ci.yml without a push trigger (created,
+rewritten or replaced) while the deploy.yml it leaves in place runs on workflow_run of CI (its top-level `on:`,
+then `workflow_run:`, then `workflows:` holding CI) is refused with one line before anything is written, also
+with --dry-run. The workflow files are read by a small indentation-scoped YAML reader (yaml_lines, block_node).
 The stack skeleton (pyproject.toml, src/<pkg>/__init__.py,
 tests/test_smoke.py; package.json, tests/smoke.test.js) is written only when the project has no
 manifest of any stack, no Makefile with a test or check target and no tests (a tests/, test/ or spec/
@@ -121,6 +129,16 @@ LAYOUT_SHOWN = 10                                             # loose test files
 # :::= assignment).
 MAKE_RULE = re.compile(r"^([^:=#]*?)\s*::?(?![:=])")
 INIT_PY = '"""{{name}}."""\n\n__version__ = "0.1.0"\n'
+
+CI_YML = ".github/workflows/ci.yml"
+DEPLOY_YML = ".github/workflows/deploy.yml"
+# The `on:` mapping of every scaffolded ci.yml before #339. Run again, init drops its two push lines (and
+# touches no other byte), so CI runs on pull requests and by hand only, as the templates now do.
+OLD_CI_ON = ["on:", "  push:", "    branches: [main]", "  pull_request:", "  workflow_dispatch:"]
+# A YAML block mapping key: quoted, or plain up to a `:` that ends the line or is followed by a blank.
+YAML_KEY = re.compile(r"""("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s"'#\[\]{},&*!|>%@`-][^#]*?|-\S[^#]*?)\s*:"""
+                      r"(?:[ \t]+(.*))?$")
+BLOCK_SCALAR = re.compile(r"[|>][1-9+-]{0,2}")                # `run: |`, `>-`: the value is the lines below
 
 # GitHub reads an issue template from .github/ISSUE_TEMPLATE only with this front matter.
 ISSUE_FRONT = {
@@ -481,20 +499,258 @@ def plan(root, stack, values, ci, verify=None, layout=()):
     return files
 
 
-def status_of(root, dest, content, force):
+# --------------------------------------------------------------- workflows
+def uncomment(line):
+    """`line` without its comment: from a `#` at the start or after a blank, outside a quoted scalar (one
+    that opens where a scalar starts: the line's start, after `[`, `{` or `,`, or after `: ` or `- `)."""
+    quote, i = "", 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 1
+            elif c == quote == "'" and line[i + 1:i + 2] == "'":
+                i += 1
+            elif c == quote:
+                quote = ""
+        elif c in "\"'":
+            before = line[:i].rstrip(" \t")
+            if before[-1:] in ("", "[", "{", ",") or (before[-1:] in (":", "-") and len(before) < i):
+                quote = c
+        elif c == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i]
+        i += 1
+    return line
+
+
+def is_item(text):
+    return text == "-" or text.startswith(("- ", "-\t"))
+
+
+def yaml_lines(text):
+    """The content lines of a YAML document as [line number, indent, text]: blank lines, comments, document
+    markers and the body of each block scalar (`run: |`, whatever it holds) left out."""
+    out, scalar = [], None
+    for n, line in enumerate(text.split("\n")):
+        line = line.rstrip("\r")
+        if scalar is not None and (not line.strip() or len(line) - len(line.lstrip(" ")) > scalar):
+            continue
+        scalar = None
+        body = uncomment(line).rstrip()
+        indent = len(body) - len(body.lstrip(" "))
+        body = body.lstrip(" ")
+        if not body or (indent == 0 and (body in ("---", "...") or body.startswith(("--- ", "%")))):
+            continue
+        out.append([n, indent, body])
+        item = re.match(r"(?:-[ \t]+)*", body).end()          # the `- ` of sequence items before the node
+        key = YAML_KEY.match(body[item:])
+        if BLOCK_SCALAR.fullmatch(((key.group(2) or "") if key else body[item:]).strip()):
+            scalar = indent + item if key else indent + item - 2 if item else indent - 1
+    return out
+
+
+def flow_node(s, i, inner=True):
+    """(value, end) of the flow node at s[i]: [..] a list, {..} a dict, a quoted scalar unquoted, a plain one
+    stripped (inside a collection it ends at `,`, a bracket or `: `). IndexError or ValueError when it is
+    not one."""
+    while s[i:i + 1] in (" ", "\t"):
+        i += 1
+    c = s[i:i + 1]
+    if c in ("[", "{"):
+        close, out = ("]", []) if c == "[" else ("}", {})
+        i += 1
+        while s[i:i + 1] in (" ", "\t"):
+            i += 1
+        while s[i] != close:
+            item, i = flow_node(s, i)
+            pair, value = False, None
+            while s[i] in " \t":
+                i += 1
+            if s[i] == ":":                                    # a pair: a key of a mapping, else a one-pair one
+                pair = True
+                value, i = flow_node(s, i + 1)
+                while s[i] in " \t":
+                    i += 1
+            if isinstance(out, dict):
+                out[str(item)] = value
+            else:
+                out.append({str(item): value} if pair else item)
+            if s[i] == ",":
+                i += 1
+                while s[i] in " \t":
+                    i += 1
+            elif s[i] != close:
+                raise ValueError(s)
+        return out, i + 1
+    if c in ('"', "'"):
+        j, chars = i + 1, []
+        while s[j] != c or (c == "'" and s[j + 1:j + 2] == "'"):
+            if s[j] == "'" == c or (s[j] == "\\" and c == '"'):  # '' is one ', \x is x
+                j += 1
+            chars.append(s[j])
+            j += 1
+        return "".join(chars), j + 1
+    j = i
+    while j < len(s) and not (inner and (s[j] in ",[]{}" or (s[j] == ":" and s[j + 1:j + 2] in ("", " ", "\t")))):
+        j += 1
+    return s[i:j].strip(), j
+
+
+def flow(text):
+    """The value of a flow node (flow_node); text that is not one node, the text stripped."""
+    try:
+        value, end = flow_node(text, 0, inner=False)
+    except (IndexError, ValueError):
+        return text.strip()
+    return value if not text[end:].strip() else text.strip()
+
+
+def entries(lines):
+    """(start, end) of each entry of the block collection in `lines`: a line no deeper than the first and
+    the deeper lines after it; a key without a value also takes the `- ` lines at its own indent."""
+    indent, i = lines[0][1], 0
+    while i < len(lines):
+        start, text = i, lines[i][2]
+        key = None if is_item(text) else YAML_KEY.match(text)
+        bare = key is not None and not (key.group(2) or "").strip()
+        i += 1
+        while i < len(lines) and (lines[i][1] > indent or (bare and lines[i][1] == indent and is_item(lines[i][2]))):
+            i += 1
+        yield start, i
+
+
+def block_node(lines):
+    """The value of the block node in `lines` (yaml_lines), the first of them the least indented: a dict, a
+    list, a string ("" for a block scalar) or None."""
+    if not lines:
+        return None
+    if is_item(lines[0][2]):
+        out = []
+        for start, end in entries(lines):
+            n, indent, text = lines[start]
+            rest = text[1:].lstrip(" \t")
+            if is_item(text):
+                head = [[n, indent + len(text) - len(rest), rest]] if rest else []
+                out.append(block_node(head + lines[start + 1:end]))
+        return out
+    if not YAML_KEY.match(lines[0][2]):                        # a scalar, maybe over several lines
+        return flow(" ".join(text for _, _, text in lines))
+    out = {}
+    for start, end in entries(lines):
+        key = None if is_item(lines[start][2]) else YAML_KEY.match(lines[start][2])
+        if key is None:
+            continue
+        value, below = (key.group(2) or "").strip(), lines[start + 1:end]
+        if BLOCK_SCALAR.fullmatch(value):
+            out[flow(key.group(1))] = ""
+        elif value:
+            out[flow(key.group(1))] = flow(" ".join([value] + [text for _, _, text in below]))
+        else:
+            out[flow(key.group(1))] = block_node(below)
+    return out
+
+
+def waits_for_ci(text):
+    """Whether a workflow runs on workflow_run of the workflow named CI: its top-level `on:` (or `"on":`)
+    mapping has a workflow_run whose `workflows:` (a flow or block list, or one name) holds `CI` exactly."""
+    doc = block_node(yaml_lines(text))
+    on = doc.get("on") if isinstance(doc, dict) else None
+    run = on.get("workflow_run") if isinstance(on, dict) else None
+    names = run.get("workflows") if isinstance(run, dict) else None
+    return "CI" in (names if isinstance(names, list) else [names])
+
+
+def drop_old_push(text):
+    """`text` without its two push lines when its top-level `on:` mapping is exactly OLD_CI_ON: those five
+    lines in a row, and the next content line (blank and comment lines are not) at the top level. None for
+    any other `on:`. Every other byte stays, a missing final newline included."""
+    lines = yaml_lines(text)
+    at = next((k for k, (_, indent, body) in enumerate(lines)
+               if indent == 0 and YAML_KEY.match(body) and flow(YAML_KEY.match(body).group(1)) == "on"), None)
+    if at is None:
+        return None
+    raw = text.split("\n")
+    first, size = lines[at][0], len(OLD_CI_ON)
+    block, after = lines[at:at + size], lines[at + size:at + size + 1]
+    if [n for n, _, _ in block] != list(range(first, first + size)) or (after and after[0][1] > 0) \
+            or [raw[n].rstrip("\r") for n in range(first, first + size)] != OLD_CI_ON:
+        return None
+    return "\n".join(raw[:first + 1] + raw[first + 3:])
+
+
+def refreshed_ci(path):
+    """The ci.yml at `path` without the old template's push lines (drop_old_push); None when its `on:` is
+    another, or it is not readable UTF-8."""
+    try:
+        return drop_old_push(path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def refuse_a_deploy_on_ci(root, stack, ci, force):
+    """A Problem, before anything is written, when this run leaves ci.yml without a push trigger (creates it
+    from the template, drops the old template's push lines, or replaces it with --force) while the deploy.yml
+    it leaves in place (the project's own, else the template's) runs on workflow_run of CI, which would then
+    never run on the push to main, so the deploy would never run again."""
+    if not ci:
+        return
+    path = root / CI_YML
+    if not path.exists():
+        change = "is created from the template"
+    elif force:
+        change = "is replaced by the template"
+    elif refreshed_ci(path) is not None:
+        change = "drops its push trigger"
+    else:
+        return                                                 # ci.yml is kept as it is
+    deploy = root / DEPLOY_YML
+    try:
+        text = deploy.read_bytes().decode("utf-8") if deploy.exists() and not force else \
+            read_template("deploy.yml", stack)
+    except (OSError, UnicodeDecodeError):
+        return
+    if waits_for_ci(text):
+        raise Problem(f"{DEPLOY_YML} runs on workflow_run of CI, but CI runs on pull requests and by hand only "
+                      f"once {CI_YML} {change}, so that deploy would never run again; trigger it on the push "
+                      "to main (as the template's deploy.yml does) or pass --no-ci, then run init again; "
+                      "nothing was written")
+
+
+def target(root, dest, content, force):
+    """(status, content to write) of one scaffold file at `root`: create when it is missing; with --force,
+    update to the template unless it is the same; else keep, except a ci.yml whose `on:` is the old
+    template's, updated to `root`'s own copy minus the two push lines (refreshed_ci)."""
     path = root / dest
     if not path.exists():
-        return "create"
-    if content is None or not force:
-        return "keep"
-    try:
-        same = path.read_text(encoding="utf-8") == content
-    except (OSError, UnicodeDecodeError):
-        same = False
-    return "keep" if same else "update"
+        return "create", content
+    if content is not None and force:
+        try:
+            same = path.read_text(encoding="utf-8") == content
+        except (OSError, UnicodeDecodeError):
+            same = False
+        return ("keep" if same else "update"), content
+    refreshed = refreshed_ci(path) if dest == CI_YML else None
+    return ("keep", None) if refreshed is None else ("update", refreshed)
+
+
+def status_of(root, dest, content, force):
+    return target(root, dest, content, force)[0]
+
+
+def refreshing(dest, status, force):
+    """Whether this status is ci.yml losing the old template's push lines (not --force's template)."""
+    return dest == CI_YML and status == "update" and not force
 
 
 PAST = {"create": "created", "keep": "kept", "update": "updated"}
+
+
+def report(dest, status, force, dry):
+    """`created|kept|updated <path>` (`would ...` when dry), plus a line for the push trigger a ci.yml loses."""
+    say(f"would {status} {dest}" if dry else f"{PAST[status]} {dest}")
+    if refreshing(dest, status, force):
+        say(f"{'would drop' if dry else 'dropped'} the push trigger from {dest} (the old template's `on:`): "
+            "CI runs on pull requests and by hand only")
 
 
 def write_files(root, files, force, dry):
@@ -502,14 +758,17 @@ def write_files(root, files, force, dry):
     The paths written, or that would be."""
     written = []
     for dest, content, mode in files:
-        status = status_of(root, dest, content, force)
-        say(f"would {status} {dest}" if dry else f"{PAST[status]} {dest}")
+        status, content = target(root, dest, content, force)
+        report(dest, status, force, dry)
         if status == "keep":
             continue
         written.append(dest)
         if dry:
             continue
         path = root / dest
+        if refreshing(dest, status, force):                    # the project's own file: its mode stays
+            path.write_bytes(content.encode("utf-8"))
+            continue
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         os.chmod(path, mode)
@@ -795,9 +1054,10 @@ def github(root, name, create, push, dry):
         say(f"warning: ruleset not created on {repo}: {last_line_collapsed(p.stderr) or last_line_collapsed(p.stdout)}")
 
 
-def adopt_body(name, stack, values, statuses):
+def adopt_body(name, stack, values, statuses, force):
     added = [d for d, s in statuses if s == "create"]
-    replaced = [d for d, s in statuses if s == "update"]
+    refreshed = [d for d, s in statuses if refreshing(d, s, force)]
+    replaced = [d for d, s in statuses if s == "update" and d not in refreshed]
     lines = ["## Request",
              f"Add the harness scaffold to {name} (`harness-scaffold init`, stack {stack}): the files it "
              "lacks, written on this ticket's branch. Files the project already has are kept.", "",
@@ -807,6 +1067,8 @@ def adopt_body(name, stack, values, statuses):
              "## Definition of done"]
     lines += [f"- [ ] `{d}` is added" for d in added]
     lines += [f"- [ ] `{d}` is replaced by the template" for d in replaced]
+    lines += [f"- [ ] `{d}` loses the two `push` lines under `on:`, so CI runs on pull requests and by hand "
+              "only; no other line changes" for d in refreshed]
     lines += ["- [ ] No other file changes", "",
               "## Tests that must pass",
               f"None: configuration and templates only (`no-tests`). The existing suite (`{values['verify_cmd']}`) "
@@ -814,7 +1076,8 @@ def adopt_body(name, stack, values, statuses):
               "## Context",
               "- `core.hooksPath` is set to `.githooks`, so the pre-commit hook starts working when this lands.",
               "- Must not change: the project's existing files"
-              + (", except the ones listed as replaced." if replaced else "."), ""]
+              + (", except the ones listed as replaced" if replaced else "")
+              + (f"{' and' if replaced else ', except'} the push lines of `{CI_YML}`" if refreshed else "") + ".", ""]
     return "\n".join(lines)
 
 
@@ -855,7 +1118,7 @@ def adopt(root, name, stack, values, files, statuses, force, dry):
     fd, body = tempfile.mkstemp(prefix="harness-scaffold-", suffix=".md")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(adopt_body(name, stack, values, statuses))
+            fh.write(adopt_body(name, stack, values, statuses, force))
         out = call(*create, body, cwd=root, project=root)
     finally:
         os.unlink(body)
@@ -918,6 +1181,7 @@ def cmd_init(args):
     top = toplevel(root)
     if top is not None and top != root:
         raise Problem(f"{root} is inside the repository {top}; scaffold its toplevel or a folder outside it")
+    refuse_a_deploy_on_ci(root, stack, not args.no_ci, args.force)
     if not root.exists():
         if dry:
             say(f"would create {root}")
@@ -975,7 +1239,7 @@ def cmd_init(args):
                 github(root, name, create=not origin, push=not origin, dry=dry)
             if dry:
                 for dest, status in statuses:
-                    say(f"would {status} {dest}")
+                    report(dest, status, args.force, True)
             adopt(root, name, stack, values, files, statuses, args.force, dry)
     if args.register:
         register(root, name, args.billable, args.client, dry)
