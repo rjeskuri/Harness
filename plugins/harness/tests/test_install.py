@@ -15,6 +15,10 @@ with CLAUDE_NESTED set to a folder and CLAUDE_NESTED_STEP naming a step, that st
 and before exiting, runs the installer named by CLAUDE_INSTALL to completion in that folder with a fresh HOME,
 state and logs (and neither mode), recording its output in `out.txt` and its exit code in `rc` there. That is a
 second install running at the same moment, between the outer step's write of its output and the installer's read.
+
+The retire and replace rules (#324) are also driven on a snippet the test writes: `tree` copies the installer's
+scripts/ and user/ into a temporary checkout, overwrites its user/settings.snippet.json and links plugins/ to the
+repository's, so the merge runs on lists and labels the real snippet does not have.
 """
 from __future__ import annotations
 
@@ -95,11 +99,31 @@ SETTINGS = {
 
 
 # The snippet's permission and autoMode lists, pinned independently of the installer: the nine harness rules of
-# the project template, the three ask rules (a raw merge and both landing commands: sessions may not land, #240),
+# the project template, the two ask rules (a raw merge, which skips the gate, and autoland; `harness-pr land` is a
+# reviewed merge a session may run without asking, Ryan 2026-11-04, so it is retired from the ask list, #324),
 # and the two autoMode lists led by the "$defaults" sentinel (the prose entries are pinned by their opening words,
 # from the ticket's Context; no autoMode.allow entry allows landing).
-LAND_ASK_RULES = ["Bash(harness-pr land *)", "Bash(harness-pr autoland *)"]
-ASK_RULES = ["Bash(gh pr merge *)"] + LAND_ASK_RULES
+RAW_MERGE, LAND, AUTOLAND = "Bash(gh pr merge *)", "Bash(harness-pr land *)", "Bash(harness-pr autoland *)"
+ASK_RULES = [RAW_MERGE, AUTOLAND]
+RETIRED = {"permissions.ask": [LAND]}
+# The snippet's Review convention entry, the live sentence of ~/.claude/settings.json (#324 Context), and two
+# stale entries with the same label that earlier add-only merges left in that file.
+REVIEW_CONVENTION = (
+    "Review convention: pull requests are opened by the harness from ticket branches t/<n>-*, reviewed by the "
+    "harness reviewer agent in a fresh context, and merged only through `harness-pr land`, which refuses a draft, "
+    "red or pending checks, a conflict and unaddressed review findings. A merge through that command is a reviewed "
+    "merge, and a session may run it without asking (Ryan's standing permission, 2026-11-04; `harness-pr revert` "
+    "undoes a land). `harness-pr autoland` is the epic #132 plan, not built yet.")
+STALE_AUTOLAND_CONVENTION = (
+    "Review convention: pull requests are opened by the harness from ticket branches t/<n>-*, reviewed by the "
+    "harness reviewer agent in a fresh context, and merged only through `harness-pr land` or `harness-pr autoland`, "
+    "which refuse a draft, red or pending checks, a conflict and unaddressed review findings. A merge through those "
+    "commands is a reviewed merge.")
+STALE_ASKING_CONVENTION = (
+    "Review convention: pull requests are opened by the harness from ticket branches t/<n>-*, reviewed by the "
+    "harness reviewer agent in a fresh context, and merged only through `harness-pr land`, which refuses a draft, "
+    "red or pending checks, a conflict and unaddressed review findings. A merge through that command is a reviewed "
+    "merge, and a session asks before running it. `harness-pr autoland` is the epic #132 plan, not built yet.")
 ENVIRONMENT_OPENINGS = ["Organization:", "Source control:", "CI/CD deploy targets:", "Review convention:",
                         "Key internal services:", "Sensitive data locations & audiences:", "Sensitive remote targets:"]
 AUTO_ALLOW_OPENINGS = ["Writing or loading a com.ryaneskuri.harness-* LaunchAgent"]
@@ -140,6 +164,7 @@ def snippet_lists(test):
     perms, auto = snippet["permissions"], snippet["autoMode"]
     test.assertEqual(sorted(perms.get("allow", [])), sorted(nine))
     test.assertEqual(perms.get("ask"), ASK_RULES)
+    test.assertEqual(snippet.get("retired"), RETIRED)
     test.assertEqual(set(perms), {"allow", "ask"})
     test.assertEqual(set(auto), {"environment", "allow"})
     for key, openings in (("environment", ENVIRONMENT_OPENINGS), ("allow", AUTO_ALLOW_OPENINGS)):
@@ -155,6 +180,25 @@ def snippet_lists(test):
 def settings_line(stdout):
     lines = [ln for ln in stdout.splitlines() if ln.startswith("~/.claude/settings.json:")]
     return lines[0] if len(lines) == 1 else "\n".join(lines)
+
+
+SUMMARY_VERBS = ("added", "removed", "replaced", "set", "put")
+
+
+def counts(line, verb):
+    """{"obj.key": N} summed over every `<verb> N obj.key, M obj.key` clause of the settings line (a clause ends at
+    `;`, `(` or the next verb), so `removed enabledPlugins[...]` counts nothing."""
+    out = {}
+    stop = "|".join(SUMMARY_VERBS)
+    for clause in re.findall(rf"\b{verb}\b((?:(?!\b(?:{stop})\b)[^;(])*)", line):
+        for n, obj, key in re.findall(r"\b(\d+) (permissions|autoMode)\.(\w+)\b", clause):
+            out[f"{obj}.{key}"] = out.get(f"{obj}.{key}", 0) + int(n)
+    return out
+
+
+def label(entry):
+    """An autoMode.environment entry's label: the text before its first `:` (None without one, as "$defaults")."""
+    return entry.split(":", 1)[0] if ":" in entry else None
 
 
 def setUpModule():
@@ -181,14 +225,30 @@ class Install(unittest.TestCase):
         self.settings = os.path.join(self.home, ".claude", "settings.json")
         self.claude_log, self.launch_log = os.path.join(self.tmp, "claude.log"), os.path.join(self.tmp, "launchctl.log")
 
-    def install(self, **extra):
+    def install(self, script=INSTALL, **extra):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("HARNESS_", "CLAUDE_", "LAUNCHCTL_"))}
         env.update(HOME=self.home, PATH=os.pathsep.join([W["fakebin"], "/usr/bin", "/bin"]),
                    CLAUDE_BIN=os.path.join(W["fakebin"], "claude"), CLAUDE_LOG=self.claude_log,
                    CLAUDE_STATE=self.state, HARNESS_LAUNCHCTL=os.path.join(W["fakebin"], "launchctl"),
                    LAUNCHCTL_LOG=self.launch_log)
         env.update(extra)
-        return subprocess.run(["sh", INSTALL], cwd=self.tmp, env=env, capture_output=True, text=True, timeout=120)
+        return subprocess.run(["sh", script], cwd=self.tmp, env=env, capture_output=True, text=True, timeout=120)
+
+    def tree(self, snippet):
+        """A checkout of the installer whose user/settings.snippet.json is `snippet`: scripts/ and user/ are copies,
+        plugins/ and .claude-plugin/ link to the repository's. Returns its scripts/install.sh."""
+        root = os.path.join(self.tmp, "tree")
+        shutil.copytree(os.path.join(REPO, "scripts"), os.path.join(root, "scripts"))
+        shutil.copytree(os.path.join(REPO, "user"), os.path.join(root, "user"))
+        write(os.path.join(root, "user", "settings.snippet.json"), json.dumps(snippet, indent=2))
+        for name in ("plugins", ".claude-plugin"):
+            os.symlink(os.path.join(REPO, name), os.path.join(root, name))
+        return os.path.join(root, "scripts", "install.sh")
+
+    def assert_line_counts(self, line, **verbs):
+        """Each verb's `N obj.key` counts on the settings line are exactly the given dict (an empty one: none)."""
+        for verb, want in verbs.items():
+            self.assertEqual(counts(line, verb), want, f"{verb}: {line}")
 
     def lines(self, path):
         if not os.path.exists(path):
@@ -222,6 +282,7 @@ class Install(unittest.TestCase):
         self.assertEqual({k: merged[k] for k in ("model", "effortLevel", "modelSettings")},
                          {k: snippet[k] for k in ("model", "effortLevel", "modelSettings")})
         self.assertNotIn("_comment", merged)
+        self.assertNotIn("retired", merged)                                           # the merge's, not a setting
         self.assertEqual(merged["enabledPlugins"], {"harness@ryan": True})          # companion gone
         for k in ("theme", "env"):                                                    # the rest untouched
             self.assertEqual(merged[k], SETTINGS[k])
@@ -242,9 +303,10 @@ class Install(unittest.TestCase):
         for piece in ("~/.claude/settings.json: set model, effortLevel; ",
                       f'set modelSettings for {", ".join(snippet["modelSettings"])}',
                       'removed enabledPlugins["companion@ryan"]', ADDED_ALL,
-                      "added 9 permissions.allow, 3 permissions.ask, 7 autoMode.environment, 1 autoMode.allow",
+                      "added 9 permissions.allow, 2 permissions.ask, 7 autoMode.environment, 1 autoMode.allow",
                       f"(backup settings.json.bak-{today})"):
             self.assertIn(piece, line)
+        self.assert_line_counts(line, removed={}, replaced={})                       # nothing retired or stale
 
         plist = os.path.join(self.home, "Library", "LaunchAgents", f"{LABEL}.plist")
         with open(plist, "rb") as fh:
@@ -279,7 +341,7 @@ class Install(unittest.TestCase):
         for piece in ("~/.claude/settings.json: set model, effortLevel; ",
                       f'set modelSettings for {", ".join(snippet["modelSettings"])}',
                       ADDED_ALL,
-                      "added 9 permissions.allow, 3 permissions.ask, 7 autoMode.environment, 1 autoMode.allow"):
+                      "added 9 permissions.allow, 2 permissions.ask, 7 autoMode.environment, 1 autoMode.allow"):
             self.assertIn(piece, line)
         self.assertTrue(line.endswith(" (created)"), line)
 
@@ -330,21 +392,26 @@ class Install(unittest.TestCase):
         self.assertIn("the LaunchAgent is not loaded", p.stdout)
         self.assertIn("security add-generic-password", p.stdout)                  # the install carried on
 
-    # Sessions may not land (#240): after an install, both landing commands prompt and nothing in autoMode.allow
-    # lets the classifier wave a landing through. The rules are spelled out here, not read from the snippet.
+    # Sessions may land but never merge raw (#324, Ryan 2026-11-04): after an install a raw `gh pr merge` and
+    # `harness-pr autoland` prompt, `harness-pr land` does not (the retired ask rule is gone, `Bash(harness-pr:*)`
+    # allows it), and the classifier is told so. The rules are spelled out here, not read from the snippet.
 
-    def test_sessions_may_not_land_after_install(self):
-        starts = {
-            "fresh HOME, no settings": None,
-            "settings with none of the lists": SETTINGS,
-            "own ask and autoMode.allow": {"permissions": {"allow": ["Bash(ls:*)"],
-                                                           "ask": ["Bash(git push --force:*)"]},
-                                           "autoMode": {"allow": ["Running make test is allowed."]}},
-            "the raw-merge ask rule already there": {"permissions": {"ask": ["Bash(gh pr merge *)"]},
-                                                     "autoMode": {"allow": [DEFAULTS], "environment": []}},
-            "one land rule already there": {"permissions": {"ask": ["Bash(harness-pr autoland *)", "Bash(x)"]}},
+    def test_sessions_may_land_but_never_merge_raw_after_install(self):
+        starts = {      # name: (settings or None, the user's own ask rules, in the order they must keep)
+            "fresh HOME, no settings": (None, []),
+            "settings with none of the lists": (SETTINGS, []),
+            "own ask and autoMode.allow": ({"permissions": {"allow": ["Bash(ls:*)"],
+                                                            "ask": ["Bash(git push --force:*)", "Bash(npm publish:*)"]},
+                                            "autoMode": {"allow": ["Running make test is allowed."]}},
+                                           ["Bash(git push --force:*)", "Bash(npm publish:*)"]),
+            "the raw-merge ask rule already there": ({"permissions": {"ask": [RAW_MERGE]},
+                                                      "autoMode": {"allow": [DEFAULTS], "environment": []}}, []),
+            "the land rule there": ({"permissions": {"ask": [AUTOLAND, LAND, "Bash(x)"]}}, ["Bash(x)"]),
+            "the land rule twice, around own rules": ({"permissions": {"ask": ["Bash(rm -rf build)", LAND, RAW_MERGE,
+                                                                               "Bash(x)", LAND]}},
+                                                      ["Bash(rm -rf build)", "Bash(x)"]),
         }
-        for name, start in starts.items():
+        for name, (start, own) in starts.items():
             with self.subTest(start=name):
                 if start is None:
                     if os.path.exists(self.settings):
@@ -355,26 +422,37 @@ class Install(unittest.TestCase):
                 self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                 merged = read_json(self.settings)
                 ask = merged["permissions"]["ask"]
-                for rule in ("Bash(gh pr merge *)", "Bash(harness-pr land *)", "Bash(harness-pr autoland *)"):
+                for rule in (RAW_MERGE, AUTOLAND):
                     self.assertEqual(ask.count(rule), 1, (rule, ask))
-                self.assertIn("Bash(harness-pr:*)", merged["permissions"]["allow"])  # allowed, but landing asks
-                for rule in ("Bash(harness-pr land *)", "Bash(harness-pr autoland *)"):
+                self.assertEqual([e for e in ask if "harness-pr land" in e], [], ask)
+                self.assertEqual([e for e in ask if e not in (RAW_MERGE, AUTOLAND)], own, "own ask rules moved")
+                self.assertIn("Bash(harness-pr:*)", merged["permissions"]["allow"])  # so landing runs unasked
+                for rule in (LAND, AUTOLAND):
                     self.assertNotIn(rule, merged["permissions"]["allow"])
                 landing = [e for e in merged["autoMode"]["allow"]
                            if re.search(r"\bland|autoland|harness-pr|\bmerg", e, re.IGNORECASE)]
                 self.assertEqual(landing, [], "an autoMode.allow entry mentions landing")
                 self.assertEqual(merged["autoMode"]["allow"][0], DEFAULTS)
                 self.assertGreaterEqual(len(merged["autoMode"]["allow"]), 2, "the LaunchAgent entry is gone too")
+                conventions = [e for e in merged["autoMode"]["environment"] if label(e) == "Review convention"]
+                self.assertEqual(conventions, [REVIEW_CONVENTION])
 
-    def test_the_snippet_asks_before_landing_and_never_allows_it(self):
+    def test_the_snippet_asks_only_for_raw_merge_and_autoland(self):
         snippet = read_json(SNIPPET)
-        ask = snippet["permissions"]["ask"]
-        self.assertEqual(ask[:1], ["Bash(gh pr merge *)"])                       # the land rules come after it
-        for rule in ("Bash(harness-pr land *)", "Bash(harness-pr autoland *)"):
-            self.assertEqual(ask.count(rule), 1, (rule, ask))
-            self.assertGreater(ask.index(rule), 0)
+        self.assertEqual(snippet["permissions"]["ask"], [RAW_MERGE, AUTOLAND])
+        self.assertEqual(snippet.get("retired"), {"permissions.ask": [LAND]})
+        for entry in snippet["permissions"]["allow"]:
+            self.assertIsNone(re.search(r"\bland\b|autoland|\bmerg", entry, re.IGNORECASE), entry)
         for entry in snippet["autoMode"]["allow"]:
             self.assertIsNone(re.search(r"\bland|autoland|harness-pr", entry, re.IGNORECASE), entry)
+        # Replacing by label needs one label per entry: every prose entry has one, and no two share it.
+        labels = [label(e) for e in snippet["autoMode"]["environment"] if e != DEFAULTS]
+        self.assertNotIn(None, labels)
+        self.assertEqual(len(set(labels)), len(labels), labels)
+
+    def test_the_snippet_review_convention_is_the_live_sentence(self):
+        env = read_json(SNIPPET)["autoMode"]["environment"]
+        self.assertEqual([e for e in env if label(e) == "Review convention"], [REVIEW_CONVENTION])
 
     # Neither `harness-pr autoland` nor an autoland LaunchAgent exists yet (epic #132). The text checks below read
     # each sentence (a line split after . ; ! or ?) with backticks removed. A line that is only a permission rule
@@ -454,13 +532,6 @@ class Install(unittest.TestCase):
                         self.assertIsNone(self.AUTOLAND_CLAIMS.search(sentence))
                         self.assertRegex(sentence, self.PLANNED)
 
-    def test_user_claude_md_says_how_landing_works_today(self):
-        # Ryan lands with /harness:land or approves the land prompt: one sentence of user/CLAUDE.md says both.
-        text = self.user_files()["CLAUDE.md"]
-        both = [s for s in self.sentences(text)
-                if "/harness:land" in s and re.search(r"approv\w*\W+(\w+\W+){0,4}?(the\W+)?(land|prompt)", s, re.I)]
-        self.assertTrue(both, "no sentence names /harness:land and approving the land prompt")
-
     # The permission and autoMode merge. Expected lists are derived from the test's own fixture and the
     # snippet's entries (checked against the ticket by snippet_lists), never from the installer.
 
@@ -493,7 +564,7 @@ class Install(unittest.TestCase):
         env, auto_allow = wanted["autoMode", "environment"], wanted["autoMode", "allow"]
         own = {
             ("permissions", "allow"): ["Bash(ls:*)", allow[3], "Read(~/notes/**)", allow[0], "Bash(make test)"],
-            ("permissions", "ask"): ["Bash(git push --force:*)", ask[2]],
+            ("permissions", "ask"): ["Bash(git push --force:*)", LAND, ask[1]],
             ("autoMode", "environment"): ["My own context line.", env[2], DEFAULTS, "Another of mine."],
             ("autoMode", "allow"): [auto_allow[1], "Running make test is allowed."],
         }
@@ -508,17 +579,19 @@ class Install(unittest.TestCase):
         merged = read_json(self.settings)
         for obj, key in LISTS:
             with self.subTest(list=f"{obj}.{key}"):
-                self.assert_merged(merged[obj][key], own[obj, key], wanted[obj, key], sentinel=obj == "autoMode")
+                kept = [e for e in own[obj, key] if e != LAND]                    # the retired rule goes
+                self.assert_merged(merged[obj][key], kept, wanted[obj, key], sentinel=obj == "autoMode")
         self.assertEqual(merged["permissions"]["deny"], mine["permissions"]["deny"])
         self.assertEqual(merged["autoMode"]["soft_deny"], mine["autoMode"]["soft_deny"])
         self.assertEqual(merged["theme"], "light")
         line = settings_line(p.stdout)
-        # The own lists already hold ask[2], env[2] (and the sentinel) and auto_allow[1]: one fewer of the first two
+        # The own lists already hold ask[1], env[2] (and the sentinel) and auto_allow[1]: one fewer of the first two
         # is added, and autoMode.allow, already holding its one prose entry, gains nothing and gets no count (only its sentinel moves).
         self.assertIn(f"added {len(allow) - 2} permissions.allow, {len(ask) - 1} permissions.ask, "
                       f"{len(ENVIRONMENT_OPENINGS) - 1} autoMode.environment", line)
-        self.assertIn("added 7 permissions.allow, 2 permissions.ask, 6 autoMode.environment", line)
+        self.assertIn("added 7 permissions.allow, 1 permissions.ask, 6 autoMode.environment", line)
         self.assertNotRegex(line, r"\d+ autoMode\.allow")
+        self.assert_line_counts(line, removed={"permissions.ask": 1}, replaced={})
         self.assertIn(" (backup settings.json.bak-", line)
         self.assertEqual(len(self.backups()), 1)
 
@@ -542,6 +615,7 @@ class Install(unittest.TestCase):
                       f"{len(AUTO_ALLOW_OPENINGS)} autoMode.allow", line)               # env[3:] held already
         self.assertIn("added 4 permissions.allow, 2 autoMode.environment, 1 autoMode.allow", line)
         self.assertNotIn("permissions.ask", line)                                  # nothing added there
+        self.assert_line_counts(line, removed={}, replaced={})                     # nor retired, nor stale
 
     def test_defaults_sentinel_leads_each_auto_mode_list(self):
         wanted = snippet_lists(self)
@@ -581,7 +655,8 @@ class Install(unittest.TestCase):
                                    "allow": ["Bash(ls:*)"] + list(reversed(wanted["permissions", "allow"])),
                                    "ask": ["Bash(git push --force:*)"] + wanted["permissions", "ask"]},
                    "autoMode": {"allow": [DEFAULTS, "Mine."] + list(reversed(wanted["autoMode", "allow"][1:])),
-                                "environment": wanted["autoMode", "environment"] + ["Mine too."]},
+                                "environment": wanted["autoMode", "environment"] + ["Mine too.", "Team: just me.",
+                                                                                     "Team: and a dog."]},
                    "modelSettings": snippet["modelSettings"], "effortLevel": snippet["effortLevel"],
                    "model": snippet["model"], "theme": "dark"}
         before = self.reset(by_hand)
@@ -614,6 +689,239 @@ class Install(unittest.TestCase):
                 with open(self.settings, "rb") as fh:
                     self.assertEqual(fh.read(), after_first)
                 self.assertEqual(self.backups(), backups)
+
+        # Needing only the retire and the replace, as the live file did on 2026-11-04 (the land rule asked, two
+        # stale Review convention entries): the first run removes and replaces, the next change nothing.
+        env = wanted["autoMode", "environment"]
+        at = env.index(REVIEW_CONVENTION)
+        stale_env = env[:at] + [STALE_AUTOLAND_CONVENTION] + env[at + 1:] + ["Mine too.", STALE_ASKING_CONVENTION]
+        stale_ask = [RAW_MERGE, LAND, AUTOLAND, "Bash(git push --force:*)"]
+        before = self.reset({"permissions": {"allow": wanted["permissions", "allow"], "ask": stale_ask},
+                             "autoMode": {"environment": stale_env, "allow": wanted["autoMode", "allow"]},
+                             "theme": "dark", **{k: snippet[k] for k in ("model", "effortLevel", "modelSettings")}})
+        p = self.install()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        line = settings_line(p.stdout)
+        self.assertNotIn("already up to date", line)
+        self.assert_line_counts(line, added={}, replaced={"autoMode.environment": 1})
+        self.assertEqual(counts(line, "removed").get("permissions.ask"), 1, line)
+        merged = read_json(self.settings)
+        self.assertEqual(merged["permissions"]["ask"], [RAW_MERGE, AUTOLAND, "Bash(git push --force:*)"])
+        self.assertEqual(merged["autoMode"]["environment"], env + ["Mine too."])
+        backups = self.backups()
+        self.assertEqual(len(backups), 1)
+        with open(os.path.join(os.path.dirname(self.settings), backups[0]), "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        with open(self.settings, "rb") as fh:
+            after_first = fh.read()
+        for again in (2, 3):
+            with self.subTest(run=again, start="retire and replace"):
+                p = self.install()
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("~/.claude/settings.json: already up to date", p.stdout)
+                with open(self.settings, "rb") as fh:
+                    self.assertEqual(fh.read(), after_first)
+                self.assertEqual(self.backups(), backups)
+
+    def assert_list(self, got, prefix, appended):
+        """`got` is `prefix` exactly, then `appended` in any order (each entry as often as it is listed)."""
+        self.assertEqual(got[:len(prefix)], prefix, got)
+        self.assertEqual(sorted(got[len(prefix):]), sorted(appended), got)
+
+    def test_retired_rule_is_removed_wherever_it_appears(self):
+        # Every list but permissions.ask is already as the snippet has it, so the line names the ask list only.
+        wanted = snippet_lists(self)
+        snippet = read_json(SNIPPET)
+        base = {k: snippet[k] for k in ("model", "effortLevel", "modelSettings")}
+        own_allow = ["Bash(ls:*)"] + wanted["permissions", "allow"]
+        auto = {"environment": wanted["autoMode", "environment"] + ["Mine."], "allow": wanted["autoMode", "allow"]}
+        cases = {   # name: (ask before, ask after up to the appended entries, appended, removed count)
+            "one copy, alone": ([LAND], [], [RAW_MERGE, AUTOLAND], 1),
+            "two copies around the snippet's rules": ([LAND, RAW_MERGE, AUTOLAND, LAND], [RAW_MERGE, AUTOLAND], [], 2),
+            "one between own rules": (["Bash(git push --force:*)", LAND, "Bash(npm publish:*)", AUTOLAND],
+                                      ["Bash(git push --force:*)", "Bash(npm publish:*)", AUTOLAND], [RAW_MERGE], 1),
+            "three copies beside rules that only resemble it": (
+                [LAND, "Bash(harness-pr land 42)", RAW_MERGE, LAND, "Bash(git reset --hard:*)", AUTOLAND, LAND,
+                 "Bash(harness-pr land:*)"],
+                ["Bash(harness-pr land 42)", RAW_MERGE, "Bash(git reset --hard:*)", AUTOLAND, "Bash(harness-pr land:*)"],
+                [], 3),
+            "none to remove": (["Bash(git push --force:*)", AUTOLAND, RAW_MERGE],
+                               ["Bash(git push --force:*)", AUTOLAND, RAW_MERGE], [], 0),
+        }
+        for name, (ask, kept, appended, removed) in cases.items():
+            with self.subTest(case=name):
+                before = self.reset(dict(base, theme="dark",
+                                         permissions={"allow": own_allow, "ask": ask, "deny": [LAND]},
+                                         autoMode=auto))
+                p = self.install()
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                merged = read_json(self.settings)
+                self.assert_list(merged["permissions"]["ask"], kept, appended)
+                self.assertEqual(merged["permissions"]["allow"], own_allow)
+                self.assertEqual(merged["permissions"]["deny"], [LAND])                # deny is never merged
+                self.assertEqual(merged["autoMode"], auto)
+                line = settings_line(p.stdout)
+                if not removed:
+                    self.assertIn("~/.claude/settings.json: already up to date", line)
+                    with open(self.settings, "rb") as fh:
+                        self.assertEqual(fh.read(), before)
+                    self.assertEqual(self.backups(), [])
+                    continue
+                self.assert_line_counts(line, removed={"permissions.ask": removed}, replaced={},
+                                        added={"permissions.ask": len(appended)} if appended else {})
+                self.assertEqual(len(self.backups()), 1)
+
+    def test_environment_entry_is_replaced_by_its_label(self):
+        # Every other list is already as the snippet has it, so the line names autoMode.environment only.
+        wanted = snippet_lists(self)
+        snippet = read_json(SNIPPET)
+        env = wanted["autoMode", "environment"]
+        snip = {label(e): e for e in env if label(e)}
+        self.assertEqual(snip["Review convention"], REVIEW_CONVENTION)
+        base = dict({k: snippet[k] for k in ("model", "effortLevel", "modelSettings")}, theme="dark",
+                    permissions={"allow": wanted["permissions", "allow"], "ask": wanted["permissions", "ask"]})
+        org, source, ci = snip["Organization"], snip["Source control"], snip["CI/CD deploy targets"]
+        services, data, remote = (snip["Key internal services"], snip["Sensitive data locations & audiences"],
+                                  snip["Sensitive remote targets"])
+        cases = {   # name: (environment before, after up to the appended entries, appended, replaced count or None)
+            "two stale Review convention entries": (
+                [DEFAULTS, org, "Team: just me, no staff.", source, STALE_AUTOLAND_CONVENTION, ci,
+                 "A line of my own without a label.", STALE_ASKING_CONVENTION,
+                 "Note: the Review convention: below is mine.", services, data, remote, "Deploy: by hand on Fridays."],
+                [DEFAULTS, org, "Team: just me, no staff.", source, REVIEW_CONVENTION, ci,
+                 "A line of my own without a label.", "Note: the Review convention: below is mine.", services, data,
+                 remote, "Deploy: by hand on Fridays."],
+                [], 1),
+            "three stale labels, three missing, the sentinel out of place": (
+                ["Organization: someone else, long ago.", "Mine: a line of my own.", DEFAULTS,
+                 "Review convention: merged by hand after a look.", source, "Sensitive remote targets: none yet.",
+                 "Organization: a second, older line.", REVIEW_CONVENTION, "Mine: another line of my own."],
+                [DEFAULTS, org, "Mine: a line of my own.", REVIEW_CONVENTION, source, remote,
+                 "Mine: another line of my own."],
+                [ci, services, data], 3),
+            "the snippet's entry first, a stale one later": (
+                env + ["Mine.", STALE_AUTOLAND_CONVENTION, "Source control:github.com/someone-else"],
+                env + ["Mine."], [], None),
+        }
+        for name, (before, kept, appended, replaced) in cases.items():
+            with self.subTest(case=name):
+                self.reset(dict(base, autoMode={"environment": before, "allow": wanted["autoMode", "allow"]}))
+                p = self.install()
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                merged = read_json(self.settings)
+                self.assert_list(merged["autoMode"]["environment"], kept, appended)
+                self.assertEqual(merged["autoMode"]["allow"], wanted["autoMode", "allow"])
+                self.assertEqual(merged["permissions"], base["permissions"])
+                line = settings_line(p.stdout)
+                self.assertNotIn("already up to date", line)
+                self.assertEqual(len(self.backups()), 1)
+                self.assertEqual({k for k in counts(line, "removed") if k != "autoMode.environment"}, set(), line)
+                self.assert_line_counts(line, added={"autoMode.environment": len(appended)} if appended else {})
+                if replaced is not None:
+                    self.assert_line_counts(line, replaced={"autoMode.environment": replaced})
+
+    def test_retire_and_replace_follow_the_snippet_list_by_list(self):
+        # A snippet of the test's own: a retired string goes from the list the snippet retires it under, every
+        # copy, and stays in every other list; labels are replaced in autoMode.environment only.
+        script = self.tree({
+            "permissions": {"allow": ["Bash(alpha:*)", "Bash(beta:*)"], "ask": ["Bash(gamma *)"]},
+            "autoMode": {"environment": [DEFAULTS, "Alpha: the new alpha.", "Beta: the new beta.",
+                                         "Gamma: the new gamma.", "A line with no label."],
+                         "allow": [DEFAULTS, "Delta: the new delta is allowed."]},
+            "retired": {"permissions.allow": ["Bash(old-allow:*)"],
+                        "permissions.ask": ["Bash(old ask *)", "Bash(older ask *)"],
+                        "autoMode.environment": ["A retired context line."],
+                        "autoMode.allow": ["A retired allow line."]},
+        })
+        deny, soft_deny = ["Bash(old ask *)", "Bash(old-allow:*)"], [DEFAULTS, "A retired allow line."]
+        first = {
+            "permissions": {"allow": ["Bash(old-allow:*)", "Bash(ls:*)", "Bash(alpha:status)", "Bash(old-allow:*)",
+                                      "Bash(old ask *)"],
+                            "ask": ["Bash(older ask *)", "Bash(mine *)", "Bash(old ask *)", "Bash(gamma *)",
+                                    "Bash(old ask *)"],
+                            "deny": deny},
+            "autoMode": {"environment": ["Gamma: a stale gamma.", "A retired context line.", DEFAULTS,
+                                         "Mine: keep me.", "Alpha: a stale alpha.", "A retired allow line.",
+                                         "A retired context line."],
+                         "allow": ["A retired allow line.", "Delta: mine, kept.", DEFAULTS, "A retired context line."],
+                         "soft_deny": soft_deny},
+            "theme": "dark",
+        }
+        second = {"permissions": {"ask": ["Bash(old ask *)"]},
+                  "autoMode": {"environment": ["Beta: a stale beta.", "Beta: an older beta.", "Alpha: the new alpha.",
+                                               "Beta: the oldest beta."]}}
+        expect = {  # name: (settings, {list: (after up to the appended entries, appended)}, removed, replaced, added)
+            "first": (first, {
+                ("permissions", "allow"): (["Bash(ls:*)", "Bash(alpha:status)", "Bash(old ask *)"],
+                                           ["Bash(alpha:*)", "Bash(beta:*)"]),
+                ("permissions", "ask"): (["Bash(mine *)", "Bash(gamma *)"], []),
+                ("autoMode", "environment"): ([DEFAULTS, "Gamma: the new gamma.", "Mine: keep me.",
+                                               "Alpha: the new alpha.", "A retired allow line."],
+                                              ["Beta: the new beta.", "A line with no label."]),
+                ("autoMode", "allow"): ([DEFAULTS, "Delta: mine, kept.", "A retired context line."],
+                                        ["Delta: the new delta is allowed."]),
+            }, {"permissions.allow": 2, "permissions.ask": 3, "autoMode.environment": 2, "autoMode.allow": 1},
+                {"autoMode.environment": 2},
+                {"permissions.allow": 2, "autoMode.environment": 2, "autoMode.allow": 1}),
+            "second": (second, {
+                ("permissions", "allow"): ([], ["Bash(alpha:*)", "Bash(beta:*)"]),
+                ("permissions", "ask"): ([], ["Bash(gamma *)"]),
+                ("autoMode", "environment"): ([DEFAULTS, "Beta: the new beta.", "Alpha: the new alpha."],
+                                              ["Gamma: the new gamma.", "A line with no label."]),
+                ("autoMode", "allow"): ([DEFAULTS], ["Delta: the new delta is allowed."]),
+            }, {"permissions.ask": 1}, {"autoMode.environment": 1},
+                {"permissions.allow": 2, "permissions.ask": 1, "autoMode.environment": 2, "autoMode.allow": 1}),
+        }
+        for name, (start, lists, removed, replaced, added) in expect.items():
+            with self.subTest(start=name):
+                before = self.reset(start)
+                p = self.install(script)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                merged = read_json(self.settings)
+                for (obj, key), (kept, appended) in lists.items():
+                    with self.subTest(list=f"{obj}.{key}"):
+                        self.assert_list(merged[obj][key], kept, appended)
+                line = settings_line(p.stdout)
+                self.assert_line_counts(line, replaced=replaced, added=added)
+                got = counts(line, "removed")
+                if name == "second":          # later entries of a replaced label may be counted as removed or not
+                    got.pop("autoMode.environment", None)
+                self.assertEqual(got, removed, line)
+                backups = self.backups()
+                self.assertEqual(len(backups), 1)
+                with open(os.path.join(os.path.dirname(self.settings), backups[0]), "rb") as fh:
+                    self.assertEqual(fh.read(), before)
+                if name == "first":
+                    self.assertEqual(merged["permissions"]["deny"], deny)
+                    self.assertEqual(merged["autoMode"]["soft_deny"], soft_deny)
+                    self.assertEqual(merged["theme"], "dark")
+                    with open(self.settings, "rb") as fh:
+                        after_first = fh.read()
+                    p = self.install(script)                                       # again: nothing changes
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn("~/.claude/settings.json: already up to date", p.stdout)
+                    with open(self.settings, "rb") as fh:
+                        self.assertEqual(fh.read(), after_first)
+                    self.assertEqual(self.backups(), backups)
+
+        # Retired strings only where they are not retired, labels of the user's own, the snippet's entries in
+        # place: nothing to do, so nothing is written.
+        with self.subTest(start="up to date"):
+            before = self.reset({
+                "permissions": {"allow": ["Bash(old ask *)", "Bash(beta:*)", "Bash(alpha:*)", "Bash(alpha:status)"],
+                                "ask": ["Bash(old-allow:*)", "Bash(gamma *)"], "deny": deny},
+                "autoMode": {"environment": [DEFAULTS, "Gamma: the new gamma.", "A retired allow line.",
+                                             "Mine: one.", "Alpha: the new alpha.", "Mine: two.", "Beta: the new beta.",
+                                             "A line with no label."],
+                             "allow": [DEFAULTS, "A retired context line.", "Delta: mine, kept.",
+                                       "Delta: the new delta is allowed."],
+                             "soft_deny": soft_deny}})
+            p = self.install(script)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("~/.claude/settings.json: already up to date", p.stdout)
+            with open(self.settings, "rb") as fh:
+                self.assertEqual(fh.read(), before)
+            self.assertEqual(self.backups(), [])
 
     def test_deny_default_mode_and_soft_deny_untouched(self):
         wanted = snippet_lists(self)

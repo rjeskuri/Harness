@@ -1,14 +1,14 @@
 name: CI
 
+# On pull requests and by hand. Not on the push to main: a squash merge lands the tree the pull
+# request run already verified, and harness-pr land refuses a conflicting or behind-main branch.
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

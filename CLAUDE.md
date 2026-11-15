@@ -11,7 +11,7 @@ Ryan's Claude Code harness: one plugin (agents, skills, hooks, command-line tool
 - `plugins/harness/tests/`: the suite; `fakegh.py` is the scripted fake `gh` every tool test uses, and fake executables are written once per module.
 - `plugins/harness/{agents,skills,hooks,bin,templates}/`: the plugin. `docs/design.md` is the contract; `docs/research/` holds the verified platform facts.
 - `user/` and `scripts/install.sh`: the personal CLAUDE.md and settings snippet, and how they are installed.
-- `scripts/verify.sh`: the checks behind the verify command; `.github/workflows/ci.yml` runs it.
+- `scripts/verify.sh`: the checks behind the verify command; `.github/workflows/ci.yml` runs it on every pull request and by hand, not again on the push to main (a squash merge lands the tree the pull request run verified).
 - `.githooks/`: `pre-commit` (format and lint on staged files, no commits on main) and `pre-push` (no pushes to main, no force pushes).
 
 ## Conventions
