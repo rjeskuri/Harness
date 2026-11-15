@@ -74,7 +74,9 @@ run ended without a ready pull request, a draft counting as none, until 3 runs o
 a billing or auth run not counting) that has no live run, up to --max minus the live runs. When the branch has an
 open draft PR, the prompt and the start comment name it and say the worktree may hold uncommitted work from the
 previous run. Launched sessions get neither
-the dispatching session's identity nor ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN. bg, the
+the dispatching session's identity nor ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN; when the
+session is another project's (harness_lib.settings.other_project), CLAUDE_VERIFY_CMD and HARNESS_TEST_CMD are this
+repository's from its .claude settings, left out where they set none (#299). bg, the
 default whatever the budgets say, runs on the subscription: `claude --bg -n "<repo> #N <title>" --permission-mode
 auto "/harness:work N"`.
 headless, only with --venue headless or its alias --api (--api with --venue bg is an error): `claude -p
@@ -124,7 +126,8 @@ budget, an unended cloud run of the ticket, and what start refuses; then starts 
 branch with upstream (a failed push launches nothing) and runs `claude --cloud <prompt> --on-branch <branch>` in the
 worktree with its stdout on a pseudo-terminal (claude starts a new cloud session only from a terminal), without the
 credentials above. The prompt is self-contained: repository, ticket, branch, the verify command (CLAUDE_VERIFY_CMD,
-else HARNESS_TEST_CMD), `gh api` REST for comments and the two markers; the session loads no harness plugin, hooks or
+else HARNESS_TEST_CMD, through project_setting: from another project's session only this repository's settings
+count), `gh api` REST for comments and the two markers; the session loads no harness plugin, hooks or
 tests-first gate. claude's output without ANSI escapes and carriage returns is the run's log; the session id comes
 from its claude.ai/code URL. The run record gets venue cloud, cloud_id and url, and the URL is commented on the
 ticket. A failed launch, or one without a session id, ends the record in error with claude's last line; billing
@@ -171,6 +174,7 @@ try:
     from harness_lib.repo import NotARepository, RepoError, repo_facts, worktree_entries
     from harness_lib.routing import EFFORTS, cached_code_route, code_route, load_routing, next_route, review_route
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, patterns, setting, settings_env
+    from harness_lib.settings import other_project, project_setting, setting_from
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
     from harness_lib import backups, cost, reviews, waves
     from harness_lib.text import age_text as ago_text
@@ -252,6 +256,9 @@ SESSION_ENV = ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CL
                "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_EXECPATH", "CLAUDE_PID", "CLAUDE_EFFORT")
 # Credentials a launched session must not inherit: headless bills through apiKeyHelper, bg through the login.
 CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+# A project's own commands: a session launched for another repository than the dispatching session's takes them from
+# that repository's settings, never from the dispatching session's environment (#299).
+PROJECT_ENV = ("CLAUDE_VERIFY_CMD", "HARNESS_TEST_CMD")
 
 
 def warn(text):
@@ -330,10 +337,20 @@ def claude_exe():
     return os.environ.get("HARNESS_CLAUDE", "claude")
 
 
-def child_env():
+def child_env(repo=None):
     """The environment for a launched session: ours, without the dispatching session's identity and without
-    credentials that would bill instead of the apiKeyHelper (headless) or the subscription login (bg)."""
-    return {k: v for k, v in os.environ.items() if k not in SESSION_ENV and k not in CREDENTIAL_ENV}
+    credentials that would bill instead of the apiKeyHelper (headless) or the subscription login (bg). When `repo`
+    is another project's than the session's (other_project), PROJECT_ENV comes from `repo`'s settings alone, a name
+    they do not set left out."""
+    env = {k: v for k, v in os.environ.items() if k not in SESSION_ENV and k not in CREDENTIAL_ENV}
+    if repo is not None and other_project(repo.main):
+        file_env = settings_env(repo.main)
+        for name in PROJECT_ENV:
+            env.pop(name, None)
+            value = setting_from(name, file_env)
+            if value:
+                env[name] = value
+    return env
 
 
 # --------------------------------------------------------------- the repository
@@ -1130,7 +1147,7 @@ def launch(repo, ticket, venue, effort=None):
         try:
             with open(log, "ab") as out:
                 proc = subprocess.Popen(argv, cwd=ticket["worktree"], start_new_session=True, stdout=out,
-                                        stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=child_env())
+                                        stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=child_env(repo))
         except OSError as err:
             return failed(record, f"cannot launch {argv[0]}: {err.strerror or err}")
         record["pid"] = proc.pid
@@ -1142,7 +1159,7 @@ def launch(repo, ticket, venue, effort=None):
         argv.append(prompt)
         try:
             done = subprocess.run(argv, cwd=ticket["worktree"], capture_output=True, text=True, errors="replace",
-                                  stdin=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT, env=child_env())
+                                  stdin=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT, env=child_env(repo))
         except (OSError, subprocess.SubprocessError) as err:
             return failed(record, f"cannot launch {argv[0]} --bg: {err}")
         try:
@@ -1425,8 +1442,9 @@ def cmd_cloud(repo, args):
     slug = found.get("nameWithOwner") if isinstance(found, dict) else None
     if not isinstance(slug, str) or "/" not in slug:
         raise Problem("gh repo view printed no owner/name; nothing started")
-    file_env = settings_env(repo.main)
-    verify = setting("CLAUDE_VERIFY_CMD", file_env) or setting("HARNESS_TEST_CMD", file_env)
+    file_env, foreign = settings_env(repo.main), other_project(repo.main)
+    verify = (project_setting("CLAUDE_VERIFY_CMD", file_env, foreign)
+              or project_setting("HARNESS_TEST_CMD", file_env, foreign))
     ticket = start_ticket(repo, n, "cloud")
     branch = ticket["branch"]
     pushed = git(ticket["worktree"], "push", "-u", "origin", branch)
