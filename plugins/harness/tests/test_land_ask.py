@@ -4,7 +4,8 @@ prompt (permissionDecision "ask") unless every ticket the PR closes is labeled r
 The hook runs as a subprocess, the way Claude Code runs it: PreToolUse JSON on stdin, a temporary HOME, its own
 working directory outside the repos, and temporary git repos made with `git init -b main`. gh is HARNESS_GH, a
 small wrapper written once per module: it logs every call (argv and the directory it ran in), hangs on one gh
-subcommand when told to, and answers as fakegh.py does from the scenario of the directory it runs in. Any
+subcommand or answers every call slowly when told to, and answers as fakegh.py does from the scenario of the
+directory it runs in. Any
 directory without a scenario of its own (a linked worktree, a subdirectory, the hook's working directory) gets
 a decoy in which every PR closes a risk:low ticket, so a hook that runs gh anywhere but the main checkout stays
 silent where it must ask. Nothing touches the network or ~/.claude.
@@ -13,8 +14,8 @@ The contract these tests read from the ticket:
   - ask, the reason naming the ticket and risk:high, for a PR closing a risk:high ticket; nothing at all (no
     stdout, no stderr, exit 0) when every ticket is risk:low;
   - ask, each with its own reason, for a ticket without a risk label, a PR with no ticket (it closes nothing and
-    its head is not t/<N>-), a failing gh and a gh slower than 3 s; the ticket comes from a t/<N>- head only
-    when the PR closes nothing;
+    its head is not t/<N>-), a failing gh, a gh slower than 3 s and gh calls past 8 s in all (inside the 10 s
+    hook timeout); the ticket comes from a t/<N>- head only when the PR closes nothing;
   - ask, naming the flag, with no gh call, for --accept-findings or --discard;
   - `cd <dir> && harness-pr land P` is judged in the main checkout of <dir>; `harness-pr ready P`,
     `harness-pr land --help`, `harness-pr land` without a number and commands without harness-pr print nothing
@@ -59,11 +60,16 @@ GIT_IDENTITY = {
 HOOK_TIMEOUT = 10  # what hooks.json gives the hook
 # A gh that hangs is cut off after 3 s; 6 s leaves room for a loaded machine, not for an 8 s call.
 ONE_CALL_LIMIT = 6.0
-# Several gh calls that each hang share 8 s in all: the hook answers inside the 10 s Claude Code gives it.
+# gh calls share 8 s in all: the hook answers inside the 10 s Claude Code gives it.
 ALL_CALLS_LIMIT = 9.5
+# A slow gh that is still in time on every call: each answer after 1.5 s (with the fake's own start, 1.7 to 2.3 s
+# on a loaded Mac), so a loaded machine does not push one past the 3 s cut-off.
+CALL_DELAY = 1.5
 
 # The fake gh. It logs the call and the directory it ran in, sleeps 30 s when its first argument is
-# LANDASK_HANG's, then runs fakegh.py with the scenario LANDASK_DIRS maps this directory to ("*" for any other).
+# LANDASK_HANG's, answers one call at a time, each after LANDASK_DELAY seconds, when that is set (calls made at
+# once queue, so the total is the same however the hook makes them), then runs fakegh.py with the scenario
+# LANDASK_DIRS maps this directory to ("*" for any other).
 WRAPPER = r'''#!@PYTHON@
 import json
 import os
@@ -78,6 +84,12 @@ with open(os.environ["LANDASK_LOG"], "a", encoding="utf-8") as fh:
 hang = os.environ.get("LANDASK_HANG")
 if hang and sys.argv[1:2] == [hang]:
     time.sleep(30)
+delay = os.environ.get("LANDASK_DELAY")
+if delay:
+    import fcntl
+    turn = open(os.environ["LANDASK_LOG"] + ".lock", "a")  # held until this gh exits or is killed
+    fcntl.flock(turn, fcntl.LOCK_EX)
+    time.sleep(float(delay))
 with open(os.environ["LANDASK_DIRS"], encoding="utf-8") as fh:
     dirs = json.load(fh)
 os.environ["FAKEGH_SCENARIO"] = dirs.get(cwd, dirs["*"])
@@ -386,8 +398,8 @@ class LandAskTests(unittest.TestCase):
                 if cause == "pr view fails":
                     reasons["gh failing"] = reason
 
-        # A gh slower than 3 s: on the PR's view, or on every issue view of a PR closing four tickets (sequential
-        # 3 s calls would outlast the hook's 10 s; 8 s in all keeps it inside).
+        # A gh slower than 3 s: on the PR's view, or on every issue view of a PR closing four tickets (a hook that
+        # goes on past a cut-off call still answers inside 8 s in all).
         tickets = (21, 22, 23, 24)
         for hang, limit in (("pr", ONE_CALL_LIMIT), ("issue", ALL_CALLS_LIMIT)):
             with self.subTest(cause="gh slow", hang=hang):
@@ -398,6 +410,24 @@ class LandAskTests(unittest.TestCase):
                 self.assertRegex(reason, r"\bgh\b", "the reason does not say gh was too slow")
                 if hang == "pr":
                     reasons["gh slow"] = reason
+
+        # A gh in time on every call, slow in all: a PR closing six risk:low tickets is seven calls, 10.5 s or more
+        # at 1.5 s each, past 8 s in all. Calls cut off at 3 s each with no shared deadline run past the 10 s
+        # Claude Code gives the hook, and a hook killed there lets the land run unasked: ask, naming gh, inside it.
+        slow = {"LANDASK_DELAY": str(CALL_DELAY)}
+        many = (21, 22, 23, 24, 25, 26)
+        with self.subTest(cause="gh slow in all", tickets=many, delay=CALL_DELAY):
+            self.scenario(pr_call(12, many), *(issue_call(n, "risk:low") for n in many))
+            code, out, err, seconds = self.run_hook("harness-pr land 12", env=slow)
+            reason = self.ask_reason("harness-pr land 12", code, out, err)
+            self.assertLess(seconds, ALL_CALLS_LIMIT, f"seven {CALL_DELAY} s gh calls took {seconds:.1f} s to answer")
+            self.assertRegex(reason, r"\bgh\b", "the reason does not say gh ran out of time")
+        # What that ask is not: the six tickets answered at once pass, and so do two of them at 1.5 s a call (three
+        # calls, about 5.5 s, inside 8 s), so neither the tickets nor a slow call alone asks.
+        for few, env in ((many, None), (many[:2], slow)):
+            with self.subTest(cause="gh in time", tickets=few, delay=env and CALL_DELAY):
+                self.scenario(pr_call(12, few), *(issue_call(n, "risk:low") for n in few))
+                self.assert_silent("harness-pr land 12", env=env)
 
         # P that is not a PR number.
         self.scenario(pr_call(12, [40]), issue_call(40, "risk:low"))
