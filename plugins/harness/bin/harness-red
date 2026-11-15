@@ -532,33 +532,39 @@ def module_parts(python, node):
     return node.split("/")[:2 if node.startswith("@") else 1]
 
 
-def provides(path, parts):
-    """Whether `path` lies under a directory or is a file that provides the module `parts`: its components hold
-    them in a row, the last one also matching a file's name up to its first dot (a.py, a.cpython-312-darwin.so)."""
+PY_SUFFIXES = (".py", ".so", ".pyd")         # what python imports a module from: source or a compiled extension
+
+
+def provides(path, parts, node):
+    """Whether `path` is a file that can satisfy the import of the module `parts`. Node: it lies in a directory
+    `node_modules/<pkg>` (or is that link). Python: it is `<top>.py`, or `<top>.<tag>.so`/`.pyd`, or a python file
+    beneath a directory named `<top>` (a package, a namespace package). A config or doc file that only shares the
+    name (next.config.js, pytest.ini, docs/yaml.md) provides nothing."""
     comps = path.rstrip("/").split("/")
-    n = len(parts)
-    for i in range(len(comps) - n + 1):
-        here = comps[i:i + n]
-        if here[:-1] == parts[:-1] and (here[-1] == parts[-1] or
-                                        (i + n == len(comps) and here[-1].split(".")[0] == parts[-1])):
-            return True
-    return False
+    if node:
+        n = len(parts)
+        return any(comps[i] == "node_modules" and comps[i + 1:i + 1 + n] == parts for i in range(len(comps) - n))
+    top, name = parts[0], comps[-1]
+    if name == top + ".py" or (name.startswith(top + ".") and name.endswith((".so", ".pyd"))):
+        return True
+    return top in comps[:-1] and name.endswith(PY_SUFFIXES)
 
 
 def environment_dependencies(repo, output):
     """[(module, path)]: the modules a failed run could not import that only the ticket worktree's environment has:
     an untracked or ignored path there provides it and no tracked file does (a module the branch's own source adds
     is tracked, and is the usual red)."""
-    names = list(dict.fromkeys(tuple(module_parts(*m)) for m in MISSING_NAME_RE.findall(output)))
+    names = list(dict.fromkeys((bool(m[1]), tuple(module_parts(*m))) for m in MISSING_NAME_RE.findall(output)))
     if not names:
         return []
     tracked = [p for p in git(repo.top, "ls-files", "-z", "--cached").stdout.split("\0") if p]
     others = [p for p in git(repo.top, "ls-files", "-z", "--others").stdout.split("\0") if p]
     found = []
-    for parts in map(list, names):
-        if any(provides(p, parts) for p in tracked):
+    for node, parts in names:
+        parts = list(parts)
+        if any(provides(p, parts, node) for p in tracked):
             continue
-        provider = next((p for p in others if provides(p, parts)), None)
+        provider = next((p for p in others if provides(p, parts, node)), None)
         if provider:
             found.append(("/".join(parts), provider))
     return found

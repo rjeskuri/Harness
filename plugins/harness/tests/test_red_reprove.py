@@ -698,6 +698,27 @@ print("AssertionError: pad(1) is not '01'")
 sys.exit(1)
 '''
 
+NODE_FORMS = '''import os, sys
+pkg, says = os.environ["NODE_NEEDS"], os.environ["NODE_SAYS"]
+if not os.path.isdir(os.path.join("node_modules", pkg)):
+    if os.environ.get("NODE_ESM"):
+        print("node:internal/modules/esm/resolve:873")
+        print("  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);")
+        print("Error [ERR_MODULE_NOT_FOUND]: Cannot find " + "package '" + says + "' imported from "
+              + os.path.join(os.getcwd(), "tests", "fmt.test.mjs"))
+        print("  code: 'ERR_MODULE_NOT_FOUND'")
+    else:
+        print("node:internal/modules/cjs/loader:1228")
+        print("  throw err;")
+        print("Error: Cannot find " + "module '" + says + "'")
+        print("Require stack:")
+        print("- " + os.path.join(os.getcwd(), "tests", "x.test.js"))
+        print("  code: 'MODULE_NOT_FOUND',")
+    sys.exit(1)
+print("AssertionError: expected 1 to equal 2")
+sys.exit(1)
+'''
+
 
 class ReproveEnvironment(Fixture):
     """#292: the temporary worktree has only tracked files. A run there that fails only because a dependency the
@@ -760,6 +781,93 @@ class ReproveEnvironment(Fixture):
                         shutil.rmtree(target) if os.path.isdir(target) else os.remove(target)
         self.assertEqual(self.status_line(), "current: yes")
 
+    def test_a_tracked_file_that_only_shares_the_dependencys_name_does_not_provide_it(self):
+        # A project tracks config and docs named like its dependencies (next.config.js, pytest.ini, docs/yaml.md):
+        # none of them can satisfy the import, so the dependency is still only in the environment and the run
+        # against main's code is refused, in python's dotted form and node's CommonJS and ESM forms too.
+        self.red_ticket_with_source()
+        node = write(os.path.join(self.tmp, "node_forms.py"), NODE_FORMS)
+        decoys = {
+            "docs/ruamelx_b6.md": "# ruamelx_b6\n", "ruamelx_b6.ini": "[ruamelx_b6]\nx = 1\n",
+            "tomlette_h1.toml": "x = 1\n", "config/tomlette_h1.yaml": "x: 1\n",
+            "docs/vendored_n8.rst": "vendored_n8\n",
+            "pkgx_d4.cfg": "[pkgx_d4]\n", "docs/pkgx_d4/sub.md": "# sub\n",
+            "nextish_c5.config.js": "module.exports = {};\n", "src/nextish_c5.js": "module.exports = 1;\n",
+            "vitestish_e2.config.ts": "export default {};\n", "docs/vitestish_e2.md": "# vitestish_e2\n",
+            "fmt.config.js": "module.exports = {};\n", "docs/@acme_w3/fmt.md": "# fmt\n",
+        }
+        for rel, text in decoys.items():
+            self.put(rel, text)
+        self.commit("config and docs named like the dependencies")
+        self.assertEqual(self.status_line(), "current: yes")        # they are not tests: the record still holds
+
+        def node_env(pkg, says, esm=False):
+            env = {"HARNESS_TEST_CMD": f"python3 {shlex.quote(node)} {{files}}", "NODE_NEEDS": pkg,
+                   "NODE_SAYS": says}
+            return dict(env, NODE_ESM="1") if esm else env
+
+        dotted = ("Traceback (most recent call last):\n  File \"tests/test_calc.py\", line 4, in <module>\n"
+                  "    import pkgx_d4.sub\nModuleNotFoundError: No module named 'pkgx_d4.sub'\n\n"
+                  "Ran 0 tests in 0.000s\n\nFAILED (errors=1)\n")
+        cases = [
+            # (name, module named in the refusal, untracked providers, test file changes, env, real python run)
+            ("virtualenv package beside docs and an ini", "ruamelx_b6",
+             [".venv/site/ruamelx_b6/__init__.py"], {"tests/test_calc.py": self.dep_test("ruamelx_b6")},
+             self.venv_cmd, True),
+            ("virtualenv module beside toml and yaml", "tomlette_h1",
+             [".venv/site/tomlette_h1.py"], {"tests/test_calc.py": self.dep_test("tomlette_h1")},
+             self.venv_cmd, True),
+            ("vendored, ignored, beside a doc", "vendored_n8",
+             ["vendored_n8.py"], {"tests/test_calc.py": self.dep_test("vendored_n8")}, {}, True),
+            ("dotted python name", "pkgx_d4",
+             [".venv/site/pkgx_d4/__init__.py", ".venv/site/pkgx_d4/sub.py"],
+             {"tests/test_calc.py": self.dep_test("pkgx_d4.sub")}, self.fake_runner(dotted, 1), False),
+            ("node subpath beside a config and src file", "nextish_c5",
+             ["node_modules/nextish_c5/router.js"],
+             {"tests/router.test.js": "const router = require('nextish_c5/router');\n"},
+             node_env("nextish_c5", "nextish_c5/router"), False),
+            ("node ESM package", "vitestish_e2",
+             ["node_modules/vitestish_e2/index.js"],
+             {"tests/fmt.test.mjs": "import { it } from 'vitestish_e2';\n"},
+             node_env("vitestish_e2", "vitestish_e2", esm=True), False),
+            ("node scoped package", "@acme_w3/fmt",
+             ["node_modules/@acme_w3/fmt/index.js"],
+             {"tests/scoped.test.js": "const fmt = require('@acme_w3/fmt/sub');\n"},
+             node_env("@acme_w3/fmt", "@acme_w3/fmt/sub"), False),
+        ]
+        for name, module, providers, changes, env, real in cases:
+            with self.subTest(name):
+                for provider in providers:
+                    self.put(provider, "VALUE = 1\n")
+                self.put("tests/test_calc.py", TEST_ADD_COVERED)
+                for rel, text in changes.items():
+                    self.put(rel, text)
+                try:
+                    if real:                           # the premise: the ticket worktree has it, the test passes
+                        p = subprocess.run(env.get("HARNESS_TEST_CMD", "python3 -m unittest {files}").format(
+                            files="tests/test_calc.py"), shell=True, cwd=self.wt, env=self.env,
+                            capture_output=True, text=True, timeout=120)
+                        self.assertEqual(p.returncode, 0, quiet(p.stdout + p.stderr))
+                    self.assertEqual(self.status_line(), "current: no")
+                    kept, snapshot = self.kept(), self.snapshot()
+                    p = self.red("reprove", **env)
+                    said = quiet(p.stdout + p.stderr)
+                    self.assertEqual(p.returncode, 1, f"not refused: {said}")
+                    self.assertEqual(len(p.stderr.strip().splitlines()), 1, said)
+                    self.assertFalse("Traceback" in p.stderr, said)
+                    self.assertTrue(module in p.stderr, f"the refusal does not name {module}: {said}")
+                    self.assertEqual(self.kept(), kept, "a record or side file was written")
+                    self.assertEqual(self.snapshot(), snapshot)
+                    self.assertEqual(self.status_line(), "current: no")
+                    self.assertEqual(self.hook("calc.py"), CHANGED)
+                finally:
+                    self.git(self.wt, "checkout", "--", "tests/test_calc.py")
+                    tops = {p.split("/")[0] for p in providers} | {r for r in changes if r != "tests/test_calc.py"}
+                    for rel in tops:
+                        target = os.path.join(self.wt, rel)
+                        shutil.rmtree(target) if os.path.isdir(target) else os.remove(target)
+        self.assertEqual(self.status_line(), "current: yes")
+
     def test_a_module_only_the_branchs_source_has_is_still_red(self):
         # The guard: the tests import what the branch builds (a new module, a new name in calc), which main's code
         # at the merge base lacks; that is the usual red, and an ignored .venv beside it changes nothing.
@@ -767,12 +875,16 @@ class ReproveEnvironment(Fixture):
         self.red_ticket_with_source()
         self.put("shapes_v5.py", "def area(w, h):\n    return w * h\n")
         self.put("calc.py", CALC_BUILT + "\n\ndef mul_w8(a, b):\n    return a * b\n")
+        self.put("geom_p2/__init__.py", "def perimeter(w, h):\n    return 2 * (w + h)\n")
         self.commit("the branch's own source")
+        self.put(".venv/site/geom_p2/__init__.py", "def perimeter(w, h):\n    return 2 * (w + h)\n")  # untracked copy
         cases = [
             ("a new module", "import shapes_v5\n",
              "    def test_area(self):\n        self.assertEqual(shapes_v5.area(2, 3), 6)\n", "shapes_v5"),
             ("a new name in calc", "from calc import mul_w8\n",
              "    def test_mul(self):\n        self.assertEqual(mul_w8(2, 3), 6)\n", "mul_w8"),
+            ("a new tracked package beside an untracked copy", "import geom_p2\n",
+             "    def test_perimeter(self):\n        self.assertEqual(geom_p2.perimeter(2, 3), 10)\n", "geom_p2"),
         ]
         for name, imports, test, needle in cases:
             with self.subTest(name):
