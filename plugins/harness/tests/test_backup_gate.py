@@ -54,9 +54,17 @@ Choices the ticket leaves open, fixed here:
   files' st_size, links not followed, as the manifest's bytes), over all copied targets of the command; the sizes
   used are over or under the cap whether MB means 10^6 or 2^20 bytes. A reason names the size when it shows a
   number with a unit within 25% of the byte count (decimal or binary units), and the cap when it shows its number.
-- HARNESS_BACKUP is read from the environment first, then `env` in the main checkout's tracked
-  .claude/settings.json; an environment value other than off (on) wins over a settings off. Every
+- HARNESS_BACKUP is read from the environment first, then `env` in the main checkout's .claude/settings.json as it
+  is on disk (settings_env, as backups.sensitive_patterns, branch_guard and tests_first read their settings; only
+  autoland reads the committed file); an environment value other than off (on) wins over a settings off. Every
   permission_mode but plan (default, auto, acceptEdits, bypassPermissions) gets the same answer.
+- branch_guard's decision is its own, on the whole command: any part it refuses (a write into a main checkout on
+  main, git commit there, a force push, a push to main) leaves the command with no decision and no snapshot, even
+  when the rm itself is in a worktree; HARNESS_ALLOW_MAIN counts wherever branch_guard reads it (the environment,
+  the repository's .claude/settings.json, then its .claude/settings.local.json).
+- Every named folder (not sensitive, not secret-shaped) inside a copied target is left out of the copy and the
+  size, at any depth; in a project with sensitive patterns a named folder holding no matching path stays
+  rebuildable, and one holding a matching path (node_modules/pkg/x.db under *.db) is copied whole.
 - The session's project is the main checkout of CLAUDE_PROJECT_DIR (a worktree's names its main checkout), else
   of the event's cwd; a worktree outside the main checkout's folder is inside the project.
 - A store the snapshot cannot be written to is the hook's own error: one stderr line, exit 0, no decision.
@@ -521,22 +529,25 @@ class BackedUp(GateTest):
                 self.assertFalse(holds(store, nm_marker), f"{command!r}: node_modules went into the snapshot")
                 self.round_trip(sid, held, was, wt)
 
-        # A named folder inside a copied target is left out of the copy and of the size: 2.5 MB of
-        # web/node_modules under a 1 MB cap is no reason to ask.
-        app = os.path.join(wt, "app-" + self.word())
-        self.put(os.path.join(app, "index.js"))
-        self.put(os.path.join(app, "src", "view.js"), mode=0o640)
-        big = self.put(os.path.join(app, "node_modules", "react", "big.bin"), size=2_500_000)
-        command = f"rm -rf {os.path.basename(app)}"
-        with self.subTest(command=command):
-            before = self.snapshots()
-            want = {k: v for k, v in tree(app).items() if k != "node_modules" and not k.startswith("node_modules/")}
-            p = self.run_gate(command, wt, main, env={"HARNESS_BACKUP_CAP_MB": "1"})
-            sid = self.expect_backup(p, before, store, None, command)
-            self.assertFalse(holds(os.path.join(store, sid), big[:4096]), "node_modules went into the snapshot")
-            remove(app)
-            self.restore(sid, wt)
-            self.assertEqual(tree(app), want, f"restored from {sid} (seed {self.seed})")
+        # Every named folder inside a copied target is left out of the copy and of the size: 2.5 MB of it
+        # under a 1 MB cap is no reason to ask. Each sits at the top of the target or one folder down.
+        for name in REBUILDABLE:
+            app = os.path.join(wt, "app-" + self.word())
+            self.put(os.path.join(app, "index.js"))
+            self.put(os.path.join(app, "src", "view.js"), mode=0o640)
+            self.put(os.path.join(app, "sub", "keep.js"))
+            inner = self.rng.choice([name, "sub/" + name])
+            big = self.put(os.path.join(app, inner, "pkg", "big.bin"), size=2_500_000)
+            command = f"rm -rf {os.path.basename(app)}"
+            with self.subTest(command=command, inner=inner, seed=self.seed):
+                before = self.snapshots()
+                want = {k: v for k, v in tree(app).items() if k != inner and not k.startswith(inner + "/")}
+                p = self.run_gate(command, wt, main, env={"HARNESS_BACKUP_CAP_MB": "1"})
+                sid = self.expect_backup(p, before, store, None, command)
+                self.assertFalse(holds(os.path.join(store, sid), big[:4096]), f"{inner} went into the snapshot")
+                remove(app)
+                self.restore(sid, wt)
+                self.assertEqual(tree(app), want, f"restored from {sid} (seed {self.seed})")
 
     def test_sensitive_path_snapshot_stays_in_the_project(self):
         main = self.make_project("vault", settings={"HARNESS_SENSITIVE_PATHS": "data/**, *.db"})
@@ -562,9 +573,22 @@ class BackedUp(GateTest):
                 p = self.run_gate(command, cwd, project)
                 sid = self.expect_backup(p, before, store, targets, command)
                 self.round_trip(sid, targets, was, cwd)
-        self.fill(os.path.join(wt, "node_modules"), files=1)                   # neither sensitive nor copied
-        before = self.snapshots()
-        self.expect_allow_without_copy(self.run_gate("rm -rf node_modules", wt, main), before, "rm -rf node_modules")
+        # Named folders holding nothing that matches a pattern stay rebuildable in a project with patterns.
+        plain = ["build", ".venv", f"lib/{self.word()}/__pycache__", "site/dist", "node_modules"]
+        for rel in plain:
+            self.fill(os.path.join(wt, rel), files=2)
+        for rel in plain:
+            command = f"rm -rf {rel}"
+            with self.subTest(command=command):
+                before = self.snapshots()
+                self.expect_allow_without_copy(self.run_gate(command, wt, main), before, command)
+        modules = os.path.join(wt, "node_modules")
+        self.put(os.path.join(modules, "pkg", "x.db"))                         # now it holds a sensitive path
+        with self.subTest(command="rm -rf node_modules", holds="x.db"):
+            before, was = self.snapshots(), {modules: tree(modules)}
+            p = self.run_gate("rm -rf node_modules", wt, main)
+            sid = self.expect_backup(p, before, store, [modules], "rm -rf node_modules")
+            self.round_trip(sid, [modules], was, wt)
         glob = self.global_store()
         self.assertFalse(os.path.lexists(glob) and not os.path.isdir(glob), glob)
         self.assertEqual(os.listdir(glob) if os.path.isdir(glob) else [], [], f"written under {glob}")
@@ -836,6 +860,7 @@ class Nothing(GateTest):
         self.put(scratch)
         s = os.path.basename(scratch)
         victim = self.fill(os.path.join(wt, "victim-" + self.word()), files=1)
+        v = os.path.basename(victim)
         denied = (
             ("rm src/app.py", main),
             ("rm -rf src", main),
@@ -843,12 +868,35 @@ class Nothing(GateTest):
             (f"rm -rf {os.path.basename(notes)}", main),
             (f"rm -f {s} && rm docs/a.md", main),
             (f"rm -f {main}/README.md", wt),
-            (f"rm -rf {os.path.basename(victim)} && git push --force origin t/1-x", wt),
+            # The rm is fine (a worktree); branch_guard refuses another part of the command.
+            (f"rm -rf {v} && git push --force origin t/1-x", wt),
+            (f"rm -rf {v} && git push -f origin t/1-x", wt),
+            (f"rm -rf {v} && git push origin +t/1-x", wt),
+            (f"rm -rf {v} && git push origin main", wt),
+            (f"rm -rf {v} && echo x > {main}/src/new.py", wt),
+            (f"rm -rf {v} && cp a {main}/src/app.py", wt),
+            (f"rm -rf {v} && git -C {main} commit -m x", wt),
         )
         for command, cwd in denied:
             with self.subTest(command=command, cwd=cwd):
                 before = self.snapshots()
                 self.expect_nothing(self.run_gate(command, cwd, main), before, command)
+        command = f"rm -rf {v} && git push origin t/1-x"            # a push branch_guard lets through
+        with self.subTest(command=command):
+            before = self.snapshots()
+            self.expect_snapshot_only(self.run_gate(command, wt, main), before, self.global_store(), [victim], command)
+
+        # HARNESS_ALLOW_MAIN=1 in the main checkout's settings.local.json alone (git-ignored), as branch_guard reads it.
+        local = self.make_project("proj-local")
+        self.put(os.path.join(local, ".claude", "settings.local.json"),
+                 data=(json.dumps({"env": {"HARNESS_ALLOW_MAIN": "1"}}) + "\n").encode())
+        self.assertTrue(self.ignored(local, ".claude/settings.local.json"))
+        target = os.path.join(local, "src", "app.py")
+        with self.subTest(command="rm src/app.py", settings_local="HARNESS_ALLOW_MAIN=1"):
+            before, was = self.snapshots(), {target: tree(target)}
+            p = self.run_gate("rm src/app.py", local, local)
+            sid = self.expect_backup(p, before, self.global_store(), [target], "rm src/app.py")
+            self.round_trip(sid, [target], was, local)
 
         backed = (
             (f"rm -f {s}", None, [scratch]),                                    # branch_guard's ignored exemption
