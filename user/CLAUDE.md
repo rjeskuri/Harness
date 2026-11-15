@@ -10,7 +10,7 @@
 
 - Ticketed work is a GitHub issue on the project's board: an epic with task sub-issues, each with a request, an outline, a definition of done and the tests that must pass. Read the ticket (`harness-board show N --markdown`) and its epic before working; status changes go through `harness-board`.
 - A question the ticket, the epic and the code cannot answer becomes `harness-board needs-input N --question ...` when it is about product behavior, is hard to undo, or touches security, credentials or personal data. A reversible implementation choice is decided and recorded as a `Ruling:` line under `### Rulings` in the PR's Notes. I answer on the ticket; the next `/harness:work N` reads the answer.
-- New work: `/harness:plan <request>`. Tickets to pull requests: `/harness:work [N]`. I land every pull request, with `/harness:land [PR#]` or by approving the land prompt; a session pushes `t/*` branches and opens PRs without asking but never merges. A quick fix outside a ticket goes on a branch too (`git switch -c t/<n>-<slug>`).
+- New work: `/harness:plan <request>`. Tickets to pull requests: `/harness:work [N]`. The loop lands a `risk:low` ticket's PR with `harness-pr land` once its branch is current with main and green and its high and medium findings are fixed, a `risk:high` one waits for my `/harness:land`, and a session merges no other way. A session pushes `t/*` branches and opens PRs without asking. A quick fix outside a ticket goes on a branch too (`git switch -c t/<n>-<slug>`).
 
 ## Tests first
 

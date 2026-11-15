@@ -4,7 +4,7 @@ Written 2026-10-13 for harness v2, Claude Code 2.1.296 and gh 2.99.0. The design
 
 ## What you have now
 
-The harness turns each project's GitHub issues into the context for every session. You describe work once, it becomes tickets, agents carry tickets to pull requests, and you merge. Each piece has one job.
+The harness turns each project's GitHub issues into the context for every session. You describe work once, it becomes tickets, agents carry tickets to pull requests and land the low-risk ones, and you land the rest. Each piece has one job.
 
 | Piece | What it is | What it does for you |
 | --- | --- | --- |
@@ -29,7 +29,7 @@ In a terminal, in this order.
 6. **Plan once.** `/harness:plan <a small, real request>`. Answer the interview, read the proposed table of tasks, approve it. The epic and tasks appear on GitHub.
 7. **Work one ticket here.** `/harness:work <n>` runs the whole loop in this session, so you see each stage. Later, `/harness:work` with no number dispatches every ready ticket in the background.
 8. **Answer a ticket.** When a notification says `<repo> #N needs input`, open the issue, reply in a comment, then run `/harness:work N`.
-9. **Land.** When a notification says a PR is ready, read it on GitHub, then `/harness:land` to list what is waiting and `/harness:land <P>` to merge one.
+9. **Land.** A `risk:low` ticket's run lands its own PR with `harness-pr land` once the branch is current with main, CI is green and its high and medium findings are fixed. A `risk:high` one stops at a ready PR for you: when a notification says a PR is ready, read it on GitHub, then `/harness:land` to list what is waiting and `/harness:land <P>` to merge one.
 
 ## A working day
 
@@ -39,7 +39,7 @@ In a terminal, in this order.
 | Standup | `/harness:standup` | Per project: git state, board counts, PRs awaiting you, needs-input tickets, stale worktrees, next steps, hours. Then a proposed order for the day |
 | Plan | `/harness:plan <request>` | New work on the board as an epic and tasks |
 | Work | `/harness:work` or `/harness:work <n>` | Ready tickets dispatched, or one run here |
-| Land | `/harness:land`, then `/harness:land <P>` | Reviewed PRs merged, worktrees and branches cleaned up, tickets closed |
+| Land | `/harness:land`, then `/harness:land <P>` | The PRs the loop leaves at ready (`risk:high`, or a land it could not finish) merged, worktrees and branches cleaned up, tickets closed. A `risk:low` PR lands at the end of its run |
 | Handoff | `/harness:handoff`, then `/clear` | `docs/agent/handoff.md`, which the next session's brief reads |
 | Worklog | `/harness:worklog` | The day's hours and a client note on billable projects |
 
@@ -59,6 +59,7 @@ One session per project. `claude agents` in a terminal lists every session, incl
 | CI | `harness-pr checks <P> --wait` | Waits for checks. Failures go back to the coder, at most twice |
 | Ultrareview | `harness-pr ultra <P> --post` | Only on `risk:high`; posts a cloud review to the PR. With `HARNESS_ULTRAREVIEW=off` in the project's settings it prints one line saying ultrareview is off and runs nothing |
 | Ready | `harness-pr ready <P>` | Marks the PR ready, sets `status:in-review`, notifies you |
+| Land | `harness-pr land <P>` | Only on `risk:low`: merges main into the branch when it is behind, reruns the ticket's own tests and CI, then merges the PR, removes the worktree and branch and closes the ticket. A `risk:high` PR stops at Ready for you |
 
 Every stage reports pass or fail to `harness-work attempt`. A first failure retries at the same tier and effort. A second re-runs one step up: Sonnet goes to Opus, Opus goes to Opus at effort xhigh, and a second failure already at Opus xhigh (or max), or on an explicitly named Fable run, posts a needs-input question instead. A third posts a needs-input question on the ticket and stops. No escalation goes to Fable.
 
@@ -76,7 +77,7 @@ On GitHub you see the work in two places. The ticket gets comments as it moves: 
 
 **Answer needs-input tickets.** The agents stop and ask only when the ticket, the epic and the code cannot answer a question that is about product behavior, is hard to undo, or touches security, credentials or personal data. A reversible implementation choice the ticket leaves open is decided and recorded as a `Ruling:` line under `### Rulings` in the PR's Notes; overrule one in a review comment on the PR. For a question, the ticket gets `status:needs-input` and a comment headed **Needs your input** with the question and the evidence, and you get a notification. Reply in a comment on the issue. `/harness:work N` reads your newest comment as the answer and carries on.
 
-**Review pull requests.** Agents open PRs under your GitHub account, so GitHub will not let you approve them; landing is the approval. Read the PR, leave review comments where something should change, and run `/harness:work N` again: it gives the coder your unresolved threads, pushes, waits for checks and answers each thread with what changed. When it is right, `/harness:land <P>`.
+**Review pull requests.** Agents open PRs under your GitHub account, so GitHub will not let you approve them; landing is the approval. A `risk:low` PR is landed by its own run once the harness review's high and medium findings are fixed and CI is green; a `risk:high` PR, or one the loop could not land, waits for you. Read the PR, leave review comments where something should change, and run `/harness:work N` again: it gives the coder your unresolved threads, pushes, waits for checks and answers each thread with what changed, then lands a `risk:low` PR (your comments count as its review). When a PR left for you is right, `/harness:land <P>`.
 
 The PR body is laid out the same way every time:
 
@@ -161,7 +162,7 @@ A project that sets `HARNESS_ULTRAREVIEW=off` gets no ultrareview: `harness-pr u
 | Red run | `harness-red check` proving the new tests fail before any source changes. Its record unlocks source edits |
 | Breaker | The `test-breaker` agent, which tries to cheat the tests to show they are too narrow |
 | Worktree | A second checkout of the repo in another folder. Each ticket gets one under `.claude/worktrees/` |
-| Land | Squash-merge a PR, remove its worktree and branch, close the ticket: `/harness:land <P>` |
+| Land | Squash-merge a PR, remove its worktree and branch, close the ticket, always through `harness-pr land`: the loop runs it for a `risk:low` ticket, and you run `/harness:land <P>` for the rest |
 | Headless run | A `claude -p` session that dispatch starts per ticket only with `--api` or `--venue headless`, billed to the API key, logged under `~/.claude/harness/runs/` |
 | Budget | The API key or the usage credits. An exhausted one is skipped for 24 hours |
 | Digest | The daily summary across projects, written to `~/.claude/harness/digest/` |
