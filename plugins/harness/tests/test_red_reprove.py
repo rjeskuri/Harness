@@ -72,8 +72,10 @@ TEST_SYNTAX = "import unittest\n\nimport calc\n\n\ndef test_add(:\n    assert ca
 # message goes through quiet().
 EMPTY_RUN = "no tests" + " ran"
 PYTEST_NONE = "collected 0" + " items\n\n=================== " + EMPTY_RUN + " in 0.00s ===================\n"
+# The import phrases (IMPORT_RE) are masked too: they would turn this module's own red run into kind `import`.
 QUIET = re.compile(r"(?i)no\s+tests\s+ran|collected\s+0\s+items|error\s+during\s+collection|error\s+collecting|"
-                   r"(?:Syntax|Indentation|Tab)Error")
+                   r"(?:Syntax|Indentation|Tab)Error|ModuleNotFoundError|ImportError|No\s+module\s+named|"
+                   r"Cannot\s+find\s+module|ERR_MODULE_NOT_FOUND")
 
 
 def quiet(text):
@@ -680,6 +682,120 @@ class ReproveTest(Fixture):
         self.assertEqual(self.status_line(), "current: yes")
 
 
+# A stand-in for node: it resolves the module NODE_NEEDS from ./node_modules as require() does, says what node says
+# when it is not there, and otherwise fails as an assertion would (main's code). The phrase is built from pieces.
+NODE_LIKE = '''import os, sys
+need = os.environ["NODE_NEEDS"]
+if not os.path.isdir(os.path.join("node_modules", need)):
+    print("node:internal/modules/cjs/loader:1228")
+    print("  throw err;")
+    print("Error: Cannot find " + "module '" + need + "'")
+    print("Require stack:")
+    print("- " + os.path.join(os.getcwd(), "tests", "pad.test.js"))
+    print("  code: 'MODULE_NOT_FOUND',")
+    sys.exit(1)
+print("AssertionError: pad(1) is not '01'")
+sys.exit(1)
+'''
+
+
+class ReproveEnvironment(Fixture):
+    """#292: the temporary worktree has only tracked files. A run there that fails only because a dependency the
+    ticket worktree's environment has (an ignored .venv, a vendored module, node_modules) is missing proves nothing
+    about main's code: it is refused and records nothing. A module the branch's own source adds is still red."""
+
+    def setUp(self):
+        super().setUp()
+        with open(os.path.join(self.repo, ".git", "info", "exclude"), "a", encoding="utf-8") as fh:
+            fh.write(".venv/\nnode_modules/\nvendored_*.py\n")
+        self.venv_cmd = {"HARNESS_TEST_CMD": "PYTHONPATH=.venv/site python3 -m unittest {files}"}
+
+    def dep_test(self, module):
+        """TEST_ADD_COVERED that also imports `module`, as a project's tests import a dependency."""
+        return TEST_ADD_COVERED.replace("import calc\n", f"import calc\nimport {module}\n")
+
+    def test_a_run_that_cannot_import_a_dependency_of_the_ticket_worktree_is_refused(self):
+        self.red_ticket_with_source()
+        node = write(os.path.join(self.tmp, "node_like.py"), NODE_LIKE)
+        cases = [
+            # (name, module, the untracked file that provides it in the ticket worktree, extra test files, env)
+            ("virtualenv", "venvdep_q7", ".venv/site/venvdep_q7/__init__.py", {}, self.venv_cmd),
+            ("another virtualenv module", "yamlish_r2", ".venv/site/yamlish_r2.py", {}, self.venv_cmd),
+            ("vendored, ignored", "vendored_k3", "vendored_k3.py", {}, {}),
+            ("node_modules", "leftpad_z9", "node_modules/leftpad_z9/index.js",
+             {"tests/pad.test.js": "const pad = require('leftpad_z9');\n"},
+             {"HARNESS_TEST_CMD": f"python3 {shlex.quote(node)} {{files}}", "NODE_NEEDS": "leftpad_z9"}),
+        ]
+        for name, module, provider, extra, env in cases:
+            with self.subTest(name):
+                self.put(provider, "VALUE = 1\n")
+                if not provider.endswith(".js"):
+                    self.put("tests/test_calc.py", self.dep_test(module))
+                else:
+                    self.put("tests/test_calc.py", TEST_ADD_COVERED)
+                for rel, text in extra.items():
+                    self.put(rel, text)
+                try:
+                    if not provider.endswith(".js"):   # the premise: the ticket worktree has it, the test passes
+                        p = subprocess.run(env.get("HARNESS_TEST_CMD", "python3 -m unittest {files}").format(
+                            files="tests/test_calc.py"), shell=True, cwd=self.wt, env=self.env,
+                            capture_output=True, text=True, timeout=120)
+                        self.assertEqual(p.returncode, 0, quiet(p.stdout + p.stderr))
+                    self.assertEqual(self.status_line(), "current: no")
+                    kept, snapshot = self.kept(), self.snapshot()
+                    p = self.red("reprove", **env)
+                    said = quiet(p.stdout + p.stderr)
+                    self.assertEqual(p.returncode, 1, f"not refused: {said}")
+                    self.assertEqual(len(p.stderr.strip().splitlines()), 1, said)
+                    self.assertFalse("Traceback" in p.stderr, said)
+                    self.assertTrue(module in p.stderr, f"the refusal does not name {module}: {said}")
+                    self.assertEqual(self.kept(), kept, "a record or side file was written")
+                    self.assertEqual(self.snapshot(), snapshot)        # the provider is still there, nothing moved
+                    self.assertEqual(self.status_line(), "current: no")
+                    self.assertEqual(self.hook("calc.py"), CHANGED)
+                finally:
+                    self.git(self.wt, "checkout", "--", "tests/test_calc.py")
+                    for rel in [provider.split("/")[0], *extra]:     # the whole .venv / node_modules
+                        target = os.path.join(self.wt, rel)
+                        shutil.rmtree(target) if os.path.isdir(target) else os.remove(target)
+        self.assertEqual(self.status_line(), "current: yes")
+
+    def test_a_module_only_the_branchs_source_has_is_still_red(self):
+        # The guard: the tests import what the branch builds (a new module, a new name in calc), which main's code
+        # at the merge base lacks; that is the usual red, and an ignored .venv beside it changes nothing.
+        self.put(".venv/site/helperdep_m4/__init__.py", "VALUE = 1\n")      # an environment the test does not use
+        self.red_ticket_with_source()
+        self.put("shapes_v5.py", "def area(w, h):\n    return w * h\n")
+        self.put("calc.py", CALC_BUILT + "\n\ndef mul_w8(a, b):\n    return a * b\n")
+        self.commit("the branch's own source")
+        cases = [
+            ("a new module", "import shapes_v5\n",
+             "    def test_area(self):\n        self.assertEqual(shapes_v5.area(2, 3), 6)\n", "shapes_v5"),
+            ("a new name in calc", "from calc import mul_w8\n",
+             "    def test_mul(self):\n        self.assertEqual(mul_w8(2, 3), 6)\n", "mul_w8"),
+        ]
+        for name, imports, test, needle in cases:
+            with self.subTest(name):
+                self.put("tests/test_calc.py", TEST_ADD.replace("import calc\n", "import calc\n" + imports) + "\n"
+                         + test)
+                try:
+                    self.assertEqual(self.unittest_exit(self.wt, "tests/test_calc.py"), 0)
+                    base = self.merge_base()
+                    p = self.red("reprove", **self.venv_cmd)
+                    said = quiet(p.stdout + p.stderr)
+                    self.assertEqual(p.returncode, 0, said)
+                    self.assertTrue(p.stdout.splitlines()[:1] == ["red (import): 1 test files, exit 1"], said)
+                    rec = self.record()
+                    self.assertEqual((rec["kind"], rec["exit"], rec["base_sha"]), ("import", 1, base))
+                    self.assertEqual(rec["test_hash"], expected_hash(self.wt, ["tests/test_calc.py"]))
+                    self.assertInText(needle, rec["tail"], "the tail")
+                    self.assertEqual(json.loads(read(self.side_path)), expected_side_file(self.wt, ["tests/test_calc.py"]))
+                    self.assertEqual(self.status_line(), "current: yes")
+                    self.assertIsNone(self.hook("calc.py"))
+                finally:
+                    self.git(self.wt, "checkout", "--", "tests/test_calc.py")
+
+
 class ReproveNoTests(Fixture):
     """A ticket whose cache carries `no-tests` needs no red run: reprove answers exactly as check and status do."""
 
@@ -769,6 +885,29 @@ class ReproveDocs(unittest.TestCase):
         text = "\n".join(design_lines())
         self.assertTrue(CHANGED in text, f"docs/design.md does not state tests_first's denial {CHANGED!r}")
         self.assertFalse(OLD_CHANGED in text, f"docs/design.md still states the old denial {OLD_CHANGED!r}")
+
+
+class HookMatchesDesign(Fixture):
+    """#292: where docs/design.md quotes a tests_first denial, the hook prints exactly that."""
+
+    def test_the_missing_kind_denial_is_the_one_design_md_quotes(self):
+        # Whatever the wording settles on, design.md's tests_first step 4 quotes it in backticks, t/N for the ticket.
+        self.cache()
+        self.put("tests/test_calc.py", TEST_ADD)
+        self.assertRed(self.red("check"), 1)
+        rec = self.record()
+        for kind in (None, "passed"):
+            with self.subTest(kind=kind):
+                if kind is None:
+                    rec.pop("kind", None)
+                else:
+                    rec["kind"] = kind
+                write(self.record_path, json.dumps(rec))
+                reason = self.hook("calc.py")
+                self.assertTrue(reason and reason.startswith("The red record for t/12 "), quiet(reason))
+                quoted = "`" + reason.replace("t/12", "t/N") + "`"
+                self.assertTrue(quoted in "\n".join(design_lines()),
+                                f"docs/design.md does not quote tests_first's denial {quiet(quoted)}")
 
 
 if __name__ == "__main__":
