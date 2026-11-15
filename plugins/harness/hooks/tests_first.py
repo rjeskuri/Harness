@@ -331,7 +331,7 @@ def source_refusal(facts: dict, number: str) -> str | None:
     if record.get("kind") not in RED_KINDS:
         return (
             f"The red record for t/{number} does not say how the tests failed; run "
-            "harness-red check again."
+            "harness-red check again, or harness-red reprove once the branch has source changes."
         )
     # The files hash to test_hash, or are the red-time files (kept in red-files/) with main's
     # merged changes (redproof.py), with what is left of the deadline. Fails closed: a proof that
