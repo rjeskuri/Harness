@@ -6,9 +6,11 @@ notification) and the land exits 1 naming the revert. No executable scripts/smok
 
 The fixtures are pr_support's (WorktreeTest: a bare origin, the main checkout `proj`, the ticket worktree), plus a
 project whose committed scripts/smoke.sh reads the landed content: canary/status is its exit, canary/sleep how long
-it sleeps first, canary/note what it prints (on stdout and on stderr) and logs with its working directory. Main
-holds the healthy values before the land; PR #34's squash merge, a real commit pushed to origin from a second clone
-as GitHub's merge would be, sets the case's values, so only a canary run after the fast-forward sees them.
+it sleeps first, canary/linger how long a background child it leaves (its pid recorded) lives, canary/note what it
+prints (on stdout and on stderr) and logs with its working directory. Main holds the healthy values before the land;
+PR #34's squash merge, a real commit pushed to origin from a second clone as GitHub's merge would be, sets the case's
+values, so only a canary run after the fast-forward sees them. Every slow canary sleeps the same SLOW seconds, so
+only the limit in force (SHORT or LONG, from the environment, else the settings, else the default) decides.
 
 Run: PYTHONPATH=plugins/harness/tests python3 -m unittest plugins/harness/tests/test_pr_land_canary.py -v
 """
@@ -16,6 +18,7 @@ Run: PYTHONPATH=plugins/harness/tests python3 -m unittest plugins/harness/tests/
 from __future__ import annotations
 
 import re
+import signal
 import time
 import unittest
 
@@ -28,13 +31,21 @@ LAND_FIELDS = "isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,
 HEAD_SHA = harness_review(1, at(1))[0]["commit_id"]
 SMOKE = "scripts/smoke.sh"
 BUG = 40
+SLOW = 2            # seconds every slow canary takes before it exits
+SHORT = "1"         # a limit it runs past: degraded
+LONG = "8"          # a limit it ends within: its exit decides
 
 # The fixture project's canary, as the scaffold's contract has it (0 healthy, 1 big failure, 2 degraded); what it
-# does is read from the checkout it runs in. {log} is the absolute path of the run log.
+# does is read from the checkout it runs in. {log} is the absolute path of the run log, {pids} where the pid of its
+# lingering background child goes (that child holds none of the canary's output streams).
 SMOKE_SCRIPT = """#!/bin/sh
 printf '%s|%s\\n' "$(pwd -P)" "$(cat canary/note)" >> "{log}"
 echo "canary out: $(cat canary/note)"
 echo "canary err: $(cat canary/note)" >&2
+if [ -f canary/linger ]; then
+    sleep "$(cat canary/linger)" </dev/null >/dev/null 2>&1 &
+    echo $! > "{pids}"
+fi
 if [ -f canary/sleep ]; then sleep "$(cat canary/sleep)"; fi
 exit "$(cat canary/status)"
 """
@@ -58,6 +69,7 @@ class LandCanary(WorktreeTest):
     def setUp(self):
         super().setUp()
         self.smoke_log = os.path.join(self.tmp, "smoke-runs.log")
+        self.smoke_pids = os.path.join(self.tmp, "smoke-child.pid")
         self.bug_stdin = os.path.join(self.tmp, "bug-stdin.jsonl")
         self.outputs(**{"harness-board": {
             "epic-check": {"stdout": EPIC_SAID},
@@ -74,7 +86,8 @@ class LandCanary(WorktreeTest):
         write(os.path.join(self.main, "canary", "status"), "0\n")
         write(os.path.join(self.main, "canary", "note"), "before the land\n")
         if smoke:
-            path = write(os.path.join(self.main, SMOKE), SMOKE_SCRIPT.replace("{log}", self.smoke_log))
+            script = SMOKE_SCRIPT.replace("{log}", self.smoke_log).replace("{pids}", self.smoke_pids)
+            path = write(os.path.join(self.main, SMOKE), script)
             if smoke == "executable":
                 os.chmod(path, 0o755)
             else:
@@ -87,9 +100,10 @@ class LandCanary(WorktreeTest):
         mode = self.git(self.main, "ls-files", "-s", SMOKE).split(" ")[0] if smoke else ""
         self.assertEqual(mode, {"executable": "100755", "plain": "100644", None: ""}[smoke])
 
-    def landed(self, status, note, sleep=None):
+    def landed(self, status, note, sleep=None, linger=None):
         """Push PR #34's squash merge to origin/main from a second clone: the widget, and the canary's inputs for
-        this case (its exit, what it prints, how long it sleeps first); its sha."""
+        this case (its exit, what it prints, how long it sleeps first, how long its background child lives); its
+        sha."""
         clone = os.path.join(self.tmp, "github")
         if not os.path.isdir(clone):
             subprocess.run([GIT, "clone", "-q", self.origin, clone], env=self.env(), check=True, capture_output=True)
@@ -98,6 +112,8 @@ class LandCanary(WorktreeTest):
                  "canary/note": f"{note}\n"}
         if sleep is not None:
             files["canary/sleep"] = f"{sleep}\n"
+        if linger is not None:
+            files["canary/linger"] = f"{linger}\n"
         for path, text in files.items():
             write(os.path.join(clone, path), text)
         self.git(clone, "add", "-A")
@@ -134,10 +150,7 @@ class LandCanary(WorktreeTest):
 
     def land(self, sha, cwd=None, **env):
         self.scenario(self.calls(sha))
-        start = time.monotonic()
-        p = self.pr("land", "34", cwd=cwd or self.main, **env)
-        self.elapsed = time.monotonic() - start
-        return p
+        return self.pr("land", "34", cwd=cwd or self.main, **env)
 
     # ----------------------------------------------------------- what happened
     def smoke_runs(self):
@@ -177,13 +190,11 @@ class LandCanary(WorktreeTest):
         return [n for n in self.notifications() if "revert" in " ".join(n).lower()]
 
     # ----------------------------------------------------------- assertions
-    def assertLandedAsToday(self, p, sha):
-        """Exit 0; origin/main and the main checkout at the merge with no revert made anywhere; the ticket closed,
-        unlabelled and commented as today; no bug, no needs-input, no reopen, no revert notification."""
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+    def assertNothingReverted(self, p, sha):
+        """origin/main still at the merge with no revert made anywhere; the ticket closed, unlabelled and commented
+        as today; no bug, no needs-input, no reopen, no revert notification."""
         self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(self.origin_head(), sha, "origin/main moved after the merge")
-        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), sha)
         self.assertEqual(self.reverts_on_origin(), [])
         self.assertFalse([line for line in self.order() if line.startswith("git") and " revert " in f" {line} "],
                          self.order())
@@ -195,6 +206,12 @@ class LandCanary(WorktreeTest):
         self.assertFalse([a for a in self.gh_argv() if a[:2] == ["issue", "reopen"]], self.gh_argv())
         self.assertEqual(self.revert_notes(), [])
 
+    def assertLandedAsToday(self, p, sha):
+        """Exit 0, the main checkout fast-forwarded to the merge, and nothing reverted."""
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), sha)
+        self.assertNothingReverted(p, sha)
+
     def assertDegraded(self, p, sha, note, timed_out):
         """Landed as today, plus exactly one warning line naming scripts/smoke.sh and its exit 2 (or the time
         limit), and one ticket comment naming scripts/smoke.sh."""
@@ -203,12 +220,44 @@ class LandCanary(WorktreeTest):
         said = self.smoke_warnings(p)
         self.assertEqual(len(said), 1, p.stderr)
         if timed_out:     # the time limit, in words ("timed out", "time limit") or as its seconds ("past 1 s")
-            self.assertRegex(self.without_paths(said[0]), re.compile(r"tim(e|ed)|\b1(\.0+)?\s?s(ec\w*)?\b", re.IGNORECASE))
+            self.assertRegex(self.without_paths(said[0]),
+                             re.compile(rf"tim(e|ed)|\b{SHORT}(\.0+)?\s?s(ec\w*)?\b", re.IGNORECASE))
         else:
             self.assertRegex(self.without_paths(said[0]), r"\b2\b")
         comments = self.canary_comments()
         self.assertEqual(len(comments), 1, self.ticket_comments())
         self.assertIn(SMOKE, comments[0])
+
+    def assertNoCanaryRan(self, p, sha):
+        """A land whose main checkout was not fast-forwarded: the canary never ran, nothing was reverted."""
+        self.assertEqual(self.smoke_runs(), [])
+        self.assertNothingReverted(p, sha)
+        self.assertEqual(self.canary_comments(), [])
+        self.assertEqual(self.smoke_warnings(p), [])
+
+    def assertChildGone(self):
+        """The canary's lingering background child (it would live 30 s) is dead soon after the land returns: the
+        time limit stopped the canary's whole process group, not only the script."""
+        with open(self.smoke_pids, encoding="utf-8") as fh:
+            pid = int(fh.read().strip())
+        self.addCleanup(self.kill_quietly, pid)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            except PermissionError:          # the pid went to another user's process: ours is gone
+                return
+            time.sleep(0.05)
+        self.fail(f"the canary's background child {pid} still runs after the timed-out land")
+
+    @staticmethod
+    def kill_quietly(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
     def assertReverted(self, p, sha, note, code):
         """Exit 1 naming the revert; origin/main's head a revert of the merge on top of it, the main checkout at it;
@@ -289,30 +338,75 @@ class LandCanary(WorktreeTest):
         self.assertEqual(self.canary_comments(), [])
         self.assertEqual(self.smoke_warnings(p), [])
 
+    def test_a_land_that_does_not_fast_forward_main_runs_no_canary(self):
+        # the main checkout's own edit of a landed file blocks the pull (as today: exit 1, main not pulled), so the
+        # canary never sees the landed content, which would fail it
+        self.project()
+        sha = self.landed(1, "unpulled landing 1d9")
+        before = self.git(self.main, "rev-parse", "HEAD")
+        write(os.path.join(self.main, "canary", "note"), "my own note, not the landed one\n")
+        p = self.land(sha)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("canary/note", p.stderr)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), before)
+        self.assertNoCanaryRan(p, sha)
+
     # ---------------------------------------------------------- specific
+    def test_a_main_checkout_on_another_branch_runs_no_canary(self):
+        # as today: exit 0, main not pulled; the checkout's scripts/smoke.sh is not run there either
+        self.project()
+        self.git(self.main, "switch", "-q", "-c", "notes")
+        before = self.git(self.main, "rev-parse", "HEAD")
+        sha = self.landed(1, "landing while on notes 0c5")
+        p = self.land(sha)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.git(self.main, "rev-parse", "--abbrev-ref", "HEAD"), "notes")
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), before)
+        self.assertNoCanaryRan(p, sha)
+
     def test_any_other_failing_exit_is_a_big_failure(self):
-        # 3 s is slower than the other canaries here and well inside the default limit: a failure, not a timeout
+        # SLOW seconds under the default limit (none set): a failure, not a timeout
         note = "exit three landing 6a1"
         self.project()
-        sha = self.landed(3, note, sleep=3)
+        sha = self.landed(3, note, sleep=SLOW)
         p = self.land(sha)
         self.assertReverted(p, sha, note, 3)
 
     def test_a_canary_past_its_time_limit_lands_as_degraded(self):
-        # it would exit 1 after 30 s: the land returns well before that, as degraded, and nothing is reverted
+        # it would exit 1 after SLOW seconds: the limit in the environment stops it first, its child too
         note = "hanging landing 9d2"
         self.project()
-        sha = self.landed(1, note, sleep=30)
-        p = self.land(sha, HARNESS_SMOKE_TIMEOUT="1")
-        self.assertLess(self.elapsed, 20, p.stdout + p.stderr)
+        sha = self.landed(1, note, sleep=SLOW, linger=30)
+        p = self.land(sha, HARNESS_SMOKE_TIMEOUT=SHORT)
         self.assertDegraded(p, sha, note, timed_out=True)
+        self.assertChildGone()
 
     def test_the_time_limit_comes_from_the_settings_when_the_environment_sets_none(self):
         note = "hanging landing, limit in the settings 4e7"
-        self.project(settings={"HARNESS_SMOKE_TIMEOUT": "1"})
-        sha = self.landed(1, note, sleep=30)
+        self.project(settings={"HARNESS_SMOKE_TIMEOUT": SHORT})
+        sha = self.landed(1, note, sleep=SLOW)
         p = self.land(sha)
-        self.assertLess(self.elapsed, 20, p.stdout + p.stderr)
+        self.assertDegraded(p, sha, note, timed_out=True)
+
+    def test_a_long_limit_in_the_settings_lets_a_slow_failing_canary_revert(self):
+        note = "slow failing landing, long limit in the settings 5d3"
+        self.project(settings={"HARNESS_SMOKE_TIMEOUT": LONG})
+        sha = self.landed(1, note, sleep=SLOW)
+        p = self.land(sha)
+        self.assertReverted(p, sha, note, 1)
+
+    def test_a_long_limit_in_the_environment_wins_over_a_short_one_in_the_settings(self):
+        note = "slow failing landing, long limit in the environment 2a6"
+        self.project(settings={"HARNESS_SMOKE_TIMEOUT": SHORT})
+        sha = self.landed(1, note, sleep=SLOW)
+        p = self.land(sha, HARNESS_SMOKE_TIMEOUT=LONG)
+        self.assertReverted(p, sha, note, 1)
+
+    def test_a_short_limit_in_the_environment_wins_over_a_long_one_in_the_settings(self):
+        note = "slow failing landing, short limit in the environment 8f1"
+        self.project(settings={"HARNESS_SMOKE_TIMEOUT": LONG})
+        sha = self.landed(1, note, sleep=SLOW)
+        p = self.land(sha, HARNESS_SMOKE_TIMEOUT=SHORT)
         self.assertDegraded(p, sha, note, timed_out=True)
 
     def test_a_smoke_script_that_is_not_executable_is_not_run(self):
