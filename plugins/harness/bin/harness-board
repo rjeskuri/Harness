@@ -387,8 +387,50 @@ def parse_sections(body):
 
 
 # --------------------------------------------------------------- show
+def owner_login(repo):
+    """(login, None): the gh login the harness posts as (`gh api user --jq .login`, as `answers` reads it),
+    casefolded; (None, why) when gh fails or prints none: `show` then keeps the deploy guard's comments only (fail
+    closed), never falling back to the remote's or the slug's owner."""
+    try:
+        login = gh(repo, ["api", "user", "--jq", ".login"]).strip()
+    except Problem as err:
+        return None, str(err)
+    return (login.casefold(), None) if login else (None, "gh api user printed no login")
+
+
+def comment_login(c):
+    """The author login of a `gh issue view --json comments` comment, or None."""
+    author = c.get("author") if isinstance(c.get("author"), dict) else {}
+    return author.get("login") or None
+
+
+def from_trusted(login, owner):
+    """Whether a comment by `login` reaches the context (#334): the owner's (`owner`, casefolded; the harness posts
+    under it) or the deploy guard's. Any other account's is counted, never shown and never cached."""
+    login = (login or "").casefold()
+    return login == owner or login in BOT_LOGINS
+
+
+def other_comments_line(hidden, number):
+    """The one line that stands in for the other accounts' comments."""
+    plural = "s" if hidden != 1 else ""
+    return f"{hidden} comment{plural} from other accounts not shown: gh issue view {number} --comments"
+
+
+def keep_trusted(record, owner):
+    """Drop from `record` the comments `from_trusted` rejects under `owner` (#334), so neither the output nor the
+    cache carries them, and set `other_comments`, the line counting them, when any were; the count dropped."""
+    kept = [c for c in record["comments"] if from_trusted(c["author"], owner)]
+    hidden = len(record["comments"]) - len(kept)
+    record["comments"] = kept
+    if hidden:
+        record["other_comments"] = other_comments_line(hidden, record["number"])
+    return hidden
+
+
 def fetch_record(repo, number):
-    """The ticket as the cache schema has it (plus `goal` and `tasks` for an epic), fetched now."""
+    """The ticket as the cache schema has it (plus `goal` and `tasks` for an epic), fetched now, every comment
+    included: `show` filters them with `keep_trusted`."""
     data = gh_json(repo, ["issue", "view", str(number), "--json", ISSUE_FIELDS])
     if not isinstance(data, dict):
         raise Problem(f"gh issue view {number} printed no issue")
@@ -411,8 +453,7 @@ def fetch_record(repo, number):
         if b.get("number"):
             record["blocked_by"].append({"number": int(b["number"]), "state": str(b.get("state", "")).upper()})
     for c in as_list(data.get("comments")):
-        author = c.get("author") if isinstance(c.get("author"), dict) else {}
-        record["comments"].append({"author": author.get("login") or "ghost", "created_at": c.get("createdAt") or "",
+        record["comments"].append({"author": comment_login(c) or "ghost", "created_at": c.get("createdAt") or "",
                                    "body": c.get("body") or ""})
     if record["type"] == "epic":
         record["goal"] = first_paragraph(split_sections(record["body"]).get("goal", ""))
@@ -461,9 +502,9 @@ def newest_resolution(comments):
     return found[-1] if found else (None, [])
 
 
-def task_resolutions(repo, tasks):
-    """{task number: its newest Resolution's lines} for the closed tasks; a task whose comments cannot be read,
-    or that has no Resolution, is left out."""
+def task_resolutions(repo, tasks, owner=None):
+    """{task number: its newest Resolution's lines} for the closed tasks, among the comments `from_trusted` keeps
+    under `owner`; a task whose comments cannot be read, or that has no Resolution, is left out."""
     out = {}
     for t in tasks:
         if t["state"] != "CLOSED" or not t.get("number"):
@@ -472,7 +513,8 @@ def task_resolutions(repo, tasks):
             data = gh_json(repo, ["issue", "view", str(t["number"]), "--json", "comments"])
         except Problem:
             continue
-        _, lines = newest_resolution(as_list(data.get("comments")) if isinstance(data, dict) else [])
+        comments = as_list(data.get("comments")) if isinstance(data, dict) else []
+        _, lines = newest_resolution([c for c in comments if from_trusted(comment_login(c), owner)])
         if lines:
             out[t["number"]] = lines
     return out
@@ -505,8 +547,9 @@ def fitted_resolutions(entries, room, newest=0):
 
 def context_markdown(record, resolutions=None, tier_from=None):
     """The ticket context: header, epic and blockers, the task list and the closed tasks' Resolutions
-    (`resolutions`), the sections, a closed ticket's own Resolutions, then the newest comments that fit. `tier_from`
-    names the setting that decided the tier, when one did."""
+    (`resolutions`), the sections, a closed ticket's own Resolutions, then the newest comments that fit, and last the
+    line counting the other accounts' comments (`other_comments`), which the Resolution and comment budgets leave
+    room for. `tier_from` names the setting that decided the tier, when one did."""
     n = record["number"]
     raw = split_sections(record.get("body"))
     state = "closed" if record.get("status") == "closed" else "open"
@@ -552,8 +595,9 @@ def context_markdown(record, resolutions=None, tier_from=None):
             for k, (_, body) in enumerate(own, 1):     # one per landing, oldest first
                 heading = "## Resolution" if len(own) == 1 else f"## Resolution (landing {k} of {len(own)})"
                 entries.append((n, [heading] + body))
+    tail = ["", record["other_comments"]] if record.get("other_comments") else []
     if entries:
-        lines[at:at] = fitted_resolutions(entries, CONTEXT_LINES - len(lines) - 2, newest=len(own))
+        lines[at:at] = fitted_resolutions(entries, CONTEXT_LINES - len(lines) - 2 - len(tail), newest=len(own))
     blocks = []
     for c in comments[-COMMENTS_SHOWN:]:
         body = (c["body"] or "").strip("\n").splitlines()
@@ -561,7 +605,7 @@ def context_markdown(record, resolutions=None, tier_from=None):
         if len(body) > COMMENT_LINES:
             block.append(f"[... {len(body) - COMMENT_LINES} more lines]")
         blocks.append(block)
-    room = CONTEXT_LINES - len(lines) - 2
+    room = CONTEXT_LINES - len(lines) - 2 - len(tail)
     chosen = []
     for block in reversed(blocks):                     # newest first, whole comments only
         if len(block) > room:
@@ -574,6 +618,7 @@ def context_markdown(record, resolutions=None, tier_from=None):
             lines += block
     elif comments:
         lines += ["", f"{len(comments)} comments not shown: gh issue view {n} --comments"]
+    lines += tail
     if len(lines) > CONTEXT_LINES:
         lines = lines[:CONTEXT_LINES - 1] + [f"[... cut at {CONTEXT_LINES} lines; harness-board show {n} has it all]"]
     return "\n".join(lines)
@@ -676,11 +721,14 @@ def cmd_task_create(repo, args):
 
 
 def cmd_show(repo, args):
-    record = fetch_record(repo, args.number)
+    record = fetch_record(repo, args.number)       # first, so a missing issue is the one error printed
+    owner, why = owner_login(repo)                 # one gh api user per show, shared with the tasks' Resolutions
+    if keep_trusted(record, owner) and why:
+        warn("harness-board", f"the gh login could not be read ({why}); only the deploy guard's comments are shown")
     save_record(repo, record)
     if args.markdown:
         tier_from = "HARNESS_CODE_TIER" if routing_for(repo)["code_tier"] else None
-        print(context_markdown(record, task_resolutions(repo, record.get("tasks") or []), tier_from))
+        print(context_markdown(record, task_resolutions(repo, record.get("tasks") or [], owner), tier_from))
     else:
         emit(True, record, "")
 
