@@ -1351,5 +1351,196 @@ class DispatchCrossProject(WorkTest):
                     self.assertEqual(env.get(self.KEEP[0]), self.KEEP[1])
 
 
+# =========================================================================== #335: a dry run stops no session
+WOULD_STOP_RE = re.compile(r"would stop session ([A-Za-z0-9_-]+) \(#(\d+) [^)\n]+\)")
+
+
+class DispatchDryRunStopsNothing(WorkTest):
+    """#335: `dispatch --dry-run` runs dispatch's sweep without its effects: a finished ticket's bg session is not
+    stopped and its record not written, a `would stop session <id> (#N <state>)` line says what a real dispatch would
+    do, and the plan counts the slot as freed. A real dispatch and `runs --sweep` still stop and close."""
+
+    # Each fixture: finished {n: (bg id, agents state, labels, issue state, PRs)}, live {n: (bg id, agents state,
+    # PRs)} of status:in-progress tickets, the ready tickets in board order, and --max.
+    FIXTURES = (
+        {"finished": {301: ("s-fin1", "blocked", IN_REVIEW, "OPEN", ready_pr(401)),
+                      302: ("s-fin2", "idle", NEEDS_INPUT, "OPEN", []),
+                      303: ("s-fin3", "done", IN_REVIEW, "CLOSED", MERGED)},
+         "live": {304: ("s-run4", "running", [])},
+         "ready": [310, 311, 312, 313, 314, 315], "max": 3},
+        {"finished": {57: ("s-q57", "blocked", IN_PROGRESS, "CLOSED", MERGED)},
+         "live": {58: ("s-b58", "blocked", []), 59: ("s-i59", "idle", draft(459))},
+         "ready": [60, 61, 62, 63, 64], "max": 4},
+        {"finished": {88: ("s-x88", "blocked", NEEDS_INPUT, "OPEN", draft(488)),
+                      89: ("s-y89", "blocked", IN_REVIEW, "OPEN", ready_pr(489))},
+         "live": {},
+         "ready": [90, 91, 92], "max": 2},
+    )
+
+    def setup_fixture(self, fx):
+        """Unended bg records for every session, the `claude agents` listing and the gh scenario. Returns env."""
+        shutil.rmtree(self.runs_dir(), True)
+        for path in (self.claude_log, self.gh_log):
+            if os.path.exists(path):
+                os.unlink(path)
+        sessions = {n: (c[0], c[1]) for n, c in fx["finished"].items()}
+        sessions.update({n: (c[0], c[1]) for n, c in fx["live"].items()})
+        for n, (bg_id, _state) in sessions.items():
+            self.write_run(n, venue="bg", bg_id=bg_id, log=None)
+        listing = [{"id": bg_id, "kind": "background", "state": state, "cwd": self.repo, "name": f"proj #{n} {TITLE}"}
+                   for n, (bg_id, state) in sessions.items()]
+        tickets = {n: (c[2], c[3], c[4]) for n, c in fx["finished"].items()}
+        tickets.update({n: (IN_PROGRESS, "OPEN", c[2]) for n, c in fx["live"].items()})
+        calls = [{"match": ["issue", "view", str(n)], "stdout_json": issue(n, labels=labels, state=state)}
+                 for n, (labels, state, _prs) in tickets.items()]
+        calls += [{"match": ["issue", "view", str(n)], "stdout_json": issue(n, title=f"Ready {n}")}
+                  for n in fx["ready"]]
+        for n, (_labels, _state, prs) in tickets.items():
+            calls.append({"contains": ["pr", "list", "--head", f"t/{n}-x", "--state", "all"], "stdout_json": prs})
+            calls.append({"contains": ["pr", "list", "--head", f"t/{n}-x"],
+                          "stdout_json": [pr for pr in prs if pr["state"] == "OPEN"]})
+        calls += [
+            {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}},
+            {"match": ["issue", "list"], "stdout_json": [ready_row(n, f"Ready {n}") for n in fx["ready"]]},
+            {"match": ["issue", "edit"], "stdout": ""},
+            {"match": ["issue", "comment"], "stdout": "https://github.com/o/r/issues/12#issuecomment-1\n"},
+            {"match": ["pr", "list"], "stdout_json": []},
+            {"match": ["api", "user"], "stdout": "rjeskuri\n"},
+            {"match": ["api"], "stdout_json": []},
+        ]
+        write(self.scenario_path, json.dumps({"calls": calls}))
+        state = self.scenario_path + ".state.json"
+        if os.path.exists(state):
+            os.unlink(state)
+        return self.env(FAKECLAUDE_AGENTS=json.dumps(listing), **CREDENTIALS)
+
+    def runs_snapshot(self):
+        """{file name: bytes} of everything in the runs directory."""
+        folder = self.runs_dir()
+        out = {}
+        for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+            with open(os.path.join(folder, name), "rb") as fh:
+                out[name] = fh.read()
+        return out
+
+    def stops(self):
+        """{session id: times `claude stop` was called with it}, from the fake claude's argv log."""
+        counts = {}
+        for call in self.claude_calls():
+            if call["argv"][:1] == ["stop"]:
+                for arg in call["argv"][1:]:
+                    if not arg.startswith("-"):
+                        counts[arg] = counts.get(arg, 0) + 1
+        return counts
+
+    def bg_launches(self):
+        return sorted(c["argv"][-1] for c in self.claude_calls() if "--bg" in c["argv"])
+
+    def record_id(self, n):
+        return f"{self.key}-{n}-20261013120000"
+
+    @staticmethod
+    def expected_plan(fx):
+        """What today's dry run plans: the finished sessions hold no slot, the live ones do."""
+        free = fx["max"] - len(fx["live"])
+        return fx["ready"][:free], fx["ready"][free:], free
+
+    # ---- DoD 1: no `claude stop`, the runs directory byte-identical, a `would stop` line per finished session
+    def test_dry_run_stops_no_session_writes_no_record_and_says_what_it_would_stop(self):
+        for i, fx in enumerate(self.FIXTURES):
+            for as_json in (False, True):
+                with self.subTest(fixture=i, json=as_json):
+                    env = self.setup_fixture(fx)
+                    before = self.runs_snapshot()
+                    self.assertEqual(len(before), len(fx["finished"]) + len(fx["live"]))
+                    args = ["dispatch", "--dry-run", "--max", str(fx["max"])] + (["--json"] if as_json else [])
+                    p = self.work(*args, env=env)
+                    out = p.stdout + p.stderr
+                    self.assertEqual(p.returncode, 0, out)
+                    self.assertEqual(self.stops(), {}, out)
+                    self.assertEqual([c["argv"] for c in self.claude_calls() if c["argv"][:1] != ["agents"]], [],
+                                     out)
+                    self.assertEqual(self.runs_snapshot(), before, out)
+                    self.assertEqual(re.findall(STOPPED_RE, out), [], out)
+                    expected = sorted((c[0], str(n)) for n, c in fx["finished"].items())
+                    self.assertEqual(sorted(WOULD_STOP_RE.findall(out)), expected, out)    # none for a live one
+                    if as_json:
+                        json.loads(p.stdout)        # the would-stop lines leave stdout whole
+
+    def test_a_second_dry_run_sees_the_same_sessions_and_still_stops_none(self):
+        fx = self.FIXTURES[0]
+        env = self.setup_fixture(fx)
+        before = self.runs_snapshot()
+        for _ in range(2):
+            p = self.ok("dispatch", "--dry-run", "--max", str(fx["max"]), env=env)
+            self.assertEqual(sorted(WOULD_STOP_RE.findall(p.stdout + p.stderr)),
+                             sorted((c[0], str(n)) for n, c in fx["finished"].items()), p.stdout + p.stderr)
+        self.assertEqual(self.stops(), {})
+        self.assertEqual(self.runs_snapshot(), before)
+        self.assertEqual(self.bg_launches(), [])
+
+    # ---- DoD 2: the plan and slot count of today's dry run, the finished sessions' slots freed
+    def test_dry_run_plans_as_if_the_finished_sessions_had_been_stopped(self):
+        for i, fx in enumerate(self.FIXTURES):
+            plan, over, free = self.expected_plan(fx)
+            with self.subTest(fixture=i):
+                env = self.setup_fixture(fx)
+                data = self.ok_json("dispatch", "--dry-run", "--max", str(fx["max"]), "--json", env=env)
+                self.assertEqual(sorted(data["live"]), sorted(self.record_id(n) for n in fx["live"]), data)
+                self.assertEqual([row["number"] for row in data["plan"]], plan, data)
+                self.assertEqual([(s["number"], s["why"]) for s in data["skipped"]],
+                                 [(n, f"over --max {fx['max']}") for n in over], data)
+
+                p = self.ok("dispatch", "--dry-run", "--max", str(fx["max"]), env=env)
+                self.assertIn(f"Dry run: venue bg, {len(fx['live'])} live, {free} of {fx['max']} slots free.",
+                              p.stdout)
+                starts = [ln for ln in p.stdout.splitlines() if ln.startswith("would start #")]
+                self.assertEqual([int(re.match(r"would start #(\d+)", ln).group(1)) for ln in starts], plan,
+                                 p.stdout)
+                self.assertEqual(self.stops(), {})
+
+    # ---- DoD 3: the same fixture without --dry-run stops and closes as today, and launches into the freed slots
+    def test_a_real_dispatch_stops_the_finished_sessions_and_closes_their_records(self):
+        for i, fx in enumerate(self.FIXTURES):
+            plan, _over, _free = self.expected_plan(fx)
+            with self.subTest(fixture=i):
+                env = self.setup_fixture(fx)
+                self.ok("dispatch", "--dry-run", "--max", str(fx["max"]), env=env)    # changes nothing
+                self.assertEqual(self.stops(), {})
+                p = self.work("dispatch", "--max", str(fx["max"]), env=env)
+                out = p.stdout + p.stderr
+                self.assertEqual(p.returncode, 0, out)
+                finished_ids = sorted(c[0] for c in fx["finished"].values())
+                self.assertEqual(self.stops(), {bg_id: 1 for bg_id in finished_ids}, out)
+                self.assertEqual(sorted(re.findall(STOPPED_RE, out)), finished_ids, out)
+                self.assertEqual(WOULD_STOP_RE.findall(out), [], out)
+                saved = {r["id"]: r for r in self.run_records()}
+                for n in fx["finished"]:
+                    record = saved[self.record_id(n)]
+                    self.assertTrue(record["ended_at"], record)
+                    self.assertEqual(record["outcome"], "ok", record)
+                for n in fx["live"]:
+                    self.assertIsNone(saved[self.record_id(n)]["ended_at"], saved[self.record_id(n)])
+                self.assertEqual(self.bg_launches(), sorted(f"/harness:work {n}" for n in plan), out)
+
+    # ---- outline 2: `runs --sweep` is unchanged
+    def test_runs_sweep_still_stops_the_finished_sessions_and_closes_their_records(self):
+        for i, fx in enumerate(self.FIXTURES):
+            with self.subTest(fixture=i):
+                env = self.setup_fixture(fx)
+                p = self.work("runs", "--sweep", env=env)
+                out = p.stdout + p.stderr
+                self.assertEqual(p.returncode, 0, out)
+                finished_ids = sorted(c[0] for c in fx["finished"].values())
+                self.assertEqual(self.stops(), {bg_id: 1 for bg_id in finished_ids}, out)
+                self.assertEqual(sorted(re.findall(STOPPED_RE, out)), finished_ids, out)
+                self.assertEqual(WOULD_STOP_RE.findall(out), [], out)
+                saved = {r["id"]: r for r in self.run_records()}
+                for n in fx["finished"]:
+                    self.assertTrue(saved[self.record_id(n)]["ended_at"])
+                for n in fx["live"]:
+                    self.assertIsNone(saved[self.record_id(n)]["ended_at"])
+
+
 if __name__ == "__main__":
     unittest.main()
