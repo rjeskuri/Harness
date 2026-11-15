@@ -1,6 +1,6 @@
 # Harness
 
-Ryan's personal Claude Code harness, v2: one plugin installed once at user scope, applied to every project. The board is the context: every unit of work is a GitHub issue, an epic with task sub-issues, and agents read the ticket before they work and write status back to it. Tests come first and are proven to fail before any source changes. Nothing happens on main: each ticket gets its own branch and worktree, and work lands through a pull request. Your part is to plan, answer tickets that need input, and land pull requests.
+Ryan's personal Claude Code harness, v2: one plugin installed once at user scope, applied to every project. The board is the context: every unit of work is a GitHub issue, an epic with task sub-issues, and agents read the ticket before they work and write status back to it. Tests come first and are proven to fail before any source changes. Nothing happens on main: each ticket gets its own branch and worktree, and work lands through a pull request. Your part is to plan, answer tickets that need input, and land the `risk:high` pull requests: `/harness:work` lands a `risk:low` ticket's pull request itself once it is green and reviewed.
 
 Built 2026-10-13 against Claude Code 2.1.296 and gh 2.99.0. New to the CLI? Start with the [first-run guide](docs/guide.md). The design and every contract live in [docs/design.md](docs/design.md).
 
@@ -64,7 +64,7 @@ The main session runs Opus 5.5 at high effort. `harness-board tier N` picks the 
 |---|---|
 | `/harness:new-project [path]` | Interview, scaffold, private GitHub repo, labels, registry entry |
 | `/harness:plan [request]` | Interview, planner proposal, issues on the board after approval |
-| `/harness:work [issue#]` | One ticket to a ready PR here, or dispatch every ready ticket |
+| `/harness:work [issue#]` | One ticket to a landed PR here (a `risk:high` one to a ready PR for you), or dispatch every ready ticket |
 | `/harness:land [PR#]` | PRs awaiting you, or one PR merged after one confirmation |
 | `/harness:standup` | Every project: git state, board counts, PRs, needs-input tickets, stale worktrees, budgets |
 | `/harness:learn` | Lessons from the session become `chore` tickets, not edits |
