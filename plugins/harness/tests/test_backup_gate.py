@@ -42,6 +42,10 @@ Choices the ticket leaves open, fixed here:
 - A word with a glob character (*, ? or [) is expanded from the directory its part runs in, as the shell does;
   each match is a target, and a glob matching nothing makes the command's targets unknown.
 - A missing literal target is nothing to copy; an empty folder (rmdir) is an existing target and is copied.
+- unlink and rmdir count as rm for branch_guard's main-branch check (orchestrator's ruling on #327): where
+  branch_guard would deny rm of the same path from the same directory (a main checkout on main or master,
+  HARNESS_ALLOW_MAIN unset), the command gets no decision and no snapshot, although branch_guard itself lets
+  unlink and rmdir through; with HARNESS_ALLOW_MAIN=1, or for a git-ignored path, they are backed up and allowed.
 - `.git` by name: a target named .git (a worktree's .git file too) or with a .git component gets nothing. The
   folders .claude, .githooks and .github themselves get nothing, like the paths under them.
 - A command whose parts run no rm, unlink or rmdir (the word only as an argument: `echo rm -rf build`) gets no
@@ -857,6 +861,33 @@ class Nothing(GateTest):
                 p = self.run_gate(command, main, main, env=env)
                 sid = self.expect_backup(p, before, self.global_store(), targets, command)
                 self.round_trip(sid, targets, was, main)
+
+        # unlink and rmdir count as rm for branch_guard's main-branch check (ruling on #327), although
+        # branch_guard itself lets them through: where rm of the path would be denied, nothing.
+        empty = os.path.join(main, "empty-" + self.word())                         # untracked, not ignored
+        os.mkdir(empty)
+        self.assertFalse(self.ignored(main, os.path.basename(empty)))
+        util = os.path.join(main, "src", "util.py")
+        shapes = (
+            ("unlink src/util.py", main, [util]),
+            (f"rmdir {os.path.basename(empty)}", main, [empty]),
+            ("cd src && unlink util.py", main, [util]),
+            (f"unlink {main}/README.md", wt, [os.path.join(main, "README.md")]),
+        )
+        for command, cwd, _targets in shapes:
+            with self.subTest(command=command, cwd=cwd, allow_main=None):
+                before = self.snapshots()
+                self.expect_nothing(self.run_gate(command, cwd, main), before, command)
+        ignored = os.path.join(main, f"scratch-{self.word()}.tmp")
+        self.put(ignored)
+        allowed = [(c, w, t, {"HARNESS_ALLOW_MAIN": "1"}) for c, w, t in shapes]
+        allowed.append((f"unlink {os.path.basename(ignored)}", main, [ignored], None))   # rm of it is not denied
+        for command, cwd, targets, env in allowed:
+            with self.subTest(command=command, cwd=cwd, env=env):
+                before, was = self.snapshots(), {t: tree(t) for t in targets}
+                p = self.run_gate(command, cwd, main, env=env)
+                sid = self.expect_backup(p, before, self.global_store(), targets, command)
+                self.round_trip(sid, targets, was, cwd)
         self.commit_settings(main, {"HARNESS_ALLOW_MAIN": "1"})
         target = os.path.join(main, "docs", "b.md")
         with self.subTest(command="rm -f docs/b.md", settings="HARNESS_ALLOW_MAIN=1"):
