@@ -116,14 +116,14 @@ with a warning. One command asks gh once per ticket and branch.
 A cloud run ends on the latest marker comment (first line `<!-- harness-cloud: done -->` or `<!-- harness-cloud:
 blocked -->`) by the gh user after the run's start, at that comment's time: done is `ok` (never early), blocked is
 `blocked` and asks the owner (`harness-board needs-input` with the comment's other lines); else, when its ticket is
-finished, `ok`; else, 24 h after its start, `unknown`. A failing gh call is one warning and leaves it open. An unended
-cloud run is live.
+closed or a pull request of its branch merged, `ok`; else, 24 h after its start, `unknown`. Its status label never
+ends it. A failing gh call is one warning and leaves it open. An unended cloud run is live.
 
 cloud: refuses, before anything starts, a needs-local ticket (run it here with /harness:work N), an exhausted cloud
-budget, an unended cloud run of the ticket, and what start refuses; then starts the ticket (venue cloud), pushes its
-branch with upstream (a failed push launches nothing) and runs `claude --cloud <prompt> --on-branch <branch>` in the
-worktree with its stdout on a pseudo-terminal (claude starts a new cloud session only from a terminal), without the
-credentials above. The prompt is self-contained: repository, ticket, branch, the verify command (CLAUDE_VERIFY_CMD,
+budget, an unended cloud run of the ticket, a needs-input ticket with no answer since its question, and what start
+refuses; then starts the ticket (venue cloud), pushes its branch with upstream (a failed push launches nothing) and
+runs `claude --cloud <prompt> --on-branch <branch>` in the worktree with its stdout on a pseudo-terminal (claude
+starts a new cloud session only from a terminal), without the credentials above. The prompt is self-contained: repository, ticket, branch, the verify command (CLAUDE_VERIFY_CMD,
 else HARNESS_TEST_CMD), `gh api` REST for comments and the two markers; the session loads no harness plugin, hooks or
 tests-first gate. claude's output without ANSI escapes and carriage returns is the run's log; the session id comes
 from its claude.ai/code URL. The run record gets venue cloud, cloud_id and url, and the URL is commented on the
@@ -972,10 +972,22 @@ def cloud_marker(issue, login, since):
     return found
 
 
+def branch_merged(repo, branch):
+    """Whether a pull request of `branch` (in any state) has merged; False when the run names no branch."""
+    if not branch:
+        return False
+    prs = gh_json(repo, ["pr", "list", "--head", str(branch), "--state", "all", "--json", "number,state",
+                         "--limit", str(PR_ROWS)])
+    rows = prs if isinstance(prs, list) else []
+    return any(isinstance(pr, dict) and str(pr.get("state", "")).upper() == "MERGED" for pr in rows)
+
+
 def sweep_cloud(record, repos, logins):
     """Close a cloud run from its ticket: the newest marker comment by the gh user since the start (done: ok;
-    blocked: blocked, the owner asked through harness-board needs-input), else a finished ticket (ok), else 24 h
-    since the start (unknown). A failing gh call is one warning and leaves the run open. Saves when it closes."""
+    blocked: blocked, the owner asked through harness-board needs-input), else a closed ticket or a merged pull
+    request of its branch (ok), else 24 h since the start (unknown). Its status label never ends it: a cloud session
+    can still be working on a ticket left needs-input or ready (#295). A failing gh call is one warning and leaves
+    the run open. Saves when it closes."""
     n = record.get("ticket")
     if not isinstance(n, int):
         return
@@ -1000,12 +1012,20 @@ def sweep_cloud(record, repos, logins):
                 warn(f"#{n}: its cloud run is blocked, but the question could not be asked: {err}")
                 return
         outcome, ended = ("blocked" if kind == CLOUD_BLOCKED else "ok"), iso(when)
-    elif issue_finished(issue):
+    elif str(issue.get("state", "")).upper() == "CLOSED":
         outcome, ended = "ok", iso(now())
-    elif now() - started >= CLOUD_SILENCE:
-        outcome, ended = "unknown", iso(now())
     else:
-        return
+        try:
+            merged = branch_merged(repo, record.get("branch"))
+        except Problem as err:
+            warn(f"#{n}: cannot tell whether a pull request of its cloud run merged: {err}")
+            return
+        if merged:
+            outcome, ended = "ok", iso(now())
+        elif now() - started >= CLOUD_SILENCE:
+            outcome, ended = "unknown", iso(now())
+        else:
+            return
     record.update(ended_at=ended, outcome=outcome)
     save_run(record)
 
@@ -1417,8 +1437,12 @@ def cmd_cloud(repo, args):
     if unended:
         raise Problem(f"#{n} already has a cloud run that has not ended: {unended[0].get('id')} "
                       f"({unended[0].get('url')}); follow it with harness-work runs --sweep")
-    if "needs-local" in issue_labels(repo, n):
+    labels = issue_labels(repo, n)
+    if "needs-local" in labels:
         raise Problem(f"#{n} is labelled needs-local: it needs this machine; run it here with /harness:work {n}")
+    if "status:needs-input" in labels and not board_json(repo, "answers", n, "--json"):
+        raise Problem(f"#{n} is status:needs-input with no answer since its question; nothing started. Answer it "
+                      f"on the ticket, then run harness-work cloud {n} again")
     if shutil.which(claude_exe()) is None:
         raise Problem(f"claude not found ({claude_exe()}); nothing started")
     found = gh_json(repo, ["repo", "view", "--json", "nameWithOwner"])
