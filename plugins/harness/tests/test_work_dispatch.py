@@ -1263,5 +1263,93 @@ class DispatchRouteEffort(WorkTest):
         self.assertEqual(again["effort"], "xhigh")
 
 
+class DispatchCrossProject(WorkTest):
+    """#299: `harness-work dispatch --repo B` run from a session of project A (HARNESS_SESSION_PROJECT, else
+    CLAUDE_PROJECT_DIR, naming A), whose CLAUDE_VERIFY_CMD and HARNESS_TEST_CMD are exported, gives the launched
+    session (bg and headless) B's own values of those two from B's settings, and no value of A's where B sets none.
+    From B's own session the environment passes through unchanged. Repo A is a separate git repository."""
+
+    NAMES = ("CLAUDE_VERIFY_CMD", "HARNESS_TEST_CMD")
+    A_VERIFY = "make verify-alpha-only"
+    A_TEST = "npm run alpha-tests -- {files}"
+    KEEP = ("HARNESS_UNRELATED_KEEP", "kept-7c1e")      # any other exported setting still reaches the session
+
+    def setUp(self):
+        super().setUp()
+        self.alpha = self.mk("alpha")
+        self.git(self.alpha, "init", "-q", "-b", "main")
+        write(os.path.join(self.alpha, ".claude", "settings.json"),
+              json.dumps({"env": {"CLAUDE_VERIFY_CMD": self.A_VERIFY, "HARNESS_TEST_CMD": self.A_TEST}}))
+        self.git(self.alpha, "add", "-A")
+        self.git(self.alpha, "commit", "-q", "-m", "Alpha")
+
+    def commit_settings(self, env):
+        """B's settings.json, committed and pushed."""
+        write(os.path.join(self.repo, ".claude", "settings.json"), json.dumps({"env": env}))
+        self.git(self.repo, "add", "-A")
+        self.git(self.repo, "commit", "-q", "-m", "Settings")
+        self.git(self.repo, "push", "-q", "origin", "main")
+
+    def launched_env(self, venue, settings, cwd=None, **exported):
+        """The environment the one session launched by `dispatch --repo <B> --venue <venue>` received."""
+        self.commit_settings(settings)
+        self.scenario(issues=[issue()], ready=[ready_row(12)])
+        p = self.work("dispatch", "--repo", self.repo, "--venue", venue,
+                      env=self.env(**dict([self.KEEP], **exported)), cwd=cwd or self.repo)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue(wait_for(lambda: len(self.claude_calls()) >= 1), self.claude_calls())
+        [call] = self.claude_calls()
+        self.assertEqual(os.path.realpath(call["cwd"]), self.worktree_path())
+        for record in self.run_records():
+            if record.get("pid"):
+                self.assertTrue(wait_for(lambda: pid_gone(record["pid"])))
+        return call["env"]
+
+    def test_a_dispatch_for_another_repository_carries_its_commands_not_the_sessions(self):
+        both = {"CLAUDE_VERIFY_CMD": self.A_VERIFY, "HARNESS_TEST_CMD": self.A_TEST}
+        cases = (
+            ("B both, A both, HARNESS_SESSION_PROJECT",
+             {"CLAUDE_VERIFY_CMD": "make verify-widgets", "HARNESS_TEST_CMD": "pytest -q {files}"},
+             "HARNESS_SESSION_PROJECT", both),
+            ("B test only, A both, CLAUDE_PROJECT_DIR", {"HARNESS_TEST_CMD": "go test ./..."},
+             "CLAUDE_PROJECT_DIR", both),
+            ("B verify only, A test only, HARNESS_SESSION_PROJECT", {"CLAUDE_VERIFY_CMD": "tox -e py39"},
+             "HARNESS_SESSION_PROJECT", {"HARNESS_TEST_CMD": self.A_TEST}),
+            ("B neither, A both, CLAUDE_PROJECT_DIR", {}, "CLAUDE_PROJECT_DIR", both),
+            ("B neither, A verify only, HARNESS_SESSION_PROJECT", {}, "HARNESS_SESSION_PROJECT",
+             {"CLAUDE_VERIFY_CMD": self.A_VERIFY}),
+        )
+        for venue in ("bg", "headless"):
+            for label, settings, signal, exported in cases:
+                with self.subTest(venue=venue, case=label):
+                    self.setUp()
+                    env = self.launched_env(venue, settings, cwd=self.alpha, **{signal: self.alpha}, **exported)
+                    for name in self.NAMES:
+                        if name in settings:
+                            self.assertEqual(env.get(name), settings[name], name)
+                        else:
+                            self.assertFalse((env.get(name) or "").strip(), f"{name}={env.get(name)!r}")
+                    flat = json.dumps(env)
+                    self.assertNotIn(self.A_VERIFY, flat)
+                    self.assertNotIn("alpha-tests", flat)
+                    self.assertEqual(env.get(self.KEEP[0]), self.KEEP[1])
+
+    def test_a_dispatch_from_the_repositorys_own_session_passes_the_environment_through(self):
+        settings = {"CLAUDE_VERIFY_CMD": "make verify-widgets", "HARNESS_TEST_CMD": "pytest -q {files}"}
+        cases = (("no session project", None, "make exported-check", "pytest -x {files}"),
+                 ("HARNESS_SESSION_PROJECT is B", "HARNESS_SESSION_PROJECT", "just verify-all", "just test {files}"),
+                 ("CLAUDE_PROJECT_DIR is B", "CLAUDE_PROJECT_DIR", "nox -s verify", "nox -s tests -- {files}"))
+        for venue in ("bg", "headless"):
+            for label, signal, verify, test in cases:
+                with self.subTest(venue=venue, case=label):
+                    self.setUp()
+                    exported = {"CLAUDE_VERIFY_CMD": verify, "HARNESS_TEST_CMD": test}
+                    if signal:
+                        exported[signal] = self.repo
+                    env = self.launched_env(venue, settings, **exported)
+                    self.assertEqual((env.get("CLAUDE_VERIFY_CMD"), env.get("HARNESS_TEST_CMD")), (verify, test))
+                    self.assertEqual(env.get(self.KEEP[0]), self.KEEP[1])
+
+
 if __name__ == "__main__":
     unittest.main()

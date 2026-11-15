@@ -1045,5 +1045,96 @@ class CloudSweep(CloudTest):
         self.assertEqual(data["live"], [])
 
 
+class CloudCrossProject(CloudTest):
+    """#299: `harness-work cloud N --repo B` run from a session of project A, whose settings are exported into the
+    session's environment, puts B's own verify (or test) command in the prompt, never A's. A launch from B's own
+    session keeps the environment first. Repo A is a separate git repository, so B's main checkout is not its."""
+
+    A_VERIFY = "make verify-alpha-only"
+    A_TEST = "npm run alpha-tests -- {files}"
+
+    def setUp(self):
+        super().setUp()
+        self.alpha = self.mk("alpha")
+        self.git(self.alpha, "init", "-q", "-b", "main")
+        write(os.path.join(self.alpha, "README.md"), "# alpha\n")
+        write(os.path.join(self.alpha, ".claude", "settings.json"),
+              json.dumps({"env": {"CLAUDE_VERIFY_CMD": self.A_VERIFY, "HARNESS_TEST_CMD": self.A_TEST}}))
+        self.git(self.alpha, "add", "-A")
+        self.git(self.alpha, "commit", "-q", "-m", "Alpha")
+
+    def cloud_prompt(self, settings, cwd=None, **exported):
+        """The prompt of `harness-work cloud 12 --repo <B>` with B's committed settings `settings`, run from `cwd`
+        with `exported` in the environment."""
+        self.commit_settings(settings)
+        self.cloud_scenario([issue(12)])
+        p = self.work("cloud", "12", "--repo", self.repo, env=self.env(**exported), cwd=cwd or self.repo)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        [call] = self.cloud_calls()
+        argv = call["argv"]
+        return argv[argv.index("--cloud") + 1]
+
+    def own_prompt(self, settings):
+        """The reference: the prompt B's own session gets with nothing exported, from a fresh fixture."""
+        self.setUp()
+        return self.cloud_prompt(settings)
+
+    def test_a_launch_for_another_repository_takes_its_command_not_the_sessions(self):
+        both = {"CLAUDE_VERIFY_CMD": self.A_VERIFY, "HARNESS_TEST_CMD": self.A_TEST}
+        cases = (
+            ("B verify and test, A exports both, HARNESS_SESSION_PROJECT",
+             {"CLAUDE_VERIFY_CMD": "make verify-widgets", "HARNESS_TEST_CMD": "pytest -q {files}"},
+             "HARNESS_SESSION_PROJECT", both, "make verify-widgets"),
+            ("B test only, A exports both, CLAUDE_PROJECT_DIR",
+             {"HARNESS_TEST_CMD": "python3 -m pytest tests -q"}, "CLAUDE_PROJECT_DIR", both,
+             "python3 -m pytest tests -q"),
+            ("B test only, A exports its verify only, HARNESS_SESSION_PROJECT",
+             {"HARNESS_TEST_CMD": "go test ./..."}, "HARNESS_SESSION_PROJECT",
+             {"CLAUDE_VERIFY_CMD": self.A_VERIFY}, "go test ./..."),
+            ("B verify only, A exports both, CLAUDE_PROJECT_DIR",
+             {"CLAUDE_VERIFY_CMD": "tox -e lint,py39"}, "CLAUDE_PROJECT_DIR", both, "tox -e lint,py39"),
+        )
+        for label, settings, signal, exported, want in cases:
+            with self.subTest(label):
+                expected = self.own_prompt(settings)
+                self.assertIn(f"`{want}`", expected)          # the reference itself names B's command
+                self.setUp()
+                prompt = self.cloud_prompt(settings, cwd=self.alpha, **{signal: self.alpha}, **exported)
+                self.assertIn(f"`{want}`", prompt)
+                self.assertNotIn(self.A_VERIFY, prompt)
+                self.assertNotIn("alpha-tests", prompt)
+                self.assertEqual(prompt, expected)
+
+    def test_another_repository_without_a_command_gets_no_command_from_the_session(self):
+        for signal, exported in (("HARNESS_SESSION_PROJECT", {"CLAUDE_VERIFY_CMD": self.A_VERIFY,
+                                                              "HARNESS_TEST_CMD": self.A_TEST}),
+                                 ("CLAUDE_PROJECT_DIR", {"HARNESS_TEST_CMD": self.A_TEST})):
+            with self.subTest(signal):
+                expected = self.own_prompt({})
+                self.setUp()
+                prompt = self.cloud_prompt({}, cwd=self.alpha, **{signal: self.alpha}, **exported)
+                self.assertNotIn(self.A_VERIFY, prompt)
+                self.assertNotIn("alpha-tests", prompt)
+                self.assertEqual(prompt, expected)
+
+    def test_a_launch_from_the_repositorys_own_session_keeps_the_environment_first(self):
+        settings = {"CLAUDE_VERIFY_CMD": "make verify-widgets", "HARNESS_TEST_CMD": "pytest -q {files}"}
+        for label, signal, exported_verify in (("no session project", None, "make exported-check"),
+                                               ("HARNESS_SESSION_PROJECT is B", "HARNESS_SESSION_PROJECT",
+                                                "just verify-all"),
+                                               ("HARNESS_SESSION_PROJECT is inside B", "inside", "make ci-local"),
+                                               ("CLAUDE_PROJECT_DIR is B", "CLAUDE_PROJECT_DIR", "nox -s verify")):
+            with self.subTest(label):
+                self.setUp()
+                exported = {"CLAUDE_VERIFY_CMD": exported_verify}
+                if signal == "inside":
+                    exported["HARNESS_SESSION_PROJECT"] = self.mk("proj", "docs", "deep")
+                elif signal:
+                    exported[signal] = self.repo
+                prompt = self.cloud_prompt(settings, **exported)
+                self.assertIn(f"`{exported_verify}`", prompt)
+                self.assertNotIn("make verify-widgets", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
