@@ -17,6 +17,9 @@ The contract these tests read from the ticket:
     its head is not t/<N>-), a failing gh, a gh slower than 3 s and gh calls past 8 s in all (inside the 10 s
     hook timeout); the ticket comes from a t/<N>- head only when the PR closes nothing;
   - ask, naming the flag, with no gh call, for --accept-findings or --discard;
+  - every `harness-pr land P` in a command is judged, each in the main checkout of its own directory (a cd
+    carries over to the parts after it, as in the shell): one land that asks makes the command ask, in any
+    position, and an override flag in any part asks with no gh call;
   - `cd <dir> && harness-pr land P` is judged in the main checkout of <dir>; `harness-pr ready P`,
     `harness-pr land --help`, `harness-pr land` without a number and commands without harness-pr print nothing
     and call no gh;
@@ -272,6 +275,16 @@ class LandAskTests(unittest.TestCase):
             return []
         return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines() if line.strip()]
 
+    def pr_views(self) -> set:
+        """(PR, directory) of every gh pr view the last hook run made."""
+        return {
+            (int(arg), call["cwd"])
+            for call in self.gh_calls()
+            if "pr" in call["argv"] and "view" in call["argv"]
+            for arg in call["argv"]
+            if arg.isdigit()
+        }
+
     # ---- running the hook
 
     def event(self, command: str, cwd: Path | None = None) -> dict:
@@ -513,9 +526,11 @@ class LandAskTests(unittest.TestCase):
     # ---- where it is judged, and what it leaves alone
 
     def test_cd_prefix_and_other_commands(self):
-        # PR 12 closes #40: risk:high in this repo, risk:low in the other one. gh anywhere else answers the decoy.
+        # PR 12 closes #40: risk:high in this repo, risk:low in the other one. PR 7 (closing #3) and PR 9 (closing
+        # #5) are risk:low and exist in this repo only. gh anywhere else answers the decoy.
         other = self.make_repo("other")
-        self.scenario(pr_call(12, [40]), issue_call(40, "risk:high"))
+        self.scenario(pr_call(12, [40]), issue_call(40, "risk:high"), pr_call(7, [3]), issue_call(3, "risk:low"),
+                      pr_call(9, [5]), issue_call(5, "task", "risk:low"))
         self.scenario(pr_call(12, [40]), issue_call(40, "risk:low"), where=other)
         worktree = self.tmp / "wt"
         self.git(self.repo, "worktree", "add", "-q", "-b", "t/40-fix-login", str(worktree))
@@ -544,6 +559,69 @@ class LandAskTests(unittest.TestCase):
                     self.assertIn("risk:high", reason)
                 else:
                     self.assert_silent(command, cwd=cwd)
+
+        # Every land in a command is judged, each in the main checkout of its own directory, a cd carrying over to
+        # the parts after it: one risk:high PR anywhere in the chain asks, in either order, and a chain of risk:low
+        # lands passes. Judging only the first land, only the last, or every land in one directory (the session's,
+        # the first cd's or the last cd's) gets one of these wrong; so does asking on any chain.
+        home, away = os.path.realpath(str(self.repo)), os.path.realpath(str(other))
+        chains = [
+            # (the session's cwd, the command, the risk:high ticket the ask names or None for silence, (PR,
+            # directory) views gh must have answered)
+            (self.repo, "harness-pr land 7 && harness-pr land 12", 40, {(12, home)}),
+            (self.repo, "harness-pr land 12 && harness-pr land 7", 40, {(12, home)}),
+            (self.repo, "harness-pr land 7; harness-pr land 12", 40, {(12, home)}),
+            (self.repo, "harness-pr land 7 || harness-pr land 12", 40, {(12, home)}),
+            (self.repo, "harness-pr land 9\nharness-pr land '#12'", 40, {(12, home)}),
+            (self.repo, "harness-pr land 7 && harness-pr land 12 && harness-pr land 9", 40, {(12, home)}),
+            (self.repo, "harness-pr land 9 2>&1 | tail -1; harness-pr land 12 --yes", 40, {(12, home)}),
+            (self.repo, "harness-pr land 7 && harness-pr land 9", None, {(7, home), (9, home)}),
+            (self.repo, "harness-pr land 9; harness-pr land '#7' --yes", None, {(7, home), (9, home)}),
+            (self.repo, "harness-pr ready 12 && harness-pr land 7", None, {(7, home)}),
+            (self.repo, "harness-pr land 7 && harness-pr land --help", None, {(7, home)}),
+            # across the two repos: PR 12 is risk:high in this one only, PR 7 exists in this one only
+            (self.tmp, f"cd {there} && harness-pr land 12; cd {repo} && harness-pr land 12", 40, {(12, home)}),
+            (self.tmp, f"cd {repo} && harness-pr land 12; cd {there} && harness-pr land 12", 40, {(12, home)}),
+            (other, f"harness-pr land 12 && cd {repo} && harness-pr land 12", 40, {(12, home)}),
+            (self.tmp, "cd other && harness-pr land 12; cd ../proj && harness-pr land 12", 40, {(12, home)}),
+            (self.tmp, f"cd {there} && harness-pr land 12 && cd {repo} && harness-pr land 7", None,
+             {(12, away), (7, home)}),
+            (self.repo, f"harness-pr land 7 && cd {there} && harness-pr land 12", None, {(7, home), (12, away)}),
+            (self.tmp, "cd proj && harness-pr land 9; cd ../other && harness-pr land 12", None,
+             {(9, home), (12, away)}),
+        ]
+        for cwd, command, high, views in chains:
+            with self.subTest(cwd=cwd.name, command=command):
+                if high is None:
+                    self.assert_silent(command, cwd=cwd)
+                else:
+                    reason = self.ask(command, cwd=cwd)
+                    self.assertTrue(names_number(reason, high), f"the reason does not name #{high}: {reason}")
+                    self.assertIn("risk:high", reason)
+                made = self.pr_views()
+                self.assertLessEqual(views, made, "a land was not judged in the main checkout of its directory")
+                self.assertLessEqual({where for _, where in made}, {home, away}, "gh ran outside a main checkout")
+        # Not a PR number in any part asks.
+        for command in ("harness-pr land 7 && harness-pr land abc", "harness-pr land 9; harness-pr land '#x'"):
+            with self.subTest(command=command):
+                self.ask(command)
+        # An override flag in any part asks, naming it, before any gh call: every land but PR 12 in this repo is
+        # risk:low, so the flag alone is what asks, wherever it stands.
+        flagged = [
+            (self.repo, "harness-pr land 7 && harness-pr land 9 --discard", "discard", "accept-findings"),
+            (self.repo, "harness-pr land 9 --discard && harness-pr land 7", "discard", "accept-findings"),
+            (self.repo, "harness-pr land 7 && harness-pr land 12 --discard", "discard", "accept-findings"),
+            (self.repo, "harness-pr land 7; harness-pr land --accept-findings 9; harness-pr land 7", "accept-findings",
+             "discard"),
+            (self.tmp, f"cd {there} && harness-pr land 12; cd {repo} && harness-pr land 7 --accept-findings",
+             "accept-findings", "discard"),
+        ]
+        for cwd, command, flag, unnamed in flagged:
+            with self.subTest(cwd=cwd.name, command=command):
+                reason = self.ask(command, cwd=cwd)
+                self.assertIn(flag, reason)
+                self.assertNotIn(unnamed, reason, "the reason names a flag the command does not give")
+                self.assertEqual(self.gh_calls(), [], "an override flag in any part must ask without calling gh")
 
         left_alone = [
             "harness-pr ready 12",
