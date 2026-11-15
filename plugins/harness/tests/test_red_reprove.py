@@ -9,6 +9,12 @@ files as they are now against main's code at the merge base, in a temporary deta
 worktree, and writes the side file and the record exactly as `check` does; a run that passes there, or proves
 nothing, is refused and the old record is kept byte for byte.
 
+#309: a branch brought home from a cloud session (no harness hooks there) carries its tests and its source in the
+same commits and has no red record, so tests_first refuses every source edit, a merge-conflict resolution included,
+and `check` refuses (source already changed). `reprove` no longer needs an earlier record: red at the merge base
+writes the record and the side file as above; green, or a run that proves nothing, leaves no record and no side
+file. A corrupt record does not block it either: a red run replaces it.
+
 Every case builds, with real git under a temporary folder, a bare "origin", a clone with `main` (calc.py, whose
 `add` is not built yet), and the branch t/12-slug in a linked worktree at <clone>/.claude/worktrees/t-12-slug.
 HOME and TMPDIR are temporary, so records and temporary worktrees land under them. The test command is
@@ -64,6 +70,16 @@ TEST_SUB = ("import unittest\n\nimport calc\n\n\nclass SubTest(unittest.TestCase
 TEST_HANG = ("import time\nimport unittest\n\n\nclass HangTest(unittest.TestCase):\n"
              "    def test_hang(self):\n        time.sleep(60)\n")
 TEST_SYNTAX = "import unittest\n\nimport calc\n\n\ndef test_add(:\n    assert calc.add(2, 3) == 5\n"
+# #309: passes against main's code only (add is not built there), so it fails at HEAD once add is built.
+TEST_ADD_UNBUILT = ("import unittest\n\nimport calc\n\n\nclass UnbuiltTest(unittest.TestCase):\n"
+                    "    def test_add_is_not_built(self):\n        self.assertIsNone(calc.add(2, 3))\n")
+# Main's later edit of add's own line: a branch that built add conflicts with it in calc.py.
+CALC_MAIN_EDIT = CALC.replace("    return None\n", '    """The sum of a and b."""\n    return None  # not built\n')
+CALC_RESOLVED = CALC.replace("    return None\n", '    """The sum of a and b."""\n    return a + b\n')
+# tests_first's denial of a source edit on a ticket branch with no red record (its cache present).
+NO_RED_HOOK = "Tests first on t/{n}: write the tests, then run harness-red check. (No red run recorded.)"
+TESTS_FIXED = ("Tests are fixed for this ticket. If a test is wrong, stop and report it; the orchestrator sends it "
+               "back to the test-author.")
 
 # harness-red reads some phrases in a run's output as a run that proves nothing (bin/harness-red: NO_TESTS_RE,
 # COLLECTED_NONE_RE, BAD_SYNTAX_RE, LOAD_ERROR_RE), and `harness-red check` runs this module before reprove exists.
@@ -72,8 +88,10 @@ TEST_SYNTAX = "import unittest\n\nimport calc\n\n\ndef test_add(:\n    assert ca
 # message goes through quiet().
 EMPTY_RUN = "no tests" + " ran"
 PYTEST_NONE = "collected 0" + " items\n\n=================== " + EMPTY_RUN + " in 0.00s ===================\n"
+# The import phrases (IMPORT_RE) are masked too: they would turn this module's own red run into kind `import`.
 QUIET = re.compile(r"(?i)no\s+tests\s+ran|collected\s+0\s+items|error\s+during\s+collection|error\s+collecting|"
-                   r"(?:Syntax|Indentation|Tab)Error")
+                   r"(?:Syntax|Indentation|Tab)Error|ModuleNotFoundError|ImportError|No\s+module\s+named|"
+                   r"Cannot\s+find\s+module|ERR_MODULE_NOT_FOUND")
 
 
 def quiet(text):
@@ -351,6 +369,29 @@ class Fixture(unittest.TestCase):
             "stash": self.git(self.repo, "stash", "list"),
         }
 
+    def cloud_commit(self, files, root=None, message="tests and source, from a cloud session"):
+        """What a cloud session pushes (#309): the tests and the source in one commit, no harness-red run, no
+        record."""
+        for rel, text in files.items():
+            self.put(rel, text, root=root)
+        self.commit(message, root=root)
+
+    def ticket_worktree(self, number, slug):
+        """(worktree, record path, side file path) of a further ticket branch t/<number>-<slug> off origin/main,
+        with its ticket cache."""
+        self.cache(number)
+        wt = os.path.join(self.repo, ".claude", "worktrees", f"t-{number}-{slug}")
+        self.git(self.repo, "worktree", "add", "-q", wt, "-b", f"t/{number}-{slug}", "origin/main")
+        return (wt, os.path.join(self.state, "red", f"t-{number}-{slug}.json"),
+                os.path.join(self.state, "red-files", f"t-{number}-{slug}.json"))
+
+    def assertNoRecordAnywhere(self):
+        """No red record and no side file under any name: nothing tests_first could accept."""
+        for folder in ("red", "red-files"):
+            path = os.path.join(self.state, folder)
+            left = [n for n in os.listdir(path) if not n.startswith(".")] if os.path.isdir(path) else []
+            self.assertEqual(left, [], f"{folder}/ holds {left}")
+
 
 class ReproveTest(Fixture):
 
@@ -424,6 +465,143 @@ class ReproveTest(Fixture):
         self.assertEqual(self.status_line(), "current: yes")
         self.assertIsNone(self.hook("calc.py"))
         self.assertEqual(self.git(self.wt, "status", "--porcelain"), "?? tests/test_more.py")   # still uncommitted
+
+    # ------------------------------------------------------------ #309: a branch brought home from a cloud session
+    def test_a_branch_brought_home_with_tests_and_source_and_no_record_is_reproved_and_unlocks_source(self):
+        self.cache()
+        self.cloud_commit({"tests/test_calc.py": TEST_ADD, "calc.py": CALC_BUILT})
+        self.assertEqual(self.git(self.wt, "show", "--name-only", "--format=", "HEAD").split(),
+                         ["calc.py", "tests/test_calc.py"])                 # one commit holds both
+        branch_point = self.merge_base()
+        # Main edits add's own line meanwhile, so merging main conflicts in calc.py: a source file.
+        self.on_main({"calc.py": CALC_MAIN_EDIT})
+        merge = subprocess.run([GIT, "-C", self.wt, "merge", "--no-edit", "origin/main"], env=self.env,
+                               capture_output=True, text=True)
+        self.assertNotEqual(merge.returncode, 0, "the merge of main must conflict")
+        self.assertEqual(self.git(self.wt, "diff", "--name-only", "--diff-filter=U"), "calc.py")
+        # The premise: no record, so the resolution cannot be written; check refuses, status has nothing.
+        self.assertEqual(self.kept(), (None, None))
+        for agent in ("harness:coder", None):
+            with self.subTest(agent=agent, before="reprove"):
+                self.assertEqual(self.hook("calc.py", agent), NO_RED_HOOK.format(n=12))
+        self.assertOneLineError(self.red("check"), "Source already changed before the red run: calc.py.")
+        self.assertOneLineError(self.red("status"), NO_RECORD)
+
+        p = self.red("reprove")
+        self.assertRed(p, 1)
+        files = ["tests/test_calc.py"]
+        rec = self.record()
+        self.assertEqual(set(rec), RECORD_KEYS)
+        self.assertEqual(rec["branch"], BRANCH)
+        self.assertEqual(rec["base_sha"], branch_point)                     # the merge base, mid-merge
+        self.assertNotEqual(rec["base_sha"], self.git(self.repo, "rev-parse", "origin/main"))
+        self.assertEqual((rec["test_files"], rec["run_files"]), (files, files))
+        self.assertEqual(rec["test_hash"], expected_hash(self.wt, files))
+        self.assertEqual(rec["cmd"], "python3 -m unittest tests/test_calc.py")
+        self.assertEqual((rec["exit"], rec["kind"]), (1, "assertion"))
+        self.assertInText("None != 5", rec["tail"], "the tail")              # main's add, not the branch's
+        self.assertTrue(rec["tail"] in p.stdout, "the tail is not printed after the red line")
+        self.assertIsNotNone(dt.datetime.fromisoformat(rec["at"]).tzinfo)
+        self.assertEqual(json.loads(read(self.side_path)), expected_side_file(self.wt, files))
+        self.assertEqual(self.status_line(), "current: yes")
+
+        # The conflict resolution in source is allowed now, for the coder and the main session alike...
+        for agent in ("harness:coder", None):
+            with self.subTest(agent=agent, after="reprove"):
+                self.assertIsNone(self.hook("calc.py", agent))
+        self.put("calc.py", CALC_RESOLVED)
+        self.git(self.wt, "add", "calc.py")
+        self.git(self.wt, "commit", "-q", "--no-edit")
+        self.assertEqual(len(self.git(self.wt, "rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+        self.assertEqual(self.unittest_exit(self.wt, "tests/test_calc.py"), 0)
+        # ...and so is a later fix, while the role rules still hold.
+        self.assertEqual(self.status_line(), "current: yes")
+        self.assertIsNone(self.hook("calc.py"))
+        self.assertIsNone(self.hook("util.py"))
+        self.assertEqual(self.hook("tests/test_calc.py"), TESTS_FIXED)
+
+    def test_branches_brought_home_in_other_shapes_get_their_own_red_record(self):
+        # Each its own ticket branch, worktree and record: (name, ticket, the cloud commit, main's move, merged?,
+        # test files, run files, failures in the tail, failures that must not be there).
+        shapes = [
+            ("two modules, a fixture and new source in one commit", 21,
+             {"tests/test_calc.py": TEST_ADD_COVERED, "tests/test_more.py": TEST_MORE,
+              "tests/fixtures/data.json": '{"n": 2}\n', "calc.py": CALC_BUILT, "util.py": "HELPER = 1\n"},
+             None, False,
+             ["tests/fixtures/data.json", "tests/test_calc.py", "tests/test_more.py"],
+             ["tests/test_calc.py", "tests/test_more.py"], ["None != 5", "None != 9", "None != 15"], []),
+            ("main merged in since", 22,
+             {"tests/test_more.py": TEST_MORE, "calc.py": CALC_BUILT},
+             {"mathx.py": "def double(x):\n    return 2 * x\n"}, True,
+             ["tests/test_more.py"], ["tests/test_more.py"], ["None != 15"], ["None != 5"]),
+            ("main moved on, not merged", 23,
+             {"tests/test_calc.py": TEST_ADD, "calc.py": CALC_BUILT},
+             {"README.md": "# calc, moved on\n"}, False,
+             ["tests/test_calc.py"], ["tests/test_calc.py"], ["None != 5"], ["None != 15"]),
+        ]
+        for name, number, commit, main_move, merged, files, run_files, failures, absent in shapes:
+            with self.subTest(name):
+                wt, record_path, side_path = self.ticket_worktree(number, "cloud")
+                self.cloud_commit(commit, root=wt)
+                if main_move:
+                    self.on_main(main_move)
+                if merged:
+                    self.git(wt, "merge", "-q", "--no-edit", "origin/main")
+                base = self.git(wt, "merge-base", "HEAD", "origin/main")
+                tip = self.git(self.repo, "rev-parse", "origin/main")
+                self.assertEqual(base == tip, merged or not main_move, "the shape's merge base")
+                self.assertFalse(os.path.exists(record_path) or os.path.exists(side_path))
+                self.assertEqual(self.hook("calc.py", root=wt), NO_RED_HOOK.format(n=number))
+
+                p = self.red("reprove", cwd=wt)
+                self.assertRed(p, len(files))
+                with open(record_path, encoding="utf-8") as fh:
+                    rec = json.load(fh)
+                self.assertEqual(set(rec), RECORD_KEYS)
+                self.assertEqual(rec["branch"], f"t/{number}-cloud")
+                self.assertEqual(rec["base_sha"], base)
+                self.assertEqual((rec["test_files"], rec["run_files"]), (files, run_files))
+                self.assertEqual(rec["test_hash"], expected_hash(wt, files))
+                self.assertEqual(rec["cmd"], "python3 -m unittest " + " ".join(run_files))
+                self.assertEqual((rec["exit"], rec["kind"]), (1, "assertion"))
+                for failure in failures:
+                    self.assertInText(failure, rec["tail"], "the tail")
+                for failure in absent:
+                    self.assertFalse(failure in rec["tail"], quiet(rec["tail"]))
+                self.assertEqual(json.loads(read(side_path)), expected_side_file(wt, files))
+                status = self.red("status", cwd=wt)
+                self.assertEqual(status.returncode, 0, quiet(status.stdout + status.stderr))
+                self.assertEqual(status.stdout.splitlines()[-1], "current: yes")
+                self.assertIsNone(self.hook("calc.py", root=wt))
+                self.assertIsNone(self.hook("util.py", root=wt))
+        self.assertEqual(self.kept(), (None, None))                # t/12-slug was never touched
+
+    def test_a_corrupt_record_does_not_block_reprove_and_a_red_run_replaces_it(self):
+        self.cache()
+        self.cloud_commit({"tests/test_calc.py": TEST_ADD, "calc.py": CALC_BUILT})
+        files = ["tests/test_calc.py"]
+        corrupt = [
+            ("not JSON", "{not json\n"),
+            ("no test_files", json.dumps({"branch": BRANCH, "kind": "assertion", "exit": 1}) + "\n"),
+            ("empty test_files", json.dumps({"branch": BRANCH, "test_files": []}) + "\n"),
+            ("test_files not a list", json.dumps({"branch": BRANCH, "test_files": "tests/test_calc.py"}) + "\n"),
+        ]
+        for name, text in corrupt:
+            with self.subTest(name):
+                write(self.record_path, text)
+                if os.path.exists(self.side_path):
+                    os.remove(self.side_path)
+                self.assertIsNotNone(self.hook("calc.py"))           # the corrupt record allows nothing
+                p = self.red("reprove")
+                self.assertRed(p, 1)
+                rec = self.record()
+                self.assertEqual(set(rec), RECORD_KEYS)
+                self.assertEqual(rec["base_sha"], self.merge_base())
+                self.assertEqual((rec["test_files"], rec["kind"]), (files, "assertion"))
+                self.assertEqual(rec["test_hash"], expected_hash(self.wt, files))
+                self.assertEqual(json.loads(read(self.side_path)), expected_side_file(self.wt, files))
+                self.assertEqual(self.status_line(), "current: yes")
+                self.assertIsNone(self.hook("calc.py"))
 
     # ------------------------------------------------------------ where the run happens
     def test_the_run_is_at_the_merge_base_with_the_test_files_as_they_are_now(self):
@@ -617,7 +795,9 @@ class ReproveTest(Fixture):
         self.assertEqual(self.kept(), kept)
         self.assertEqual(self.status_line(), "current: no")
 
-    def test_without_a_red_record_it_is_refused(self):
+    def test_without_a_red_record_it_runs_and_a_red_run_writes_one(self):
+        # #309 changed this on purpose: without an earlier record reprove used to be refused with NO_RECORD and run
+        # nothing; now it runs, and red writes the record. Tests and source in two commits, no check between.
         self.cache()
         self.put("tests/test_calc.py", TEST_ADD)
         self.commit("tests for add")
@@ -625,10 +805,91 @@ class ReproveTest(Fixture):
         self.commit("add")
         env, marker = self.marker_env()
         worktrees = self.worktrees()
+        self.assertEqual(self.kept(), (None, None))
+        p = self.red("reprove", **env)
+        self.assertRed(p, 1)
+        self.assertTrue(os.path.exists(marker), "the test command did not run")
+        rec = self.record()
+        self.assertEqual(rec["base_sha"], self.merge_base())
+        self.assertEqual(rec["test_files"], ["tests/test_calc.py"])
+        self.assertEqual(rec["cmd"], env["HARNESS_TEST_CMD"].replace("{files}", "tests/test_calc.py"))
+        self.assertEqual(json.loads(read(self.side_path)), expected_side_file(self.wt, ["tests/test_calc.py"]))
+        self.assertEqual(self.worktrees(), worktrees)
+        self.assertEqual(self.status_line(), "current: yes")
+        self.assertIsNone(self.hook("calc.py"))
+
+    def test_without_a_red_record_tests_that_pass_against_mains_code_leave_no_record(self):
+        # The cloud shape whose tests prove nothing at the merge base: no record, not even a green one, and no
+        # side file, so tests-first still refuses source. The second case fails at HEAD and passes only against
+        # main's code: the judging is of the merge base's run.
+        self.cache()
+        cases = [
+            ("sub, which main has", {"tests/test_calc.py": TEST_SUB, "calc.py": CALC_BUILT}, 0),
+            ("add unbuilt, which only main's code passes", {"tests/test_calc.py": TEST_ADD_UNBUILT}, 1),
+            ("two more files, all passing there",
+             {"tests/test_sub.py": TEST_SUB, "tests/test_unbuilt.py": TEST_ADD_UNBUILT}, 1),
+        ]
+        for name, commit, exit_at_head in cases:
+            with self.subTest(name):
+                self.cloud_commit(commit)
+                tests = sorted(p for p in commit if p.startswith("tests/"))
+                self.assertEqual(self.unittest_exit(self.wt, *tests) != 0, bool(exit_at_head))
+                snapshot = self.snapshot()
+                p = self.red("reprove")
+                self.assertOneLineError(p, "merge base", "prove nothing")
+                self.assertEqual(self.kept(), (None, None))
+                self.assertNoRecordAnywhere()
+                self.assertEqual(self.snapshot(), snapshot)
+                self.assertOneLineError(self.red("status"), NO_RECORD)
+                self.assertEqual(self.hook("calc.py"), NO_RED_HOOK.format(n=12))
+        p = self.red("reprove", "--json")
+        self.assertOneLineError(p, "merge base", "prove nothing")
+        self.assertEqual(json.loads(p.stdout).get("refused"), "green")
+        self.assertEqual(self.kept(), (None, None))
+
+    def test_without_a_red_record_runs_that_prove_nothing_leave_no_record(self):
+        self.cache()
+        self.cloud_commit({"tests/test_calc.py": TEST_ADD, "calc.py": CALC_BUILT})
+        snapshot = self.snapshot()
+        cases = [
+            ("empty run", {}, self.fake_runner(PYTEST_NONE, 5), [f"no red run recorded: {EMPTY_RUN} (exit 5)"]),
+            ("failed to load", {"tests/test_bad.py": TEST_SYNTAX}, {},
+             ["no red run recorded: tests failed to load (exit 1)"]),
+            ("timeout", {"tests/test_hang.py": TEST_HANG}, {"HARNESS_TEST_TIMEOUT": "1"},
+             ["timed out after 1s", "no red run recorded"]),
+            ("cannot start", {}, {"HARNESS_TEST_CMD": "no-such-test-runner-309 {files}"}, ["could not start"]),
+        ]
+        for name, files, env, needles in cases:
+            with self.subTest(name):
+                for rel, text in files.items():
+                    self.put(rel, text)
+                try:
+                    started = time.monotonic()
+                    p = self.red("reprove", **env)
+                    self.assertLess(time.monotonic() - started, 30)
+                    self.assertOneLineError(p, *needles)
+                    self.assertEqual(self.kept(), (None, None))
+                    self.assertNoRecordAnywhere()
+                    self.assertEqual(self.worktrees(), snapshot["worktrees"])   # removed whatever the outcome
+                finally:
+                    for rel in files:
+                        os.remove(os.path.join(self.wt, rel))
+        self.assertEqual(self.snapshot(), snapshot)
+        self.assertEqual(self.hook("calc.py"), NO_RED_HOOK.format(n=12))
+        # The same branch with a run that proves something: red, so the refusals above were the runs'.
+        self.assertRed(self.red("reprove"), 1)
+        self.assertEqual(self.status_line(), "current: yes")
+
+    def test_without_a_red_record_or_test_changes_it_is_refused_as_check_refuses(self):
+        self.cache()
+        self.cloud_commit({"calc.py": CALC_BUILT}, message="source only, from a cloud session")
+        self.put("docs/notes.md", "notes\n")                        # exempt, uncommitted
+        env, marker = self.marker_env()
+        worktrees = self.worktrees()
         p = self.red("reprove", **env)
         self.assertEqual(p.returncode, 1, quiet(p.stdout + p.stderr))
-        self.assertEqual(quiet(p.stderr.strip()), "harness-red: " + NO_RECORD)
-        self.assertFalse(os.path.exists(marker), "the test command ran without a red record")
+        self.assertEqual(quiet(p.stderr.strip()), "harness-red: " + NO_TEST_CHANGES)
+        self.assertFalse(os.path.exists(marker), "the test command ran without test changes")
         self.assertEqual(self.kept(), (None, None))
         self.assertEqual(self.worktrees(), worktrees)
 
@@ -678,6 +939,232 @@ class ReproveTest(Fixture):
         self.assertEqual(tree(self.scratch), scratch_tree)
         self.assertEqual(read(os.path.join(self.wt, "calc.py")), CALC_BUILT)
         self.assertEqual(self.status_line(), "current: yes")
+
+
+# A stand-in for node: it resolves the module NODE_NEEDS from ./node_modules as require() does, says what node says
+# when it is not there, and otherwise fails as an assertion would (main's code). The phrase is built from pieces.
+NODE_LIKE = '''import os, sys
+need = os.environ["NODE_NEEDS"]
+if not os.path.isdir(os.path.join("node_modules", need)):
+    print("node:internal/modules/cjs/loader:1228")
+    print("  throw err;")
+    print("Error: Cannot find " + "module '" + need + "'")
+    print("Require stack:")
+    print("- " + os.path.join(os.getcwd(), "tests", "pad.test.js"))
+    print("  code: 'MODULE_NOT_FOUND',")
+    sys.exit(1)
+print("AssertionError: pad(1) is not '01'")
+sys.exit(1)
+'''
+
+NODE_FORMS = '''import os, sys
+pkg, says = os.environ["NODE_NEEDS"], os.environ["NODE_SAYS"]
+if not os.path.isdir(os.path.join("node_modules", pkg)):
+    if os.environ.get("NODE_ESM"):
+        print("node:internal/modules/esm/resolve:873")
+        print("  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);")
+        print("Error [ERR_MODULE_NOT_FOUND]: Cannot find " + "package '" + says + "' imported from "
+              + os.path.join(os.getcwd(), "tests", "fmt.test.mjs"))
+        print("  code: 'ERR_MODULE_NOT_FOUND'")
+    else:
+        print("node:internal/modules/cjs/loader:1228")
+        print("  throw err;")
+        print("Error: Cannot find " + "module '" + says + "'")
+        print("Require stack:")
+        print("- " + os.path.join(os.getcwd(), "tests", "x.test.js"))
+        print("  code: 'MODULE_NOT_FOUND',")
+    sys.exit(1)
+print("AssertionError: expected 1 to equal 2")
+sys.exit(1)
+'''
+
+
+class ReproveEnvironment(Fixture):
+    """#292: the temporary worktree has only tracked files. A run there that fails only because a dependency the
+    ticket worktree's environment has (an ignored .venv, a vendored module, node_modules) is missing proves nothing
+    about main's code: it is refused and records nothing. A module the branch's own source adds is still red."""
+
+    def setUp(self):
+        super().setUp()
+        with open(os.path.join(self.repo, ".git", "info", "exclude"), "a", encoding="utf-8") as fh:
+            fh.write(".venv/\nnode_modules/\nvendored_*.py\n")
+        self.venv_cmd = {"HARNESS_TEST_CMD": "PYTHONPATH=.venv/site python3 -m unittest {files}"}
+
+    def dep_test(self, module):
+        """TEST_ADD_COVERED that also imports `module`, as a project's tests import a dependency."""
+        return TEST_ADD_COVERED.replace("import calc\n", f"import calc\nimport {module}\n")
+
+    def test_a_run_that_cannot_import_a_dependency_of_the_ticket_worktree_is_refused(self):
+        self.red_ticket_with_source()
+        node = write(os.path.join(self.tmp, "node_like.py"), NODE_LIKE)
+        cases = [
+            # (name, module, the untracked file that provides it in the ticket worktree, extra test files, env)
+            ("virtualenv", "venvdep_q7", ".venv/site/venvdep_q7/__init__.py", {}, self.venv_cmd),
+            ("another virtualenv module", "yamlish_r2", ".venv/site/yamlish_r2.py", {}, self.venv_cmd),
+            ("vendored, ignored", "vendored_k3", "vendored_k3.py", {}, {}),
+            ("node_modules", "leftpad_z9", "node_modules/leftpad_z9/index.js",
+             {"tests/pad.test.js": "const pad = require('leftpad_z9');\n"},
+             {"HARNESS_TEST_CMD": f"python3 {shlex.quote(node)} {{files}}", "NODE_NEEDS": "leftpad_z9"}),
+        ]
+        for name, module, provider, extra, env in cases:
+            with self.subTest(name):
+                self.put(provider, "VALUE = 1\n")
+                if not provider.endswith(".js"):
+                    self.put("tests/test_calc.py", self.dep_test(module))
+                else:
+                    self.put("tests/test_calc.py", TEST_ADD_COVERED)
+                for rel, text in extra.items():
+                    self.put(rel, text)
+                try:
+                    if not provider.endswith(".js"):   # the premise: the ticket worktree has it, the test passes
+                        p = subprocess.run(env.get("HARNESS_TEST_CMD", "python3 -m unittest {files}").format(
+                            files="tests/test_calc.py"), shell=True, cwd=self.wt, env=self.env,
+                            capture_output=True, text=True, timeout=120)
+                        self.assertEqual(p.returncode, 0, quiet(p.stdout + p.stderr))
+                    self.assertEqual(self.status_line(), "current: no")
+                    kept, snapshot = self.kept(), self.snapshot()
+                    p = self.red("reprove", **env)
+                    said = quiet(p.stdout + p.stderr)
+                    self.assertEqual(p.returncode, 1, f"not refused: {said}")
+                    self.assertEqual(len(p.stderr.strip().splitlines()), 1, said)
+                    self.assertFalse("Traceback" in p.stderr, said)
+                    self.assertTrue(module in p.stderr, f"the refusal does not name {module}: {said}")
+                    self.assertEqual(self.kept(), kept, "a record or side file was written")
+                    self.assertEqual(self.snapshot(), snapshot)        # the provider is still there, nothing moved
+                    self.assertEqual(self.status_line(), "current: no")
+                    self.assertEqual(self.hook("calc.py"), CHANGED)
+                finally:
+                    self.git(self.wt, "checkout", "--", "tests/test_calc.py")
+                    for rel in [provider.split("/")[0], *extra]:     # the whole .venv / node_modules
+                        target = os.path.join(self.wt, rel)
+                        shutil.rmtree(target) if os.path.isdir(target) else os.remove(target)
+        self.assertEqual(self.status_line(), "current: yes")
+
+    def test_a_tracked_file_that_only_shares_the_dependencys_name_does_not_provide_it(self):
+        # A project tracks config and docs named like its dependencies (next.config.js, pytest.ini, docs/yaml.md):
+        # none of them can satisfy the import, so the dependency is still only in the environment and the run
+        # against main's code is refused, in python's dotted form and node's CommonJS and ESM forms too.
+        self.red_ticket_with_source()
+        node = write(os.path.join(self.tmp, "node_forms.py"), NODE_FORMS)
+        decoys = {
+            "docs/ruamelx_b6.md": "# ruamelx_b6\n", "ruamelx_b6.ini": "[ruamelx_b6]\nx = 1\n",
+            "tomlette_h1.toml": "x = 1\n", "config/tomlette_h1.yaml": "x: 1\n",
+            "docs/vendored_n8.rst": "vendored_n8\n",
+            "pkgx_d4.cfg": "[pkgx_d4]\n", "docs/pkgx_d4/sub.md": "# sub\n",
+            "nextish_c5.config.js": "module.exports = {};\n", "src/nextish_c5.js": "module.exports = 1;\n",
+            "vitestish_e2.config.ts": "export default {};\n", "docs/vitestish_e2.md": "# vitestish_e2\n",
+            "fmt.config.js": "module.exports = {};\n", "docs/@acme_w3/fmt.md": "# fmt\n",
+        }
+        for rel, text in decoys.items():
+            self.put(rel, text)
+        self.commit("config and docs named like the dependencies")
+        self.assertEqual(self.status_line(), "current: yes")        # they are not tests: the record still holds
+
+        def node_env(pkg, says, esm=False):
+            env = {"HARNESS_TEST_CMD": f"python3 {shlex.quote(node)} {{files}}", "NODE_NEEDS": pkg,
+                   "NODE_SAYS": says}
+            return dict(env, NODE_ESM="1") if esm else env
+
+        dotted = ("Traceback (most recent call last):\n  File \"tests/test_calc.py\", line 4, in <module>\n"
+                  "    import pkgx_d4.sub\nModuleNotFoundError: No module named 'pkgx_d4.sub'\n\n"
+                  "Ran 0 tests in 0.000s\n\nFAILED (errors=1)\n")
+        cases = [
+            # (name, module named in the refusal, untracked providers, test file changes, env, real python run)
+            ("virtualenv package beside docs and an ini", "ruamelx_b6",
+             [".venv/site/ruamelx_b6/__init__.py"], {"tests/test_calc.py": self.dep_test("ruamelx_b6")},
+             self.venv_cmd, True),
+            ("virtualenv module beside toml and yaml", "tomlette_h1",
+             [".venv/site/tomlette_h1.py"], {"tests/test_calc.py": self.dep_test("tomlette_h1")},
+             self.venv_cmd, True),
+            ("vendored, ignored, beside a doc", "vendored_n8",
+             ["vendored_n8.py"], {"tests/test_calc.py": self.dep_test("vendored_n8")}, {}, True),
+            ("dotted python name", "pkgx_d4",
+             [".venv/site/pkgx_d4/__init__.py", ".venv/site/pkgx_d4/sub.py"],
+             {"tests/test_calc.py": self.dep_test("pkgx_d4.sub")}, self.fake_runner(dotted, 1), False),
+            ("node subpath beside a config and src file", "nextish_c5",
+             ["node_modules/nextish_c5/router.js"],
+             {"tests/router.test.js": "const router = require('nextish_c5/router');\n"},
+             node_env("nextish_c5", "nextish_c5/router"), False),
+            ("node ESM package", "vitestish_e2",
+             ["node_modules/vitestish_e2/index.js"],
+             {"tests/fmt.test.mjs": "import { it } from 'vitestish_e2';\n"},
+             node_env("vitestish_e2", "vitestish_e2", esm=True), False),
+            ("node scoped package", "@acme_w3/fmt",
+             ["node_modules/@acme_w3/fmt/index.js"],
+             {"tests/scoped.test.js": "const fmt = require('@acme_w3/fmt/sub');\n"},
+             node_env("@acme_w3/fmt", "@acme_w3/fmt/sub"), False),
+        ]
+        for name, module, providers, changes, env, real in cases:
+            with self.subTest(name):
+                for provider in providers:
+                    self.put(provider, "VALUE = 1\n")
+                self.put("tests/test_calc.py", TEST_ADD_COVERED)
+                for rel, text in changes.items():
+                    self.put(rel, text)
+                try:
+                    if real:                           # the premise: the ticket worktree has it, the test passes
+                        p = subprocess.run(env.get("HARNESS_TEST_CMD", "python3 -m unittest {files}").format(
+                            files="tests/test_calc.py"), shell=True, cwd=self.wt, env=self.env,
+                            capture_output=True, text=True, timeout=120)
+                        self.assertEqual(p.returncode, 0, quiet(p.stdout + p.stderr))
+                    self.assertEqual(self.status_line(), "current: no")
+                    kept, snapshot = self.kept(), self.snapshot()
+                    p = self.red("reprove", **env)
+                    said = quiet(p.stdout + p.stderr)
+                    self.assertEqual(p.returncode, 1, f"not refused: {said}")
+                    self.assertEqual(len(p.stderr.strip().splitlines()), 1, said)
+                    self.assertFalse("Traceback" in p.stderr, said)
+                    self.assertTrue(module in p.stderr, f"the refusal does not name {module}: {said}")
+                    self.assertEqual(self.kept(), kept, "a record or side file was written")
+                    self.assertEqual(self.snapshot(), snapshot)
+                    self.assertEqual(self.status_line(), "current: no")
+                    self.assertEqual(self.hook("calc.py"), CHANGED)
+                finally:
+                    self.git(self.wt, "checkout", "--", "tests/test_calc.py")
+                    tops = {p.split("/")[0] for p in providers} | {r for r in changes if r != "tests/test_calc.py"}
+                    for rel in tops:
+                        target = os.path.join(self.wt, rel)
+                        shutil.rmtree(target) if os.path.isdir(target) else os.remove(target)
+        self.assertEqual(self.status_line(), "current: yes")
+
+    def test_a_module_only_the_branchs_source_has_is_still_red(self):
+        # The guard: the tests import what the branch builds (a new module, a new name in calc), which main's code
+        # at the merge base lacks; that is the usual red, and an ignored .venv beside it changes nothing.
+        self.put(".venv/site/helperdep_m4/__init__.py", "VALUE = 1\n")      # an environment the test does not use
+        self.red_ticket_with_source()
+        self.put("shapes_v5.py", "def area(w, h):\n    return w * h\n")
+        self.put("calc.py", CALC_BUILT + "\n\ndef mul_w8(a, b):\n    return a * b\n")
+        self.put("geom_p2/__init__.py", "def perimeter(w, h):\n    return 2 * (w + h)\n")
+        self.commit("the branch's own source")
+        self.put(".venv/site/geom_p2/__init__.py", "def perimeter(w, h):\n    return 2 * (w + h)\n")  # untracked copy
+        cases = [
+            ("a new module", "import shapes_v5\n",
+             "    def test_area(self):\n        self.assertEqual(shapes_v5.area(2, 3), 6)\n", "shapes_v5"),
+            ("a new name in calc", "from calc import mul_w8\n",
+             "    def test_mul(self):\n        self.assertEqual(mul_w8(2, 3), 6)\n", "mul_w8"),
+            ("a new tracked package beside an untracked copy", "import geom_p2\n",
+             "    def test_perimeter(self):\n        self.assertEqual(geom_p2.perimeter(2, 3), 10)\n", "geom_p2"),
+        ]
+        for name, imports, test, needle in cases:
+            with self.subTest(name):
+                self.put("tests/test_calc.py", TEST_ADD.replace("import calc\n", "import calc\n" + imports) + "\n"
+                         + test)
+                try:
+                    self.assertEqual(self.unittest_exit(self.wt, "tests/test_calc.py"), 0)
+                    base = self.merge_base()
+                    p = self.red("reprove", **self.venv_cmd)
+                    said = quiet(p.stdout + p.stderr)
+                    self.assertEqual(p.returncode, 0, said)
+                    self.assertTrue(p.stdout.splitlines()[:1] == ["red (import): 1 test files, exit 1"], said)
+                    rec = self.record()
+                    self.assertEqual((rec["kind"], rec["exit"], rec["base_sha"]), ("import", 1, base))
+                    self.assertEqual(rec["test_hash"], expected_hash(self.wt, ["tests/test_calc.py"]))
+                    self.assertInText(needle, rec["tail"], "the tail")
+                    self.assertEqual(json.loads(read(self.side_path)), expected_side_file(self.wt, ["tests/test_calc.py"]))
+                    self.assertEqual(self.status_line(), "current: yes")
+                    self.assertIsNone(self.hook("calc.py"))
+                finally:
+                    self.git(self.wt, "checkout", "--", "tests/test_calc.py")
 
 
 class ReproveNoTests(Fixture):
@@ -769,6 +1256,29 @@ class ReproveDocs(unittest.TestCase):
         text = "\n".join(design_lines())
         self.assertTrue(CHANGED in text, f"docs/design.md does not state tests_first's denial {CHANGED!r}")
         self.assertFalse(OLD_CHANGED in text, f"docs/design.md still states the old denial {OLD_CHANGED!r}")
+
+
+class HookMatchesDesign(Fixture):
+    """#292: where docs/design.md quotes a tests_first denial, the hook prints exactly that."""
+
+    def test_the_missing_kind_denial_is_the_one_design_md_quotes(self):
+        # Whatever the wording settles on, design.md's tests_first step 4 quotes it in backticks, t/N for the ticket.
+        self.cache()
+        self.put("tests/test_calc.py", TEST_ADD)
+        self.assertRed(self.red("check"), 1)
+        rec = self.record()
+        for kind in (None, "passed"):
+            with self.subTest(kind=kind):
+                if kind is None:
+                    rec.pop("kind", None)
+                else:
+                    rec["kind"] = kind
+                write(self.record_path, json.dumps(rec))
+                reason = self.hook("calc.py")
+                self.assertTrue(reason and reason.startswith("The red record for t/12 "), quiet(reason))
+                quoted = "`" + reason.replace("t/12", "t/N") + "`"
+                self.assertTrue(quoted in "\n".join(design_lines()),
+                                f"docs/design.md does not quote tests_first's denial {quiet(quoted)}")
 
 
 if __name__ == "__main__":

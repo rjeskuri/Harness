@@ -20,7 +20,7 @@ Awaiting you:
 - **A number**:
   1. Summarize in at most 15 lines: title and ticket, the definition-of-done checklist from the PR body (`gh pr view P --json body,title`), the review summary and unresolved threads (`harness-pr comments P --unresolved`), checks state (`harness-pr checks P`), files changed (`gh pr diff P --stat`), the risks line.
   2. Ask once with AskUserQuestion: merge, show the diff first, or stop. "Show the diff": print `gh pr diff P` in readable chunks and ask again.
-  3. On merge: `harness-pr land P` (add `--discard` only when the user passed it, to drop a dirty worktree). It merges, removes the worktree and branch, fast-forwards main, closes the ticket and checks the epic. It refuses a PR whose latest harness review has findings and no commit after it, naming them: show them and stop. Add `--accept-findings` only when the user passed it.
+  3. On merge: `harness-pr land P` (add `--discard` only when the user passed it, to drop a dirty worktree). It merges, removes the worktree and branch, fast-forwards main, closes the ticket and checks the epic. It refuses a PR whose head is behind main, whose latest harness review does not cover the head (only clean merges of main may follow it), or whose latest harness review has high or medium findings at the head, naming them: show the refusal and stop. Add `--accept-findings` only when the user passed it.
   4. Report the merge commit, the ticket closed, the epic state, and what is awaiting next. On a billable project remind the user of `/harness:worklog`.
 
 Never merge without the confirmation and never bypass red checks. The user lands every PR, with `/harness:land` or by approving the land prompt; `harness-pr autoland` for eligible ones is the epic #132 plan.
