@@ -10,7 +10,9 @@ it sleeps first, canary/linger how long a background child it leaves (its pid re
 prints (on stdout and on stderr) and logs with its working directory. Main holds the healthy values before the land;
 PR #34's squash merge, a real commit pushed to origin from a second clone as GitHub's merge would be, sets the case's
 values, so only a canary run after the fast-forward sees them. Every slow canary sleeps the same SLOW seconds, so
-only the limit in force (SHORT or LONG, from the environment, else the settings, else the default) decides.
+only the limit in force (SHORT or LONG, from the environment, else the main checkout's settings, else the default)
+decides. The hanging canary sleeps HANG seconds, longer than the BOUND a land is given to return, so only a limit
+that stops it while it runs lets the land return in time.
 
 Run: PYTHONPATH=plugins/harness/tests python3 -m unittest plugins/harness/tests/test_pr_land_canary.py -v
 """
@@ -34,6 +36,8 @@ BUG = 40
 SLOW = 2            # seconds every slow canary takes before it exits
 SHORT = "1"         # a limit it runs past: degraded
 LONG = "8"          # a limit it ends within: its exit decides
+HANG = 30           # seconds the hanging canary sleeps before it would exit 1
+BOUND = 10          # seconds a land with a hanging canary is given to return
 
 # The fixture project's canary, as the scaffold's contract has it (0 healthy, 1 big failure, 2 degraded); what it
 # does is read from the checkout it runs in. {log} is the absolute path of the run log, {pids} where the pid of its
@@ -151,6 +155,41 @@ class LandCanary(WorktreeTest):
     def land(self, sha, cwd=None, **env):
         self.scenario(self.calls(sha))
         return self.pr("land", "34", cwd=cwd or self.main, **env)
+
+    def bounded_land(self, sha, **env):
+        """self.land's run from the main checkout, given BOUND seconds to return: still running then, it is killed
+        with its process group and the test fails, so a canary that never ends cannot hang the suite. Its output goes
+        to files, not pipes, so the land's own exit is timed, not that of whatever still holds its output."""
+        self.scenario(self.calls(sha))
+        argv = [sys.executable, TOOL, "land", "34"]
+        out_path, err_path = os.path.join(self.tmp, "land.out"), os.path.join(self.tmp, "land.err")
+        start = time.monotonic()
+        with open(out_path, "w", encoding="utf-8") as out, open(err_path, "w", encoding="utf-8") as err:
+            proc = subprocess.Popen(argv, cwd=self.main, env=self.env(**env), stdout=out, stderr=err,
+                                    start_new_session=True)
+        try:
+            code = proc.wait(timeout=BOUND)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+            code = None
+        elapsed = time.monotonic() - start
+        with open(out_path, encoding="utf-8") as fh:
+            stdout = fh.read()
+        with open(err_path, encoding="utf-8") as fh:
+            stderr = fh.read()
+        if code is None:
+            if os.path.exists(self.smoke_pids):
+                with open(self.smoke_pids, encoding="utf-8") as fh:
+                    pid = fh.read().strip()
+                if pid.isdigit():
+                    self.addCleanup(self.kill_quietly, int(pid))
+            self.fail(f"the land was still running {elapsed:.1f} s after it started, with a {SHORT} s limit on a "
+                      f"canary that sleeps {HANG} s: the limit did not stop it\n{stdout}{stderr}")
+        return subprocess.CompletedProcess(argv, code, stdout, stderr)
 
     # ----------------------------------------------------------- what happened
     def smoke_runs(self):
@@ -401,6 +440,29 @@ class LandCanary(WorktreeTest):
         sha = self.landed(1, note, sleep=SLOW)
         p = self.land(sha, HARNESS_SMOKE_TIMEOUT=LONG)
         self.assertReverted(p, sha, note, 1)
+
+    def test_a_hanging_canary_is_stopped_at_its_limit_and_the_land_lands_as_degraded(self):
+        # it would sleep HANG seconds, then exit 1: the 1 s limit stops it while it runs, its child too, and the
+        # land returns within BOUND seconds, without a revert
+        note = "hung landing b71"
+        self.project()
+        sha = self.landed(1, note, sleep=HANG, linger=HANG)
+        p = self.bounded_land(sha, HARNESS_SMOKE_TIMEOUT=SHORT)
+        self.assertDegraded(p, sha, note, timed_out=True)
+        self.assertChildGone()
+
+    def test_the_main_checkouts_settings_set_the_limit_when_the_land_runs_from_the_ticket_worktree(self):
+        # the ticket worktree, the land's working directory, carries its own committed settings with the long
+        # limit; the main checkout's short one is in force, so the slow failing canary times out, no revert
+        note = "slow landing run from the worktree, short limit in main 6c2"
+        self.project(settings={"HARNESS_SMOKE_TIMEOUT": SHORT})
+        write(os.path.join(self.wt, ".claude", "settings.json"), json.dumps({"env": {"HARNESS_SMOKE_TIMEOUT": LONG}}))
+        self.git(self.wt, "add", "-A")
+        self.git(self.wt, "commit", "-q", "-m", "The worktree's own limit")
+        self.assertEqual(self.git(self.wt, "status", "--porcelain"), "")
+        sha = self.landed(1, note, sleep=SLOW)
+        p = self.land(sha, cwd=self.wt)
+        self.assertDegraded(p, sha, note, timed_out=True)
 
     def test_a_short_limit_in_the_environment_wins_over_a_long_one_in_the_settings(self):
         note = "slow failing landing, short limit in the environment 8f1"
