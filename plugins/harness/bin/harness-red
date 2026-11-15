@@ -90,6 +90,9 @@ BAD_SYNTAX_RE = re.compile(r"^[ \t]*(?:E[ \t]+)?(?:SyntaxError|IndentationError|
 LOAD_ERROR_RE = re.compile(r"error during collection|ERROR collecting")
 MISSING_RE = re.compile(r"ModuleNotFoundError|ImportError: cannot import name|No module named|Cannot find module|"
                         r"ERR_MODULE_NOT_FOUND")    # the code under test does not exist yet: the usual first red
+# The module a failed import names: python's `No module named 'x.y'`, node's `Cannot find module 'x'` (require) and
+# `Cannot find package 'x'` (ESM). A relative or absolute node path is a source file, never a dependency.
+MISSING_NAME_RE = re.compile(r"No module named '([^']+)'|Cannot find (?:module|package) '([^'./][^']*)'")
 NO_TESTS, NOT_LOADED = "no tests ran", "tests failed to load"
 GREEN = "Tests pass before the implementation; they do not test this change."
 RUNNABLE = ("test_*.py", "*_test.py", "*.test.js", "*_test.js", "*.test.ts", "*_test.ts", "*.test.mjs",
@@ -521,6 +524,52 @@ def save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, o
     return kind
 
 
+def module_parts(python, node):
+    """The path components a missing module's top level is found under: `a` for python's `a.b`, `pkg` or
+    `@scope/pkg` for node's `pkg/sub` and `@scope/pkg/sub` (an npm name may hold a dot: `lodash.merge`)."""
+    if python:
+        return [python.split(".")[0]]
+    return node.split("/")[:2 if node.startswith("@") else 1]
+
+
+PY_SUFFIXES = (".py", ".so", ".pyd")         # what python imports a module from: source or a compiled extension
+
+
+def provides(path, parts, node):
+    """Whether `path` is a file that can satisfy the import of the module `parts`. Node: it lies in a directory
+    `node_modules/<pkg>` (or is that link). Python: it is `<top>.py`, or `<top>.<tag>.so`/`.pyd`, or a python file
+    beneath a directory named `<top>` (a package, a namespace package). A config or doc file that only shares the
+    name (next.config.js, pytest.ini, docs/yaml.md) provides nothing."""
+    comps = path.rstrip("/").split("/")
+    if node:
+        n = len(parts)
+        return any(comps[i] == "node_modules" and comps[i + 1:i + 1 + n] == parts for i in range(len(comps) - n))
+    top, name = parts[0], comps[-1]
+    if name == top + ".py" or (name.startswith(top + ".") and name.endswith((".so", ".pyd"))):
+        return True
+    return top in comps[:-1] and name.endswith(PY_SUFFIXES)
+
+
+def environment_dependencies(repo, output):
+    """[(module, path)]: the modules a failed run could not import that only the ticket worktree's environment has:
+    an untracked or ignored path there provides it and no tracked file does (a module the branch's own source adds
+    is tracked, and is the usual red)."""
+    names = list(dict.fromkeys((bool(m[1]), tuple(module_parts(*m))) for m in MISSING_NAME_RE.findall(output)))
+    if not names:
+        return []
+    tracked = [p for p in git(repo.top, "ls-files", "-z", "--cached").stdout.split("\0") if p]
+    others = [p for p in git(repo.top, "ls-files", "-z", "--others").stdout.split("\0") if p]
+    found = []
+    for node, parts in names:
+        parts = list(parts)
+        if any(provides(p, parts, node) for p in tracked):
+            continue
+        provider = next((p for p in others if provides(p, parts, node)), None)
+        if provider:
+            found.append(("/".join(parts), provider))
+    return found
+
+
 def cmd_check(repo, args):
     note = no_tests_message(repo)
     if note:
@@ -573,6 +622,13 @@ def cmd_reprove(repo, args):
         print_refused(args, "green", tests, cmd, code, output)
         raise Problem(f"Tests pass against main's code at the merge base {merge_base[:12]}: they prove nothing; "
                       "the red record is kept.")
+    missing = environment_dependencies(repo, output)
+    if missing:
+        print_refused(args, "cannot import " + ", ".join(m for m, _ in missing), tests, cmd, code, output)
+        raise Problem(f"The run against main's code could not import {', '.join(m for m, _ in missing)}, which "
+                      f"this worktree has untracked or ignored ({missing[0][1]}) and the temporary worktree lacks: "
+                      "it proves nothing; the red record is kept. Point HARNESS_TEST_CMD at that environment by "
+                      "absolute path, then run harness-red reprove again.")
     save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output)
     return 0
 
