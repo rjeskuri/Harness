@@ -23,12 +23,15 @@ but this revert; fetched and fast-forwarded first): `git revert --no-edit` of it
 `git pull --rebase`), an incident bug under the ticket's epic, the ticket reopened as needs-input, a notification.
 A step an earlier run did is skipped. autoland calls revert_landed() in-process; the work loop never runs it.
 
-ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has high
-or medium findings and no commit newer than it, naming those findings, and refuse when gh cannot tell. A finding
-without a recognisable severity counts as high; low findings never refuse, and ready names them in one warning
-line. When the review's summary counts more high plus medium findings than it lists, the refusal says how many
-more. --accept-findings on land is the only override; ready has none. land on a PR that is already merged skips
-the check.
+ready refuses a PR whose latest harness review (the newest review carrying the harness marker) has high or
+medium findings and no commit newer than it, naming those findings, and refuses when gh cannot tell. land judges
+at the head (headRefOid) instead: it refuses a head behind main, a latest harness review that is not of the head
+or of a commit the head adds only clean merges of main to (autoland.at_head), and that review's high or medium
+findings whatever the commit dates; a failed read of these refuses too. A finding without a recognisable severity
+counts as high; low findings never refuse, and ready names them in one warning line. When the review's summary
+counts more high plus medium findings than it lists, the refusal says how many more. --accept-findings on land
+overrides only the findings (and a failed read of the review's inline comments); ready has no override. land on a
+PR that is already merged skips every check.
 
 findings splits a review by the files the ticket branch changed (`git diff --name-only` from the merge-base of HEAD
 and origin/main, else main): high and medium on a changed file block, low on one is low, anything else is outside.
@@ -83,8 +86,8 @@ try:
     from harness_lib.notify import notify
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
-    from harness_lib.autoland import (CONVERSATION, check_entries as lib_check_entries, evaluate, fetch_origin,
-                                      gate_settings, gather_facts, overall, review_counts)
+    from harness_lib.autoland import (CONVERSATION, at_head, behind_main, check_entries as lib_check_entries,
+                                      evaluate, fetch_origin, gate_settings, gather_facts, overall, review_counts)
     from harness_lib.routing import load_routing
     from harness_lib.reviews import (add_rulings, add_ticket, finding_key, latest_round, load_rounds, load_tickets,
                                      reviews_dir, save_round)
@@ -129,7 +132,7 @@ TOOL_TIMEOUT = 180
 ULTRA_MINUTES = 30
 EXHAUSTED_HOURS = 24
 DEFAULT_CHECKED = "the diff against the ticket's definition of done"
-LAND_FIELDS = "isDraft,mergeable,headRefName,closingIssuesReferences,statusCheckRollup,title,url,state"
+LAND_FIELDS = "isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state"
 RULING_LINE = re.compile(r"^[ \t]*(?:- )?(Ruling:.*\S)[ \t]*$", re.M)
 OUTSIDE_NOTE = "(outside the files this ticket changed)"
 SENTENCE_END = re.compile(r"[.!?](?= |$)")
@@ -1120,11 +1123,12 @@ def review_gate(repo, number):
             unlisted)
 
 
-def unaddressed(number, review, blocking, unlisted):
-    """The refusal: the high and medium findings listed, then a line for those the summary counts beyond them."""
+def unaddressed(number, review, blocking, unlisted, after="no commit after it"):
+    """The refusal: the high and medium findings listed, then a line for those the summary counts beyond them;
+    `after` says what came after the review."""
     items = blocking + ([f"{unlisted} more high or medium not listed (see the review)"] if unlisted else [])
     return (f"PR #{number}: the latest harness review ({review.get('submitted_at')}) has "
-            f"{plural(len(blocking) + unlisted, 'high or medium finding')} and no commit after it: " + "; ".join(items))
+            f"{plural(len(blocking) + unlisted, 'high or medium finding')} and {after}: " + "; ".join(items))
 
 
 # --------------------------------------------------------------- ready
@@ -1673,22 +1677,59 @@ def merge_preconditions(repo, number, view):
     return view
 
 
-def land_gate(repo, number, accept):
-    """Refuse a PR whose latest harness review has high or medium findings and no newer commit, and fail closed
-    when gh cannot tell; with --accept-findings, warn instead. Low findings never refuse."""
+def land_gate(repo, number, view, accept):
+    """The head checks, autoland's rules that hold for any land, at the view's headRefOid: not behind main; the
+    latest harness review at the head (of the head itself, or of a commit the head adds only clean merges of main
+    to: autoland.at_head, after a fetch of origin in the main checkout); and that review's high or medium findings,
+    judged at the head whatever the commit dates (review_gate's date rule is ready's only). No harness review
+    proceeds; low findings never refuse. A failed read the head checks need refuses whatever the flags;
+    --accept-findings turns only the findings refusal, or a failed read of the review's inline comments, into a
+    warning."""
+    main, head, branch = repo.main, str(view.get("headRefOid") or ""), str(view.get("headRefName") or "")
     try:
-        review, blocking, _lows, unlisted = review_gate(repo, number)
+        if not head:
+            raise Problem(f"gh pr view {number} printed no headRefOid")
+        slug = repo.slug()
+        behind = behind_main(main, slug, head)
+    except Problem as err:
+        raise Problem(f"cannot check whether PR #{number} is behind main: {err}") from None
+    if behind:
+        raise Problem(f"PR #{number} is behind main by {plural(behind, 'commit')} at {head[:7]}; merge origin/main "
+                      f"into {branch or 'its branch'} and push, then harness-pr land {number} once the checks at "
+                      "the new head are green")
+    try:
+        review = latest_harness_review(api_list(repo, f"repos/{slug}/pulls/{number}/reviews"))
+        reviewed = str(review.get("commit_id") or "") if review else ""
+        covered = review is None or reviewed == head
+        if not covered:
+            commits = [c for c in api_list(repo, f"repos/{slug}/pulls/{number}/commits") if isinstance(c, dict)]
+            fetch_origin(main)                    # at_head reads origin/main
+            covered = at_head(main, reviewed, head, branch, commits)
+    except Problem as err:
+        raise Problem(f"cannot check whether the latest harness review of PR #{number} covers its head "
+                      f"{head[:7]}: {err}") from None
+    if not covered:
+        raise Problem(f"PR #{number}: the latest harness review ({review.get('submitted_at')}) is of "
+                      f"{reviewed[:7] or 'no commit'}, and the head {head[:7]} is not that commit with only clean "
+                      f"merges of main after it; review the head again, then harness-pr land {number}")
+    if review is None:
+        return
+    try:
+        found, unlisted = review_findings(repo, slug, number, review)
     except Problem as err:
         if not accept:
             raise Problem(f"cannot check the harness review findings of PR #{number}: {err}") from None
         warn("harness-pr",
              f"cannot check the harness review findings of PR #{number} ({err}); landing it (--accept-findings)")
         return
-    if (blocking or unlisted) and not accept:
-        raise Problem(unaddressed(number, review, blocking, unlisted)
-                      + f"; fix them and push, or harness-pr land {number} --accept-findings to land it anyway")
-    if blocking or unlisted:
-        warn("harness-pr", unaddressed(number, review, blocking, unlisted) + "; landing it (--accept-findings)")
+    blocking = [text for sev, text in found if sev != "low"]
+    if not blocking and not unlisted:
+        return
+    said = unaddressed(number, review, blocking, unlisted,
+                       "no commit after it" if reviewed == head else "only clean merges of main after it")
+    if not accept:
+        raise Problem(said + f"; fix them and push, or harness-pr land {number} --accept-findings to land it anyway")
+    warn("harness-pr", said + "; landing it (--accept-findings)")
 
 
 def cmd_land(args):
@@ -1709,7 +1750,7 @@ def cmd_land(args):
         raise Problem(f"PR #{number} is {state.lower()}, not open")
     else:
         view = merge_preconditions(repo, number, view)
-        land_gate(repo, number, args.accept_findings)
+        land_gate(repo, number, view, args.accept_findings)
     tickets = closing_numbers(view)
     if not tickets:
         warn("harness-pr", f"PR #{number} closes no issue (no Closes #N in its body); no ticket to close")
@@ -2205,7 +2246,7 @@ def parser():
     ld.add_argument("--yes", action="store_true", help="accepted and ignored (the land skill confirms)")
     ld.add_argument("--discard", action="store_true", help="remove the worktree even with uncommitted changes")
     ld.add_argument("--accept-findings", action="store_true",
-                    help="land even though the latest harness review has findings and no newer commit")
+                    help="land even though the latest harness review has high or medium findings at the head")
 
     gt = sub.add_parser("gate", help="the auto-land verdict: land, wait, fix or manual, and why")
     gt.add_argument("number", type=number_arg, metavar="P")
