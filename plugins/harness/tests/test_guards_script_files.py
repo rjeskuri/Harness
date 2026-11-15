@@ -3,9 +3,10 @@
 On a ticket branch the coder, the test-author and the test-breaker are refused a run of
 python, node, deno, bun, ruby, perl, php, sh, bash or zsh on a program file that is not
 tracked at the worktree's HEAD (in /tmp, the scratchpad, ~, another repository, or new in
-the worktree): what it writes cannot be seen. Tracked program files, the test runners,
-npm and harness-red still run, and off a ticket branch nothing changes. The fixtures are
-in guards_support.py.
+the worktree): what it writes cannot be seen. Tracked means in HEAD's tree, not the
+index. A test runner given a program file outside the worktree is refused the same way.
+Tracked program files, the test runners on the worktree's files, npm and harness-red
+still run, and off a ticket branch nothing changes. The fixtures are in guards_support.py.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_guards_script_files.py" -v
 """
@@ -62,6 +63,12 @@ SPELLINGS = (
     ("timeout 60 python3 {f}", "py"),
     ("/usr/bin/env node {f}", "mjs"),
     ("node --no-warnings {f}", "mjs"),
+    ("node --conditions development {f}", "mjs"),
+    ("node -C development {f}", "mjs"),
+    # an option's value naming a tracked file does not make the run tracked
+    ("python3 -W scripts/tool.py {f}", "py"),
+    ("python3 -X scripts/tool.py {f}", "py"),
+    ("node -C scripts/tool.mjs {f}", "mjs"),
     ("deno {f}", "ts"),
     ("deno run -A {f}", "ts"),
     ("bun run {f}", "ts"),
@@ -94,10 +101,11 @@ RUNNERS = (
     "deno test -A",
     "bun test",
     "bun test tests/new.test.ts",
+    "python3 -m pytest tests/test_app.py",  # tracked, in the worktree
+    "node --test scripts/tool.mjs",
     "harness-red run --worktree {wt}",
     "harness-red check",
     "{red} run --worktree {wt}",
-    "python3 -m json.tool tests/fixtures/data.json",
     "python3 --version",
     "node --version",
     "bash --version",
@@ -105,15 +113,36 @@ RUNNERS = (
     "sh -c 'echo hi'",
     "bash -lc 'npm test'",
 )
-# Tracked program files run in other spellings ({wt} is the worktree); the last is the
-# project's test command (HARNESS_TEST_CMD in the main checkout's tracked settings).
+# -m with a module that is not the worktree's own file: the standard library, installed.
+MODULES = (
+    "python3 -m pip --version",
+    "python3 -m venv --help",
+    "python3 -m timeit pass",
+    "python3 -m site",
+    "python3 -m json.tool tests/fixtures/data.json",
+)
+# Tracked program files run in other spellings ({wt} is the worktree): behind options,
+# some taking a value; as modules, resolved from the directory the part runs in; the last
+# is the project's test command (HARNESS_TEST_CMD in the main checkout's tracked settings).
 TRACKED_SPELLINGS = (
     "python3 ./scripts/tool.py",
     "python3 {wt}/scripts/tool.py",
     "cd scripts && python3 tool.py",
     "env python3 scripts/tool.py",
     "python3 -I scripts/tool.py",
+    "python3 -W ignore scripts/tool.py",
+    "python3 -X utf8 scripts/tool.py",
+    "python3 -X dev -W error scripts/tool.py",
+    "python3 -X pycache_prefix=/tmp/pycache scripts/tool.py",
+    "node --no-warnings scripts/tool.mjs",
+    "node --conditions development scripts/tool.mjs",
+    "node -C development scripts/tool.mjs",
+    "deno run -A scripts/tool.ts",
+    "php -f scripts/tool.php",
     "python3 -m scripts.tool",
+    "python3 -m scripts.pkg",  # a package, run through its __main__.py
+    "cd scripts && python3 -m tool",
+    "cd scripts && python3 -m pkg",
     "python3 scripts/run_tests.py tests/test_new.py",
 )
 
@@ -137,6 +166,8 @@ class ScriptFileTests(GuardTestCase):
         for ext, program in PROGRAMS.items():
             self.write(self.wt / f"scripts/tool.{ext}", program)
         self.write(self.wt / "scripts/run_tests.py", "import sys\nsys.exit(0)\n")
+        self.write(self.wt / "scripts/pkg/__init__.py", "")
+        self.write(self.wt / "scripts/pkg/__main__.py", PROGRAMS["py"])
         self.git(self.wt, "add", "-A")
         self.git(self.wt, "commit", "-q", "-m", "Add the project's scripts")
         # untracked: outside any repository (the temp directory, ~) and in the worktree
@@ -258,6 +289,7 @@ class ScriptFileTests(GuardTestCase):
             ("python3 -m tools.gen", None),
             ("python3 -m genpkg", None),
             ("python3 -m w", None),
+            ("cd tools && python3 -m gen", "python3 -m gen"),
         ]
         for command, part in cases:
             for agent in ROLES:
@@ -265,26 +297,63 @@ class ScriptFileTests(GuardTestCase):
                     self.assertRefused(self.bash(command, agent), part or command)
 
     def test_the_same_command_follows_whether_head_tracks_the_file(self):
-        """A new program file is refused until it is committed, then runs; a committed one
-        taken out of HEAD (still on disk) is refused again."""
-        new = ("python3 tools/gen.py", "node tools/gen.mjs", "bash tools/gen.sh", "python3 -m tools.gen")
+        """Tracked means in HEAD's tree, not in the index. A new program file is refused
+        while it is untracked and while it is only staged, and runs once it is committed; a
+        committed one keeps running while its removal is only staged, and is refused once
+        the removal is committed (the file still on disk)."""
+        new = (
+            "python3 tools/gen.py",
+            "node tools/gen.mjs",
+            "bash tools/gen.sh",
+            "python3 -m tools.gen",
+            "python3 -m genpkg",  # a package, run through its __main__.py
+        )
         dropped = ("python3 scripts/tool.py", "bash scripts/tool.sh", "python3 -m scripts.tool")
-        for command in new:
-            for agent in ROLES:
-                with self.subTest(command=command, agent=agent, tracked=False):
-                    self.assertRefused(self.bash(command, agent), command)
-        self.git(self.wt, "add", "tools/gen.py", "tools/gen.mjs", "tools/gen.sh")
-        self.git(self.wt, "commit", "-q", "-m", "Commit the generators")
+
+        def expect(commands, allowed: bool, phase: str) -> None:
+            for command in commands:
+                for agent in ROLES:
+                    with self.subTest(command=command, agent=agent, phase=phase):
+                        reason = self.bash(command, agent)
+                        if allowed:
+                            self.assertIsNone(reason)
+                        else:
+                            self.assertRefused(reason, command)
+
+        expect(new, False, "untracked")
+        expect(dropped, True, "committed")
+        self.git(
+            self.wt, "add", "tools/gen.py", "tools/gen.mjs", "tools/gen.sh",
+            "genpkg/__init__.py", "genpkg/__main__.py",
+        )
         self.git(self.wt, "rm", "-q", "--cached", "scripts/tool.py", "scripts/tool.sh")
-        self.git(self.wt, "commit", "-q", "-m", "Untrack two scripts")
+        expect(new, False, "staged, not committed")
+        expect(dropped, True, "removal staged, not committed")
+        self.git(self.wt, "commit", "-q", "-m", "Commit the generators, untrack two scripts")
         self.assertTrue((self.wt / "scripts/tool.py").is_file())
-        for command in new:
+        expect(new, True, "committed")
+        expect(dropped, False, "removal committed")
+
+    def test_a_test_runner_given_a_program_file_outside_the_worktree_is_refused(self):
+        """A runner imports and runs the files it is given: one outside the worktree is the
+        same bypass. Runners on the worktree's own files, tracked or new, still run."""
+        o = self.outside
+        for command in (
+            "node --test /tmp/w.mjs",
+            f"node --test {o}/w.mjs",
+            f"node --test tests/ {o}/w.mjs",
+            "python3 -m pytest /tmp/t.py",
+            f"python3 -m pytest -q {o}/w.py",
+            "python3 -m unittest /tmp/w.py",
+            f"python3 -m unittest tests/test_new.py {o}/w.py",
+            ".venv/bin/python -m pytest ~/w.py",
+            "deno test /tmp/w.ts",
+            f"deno test -A {o}/w.ts",
+            "bun test /tmp/w.ts",
+            f"bun test {o}/w.ts",
+        ):
             for agent in ROLES:
-                with self.subTest(command=command, agent=agent, tracked=True):
-                    self.assertIsNone(self.bash(command, agent))
-        for command in dropped:
-            for agent in ROLES:
-                with self.subTest(command=command, agent=agent, tracked=False):
+                with self.subTest(command=command, agent=agent):
                     self.assertRefused(self.bash(command, agent), command)
 
     def test_a_program_file_whose_path_is_not_known_is_refused(self):
@@ -357,7 +426,7 @@ class ScriptFileTests(GuardTestCase):
 
     def test_test_runners_npm_and_harness_red_still_run(self):
         red = HOOKS.parent / "bin" / "harness-red"
-        for k, template in enumerate(RUNNERS):
+        for k, template in enumerate(RUNNERS + MODULES):
             command = template.format(wt=self.wt, red=red)
             agent = ROLES[k % len(ROLES)]
             with self.subTest(command=command, agent=agent):
