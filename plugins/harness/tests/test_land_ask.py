@@ -3,9 +3,9 @@ prompt (permissionDecision "ask") unless every ticket the PR closes is labeled r
 
 The hook runs as a subprocess, the way Claude Code runs it: PreToolUse JSON on stdin, a temporary HOME, its own
 working directory outside the repos, and temporary git repos made with `git init -b main`. gh is HARNESS_GH, a
-small wrapper written once per module: it logs every call (argv and the directory it ran in), hangs on one gh
-subcommand or answers every call slowly when told to, and answers as fakegh.py does from the scenario of the
-directory it runs in. Any
+small wrapper written once per module: it logs every call (argv and the directory it ran in), slows each gh
+subcommand as the scenario's pace says, and answers as fakegh.py does from the scenario of the directory it runs
+in. Any
 directory without a scenario of its own (a linked worktree, a subdirectory, the hook's working directory) gets
 a decoy in which every PR closes a risk:low ticket, so a hook that runs gh anywhere but the main checkout stays
 silent where it must ask. Nothing touches the network or ~/.claude.
@@ -62,14 +62,20 @@ HOOK_TIMEOUT = 10  # what hooks.json gives the hook
 ONE_CALL_LIMIT = 6.0
 # gh calls share 8 s in all: the hook answers inside the 10 s Claude Code gives it.
 ALL_CALLS_LIMIT = 9.5
-# A slow gh that is still in time on every call: each answer after 1.5 s (with the fake's own start, 1.7 to 2.3 s
-# on a loaded Mac), so a loaded machine does not push one past the 3 s cut-off.
-CALL_DELAY = 1.5
+# Slow gh calls that are each still in time: the fake's own start adds about 0.03 s a call on an idle Mac and up to
+# 0.8 s on a loaded one, so none of these comes near the 3 s cut-off.
+CALL_DELAY = 1.5  # every call
+ISSUE_DELAY = 1.8  # issue views only, the PR's view at once
+PR_DELAY = 2.0  # the PR's view only, the issue views at once
+IN_FLIGHT_DELAY = 2.4  # every call: the fourth starts inside 8 s and would end well past it
+HANG = 30  # a gh that never answers in time
 
-# The fake gh. It logs the call and the directory it ran in, sleeps 30 s when its first argument is
-# LANDASK_HANG's, answers one call at a time, each after LANDASK_DELAY seconds, when that is set (calls made at
-# once queue, so the total is the same however the hook makes them), then runs fakegh.py with the scenario
-# LANDASK_DIRS maps this directory to ("*" for any other).
+# The fake gh. It logs the call and the directory it ran in, then answers as fakegh.py does from the scenario
+# LANDASK_DIRS maps this directory to ("*" for any other). A scenario's "pace" ({"pr": 2.0, "issue": 30}: seconds
+# for each gh subcommand, by its first argument) slows it: each call waits its turn (calls made at once queue, so
+# the total is the same however the hook makes them), then sleeps its subcommand's seconds. The pace sits in the
+# scenario file, beside the answers, and nowhere in the hook's environment: the hook cannot read the timing it is
+# judged on.
 WRAPPER = r'''#!@PYTHON@
 import json
 import os
@@ -81,18 +87,17 @@ FAKEGH = @FAKEGH@
 cwd = os.path.realpath(os.getcwd())
 with open(os.environ["LANDASK_LOG"], "a", encoding="utf-8") as fh:
     fh.write(json.dumps({"argv": sys.argv[1:], "cwd": cwd}) + "\n")
-hang = os.environ.get("LANDASK_HANG")
-if hang and sys.argv[1:2] == [hang]:
-    time.sleep(30)
-delay = os.environ.get("LANDASK_DELAY")
-if delay:
-    import fcntl
-    turn = open(os.environ["LANDASK_LOG"] + ".lock", "a")  # held until this gh exits or is killed
-    fcntl.flock(turn, fcntl.LOCK_EX)
-    time.sleep(float(delay))
 with open(os.environ["LANDASK_DIRS"], encoding="utf-8") as fh:
     dirs = json.load(fh)
-os.environ["FAKEGH_SCENARIO"] = dirs.get(cwd, dirs["*"])
+scenario = dirs.get(cwd, dirs["*"])
+with open(scenario, encoding="utf-8") as fh:
+    pace = json.load(fh).get("pace")
+if pace:
+    import fcntl
+    turn = open(scenario + ".lock", "a")  # held until this gh exits or is killed
+    fcntl.flock(turn, fcntl.LOCK_EX)
+    time.sleep(float(pace.get(sys.argv[1] if len(sys.argv) > 1 else "", 0)))
+os.environ["FAKEGH_SCENARIO"] = scenario
 os.environ.pop("FAKEGH_LOG", None)
 sys.argv[0] = FAKEGH
 runpy.run_path(FAKEGH, run_name="__main__")
@@ -252,11 +257,13 @@ class LandAskTests(unittest.TestCase):
     def save_dirs(self) -> None:
         self.dirs_file.write_text(json.dumps(self.dirs), encoding="utf-8")
 
-    def scenario(self, *calls: dict, where: Path | None = None) -> None:
-        """gh run in `where` (the repo by default) answers `calls`; anything else there fails as gh does."""
+    def scenario(self, *calls: dict, where: Path | None = None, pace: dict | None = None) -> None:
+        """gh run in `where` (the repo by default) answers `calls`, one at a time and slowed by `pace` (seconds per
+        subcommand) when it is given; anything else there fails as gh does."""
         self.scenarios += 1
         path = self.tmp / f"scenario-{self.scenarios}.json"
-        path.write_text(json.dumps({"calls": list(calls)}), encoding="utf-8")
+        path.write_text(json.dumps(dict({"calls": list(calls)}, **({"pace": pace} if pace else {}))),
+                        encoding="utf-8")
         self.dirs[os.path.realpath(str(where or self.repo))] = str(path)
         self.save_dirs()
 
@@ -403,31 +410,47 @@ class LandAskTests(unittest.TestCase):
         tickets = (21, 22, 23, 24)
         for hang, limit in (("pr", ONE_CALL_LIMIT), ("issue", ALL_CALLS_LIMIT)):
             with self.subTest(cause="gh slow", hang=hang):
-                self.scenario(pr_call(12, tickets), *(issue_call(n, "risk:low") for n in tickets))
-                code, out, err, seconds = self.run_hook("harness-pr land 12", env={"LANDASK_HANG": hang})
+                self.scenario(pr_call(12, tickets), *(issue_call(n, "risk:low") for n in tickets), pace={hang: HANG})
+                code, out, err, seconds = self.run_hook("harness-pr land 12")
                 reason = self.ask_reason("harness-pr land 12", code, out, err)
                 self.assertLess(seconds, limit, f"a hanging gh {hang} call took {seconds:.1f} s to answer")
                 self.assertRegex(reason, r"\bgh\b", "the reason does not say gh was too slow")
                 if hang == "pr":
                     reasons["gh slow"] = reason
 
-        # A gh in time on every call, slow in all: a PR closing six risk:low tickets is seven calls, 10.5 s or more
-        # at 1.5 s each, past 8 s in all. Calls cut off at 3 s each with no shared deadline run past the 10 s
-        # Claude Code gives the hook, and a hook killed there lets the land run unasked: ask, naming gh, inside it.
-        slow = {"LANDASK_DELAY": str(CALL_DELAY)}
+        # gh in time on every call, slow in all: past 8 s, ask, naming gh, inside the 10 s Claude Code gives the
+        # hook (a hook killed there lets the land run unasked). The 8 s are one deadline for every call: calls cut
+        # off at 3 s each, a deadline looked at only between calls, or a guess at the total from the PR's view all
+        # run past 10 s on one of these.
         many = (21, 22, 23, 24, 25, 26)
-        with self.subTest(cause="gh slow in all", tickets=many, delay=CALL_DELAY):
-            self.scenario(pr_call(12, many), *(issue_call(n, "risk:low") for n in many))
-            code, out, err, seconds = self.run_hook("harness-pr land 12", env=slow)
-            reason = self.ask_reason("harness-pr land 12", code, out, err)
-            self.assertLess(seconds, ALL_CALLS_LIMIT, f"seven {CALL_DELAY} s gh calls took {seconds:.1f} s to answer")
-            self.assertRegex(reason, r"\bgh\b", "the reason does not say gh ran out of time")
-        # What that ask is not: the six tickets answered at once pass, and so do two of them at 1.5 s a call (three
-        # calls, about 5.5 s, inside 8 s), so neither the tickets nor a slow call alone asks.
-        for few, env in ((many, None), (many[:2], slow)):
-            with self.subTest(cause="gh in time", tickets=few, delay=env and CALL_DELAY):
-                self.scenario(pr_call(12, few), *(issue_call(n, "risk:low") for n in few))
-                self.assert_silent("harness-pr land 12", env=env)
+        slow_in_all = [
+            # seven calls at 1.5 s each: 10.5 s or more
+            ("every call slow", many, {"pr": CALL_DELAY, "issue": CALL_DELAY}),
+            # the PR's view at once, then six issue views at 1.8 s each: 10.8 s or more, the first call fast
+            ("issue views slow", many, {"issue": ISSUE_DELAY}),
+            # four calls at 2.4 s each: the fourth starts near 7.3 s, inside 8 s, and would end near 9.8 s, so only
+            # a cut-off at 8 s (not 3 s after the call starts) answers in time
+            ("call in flight at 8 s", many[:3], {"pr": IN_FLIGHT_DELAY, "issue": IN_FLIGHT_DELAY}),
+        ]
+        for cause, few, pace in slow_in_all:
+            with self.subTest(cause="gh slow in all", calls=cause, tickets=few, pace=pace):
+                self.scenario(pr_call(12, few), *(issue_call(n, "risk:low") for n in few), pace=pace)
+                code, out, err, seconds = self.run_hook("harness-pr land 12")
+                reason = self.ask_reason("harness-pr land 12", code, out, err)
+                self.assertLess(seconds, ALL_CALLS_LIMIT, f"{cause}: gh took {seconds:.1f} s to answer")
+                self.assertRegex(reason, r"\bgh\b", f"{cause}: the reason does not say gh ran out of time")
+        # What those asks are not: the six tickets answered at once pass; so do two of them at 1.5 s a call (three
+        # calls, about 5 s); and so does a PR's view at 2 s followed by four issue views at once (about 2.3 s), so
+        # neither the tickets, nor slow calls inside 8 s, nor a slow first call alone asks.
+        in_time = [
+            ("at once", many, None),
+            ("every call slow", many[:2], {"pr": CALL_DELAY, "issue": CALL_DELAY}),
+            ("PR's view slow", many[:4], {"pr": PR_DELAY}),
+        ]
+        for cause, few, pace in in_time:
+            with self.subTest(cause="gh in time", calls=cause, tickets=few, pace=pace):
+                self.scenario(pr_call(12, few), *(issue_call(n, "risk:low") for n in few), pace=pace)
+                self.assert_silent("harness-pr land 12")
 
         # P that is not a PR number.
         self.scenario(pr_call(12, [40]), issue_call(40, "risk:low"))
