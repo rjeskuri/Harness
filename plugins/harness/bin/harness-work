@@ -148,7 +148,8 @@ sat in one, else where its repository's snapshots go now) and prints that snapsh
 A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through to stderr, in order,
 except a routing problem dispatch already printed (those children load the same settings; REPORTED); its other
 stderr stays hidden. Siblings (harness-board) are found on PATH, else next to this script. gh is HARNESS_GH when set, else `gh`;
-claude is HARNESS_CLAUDE when set, else `claude`.
+claude is HARNESS_CLAUDE when set, else `claude`. Now is HARNESS_NOW (`%Y-%m-%dT%H:%M:%SZ`, UTC) when set and not
+empty, else the real clock; an unreadable value is one line, exit 1, before any subcommand runs.
 """
 from __future__ import annotations
 
@@ -269,7 +270,15 @@ def warn(text):
 
 
 def now():
-    return dt.datetime.now(dt.timezone.utc)
+    """The tool's clock: HARNESS_NOW (a UTC stamp `%Y-%m-%dT%H:%M:%SZ`) when set and not empty, else the real clock
+    (#356). An unreadable HARNESS_NOW is Problem; main checks it before any command runs."""
+    pinned = os.environ.get("HARNESS_NOW", "")
+    if not pinned:
+        return dt.datetime.now(dt.timezone.utc)
+    try:
+        return dt.datetime.strptime(pinned, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        raise Problem(f"HARNESS_NOW must be a UTC stamp YYYY-MM-DDTHH:MM:SSZ, not {pinned!r}") from None
 
 
 def iso(when):
@@ -2390,6 +2399,7 @@ def main():
             ap.error("dispatch: --api is --venue headless and cannot go with --venue bg")
         args.venue = "headless"
     try:
+        now()  # an unreadable HARNESS_NOW stops here, before any command has written anything
         if args.cmd == "runs":
             cmd_runs(args)
         elif args.cmd == "budget":
