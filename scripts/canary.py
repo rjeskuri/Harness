@@ -13,7 +13,8 @@ Three steps, one line per check on stdout; a passing check's line starts with "o
      branch_guard denies an Edit of a source file and `git commit -m x` and allows an Edit under docs/agent/
      and `git status`; readonly_bash denies `echo x > f` for harness:reviewer; tests_first allows on main;
      session_brief answers SessionStart with an additionalContext; notify, with no notifier on PATH, prints
-     the bell; after_edit and verify_on_stop exit 0 without blocking. A case fails on a timeout, a non-zero
+     the bell; after_edit and verify_on_stop exit 0 without blocking; land_ask makes no decision on
+     `git status`. A case fails on a timeout, a non-zero
      exit, a traceback, an error line on stderr (a hook failing open) or a wrong answer.
   3. `<tool> --help` for every file in bin/: exit 0 with usage on stdout.
 
@@ -255,6 +256,8 @@ def hook_cases(repo: str) -> list:
          event("PostToolUse", tool_name="Edit", tool_input=edit, tool_response={"filePath": source}),
          expect_no_block, False),
         ("verify_on_stop.py", "exits 0 at a stop", event("Stop", stop_hook_active=False), expect_no_block, False),
+        ("land_ask.py", "makes no decision on Bash `git status`", pre("Bash", {"command": "git status"}),
+         expect_allow, False),
     ]
 
 
