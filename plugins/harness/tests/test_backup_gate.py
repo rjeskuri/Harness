@@ -139,6 +139,20 @@ Choices #328 leaves open, fixed here:
 - Plan mode and HARNESS_BACKUP=off (the environment, or `env` in the main checkout's .claude/settings.json) hold
   for the git forms as for rm: no decision and no ref; an environment `on` beats a settings `off`; every other
   permission_mode gets the allow.
+- Ruling (review of PR #361, finding 1): `git stash create` holds no untracked or ignored file, so a command that
+  overwrites one gets no decision and no snapshot or ref (the review's cheaper form; the colliding files are not
+  copied through the file rules). That is `reset --hard <commit>`, `checkout -f <branch>`, `switch -f` or
+  `--discard-changes <branch>`, `checkout <commit> -- <path>` and `restore --source=<commit> <path>`, given a
+  branch name or a sha, when an untracked or ignored path of the worktree is a path the target tracks, lies under
+  one (a folder's file where it tracks a file) or over one (a file where it tracks a folder). The colliding path is
+  always inside the pathspec of the path forms, so whether they check the whole target tree is not pinned. Without
+  such a path the same command is backed up and allowed as before, untracked and ignored files elsewhere included.
+- Ruling (finding 1): a git clean that follows a reset, checkout -f or switch to another commit in the same worktree
+  in one command gets no decision and no snapshot (its dry run reads the ignore rules the reset replaces); a clean
+  before the reset, or after a reset with no target, is backed up as before.
+- Ruling (finding 2): a branch name that is not a plain branch of refs/heads/ (`@{-1}`, `@{-2}`, quoted or not) or
+  names none (a missing branch) gets no decision and no ref, for every branch of the part: `git branch -D <real>
+  @{-1}` and `git branch -D <real> <missing>` keep nothing either (git deletes the real one before it fails).
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p test_backup_gate.py -v
 """
@@ -2118,6 +2132,174 @@ class GitParts(GitGate):
             with self.subTest(command=command, alone=True):
                 before, refs = self.snapshots(), self.backup_refs(wt)
                 self.expect_none(self.run_gate(command, wt, main), before, refs, command, wt)
+
+
+class GitTargets(GitGate):
+    """Review of PR #361, finding 1: a move to another commit, or paths taken from one, overwrite the untracked and
+    ignored files where that commit tracks a path, and git stash create holds none of them."""
+
+    def target(self, wt, branch):
+        """A branch made from `wt`'s HEAD whose one commit tracks tests/test_<w>.py, data/seed-<w>.csv (forced in
+        under the ignored data/), vendor-<w>/lib.py and a file gen-<w>; `wt` is back on `branch` without them.
+        Returns (its name, its sha, {kind: (a local path that collides with it, the pathspec naming that path)})."""
+        name = f"t/{self.rng.randint(10, 99)}-target-{self.word()}"
+        w = self.word()
+        tests, seed, vendor, gen = f"tests/test_{w}.py", f"data/seed-{w}.csv", f"vendor-{w}", f"gen-{w}"
+        self.git(wt, "switch", "-q", "-c", name)
+        for rel in (tests, seed, vendor + "/lib.py", gen):
+            self.put(os.path.join(wt, rel), data=self.text())
+        self.git(wt, "add", "-f", "--", seed)
+        self.git(wt, "add", "-A")
+        self.git(wt, "commit", "-q", "-m", "Target")
+        sha = self.rev(wt)
+        self.git(wt, "switch", "-q", branch)
+        for rel in (tests, seed, vendor, gen):
+            self.assertFalse(os.path.lexists(os.path.join(wt, rel)), rel)
+        return name, sha, {"untracked": (tests, tests), "ignored": (seed, seed), "over": (vendor, vendor),
+                           "under": (f"{gen}/out-{self.word()}.txt", gen)}
+
+    def test_untracked_paths_the_target_tracks_get_nothing(self):
+        main = self.make_project()
+        wt = self.add_worktree(main, "t-1-x", "t/1-x")
+        tgt, tc, kinds = self.target(wt, "t/1-x")
+        head = self.rev(wt)
+        mine = {"src/app.py": self.edit(wt, "src/app.py")}
+        self.put(os.path.join(wt, f"notes-{self.word()}.txt"))                    # untracked, where the target has none
+        self.put(os.path.join(wt, f"scratch-{self.word()}.tmp"))                  # ignored, likewise
+        both = {("head", None): head, ("changes", None): self.changes_of(wt, head, mine)}
+        changes = {("changes", None): self.changes_of(wt, head, mine)}
+        forms = (
+            (f"git reset --hard {tgt}", wt, both),
+            (f"git reset -q --hard {tc}", wt, both),
+            (f"git -C {wt} reset --hard {tgt}", main, both),
+            (f"git checkout -f {tgt}", wt, changes),
+            (f"git switch -f {tgt}", wt, changes),
+            (f"git switch --discard-changes {tgt}", wt, changes),
+            ("git checkout {tc} -- {spec}", wt, changes),
+            ("git restore --source={tc} {spec}", wt, changes),
+        )
+        for kind, (local, spec) in kinds.items():
+            path = os.path.join(wt, local)
+            data = self.put(path, data=self.text())
+            self.assertEqual(self.ignored(wt, local), kind == "ignored", local)
+            self.assertFalse(self.tracked(wt, local), local)
+            for shape, cwd, _want in forms:
+                command = shape.format(tc=tc, spec=spec)
+                with self.subTest(command=command, collides=kind):
+                    before, refs, there = self.snapshots(), self.backup_refs(wt), self.state(wt)
+                    self.expect_none(self.run_gate(command, cwd, main), before, refs, command, wt)
+                    self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
+            self.assertEqual(self.read(path), data)
+            remove(os.path.join(wt, local.split("/")[0]))
+
+        # No untracked or ignored path where the target tracks one: backed up and allowed, as before.
+        for shape, cwd, want in forms:
+            command = shape.format(tc=tc, spec=kinds["untracked"][1])
+            with self.subTest(command=command, collides=None):
+                before, there = self.snapshots(), self.state(wt)
+                self.expect_refs(self.run_gate(command, cwd, main), before, command, wt, wt, want)
+                self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
+
+        # What the review found: the real reset overwrites the untracked file, and nothing holds it.
+        local = os.path.join(wt, kinds["untracked"][0])
+        data = self.put(local, data=self.text())
+        self.git(wt, "reset", "-q", "--hard", tgt)
+        self.assertNotEqual(self.read(local), data)
+
+    def test_clean_after_a_reset_or_switch_to_another_commit_gets_nothing(self):
+        main = self.make_project()
+        wt = self.add_worktree(main, "t-1-x", "t/1-x")
+        base = self.rev(wt)
+        other = f"t/{self.rng.randint(10, 99)}-base-{self.word()}"
+        self.git(wt, "branch", other)                                              # at base
+        log = f"run-{self.word()}.log"
+        with open(os.path.join(wt, ".gitignore"), "a", encoding="utf-8") as fh:
+            fh.write(log + "\n")
+        self.git(wt, "commit", "-q", "-am", "Ignore the run log")                 # HEAD ignores it, base does not
+        head = self.rev(wt)
+        logged = self.put(os.path.join(wt, log), data=self.text())
+        self.assertTrue(self.ignored(wt, log))
+        notes = os.path.join(wt, f"notes-{self.word()}.txt")
+        self.put(notes)
+        mine = {"src/app.py": self.edit(wt, "src/app.py")}
+        both = {("head", None): head, ("changes", None): self.changes_of(wt, head, mine)}
+        nothing = (
+            ("git reset --hard HEAD~1 && git clean -fd", wt),
+            (f"git reset --hard {base}; git clean -fdx", wt),
+            (f"git reset -q --hard {other} && git clean -f", wt),
+            (f"git checkout -f {other} && git clean -fd", wt),
+            (f"git switch -f {other} && git clean -fd", wt),
+            (f"git switch --discard-changes {other}; git clean -fd", wt),
+            (f"git -C {wt} reset --hard {base} && git -C {wt} clean -fd", main),
+        )
+        for command, cwd in nothing:
+            with self.subTest(command=command, cwd=cwd):
+                before, refs, there = self.snapshots(), self.backup_refs(wt), self.state(wt)
+                self.expect_none(self.run_gate(command, cwd, main), before, refs, command, wt)
+                self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
+        allowed = (
+            ("git reset --hard && git clean -fd", both, [notes]),                  # no target: the same ignore rules
+            ("git clean -fd && git reset --hard HEAD~1", both, [notes]),           # the clean runs first
+            ("git reset --hard HEAD~1", both, []),
+            (f"git switch -f {other}", {("changes", None): both[("changes", None)]}, []),
+            ("git clean -fd", {}, [notes]),
+        )
+        for command, want, paths in allowed:
+            with self.subTest(command=command, allowed=True):
+                before = self.snapshots()
+                self.expect_refs(self.run_gate(command, wt, main), before, command, wt, wt, want, paths=paths)
+
+        # What the review found: after the reset the log is no longer ignored, and the clean removes it.
+        self.git(wt, "reset", "-q", "--hard", "HEAD~1")
+        self.assertFalse(self.ignored(wt, log))
+        self.git(wt, "clean", "-q", "-f", "-d")
+        self.assertFalse(os.path.lexists(os.path.join(wt, log)), logged[:16])
+
+
+class GitBranchNames(GitGate):
+    def test_branch_names_that_are_not_plain_branches_get_nothing(self):
+        """Review of PR #361, finding 2: git deletes the branch @{-N} names, but refs/heads/@{-N} resolves to nothing."""
+        main = self.make_project()
+        wt = self.add_worktree(main, "t-1-x", "t/1-x")
+        names = [f"t/{self.rng.randint(10, 99)}-{k}-{self.word()}" for k in "abc"]
+        tips = {}
+        for n in names:
+            self.git(wt, "switch", "-q", "-c", n)
+            tips[n] = self.commit(wt)
+        self.git(wt, "switch", "-q", "t/1-x")
+        x, y, z = self.rng.sample(names, 3)
+        self.git(wt, "switch", "-q", x)                                            # real checkouts: @{-2} is x,
+        self.git(wt, "switch", "-q", y)                                            # @{-1} is y
+        self.git(wt, "switch", "-q", "t/1-x")
+        for spec, name in (("@{-1}", y), ("@{-2}", x)):
+            self.assertEqual(self.git(wt, "rev-parse", "--symbolic-full-name", spec), "refs/heads/" + name)
+            self.assertEqual(self.branch_at(wt, name), tips[name])
+        missing = f"t/{self.rng.randint(100, 999)}-gone-{self.word()}"
+        self.assertIsNone(self.branch_at(wt, missing))
+        nothing = (
+            "git branch -D @{-1}",
+            "git branch -D @{-2}",
+            "git branch -d '@{-1}'",
+            "git branch --delete --force @{-2}",
+            f"git branch -D {z} @{{-1}}",
+            f"git branch -D @{{-2}} {z}",
+            f"git branch -D {missing}",
+            f"git branch -D {z} {missing}",
+        )
+        for command in nothing:
+            with self.subTest(command=command):
+                before, refs, there = self.snapshots(), self.backup_refs(wt), self.state(wt)
+                self.expect_none(self.run_gate(command, wt, main), before, refs, command, wt)
+                self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the repository")
+        for command, kept in ((f"git branch -D {z}", [z]), (f"git branch -D {x} {y}", [x, y])):
+            with self.subTest(command=command, plain=True):
+                before = self.snapshots()
+                self.expect_refs(self.run_gate(command, wt, main), before, command, wt, wt,
+                                 {("branch", n): tips[n] for n in kept})
+
+        # What the review found: git deletes the branch @{-1} names.
+        self.git(wt, "branch", "-q", "-D", "@{-1}")
+        self.assertIsNone(self.branch_at(wt, y))
 
 
 # ================================================================ failing open

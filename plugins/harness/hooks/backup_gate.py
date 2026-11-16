@@ -17,8 +17,12 @@ or -ff) copies what `git clean -n` lists with its options and pathspecs, a glob 
 as written and as expanded, through the file rules below. Nothing for the whole command: a
 repository other than the main checkout or its worktrees, a word with $, a backtick, a brace
 expansion or a leading ~, --git-dir, --work-tree, -c core.*, a GIT_ assignment, a branch main or
-master, another stash spelling, a reset after a branch switch in the same worktree, or a failed
-git call. status, log, diff, show, rev-parse, stash list and a branch listing are harmless.
+master or one that is not a plain existing branch (@{-1}, a missing one), another stash spelling,
+a reset after a branch switch in the same worktree, a reset, forced switch or path form whose
+target (the commit or tree-ish named; HEAD for a reset or forced switch naming none) would
+overwrite an untracked or ignored path (at, under or over a path it tracks), a clean after a
+move to another tree in the same worktree, or a failed git call. status, log, diff, show,
+rev-parse, stash list and a branch listing are harmless.
 
 No decision and no snapshot: plan mode; HARNESS_BACKUP=off (the environment first, then `env`
 in the main checkout's .claude/settings.json and settings.local.json); a command branch_guard
@@ -124,6 +128,7 @@ LISTING = re.compile(r"-[arvl]+\Z|--(?:all|remotes|verbose|list|show-current|ign
 GIT_UNREAD = re.compile(r"[$`]|\{[^{}]*(?:,|\.\.)[^{}]*\}|\A~")
 GIT_ELSEWHERE = re.compile(r"(?:--git-dir|--work-tree|--namespace|--config-env|--bare)(?:=|\Z)")
 STASH_ENTRY = re.compile(r"stash@\{(\d+)\}\Z|(\d+)\Z")
+SWITCH_VALUE_OPTIONS = {"-c", "-C", "--create", "--force-create", "--orphan"}
 GLOB = re.compile(r"[*?[]")
 UNREAD = re.compile(r"[$`^#]|\*\*|\[\^|\[\[[:=.]|(?<=.)~(?=.)|\A=|\{[^{}]*(?:,|\.\.)[^{}]*\}")
 SUBSTITUTION = re.compile(r"\$\(|`|[<>]\(")
@@ -148,14 +153,17 @@ def branch_guard():
     return guard
 
 
-def git(cwd, *args):
-    """git's stripped stdout, or None when it fails or does not answer in time."""
+def git(cwd, *args, names=False):
+    """git's stripped stdout (with `names`, the NUL-separated names it lists), or None when it fails or does not
+    answer in time."""
     try:
         done = subprocess.run(["git", "-C", cwd, *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
                               encoding="utf-8", errors="surrogateescape", timeout=GIT_TIMEOUT)
     except (OSError, subprocess.SubprocessError):
         return None
-    return done.stdout.strip() if done.returncode == 0 else None
+    if done.returncode != 0:
+        return None
+    return [name for name in done.stdout.split("\0") if name] if names else done.stdout.strip()
 
 
 # ---------- the command ----------
@@ -398,15 +406,105 @@ def clean_listing(rest, where, here):
     return sorted(listed)
 
 
+def restore_source(rest):
+    """The tree-ish git restore takes the files from (-s, --source or a prefix of it down to --so, the last one
+    given), None for the index."""
+    found, k = None, 0
+    while k < len(rest) and rest[k] != "--":
+        a, k = rest[k], k + 1
+        option, eq, value = a.partition("=")
+        if len(option) >= 4 and "--source".startswith(option):
+            found = value if eq else rest[k] if k < len(rest) else None
+            k += 0 if eq else 1
+        elif a.startswith("-") and not a.startswith("--") and "s" in a[1:]:
+            value = a[a.index("s", 1) + 1 :]  # -s takes the rest of the word, or the next word
+            found = value or (rest[k] if k < len(rest) else None)
+            k += 0 if value else 1
+    return found
+
+
+def git_target(guard, sub, rest, where):
+    """The commit or tree-ish a reset, a forced checkout or switch, or a checkout or restore of paths takes the
+    worktree's files from, as written: HEAD for a reset, checkout -f or switch naming none; None for git rm and for
+    the path forms naming none, which take the index."""
+    if sub == "restore":
+        return restore_source(rest)
+    if sub == "checkout" and "--" in rest:
+        named = guard.plain_args(rest[: rest.index("--")], guard.CHECKOUT_VALUE_OPTIONS)
+        return named[0] if named else None
+    if sub == "checkout":
+        named = guard.plain_args(rest, guard.CHECKOUT_VALUE_OPTIONS)
+        if len(named) == 1 and guard.checkout_paths(rest, where):
+            return None  # a lone existing path, from the index
+        if len(named) > 1 and git(where, "rev-parse", "--verify", "-q", named[0] + "^{tree}") is None:
+            return None  # no tree-ish first: git reads every word as a path, from the index
+    elif sub in ("reset", "switch"):
+        named = guard.plain_args(rest, SWITCH_VALUE_OPTIONS if sub == "switch" else ())
+    else:
+        return None
+    return named[0] if named else "HEAD"
+
+
+def fold(name):
+    """`name` as a case-insensitive disk compares it (macOS's), Unicode form included: a name git lists in another
+    case or form is the same entry there."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def in_the_way(top, name):
+    """Whether something on disk stands where git writes the tracked path `name` of `top`: anything at `name`
+    itself, or a file or link where it needs a folder."""
+    path, bits = top, name.split("/")
+    for k, bit in enumerate(bits):
+        path = os.path.join(path, bit)
+        if not os.path.lexists(path):
+            return False
+        if k == len(bits) - 1 or os.path.islink(path) or not os.path.isdir(path):
+            return True
+    return False
+
+
+def overwrites(top, target):
+    """Whether taking `top`'s files from the tree-ish `target` overwrites an untracked or ignored path, which git
+    stash create never holds: one the target tracks, one under a path it tracks as a file (a folder's file where it
+    has a file), or a file or link where it tracks a folder (a wholly untracked folder only when a path it writes
+    there is already on disk). None when git cannot tell."""
+    names = git(top, "ls-tree", "-r", "-z", "--name-only", "--full-tree", target, names=True)
+    # without --exclude-standard, ignored paths count as others; a folder with nothing tracked comes as `dir/`
+    others = git(top, "ls-files", "-z", "--others", "--directory", "--no-empty-directory", names=True)
+    if names is None or others is None:
+        return None
+    folded = [(fold(name), name) for name in names]
+    tracked, folders = {f for f, _name in folded}, set()
+    for f in tracked:
+        while "/" in f:
+            f = f.rsplit("/", 1)[0]
+            if f in folders:
+                break
+            folders.add(f)
+    for other in others:
+        path = fold(other.rstrip("/"))
+        bits = path.split("/")
+        if any("/".join(bits[:k]) in tracked for k in range(1, len(bits) + 1)):
+            return True
+        if path in folders and (not other.endswith("/") or any(
+                in_the_way(top, name) for f, name in folded if f.startswith(path + "/"))):
+            return True
+    return False
+
+
 def git_keeps(guard, kept, forms, roots):
     """({(what, name): {what, name, sha, worktree}} of the refs the destroying git parts `kept` need, [the paths their
     git clean removes]); None when any of them cannot be kept: an unknown directory or word ($, a backtick, a brace
     expansion, a leading ~), git pointed elsewhere (--git-dir, --work-tree, -c core.*, a GIT_ assignment), a repository
-    that is not the main checkout or one of its worktrees, main or master deleted, a stash named otherwise than
-    stash@{n} or n, a reset after a branch switch in the same worktree, two different shas for one ref, or a git
-    call that fails. Each is judged against the state before the command: HEAD and git stash create once per working
-    tree, the stash list once, each drop taking its entry out of it."""
-    keeps, clean, stack, cache, switched = {}, [], None, {}, set()
+    that is not the main checkout or one of its worktrees, main or master deleted, a branch name that is not a plain
+    existing branch (@{-1}, a missing one), a stash named otherwise than stash@{n} or n, a reset after a branch
+    switch in the same worktree, an untracked or ignored path the target of a reset, checkout or switch overwrites
+    (`overwrites`), a clean after files are taken from another tree in the same worktree (its dry run reads the
+    ignore rules that replaces), two different shas for one ref, or a git call that fails. Each is judged against
+    the state before the command: HEAD and git stash create once per working tree, the stash list once, each drop
+    taking its entry out of it."""
+    keeps, clean, stack, cache, switched, moved, hits = {}, [], None, {}, set(), set(), {}
 
     def once(top, *args):
         if (top, args) not in cache:
@@ -432,6 +530,17 @@ def git_keeps(guard, kept, forms, roots):
             return None
         if form == "reset" and top in switched:
             return None  # HEAD before the command is not the HEAD this reset moves
+        target = git_target(guard, sub, rest, where) if form in ("reset", "paths") else None
+        if target is not None:
+            if (top, target) not in hits:
+                hits[top, target] = overwrites(top, target)
+            if hits[top, target] is not False:
+                return None  # git stash create holds no untracked or ignored file
+            tree = once(top, "rev-parse", "--verify", "-q", target + "^{tree}")
+            if tree is None:
+                return None
+            if tree != once(top, "rev-parse", "--verify", "-q", "HEAD^{tree}"):
+                moved.add(top)
         if form == "reset" and not keep("head", None, once(top, "rev-parse", "--verify", "-q", "HEAD^{commit}"), top):
             return None
         if form in ("reset", "paths"):
@@ -445,7 +554,9 @@ def git_keeps(guard, kept, forms, roots):
             for name in guard.plain_args(rest):
                 if name in guard.PROTECTED or GLOB.search(name):
                     return None
-                if not keep("branch", name, git(top, "rev-parse", "--verify", "-q", "refs/heads/" + name), top):
+                # git deletes the branch @{-1} names, which refs/heads/@{-1} is not: a plain existing branch only
+                tip = git(top, "show-ref", "--verify", "--hash", "refs/heads/" + name)
+                if tip is None or not keep("branch", name, tip, top):
                     return None
         if form in ("drop", "clear"):
             if stack is None:
@@ -463,6 +574,8 @@ def git_keeps(guard, kept, forms, roots):
                 if not keep("stash", str(k), sha, top):
                     return None
         if form == "clean":
+            if top in moved:
+                return None  # its dry run reads the ignore rules before the move, not after it
             listed = clean_listing(rest, where, here)
             if listed is None:
                 return None
