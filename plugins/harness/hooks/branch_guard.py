@@ -57,7 +57,9 @@ repo's .claude/settings.json, then .claude/settings.local.json).
 The shell walker (Part, split_command, command_words, stdin_program and their tables) comes
 from harness_lib.shellwalk, shared with readonly_bash.py. tests_first.py imports this
 module for walk(), writes(), git_split(), git_paths(), code_writes() and the helpers and
-writer tables behind them, the walker's names included; importing it has no side effects.
+writer tables behind them, the walker's names included, and backup_gate.py for walk(),
+plain_args() and bash_refusal() (this hook's Bash decision as a reason or None);
+importing it has no side effects.
 
 A refusal prints {"hookSpecificOutput": {"hookEventName": "PreToolUse",
 "permissionDecision": "deny", "permissionDecisionReason": "..."}} and exits 0. Allowing
@@ -1227,25 +1229,32 @@ def verify_command(top: Path) -> str | None:
     return setting("CLAUDE_VERIFY_CMD", settings_env(top))
 
 
+def bash_refusal(command: str, cwd: str) -> str | None:
+    """The reason this hook refuses the Bash `command` run in `cwd`, or None when it may run
+    (HARNESS_ALLOW_MAIN read as main() and allow_main read it). backup_gate.py asks it too."""
+    if os.environ.get("HARNESS_ALLOW_MAIN", "").strip() == "1" or not command.strip():
+        return None
+    found = refusal({"cwd": cwd, "repos": {}}, command)
+    if found is None:
+        return None
+    text, why, top, branch, advice = found
+    if allow_main(top):
+        return None
+    if branch is None:
+        return f'Refused "{shown(text)}": {why}. {advice}'
+    verify = verify_command(top) if top is not None else None
+    if verify and command.strip() == verify:
+        return None
+    name = top.name if top is not None else "this repo"
+    return f'On {branch} in {name}. Refused "{shown(text)}": {why}. {advice}'
+
+
 def check_bash(data: dict, cwd: str) -> None:
     tool_input = data.get("tool_input")
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
-    if not isinstance(command, str) or not command.strip():
-        return
-    found = refusal({"cwd": cwd, "repos": {}}, command)
-    if found is None:
-        return
-    text, why, top, branch, advice = found
-    if allow_main(top):
-        return
-    if branch is None:
-        deny(f'Refused "{shown(text)}": {why}. {advice}')
-        return
-    verify = verify_command(top) if top is not None else None
-    if verify and command.strip() == verify:
-        return
-    name = top.name if top is not None else "this repo"
-    deny(f'On {branch} in {name}. Refused "{shown(text)}": {why}. {advice}')
+    why = bash_refusal(command, cwd) if isinstance(command, str) else None
+    if why:
+        deny(why)
 
 
 # ---------- main ----------
