@@ -27,6 +27,7 @@ import uuid
 
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")
 TOOL = os.path.join(BIN, "harness-red")
+SESSION_BRIEF = os.path.join(os.path.dirname(BIN), "hooks", "session_brief.py")
 GIT = shutil.which("git")
 BRANCH, SLUG, TICKET = "t/253-own", "t-253-own", 253
 NOTHING_RUN = "no own test files for this branch's changes; nothing run"
@@ -604,6 +605,162 @@ class OwnRun(Repos, unittest.TestCase):
             self.assertEqual(int(os.stat(path).st_mtime), int(past))
         self.assertEqual(sorted(os.listdir(os.path.join(state, "red"))), [SLUG + ".json"])
         self.assertEqual(sorted(os.listdir(os.path.join(state, "red-files"))), [SLUG + ".json"])
+
+
+@unittest.skipUnless(GIT, "git is not installed")
+class ClaimedSpareEnv(Repos, unittest.TestCase):
+    """Ticket #345: a background session claimed from a spare that another project's session started keeps a
+    HARNESS_TEST_CMD only that project's settings set (OkinawaDream's `npm test -- {files}`), next to the inherited
+    HARNESS_SESSION_PROJECT naming that project. Each row runs session_brief as Claude Code does at SessionStart,
+    then a later Bash call: a shell that sources CLAUDE_ENV_FILE, then runs harness-red. That call uses this
+    project's own HARNESS_TEST_CMD, or the detected default (python3 -m unittest {files}), never the stray one; a
+    command the user's settings or a plain environment with no other project sets still wins. Each row is a fresh
+    repository whose branch changes one test module so that it fails; HOME is the row's own temporary folder."""
+
+    def setUp(self):
+        super().setUp()
+        # Set by each row where it matters, never taken from the session running these tests.
+        self.env = {k: v for k, v in self.env.items()
+                    if not k.startswith("CLAUDE_VERIFY_") and k != "CLAUDE_ENV_FILE"}
+        self.sessions = 0
+
+    def recorder_cmd(self, tag):
+        return f"python3 {shlex.quote(self.recorder)} {tag} {{files}}"
+
+    def rows(self):
+        """(name, CLAUDE_PROJECT_DIR, the inherited HARNESS_SESSION_PROJECT, the inherited HARNESS_TEST_CMD, where this
+        project sets its own command, the tag of the command that must run (None: the detected default))."""
+        stray, own, user, plain = (f"{k}-{uuid.uuid4().hex[:8]}" for k in ("stray", "own", "user", "plain"))
+        return [
+            ("stray from another repository, no own setting", "worktree", "other repository",
+             self.recorder_cmd(stray), None, None),
+            ("OkinawaDream's npm command, no own setting", "worktree", "other repository",
+             "npm test -- {files}", None, None),
+            ("stray from a folder outside any repository, no own setting", "worktree", "outside",
+             self.recorder_cmd(stray), None, None),
+            ("stray, the worktree's own settings.local.json", "main checkout", "other repository",
+             self.recorder_cmd(stray), ("worktree local", own), own),
+            ("the user's own settings", "worktree", "other repository",
+             self.recorder_cmd(user), ("user", user), user),
+            ("a plain environment, no other project", "worktree", None, self.recorder_cmd(plain), None, plain),
+            ("a plain environment, this repository's own session", "worktree", "main checkout",
+             self.recorder_cmd(plain), None, plain),
+            # the same repository or another, by what git says, not by how the paths begin
+            ("stray from a sibling repository sharing the worktree's path prefix", "worktree", "sibling repository",
+             self.recorder_cmd(stray), None, None),
+            ("a plain environment, another worktree of this repository elsewhere", "worktree", "worktree elsewhere",
+             self.recorder_cmd(plain), None, plain),
+            ("a plain environment, a folder inside that worktree", "worktree", "inside the worktree elsewhere",
+             self.recorder_cmd(plain), None, plain),
+            # this project's settings name HARNESS_TEST_CMD only outside `env`: that sets nothing
+            ("stray named only outside env in this project's settings", "worktree", "other repository",
+             self.recorder_cmd(stray), ("named outside env", None), None),
+        ]
+
+    def claimed_session(self, project, session, test_cmd, own):
+        """The row's repository and session: session_brief has run at SessionStart. Returns (worktree, the session's
+        cwd, the environment its later Bash calls start with)."""
+        self.sessions += 1
+        n = self.sessions
+        home = os.path.join(self.tmp, f"home{n}")
+        os.makedirs(home)
+        repo, wt = self.new_repo(["src/app/models.py"], {"tests/test_models.py": PASSING_TEST})
+        write(os.path.join(wt, "tests", "test_models.py"), FAILING_TEST)
+        self.git(wt, "add", "-A")
+        self.git(wt, "commit", "-q", "-m", "a failing test")
+
+        if own and own[0] == "worktree local":
+            write(os.path.join(wt, ".claude", "settings.local.json"),
+                  json.dumps({"env": {"HARNESS_TEST_CMD": self.recorder_cmd(own[1])}}))
+        elif own and own[0] == "user":       # Claude Code overlays the user's settings: the inherited value is theirs
+            write(os.path.join(home, ".claude", "settings.json"), json.dumps({"env": {"HARNESS_TEST_CMD": test_cmd}}))
+        elif own and own[0] == "named outside env":
+            write(os.path.join(home, ".claude", "settings.json"), json.dumps({
+                "permissions": {"allow": ["Bash(HARNESS_TEST_CMD=* harness-red run)"]},
+                "env": {"HARNESS_TEST_CMD_EXTRA": "--verbose"}}))
+            write(os.path.join(wt, ".claude", "settings.local.json"), json.dumps({
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": 'test -n "$HARNESS_TEST_CMD"'}]}]}}))
+
+        project_dir = wt if project == "worktree" else repo
+        if session in ("other repository", "sibling repository"):
+            # OkinawaDream, a repository of its own whose settings set the command; or one beside this project's
+            # folder whose path starts with it
+            other = (os.path.join(self.tmp, f"OkinawaDream{n}") if session == "other repository"
+                     else project_dir + "-old")
+            write(os.path.join(other, ".claude", "settings.json"), json.dumps({"env": {"HARNESS_TEST_CMD": test_cmd}}))
+            self.git(self.tmp, "init", "-q", other)
+            self.git(other, "add", "-A")
+            self.git(other, "commit", "-q", "-m", "other project")
+        elif session in ("worktree elsewhere", "inside the worktree elsewhere"):
+            # a worktree of this repository whose path shares no prefix with the project's
+            elsewhere = os.path.join(self.tmp, f"elsewhere{n}", "wt-345")
+            self.git(repo, "worktree", "add", "-q", elsewhere, "-b", f"t/345-elsewhere-{n}", "origin/main")
+            other = elsewhere if session == "worktree elsewhere" else os.path.join(elsewhere, "lib")
+            os.makedirs(other, exist_ok=True)
+        elif session == "outside":
+            other = os.path.join(self.tmp, f"outside{n}")
+            os.makedirs(other)
+        elif session == "main checkout":
+            other = repo
+        else:
+            other = None
+
+        inherited = {"HOME": home, "HARNESS_TEST_CMD": test_cmd}
+        if other is not None:
+            inherited["HARNESS_SESSION_PROJECT"] = other
+        env_file = write(os.path.join(self.tmp, "envfiles", f"env-{n}.sh"), "")
+        hook_env = dict(self.env, **inherited)
+        hook_env.update(CLAUDE_PROJECT_DIR=project_dir, CLAUDE_ENV_FILE=env_file)
+        payload = {"session_id": f"sess-{n}", "transcript_path": "/dev/null", "cwd": project_dir,
+                   "permission_mode": "default", "hook_event_name": "SessionStart", "source": "startup"}
+        p = subprocess.run([sys.executable, SESSION_BRIEF], input=json.dumps(payload), cwd=project_dir, env=hook_env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        bash_env = dict(self.env, **inherited)
+        bash_env.update(CLAUDE_ENV_FILE=env_file, RECORD_ARGV=self.argv_log)
+        return wt, project_dir, bash_env
+
+    def bash_call(self, cwd, env, *args, **extra):
+        """A later Bash call of the session: a shell sources CLAUDE_ENV_FILE, then runs harness-red."""
+        return subprocess.run(["/bin/sh", "-c", '. "$CLAUDE_ENV_FILE" && exec python3 "$0" "$@"', TOOL, *args],
+                              cwd=cwd, env=dict(env, **extra), capture_output=True, text=True, timeout=120)
+
+    def test_run_uses_this_projects_command_never_another_projects(self):
+        for name, project, session, test_cmd, own, expect in self.rows():
+            with self.subTest(name):
+                wt, cwd, env = self.claimed_session(project, session, test_cmd, own)
+                p = self.bash_call(cwd, env, "run", "--worktree", wt)
+                said = p.stdout + p.stderr
+                self.assertNotIn("Traceback", p.stderr)
+                calls = [c["argv"] for c in self.invocations()]
+                if expect is None:            # the detected default, on the one failing module
+                    self.assertEqual(calls, [], f"a recorded command ran, not the detected default: {said}")
+                    self.assertEqual(p.returncode, 1, said)
+                    self.assertIn("own tests: 1 files, exit 1", p.stdout.splitlines(), said)
+                    self.assertIn("AssertionError: 5 != 6", p.stdout, said)
+                else:
+                    self.assertEqual(calls, [[expect, "tests/test_models.py"]], said)
+                    self.assertEqual(p.returncode, 0, said)
+                    self.assertIn("own tests: 1 files, exit 0", p.stdout.splitlines(), said)
+
+    def test_check_records_this_projects_command_never_another_projects(self):
+        for name, project, session, test_cmd, own, expect in self.rows():
+            with self.subTest(name):
+                wt, cwd, env = self.claimed_session(project, session, test_cmd, own)
+                p = self.bash_call(cwd, env, "check", "--json", "--worktree", wt, RUNNER_EXIT="1")
+                said = p.stdout + p.stderr
+                self.assertNotIn("Traceback", p.stderr)
+                calls = [c["argv"] for c in self.invocations()]
+                self.assertEqual(p.returncode, 0, said)
+                record = json.loads(p.stdout)
+                if expect is None:            # the detected default, red on the failing assertion
+                    self.assertEqual(calls, [], f"a recorded command ran, not the detected default: {said}")
+                    self.assertEqual(record["cmd"], "python3 -m unittest tests/test_models.py", said)
+                    self.assertEqual(record["kind"], "assertion", said)
+                else:
+                    self.assertEqual(calls, [[expect, "tests/test_models.py"]], said)
+                    self.assertEqual(record["cmd"], f"python3 {shlex.quote(self.recorder)} {expect} tests/test_models.py")
 
 
 if __name__ == "__main__":
