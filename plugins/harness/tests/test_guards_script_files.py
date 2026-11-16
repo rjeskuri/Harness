@@ -5,6 +5,12 @@ python, node, deno, bun, ruby, perl, php, sh, bash or zsh on a program file that
 tracked at the worktree's HEAD (in /tmp, the scratchpad, ~, another repository, or new in
 the worktree): what it writes cannot be seen. Tracked means in HEAD's tree, not the
 index. A test runner given a program file outside the worktree is refused the same way.
+The program file is judged wherever it stands: behind an option whose value names a
+tracked path (ruby -I lib, perl -I lib, php -c dir, node -r file, deno --config file),
+as a preload run next to a tracked program (node -r, --require, --import, --loader;
+ruby -r; bun --preload, -r), or as a module python resolves from the part's directory or
+its PYTHONPATH. A load path or a runner's output path is not a program: ruby -I /tmp/gems
+on a tracked program, pytest --junitxml /tmp/r.xml, PYTHONPATH=x python3 -m pytest run.
 Tracked program files, the test runners on the worktree's files, npm and harness-red
 still run, and off a ticket branch nothing changes. The fixtures are in guards_support.py.
 
@@ -28,6 +34,7 @@ NODE_PROGRAM = (
 PROGRAMS = {
     "py": "open('tests/test_app.py', 'w').write('')\nopen('src/app.py', 'w').write('')\n",
     "mjs": NODE_PROGRAM,
+    "cjs": "const fs = require('node:fs');\nfs.writeFileSync('tests/test_app.py', '');\nfs.writeFileSync('src/app.py', '');\n",
     "ts": NODE_PROGRAM,
     "rb": "File.write('tests/test_app.py', '')\nFile.write('src/app.py', '')\n",
     "pl": "for my $f ('tests/test_app.py', 'src/app.py') { open(my $h, '>', $f) or die; close $h; }\n",
@@ -145,6 +152,110 @@ TRACKED_SPELLINGS = (
     "cd scripts && python3 -m pkg",
     "python3 scripts/run_tests.py tests/test_new.py",
 )
+# An option taking a value that names a tracked path (a load path, a config, a preload),
+# then the program file: the value is not the program, so the run is still judged by the
+# file it runs ({f} is the untracked program).
+VALUE_OPTION_SPELLINGS = (
+    ("ruby -I scripts {f}", "rb"),
+    ("ruby -I lib {f}", "rb"),
+    ("ruby -Ilib -w {f}", "rb"),
+    ("perl -I scripts {f}", "pl"),
+    ("perl -I lib {f}", "pl"),
+    ("perl -Ilib -w {f}", "pl"),
+    ("php -c scripts {f}", "php"),
+    ("node -r scripts/setup.cjs {f}", "mjs"),
+    ("node --require scripts/setup.cjs {f}", "mjs"),
+    ("node --import scripts/setup.mjs {f}", "mjs"),
+    ("node --import=./scripts/setup.mjs {f}", "mjs"),
+    ("deno run --config deno.json {f}", "ts"),
+    ("bun --preload scripts/setup.ts {f}", "ts"),
+    ("python3 -W ignore -X utf8 {f}", "py"),
+)
+# A preload is a program the interpreter runs before the one it is given: an untracked
+# or out-of-tree preload next to a tracked program ({f} is the preload).
+PRELOAD_SPELLINGS = (
+    ("node -r {f} scripts/tool.mjs", "cjs"),
+    ("node --require {f} scripts/tool.mjs", "cjs"),
+    ("node --require={f} scripts/tool.mjs", "cjs"),
+    ("node --import {f} scripts/tool.mjs", "mjs"),
+    ("node --import={f} scripts/tool.mjs", "mjs"),
+    ("node --loader {f} scripts/tool.mjs", "mjs"),
+    ("node --experimental-loader={f} scripts/tool.mjs", "mjs"),
+    ("ruby -r{f} scripts/tool.rb", "rb"),
+    ("ruby -r {f} scripts/tool.rb", "rb"),
+    ("bun --preload {f} scripts/tool.ts", "ts"),
+    ("bun --preload={f} scripts/tool.ts", "ts"),
+    ("bun -r {f} scripts/tool.ts", "ts"),
+    ("node --import {f} --test tests/", "mjs"),  # and next to a runner
+    ("node -r {f} --test", "cjs"),
+)
+# The same options with tracked values and tracked programs, or a value that is a load
+# path and not a program at all ({o} is the untracked directory outside the worktree).
+VALUE_OPTION_TRACKED = (
+    "ruby -I lib scripts/tool.rb",
+    "ruby -Ilib -w scripts/tool.rb",
+    "ruby -I {o}/gems scripts/tool.rb",
+    "ruby -r ./scripts/setup.rb scripts/tool.rb",
+    "perl -I lib scripts/tool.pl",
+    "perl -I ~/perl5/lib scripts/tool.pl",
+    "php -c scripts scripts/tool.php",
+    "node -r scripts/setup.cjs scripts/tool.mjs",
+    "node --require ./scripts/setup.cjs scripts/tool.mjs",
+    "node --import ./scripts/setup.mjs scripts/tool.mjs",
+    "node --import=./scripts/setup.mjs scripts/tool.mjs",
+    "node --import ./scripts/setup.mjs --test tests/",
+    "node --import ./tests/setup.mjs --test tests/",  # the test-author's new setup, run by a runner
+    "deno run --config deno.json scripts/tool.ts",
+    "bun --preload ./scripts/setup.ts scripts/tool.ts",
+    "bun -r scripts/setup.ts scripts/tool.ts",
+)
+# -m with PYTHONPATH on the part: the module is resolved from the part's directory and
+# each PYTHONPATH entry, so a module found in an untracked or out-of-tree directory is the
+# untracked program it is. (command with {o} the outside directory and {home} ~, the part
+# the reason quotes or None for the whole command)
+PYTHONPATH_MODULES = (
+    ("PYTHONPATH=tools python3 -m gen", None),
+    ("env PYTHONPATH=tools python3 -m gen", None),
+    ("PYTHONPATH=tests/helpers python3 -m gen", None),
+    ("PYTHONPATH=scripts:tools python3 -m gen", None),
+    ("PYTHONPATH=tools:scripts python3 -m gen", None),
+    ("PYTHONPATH=./tools python3 -m gen", None),
+    ("PYTHONPATH={o} python3 -m w", None),
+    ("PYTHONPATH={home} python3 -m w", None),
+    ("cd tests && PYTHONPATH=helpers python3 -m gen", "PYTHONPATH=helpers python3 -m gen"),
+    ("cd scripts && PYTHONPATH=../tools python3 -m gen", "PYTHONPATH=../tools python3 -m gen"),
+)
+# PYTHONPATH that leads to a tracked module, or to no module of that name at all (the
+# runner is installed), and PYTHONPATH on a tracked program file: the load path does not
+# decide, the program does.
+PYTHONPATH_ALLOWED = (
+    "PYTHONPATH=scripts python3 -m tool",
+    "env PYTHONPATH=scripts python3 -m tool",
+    "PYTHONPATH=scripts python3 -m pkg",
+    "PYTHONPATH=tests python3 -m unittest tests/test_new.py",
+    "PYTHONPATH=tools python3 -m pytest tests/test_new.py",
+    "PYTHONPATH=tools python3 -m json.tool tests/fixtures/data.json",
+    "PYTHONPATH=tools python3 scripts/tool.py",
+    "PYTHONPATH={o} python3 scripts/tool.py",
+)
+# A test runner's options whose values are out-of-tree non-program paths (a report, a
+# temp directory, a cache): the loop writes those, so they stay allowed ({o} is the
+# outside directory, where r.xml and r.txt exist).
+RUNNER_VALUES = (
+    "python3 -m pytest --junitxml {o}/r.xml tests/test_new.py",
+    "python3 -m pytest --junitxml=/tmp/r.xml tests/test_new.py",
+    "python3 -m pytest --basetemp {o}/pt tests/",
+    "python3 -m pytest --basetemp=/tmp/pt -q tests/test_new.py",
+    "python3 -m pytest -o cache_dir={o}/pc tests/test_new.py",
+    "python3 -m pytest -p no:cacheprovider tests/test_new.py",
+    "python3 -m unittest -k login tests/test_new.py",
+    "uv run pytest --junitxml {o}/r.xml tests/test_new.py",
+    "node --test --test-reporter spec --test-reporter-destination {o}/r.txt tests/",
+    "node --test --test-reporter=junit --test-reporter-destination=/tmp/r.xml tests/new.test.js",
+    "npx vitest run --reporter junit --outputFile {o}/r.xml tests/new.test.ts",
+    "deno test --junit-path {o}/r.xml tests/new.test.ts",
+    "bun test --timeout 5000 tests/new.test.ts",
+)
 
 
 class ScriptFileTests(GuardTestCase):
@@ -168,6 +279,12 @@ class ScriptFileTests(GuardTestCase):
         self.write(self.wt / "scripts/run_tests.py", "import sys\nsys.exit(0)\n")
         self.write(self.wt / "scripts/pkg/__init__.py", "")
         self.write(self.wt / "scripts/pkg/__main__.py", PROGRAMS["py"])
+        # tracked values for the options that take one: preloads, load paths, a config
+        for ext in ("mjs", "cjs", "rb", "ts"):
+            self.write(self.wt / f"scripts/setup.{ext}", "// setup\n" if ext != "rb" else "# setup\n")
+        self.write(self.wt / "lib/util.rb", "module Util; end\n")
+        self.write(self.wt / "lib/Util.pm", "package Util;\n1;\n")
+        self.write(self.wt / "deno.json", "{}\n")
         self.git(self.wt, "add", "-A")
         self.git(self.wt, "commit", "-q", "-m", "Add the project's scripts")
         # untracked: outside any repository (the temp directory, ~) and in the worktree
@@ -181,10 +298,16 @@ class ScriptFileTests(GuardTestCase):
         self.write(self.wt / "w.py", PROGRAMS["py"])
         self.write(self.wt / "genpkg/__init__.py", "")
         self.write(self.wt / "genpkg/__main__.py", PROGRAMS["py"])
-        # the test-author's new tests, not committed yet
+        # outside the worktree, not programs: a load path, runner output, temp and cache dirs
+        for d in ("gems", "pt", "pc"):
+            (self.outside / d).mkdir()
+        self.write(self.outside / "r.xml", "<testsuites/>\n")
+        self.write(self.outside / "r.txt", "ok\n")
+        # the test-author's new tests and test setup, not committed yet
         self.write(self.wt / "tests/test_new.py", "def test_new():\n    assert False\n")
         self.write(self.wt / "tests/new.test.js", "require('node:assert').fail('red');\n")
         self.write(self.wt / "tests/new.test.ts", "throw new Error('red');\n")
+        self.write(self.wt / "tests/setup.mjs", "process.env.TZ = 'UTC';\n")
         self.write(self.wt / "tests/fixtures/data.json", "{}\n")
         self.cache()
         self.red()
@@ -334,6 +457,47 @@ class ScriptFileTests(GuardTestCase):
         expect(new, True, "committed")
         expect(dropped, False, "removal committed")
 
+    def test_an_option_value_naming_a_tracked_path_does_not_hide_the_program_file(self):
+        """ruby -I lib /tmp/w.rb runs /tmp/w.rb: the value of a load path, config or
+        preload option is not the program, whatever interpreter it belongs to."""
+        commands = [self.outside_file(t, ext) for t, ext in VALUE_OPTION_SPELLINGS]
+        commands += [
+            "ruby -I lib tools/gen.rb",
+            "perl -I lib tests/helpers/gen.pl",
+            "php -c scripts tools/gen.php",
+            "node -r scripts/setup.cjs tools/gen.mjs",
+            "node --import=./scripts/setup.mjs tests/helpers/gen.mjs",
+            "deno run --config deno.json tools/gen.ts",
+            "bun --preload scripts/setup.ts tools/gen.ts",
+        ]
+        for command in commands:
+            for agent in ROLES:
+                with self.subTest(command=command, agent=agent):
+                    self.assertRefused(self.bash(command, agent), command)
+
+    def test_an_untracked_preload_is_a_program_file(self):
+        """A preload runs before the program; one the worktree does not track is refused
+        however tracked the program next to it is, alone and beside a runner."""
+        commands = [self.outside_file(t, ext) for t, ext in PRELOAD_SPELLINGS]
+        commands += [
+            "node -r tools/gen.cjs scripts/tool.mjs",
+            "node --import ./tests/helpers/gen.mjs scripts/tool.mjs",
+            "ruby -r ./tools/gen.rb scripts/tool.rb",
+            "bun --preload tools/gen.ts scripts/tool.ts",
+            f"node --import {self.home}/w.mjs scripts/tool.mjs",
+        ]
+        for command in commands:
+            for agent in ROLES:
+                with self.subTest(command=command, agent=agent):
+                    self.assertRefused(self.bash(command, agent), command)
+
+    def test_a_module_found_on_pythonpath_is_judged_like_the_file_it_is(self):
+        for template, part in PYTHONPATH_MODULES:
+            command = template.format(o=self.outside, home=self.home)
+            for agent in ROLES:
+                with self.subTest(command=command, agent=agent):
+                    self.assertRefused(self.bash(command, agent), part or command)
+
     def test_a_test_runner_given_a_program_file_outside_the_worktree_is_refused(self):
         """A runner imports and runs the files it is given: one outside the worktree is the
         same bypass. Runners on the worktree's own files, tracked or new, still run."""
@@ -432,6 +596,23 @@ class ScriptFileTests(GuardTestCase):
             with self.subTest(command=command, agent=agent):
                 self.assertIsNone(self.bash(command, agent))
 
+    def test_option_values_preloads_and_pythonpath_on_tracked_programs_still_run(self):
+        """The mirror of the refusals above: tracked values and preloads, a load path that
+        is no program, and PYTHONPATH that leads to a tracked module, to an installed one
+        or to nothing the program run depends on."""
+        for k, template in enumerate(VALUE_OPTION_TRACKED + PYTHONPATH_ALLOWED):
+            command = template.format(o=self.outside)
+            agent = ROLES[k % len(ROLES)]
+            with self.subTest(command=command, agent=agent):
+                self.assertIsNone(self.bash(command, agent))
+
+    def test_runner_options_with_out_of_tree_values_still_run(self):
+        for k, template in enumerate(RUNNER_VALUES):
+            command = template.format(o=self.outside)
+            agent = ROLES[k % len(ROLES)]
+            with self.subTest(command=command, agent=agent):
+                self.assertIsNone(self.bash(command, agent))
+
     def test_the_main_session_and_other_agents_are_left_alone(self):
         commands = list(LITERAL) + [
             self.outside_file("python3 {f}", "py"),
@@ -483,6 +664,17 @@ class ScriptFileTests(GuardTestCase):
             "python3 ''",
             "node --",
             "node -r",
+            "node --import",
+            "node --import=",
+            "ruby -I",
+            "ruby -r",
+            "perl -I",
+            "php -c",
+            "bun --preload",
+            "deno run --config",
+            "PYTHONPATH= python3 -m gen",
+            "PYTHONPATH=tools python3 -m",
+            "PYTHONPATH=: python3 -m w",
             "bash -",
             "env",
             "deno run",
