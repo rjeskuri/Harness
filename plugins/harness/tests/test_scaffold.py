@@ -198,7 +198,7 @@ class Render(ScaffoldTest):
         ci = self.read(root, ".github/workflows/ci.yml")
         for piece in ("group: ${{ github.workflow }}-${{ github.ref }}",
                       "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
-                      "branches: [main]", "pull_request:", "workflow_dispatch:", "actions/checkout@v7",
+                      "pull_request:", "workflow_dispatch:", "actions/checkout@v7",
                       "astral-sh/setup-uv@v10.3.0", "enable-cache: true", "uv sync --locked --all-extras --dev",
                       "run: scripts/verify.sh"):
             self.assertIn(piece, ci)
@@ -2172,6 +2172,427 @@ class Paths(ScaffoldTest):
         self.assertOneLineError(p, "no origin remote", "--github")
         self.assertEqual(self.calls(), [])
         self.assertFalse(os.path.exists(os.path.join(root, "CLAUDE.md")))
+
+
+# =========================================================================== CI on pull requests only (ticket #339)
+CI = ".github/workflows/ci.yml"
+DEPLOY = ".github/workflows/deploy.yml"
+# The `on:` block of every scaffolded ci.yml before #339, written out here because the templates change.
+OLD_ON = "on:\n  push:\n    branches: [main]\n  pull_request:\n  workflow_dispatch:\n"
+PR_ONLY_ON = "on:\n  pull_request:\n  workflow_dispatch:\n"          # OLD_ON without its two push lines
+ADOPT_CALLS = [("harness-board", "task"), ("harness-work", "start"), ("harness-pr", "open"), ("harness-pr", "ready")]
+WRITE_CLAIM = re.compile(r"^(created|updated|committed|initialized|set|opened|started) ")
+
+# (label, stack, head, tail): what a project's ci.yml holds around an old-template `on:` block. One is the
+# old stack-none template exactly; the others are edited by their owner, each a trap for a rewrite that does
+# more than drop the two push lines: other `push` text (a job named push, `git push`), comments, another
+# timeout and steps, no blank line around the block, no newline at the end of the file.
+CI_BODIES = [
+    ("the old stack-none template", "none", "name: CI\n\n",
+     "\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.ref }}\n"
+     "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n\npermissions:\n  contents: read\n\n"
+     "jobs:\n  verify:\n    runs-on: ubuntu-latest\n    timeout-minutes: 20\n    steps:\n"
+     "      - uses: actions/checkout@v7\n      - name: Verify\n        run: scripts/verify.sh\n"),
+    ("python, a lint step and a longer timeout", "python", "name: CI\n\n",
+     "\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.ref }}\n"
+     "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n\npermissions:\n  contents: read\n\n"
+     "jobs:\n  verify:\n    runs-on: ubuntu-latest\n    timeout-minutes: 45\n    steps:\n"
+     "      - uses: actions/checkout@v7\n      - uses: astral-sh/setup-uv@v10.3.0\n        with:\n"
+     "          enable-cache: true\n      - name: Install\n        run: uv sync --locked --all-extras --dev\n"
+     "      - name: Lint\n        run: uv run ruff check .\n      - name: Verify\n        run: scripts/verify.sh\n"),
+    ("node, comments and a job named push", "node",
+     "# CI for the web app.\n# Keep node-version in step with .nvmrc.\nname: CI\n\n",
+     "\nconcurrency:\n  group: ci-${{ github.ref }}\n  cancel-in-progress: true\n\njobs:\n  verify:\n"
+     "    runs-on: ubuntu-latest\n    timeout-minutes: 20\n    steps:\n      - uses: actions/checkout@v7\n"
+     "      - uses: actions/setup-node@v7\n        with:\n          node-version: 22\n          cache: npm\n"
+     "      - run: npm ci\n      - run: scripts/verify.sh\n  push:\n    needs: verify\n"
+     "    if: github.event_name == 'push'\n    runs-on: ubuntu-latest\n    steps:\n"
+     "      - run: git push --dry-run origin main\n"),
+    ("no blank lines around the block, no newline at the end", "none", "name: Checks\n",
+     "jobs:\n  verify:\n    runs-on: macos-latest\n    steps:\n      - uses: actions/checkout@v7\n"
+     "      - run: make check"),
+]
+
+# `on:` blocks that are not exactly OLD_ON: such a ci.yml is kept byte for byte. Five start with OLD_ON itself,
+# the last three with another trigger after a blank line or a comment line, still inside the `on:` mapping.
+KEPT_ON = [
+    ("push on main and develop",
+     "on:\n  push:\n    branches: [main, develop]\n  pull_request:\n  workflow_dispatch:\n"),
+    ("push on tags too",
+     "on:\n  push:\n    branches: [main]\n    tags: ['v*']\n  pull_request:\n  workflow_dispatch:\n"),
+    ("a schedule after the old block", OLD_ON + "  schedule:\n    - cron: '0 3 * * 1'\n"),
+    ("workflow_dispatch inputs", OLD_ON + "    inputs:\n      debug:\n        type: boolean\n"),
+    ("push on every branch", "on:\n  push:\n  pull_request:\n  workflow_dispatch:\n"),
+    ("the flow form", "on: [push, pull_request, workflow_dispatch]\n"),
+    ("already pull requests only", PR_ONLY_ON),
+    ("a blank line, then a schedule", OLD_ON + "\n  schedule:\n    - cron: '0 3 * * 1'\n"),
+    ("a comment line, then a schedule", OLD_ON + "# Mondays as well.\n  schedule:\n    - cron: '0 3 * * 1'\n"),
+    ("a blank line and a comment, then workflow_call", OLD_ON + "\n# release.yml reuses this.\n  workflow_call:\n"),
+]
+
+# The workflow_run lines of a deploy.yml that waits for the workflow named CI, in each spelling of the list.
+# Ruling (#339): a deploy.yml that also runs on push is still refused; its workflow_run run would stop.
+REFUSED_RUNS = [
+    ("[CI]", "    workflows: [CI]\n    types: [completed]\n    branches: [main]\n"),
+    ('["CI"]', '    workflows: ["CI"]\n    types: [completed]\n'),
+    ("['CI']", "    types: [completed]\n    workflows: ['CI']\n"),
+    ("- CI", "    types: [completed]\n    workflows:\n      - CI\n    branches: [main]\n"),
+    ("[Lint, CI]", "    workflows: [Lint, CI]\n    types: [completed]\n"),
+    ("[CI, Lint]", "    workflows: [CI, Lint]\n    types: [completed]\n"),
+    ("[Build, CI, Deploy-prep]", "    workflows: [Build, CI, Deploy-prep]\n    types: [completed]\n"),
+    ("[ CI ]", "    workflows: [ CI ]\n    types: [completed]\n    branches: [main]\n"),
+    ("[Lint,CI]", "    types: [completed]\n    workflows: [Lint,CI]\n"),
+    ("- CI, then types", "    workflows:\n      - CI\n    types: [completed]\n"),
+    ("[CI] beside a push trigger", "    workflows: [CI]\n    types: [completed]\n  push:\n    branches: [main]\n"),
+]
+# ... and of one that waits for some other workflow.
+OTHER_RUNS = [
+    ("[Release]", "    workflows: [Release]\n    types: [completed]\n"),
+    ('["CI Nightly"]', '    workflows: ["CI Nightly"]\n    types: [completed]\n'),
+    ("- Lint", "    workflows:\n      - Lint\n    types: [completed]\n"),
+]
+# A deploy.yml on the push to main; its comment names workflow_run and CI without being a trigger.
+DEPLOY_ON_PUSH = ("name: Deploy\n\n# Moved off workflow_run of CI, which also ran after pull request runs.\non:\n"
+                  "  push:\n    branches: [main]\n  workflow_dispatch:\n\njobs:\n  deploy:\n"
+                  "    runs-on: ubuntu-latest\n"
+                  "    steps:\n      - uses: actions/checkout@v7\n      - run: scripts/deploy.sh\n")
+
+
+def deploy_after(run):
+    """A deploy.yml whose `on:` is workflow_run (with the lines `run`) and workflow_dispatch, as in a real
+    project whose Deploy waits for CI's run on the push to main."""
+    return ("name: Deploy\n\non:\n  workflow_run:\n" + run + "  workflow_dispatch:\n\n"
+            "concurrency:\n  group: deploy-${{ github.ref }}\n  cancel-in-progress: false\n\njobs:\n  deploy:\n"
+            "    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'\n"
+            "    runs-on: ubuntu-latest\n    timeout-minutes: 30\n    steps:\n      - uses: actions/checkout@v7\n"
+            "      - run: scripts/deploy.sh\n")
+
+
+# Deploys that do not wait for CI, though their text holds the spellings of CI a workflow_run list uses: in a
+# commented-out trigger, a job's env, a step, a matrix, an action's input, and beside a workflow_run of Release.
+_STEP = "      - run: scripts/deploy.sh\n"
+DEPLOY_LOOKALIKES = [
+    ("a commented-out workflow_run of [CI]", DEPLOY_ON_PUSH.replace(
+        "  workflow_dispatch:\n",
+        "  # was:\n  # workflow_run:\n  #   workflows: [CI]\n  #   types: [completed]\n  workflow_dispatch:\n")),
+    ('env {STAGE: "CI"}', DEPLOY_ON_PUSH.replace("    runs-on:", '    env: {STAGE: "CI", LANE: \'CI\'}\n    runs-on:')),
+    ('a step echoing "[CI]"', DEPLOY_ON_PUSH.replace(_STEP, '      - run: echo "[CI] passed"\n' + _STEP)),
+    ("a matrix listing - CI", DEPLOY_ON_PUSH.replace(
+        "    runs-on:", "    strategy:\n      matrix:\n        stage:\n          - CI\n          - prod\n    runs-on:")),
+    ("an input [deploy, CI]", DEPLOY_ON_PUSH.replace(
+        _STEP, _STEP + "      - uses: ./.github/actions/notify\n        with:\n          tags: '[deploy, CI]'\n")),
+    ("a workflow_run of [Release], CI in its steps", deploy_after(OTHER_RUNS[0][1]).replace(
+        _STEP, '      - run: |\n          echo "workflows: [CI, Release] passed"\n' + _STEP)),
+]
+
+
+def on_triggers(text):
+    """The trigger names of a workflow's top-level `on:` block (or of `on: [a, b]`), None without one."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^on:(.*)$", line)
+        if not m:
+            continue
+        rest = m.group(1).split("#", 1)[0].strip()
+        if rest:
+            return [t.strip() for t in rest.strip("[]").split(",") if t.strip()]
+        names = []
+        for line in lines[i + 1:]:
+            if line.strip() and not line.startswith((" ", "#")):
+                break
+            key = re.match(r"^  ([A-Za-z_]+):", line)
+            if key:
+                names.append(key.group(1))
+        return names
+    return None
+
+
+class PullRequestOnlyCI(ScaffoldTest):
+    """The scaffolded ci.yml runs on pull requests and by hand, not on the push to main. Re-running init on a
+    project whose ci.yml still has the old template's `on:` block drops its two push lines and nothing else;
+    any other `on:` block is kept. A run that would leave ci.yml without its push trigger while the deploy.yml
+    it leaves in place runs on workflow_run of CI is refused with one line and writes nothing."""
+
+    # ------------------------------------------------------------ helpers
+    def raw(self, *parts):
+        with open(os.path.join(*parts), "rb") as fh:
+            return fh.read()
+
+    def blob(self, repo, rev, rel):
+        p = subprocess.run([GIT, "-C", repo, "show", f"{rev}:{rel}"], env=self.env(), capture_output=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p.stdout
+
+    def reset_calls(self):
+        if os.path.exists(self.log):
+            os.remove(self.log)
+
+    def project(self, label, files, repo=False):
+        """A folder holding `files` ({path: text}); `git init -b main` with no commit when `repo`."""
+        root = self.mk(label)
+        for rel, text in files.items():
+            self.write(os.path.join(root, rel), text)
+        if repo:
+            self.git(root, "init", "-q", "-b", "main")
+        return root
+
+    def ticket(self, root, n):
+        """Ticket n's worktree from origin/main, and stub harness-board, harness-work and harness-pr for it."""
+        branch = f"t/{n}-adopt-the-harness-scaffold"
+        worktree = os.path.join(root, ".claude", "worktrees", f"t-{n}-adopt-the-harness-scaffold")
+        self.git(root, "worktree", "add", "-q", worktree, "-b", branch, "origin/main")
+        self.stub("harness-board", {"task": f"#{n} https://github.com/ryan/proj/issues/{n}\n"})
+        self.stub("harness-work", {"start": json.dumps({"number": n, "branch": branch, "worktree": worktree,
+                                                        "tier": "sonnet", "context": f"# {n}"})})
+        self.stub("harness-pr", {"open": json.dumps({"number": n + 100,
+                                                     "url": f"https://github.com/ryan/proj/pull/{n + 100}"}),
+                                 "ready": f"PR #{n + 100} ready for review\n"})
+        self.reset_calls()
+        return worktree
+
+    def adoptable(self, label, files, n):
+        """A repository with commits (a README, then `files`) pushed to a bare origin, and ticket n set up."""
+        root = self.repo_with_commit(label)
+        for rel, text in files.items():
+            self.write(os.path.join(root, rel), text)
+        self.git(root, "add", "-A")
+        self.git(root, "commit", "-q", "--allow-empty", "-m", "The project")
+        self.git(root, "remote", "add", "origin", self.bare(f"{label}.git"))
+        self.git(root, "push", "-q", "-u", "origin", "main")
+        return root, self.ticket(root, n)
+
+    def scaffolded(self, label, files, n):
+        """A project this harness-scaffold made (stack none, first-commit path), then `files` committed on main
+        by its owner, pushed to a bare origin, and ticket n set up."""
+        root = os.path.join(self.tmp, label)
+        self.ok("init", root, "--name", "proj", "--stack", "none")
+        for rel, text in files.items():
+            self.write(os.path.join(root, rel), text)
+        self.git(root, "add", "-A")
+        # the owner's edit on main: the scaffolded hooks refuse commits and pushes on main, so skip them once
+        self.git(root, "commit", "-q", "--no-verify", "--allow-empty", "-m", "The owner's workflows")
+        self.git(root, "remote", "add", "origin", self.bare(f"{label}.git"))
+        self.git(root, "push", "-q", "--no-verify", "-u", "origin", "main")
+        return root, self.ticket(root, n)
+
+    def state(self, root):
+        """What a refused run must leave as it was: every file under root (bytes and mode, .git aside) and, in a
+        repository, its status, refs, HEAD, local config, info/exclude and worktrees."""
+        files, folders = {}, []
+        for here, dirs, names in os.walk(root):
+            dirs[:] = [d for d in dirs if d != ".git"]
+            folders.append(os.path.relpath(here, root))
+            for name in names:
+                path = os.path.join(here, name)
+                files[os.path.relpath(path, root)] = (self.raw(path), stat.S_IMODE(os.lstat(path).st_mode))
+        out = {"files": files, "dirs": sorted(folders), "repo": os.path.exists(os.path.join(root, ".git"))}
+        if out["repo"]:
+            for key, args in (("status", ["status", "--porcelain", "--untracked-files=all"]),
+                              ("refs", ["for-each-ref"]),
+                              ("head", ["symbolic-ref", "HEAD"]), ("config", ["config", "--local", "--list"]),
+                              ("worktrees", ["worktree", "list", "--porcelain"])):
+                p = subprocess.run([GIT, "-C", root] + args, env=self.env(), capture_output=True, text=True)
+                out[key] = (p.returncode, p.stdout)
+            exclude = os.path.join(root, ".git", "info", "exclude")
+            out["exclude"] = self.raw(exclude) if os.path.isfile(exclude) else None
+        return out
+
+    def assertRefused(self, root, *args, worktree=None):
+        """init refuses with one line naming deploy.yml; no file, git state or stub call changes."""
+        before = self.state(root)
+        before_wt = self.state(worktree) if worktree else None
+        self.reset_calls()
+        p = self.scaffold("init", root, "--name", "proj", *args)
+        self.assertOneLineError(p, DEPLOY)
+        self.assertEqual(self.calls(), [], "a refused run called a harness tool")
+        claims = [ln for ln in self.lines(p) if WRITE_CLAIM.match(ln)]
+        self.assertEqual(claims, [], "a refused run says it wrote something")
+        self.assertEqual(self.state(root), before, "a refused run changed the project")
+        if worktree:
+            self.assertEqual(self.state(worktree), before_wt, "a refused run changed the ticket's worktree")
+
+    def assertSaysPushDropped(self, p, dry=False):
+        self.assertIn(f"{'would update' if dry else 'updated'} {CI}", self.lines(p))
+        said = [ln for ln in self.lines(p) if CI in ln and "push" in ln]
+        self.assertTrue(said, f"no line names {CI} and the push trigger:\n{p.stdout}")
+
+    # ------------------------------------------------------------ fresh renders
+    def test_fresh_renders_run_ci_on_pull_requests_and_by_hand_only(self):
+        for stack in ("python", "node", "none"):
+            with self.subTest(stack=stack):
+                root = os.path.join(self.tmp, f"fresh-{stack}")
+                p = self.ok("init", root, "--name", f"fresh-{stack}", "--stack", stack)
+                self.assertIn(f"created {CI}", self.lines(p))
+                ci = self.read(root, CI)
+                self.assertEqual(on_triggers(ci), ["pull_request", "workflow_dispatch"], ci)
+                self.assertEqual(self.blob(root, "HEAD", CI).decode(), ci)
+
+    # ------------------------------------------------------------ refresh: the rewrite
+    def test_refresh_on_the_first_commit_path_drops_only_the_two_push_lines(self):
+        for n, (label, stack, head, tail) in enumerate(CI_BODIES):
+            for repo in (False, True):
+                with self.subTest(ci=label, git_init=repo):
+                    root = self.project(f"refresh{n}-{int(repo)}", {CI: head + OLD_ON + tail}, repo=repo)
+                    expected = (head + PR_ONLY_ON + tail).encode()
+                    p = self.ok("init", root, "--name", "proj", "--stack", stack)
+                    self.assertEqual(self.raw(root, CI), expected)
+                    self.assertSaysPushDropped(p)
+                    self.assertEqual(self.git(root, "rev-list", "--count", "HEAD"), "1")
+                    self.assertEqual(self.blob(root, "HEAD", CI), expected)
+
+    def test_refresh_on_the_adopt_path_commits_the_ci_yml_minus_the_two_push_lines(self):
+        # a deploy.yml the run keeps, where there is one, does not wait for CI: on push, or another workflow's run
+        deploys = [("none", None), ("on push", DEPLOY_ON_PUSH),
+                   (f"workflow_run of {OTHER_RUNS[1][0]}", deploy_after(OTHER_RUNS[1][1])), ("none", None)]
+        # Ruling (#339): the commit holds the worktree's own ci.yml (harness-work start builds it from
+        # origin/main) minus the push lines; an uncommitted edit in the main checkout's ci.yml never reaches it.
+        edits = [None, "# Uncommitted: trying a matrix.\n", None, "# Local only.\n"]
+        for n, ((label, stack, head, tail), (deploy_label, deploy), edit) in enumerate(zip(CI_BODIES, deploys, edits)):
+            with self.subTest(ci=label, deploy=deploy_label, uncommitted_edit=bool(edit)):
+                files = {CI: head + OLD_ON + tail}
+                if deploy:
+                    files[DEPLOY] = deploy
+                root, worktree = self.adoptable(f"adopt{n}", files, 20 + n)
+                if edit:                                # still the old block, plus a line origin/main lacks
+                    files[CI] = head + edit + OLD_ON + tail
+                    self.write(os.path.join(root, CI), files[CI])
+                main_head = self.git(root, "rev-parse", "main")
+                expected = (head + PR_ONLY_ON + tail).encode()
+                p = self.ok("init", root, "--name", "proj", "--stack", stack)
+                self.assertEqual([(c["tool"], c["argv"][0]) for c in self.calls()], ADOPT_CALLS)
+                self.assertSaysPushDropped(p)
+                self.assertEqual(self.raw(worktree, CI), expected)
+                self.assertEqual(self.blob(worktree, "HEAD", CI), expected)
+                self.assertIn(CI, self.git(worktree, "show", "--name-only", "--format=", "HEAD").splitlines())
+                self.assertEqual(self.git(worktree, "status", "--porcelain"), "")
+                if deploy:
+                    self.assertIn(f"kept {DEPLOY}", self.lines(p))
+                    self.assertEqual(self.raw(worktree, DEPLOY), deploy.encode())
+                self.assertEqual(self.raw(root, CI), files[CI].encode())       # main and its checkout untouched
+                self.assertEqual(self.git(root, "rev-parse", "main"), main_head)
+
+    def test_a_scaffolded_project_is_adopted_for_an_old_trigger_alone_and_only_for_that(self):
+        """Every other scaffold file is already there: a ci.yml with the old block is the one change, through a
+        ticket; a ci.yml with any other block leaves nothing to adopt."""
+        cases = [(label, head + OLD_ON + tail, (head + PR_ONLY_ON + tail).encode())
+                 for label, _, head, tail in (CI_BODIES[0], CI_BODIES[2])]
+        _, _, head, tail = CI_BODIES[1]
+        cases += [(label, head + on + tail, None) for label, on in (KEPT_ON[0], KEPT_ON[2], KEPT_ON[6], KEPT_ON[8])]
+        for n, (label, text, expected) in enumerate(cases):
+            with self.subTest(ci=label):
+                root, worktree = self.scaffolded(f"again{n}", {CI: text}, 40 + n)
+                p = self.ok("init", root, "--name", "proj", "--stack", "none")
+                if expected is None:
+                    self.assertIn(f"kept {CI}", self.lines(p))
+                    self.assertIn("nothing to adopt: every scaffold file is already here", self.lines(p))
+                    self.assertEqual(self.calls(), [])
+                    self.assertEqual(self.raw(root, CI), text.encode())
+                    self.assertEqual(self.raw(worktree, CI), text.encode())
+                    continue
+                self.assertNotIn("nothing to adopt: every scaffold file is already here", self.lines(p))
+                self.assertEqual([(c["tool"], c["argv"][0]) for c in self.calls()], ADOPT_CALLS)
+                self.assertSaysPushDropped(p)
+                for rel in COMMON_FILES:
+                    if rel != CI:
+                        self.assertIn(f"kept {rel}", self.lines(p))
+                self.assertEqual(self.git(worktree, "diff", "--name-only", "origin/main", "HEAD").splitlines(), [CI])
+                self.assertEqual(self.blob(worktree, "HEAD", CI), expected)
+
+    def test_only_the_exact_old_block_is_rewritten_any_other_is_kept_byte_for_byte(self):
+        cases = [("the old block", OLD_ON)] + KEPT_ON
+        for n, (label, on) in enumerate(cases):
+            _, stack, head, tail = CI_BODIES[n % len(CI_BODIES)]
+            with self.subTest(on=label):
+                text = head + on + tail
+                root = self.project(f"kept{n}", {CI: text}, repo=bool(n % 2))
+                p = self.ok("init", root, "--name", "proj", "--stack", stack)
+                if on == OLD_ON:
+                    self.assertEqual(self.raw(root, CI), (head + PR_ONLY_ON + tail).encode())
+                    self.assertSaysPushDropped(p)
+                    continue
+                self.assertEqual(self.raw(root, CI), text.encode())
+                self.assertIn(f"kept {CI}", self.lines(p))
+                self.assertNotIn(f"updated {CI}", self.lines(p))
+                self.assertEqual(self.blob(root, "HEAD", CI), text.encode())
+
+    def test_dry_run_says_would_update_and_writes_nothing(self):
+        label, stack, head, tail = CI_BODIES[1]
+        text = head + OLD_ON + tail
+        for repo in (False, True):
+            with self.subTest(path="first commit", git_init=repo):
+                root = self.project(f"dry{int(repo)}", {CI: text}, repo=repo)
+                before = self.state(root)
+                p = self.ok("init", root, "--name", "proj", "--stack", stack, "--dry-run")
+                self.assertSaysPushDropped(p, dry=True)
+                self.assertEqual(self.state(root), before)
+        with self.subTest(path="adopt"):
+            root, worktree = self.adoptable("dry-adopt", {CI: text}, 60)
+            before, before_wt = self.state(root), self.state(worktree)
+            p = self.ok("init", root, "--name", "proj", "--stack", stack, "--dry-run")
+            self.assertSaysPushDropped(p, dry=True)
+            self.assertEqual(self.calls(), [])
+            self.assertEqual(self.state(root), before)
+            self.assertEqual(self.state(worktree), before_wt)
+
+    # ------------------------------------------------------------ a deploy that waits for CI
+    def test_a_deploy_on_workflow_run_of_ci_is_refused_on_the_first_commit_path(self):
+        _, _, head, tail = CI_BODIES[2]
+        for n, (form, run) in enumerate(REFUSED_RUNS):
+            deploy = deploy_after(run)
+            cases = [("ci.yml from the template", {DEPLOY: deploy}, False, ()),
+                     ("ci.yml rewritten", {DEPLOY: deploy, CI: head + OLD_ON + tail}, True, ()),
+                     ("ci.yml from the template, --dry-run", {DEPLOY: deploy}, True, ("--dry-run",)),
+                     ("ci.yml rewritten, --dry-run", {DEPLOY: deploy, CI: head + OLD_ON + tail}, False, ("--dry-run",))]
+            for m, (label, files, repo, extra) in enumerate(cases):
+                with self.subTest(workflows=form, case=label):
+                    root = self.project(f"refused{n}-{m}", files, repo=repo)
+                    self.assertRefused(root, "--stack", ("none", "python")[(n + m) % 2], *extra)
+
+    def test_a_deploy_on_workflow_run_of_ci_is_refused_on_the_adopt_path(self):
+        _, _, head, tail = CI_BODIES[1]
+        for n, (form, run) in enumerate(REFUSED_RUNS):
+            deploy = deploy_after(run)
+            cases = [("ci.yml rewritten", {DEPLOY: deploy, CI: head + OLD_ON + tail}, ()),
+                     ("ci.yml from the template", {DEPLOY: deploy}, ()),
+                     ("ci.yml rewritten, --dry-run", {DEPLOY: deploy, CI: head + OLD_ON + tail}, ("--dry-run",))]
+            for m, (label, files, extra) in enumerate(cases):
+                with self.subTest(workflows=form, case=label):
+                    root, worktree = self.adoptable(f"adopt-refused{n}-{m}", files, 70 + 3 * n + m)
+                    self.assertRefused(root, "--stack", "none", *extra, worktree=worktree)
+        with self.subTest(case="a scaffolded project whose only change would be the trigger"):
+            root, worktree = self.scaffolded("scaffolded-refused", {CI: CI_BODIES[0][2] + OLD_ON + CI_BODIES[0][3],
+                                                                    DEPLOY: deploy_after(REFUSED_RUNS[0][1])}, 190)
+            self.assertRefused(root, "--stack", "none", worktree=worktree)
+
+    def test_deploys_that_do_not_wait_for_ci_are_not_refused(self):
+        _, _, head, tail = CI_BODIES[1]
+        old, new = head + OLD_ON + tail, head + PR_ONLY_ON + tail
+        after_ci = deploy_after(REFUSED_RUNS[0][1])
+        cases = [("a deploy on push", {CI: old, DEPLOY: DEPLOY_ON_PUSH}, (), new, DEPLOY_ON_PUSH)]
+        cases += [(f"a workflow_run of {form}", {CI: old, DEPLOY: deploy_after(run)}, (), new, deploy_after(run))
+                  for form, run in OTHER_RUNS]
+        cases += [(f"CI outside a workflow_run trigger: {label}", {CI: old, DEPLOY: deploy}, (), new, deploy)
+                  for label, deploy in DEPLOY_LOOKALIKES]
+        cases += [("--no-ci", {CI: old, DEPLOY: after_ci}, ("--no-ci",), old, after_ci),
+                  ("--no-ci without a ci.yml", {DEPLOY: after_ci}, ("--no-ci",), None, after_ci)]
+        cases += [(f"a kept ci.yml: {label}", {CI: head + on + tail, DEPLOY: after_ci}, (), head + on + tail, after_ci)
+                  for label, on in (KEPT_ON[0], KEPT_ON[6])]
+        for n, (label, files, extra, ci, deploy) in enumerate(cases):
+            with self.subTest(case=label):
+                root = self.project(f"allowed{n}", files, repo=bool(n % 2))
+                self.ok("init", root, "--name", "proj", "--stack", "none", *extra)
+                if ci is None:
+                    self.assertFalse(os.path.exists(os.path.join(root, CI)))
+                else:
+                    self.assertEqual(self.raw(root, CI), ci.encode())
+                self.assertEqual(self.raw(root, DEPLOY), deploy.encode())
+        with self.subTest(case="--force replaces deploy.yml with the template's push on main"):
+            root = self.project("allowed-force", {CI: old, DEPLOY: after_ci})
+            p = self.ok("init", root, "--name", "proj", "--stack", "none", "--force")
+            self.assertIn(f"updated {DEPLOY}", self.lines(p))
+            self.assertEqual(self.read(root, DEPLOY), self.read(TEMPLATES, "deploy.yml"))
+            self.assertIn("push", on_triggers(self.read(root, DEPLOY)))
+            self.assertEqual(on_triggers(self.read(root, CI)), ["pull_request", "workflow_dispatch"])
 
 
 # =========================================================================== the python stack's own lint
