@@ -21,8 +21,9 @@ master or one that is not a plain existing branch (@{-1}, a missing one), anothe
 a reset after a branch switch in the same worktree, a reset, forced switch or path form whose
 target (the commit or tree-ish named; HEAD for a reset or forced switch naming none) would
 overwrite an untracked or ignored path (at, under or over a path it tracks), a clean after a
-move to another tree in the same worktree, or a failed git call. status, log, diff, show,
-rev-parse, stash list and a branch listing are harmless.
+move to another tree or a form that rewrites a tracked .gitignore in the same worktree, or after
+an rm of a .gitignore, or a failed git call. status, log, diff, show, rev-parse, stash list and a
+branch listing are harmless.
 
 No decision and no snapshot: plan mode; HARNESS_BACKUP=off (the environment first, then `env`
 in the main checkout's .claude/settings.json and settings.local.json); a command branch_guard
@@ -493,6 +494,27 @@ def overwrites(top, target):
     return False
 
 
+def rewrites_ignore(guard, sub, rest, where, target):
+    """Whether the reset or path form `sub rest`, run in `where`, writes or deletes a tracked .gitignore (root,
+    nested, deleted from disk or only staged) that differs on disk from what it writes there: `git diff` of its
+    source (`target`; None, the index) against the worktree, the whole tree for a reset or a branch switch, else
+    within its pathspec; for git rm, any tracked .gitignore within it. None when git cannot tell."""
+    if sub == "rm":
+        names = git(where, "ls-files", "-z", "--", *guard.git_paths(sub, rest, where), names=True)
+    else:
+        if sub in ("reset", "switch") or sub == "checkout" and not guard.checkout_paths(rest, where):
+            spec = []
+        elif sub == "checkout" and target is None and "--" not in rest:
+            spec = guard.plain_args(rest, guard.CHECKOUT_VALUE_OPTIONS)  # every word a path, as git_target reads it
+        else:
+            spec = guard.git_paths(sub, rest, where)  # a word too many (restore's -Ws X) only widens it
+        names = git(where, "diff", "--name-only", "-z", "--no-renames", "--no-relative", "--no-color",
+                    *([target] if target else []), "--", *spec, names=True)
+    if names is None:
+        return None
+    return any(name.rsplit("/", 1)[-1] == ".gitignore" for name in names)
+
+
 def git_keeps(guard, kept, forms, roots):
     """({(what, name): {what, name, sha, worktree}} of the refs the destroying git parts `kept` need, [the paths their
     git clean removes]); None when any of them cannot be kept: an unknown directory or word ($, a backtick, a brace
@@ -500,11 +522,13 @@ def git_keeps(guard, kept, forms, roots):
     that is not the main checkout or one of its worktrees, main or master deleted, a branch name that is not a plain
     existing branch (@{-1}, a missing one), a stash named otherwise than stash@{n} or n, a reset after a branch
     switch in the same worktree, an untracked or ignored path the target of a reset, checkout or switch overwrites
-    (`overwrites`), a clean after files are taken from another tree in the same worktree (its dry run reads the
-    ignore rules that replaces), two different shas for one ref, or a git call that fails. Each is judged against
+    (`overwrites`), a clean after files are taken from another tree, or after a part that puts back or takes away a
+    .gitignore (`rewrites_ignore`), in the same worktree (its dry run reads the ignore rules that replaces), two
+    different shas for one ref, or a git call that fails. Each is judged against
     the state before the command: HEAD and git stash create once per working tree, the stash list once, each drop
     taking its entry out of it."""
     keeps, clean, stack, cache, switched, moved, hits = {}, [], None, {}, set(), set(), {}
+    cleaning = any(forms[id(step[0])][0] == "clean" for step in kept)
 
     def once(top, *args):
         if (top, args) not in cache:
@@ -541,6 +565,9 @@ def git_keeps(guard, kept, forms, roots):
                 return None
             if tree != once(top, "rev-parse", "--verify", "-q", "HEAD^{tree}"):
                 moved.add(top)
+        if form in ("reset", "paths") and cleaning and top not in moved and (
+                rewrites_ignore(guard, sub, rest, where, target) is not False):
+            moved.add(top)  # it puts back or takes away a .gitignore a later clean's dry run reads as it is now
         if form == "reset" and not keep("head", None, once(top, "rev-parse", "--verify", "-q", "HEAD^{commit}"), top):
             return None
         if form in ("reset", "paths"):
@@ -821,16 +848,21 @@ def decide(data, command):
         return None
     if SUBSTITUTION.search(command) and any(step[1] in ("cd", "pushd", "popd") for step in parts):
         return None  # the walker runs what a substitution holds after the whole command, where its cds left it
+    cleans = [k for k, step in enumerate(parts) if forms.get(id(step[0]), (None,))[0] == "clean"]
     for part, name, args, here, xargs in removals:
         # ( after the words: a zsh glob qualifier or an extglob
         if here is None or not os.path.isdir(here) or xargs or part.sep == "(":
             return None
         words = operands(name, args)
+        at = next(k for k, step in enumerate(parts) if step[0] is part)
         for word in words:
             found = named_paths(word, here)
             if found is None:
                 return None
             paths += found
+            if any(k > at for k in cleans) and any(os.path.basename(p.rstrip("/")).lower() == ".gitignore"
+                                                   for p in found):
+                return None  # a later git clean's dry run reads the ignore rules this takes away
         # unlink and rmdir count as rm: where branch_guard refuses rm of the word, they get nothing either
         if name != "rm" and any(guard.bash_refusal("rm -- " + shlex.quote(w), here) for w in words if w):
             return None

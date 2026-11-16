@@ -150,6 +150,16 @@ Choices #328 leaves open, fixed here:
 - Ruling (finding 1): a git clean that follows a reset, checkout -f or switch to another commit in the same worktree
   in one command gets no decision and no snapshot (its dry run reads the ignore rules the reset replaces); a clean
   before the reset, or after a reset with no target, is backed up as before.
+- Ruling (fix round 2): a git clean after an earlier destructive part of the same command, in the same worktree,
+  that rewrites a .gitignore gets no decision and no snapshot or ref. Any .gitignore counts (the root one, a
+  nested one, one deleted from disk, a new one only staged) when what is on disk differs from what the form writes
+  there: HEAD for a reset (with no target or HEAD), the index for checkout or restore of paths without a tree-ish,
+  the tree-ish for `checkout HEAD -- p`. Pinned forms: `reset --hard [HEAD]`, `checkout -- .`, `checkout -- <its
+  folder or itself>`, `restore .`, `restore <it>`, `checkout HEAD -- <it>`. A path form whose pathspec leaves out
+  every differing .gitignore (`checkout -- src`, `restore src/app.py` with only the root one edited), a clean before
+  the form, the clean alone, and these forms when no .gitignore differs are backed up as before.
+- Ruling (fix round 2, low): the overwrite check reads the target in every spelling: `restore -s X`, `-WsX`,
+  `--so X`, `checkout X p` without `--`, `checkout -f X -- .`, `switch --detach -f X`, `reset --merge X`.
 - Ruling (finding 2): a branch name that is not a plain branch of refs/heads/ (`@{-1}`, `@{-2}`, quoted or not) or
   names none (a missing branch) gets no decision and no ref, for every branch of the part: `git branch -D <real>
   @{-1}` and `git branch -D <real> <missing>` keep nothing either (git deletes the real one before it fails).
@@ -2177,6 +2187,13 @@ class GitTargets(GitGate):
             (f"git switch --discard-changes {tgt}", wt, changes),
             ("git checkout {tc} -- {spec}", wt, changes),
             ("git restore --source={tc} {spec}", wt, changes),
+            ("git restore -s {tc} {spec}", wt, changes),                       # fix round 2, low: every spelling
+            ("git restore -Ws{tc} {spec}", wt, changes),
+            ("git restore --so {tc} {spec}", wt, changes),
+            ("git checkout {tc} {spec}", wt, changes),
+            ("git checkout -f {tc} -- .", wt, changes),
+            ("git switch --detach -f {tc}", wt, changes),
+            (f"git reset --merge {tgt}", wt, both),
         )
         for kind, (local, spec) in kinds.items():
             path = os.path.join(wt, local)
@@ -2254,6 +2271,112 @@ class GitTargets(GitGate):
         self.assertFalse(self.ignored(wt, log))
         self.git(wt, "clean", "-q", "-f", "-d")
         self.assertFalse(os.path.lexists(os.path.join(wt, log)), logged[:16])
+
+    def test_clean_after_a_form_that_puts_back_a_gitignore_gets_nothing(self):
+        """Fix round 2 on PR #361: a reset with no target, or a path form from the index or HEAD, puts back a
+        .gitignore the worktree has edited, so the clean after it removes what its dry run saw ignored."""
+        main = self.make_project()
+        wt = self.add_worktree(main, "t-1-x", "t/1-x")
+        sub = "sub-" + self.word()
+        self.put(os.path.join(wt, sub, ".gitignore"), data=b"*.bak\n")          # a nested tracked .gitignore
+        self.put(os.path.join(wt, sub, "keep.txt"), data=self.text())
+        self.git(wt, "add", "-A")
+        self.git(wt, "commit", "-q", "-m", "Nested ignore rules")
+        head = self.rev(wt)
+
+        def fresh():
+            """The worktree back at HEAD with nothing untracked; then a source edit, an untracked file and an ignored
+            one. Returns (the source edit, the untracked file)."""
+            self.git(wt, "reset", "-q", "--hard")
+            self.git(wt, "clean", "-q", "-f", "-d", "-x")
+            app = self.edit(wt, "src/app.py")
+            notes = os.path.join(wt, f"notes-{self.word()}.txt")
+            self.put(notes)
+            self.put(os.path.join(wt, f"scratch-{self.word()}.tmp"))
+            return app, notes
+
+        def append(rel, line):
+            path = os.path.join(wt, rel)
+            data = self.read(path) + line.encode() + b"\n"
+            self.put(path, data=data)
+            return data
+
+        def nothing(commands, why):
+            for command in commands:
+                with self.subTest(command=command, gitignore=why):
+                    before, refs, there = self.snapshots(), self.backup_refs(wt), self.state(wt)
+                    self.expect_none(self.run_gate(command, wt, main), before, refs, command, wt)
+                    self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
+
+        def allowed(cases, why):
+            for command, want, paths in cases:
+                with self.subTest(command=command, gitignore=why, allowed=True):
+                    before = self.snapshots()
+                    self.expect_refs(self.run_gate(command, wt, main), before, command, wt, wt, want, paths=paths)
+
+        def loses(commands, folder):
+            """One of `commands`, run by a real shell, removes `folder`, which git ignores before it runs."""
+            files = [os.path.join(folder, n) for n in os.listdir(os.path.join(wt, folder))]
+            self.assertTrue(files and all(self.ignored(wt, f) for f in files), f"{folder} is not ignored now")
+            command = self.rng.choice(commands)
+            argv = [SHELL, "-f", "-c", command] if os.path.basename(SHELL) == "zsh" else [SHELL, "-c", command]
+            subprocess.run(argv, cwd=wt, env=self.env(), capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+            self.assertFalse(os.path.lexists(os.path.join(wt, folder)), f"{command!r} left {folder} (seed {self.seed})")
+
+        def then_clean(forms):
+            return [f"{form} && git clean -fd" for form in forms]
+
+        # No .gitignore differs: the forms and the clean are backed up and allowed, as before.
+        app, notes = fresh()
+        mine = {("changes", None): self.changes_of(wt, head, {"src/app.py": app})}
+        allowed([(c, {**mine, **({("head", None): head} if "reset" in c else {})}, [notes])
+                 for c in then_clean(("git reset --hard", "git checkout -- .", "git restore .",
+                                      "git checkout -- .gitignore", "git checkout HEAD -- .gitignore"))], None)
+
+        # The root .gitignore edited to ignore a folder already on disk.
+        app, notes = fresh()
+        reports = "reports-" + self.word()
+        root = append(".gitignore", reports + "/")
+        self.fill(os.path.join(wt, reports), files=2)
+        forms = then_clean(("git reset --hard", "git reset --hard HEAD", "git checkout -- .", "git restore .",
+                            "git checkout -- .gitignore", "git restore .gitignore",
+                            "git checkout HEAD -- .gitignore"))
+        nothing(forms, "root, edited")
+        edits = {("changes", None): self.changes_of(wt, head, {"src/app.py": app, ".gitignore": root})}
+        allowed([("git checkout -- src && git clean -fd", edits, [notes]),        # the pathspec leaves it out
+                 ("git restore src/app.py && git clean -fd", edits, [notes]),
+                 ("git clean -fd && git reset --hard", {**edits, ("head", None): head}, [notes]),
+                 ("git clean -fd", {}, [notes])], "root, edited")
+        loses(forms, reports)
+
+        # A nested .gitignore edited the same way.
+        app, notes = fresh()
+        cache = f"{sub}/cache-{self.word()}"
+        append(f"{sub}/.gitignore", os.path.basename(cache) + "/")
+        self.fill(os.path.join(wt, cache), files=2)
+        forms = then_clean(("git reset --hard", "git checkout -- .", "git restore .", f"git checkout -- {sub}",
+                            f"git checkout -- {sub}/.gitignore", f"git restore {sub}/.gitignore",
+                            f"git checkout HEAD -- {sub}/.gitignore"))
+        nothing(forms, "nested, edited")
+        loses(forms, cache)
+
+        # A new .gitignore, only staged: the reset takes it away.
+        app, notes = fresh()
+        gen = "gen-" + self.word()
+        out = f"{gen}/out-{self.word()}"
+        self.put(os.path.join(wt, gen, ".gitignore"), data=(os.path.basename(out) + "/\n").encode())
+        self.git(wt, "add", "--", f"{gen}/.gitignore")
+        self.fill(os.path.join(wt, out), files=2)
+        forms = then_clean(("git reset --hard", "git reset --hard HEAD"))
+        nothing(forms, "new, staged")
+        loses(forms, out)
+
+        # A tracked nested .gitignore deleted from disk: each form writes it back.
+        app, notes = fresh()
+        os.unlink(os.path.join(wt, sub, ".gitignore"))
+        nothing(then_clean(("git reset --hard", "git checkout -- .", "git restore .",
+                            f"git checkout -- {sub}/.gitignore", f"git restore {sub}/.gitignore",
+                            f"git checkout HEAD -- {sub}/.gitignore")), "nested, deleted")
 
 
 class GitBranchNames(GitGate):
