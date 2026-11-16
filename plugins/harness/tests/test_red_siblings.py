@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -54,6 +55,14 @@ def mark():
 def new_dir(prefix):
     """A test directory name no implementation can know (a valid identifier: unittest imports it as a package)."""
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+
+def path_dirs(cmd):
+    """The directories a command's `PYTHONPATH=<dirs>` names, normalised; [] when it sets none."""
+    found = re.search(r"PYTHONPATH=((?:'[^']*'|\"[^\"]*\"|[^\s$'\"])+)", cmd)
+    if not found:
+        return []
+    return [os.path.normpath(d) for d in "".join(shlex.split(found.group(1))).split(os.pathsep) if d]
 
 
 def module_text(imports, mark_expr, a, b):
@@ -305,6 +314,53 @@ class SiblingImports(unittest.TestCase):
             self.assertEqual(p.returncode, 0, said)
             self.assertIn("own tests: 1 files, exit 0", p.stdout.splitlines(), said)
 
+    def test_the_default_command_never_puts_a_package_directory_on_the_path(self):
+        # The directory put on the path for a run file is the first one upward without an `__init__.py` (pytest's
+        # rootdir rule). A package directory's modules would shadow the standard library (`pkg/json.py` over json)
+        # and are reachable by their package path anyway; a test in a package under tests/ gets tests/ itself, so
+        # a support module in that parent directory imports by its bare name (PR #371 review).
+        m, n, d = mark(), mark(), new_dir("unit")
+        shadow = "raise RuntimeError('the package directory is on the path')\n"
+        cases = [
+            # (name, the branch's files, source the branch starts from, failures, directories never on the path)
+            ("a test in a package at the root: the standard library and a sibling by package path",
+             {"pkg/test_x.py": module_text(["import json", "from pkg import mod, x_support"],
+                                           "json.dumps([mod.VALUE]) + ' ' + x_support.MARK", 2, 3)},
+             {"pkg/json.py": shadow, "pkg/x_support.py": f"MARK = {m!r}\n"}, [(f"[1] {m}", 5)], ["pkg"]),
+            ("a test in a package under tests/: a support module of the parent directory",
+             {f"tests/{d}/__init__.py": "",
+              f"tests/{d}/test_y.py": module_text(["import x_support"], "x_support.MARK", 4, 6)},
+             {"tests/x_support.py": f"MARK = {n!r}\n"}, [(n, 10)], [f"tests/{d}"]),
+        ]
+        for name, files, base, failures, never in cases:
+            with self.subTest(name):
+                wt, record, _ = self.worktree(files, False, base)
+                tests = sorted(files)
+                run_files = sorted(f for f in files if os.path.basename(f).startswith("test_"))
+                p = self.red(wt, "check")
+                said = p.stdout + p.stderr
+                self.assertEqual(p.returncode, 0, said)
+                self.assertEqual(p.stdout.splitlines()[0], f"red (assertion): {len(tests)} test files, exit 1", said)
+                rec = self.load(record)
+                self.assertEqual((rec["kind"], rec["exit"]), ("assertion", 1), said)
+                self.assertEqual((rec["test_files"], rec["run_files"]), (tests, run_files))
+                self.assertNotIn("No module named", rec["tail"], said)
+                self.assertNotIn("the package directory is on the path", rec["tail"], said)
+                for value, want in failures:                   # the real standard library, the support module
+                    self.assertIn(f"None != {want} : {value}", rec["tail"], said)
+                self.assertIn("-m unittest", rec["cmd"])
+                for f in run_files:
+                    self.assertIn(f, rec["cmd"])
+                for directory in never:
+                    self.assertNotIn(os.path.normpath(directory), path_dirs(rec["cmd"]), rec["cmd"])
+
+                write(os.path.join(wt, "calc.py"), CALC_BUILT)
+                p = self.red(wt, "run")
+                said = p.stdout + p.stderr
+                self.assertEqual(p.returncode, 0, said)
+                self.assertIn(f"own tests: {len(run_files)} files, exit 0", p.stdout.splitlines(), said)
+                self.assertNotIn("the package directory is on the path", said)
+
     # ------------------------------------------------------------ DoD 2: never red on a module the worktree has
     def test_a_real_run_failing_on_an_existing_sibling_is_never_recorded_as_red(self):
         # The reported case, with a command the user set (so no default of harness-red's own applies): plain
@@ -383,6 +439,20 @@ class SiblingImports(unittest.TestCase):
             ("dotted: a sibling package's module on the base", "tests/test_x.py", {}, False,
              unittest_import_error("test_x", "helpers.db"), 1, REFUSED,
              {"tests/helpers/__init__.py": "", "tests/helpers/db.py": "M = 1\n"}),
+            # a module in an ancestor directory of the run file, between it and the root (PR #371 review): the
+            # worktree has it, whether or not the test's own directory is a package
+            ("a module in the parent tests directory, the test in a package", f"tests/{d}/test_y.py",
+             {f"tests/{d}/__init__.py": "", "tests/y_support.py": "M = 1\n"}, False,
+             unittest_import_error("test_y", "y_support"), 1, REFUSED),
+            ("a module in the parent tests directory, the test in a plain directory", f"tests/{d}/test_y.py",
+             {"tests/y_support.py": "M = 1\n"}, False, unittest_import_error("test_y", "y_support"), 1, REFUSED),
+            ("a module in the parent tests directory on the base, the test in a package", f"tests/{d}/test_y.py",
+             {f"tests/{d}/__init__.py": ""}, False, unittest_import_error("test_y", "y_support"), 1, REFUSED,
+             {"tests/y_support.py": "M = 1\n"}),
+            # ruling: a bare-name sibling inside a package directory (pkg/x_support.py beside pkg/test_x.py, which
+            # the right command reaches only as pkg.x_support) exists in the worktree, so the run proves nothing
+            ("a sibling inside a package directory at the root, by its bare name", "pkg/test_x.py", {}, False,
+             x_support, 1, REFUSED, {"pkg/x_support.py": "MARK = 1\n"}),
             ("the module under test, not written yet", "tests/test_x.py", {}, False,
              unittest_import_error("test_x", "slugify_text"), 1, "import"),
             ("the sibling's name, but no such file", "tests/test_x.py", {}, False, x_support, 1, "import"),

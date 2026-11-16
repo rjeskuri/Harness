@@ -118,12 +118,27 @@ def read_text(path):
         return ""
 
 
-def unittest_cmd(files):
-    """`python3 -m unittest {files}` with the test files' directories (only those, in order) first on PYTHONPATH and an
-    inherited PYTHONPATH after them, as `unittest discover -s <dir>` has them, so a test module imports its sibling
-    support module (#346). The directories are relative, so the command serves the worktree, reprove's temporary
-    worktree and the scratch copy alike."""
-    dirs = list(dict.fromkeys(f.rsplit("/", 1)[0] if "/" in f else "." for f in files))
+def parent_dir(path):
+    return path.rsplit("/", 1)[0] if "/" in path else "."
+
+
+def path_dir(root, file):
+    """The directory the default unittest command puts on PYTHONPATH for a test file under `root`: the first one
+    upward from the file's own directory without an `__init__.py` (pytest's rootdir rule), `.` at the root. A package
+    directory is never added: its modules would shadow the standard library (`pkg/json.py` over json) and are
+    reachable by their package path anyway."""
+    d = parent_dir(file)
+    while d != "." and os.path.isfile(os.path.join(root, d, "__init__.py")):
+        d = parent_dir(d)
+    return d
+
+
+def unittest_cmd(root, files):
+    """`python3 -m unittest {files}` with each test file's path directory (path_dir; only those, deduplicated, in
+    order) first on PYTHONPATH and an inherited PYTHONPATH after them, as `unittest discover -s <dir>` has them, so a
+    test module imports its sibling support module (#346). The directories are relative, so the command serves the
+    worktree, reprove's temporary worktree and the scratch copy alike."""
+    dirs = list(dict.fromkeys(path_dir(root, f) for f in files))
     return f"PYTHONPATH={shlex.quote(os.pathsep.join(dirs))}${{PYTHONPATH:+:$PYTHONPATH}} python3 -m unittest {{files}}"
 
 
@@ -136,7 +151,7 @@ def detect_test_cmd(root, files):
         if any("pytest" in read_text(os.path.join(root, cfg)) for cfg in ("pyproject.toml", "pytest.ini")):
             return "python3 -m pytest -q {files}"
     if any(fnmatch.fnmatch(n, "test_*.py") or fnmatch.fnmatch(n, "*_test.py") for n in names):
-        return unittest_cmd(files)
+        return unittest_cmd(root, files)
     try:
         with open(os.path.join(root, "package.json"), encoding="utf-8") as fh:
             scripts = json.load(fh).get("scripts")
@@ -223,8 +238,9 @@ class Repo:
         project's session."""
         return project_setting(name, self.env, self.foreign)
 
-    def test_command(self, files):
-        cmd = self.worktree_setting("HARNESS_TEST_CMD") or detect_test_cmd(self.top, files)
+    def test_command(self, files, root=None):
+        """The command for `files`, detected against `root`, the tree the run happens in (default the worktree)."""
+        cmd = self.worktree_setting("HARNESS_TEST_CMD") or detect_test_cmd(root or self.top, files)
         if not cmd:
             raise Problem("no test command for these files: set HARNESS_TEST_CMD under env in "
                           ".claude/settings.json ({files} becomes the test files)")
@@ -364,7 +380,7 @@ def cannot_start(output):
 
 def run_tests(repo, files, cwd):
     """(cmd, exit, output, timed out) for the test files run in `cwd`; refuses a command that cannot start."""
-    cmd = repo.test_command(files)
+    cmd = repo.test_command(files, cwd)
     timeout = test_timeout(repo.env, repo.foreign)
     try:
         code, output = run_command(cmd, cwd, timeout)
@@ -504,11 +520,16 @@ def print_refused(args, why, tests, cmd, code, output):
 
 def present_modules(cwd, run_files, output):
     """[(module, path)]: the python modules a failed run in `cwd` could not import that exist there by their whole
-    dotted path, beside a test file run (its own directory) or at the repository root, as a module (`x/y.py`) or a
-    package (`x/y/__init__.py`). The command could not see them, so the run proves nothing (#346). A module that
-    exists nowhere there, the code under test not written yet, is the usual red; one elsewhere (a directory holding
-    no run file) is not the tests' sibling and does not count."""
-    dirs = list(dict.fromkeys(f.rsplit("/", 1)[0] if "/" in f else "" for f in run_files)) + [""]
+    dotted path, beside a test file run (its own directory, a package or not), in any directory between that one and
+    the repository root (`tests/` for `tests/unit/test_y.py`) or at the root, as a module (`x/y.py`) or a package
+    (`x/y/__init__.py`). The command could not see them, so the run proves nothing (#346). A module that exists
+    nowhere there, the code under test not written yet, is the usual red; one elsewhere (a directory holding no run
+    file and above none) is not the tests' sibling and does not count."""
+    dirs = []
+    for f in run_files:
+        parts = f.split("/")[:-1]
+        dirs.extend("/".join(parts[:n]) for n in range(len(parts), 0, -1))
+    dirs = list(dict.fromkeys(dirs)) + [""]
     found = []
     for name in dict.fromkeys(m[0] for m in MISSING_NAME_RE.findall(output) if PY_MODULE_NAME_RE.match(m[0])):
         for d in dirs:
@@ -539,8 +560,9 @@ def run_red(repo, args, tests, run_files, cwd, again):
         print_refused(args, "cannot import " + names, tests, cmd, code, output)
         raise Problem(f"no red run recorded: the run could not import {names}, which its worktree has "
                       f"({present[0][1]}), so the test command cannot see the tests' own modules (exit {code}); set "
-                      "HARNESS_TEST_CMD to put the test files' directories on the import path (the detected "
-                      f"default does), then run harness-red {again} again.")
+                      "HARNESS_TEST_CMD to put the directory the tests import from on the import path (the detected "
+                      f"default puts the first one above each test file without an __init__.py), then run "
+                      f"harness-red {again} again.")
     return cmd, code, output
 
 
