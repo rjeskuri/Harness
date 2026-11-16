@@ -753,6 +753,12 @@ class GlobMatchTests(unittest.TestCase):
 # ================================================================ nested tests/ directories (#348)
 
 
+def generated(n: int) -> str:
+    """`n` directory names made up for this run, /-joined ("" for none): "d" and hex digits, so no test pattern
+    matches one by its name, and no list written in advance can name them."""
+    return "/".join("d" + uuid.uuid4().hex[:10] for _ in range(n))
+
+
 class DefaultTestPatternsReachNestedTestsTests(unittest.TestCase):
     """#348: under the lib's default patterns (a project that sets no HARNESS_TEST_PATTERNS) every file below a
     tests/ directory, at any depth and whatever its name, is a test: a support module or fake beside the test modules
@@ -786,6 +792,10 @@ class DefaultTestPatternsReachNestedTestsTests(unittest.TestCase):
             "svc/api/tests/fixtures/rows.json",  # a test before the exempt **/*.json
             "svc/api/tests/README.md",  # and before **/*.md
         ]
+        # parents no list can know: made up for this run, 1 to 9 directories above tests/ and 0 to 3 below it
+        names = ("x.py", "fakegh.py", f"{generated(1)}_support.py", f"{generated(1)}.json", "README.md", "setup.mjs")
+        for k, (above, below) in enumerate((a, b) for a in (1, 2, 4, 6, 9) for b in (0, 1, 2, 3)):
+            cases.append("/".join(p for p in (generated(above), "tests", generated(below), names[k % 6]) if p))
         for rel in cases:
             with self.subTest(rel=rel):
                 self.assertEqual(self.kind(rel), "test")
@@ -805,6 +815,13 @@ class DefaultTestPatternsReachNestedTestsTests(unittest.TestCase):
             ("pkg/tests.py", "source"),
             ("pkg/testsuite/notes.md", "exempt"),
             ("plugins/harness/templates/settings.json", "exempt"),
+            # the same under parents made up for this run
+            (f"{generated(1)}/testsuite/{generated(1)}_support.py", "source"),
+            (f"{generated(2)}/tests_helper.py", "source"),
+            (f"{generated(3)}/{generated(1)}_support.py", "source"),
+            (f"{generated(2)}/fakegh.py", "source"),
+            (f"{generated(1)}/{generated(1)}tests/x.py", "source"),
+            (f"{generated(4)}/testsuite/notes.md", "exempt"),
         ]:
             with self.subTest(rel=rel):
                 self.assertEqual(self.kind(rel), want)

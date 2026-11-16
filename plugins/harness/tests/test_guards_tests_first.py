@@ -17,8 +17,14 @@ NO_KIND = (
     "The red record for t/12 does not say how the tests failed; run harness-red check "
     "again, or harness-red reprove once the branch has source changes."
 )
+def generated(n: int) -> str:
+    """`n` directory names made up for this run, /-joined: "d" and hex digits, so no test pattern matches one by its
+    name, and no list written in advance can name them."""
+    return "/".join("d" + uuid.uuid4().hex[:10] for _ in range(n))
+
+
 # #348: files below a tests/ directory under the top (support modules, fakes, helpers, fixtures), Harness's own
-# layout first. Under the default patterns each is a test.
+# layout first, then parents made up for this run. Under the default patterns each is a test.
 NESTED_TESTS = (
     "plugins/harness/tests/pr_support.py",
     "plugins/harness/tests/guards_support.py",
@@ -27,6 +33,8 @@ NESTED_TESTS = (
     "pkg/tests/fakegh.py",
     "svc/api/tests/helpers/builders.py",
     "svc/api/tests/fixtures/rows.json",
+    f"{generated(1)}/tests/fakegh.py",
+    f"{generated(3)}/tests/{generated(2)}/y_support.py",
 )
 # Source outside every tests/ directory, whatever the name says: a _support.py or a fakegh.py elsewhere included.
 NOT_UNDER_TESTS = (
@@ -36,6 +44,9 @@ NOT_UNDER_TESTS = (
     "pkg/testsuite/x_support.py",
     "pkg/tests_helper.py",
     "src/compat_support.py",
+    f"{generated(2)}/testsuite/x_support.py",
+    f"{generated(1)}/tests_helper.py",
+    f"{generated(3)}/{generated(1)}_support.py",
 )
 # This checkout: its tracked settings and its own support modules and fake, by their real names.
 CHECKOUT = HOOKS.parent.parent.parent
@@ -1043,12 +1054,13 @@ class TestsFirstTests(GuardTestCase):
                 self.assertIsNone(self.edit(rel, "harness:coder"))
 
     def test_bulk_forms_reach_test_files_under_nested_tests_directories(self):
-        # no test_*.py and no root tests/: the only tests are a support module and a fake below tests/ directories
+        # no test_*.py and no root tests/: the only tests are a fake and a support module below tests/ directories
+        # whose parents are made up for this run
         files = {
             "README.md": "hi\n",
             "plugins/harness/bin/tool": "echo tool\n",
-            "plugins/harness/tests/fakegh.py": "ANSWERS = []\n",
-            "pkg/tests/x_support.py": "WIDTH = 3\n",
+            f"{generated(1)}/tests/fakegh.py": "ANSWERS = []\n",
+            f"{generated(2)}/tests/{generated(1)}/x_support.py": "WIDTH = 3\n",
         }
         wt = self.other_ticket_worktree("nested", files)  # a no-tests chore: only the role rules refuse
         for command in ("git stash", "git reset --hard", "git checkout -- .", "git restore .", "git clean -fd"):

@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from importlib.machinery import SourceFileLoader
 from unittest import mock
 
@@ -171,6 +172,12 @@ def moved_to_end(text, block):
 def line_moved_into(text, line, anchor):
     """`text` with `line` taken out of its test and put after `anchor`, in another one."""
     return once(once(text, line, ""), anchor, anchor + line)
+
+
+def generated(n):
+    """`n` directory names made up for this run, /-joined: "d" and hex digits, so no test pattern matches one by its
+    name, and no list written in advance can name them (#348)."""
+    return "/".join("d" + uuid.uuid4().hex[:10] for _ in range(n))
 
 
 def expected_hash(root, files):
@@ -908,15 +915,19 @@ exit 254
             "svc/api/tests/x_support.py": "ROWS = 2\n",
             "svc/api/tests/helpers/builders.py": "def build():\n    return 1\n",
             "svc/api/tests/fixtures/rows.json": "[1, 2]\n",
+            f"{generated(1)}/lib/tests/z_support.py": "DEPTH = 2\n",          # parents made up for this run
+            f"{generated(4)}/tests/{generated(2)}/fakegh.py": "ANSWERS = [1]\n",
         }, ["plugins/harness/tests/test_widget.py"])
 
     def test_source_outside_tests_directories_is_still_refused_before_the_red_run(self):
         for rel, text in (("pkg/tests/test_widget.py", TEST_ADD), ("pkg/tests/widget_support.py", "WIDTH = 3\n"),
-                          ("pkg/tests/fakegh.py", "ANSWERS = []\n")):
+                          ("pkg/tests/fakegh.py", "ANSWERS = []\n"),
+                          (f"{generated(2)}/tests/{generated(1)}/y_support.py", "ROWS = 1\n")):
             self.put(rel, text)
         # the name alone (a _support.py, a fakegh.py, "tests" in a file or directory name) is no test
         sources = ["pkg/fakegh.py", "pkg/testsuite/x_support.py", "pkg/tests_helper.py",
-                   "plugins/harness/lib/harness_lib/x_support.py", "src/compat_support.py"]
+                   "plugins/harness/lib/harness_lib/x_support.py", "src/compat_support.py",
+                   f"{generated(2)}/testsuite/x_support.py", f"{generated(1)}/tests_helper.py"]
         for rel in sources:
             self.put(rel, "X = 1\n")
         p = self.red("check", **self.fake_runner(self.NESTED_RED, 1))
