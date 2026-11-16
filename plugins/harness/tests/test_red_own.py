@@ -756,7 +756,8 @@ class ClaimedSpareEnv(Repos, unittest.TestCase):
                 record = json.loads(p.stdout)
                 if expect is None:            # the detected default, red on the failing assertion
                     self.assertEqual(calls, [], f"a recorded command ran, not the detected default: {said}")
-                    self.assertEqual(record["cmd"], "python3 -m unittest tests/test_models.py", said)
+                    # it may also put the test directories on the import path (#346)
+                    self.assertRegex(record["cmd"], r"python3 -m unittest .*tests/test_models\.py", said)
                     self.assertEqual(record["kind"], "assertion", said)
                 else:
                     self.assertEqual(calls, [[expect, "tests/test_models.py"]], said)
