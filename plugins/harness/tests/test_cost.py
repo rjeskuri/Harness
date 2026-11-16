@@ -1085,12 +1085,13 @@ class CostExtras(CostBase):
         files = default_kind_files()
         self.assertEqual([len(p) for p in file_pages(files)], [100, 23], "fixture: two pages")
         self.assertNotEqual(lines_of(files), lines_of(files[:100]), "fixture: the second page counts")
-        # parents made up for this run (#348): 1 to 12 directories in mixed shapes (a real project's name, hex after
-        # any letter or a digit), then a real name right above tests/; no list or shape written in advance names them
+        # parents made up for this run (#348): 15 to 40 directories in mixed shapes (a real project's name, hex after
+        # any letter or a digit), then a real name right above tests/; no list, shape or fixed depth written in
+        # advance names them
         made_up = "/".join(random.choice((random.choice(("src", "app", "lib", "services", "core")),
                                           random.choice(string.ascii_letters) + uuid.uuid4().hex[:8],
                                           random.choice(string.digits) + uuid.uuid4().hex[:6]))
-                           for _ in range(random.randint(1, 12))) + "/" + random.choice(("src", "app", "lib", "api"))
+                           for _ in range(random.randint(15, 40))) + "/" + random.choice(("src", "app", "lib", "api"))
         small = [("README.md", 5, 1, "other"), ("plugins/harness/lib/gh.py", 7, 2, "source"),
                  ("plugins/harness/tests/fakegh.py", 4, 3, "test"),         # below a tests/ directory (#348)
                  (f"{made_up}/tests/q_support.py", 6, 1, "test"),

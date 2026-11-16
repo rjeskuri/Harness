@@ -65,7 +65,7 @@ NESTED_TESTS = (
     f"{generated(3)}/tests/{generated(2)}/y_support.py",
     f"{real_parent()}/tests/x_support.py",  # a real name right above tests/
     f"{generated(1)}/{real_parent()}/tests/{generated(1)}/fakegh.py",
-    f"{generated(13)}/tests/deep_support.py",  # deeper than a depth-by-depth list goes
+    f"{generated(random.randint(15, 40))}/tests/deep_support.py",  # a depth drawn per run, past any fixed list
 )
 # Source outside every tests/ directory, whatever the name says: a _support.py or a fakegh.py elsewhere included.
 NOT_UNDER_TESTS = (
@@ -1068,9 +1068,9 @@ class TestsFirstTests(GuardTestCase):
                     self.assertEqual(self.change(tool, rel, "harness:coder"), CODER_ON_TEST)
             with self.subTest(rel=rel, agent="harness:test-breaker"):
                 self.assertEqual(self.change("Edit", rel, "harness:test-breaker"), BREAKER_ON_TEST)
-            command = f"echo x > {rel}"
+            command = f"echo x > {rel}"  # the deep path can cross the shown limit: the denial cuts it as as_shown does
             with self.subTest(rel=rel, tool="Bash"):
-                self.assertEqual(self.bash(command, "harness:coder"), refusal(command, CODER_ON_TEST))
+                self.assertEqual(self.bash(command, "harness:coder"), refusal(as_shown(command), CODER_ON_TEST))
 
     def test_nested_test_files_need_no_red_run_and_source_elsewhere_still_does(self):
         self.cache()

@@ -943,7 +943,7 @@ exit 254
             "svc/api/tests/helpers/builders.py": "def build():\n    return 1\n",
             "svc/api/tests/fixtures/rows.json": "[1, 2]\n",
             f"{generated(1)}/{real_parent()}/tests/z_support.py": "DEPTH = 2\n",   # parents made up for this run
-            f"{generated(12)}/tests/{generated(2)}/fakegh.py": "ANSWERS = [1]\n",   # deeper than a list goes
+            f"{generated(random.randint(15, 40))}/tests/{generated(2)}/fakegh.py": "ANSWERS = [1]\n",  # depth per run
             f"{real_parent()}/tests/w_support.py": "COLS = 4\n",                 # a real name right above tests/
         }, ["plugins/harness/tests/test_widget.py"])
 

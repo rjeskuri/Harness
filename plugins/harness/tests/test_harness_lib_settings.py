@@ -859,6 +859,25 @@ class DefaultTestPatternsReachNestedTestsTests(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertEqual(self.kind(rel), want)
 
+    def test_a_tests_directory_makes_tests_at_every_depth(self):
+        # Depth is not a dimension of the rule: a tests/ directory 0 to 64 parents down (made up for this run, in
+        # mixed shapes) makes every file below it a test, and the same parents without a tests/ directory leave a
+        # file source (or exempt by its suffix), so no list of fixed depths and no catch-all passes. In-process:
+        # 65 depths cost nothing.
+        tails = ("x_support.py", "fakegh.py", f"{generated(1)}/helpers.py", "fixtures/rows.json")
+        for depth in range(65):
+            parents = generated(depth)
+            tail = tails[depth % len(tails)]
+            under_tests = "/".join(p for p in (parents, "tests", tail) if p)
+            beside_tests = "/".join(p for p in (parents, "testsuite", tail) if p)
+            no_tests = "/".join(p for p in (parents, f"{generated(1)}_support.py") if p)
+            with self.subTest(depth=depth, rel=under_tests):
+                self.assertEqual(self.kind(under_tests), "test")
+            with self.subTest(depth=depth, rel=beside_tests):
+                self.assertEqual(self.kind(beside_tests), "exempt" if tail.endswith(".json") else "source")
+            with self.subTest(depth=depth, rel=no_tests):
+                self.assertEqual(self.kind(no_tests), "source")
+
 
 # ================================================================ one copy
 
