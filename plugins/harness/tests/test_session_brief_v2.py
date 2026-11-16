@@ -1,10 +1,16 @@
 """Tests for the v2 additions to session_brief.py: the ticket lines on a t/<N>-... branch
-(from the ticket cache and red record only), the board line from gh, and the budget line.
+(from the ticket cache and red record only), the board line from gh, the budget line, and
+the backup sweep at SessionStart (ticket #329).
 
 The hook runs as a subprocess, fed SessionStart JSON, under a temporary HOME, in
 temporary git repos made with `git init -b main`. gh is fakegh.py copied onto a private
 PATH as `gh`, driven by a scenario file and logging every call; nothing touches the
-network or ~/.claude.
+network or ~/.claude. The sweep tests run the hook the way hooks.json wires it (its
+command and args, ${CLAUDE_PLUGIN_ROOT} filled in, its timeout); the snapshots are folders
+written in backups.py's layout with an id of the age wanted, the refs made with
+`git update-ref`. A git that hangs for every call the brief itself does not make stands
+in for a sweep that overruns; the brief is compared whole, its last commit dated long
+ago so that its age reads the same on every run.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_session_brief_v2.py" -v
 """
@@ -15,6 +21,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,11 +58,42 @@ PRS = [
 ]
 BOARD = "Board: 2 ready, 1 in progress, 1 awaiting your review, 1 needs input"
 
+PLUGIN_ROOT = TESTS.parent
+HOOKS_JSON = PLUGIN_ROOT / "hooks" / "hooks.json"
+DAY = dt.timedelta(days=1)
+LONG_AGO = "2015-06-15T12:00:00+0000"  # `last commit 11 years ago` on every run
+SWEEP_BUDGET = 2  # seconds the brief gives the sweep (ticket #329)
+TIMING_MARGIN = 4  # seconds on top, for a slow CI machine
+REAL_GIT = shutil.which("git", path=SYSTEM_PATH) or "/usr/bin/git"
+# git for the calls the brief makes itself (rev-parse --show-toplevel, status, log, remote);
+# any other call, the sweep's, is logged and hangs.
+HANGING_GIT = """#!/bin/sh
+sub=""
+skip=""
+for a in "$@"; do
+  if [ -n "$skip" ]; then skip=""; continue; fi
+  case "$a" in
+    -C|-c) skip=1 ;;
+    -*) ;;
+    *) sub="$a"; break ;;
+  esac
+done
+case "$sub" in
+  status|log|remote) exec "@GIT@" "$@" ;;
+  rev-parse)
+    for a in "$@"; do
+      if [ "$a" = "--show-toplevel" ]; then exec "@GIT@" "$@"; fi
+    done ;;
+esac
+if [ -n "$HANG_LOG" ]; then echo "$*" >> "$HANG_LOG"; fi
+exec sleep 20
+"""
+
 _SHARED: dict = {}
 
 
 def setUpModule() -> None:
-    """One copy of each fake gh for every test: a new executable costs time on macOS."""
+    """One copy of each fake gh and git for every test: a new executable costs time on macOS."""
     base = Path(tempfile.mkdtemp(prefix="harness-brief2-shared-")).resolve()
     _SHARED["base"] = base
     _SHARED["pycache"] = str(base / "pycache")
@@ -71,6 +109,10 @@ def setUpModule() -> None:
             gh.write_text(source)
         gh.chmod(0o755)
     (base / "bin-none").mkdir()
+    (base / "bin-hang").mkdir()
+    git = base / "bin-hang" / "git"
+    git.write_text(HANGING_GIT.replace("@GIT@", REAL_GIT))
+    git.chmod(0o755)
 
 
 def tearDownModule() -> None:
@@ -381,6 +423,230 @@ class BriefV2Tests(unittest.TestCase):
         self.assertEqual(len(lines), 40)
         self.assertTrue(lines[0].startswith("## Session brief: wt on t/12-fix-login"))
         self.assertEqual(lines[1], "Ticket #12: Fix login (in-progress, tier opus)")
+
+    # ---- the backup sweep (#329)
+
+    def session_start(
+        self, cwd: Path, source: str = "startup", env: dict | None = None
+    ) -> tuple[dict, float]:
+        """The SessionStart hook run as hooks.json wires it for `source`, killed at its timeout;
+        (hookSpecificOutput, seconds it took). It must exit 0 and print nothing on stderr."""
+        config = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
+        hooks = [
+            hook
+            for group in config["hooks"]["SessionStart"]
+            if re.fullmatch(group.get("matcher") or ".*", source)
+            for hook in group["hooks"]
+            if any("session_brief.py" in arg for arg in hook.get("args", []))
+        ]
+        self.assertEqual(len(hooks), 1, f"hooks.json runs session_brief.py once on {source}")
+        hook = hooks[0]
+        argv = [hook["command"]] + [
+            arg.replace("${CLAUDE_PLUGIN_ROOT}", str(PLUGIN_ROOT)) for arg in hook["args"]
+        ]
+        if argv[0] == "python3":
+            argv[0] = sys.executable  # the suite's python3 stands in for the one on PATH
+        payload = {
+            "session_id": "sess-1",
+            "transcript_path": "/dev/null",
+            "cwd": str(cwd),
+            "permission_mode": "default",
+            "hook_event_name": "SessionStart",
+            "source": source,
+        }
+        run_env = dict(
+            self.env, CLAUDE_PLUGIN_ROOT=str(PLUGIN_ROOT), CLAUDE_PROJECT_DIR=str(cwd)
+        )
+        run_env.update(env or {})
+        started = time.monotonic()
+        r = subprocess.run(
+            argv,
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=run_env,
+            cwd=str(self.tmp),
+            timeout=hook["timeout"],
+        )
+        took = time.monotonic() - started
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        out = json.loads(r.stdout)["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "SessionStart")
+        return out, took
+
+    def global_store(self) -> Path:
+        return self.home / ".claude/harness/backups"
+
+    @staticmethod
+    def project_store(repo: Path) -> Path:
+        return repo / ".git/harness-backups"
+
+    @staticmethod
+    def backup_id(when: dt.datetime) -> str:
+        return f"{when.strftime('%Y%m%dT%H%M%SZ')}-{os.urandom(3).hex()}"
+
+    def snapshot(self, store: Path, age: dt.timedelta, repo: Path | None) -> str:
+        """A snapshot folder in backups.py's layout whose id is `age` old; its id."""
+        when = dt.datetime.now(dt.timezone.utc) - age
+        sid = self.backup_id(when)
+        store.mkdir(parents=True, exist_ok=True)
+        store.chmod(0o700)
+        folder = store / sid
+        (folder / "files").mkdir(mode=0o700, parents=True)
+        (folder / "files" / "0").write_bytes(os.urandom(64))
+        where = str(repo or self.tmp)
+        manifest = {
+            "id": sid,
+            "at": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "repo": str(repo) if repo else None,
+            "cwd": where,
+            "command": "rm -rf build",
+            "session": "sess-0",
+            "sensitive": False,
+            "items": [
+                {"path": f"{where}/build", "copy": "files/0", "kind": "file", "bytes": 64}
+            ],
+            "refs": [],
+        }
+        (folder / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return sid
+
+    def backup_ref(self, repo: Path, age: dt.timedelta) -> str:
+        when = dt.datetime.now(dt.timezone.utc) - age
+        name = f"refs/harness-backup/{self.backup_id(when)}/0"
+        self.git(repo, "update-ref", name, "HEAD")
+        return name
+
+    def refs(self, repo: Path) -> set[str]:
+        return set(self.git(repo, "for-each-ref", "--format=%(refname)").splitlines())
+
+    @staticmethod
+    def listing(store: Path) -> set[str]:
+        return set(os.listdir(store)) if store.is_dir() else set()
+
+    def pin_commit_date(self, repo: Path) -> None:
+        """The last commit dated long ago, so the heading's commit age reads the same every run."""
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "--amend", "--no-edit", "-q"],
+            check=True,
+            capture_output=True,
+            env=dict(self.env, GIT_AUTHOR_DATE=LONG_AGO, GIT_COMMITTER_DATE=LONG_AGO),
+        )
+
+    def test_session_start_sweeps_old_backups(self):
+        other = self.make_repo("other")
+        vault = self.make_repo("vault")  # a sensitive project: its snapshots stay in it
+        self.write(
+            vault / ".claude/settings.json",
+            json.dumps({"env": {"HARNESS_SENSITIVE_PATHS": "secrets/**"}}),
+        )
+        self.git(vault, "add", ".claude/settings.json")
+        self.git(vault, "commit", "-q", "-m", "Mark secrets")
+        wt = self.tmp / "vault-wt"
+        self.git(vault, "worktree", "add", "-q", "-b", "t/9-vault-work", str(wt))
+        g, v = self.global_store(), self.project_store(vault)
+        g_new = {
+            self.snapshot(g, 13 * DAY, self.repo),
+            self.snapshot(g, 13 * DAY, other),
+        }
+        for repo in (self.repo, other, None):  # every project's, in the global store
+            self.snapshot(g, 15 * DAY, repo)
+        v_old, v_new = self.snapshot(v, 15 * DAY, vault), self.snapshot(v, 13 * DAY, vault)
+        mine_old = self.backup_ref(self.repo, 15 * DAY)
+        self.backup_ref(self.repo, 13 * DAY)
+        vault_old = self.backup_ref(vault, 15 * DAY)
+        self.backup_ref(vault, 13 * DAY)
+        self.backup_ref(other, 15 * DAY)
+        self.backup_ref(other, 13 * DAY)
+        mine, vaults, others = self.refs(self.repo), self.refs(vault), self.refs(other)
+
+        # A new session in a plain project: the global store and this repository's refs.
+        self.session_start(self.repo, "startup")
+        self.assertEqual(self.listing(g), g_new)
+        self.assertEqual(self.refs(self.repo), mine - {mine_old})
+        self.assertEqual(self.listing(v), {v_old, v_new}, "another project's store was swept")
+        self.assertEqual(self.refs(vault), vaults, "another repository's refs were swept")
+        self.assertEqual(self.refs(other), others, "another repository's refs were swept")
+
+        # A resumed session in the sensitive project's worktree: its own store and refs.
+        self.session_start(wt, "resume")
+        self.assertEqual(self.listing(v), {v_new})
+        self.assertEqual(self.refs(vault), vaults - {vault_old})
+        self.assertEqual(self.refs(other), others)
+        self.assertEqual(self.refs(self.repo), mine - {mine_old})
+
+        # Outside any repository the global store is swept all the same.
+        loose = self.tmp / "loose"
+        loose.mkdir()
+        self.snapshot(g, 15 * DAY, None)
+        self.session_start(loose, "compact")
+        self.assertEqual(self.listing(g), g_new)
+        self.assertEqual(self.listing(v), {v_new})
+        self.assertEqual(self.refs(other), others)
+
+    def test_brief_unchanged_by_the_sweep(self):
+        self.pin_commit_date(self.repo)
+        self.write(
+            self.repo / "docs/agent/handoff.md",
+            "# Handoff\n\n## Next steps\n- Finish the sweep\n- Land it\n",
+        )
+        self.budgets({"api": {"exhausted_until": "2999-01-01T00:00:00Z", "reason": "credits"}})
+        clean, _ = self.session_start(self.repo)
+        self.assertGreater(len(clean["additionalContext"].splitlines()), 2)
+        g = self.global_store()
+        self.snapshot(g, 15 * DAY, self.repo)
+        new = self.snapshot(g, 13 * DAY, self.repo)
+        old_ref = self.backup_ref(self.repo, 15 * DAY)
+        new_ref = self.backup_ref(self.repo, 13 * DAY)
+
+        out, _ = self.session_start(self.repo)
+        self.assertEqual(out, clean)
+        self.assertEqual(self.listing(g), {new}, "the sweep did not run")
+        self.assertNotIn(old_ref, self.refs(self.repo), "the sweep did not run")
+        self.assertIn(new_ref, self.refs(self.repo))
+        self.assertEqual(self.session_start(self.repo)[0], clean)  # nothing left to sweep
+
+        # A sweep that fails adds no line: a ref git cannot delete (another git holds its lock),
+        locked = self.backup_ref(self.repo, 20 * DAY)
+        lock = self.repo / ".git" / (locked + ".lock")
+        lock.write_text("")
+        self.assertEqual(self.session_start(self.repo)[0], clean)
+        lock.unlink()
+        # a store that is not a folder,
+        shutil.rmtree(g)
+        g.write_text("not a folder\n")
+        self.assertEqual(self.session_start(self.repo)[0], clean)
+        self.assertEqual(g.read_text(), "not a folder\n")
+        g.unlink()
+        # an old snapshot that cannot be removed (permissions do not bind root).
+        if os.geteuid() != 0:
+            self.snapshot(g, 20 * DAY, self.repo)
+            g.chmod(0o500)
+            self.addCleanup(g.chmod, 0o700)
+            self.assertEqual(self.session_start(self.repo)[0], clean)
+
+    def test_a_hanging_sweep_adds_no_delay_past_its_budget(self):
+        self.pin_commit_date(self.repo)
+        self.backup_ref(self.repo, 15 * DAY)
+        clean, took = self.session_start(self.repo)
+        self.backup_ref(self.repo, 15 * DAY)
+        self.snapshot(self.global_store(), 15 * DAY, self.repo)
+        hang_log = self.tmp / "hang.log"
+        hang = {
+            "PATH": f"{_SHARED['base'] / 'bin-hang'}:{_SHARED['base'] / 'bin-fake'}:{SYSTEM_PATH}",
+            "HANG_LOG": str(hang_log),
+        }
+        out, hung = self.session_start(self.repo, env=hang)
+        self.assertEqual(out, clean)
+        self.assertTrue(
+            hang_log.is_file() and hang_log.read_text().strip(),
+            "the sweep made no git call of its own",
+        )
+        self.assertLess(
+            hung,
+            took + SWEEP_BUDGET + TIMING_MARGIN,
+            f"a hanging sweep held the brief {hung:.1f} s (a normal run took {took:.1f} s)",
+        )
 
 
 if __name__ == "__main__":
