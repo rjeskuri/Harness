@@ -11,7 +11,7 @@ Usage:
                          [--effort low|medium|high|xhigh|max]
     harness-work stage N <stage> pass|fail [--tier T] [--effort E]
     harness-work cost N [--pr P] [--json | --markdown]
-    harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]
+    harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run] [--only N[,N...]]
     harness-work runs [--sweep] [--all]
     harness-work waves [--all] [--refresh]
     harness-work wave drop ID N
@@ -71,7 +71,9 @@ answers (the owner's replies; [] unless the ticket was needs-input) and waiting 
 
 dispatch: sweeps the runs, then starts and launches each ready ticket (and each in-progress ticket whose last
 run ended without a ready pull request, a draft counting as none, until 3 runs of it ended in the last 7 days,
-a billing or auth run not counting) that has no live run, up to --max minus the live runs. When the branch has an
+a billing or auth run not counting) that has no live run, up to --max minus the live runs. --only N[,N...] plans just
+the named tickets through the same path; a named ticket that is not such a ticket, or has a live run, is skipped
+with its reason (printed, and in "skipped"). When the branch has an
 open draft PR, the prompt and the start comment name it and say the worktree may hold uncommitted work from the
 previous run. Launched sessions get neither
 the dispatching session's identity nor ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN; when the
@@ -1398,17 +1400,19 @@ def ask_without_pr(repo, n, branch):
     return dict(issue, draft_pr=drafts[0] if drafts else None)
 
 
-def redispatch_candidates(repo, records, live, *, capped_only=False):
+def redispatch_candidates(repo, records, live, *, capped_only=False, only=None):
     """In-progress tickets whose last run ended (within the window) without a ready pull request: dispatched again,
     unless REDISPATCH_MAX runs of the ticket ended within the window, billing and auth runs not counting (the
     budget's failure, not the ticket's). (candidates, skipped, the id of the record each skipped ticket's cap rests
     on: its latest started). `capped_only` skips the gh check for tickets under the cap, whose answer the caller
-    would discard."""
+    would discard. `only` (a set of ticket numbers) considers just those tickets."""
     cutoff = now() - REDISPATCH_WINDOW
     latest, ended_runs = {}, {}
     for record in records:
         n = record.get("ticket")
         if not isinstance(n, int):
+            continue
+        if only is not None and n not in only:
             continue
         if n not in latest or str(record.get("started_at")) > str(latest[n].get("started_at")):
             latest[n] = record
@@ -1738,15 +1742,22 @@ def cmd_dispatch(repo, args):
     live = live_runs(mine, agents)
     ready = board_json(repo, "ready", "--json")
     ready = [r for r in ready if isinstance(r, dict)] if isinstance(ready, list) else []
-    again, capped, _ = redispatch_candidates(repo, mine, live)
+    only = set(args.only) if args.only else None
+    again, capped, _ = redispatch_candidates(repo, mine, live, only=only)
     candidates, seen = [], set()
     for row in again + ready:
         n = row.get("number")
-        if isinstance(n, int) and n not in seen:
+        if isinstance(n, int) and n not in seen and (only is None or n in only):
             seen.add(n)
             candidates.append(row)
     slots = args.max - len(live)
     plan, skipped = [], list(capped)
+    for n in args.only or []:       # a named ticket that is no candidate: say why, launch nothing for it
+        if n in seen or any(s["number"] == n for s in skipped):
+            continue
+        seen.add(n)
+        skipped.append({"number": n, "why": f"live run {live[n]['id']}" if n in live else
+                        "not ready, and not in progress with an ended run to redispatch"})
     for row in candidates:
         if row["number"] in live:
             skipped.append({"number": row["number"], "why": f"live run {live[row['number']]['id']}"})
@@ -1773,17 +1784,18 @@ def cmd_dispatch(repo, args):
             extra["wave"] = {"id": None, "tickets": sorted(group)}
         lines += [f"skip #{s['number']}: {s['why']}" for s in skipped]
         if not candidates:
-            lines.append("No ready tickets.")
+            lines.append("None of the named tickets can be planned." if only is not None else "No ready tickets.")
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "dry_run": True,
                                      "live": [r["id"] for r in live.values()], "plan": plan, "skipped": skipped},
                                     **extra), "\n".join(lines))
         return
     if not args.json:
-        for s in capped:
+        for s in (skipped if only is not None else capped):
             print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
-                                     "skipped": skipped}, **extra), "No ready tickets.")
+                                     "skipped": skipped}, **extra),
+             "None of the named tickets can be launched." if only is not None else "No ready tickets.")
         return
     if slots <= 0:
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
@@ -1794,7 +1806,7 @@ def cmd_dispatch(repo, args):
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
                                      "skipped": skipped}, **extra),
              "Nothing to launch: " + "; ".join(f"#{s['number']} has a {s['why']}" for s in skipped
-                                               if s not in capped) + ".")
+                                               if s not in capped and s["why"].startswith("live run")) + ".")
         return
     if shutil.which(claude_exe()) is None:
         raise Problem(f"claude not found ({claude_exe()}); nothing started")
@@ -2233,6 +2245,16 @@ def cmd_worktree_remove(repo, args):
 
 
 # --------------------------------------------------------------- arguments
+def ticket_list(text):
+    """An argparse `type=`: issue numbers separated by commas, in the order given, once each."""
+    out = []
+    for part in text.split(","):
+        n = issue_number(part.strip())
+        if n not in out:
+            out.append(n)
+    return out
+
+
 def parser():
     repo_help = "the project (default: CLAUDE_PROJECT_DIR, else the cwd's repository)"
     with_repo = argparse.ArgumentParser(add_help=False)
@@ -2293,6 +2315,9 @@ def parser():
     dispatch.add_argument("--api", action="store_true",
                           help="alias for --venue headless: runs headless, billed to the API key")
     dispatch.add_argument("--dry-run", action="store_true", help="print the plan; start and launch nothing")
+    dispatch.add_argument("--only", type=ticket_list, metavar="N[,N...]",
+                          help="consider only these tickets (each ready, or in progress with an ended run); "
+                               "any other is skipped with the reason")
 
     cloud = sub.add_parser("cloud", parents=[with_repo, with_json],
                            help="start a ticket, push its branch and launch a Claude cloud session on it")
