@@ -37,8 +37,10 @@ import inspect
 import io
 import json
 import os
+import random
 import re
 import shutil
+import string
 import subprocess
 import sys
 import tempfile
@@ -753,10 +755,35 @@ class GlobMatchTests(unittest.TestCase):
 # ================================================================ nested tests/ directories (#348)
 
 
+# Names a real project has above its tests/ (none of the fixtures' literal parents, so a made-up path never repeats
+# one). Mixed with the made-up shapes below: a pattern that names the real ones (src/tests/**) misses the made-up
+# ones, one that names a made-up shape (d*/**/tests/**) misses the real ones; only every tests/ directory passes.
+REAL_PARENTS = ("src", "app", "lib", "services", "packages", "internal", "core", "api", "cli", "backend", "server")
+
+
+def real_parent() -> str:
+    """One directory name a real project uses, drawn for this run."""
+    return random.choice(REAL_PARENTS)
+
+
+def segment() -> str:
+    """One directory name made up for this run, in no fixed shape: a real project's, one with a suffix, or hex digits
+    after any letter, upper or lower, or a digit, with a - or . inside. None contains "test", "spec" or "docs", so no
+    pattern matches one by its name, and no list or shape written in advance names them all."""
+    h = uuid.uuid4().hex[:8]
+    return random.choice((
+        real_parent(),
+        real_parent() + "_" + h[:4],
+        random.choice(string.ascii_lowercase) + h,
+        random.choice(string.ascii_uppercase) + h[:6],
+        random.choice(string.digits) + h[:3] + "-" + h[3:],
+        "v" + random.choice(string.digits) + "." + h[:4],
+    ))
+
+
 def generated(n: int) -> str:
-    """`n` directory names made up for this run, /-joined ("" for none): "d" and hex digits, so no test pattern
-    matches one by its name, and no list written in advance can name them."""
-    return "/".join("d" + uuid.uuid4().hex[:10] for _ in range(n))
+    """`n` directory names made up for this run (see segment), /-joined ("" for none)."""
+    return "/".join(segment() for _ in range(n))
 
 
 class DefaultTestPatternsReachNestedTestsTests(unittest.TestCase):
@@ -792,10 +819,13 @@ class DefaultTestPatternsReachNestedTestsTests(unittest.TestCase):
             "svc/api/tests/fixtures/rows.json",  # a test before the exempt **/*.json
             "svc/api/tests/README.md",  # and before **/*.md
         ]
-        # parents no list can know: made up for this run, 1 to 9 directories above tests/ and 0 to 3 below it
+        # parents no list can know: made up for this run in mixed shapes, 1 to 14 directories above tests/ (deeper
+        # than a depth-by-depth list goes) and 0 to 3 below it; then a real project's name right above tests/
         names = ("x.py", "fakegh.py", f"{generated(1)}_support.py", f"{generated(1)}.json", "README.md", "setup.mjs")
-        for k, (above, below) in enumerate((a, b) for a in (1, 2, 4, 6, 9) for b in (0, 1, 2, 3)):
+        for k, (above, below) in enumerate((a, b) for a in (1, 2, 3, 5, 8, 14) for b in (0, 1, 2, 3)):
             cases.append("/".join(p for p in (generated(above), "tests", generated(below), names[k % 6]) if p))
+        for k, name in enumerate(names):
+            cases += [f"{real_parent()}/tests/{name}", f"{generated(k)}/{real_parent()}/tests/{name}".lstrip("/")]
         for rel in cases:
             with self.subTest(rel=rel):
                 self.assertEqual(self.kind(rel), "test")
@@ -820,6 +850,9 @@ class DefaultTestPatternsReachNestedTestsTests(unittest.TestCase):
             (f"{generated(2)}/tests_helper.py", "source"),
             (f"{generated(3)}/{generated(1)}_support.py", "source"),
             (f"{generated(2)}/fakegh.py", "source"),
+            (f"{real_parent()}/{generated(1)}_support.py", "source"),
+            (f"{real_parent()}/{real_parent()}/testsuite/fakegh.py", "source"),
+            (f"{generated(1)}/{real_parent()}/{real_parent()}tests/x.py", "source"),
             (f"{generated(1)}/{generated(1)}tests/x.py", "source"),
             (f"{generated(4)}/testsuite/notes.md", "exempt"),
         ]:

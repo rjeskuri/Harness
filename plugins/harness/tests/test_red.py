@@ -15,8 +15,10 @@ import hashlib
 import importlib.util
 import json
 import os
+import random
 import shlex
 import shutil
+import string
 import subprocess
 import sys
 import tempfile
@@ -174,10 +176,35 @@ def line_moved_into(text, line, anchor):
     return once(once(text, line, ""), anchor, anchor + line)
 
 
+# Names a real project has above its tests/ (none of the fixtures' literal parents, so a made-up path never repeats
+# one). Mixed with the made-up shapes below: a pattern that names the real ones (src/tests/**) misses the made-up
+# ones, one that names a made-up shape (d*/**/tests/**) misses the real ones; only every tests/ directory passes (#348).
+REAL_PARENTS = ("src", "app", "lib", "services", "packages", "internal", "core", "api", "cli", "backend", "server")
+
+
+def real_parent():
+    """One directory name a real project uses, drawn for this run."""
+    return random.choice(REAL_PARENTS)
+
+
+def segment():
+    """One directory name made up for this run, in no fixed shape: a real project's, one with a suffix, or hex digits
+    after any letter, upper or lower, or a digit, with a - or . inside. None contains "test", "spec" or "docs", so no
+    pattern matches one by its name, and no list or shape written in advance names them all."""
+    h = uuid.uuid4().hex[:8]
+    return random.choice((
+        real_parent(),
+        real_parent() + "_" + h[:4],
+        random.choice(string.ascii_lowercase) + h,
+        random.choice(string.ascii_uppercase) + h[:6],
+        random.choice(string.digits) + h[:3] + "-" + h[3:],
+        "v" + random.choice(string.digits) + "." + h[:4],
+    ))
+
+
 def generated(n):
-    """`n` directory names made up for this run, /-joined: "d" and hex digits, so no test pattern matches one by its
-    name, and no list written in advance can name them (#348)."""
-    return "/".join("d" + uuid.uuid4().hex[:10] for _ in range(n))
+    """`n` directory names made up for this run (see segment), /-joined ("" for none)."""
+    return "/".join(segment() for _ in range(n))
 
 
 def expected_hash(root, files):
@@ -915,19 +942,22 @@ exit 254
             "svc/api/tests/x_support.py": "ROWS = 2\n",
             "svc/api/tests/helpers/builders.py": "def build():\n    return 1\n",
             "svc/api/tests/fixtures/rows.json": "[1, 2]\n",
-            f"{generated(1)}/lib/tests/z_support.py": "DEPTH = 2\n",          # parents made up for this run
-            f"{generated(4)}/tests/{generated(2)}/fakegh.py": "ANSWERS = [1]\n",
+            f"{generated(1)}/{real_parent()}/tests/z_support.py": "DEPTH = 2\n",   # parents made up for this run
+            f"{generated(12)}/tests/{generated(2)}/fakegh.py": "ANSWERS = [1]\n",   # deeper than a list goes
+            f"{real_parent()}/tests/w_support.py": "COLS = 4\n",                 # a real name right above tests/
         }, ["plugins/harness/tests/test_widget.py"])
 
     def test_source_outside_tests_directories_is_still_refused_before_the_red_run(self):
         for rel, text in (("pkg/tests/test_widget.py", TEST_ADD), ("pkg/tests/widget_support.py", "WIDTH = 3\n"),
                           ("pkg/tests/fakegh.py", "ANSWERS = []\n"),
-                          (f"{generated(2)}/tests/{generated(1)}/y_support.py", "ROWS = 1\n")):
+                          (f"{generated(2)}/tests/{generated(1)}/y_support.py", "ROWS = 1\n"),
+                          (f"{real_parent()}/tests/z_support.py", "ROWS = 2\n")):
             self.put(rel, text)
         # the name alone (a _support.py, a fakegh.py, "tests" in a file or directory name) is no test
         sources = ["pkg/fakegh.py", "pkg/testsuite/x_support.py", "pkg/tests_helper.py",
                    "plugins/harness/lib/harness_lib/x_support.py", "src/compat_support.py",
-                   f"{generated(2)}/testsuite/x_support.py", f"{generated(1)}/tests_helper.py"]
+                   f"{generated(2)}/testsuite/x_support.py", f"{generated(1)}/tests_helper.py",
+                   f"{real_parent()}/{generated(1)}_support.py"]
         for rel in sources:
             self.put(rel, "X = 1\n")
         p = self.red("check", **self.fake_runner(self.NESTED_RED, 1))
