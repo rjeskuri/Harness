@@ -13,12 +13,16 @@ preload run next to a tracked program or next to nothing (node -r, --require, --
 resolves from the part's directory or its PYTHONPATH (on the part or exported in an
 earlier part; separate or attached: -m w, -mw, -Imw), through a standard-library module
 that runs a file or a module (pdb, cProfile, profile, trace, doctest, runpy), behind a
-wrapper (uv run, poetry run, npx, bunx) or a bare runner (pytest, vitest), as a tracked
+wrapper (uv run, poetry run, npx, bunx, pnpm exec) whatever global options stand before
+its subcommand (uv -q run, poetry -C . run) or a bare runner (pytest, vitest), as a tracked
 directory whose entry file is untracked (tracked means a blob at HEAD, not a tree), and
 from any directory the part runs in (cd /tmp && python3 f). A PYTHONPATH entry the hook
-cannot expand ($PWD, $(pwd)) with a module that is not installed is not known, so it is
-refused like python3 $F. A test runner's test directory, working directory or config
-outside the worktree is refused; a load path or a runner's output path is not a program:
+cannot expand ($PWD, $(pwd); the hook's own PWD is not the part's after a cd) with a
+module that is not installed is not known, so it is refused like python3 $F. A test
+runner's test directory, working directory or config outside the worktree is refused,
+the directory a runner with no target collects from (cd /tmp && pytest) and the JS
+configs vitest, jest and mocha execute included; a load path or a runner's output path
+is not a program:
 ruby -I /tmp/gems on a tracked program, pytest --junitxml /tmp/r.xml, PYTHONPATH=x
 python3 -m pytest run. A runner on the worktree's own files, tracked or new, as a path or
 a dotted module (python3 -m unittest tests.test_new), still runs, as do tracked program
@@ -155,6 +159,35 @@ RUNNERS = (
     "pytest tests/test_new.py",
     "pytest -q tests/",
     "vitest run tests/new.test.ts",
+    # a wrapper's global options before its subcommand: judged by what follows
+    "uv -q run python scripts/tool.py",
+    "uv --offline run pytest tests/",
+    "uv --directory . run python scripts/tool.py",
+    "poetry --no-interaction run pytest tests/",
+    "poetry -C . run python scripts/tool.py",
+    "pnpm --silent exec tsx scripts/tool.ts",
+    "pnpm -C . exec vitest run tests/",
+    # a runner with no target collects from its directory: the worktree, or a directory
+    # in it
+    "python3 -m pytest",
+    "python3 -m pytest -q",
+    "pytest",
+    "python3 -m unittest discover",
+    "uv run pytest",
+    "npx vitest run",
+    "cd tests && pytest -q",
+    "cd tests && python3 -m unittest discover",
+    "cd tests && python3 -m pytest",
+    "(cd tests && node --test)",
+    "cd tests; bun test",
+    "cd {wt} && pytest",
+    # a tracked config a JS runner executes
+    "npx vitest run --config vitest.config.mjs tests/",
+    "npx vitest run --config=./vitest.config.mjs tests/new.test.ts",
+    "vitest run -c vitest.config.mjs",
+    "npx jest --config jest.config.js",
+    "npx jest -c jest.config.js tests/",
+    "npx mocha --config .mocharc.js tests/",
     "harness-red run --worktree {wt}",
     "harness-red check",
     "{red} run --worktree {wt}",
@@ -324,6 +357,15 @@ PYTHONPATH_MODULES = (
     ('PYTHONPATH="$PWD/tools" python3 -m gen', None),
     ("PYTHONPATH=$(pwd)/tools python3 -m gen", None),
     ("PYTHONPATH=$PWD/tools:$PYTHONPATH python3 -m gen", None),
+    # $PWD after a cd is the part's directory, not the hook's: still not expandable
+    ("cd tools && PYTHONPATH=$PWD python3 -m gen", "PYTHONPATH=$PWD python3 -m gen"),
+    (
+        "cd tests && PYTHONPATH=$PWD/helpers python3 -m gen",
+        "PYTHONPATH=$PWD/helpers python3 -m gen",
+    ),
+    ("cd tests && PYTHONPATH=$(pwd)/helpers python3 -m gen", "PYTHONPATH=$(pwd)/helpers python3 -m gen"),
+    ("cd {o} && PYTHONPATH=$PWD python3 -m w", "PYTHONPATH=$PWD python3 -m w"),
+    ("cd {o} && PYTHONPATH=$PWD/mods python3 -m gen", "PYTHONPATH=$PWD/mods python3 -m gen"),
 )
 # PYTHONPATH that leads to a tracked module, or to no module of that name at all (the
 # runner is installed), and PYTHONPATH on a tracked program file: the load path does not
@@ -379,6 +421,41 @@ RUNNER_OUTSIDE = (
     "deno test {o}/",
     "bun test --cwd {o}",
     "pytest {o}",
+    # a config vitest, jest or mocha executes: a JS or TS module ({o} holds w.config.mjs,
+    # jest.config.js and .mocharc.js, each a program that writes)
+    "npx vitest run --config {o}/w.config.mjs tests/",
+    "npx vitest run --config={o}/w.config.mjs tests/new.test.ts",
+    "vitest run -c {o}/w.config.mjs",
+    "vitest -c {o}/w.config.mjs tests/",
+    "pnpm exec vitest run --config {o}/w.config.mjs",
+    "npx jest --config {o}/jest.config.js",
+    "npx jest -c {o}/jest.config.js tests/",
+    "jest --config={o}/jest.config.js",
+    "npx mocha --config {o}/.mocharc.js tests/",
+    "mocha --config {o}/.mocharc.js",
+)
+# A test runner given no target collects from the directory the part runs in: outside the
+# worktree, that is a test directory outside the worktree (command, the part the reason
+# quotes; {o} is the outside directory).
+RUNNER_NO_TARGET_OUTSIDE = (
+    ("cd /tmp && python3 -m pytest", "python3 -m pytest"),
+    ("cd /tmp && pytest -q", "pytest -q"),
+    ("cd /tmp && python3 -m unittest discover", "python3 -m unittest discover"),
+    ("cd /tmp && node --test", "node --test"),
+    ("cd /tmp && bun test", "bun test"),
+    ("cd /tmp && deno test -A", "deno test -A"),
+    ("cd /tmp && uv run pytest", "uv run pytest"),
+    ("cd {o} && pytest", "pytest"),
+    ("cd {o} && python3 -m pytest -q", "python3 -m pytest -q"),
+    ("cd {o} && python3 -m unittest discover -p 'test_*.py'", "python3 -m unittest discover -p 'test_*.py'"),
+    ("(cd {o}; node --test)", "node --test"),
+    ("cd {o}; bun test", "bun test"),
+    ("cd {o} && npx vitest run", "npx vitest run"),
+    ("cd {o} && vitest", "vitest"),
+    ("cd {o} && npx jest", "npx jest"),
+    ("cd {o} && npx mocha", "npx mocha"),
+    ("cd ~ && pytest", "pytest"),
+    ("cd ~ && node --test", "node --test"),
 )
 # Wrappers that run what follows them, and bare runners: judged by the program file they
 # are given ({o} is the outside directory).
@@ -398,6 +475,20 @@ WRAPPERS = (
     "pytest {o}/w.py",
     "pytest -q {o}/w.py",
     "vitest run {o}/w.ts",
+    # the wrapper's own global options before its subcommand do not hide the program
+    "uv -q run python {o}/w.py",
+    "uv --offline run {o}/w.py",
+    "uv -q --offline run python {o}/w.py",
+    "uv --directory . run python {o}/w.py",
+    "uv -q run python tools/gen.py",
+    "uv --offline run tools/gen.py",
+    "poetry --no-interaction run python {o}/w.py",
+    "poetry -C . run python {o}/w.py",
+    "poetry -q run python tools/gen.py",
+    "pnpm exec tsx {o}/w.ts",
+    "pnpm --silent exec tsx {o}/w.ts",
+    "pnpm -C . exec tsx {o}/w.ts",
+    "pnpm --silent exec tsx tools/gen.ts",
 )
 # A test runner's options whose values are out-of-tree non-program paths (a report, a
 # temp directory, a cache): the loop writes those, so they stay allowed ({o} is the
@@ -450,6 +541,10 @@ class ScriptFileTests(GuardTestCase):
         self.write(self.wt / "deno.json", "{}\n")
         self.write(self.wt / "pytest.ini", "[pytest]\n")
         self.write(self.wt / ".env", "TZ=UTC\n")
+        # the JS runners' configs, modules they execute
+        self.write(self.wt / "vitest.config.mjs", "export default {};\n")
+        self.write(self.wt / "jest.config.js", "module.exports = {};\n")
+        self.write(self.wt / ".mocharc.js", "module.exports = {};\n")
         self.git(self.wt, "add", "-A")
         self.git(self.wt, "commit", "-q", "-m", "Add the project's scripts")
         # untracked: outside any repository (the temp directory, ~) and in the worktree
@@ -471,6 +566,12 @@ class ScriptFileTests(GuardTestCase):
         self.write(self.outside / "test_w.py", PROGRAMS["py"])
         self.write(self.outside / "w.test.mjs", PROGRAMS["mjs"])
         self.write(self.outside / "pytest.ini", "[pytest]\n")
+        # configs the JS runners execute, each a program that writes
+        self.write(self.outside / "w.config.mjs", PROGRAMS["mjs"])
+        self.write(self.outside / "jest.config.js", PROGRAMS["cjs"])
+        self.write(self.outside / ".mocharc.js", PROGRAMS["cjs"])
+        # a module found only through $PWD, relative to the part's directory
+        self.write(self.outside / "mods/gen.py", PROGRAMS["py"])
         for d in ("gems", "pt", "pc"):
             (self.outside / d).mkdir()
         self.write(self.outside / "r.xml", "<testsuites/>\n")
@@ -519,9 +620,11 @@ class ScriptFileTests(GuardTestCase):
         self.write(self.state / "red/t-12-fix-login.json", json.dumps(record))
 
     def bash(self, command: str, agent=None, cwd: Path | None = None, hook: str = "tests_first.py"):
-        """The deny reason `hook` gives a Bash `command` run in `cwd` (the worktree), or None."""
+        """The deny reason `hook` gives a Bash `command` run in `cwd` (the worktree), or None.
+        The hook's environment carries PWD as Claude Code's does: the session's directory,
+        which is the part's only until the command cds."""
         payload = self.payload("Bash", {"command": command}, cwd or self.wt, agent)
-        return self.decision(self.run_hook(hook, payload))
+        return self.decision(self.run_hook(hook, payload, env={"PWD": str(cwd or self.wt)}))
 
     def outside_file(self, template: str, ext: str) -> str:
         return template.format(f=self.outside / f"w.{ext}")
@@ -706,6 +809,16 @@ class ScriptFileTests(GuardTestCase):
             for agent in ROLES:
                 with self.subTest(command=command, agent=agent):
                     self.assertRefused(self.bash(command, agent), command)
+
+    def test_a_test_runner_with_no_target_collects_from_its_directory(self):
+        """cd /tmp && pytest collects /tmp: a runner given nothing is given the directory
+        the part runs in, and outside the worktree that is a test directory outside it.
+        Run in the worktree or a directory of it (RUNNERS), it stays allowed."""
+        for template, part in RUNNER_NO_TARGET_OUTSIDE:
+            command = template.format(o=self.outside)
+            for agent in ROLES:
+                with self.subTest(command=command, agent=agent):
+                    self.assertRefused(self.bash(command, agent), part)
 
     def test_a_stdlib_module_that_runs_a_file_or_module_is_judged_by_it(self):
         """python3 -m pdb /tmp/w.py runs /tmp/w.py, -m runpy w runs w.py: the module

@@ -42,17 +42,21 @@ program (-c, -e or a heredoc) that writes files, patch without a file argument o
 command that writes files (as the walker judges a part), runs git on paths, or is a
 shell or an interpreter. For the same three roles, an interpreter or shell run on a program
 file (harness_lib/programs.py: python, node, deno, bun, ruby, perl, php, sh, bash and zsh,
-and the wrappers uv run, poetry run, npx and bunx, on a file behind any option; a preload
-such as node -r or ruby -r; python -m resolved to a file from the part's directory and its
-PYTHONPATH, set on the part or exported earlier in the command; the standard library's pdb,
-cProfile, profile, trace, doctest and runpy by what they run) is refused unless the file is
-a blob at the worktree's HEAD (the index does not count), judged against the hook's worktree
-from whatever directory the part runs in; one whose path cannot be known ($F, a module on a
-PYTHONPATH entry the hook cannot expand) is refused too, and when git cannot say in time
-whether HEAD tracks the file, the run is refused, not judged. A test runner (pytest,
-unittest, node --test, deno test, bun test, vitest; npm test and npm run are not judged) is
-refused only a test path, directory or config outside the worktree: its in-tree files run,
-tracked or new, as do its output paths anywhere.
+and the wrappers uv run, poetry run, npx, bunx and pnpm exec, whatever global options stand
+before the subcommand, on a file behind any option; a preload such as node -r or ruby -r;
+python -m resolved to a file from the part's directory and its PYTHONPATH, set on the part
+or exported earlier in the command; the standard library's pdb, cProfile, profile, trace,
+doctest and runpy by what they run) is refused unless the file is a blob at the worktree's
+HEAD (the index does not count), judged against the hook's worktree from whatever directory
+the part runs in; one whose path cannot be known ($F, a module on a PYTHONPATH entry the
+hook cannot expand: a variable or substitution, $PWD included, since the hook's PWD is the
+session's directory, not the part's after a cd) is refused too, and when git cannot say in
+time whether HEAD tracks the file, the run is refused, not judged. A test runner (pytest,
+unittest, node --test, deno test, bun test, vitest, jest, mocha; npm test and npm run are
+not judged) is refused only a test path, directory or config outside the worktree, the
+directory it collects from when given no target (cd /tmp && pytest) and the JS configs
+vitest, jest and mocha execute (--config, -c) included: its in-tree files run, tracked or
+new, as do its output paths anywhere.
 
 <key> is the first 12 hex digits of the sha1 of the real path of the main working tree
 with each component spelled as its parent directory lists it, so a linked worktree

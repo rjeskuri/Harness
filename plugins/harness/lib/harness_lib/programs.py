@@ -18,11 +18,14 @@ value is a program too; python -m (also -mX and -ImX) resolved to X.py or X/__ma
 part's directory and on each PYTHONPATH entry (the part's own, env's, or exported earlier),
 every place it is found; the standard library's runners of a file or module (pdb, cProfile,
 profile, trace, doctest, runpy) by what they run; the test runners (pytest, unittest, node
---test, deno test, bun test, vitest, jest, mocha) by their test paths, directories and configs,
-a dotted module resolved like -m, their output paths skipped; and the wrappers (uv run, poetry
-run, pipenv run, pdm run, hatch run, pnpm exec, npx, bunx, uvx) by what follows them. An
-installed module (the standard library, a runner) found nowhere is no program; one not found
-with a PYTHONPATH entry the hook cannot expand is not known.
+--test, deno test, bun test, vitest, jest, mocha) by their test paths, directories and configs
+(the JS configs vitest, jest and mocha execute included), a dotted module resolved like -m,
+their output paths skipped, and by the part's directory when they are given no target, since
+that is where they collect; and the wrappers (uv run, poetry run, pipenv run, pdm run, hatch
+run, pnpm exec, npx, bunx, uvx) by what follows them, whatever global options stand before
+the subcommand (uv -q run, poetry -C . run). An installed module (the standard library, a
+runner) found nowhere is no program; one not found with a PYTHONPATH entry the hook cannot
+expand (a variable or substitution, $PWD included: the hook's is not the part's) is not known.
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -185,8 +188,9 @@ STDLIB_SPECS = {
     "doctest": Spec(PY_EXT, letters="o"),
 }
 # Test runners: options with values that are not test paths (reports, temp and cache
-# directories, patterns), the options whose value is a test directory or config (judged), the
-# preloads, and the words that are subcommands, not paths.
+# directories, patterns), the options whose value is a test directory or config (judged; the
+# configs of vitest, jest and mocha are JS or TS modules the runner executes, deno's and
+# bun's are data), the preloads, and the words that are subcommands, not paths.
 RUNNER_SPECS = {
     "pytest": {
         "values": set(
@@ -231,32 +235,32 @@ RUNNER_SPECS = {
     },
     "vitest": {
         "values": set(
-            "--reporter --outputFile --config -c --root -r --dir --testNamePattern -t --pool --maxWorkers "
+            "--reporter --outputFile --root -r --dir --testNamePattern -t --pool --maxWorkers "
             "--minWorkers --shard --project --environment --mode --coverage.reportsDirectory "
             "--coverage.reporter --coverage.provider --exclude --testTimeout --hookTimeout --retry "
             "--sequence.seed --bail".split()
         ),
-        "dirs": {"--root", "-r", "--dir"},
+        "dirs": {"--root", "-r", "--dir", "--config", "-c"},
         "preloads": set(),
         "skip": {"run", "watch", "dev", "bench", "related", "list", "init"},
         "modules": False,
     },
     "jest": {
         "values": set(
-            "--config -c --rootDir --roots --testPathPattern -t --testNamePattern --outputFile --reporters "
+            "--rootDir --roots --testPathPattern -t --testNamePattern --outputFile --reporters "
             "--coverageDirectory --maxWorkers -w --selectProjects --testTimeout --shard --cacheDirectory".split()
         ),
-        "dirs": {"--rootDir", "--roots"},
+        "dirs": {"--rootDir", "--roots", "--config", "-c"},
         "preloads": set(),
         "skip": set(),
         "modules": False,
     },
     "mocha": {
         "values": set(
-            "--reporter -R --reporter-option -O --require -r --file --spec --timeout -t --config --package "
+            "--reporter -R --reporter-option -O --require -r --file --spec --timeout -t --package "
             "--extension --ignore --exclude --grep -g --fgrep -f --retries --slow -s --ui -u -n --node-option".split()
         ),
-        "dirs": set(),
+        "dirs": {"--config"},
         "preloads": {"--require", "-r"},
         "skip": set(),
         "modules": False,
@@ -355,10 +359,19 @@ def note_exports(words: list[str], name: str, args: list[str], exports: dict) ->
 
 def python_roots(cwd: str | None, pythonpath: str | None) -> list:
     """Where python -m looks: the part's directory, then each PYTHONPATH entry (an empty
-    one is the directory); None stands for one that cannot be known."""
+    one is the directory); None stands for one that cannot be known: a relative entry in
+    an unknown directory, or one with a variable or a substitution, which the hook does
+    not expand ($PWD in the hook's environment is the session's directory, not the
+    part's after a cd)."""
     roots: list = [cwd]
     if pythonpath is not None:
-        roots.extend(resolve(e, cwd) if e else cwd for e in pythonpath.split(":"))
+        for e in pythonpath.split(":"):
+            if not e:
+                roots.append(cwd)
+            elif "$" in e or "`" in e:
+                roots.append(None)
+            else:
+                roots.append(resolve(e, cwd))
     seen: list = []
     for r in roots:
         if r not in seen:
@@ -503,6 +516,7 @@ def interpreter_programs(spec: Spec, args: list[str], cwd: str | None, roots: li
             found.append(prog)
             break
     if runner:
+        implicit_target(cwd, found, start)
         found[start:] = [Program(p.path, p.text, p.kind, True) for p in found[start:]]
 
 
@@ -553,10 +567,28 @@ def runner_targets(kind: str, args: list[str], cwd: str | None, roots: list, fou
         if a in spec["skip"]:
             continue
         target_word(a, cwd, roots, found, spec["modules"])
+    implicit_target(cwd, found, start)
     found[start:] = [Program(p.path, p.text, p.kind, True) for p in found[start:]]
 
 
+def implicit_target(cwd: str | None, found: list, start: int) -> None:
+    """A runner given no test path, directory or config collects from the directory the
+    part runs in: that directory is its target (None when the directory is not known)."""
+    if not any(p.kind == "target" for p in found[start:]):
+        found.append(Program(cwd, ".", "target", True))
+
+
 # ---------- wrappers and dispatch ----------
+
+
+def wrapper_subcommand(name: str, args: list[str]) -> int:
+    """The index of the first word of `args` that is not one of wrapper `name`'s global
+    options (uv -q run, poetry -C . run, pnpm --silent exec): where its subcommand stands."""
+    values = WRAPPER_VALUES.get(name, set())
+    k = 0
+    while k < len(args) and args[k].startswith("-") and args[k] != "-":
+        k += 2 if args[k] in values else 1
+    return k
 
 
 def wrapper_programs(name: str, args: list[str], cwd: str | None, roots: list, found: list, depth: int) -> None:
@@ -632,8 +664,9 @@ def dispatch(word: str, args: list[str], cwd: str | None, roots: list, found: li
     elif name in RUNNERS:
         runner_targets(RUNNERS[name], args, cwd, roots, found)
     elif name in RUN_WRAPPERS:
-        if args and args[0] in RUN_WRAPPERS[name]:
-            wrapper_programs(name, args[1:], cwd, roots, found, depth)
+        k = wrapper_subcommand(name, args)
+        if k < len(args) and args[k] in RUN_WRAPPERS[name]:
+            wrapper_programs(name, args[k + 1 :], cwd, roots, found, depth)
     elif name in EXEC_WRAPPERS:
         wrapper_programs(name, args, cwd, roots, found, depth)
     else:
