@@ -12,4 +12,24 @@ Gathered 2026-10-27 (Claude Code 2.1.310) for #205, from `https://code.claude.co
 
 ## Not verified
 
-- Whether subagents' Bash calls and background sessions (`--bg`) source the session's `CLAUDE_ENV_FILE`: the docs do not say. Without the export, `other_project` falls back to `CLAUDE_PROJECT_DIR`, then to this repository's own session.
+- Nothing left from #205. Whether subagents' Bash calls and background sessions (`--bg`) source the session's `CLAUDE_ENV_FILE`, which the docs do not say, was seen live on 2026-11-16 (Claude Code 2.1.325): both do (next section).
+
+## A claimed background spare keeps another project's environment (#345)
+
+Seen 2026-11-16 on Claude Code 2.1.325 (macOS), in the #345 `/harness:work` job for Harness, itself a background session, and first hit 2026-11-15 in the #337 job (`harness-red check` ran `npm test -- {files}` in Harness and stopped on `npm error enoent Could not read package.json`). session_brief's drop of the strays (docs/design.md, Settings and Hooks) rests on this section.
+
+### Observed live
+
+- **A daemon started by `claude --bg` runs with the caller's environment.** `ps -axo pid,lstart,command` showed pid 35696, started 2026-11-15 14:48, as `claude daemon run --origin transient --spawned-by {"label":"claude --bg","cwd":"/Users/ryaneskuri/Projects/OkinawaDream/.claude/wo…"}`: a `claude --bg` run from the Bash of an OkinawaDream worktree session. Its exec-time environment (`ps eww`) was that session's: `PWD=/Users/ryaneskuri/projects/okinawadream`, OkinawaDream's settings `env` (`HARNESS_TEST_CMD=npm test -- {files}`, `CLAUDE_VERIFY_CMD=scripts/verify.sh`, `HARNESS_ULTRAREVIEW=off`), the user settings' `HARNESS_PROJECT`, and `HARNESS_SESSION_PROJECT=/Users/ryaneskuri/Projects/OkinawaDream`, the export session_brief had written to that session's `CLAUDE_ENV_FILE`. The daemon was still running and serving spares the next day.
+- **Every spare inherits the daemon's environment.** The daemon keeps spares as `claude bg-pty-host --bg-pty-host /tmp/cc-daemon-501/<id>/spare/<id>.pty.sock … --bg-spare …`, each running `claude bg-spare --bg-spare /tmp/cc-daemon-501/<id>/spare/<id>.claim.sock`; a spare's `ps eww` showed the same keys as the daemon's.
+- **A claimed spare overlays the new project's settings `env`, and keeps the keys only the old project set.** The Harness job that claimed such a spare had, in its Bash calls, Harness's own `CLAUDE_VERIFY_CMD=python3 scripts/run_suite.py` and `HARNESS_TEST_MAP` (from Harness's `.claude/settings.json`, whose `env` holds `CLAUDE_VERIFY_CMD`, `HARNESS_TEST_MAP` and `HARNESS_ULTRAREVIEW`) and the user settings' `HARNESS_PROJECT`, but also `HARNESS_TEST_CMD=npm test -- {files}`, which only OkinawaDream's `.claude/settings.json` sets and no Harness settings file (user, project, local) does.
+- **A background session's Bash calls source `CLAUDE_ENV_FILE`.** The job's env file, `~/.claude/session-env/<session id>/sessionstart-hook-0.sh`, held session_brief's `export HARNESS_SESSION_PROJECT=<this worktree>`, and the job's Bash calls showed `HARNESS_SESSION_PROJECT=<this worktree>`, not OkinawaDream. So in Bash `other_project()` was False and `project_setting` took the stray.
+- **A subagent's Bash calls source it too.** The test-author subagent's first Bash call printed `SP=<this worktree> TC=npm test -- {files}`; the coder subagent's Bash calls showed the same `HARNESS_SESSION_PROJECT` and the stray `HARNESS_TEST_CMD`.
+- **Hook processes do not source it.** The SessionStart hook of the claimed session still had the inherited `HARNESS_SESSION_PROJECT` (OkinawaDream) next to `CLAUDE_PROJECT_DIR` (the Harness worktree), which is the fact session_brief's drop decides on.
+
+### Inferred, not observed
+
+- That any `claude --bg` run from a session's Bash, in any project, starts the daemon with that session's whole environment (one daemon was seen), and that a daemon started from a plain terminal carries no `HARNESS_SESSION_PROJECT` and no project's settings `env`.
+- That the overlay happens when the spare is claimed (only its result was seen), and that it sets each key of the new project's user, project and local settings `env` without unsetting the rest.
+- That restarting the daemon from a plain terminal clears the strays from later spares, and how long a `--origin transient` daemon lives.
+- That the hook processes of a claimed session (tests_first, verify_on_stop and the rest) see the same strays, since they get the process environment and never source the file; their own settings reads are not covered by the drop (follow-up to #345).

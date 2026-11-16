@@ -2,8 +2,9 @@
 log that #187 writes to ~/.claude/harness/gh/calls-<UTC date>.jsonl.
 
 The contract these tests fix:
-- The window is the last H hours (H > 0, default 24) of the real clock: since = until - H hours, both
-  `%Y-%m-%dT%H:%M:%SZ`; lines with `at` before since, lines that are not a JSON object with a readable `at`, and
+- The window is the last H hours (H > 0, default 24) of the tool's clock: since = until - H hours, both
+  `%Y-%m-%dT%H:%M:%SZ`; until is HARNESS_NOW (a UTC stamp `%Y-%m-%dT%H:%M:%SZ`) when that is set and not empty,
+  else the real clock (#356); lines with `at` before since, lines that are not a JSON object with a readable `at`, and
   files that are not day files count for nothing (ghlimit.read_calls).
 - --json (after `calls` or after `budget`) prints exactly the keys since, until, hours, total, graphql, rest,
   refused, failed, waited_seconds, peak_minute, by_tool, by_command, by_ticket and by_hour. failed: exit not 0
@@ -19,8 +20,9 @@ The contract these tests fix:
 - No gh call (FAKEGH_LOG stays empty, no line is added to the call log); budgets.json is not touched.
 - The harness-work usage text and design.md's harness-work section name `budget calls`.
 
-harness-work has no clock override, so the log lines are seeded relative to the real clock, anchored on the
-current UTC hour (a line at `hour - 2 h + 1 min`), which keeps every bucket deterministic. Expected values are
+Every test pins the tool's clock through HARNESS_NOW (self.clock, a fixed instant) and seeds the log relative to
+it, so no bucket depends on the hour the suite runs at (#356: anchoring on the real hour split the "newer day"
+across two UTC days at 01:xx). Expected values are
 written out here, never computed by the code under test. TZ is set far from UTC so a local-time slip shows.
 Each test has a temporary HOME; the fake gh (fakegh.py behind HARNESS_GH and on PATH) is written once per module.
 
@@ -96,9 +98,13 @@ def hour_of(when):
     return when.astimezone(UTC).strftime("%Y-%m-%dT%H:00:00Z")
 
 
-def this_hour():
-    """The current UTC hour, on the hour."""
-    return dt.datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+def at_utc(text):
+    """A `%Y-%m-%dT%H:%M:%SZ` stamp as an aware UTC datetime."""
+    return dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
+# The instant HARNESS_NOW pins the tool's clock at unless a test sets another: a fixed day, off the hour.
+DEFAULT_CLOCK = at_utc("2026-03-10T12:17:43Z")
 
 
 def call(at, tool, cmd, kind, repo="Harness", ticket=None, exit=0, ms=120, waited_ms=0, refused=False):
@@ -118,6 +124,16 @@ class CallsTest(unittest.TestCase):
         self.gh_log = os.path.join(self.tmp, "gh.log")
         self.scenario_path = write(os.path.join(self.tmp, "scenario.json"),
                                    json.dumps({"calls": [], "default": {"stdout": "", "exit": 0}}))
+        self.clock = DEFAULT_CLOCK           # HARNESS_NOW for every run; None leaves the variable out
+
+    def this_hour(self):
+        """The pinned clock's UTC hour, on the hour."""
+        return self.clock.replace(minute=0, second=0, microsecond=0)
+
+    def fresh_home(self, name):
+        """A new empty HOME under the test's folder, for a subTest that seeds its own log."""
+        self.home = os.path.join(self.tmp, name)
+        os.makedirs(self.home)
 
     # ----------------------------------------------------------- helpers
     def gh_dir(self):
@@ -132,6 +148,8 @@ class CallsTest(unittest.TestCase):
         env.update(HOME=self.home, PATH=os.pathsep.join([BINS["fakebin"], "/usr/bin", "/bin"]),
                    HARNESS_GH=os.path.join(BINS["fakebin"], "gh"), FAKEGH_SCENARIO=self.scenario_path,
                    FAKEGH_LOG=self.gh_log, TZ="Pacific/Kiritimati")
+        if self.clock is not None:
+            env["HARNESS_NOW"] = stamp(self.clock)
         return env
 
     def seed(self, lines):
@@ -158,31 +176,27 @@ class CallsTest(unittest.TestCase):
                 out[name] = fh.read()
         return out
 
-    def work(self, *args):
-        p = subprocess.run([sys.executable, TOOL] + list(args), cwd=self.cwd, env=self.env(),
+    def work(self, *args, env=None):
+        p = subprocess.run([sys.executable, TOOL] + list(args), cwd=self.cwd, env=env or self.env(),
                            capture_output=True, text=True, timeout=60)
         self.assertNotIn("Traceback", p.stderr)
         return p
 
-    def ok(self, *args):
-        p = self.work(*args)
+    def ok(self, *args, env=None):
+        p = self.work(*args, env=env)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         return p
 
     def report(self, *args):
-        """`budget calls <args> --json`, checked for shape and a window that ends now."""
-        before = dt.datetime.now(UTC).replace(microsecond=0)
+        """`budget calls <args> --json`, checked for shape and a window that ends at the pinned clock."""
         data = json.loads(self.ok("budget", "calls", *args, "--json").stdout)
-        after = dt.datetime.now(UTC)
         self.assertIsInstance(data, dict)
         self.assertEqual(set(data), KEYS, data)
         for key in ("since", "until"):
             self.assertRegex(data[key], STAMP)
-        until = dt.datetime.strptime(data["until"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-        since = dt.datetime.strptime(data["since"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-        self.assertTrue(before <= until <= after, (before, data["until"], after))
+        self.assertEqual(data["until"], stamp(self.clock), data)
         self.assertIsInstance(data["hours"], float)
-        self.assertEqual(until - since, dt.timedelta(hours=data["hours"]), data)
+        self.assertEqual(at_utc(data["until"]) - at_utc(data["since"]), dt.timedelta(hours=data["hours"]), data)
         return data
 
     def gh_calls(self):
@@ -195,12 +209,25 @@ class CallsTest(unittest.TestCase):
 
 # =========================================================================== the JSON report
 class Report(CallsTest):
+    # 00:30 and 01:30 are the hours #356 failed at, 12:00 a plain one; then a month end and a year end.
+    PINS = ("2026-11-16T00:30:00Z", "2026-11-16T01:30:00Z", "2026-11-16T12:00:00Z",
+            "2026-03-01T01:30:00Z", "2026-01-01T00:30:00Z")
+
     def test_counts_by_tool_command_kind_ticket_and_hour(self):
-        h = this_hour()
-        a0 = h - dt.timedelta(hours=30)      # always another UTC day than b0 (28 h apart), inside 48 h
-        b0 = h - dt.timedelta(hours=2)
-        b1 = h - dt.timedelta(hours=1)
-        m = lambda base, minutes, seconds=0: base + dt.timedelta(minutes=minutes, seconds=seconds)  # noqa: E731
+        for i, pin in enumerate(self.PINS):
+            with self.subTest(clock=pin):
+                self.fresh_home(f"home-{i}")
+                self.clock = at_utc(pin)
+                self.check_counts()
+
+    def check_counts(self):
+        # Anchored on the pinned UTC day, never its hour: the newer day is yesterday (20:00 and 21:00, inside 24 h
+        # of any clock today), the older one the day before (18:00: outside 24 h, inside 48 h).
+        day = self.clock.replace(hour=0, minute=0, second=0, microsecond=0)
+        a0 = day - dt.timedelta(days=2) + dt.timedelta(hours=18)
+        b0 = day - dt.timedelta(days=1) + dt.timedelta(hours=20)
+        b1 = b0 + dt.timedelta(hours=1)
+        m =lambda base, minutes, seconds=0: base + dt.timedelta(minutes=minutes, seconds=seconds)  # noqa: E731
         older_day = [
             call(m(a0, 0, 30), "harness-work", ACTIONS, "rest", repo="jotform"),
             call(m(a0, 5, 10), "harness-pr", "pr view", "graphql", ticket=130),
@@ -217,7 +244,7 @@ class Report(CallsTest):
             call(m(b0, 30, 20), "session_brief.py", "pr list", "graphql"),
         ]
         self.seed(older_day + newer_day)
-        self.assertEqual(len(self.day_files()), 2, self.day_files())
+        self.assertEqual(self.day_files(), [f"calls-{stamp(a0)[:10]}.jsonl", f"calls-{stamp(b0)[:10]}.jsonl"])
 
         data = self.report("--hours", "48")
         self.assertEqual(data["hours"], 48.0)
@@ -252,19 +279,54 @@ class Report(CallsTest):
         self.assertEqual(data["peak_minute"], {"minute": minute_of(m(b0, 1)), "calls": 3})
 
         # --json given before the action works the same way, and 24 h drops the older day's four calls.
-        day = json.loads(self.ok("budget", "--json", "calls").stdout)
-        self.assertEqual(day["hours"], 24.0)
-        self.assertEqual((day["total"], day["graphql"], day["rest"]), (7, 4, 3))
-        self.assertEqual([r["hour"] for r in day["by_hour"]], [hour_of(b0), hour_of(b1)])
-        self.assertEqual(day["by_tool"], [
+        last = json.loads(self.ok("budget", "--json", "calls").stdout)
+        self.assertEqual(last["hours"], 24.0)
+        self.assertEqual(last["until"], stamp(self.clock))
+        self.assertEqual((last["total"], last["graphql"], last["rest"]), (7, 4, 3))
+        self.assertEqual([r["hour"] for r in last["by_hour"]], [hour_of(b0), hour_of(b1)])
+        self.assertEqual(last["by_tool"], [
             {"tool": "harness-board", "calls": 2, "graphql": 2, "rest": 0, "refused": 0},
             {"tool": "harness-pr", "calls": 2, "graphql": 1, "rest": 1, "refused": 0},
             {"tool": "harness-work", "calls": 2, "graphql": 0, "rest": 2, "refused": 0},
             {"tool": "session_brief.py", "calls": 1, "graphql": 1, "rest": 0, "refused": 0},
         ])
 
+    def test_window_follows_the_pinned_clock(self):
+        # until is HARNESS_NOW to the second (off the hour, across a year and a month end), since until - H h.
+        cases = [("2026-11-16T01:03:00Z", "24", "2026-11-15T01:03:00Z"),
+                 ("2026-11-16T01:03:00Z", "48", "2026-11-14T01:03:00Z"),
+                 ("2025-12-31T23:59:59Z", "1.5", "2025-12-31T22:29:59Z"),
+                 ("2026-03-01T00:20:07Z", "0.5", "2026-02-28T23:50:07Z"),
+                 ("2024-02-29T06:45:30Z", "72", "2024-02-26T06:45:30Z")]
+        for pin, hours, since in cases:
+            with self.subTest(clock=pin, hours=hours):
+                self.clock = at_utc(pin)
+                data = json.loads(self.ok("budget", "calls", "--hours", hours, "--json").stdout)
+                self.assertEqual((data["until"], data["since"], data["hours"]), (pin, since, float(hours)))
+        self.clock = at_utc("2026-07-04T09:00:00Z")
+        self.assertEqual(json.loads(self.ok("budget", "--json", "calls").stdout)["since"], "2026-07-03T09:00:00Z")
+
+        # A line counts by the pinned clock: at 10:00 one from 08:30 is in a 2 h window, at 11:00 it is not.
+        self.seed([call(at_utc("2026-07-04T08:30:00Z"), "harness-pr", "pr view", "graphql", ticket=130)])
+        self.clock = at_utc("2026-07-04T10:00:00Z")
+        self.assertEqual(self.report("--hours", "2")["total"], 1)
+        self.clock = at_utc("2026-07-04T11:00:00Z")
+        self.assertEqual(self.report("--hours", "2")["total"], 0)
+
+    def test_an_empty_or_missing_clock_pin_is_the_real_clock(self):
+        self.clock = None
+        for pinned in (None, ""):
+            with self.subTest(HARNESS_NOW=pinned):
+                env = self.env()
+                if pinned is not None:
+                    env["HARNESS_NOW"] = pinned
+                before = dt.datetime.now(UTC).replace(microsecond=0)
+                data = json.loads(self.ok("budget", "calls", "--json", env=env).stdout)
+                after = dt.datetime.now(UTC)
+                self.assertTrue(before <= at_utc(data["until"]) <= after, (before, data["until"], after))
+
     def test_window_excludes_older_lines_and_skips_bad_lines(self):
-        h = this_hour()
+        h = self.this_hour()
         b0 = h - dt.timedelta(hours=2)                 # inside a 3 h window whatever the minute now
         old = h - dt.timedelta(hours=3, minutes=10)    # always before now - 3 h
         today, b0_day = stamp(h)[:10], stamp(b0)[:10]
@@ -322,7 +384,7 @@ class Report(CallsTest):
         ])
 
     def test_refused_failed_and_waited_totals(self):
-        b0 = this_hour() - dt.timedelta(hours=2)
+        b0 = self.this_hour() - dt.timedelta(hours=2)
         at = lambda minutes: b0 + dt.timedelta(minutes=minutes)  # noqa: E731
         self.seed([
             call(at(1), "harness-pr", "pr view", "graphql", ticket=130, exit=0),
@@ -361,7 +423,7 @@ class Report(CallsTest):
         ])
 
     def test_peak_minute(self):
-        b0 = this_hour() - dt.timedelta(hours=2)
+        b0 = self.this_hour() - dt.timedelta(hours=2)
         at = lambda minutes, seconds: b0 + dt.timedelta(minutes=minutes, seconds=seconds)  # noqa: E731
         lines = [
             call(at(7, 5), "harness-pr", "pr view", "graphql"),
@@ -388,7 +450,7 @@ class Report(CallsTest):
 # =========================================================================== the text form
 class Text(CallsTest):
     def test_summary_line_and_tables(self):
-        b0 = this_hour() - dt.timedelta(hours=2)
+        b0 = self.this_hour() - dt.timedelta(hours=2)
         at = lambda minutes, seconds=0: b0 + dt.timedelta(minutes=minutes, seconds=seconds)  # noqa: E731
         self.seed([                                   # the ticket's example: 6 calls, 12.5 s waited
             call(at(1, 5), "harness-pr", "pr view", "graphql", ticket=130),
@@ -431,7 +493,7 @@ class Text(CallsTest):
             f"minute ({short_minute(at(1))})\n"))
 
     def test_command_table_shows_the_top_15(self):
-        b0 = this_hour() - dt.timedelta(hours=2)
+        b0 = self.this_hour() - dt.timedelta(hours=2)
         lines, minute = [], 0
         # 17 commands: `pr view` 3 calls, `issue view` 2, then 15 with one call each, named c01..c15 in reverse
         # order of writing; the table keeps pr view, issue view and c01..c13.
@@ -441,6 +503,7 @@ class Text(CallsTest):
                 minute += 1
         self.seed(lines)
         out = self.ok("budget", "calls").stdout
+        self.assertIn("COMMAND", out)
         start = out.index("COMMAND")
         rows = []
         for row in out[start:].splitlines()[1:]:
@@ -460,7 +523,7 @@ class Text(CallsTest):
         self.assertEqual(p.stdout, "No gh calls logged in the last 24 h.\n")
         self.assertEqual(p.stderr, "")
 
-        h = this_hour()
+        h = self.this_hour()
         self.seed([call(h - dt.timedelta(hours=7), "harness-pr", "pr view", "graphql", ticket=130),
                    (stamp(h)[:10], "not json")])
         p = self.ok("budget", "calls", "--hours", "6")    # only an older line and a bad one
@@ -493,7 +556,7 @@ class Args(CallsTest):
                                  f"No gh calls logged in the last {value} h.\n")
 
     def test_makes_no_gh_call(self):
-        b0 = this_hour() - dt.timedelta(hours=2)
+        b0 = self.this_hour() - dt.timedelta(hours=2)
         self.seed([call(b0 + dt.timedelta(minutes=5), "harness-pr", "pr view", "graphql", ticket=130),
                    call(b0 + dt.timedelta(minutes=6), "harness-work", "run list", "rest")])
         files = self.day_file_texts()
@@ -510,7 +573,7 @@ class Args(CallsTest):
         self.assertFalse(os.path.exists(self.budgets_path()))
 
     def test_budgets_are_left_alone(self):
-        until = stamp(dt.datetime.now(UTC) + dt.timedelta(hours=3))
+        until = stamp(self.clock + dt.timedelta(hours=3))     # exhausted by the pinned clock
         text = json.dumps({"api": {"exhausted_until": until, "reason": "billing"},
                            "cloud": {"exhausted_until": None, "reason": ""}})
         write(self.budgets_path(), text)

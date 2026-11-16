@@ -4,7 +4,7 @@
 - Keep replies short. For code changes I will review inline, show before/after snippets of the changed lines rather than whole files.
 - I am on macOS with zsh, Homebrew and VS Code. macOS ships BSD `sed`, `grep` and `date`: no `grep -P`, `sed -i` needs `''`, and `date -d` does not exist. There is no bare `python`, only `python3` or the project's own interpreter.
 - When you finish a task, show the evidence (the command you ran and its result) and say plainly what you could not verify.
-- Ask before adding dependencies or doing anything else hard to undo, except what the loop below allows. Never put a secret on a command line; read it from the environment, a file or the keychain.
+- Ask before adding dependencies or doing anything else hard to undo, except what the loop below allows; a destructive local command runs after an automatic backup kept 14 days, and `harness-work backup list` and `harness-work backup restore <id>` undo it. Never put a secret on a command line; read it from the environment, a file or the keychain.
 
 ## The board is the context
 

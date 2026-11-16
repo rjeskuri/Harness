@@ -58,6 +58,24 @@ Choices #328 leaves open, fixed here:
   the restore stored applies with `git stash apply` next to the session's own uncommitted edits.
 - ITEMS in `backup list` is the items plus the refs, in the table; `--json` prints the refs as the manifest holds them.
 
+sweep(main, *, days=14, now=None) (ticket #329) removes each <store>/<id> whose id's UTC time is more than `days`
+before `now` (default: the current time) from the global store, whoever took the snapshot, and, with `main`, from
+main's in-project store, and deletes main's refs under refs/harness-backup/<id>/ by the same rule (made here with
+`git update-ref`, packed and loose). Choices the ticket leaves open, fixed here:
+- It returns each removed folder or link by its path in the store and each deleted ref by its full name, once each
+  (compared sorted, a path by its real parent and its own name).
+- The id's time decides, never the manifest's `at`; an id folder without a manifest (an unfinished snapshot) goes by
+  its id too; a snapshot whose copy holds read-only folders goes whole; `now` may carry any UTC offset.
+- main's in-project store is swept whatever its patterns say now; with `main` None no project store and no
+  repository's refs are touched, whatever the cwd.
+- Only a name that is a whole id is touched: a folder or file named like a near-id (`.bak`, upper-case hex, 5 or 7
+  hex digits, a prefix) or not like one, and an id one level down, stay, in a store and among refs
+  (refs/harness-backups/, refs/heads/<id-like>). An old id that is a symlink goes as a link; its target stays.
+- Ruling on #329: a name with the id's pattern but no real UTC time (`20261399T250000Z-abcdef`, 29 February 2026,
+  year 0) is not an id: never removed, as a folder or as refs/harness-backup/<it>/x, and the sweep goes on.
+- What cannot be removed (a ref under another git's lock, a snapshot in a read-only store) costs only itself: the
+  sweep removes the rest, leaves it out of what it returns and raises nothing.
+
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_backups.py" -v
 """
 from __future__ import annotations
@@ -1151,6 +1169,353 @@ class Refs(BackupTest):
         listed = {x["id"]: x for x in self.ok_json("backup", "list", cwd=main)}
         for m, _count in made:
             self.assertEqual(listed[m["id"]]["refs"], m["refs"])
+
+
+# ================================================================ sweep (#329)
+DAY = dt.timedelta(days=1)
+HOUR = dt.timedelta(hours=1)
+# The id's pattern but no real UTC time (ruling on #329: not an id, never removed); the first two sort before
+# every real id, so a sweep that stops at one would leave the old ids after it.
+NOT_TIMES = ["00000000T000000Z-abcdef", "19991232T000000Z-abcdef", "20260229T120000Z-abcdef",
+             "20261399T250000Z-abcdef"]
+
+
+def stamp(when):
+    """The id's time part for `when`: its UTC second."""
+    return when.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+@contextlib.contextmanager
+def inside(folder):
+    """The process's cwd at `folder` for the duration."""
+    before = os.getcwd()
+    os.chdir(folder)
+    try:
+        yield
+    finally:
+        os.chdir(before)
+
+
+class Sweep(BackupTest):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(self.open_up, self.tmp)     # runs before the rmtree: read-only folders can go too
+
+    @staticmethod
+    def open_up(root):
+        for folder, dirs, _files in os.walk(root):
+            for name in dirs:
+                path = os.path.join(folder, name)
+                if not os.path.islink(path):
+                    os.chmod(path, 0o700)
+
+    # ----------------------------------------------------------- fixtures
+    def new_id(self, when):
+        return f"{stamp(when)}-{self.rng.getrandbits(24):06x}"
+
+    def folder_of(self, sid, main):
+        for store in ([self.project_store(main)] if main else []) + [self.global_store()]:
+            if os.path.isdir(os.path.join(store, sid)):
+                return os.path.join(store, sid)
+        self.fail(f"no store holds {sid}")
+
+    def snap(self, main, age, *, cwd=None, env=None):
+        """A real snapshot (create) of one new file, its id `age` before self.now; its folder in the store."""
+        cwd = cwd or main or self.mk("loose")
+        path = os.path.join(cwd, f"victim-{self.word()}.txt")
+        self.put(path)
+        m = self.create([path], main=main, cwd=cwd, now=self.now - age, env=env)
+        return self.folder_of(m["id"], main)
+
+    def raw(self, store, sid, at=None):
+        """A snapshot folder written by hand: files/0, and a manifest whose `at` is `at` (none when None)."""
+        folder = os.path.join(store, sid)
+        os.makedirs(folder, 0o700)
+        self.put(os.path.join(folder, "files", "0"))
+        if at is not None:
+            manifest = {"id": sid, "at": at.strftime("%Y-%m-%dT%H:%M:%SZ"), "repo": None, "cwd": self.tmp,
+                        "command": "rm -rf x", "session": None, "sensitive": False,
+                        "items": [{"path": os.path.join(self.tmp, "x"), "copy": "files/0", "kind": "file",
+                                   "bytes": 1}], "refs": []}
+            with open(os.path.join(folder, "manifest.json"), "w", encoding="utf-8") as fh:
+                json.dump(manifest, fh)
+        return folder
+
+    def backup_ref(self, repo, sid, rest="0", cwd=None):
+        name = f"refs/harness-backup/{sid}/{rest}"
+        self.git(cwd or repo, "update-ref", name, "HEAD")
+        return name
+
+    def all_refs(self, repo):
+        return set(self.git(repo, "for-each-ref", "--format=%(refname)").splitlines())
+
+    @staticmethod
+    def listing(store):
+        return set(os.listdir(store)) if os.path.isdir(store) else set()
+
+    @staticmethod
+    def spelled(entry):
+        """A removed ref by its full name; a removed folder or link by its real parent and its own name."""
+        if entry.startswith("refs/"):
+            return entry
+        entry = entry.rstrip(os.sep)
+        return os.path.join(real(os.path.dirname(entry)), os.path.basename(entry))
+
+    def sweep(self, main, env=None, **kwargs):
+        """backups.sweep(main, **kwargs) with this test's environment; what it returned, spelled and sorted."""
+        with self.lib(env) as backups:
+            removed = backups.sweep(main, **kwargs)
+        self.assertIsInstance(removed, list)
+        for entry in removed:
+            self.assertIsInstance(entry, str)
+        return sorted(self.spelled(entry) for entry in removed)
+
+    # ----------------------------------------------------------- tests
+    def test_sweep_removes_only_snapshots_older_than_14_days(self):
+        main, other = self.make_repo("proj"), self.make_repo("other")
+        store = self.global_store()
+        ages = {}                                   # folder name in the global store -> its id's age at self.now
+        older = [14 * DAY + HOUR, 15 * DAY, 30 * DAY, 400 * DAY]
+        younger = [14 * DAY - HOUR, 13 * DAY, 3 * DAY + HOUR, 3 * DAY - HOUR, DAY, dt.timedelta(0),
+                   -DAY, -10 * DAY]                 # the last two: taken while the clock ran ahead
+        older += [dt.timedelta(seconds=self.rng.randint(14 * 86400 + 7200, 120 * 86400)) for _ in range(3)]
+        younger += [dt.timedelta(seconds=self.rng.randint(60, 14 * 86400 - 7200)) for _ in range(3)]
+        owners = [main, other, None]                # the global store is swept whole, whoever took the snapshot
+        for k, age in enumerate(older + younger):
+            ages[os.path.basename(self.snap(owners[k % 3], age))] = age
+        # A copy of a read-only tree is removed whole.
+        vendor = os.path.join(main, "vendor")
+        self.put(os.path.join(vendor, "pkg", "mod.go"), mode=0o444)
+        os.chmod(os.path.join(vendor, "pkg"), 0o555)
+        m = self.create([vendor], main=main, cwd=main, now=self.now - 20 * DAY)
+        self.assertEqual(mode(os.path.join(store, m["id"], "files", "0", "pkg")), 0o555)
+        ages[m["id"]] = 20 * DAY
+        # The id's time decides, never the manifest's `at`; a folder with no manifest (unfinished) goes by its id.
+        for age, at_age in ((20 * DAY, DAY), (DAY, 20 * DAY), (20 * DAY, None), (DAY, None)):
+            sid = self.new_id(self.now - age)
+            self.raw(store, sid, None if at_age is None else self.now - at_age)
+            ages[sid] = age
+        self.assertEqual(self.listing(store), set(ages))
+
+        left = set(ages)
+        for label, kwargs, shift, days in (("the defaults", {}, dt.timedelta(0), 14),
+                                           ("days=3", {"days": 3, "now": self.now}, dt.timedelta(0), 3),
+                                           ("now 20 days on", {"now": self.now + 20 * DAY}, 20 * DAY, 14)):
+            gone = {n for n in left if ages[n] + shift > days * DAY}
+            left -= gone
+            self.assertTrue(gone and left, label)   # each pass removes some and keeps some
+            removed = self.sweep(main, **kwargs)
+            self.assertEqual(removed, sorted(os.path.join(real(store), n) for n in gone), f"{label} (seed {self.seed})")
+            self.assertEqual(self.listing(store), left, f"{label} (seed {self.seed})")
+
+        # `now` with any UTC offset is the same instant.
+        kept = self.snap(main, 14 * DAY - 5 * HOUR)
+        east_gone = self.snap(other, 14 * DAY + 5 * HOUR)
+        removed = self.sweep(main, now=self.now.astimezone(dt.timezone(dt.timedelta(hours=9))))
+        self.assertEqual(removed, [self.spelled(east_gone)])
+        west_gone = self.snap(None, 14 * DAY + 5 * HOUR)
+        removed = self.sweep(main, now=self.now.astimezone(dt.timezone(dt.timedelta(hours=-9))))
+        self.assertEqual(removed, [self.spelled(west_gone)])
+        self.assertEqual(self.listing(store), left | {os.path.basename(kept)})
+
+    def test_sweep_deletes_old_backup_refs_in_this_repo_only(self):
+        main, other = self.make_repo("proj"), self.make_repo("other")
+        wt = self.add_worktree(main, "t-5-wt")
+        ages, refs = {}, {}                         # id -> its age at self.now, id -> its refs
+        older = [15 * DAY, 14 * DAY + HOUR, 90 * DAY]
+        younger = [13 * DAY, 14 * DAY - HOUR, 2 * DAY, 12 * HOUR, HOUR]
+        older += [dt.timedelta(seconds=self.rng.randint(14 * 86400 + 7200, 120 * 86400)) for _ in range(2)]
+        younger += [dt.timedelta(seconds=self.rng.randint(60, 14 * 86400 - 7200)) for _ in range(2)]
+        for k, age in enumerate(older + younger):
+            sid = self.new_id(self.now - age)
+            ages[sid] = age
+            refs[sid] = [self.backup_ref(main, sid, rest) for rest in (("0", "1", "tree/deep") if k % 3 == 0 else ("0",))]
+        self.git(main, "pack-refs", "--all")        # packed and loose refs both
+        for age in (20 * DAY, 4 * DAY):             # made from a linked worktree: the same refs
+            sid = self.new_id(self.now - age)
+            ages[sid], refs[sid] = age, [self.backup_ref(main, sid, cwd=wt)]
+        oldest = stamp(self.now - 400 * DAY)
+        decoys = [f"refs/harness-backup/{oldest}-ABCDEF/0", f"refs/harness-backup/{oldest}-abcdef.bak/0",
+                  f"refs/harness-backup/{oldest}-abcde/0", "refs/harness-backup/not-an-id/0",
+                  f"refs/harness-backup/x/{oldest}-abcdef/0", f"refs/harness-backups/{oldest}-abcdef/0",
+                  f"refs/backup/{oldest}-abcdef/0", f"refs/heads/{oldest}-abcdef", f"refs/tags/{oldest}-abcdef"]
+        decoys += [f"refs/harness-backup/{name}/x" for name in NOT_TIMES]
+        for name in decoys:
+            self.git(main, "update-ref", name, "HEAD")
+        other_old = self.backup_ref(other, self.new_id(self.now - 30 * DAY))
+        other_new = self.backup_ref(other, self.new_id(self.now - DAY))
+        main_refs, other_refs = self.all_refs(main), self.all_refs(other)
+
+        def older_than(days):
+            """The refs of each id left whose age is more than `days` days; those ids leave the tables."""
+            out = set()
+            for sid in [s for s in ages if ages[s] > days * DAY]:
+                del ages[sid]
+                out |= set(refs.pop(sid))
+            return out
+
+        self.assertTrue({name for names in refs.values() for name in names} <= main_refs)
+        gone = older_than(14)
+        removed = self.sweep(main, now=self.now)
+        self.assertEqual(removed, sorted(gone), f"seed {self.seed}")
+        main_refs -= gone
+        self.assertEqual(self.all_refs(main), main_refs, f"seed {self.seed}")
+        self.assertEqual(self.all_refs(other), other_refs, "another repository's refs were touched")
+
+        gone = older_than(1)
+        self.assertTrue(gone and refs)
+        removed = self.sweep(main, days=1, now=self.now)
+        self.assertEqual(removed, sorted(gone), f"seed {self.seed}")
+        main_refs -= gone
+        self.assertEqual(self.all_refs(main), main_refs, f"seed {self.seed}")
+        self.assertTrue(set(decoys) <= main_refs)
+
+        # Without a repository no repository's refs go, whatever the cwd; then the other repository's own sweep.
+        with inside(main):
+            self.assertEqual(self.sweep(None, now=self.now + 400 * DAY), [])
+        self.assertEqual(self.all_refs(main), main_refs)
+        self.assertEqual(self.all_refs(other), other_refs)
+        self.assertEqual(self.sweep(other, now=self.now), [other_old])
+        self.assertEqual(self.all_refs(other), other_refs - {other_old})
+        self.assertIn(other_new, self.all_refs(other))
+        self.assertEqual(self.all_refs(main), main_refs)
+
+    def test_sweep_never_touches_other_names_or_link_targets(self):
+        main = self.make_repo("proj")
+        store = self.global_store()
+        old_snap, new_snap = self.snap(main, 15 * DAY), self.snap(main, DAY)
+        oldest = stamp(self.now - 400 * DAY)
+        # Names that are not snapshot ids, however old they look: folders and files.
+        decoy_dirs = [f"{oldest}-abcdef.bak", f"{oldest}-ABCDEF", f"{oldest}-abcde", f"{oldest}-abcdef0",
+                      f"x{oldest}-abcdef", oldest, "notes", ".harness-backup-tmp"] + NOT_TIMES
+        decoy_files = [f"{oldest}-abcdef.json", ".DS_Store", "README"]
+        for name in decoy_dirs:
+            self.put(os.path.join(store, name, "manifest.json"), data=b"{}\n")
+            self.put(os.path.join(store, name, "files", "0"))
+        self.put(os.path.join(store, "notes", f"{oldest}-aaaaaa", "inner.txt"))     # an old id one level down
+        for name in decoy_files:
+            self.put(os.path.join(store, name))
+        # Old and new ids that are symlinks: to a folder outside, to a folder in the project.
+        outside = self.mk("outside")
+        self.put(os.path.join(outside, "linked-old", "files", "0"))
+        self.put(os.path.join(outside, "linked-old", f"{oldest}-bbbbbb", "deep.bin"))
+        self.put(os.path.join(outside, "linked-new", "files", "0"), mode=0o600)
+        src = os.path.join(main, "src")
+        self.put(os.path.join(src, "app.py"))
+        self.put(os.path.join(src, "lib", "util.py"))
+        links = {self.new_id(self.now - 20 * DAY): os.path.join(outside, "linked-old"),
+                 self.new_id(self.now - 30 * DAY): src}
+        new_link, new_target = self.new_id(self.now - 2 * DAY), os.path.join(outside, "linked-new")
+        for sid, target in list(links.items()) + [(new_link, new_target)]:
+            os.symlink(target, os.path.join(store, sid))
+        decoys = decoy_dirs + decoy_files
+        before = {n: tree(os.path.join(store, n)) for n in decoys}
+        targets = {p: tree(p) for p in (outside, src)}
+
+        removed = self.sweep(main, now=self.now)
+        self.assertEqual(removed, sorted([self.spelled(old_snap)] + [os.path.join(real(store), s) for s in links]))
+        for sid in links:
+            self.assertFalse(os.path.lexists(os.path.join(store, sid)), "an old symlinked id is still there")
+        self.assertEqual({p: tree(p) for p in targets}, targets, "the sweep followed a symlink")
+        self.assertEqual(os.readlink(os.path.join(store, new_link)), new_target)
+        self.assertEqual({n: tree(os.path.join(store, n)) for n in decoys}, before)
+        self.assertEqual(self.listing(store), set(decoys) | {os.path.basename(new_snap), new_link})
+
+        # However far on the clock is, a name that is not an id stays; a new id's link goes as a link.
+        removed = self.sweep(main, now=self.now + 1000 * DAY)
+        self.assertEqual(removed, sorted([self.spelled(new_snap), os.path.join(real(store), new_link)]))
+        self.assertEqual({p: tree(p) for p in targets}, targets, "the sweep followed a symlink")
+        self.assertEqual({n: tree(os.path.join(store, n)) for n in decoys}, before)
+        self.assertEqual(self.listing(store), set(decoys))
+
+    def test_sweep_covers_the_in_project_store(self):
+        vault = self.make_repo("vault")
+        self.commit_settings(vault, {"HARNESS_SENSITIVE_PATHS": "secrets/**"})
+        wt = self.add_worktree(vault, "t-9-wt")
+        store, everyone = self.project_store(vault), self.global_store()
+        ages = {}
+
+        def snap(main, age, **kw):
+            folder = self.snap(main, age, **kw)
+            ages[folder] = age
+            return folder
+
+        v_old = [snap(vault, 15 * DAY), snap(vault, 30 * DAY), snap(vault, 15 * DAY, cwd=wt)]
+        v_new = [snap(vault, 13 * DAY), snap(vault, HOUR), snap(vault, 2 * DAY, cwd=wt)]
+        self.assertEqual({os.path.dirname(f) for f in v_old + v_new}, {store})
+        oldest = stamp(self.now - 400 * DAY)
+        self.put(os.path.join(store, f"{oldest}-abcdef.bak", "files", "0"))
+        self.put(os.path.join(store, "notes.txt"))
+        decoys = {f"{oldest}-abcdef.bak", "notes.txt"}
+        plain = self.make_repo("plain")
+        g_old, g_new = snap(plain, 15 * DAY), snap(None, 13 * DAY)
+        marked = {"HARNESS_SENSITIVE_PATHS": "*.txt"}
+        vault2 = self.make_repo("vault2")
+        o_old, o_new = snap(vault2, 20 * DAY, env=marked), snap(vault2, 13 * DAY, env=marked)
+        self.assertEqual({os.path.dirname(o_old), os.path.dirname(o_new)}, {self.project_store(vault2)})
+
+        def names(folders):
+            return {os.path.basename(f) for f in folders}
+
+        removed = self.sweep(vault, now=self.now)
+        self.assertEqual(removed, sorted(self.spelled(f) for f in v_old + [g_old]))
+        self.assertEqual(self.listing(store), names(v_new) | decoys)
+        self.assertEqual(self.listing(everyone), names([g_new]))
+        self.assertEqual(self.listing(self.project_store(vault2)), names([o_old, o_new]), "another project's store")
+
+        # Without a repository: the global store only, never a project's, whatever the cwd.
+        v_late, g_late = snap(vault, 15 * DAY), snap(None, 15 * DAY)
+        with inside(vault):
+            removed = self.sweep(None, now=self.now)
+        self.assertEqual(removed, [self.spelled(g_late)])
+        self.assertEqual(self.listing(store), names(v_new + [v_late]) | decoys)
+        self.assertEqual(self.listing(self.project_store(vault2)), names([o_old, o_new]))
+
+        # A project's own store is swept whatever its patterns say now (vault2's marking is gone here).
+        self.assertEqual(self.sweep(vault2, now=self.now), [self.spelled(o_old)])
+        self.assertEqual(self.listing(self.project_store(vault2)), names([o_new]))
+
+        # `days` holds for both stores.
+        swept = [f for f in v_new + [v_late, g_new] if ages[f] > DAY]
+        removed = self.sweep(vault, days=1, now=self.now)
+        self.assertEqual(removed, sorted(self.spelled(f) for f in swept))
+        self.assertEqual(self.listing(store), names([f for f in v_new if ages[f] <= DAY]) | decoys)
+        self.assertEqual(self.listing(everyone), set())
+
+    def test_sweep_goes_on_past_what_it_cannot_remove(self):
+        """A ref git cannot delete, a store it cannot empty, a name that is no real time: each costs only itself;
+        the sweep goes on, returns what it did remove and raises nothing."""
+        vault = self.make_repo("vault")
+        self.commit_settings(vault, {"HARNESS_SENSITIVE_PATHS": "secrets/**"})
+        store, everyone = self.project_store(vault), self.global_store()
+        g_old = [self.snap(None, 20 * DAY), self.snap(None, 15 * DAY)]
+        g_new = self.snap(None, DAY)
+        v_old = [self.snap(vault, 25 * DAY), self.snap(vault, 15 * DAY)]
+        v_new = self.snap(vault, 2 * DAY)
+        for name in NOT_TIMES:
+            self.put(os.path.join(store, name, "files", "0"))
+            self.put(os.path.join(everyone, name, "files", "0"))
+            self.git(vault, "update-ref", f"refs/harness-backup/{name}/x", "HEAD")
+        # Old refs on both sides of one whose lock another git holds (ids sort by time).
+        first = self.backup_ref(vault, self.new_id(self.now - 30 * DAY))
+        locked = self.backup_ref(vault, self.new_id(self.now - 20 * DAY))
+        last = self.backup_ref(vault, self.new_id(self.now - 15 * DAY))
+        self.backup_ref(vault, self.new_id(self.now - DAY))
+        with open(os.path.join(vault, ".git", locked + ".lock"), "w", encoding="utf-8"):
+            pass
+        stuck = os.geteuid() != 0                   # a read-only store binds everyone but root
+        if stuck:
+            os.chmod(everyone, 0o500)               # open_up gives it back before the cleanup
+        refs_before = self.all_refs(vault)
+
+        removed = self.sweep(vault, now=self.now)
+
+        gone = v_old + ([] if stuck else g_old)
+        self.assertEqual(removed, sorted([self.spelled(f) for f in gone] + [first, last]))
+        self.assertEqual(self.all_refs(vault), refs_before - {first, last})
+        self.assertEqual(self.listing(store), {os.path.basename(v_new)} | set(NOT_TIMES))
+        kept = [g_new] + (g_old if stuck else [])
+        self.assertEqual(self.listing(everyone), {os.path.basename(f) for f in kept} | set(NOT_TIMES))
 
 
 if __name__ == "__main__":

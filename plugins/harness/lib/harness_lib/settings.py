@@ -15,7 +15,7 @@ import os
 import subprocess
 
 from harness_lib.paths import canonical_path
-from harness_lib.repo import main_checkout
+from harness_lib.repo import TIMEOUT as CHECKOUT_TIMEOUT, main_checkout
 
 GIT_TIMEOUT = 10  # seconds committed_env's git show may take
 # The defaults of HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT when a project sets none: the one
@@ -87,19 +87,19 @@ def claude_project_dir():
     return os.environ.get("CLAUDE_PROJECT_DIR") or None
 
 
-def other_project(main):
+def other_project(main, timeout=CHECKOUT_TIMEOUT):
     """Is the session another project's? The session's project is HARNESS_SESSION_PROJECT (which
     session_brief exports through CLAUDE_ENV_FILE to the session's Bash calls), else
     CLAUDE_PROJECT_DIR (set for hook processes only), a blank one counting as unset. True when
     it names a folder whose main checkout is not `main` (a canonical main checkout, as repo_facts
-    gives it): another repository, a folder outside any repository, or one git cannot read. Both
-    unset or blank, the main checkout itself (any spelling), a worktree of it or a folder inside
-    one: False."""
+    gives it): another repository, a folder outside any repository, or one git cannot read within
+    `timeout` seconds (main_checkout's). Both unset or blank, the main checkout itself (any
+    spelling), a worktree of it or a folder inside one: False."""
     project = ((os.environ.get("HARNESS_SESSION_PROJECT") or "").strip()
                or (os.environ.get("CLAUDE_PROJECT_DIR") or "").strip())
     if not project or canonical_path(project) == main:
         return False
-    return main_checkout(project) != main
+    return main_checkout(project, timeout=timeout) != main
 
 
 def project_setting(name, file_env, foreign):
