@@ -4,13 +4,13 @@
 - Keep replies short. For code changes I will review inline, show before/after snippets of the changed lines rather than whole files.
 - I am on macOS with zsh, Homebrew and VS Code. macOS ships BSD `sed`, `grep` and `date`: no `grep -P`, `sed -i` needs `''`, and `date -d` does not exist. There is no bare `python`, only `python3` or the project's own interpreter.
 - When you finish a task, show the evidence (the command you ran and its result) and say plainly what you could not verify.
-- Ask before adding dependencies or doing anything else hard to undo, except what the loop below allows. Never put a secret on a command line; read it from the environment, a file or the keychain.
+- Ask before adding dependencies or doing anything else hard to undo, except what the loop below allows; a destructive local command runs after an automatic backup kept 14 days, and `harness-work backup list` and `harness-work backup restore <id>` undo it. Never put a secret on a command line; read it from the environment, a file or the keychain.
 
 ## The board is the context
 
 - Ticketed work is a GitHub issue on the project's board: an epic with task sub-issues, each with a request, an outline, a definition of done and the tests that must pass. Read the ticket (`harness-board show N --markdown`) and its epic before working; status changes go through `harness-board`.
 - A question the ticket, the epic and the code cannot answer becomes `harness-board needs-input N --question ...` when it is about product behavior, is hard to undo, or touches security, credentials or personal data. A reversible implementation choice is decided and recorded as a `Ruling:` line under `### Rulings` in the PR's Notes. I answer on the ticket; the next `/harness:work N` reads the answer.
-- New work: `/harness:plan <request>`. Tickets to pull requests: `/harness:work [N]`. I land every pull request, with `/harness:land [PR#]` or by approving the land prompt; a session pushes `t/*` branches and opens PRs without asking but never merges. A quick fix outside a ticket goes on a branch too (`git switch -c t/<n>-<slug>`).
+- New work: `/harness:plan <request>`. Tickets to pull requests: `/harness:work [N]`. The loop lands a `risk:low` ticket's PR with `harness-pr land` once its branch is current with main and green and its high and medium findings are fixed, a `risk:high` one waits for my `/harness:land`, and a session merges no other way. A session pushes `t/*` branches and opens PRs without asking. A quick fix outside a ticket goes on a branch too (`git switch -c t/<n>-<slug>`).
 
 ## Tests first
 

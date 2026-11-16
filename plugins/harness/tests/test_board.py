@@ -27,6 +27,8 @@ TOOL = os.path.join(os.path.dirname(HERE), "bin", "harness-board")
 FAKEGH = os.path.join(HERE, "fakegh.py")
 GIT = shutil.which("git")
 REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
+# The gh login show keeps comments from (#334: the owner's, the harness's under the same login, and the bot's).
+OWNER = {"match": ["api", "user"], "stdout": "rjeskuri\n"}
 MARK = "\n\n<!-- harness -->"      # the last line of every comment harness-board posts
 # The five routing settings (docs/design.md, Settings): dropped from the inherited environment like HARNESS_PROJECT.
 ROUTING_KEYS = ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER", "HARNESS_ULTRAREVIEW",
@@ -406,6 +408,7 @@ class Show(BoardTest):
             {"match": ["issue", "view", "12"], "stdout_json": data},
             {"match": ["issue", "view", "3", "--json", "number,title,body"],
              "stdout_json": {"number": 3, "title": "Board v2", "body": EPIC_BODY}},
+            OWNER,
         ])
 
     def test_sections_are_parsed_and_the_cache_written(self):
@@ -497,7 +500,7 @@ class Show(BoardTest):
                 {"number": 13, "title": "Wire it", "state": "closed", "labels": [{"name": "task"}]}]
         closed = issue(number=13, title="Wire it", labels=("task",), state="CLOSED",       # landed before Resolutions
                        comments=[comment("rjeskuri", "2026-10-11T09:00:00Z", "Landed in abc123\n\n<!-- harness -->")])
-        self.scenario([REPO_VIEW, {"match": ["issue", "view", "3"], "stdout_json": epic},
+        self.scenario([REPO_VIEW, OWNER, {"match": ["issue", "view", "3"], "stdout_json": epic},
                        {"match": ["api", "repos/o/r/issues/3/sub_issues?per_page=100"], "stdout_json": subs},
                        {"match": ["issue", "view", "13"], "stdout_json": closed},
                        {"contains": ["repos/o/r/issues/13/comments"], "stdout_json": [
@@ -585,7 +588,7 @@ class ShowResolution(BoardTest):
                     comment("rjeskuri", "2026-10-10T12:00:00Z", "PR #34 opened\n\n<!-- harness -->"),
                     comment("rjeskuri", "2026-10-11T09:00:00Z", res),
                     comment("rjeskuri", "2026-10-11T09:01:00Z", "Landed in abc123\n\n<!-- harness -->")]
-        comments += [comment("pal", f"2026-10-12T{10 + i:02d}:00:00Z", f"later note {i}") for i in range(chatter)]
+        comments += [comment("rjeskuri", f"2026-10-12T{10 + i:02d}:00:00Z", f"later note {i}") for i in range(chatter)]
         return issue(number=number, title=title or f"Task {number}", state="CLOSED",
                      labels=("task", "size:M", "risk:low"), comments=comments,
                      parent={"number": 3, "title": "Board v2", "url": "https://github.com/o/r/issues/3"})
@@ -593,7 +596,7 @@ class ShowResolution(BoardTest):
     def comment_calls(self, number, data):
         """gh answers for a task's comments however show asks: issue view (any fields) or the REST endpoint."""
         rest = [{"body": c["body"], "user": c["author"], "created_at": c["createdAt"]} for c in data["comments"]]
-        return [{"match": ["issue", "view", str(number)], "stdout_json": data},
+        return [OWNER, {"match": ["issue", "view", str(number)], "stdout_json": data},
                 {"contains": [f"repos/o/r/issues/{number}/comments"], "stdout_json": rest},
                 {"contains": [f"repos/o/r/issues/{number}/comments?per_page=100"], "stdout_json": rest}]
 
@@ -667,7 +670,8 @@ class ShowResolution(BoardTest):
                     if k < len(passes) - 1:
                         comments.append(comment("rjeskuri", f"2026-10-0{7 + k}T12:00:00Z",
                                                 f"Reopened after pass {k + 1}: it broke the hooks."))
-                comments += [comment("pal", f"2026-10-12T{10 + i:02d}:00:00Z", f"later note {i}") for i in range(10)]
+                comments += [comment("rjeskuri", f"2026-10-12T{10 + i:02d}:00:00Z", f"later note {i}")
+                             for i in range(10)]
                 data = issue(number=12, state="CLOSED", labels=("task", "size:M", "risk:low"), comments=comments,
                              parent={"number": 3, "title": "Board v2", "url": "https://github.com/o/r/issues/3"})
                 self.scenario([self.parent_call()] + self.comment_calls(12, data))
@@ -717,7 +721,7 @@ class ShowResolution(BoardTest):
                 comments.append(comment("rjeskuri", f"2026-10-0{1 + k}T09:01:00Z",
                                         f"Landed in {sha}\n\n<!-- harness -->"))
         if others is None:
-            others = [comment("pal", f"2026-10-12T{10 + i:02d}:00:00Z", f"later note {i}") for i in range(10)]
+            others = [comment("rjeskuri", f"2026-10-12T{10 + i:02d}:00:00Z", f"later note {i}") for i in range(10)]
         data = issue(number=12, state="CLOSED", labels=("task", "size:M", "risk:low"), body=body,
                      comments=comments + list(others),
                      parent={"number": 3, "title": "Board v2", "url": "https://github.com/o/r/issues/3"})
@@ -777,8 +781,8 @@ class ShowResolution(BoardTest):
         section and the Comments section holds the three others only."""
         passes = [RES_13_STALE, RES_12]
         others = [comment("rjeskuri", "2026-10-09T09:00:00Z", "Reopened: it broke the hooks."),
-                  comment("pal", "2026-10-12T10:00:00Z", "Looks right now."),
-                  comment("pal", "2026-10-12T11:00:00Z", "Thanks.")]
+                  comment("rjeskuri", "2026-10-12T10:00:00Z", "Looks right now."),
+                  comment("rjeskuri", "2026-10-12T11:00:00Z", "Thanks.")]
         lines = self.reopened_ticket(passes, 3, others=others, landed=False)
         md = "\n".join(lines)
         self.assertEqual([self.printed(lines, res) for res in passes], ["whole", "whole"], md)

@@ -11,6 +11,13 @@ import unittest
 
 from guards_support import *  # noqa: F401,F403
 
+# #292: the denial of a red record without a failure kind, word for word as docs/design.md's
+# tests_first step 4 quotes it: like the stale denial (CHANGED), it names reprove.
+NO_KIND = (
+    "The red record for t/12 does not say how the tests failed; run harness-red check "
+    "again, or harness-red reprove once the branch has source changes."
+)
+
 
 # ---------------------------------------------------------------- tests_first.py
 
@@ -220,9 +227,8 @@ class TestsFirstTests(GuardTestCase):
                 else:
                     record["kind"] = kind
                 self.write(record_path, json.dumps(record))
-                reason = self.edit("src/app.py", "harness:coder")
-                self.assertIsNotNone(reason)
-                self.assertIn("does not say how the tests failed", reason)
+                self.assertEqual(self.edit("src/app.py", "harness:coder"), NO_KIND)
+                self.assertEqual(self.edit("src/app.py"), NO_KIND)  # the main session too
         for kind in ("assertion", "import", "error"):
             with self.subTest(kind=kind):
                 record["kind"] = kind

@@ -459,7 +459,9 @@ def _conversation(main, slug, pr):
     return threads, said, (f"more {', '.join(cut)} than one page holds" if cut else None)
 
 
-def _behind(main, slug, head):
+def behind_main(main, slug, head):
+    """How many commits of main the commit `head` lacks (GitHub's compare of main with it); harness-pr land asks
+    it too."""
     args = ["api", f"repos/{slug}/compare/main...{head}", "--jq", ".behind_by"]
     out = gh(args, main).strip()
     if not out.isdigit():
@@ -509,7 +511,7 @@ def _gather(main, slug, pr, facts):
     commits = _pages(["api", "--paginate", f"repos/{slug}/pulls/{pr}/commits"], main)
     (facts["unresolved_threads"], facts["owner_comments"],
      facts["conversation_truncated"]) = _conversation(main, slug, pr)
-    facts["behind_by"] = _behind(main, slug, head)
+    facts["behind_by"] = behind_main(main, slug, head)
     if review is None:
         facts["review"] = None
     else:

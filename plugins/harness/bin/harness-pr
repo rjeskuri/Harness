@@ -2,7 +2,7 @@
 """
 Pull requests for tickets: open a draft PR from a ticket worktree, post the reviewer's findings inline, wait on
 the checks, mark it ready, read the comments, list the PRs awaiting the user, run ultrareview, and land it
-(squash merge, then the worktree, the branch, the main checkout and the ticket).
+(squash merge, then the worktree, the branch, the main checkout, the ticket and the project's canary).
 
 Usage:
     harness-pr open N [--worktree PATH] [--verify-log F] [--review F] [--notes F] [--json]
@@ -21,14 +21,22 @@ Usage:
 revert undoes a landed PR on main through the main checkout (on main, no tracked changes, no commit origin/main lacks
 but this revert; fetched and fast-forwarded first): `git revert --no-edit` of its merge commit and `git push origin main` (a rejected push gets one
 `git pull --rebase`), an incident bug under the ticket's epic, the ticket reopened as needs-input, a notification.
-A step an earlier run did is skipped. autoland calls revert_landed() in-process; the work loop never runs it.
+A step an earlier run did is skipped. autoland, and land after a failed canary, call revert_landed() in-process.
 
-ready and land refuse a PR whose latest harness review (the newest review carrying the harness marker) has high
-or medium findings and no commit newer than it, naming those findings, and refuse when gh cannot tell. A finding
-without a recognisable severity counts as high; low findings never refuse, and ready names them in one warning
-line. When the review's summary counts more high plus medium findings than it lists, the refusal says how many
-more. --accept-findings on land is the only override; ready has none. land on a PR that is already merged skips
-the check.
+land, once it has pulled the main checkout, runs that checkout's scripts/smoke.sh there when it is an executable
+file, under HARNESS_SMOKE_TIMEOUT seconds (the environment, else the main checkout's .claude/settings.json `env`, else
+300), its whole process group killed at the limit. Exit 0 lands as before; 2 or the limit is one warning and a
+comment on each ticket; any other exit reverts the merge (revert_landed) and the land exits 1 naming the revert.
+
+ready refuses a PR whose latest harness review (the newest review carrying the harness marker) has high or
+medium findings and no commit newer than it, naming those findings, and refuses when gh cannot tell. land judges
+at the head (headRefOid) instead: it refuses a head behind main, a latest harness review that is not of the head
+or of a commit the head adds only clean merges of main to (autoland.at_head), and that review's high or medium
+findings whatever the commit dates; a failed read of these refuses too. A finding without a recognisable severity
+counts as high; low findings never refuse, and ready names them in one warning line. When the review's summary
+counts more high plus medium findings than it lists, the refusal says how many more. --accept-findings on land
+overrides only the findings (and a failed read of the review's inline comments); ready has no override. land on a
+PR that is already merged skips every check.
 
 findings splits a review by the files the ticket branch changed (`git diff --name-only` from the merge-base of HEAD
 and origin/main, else main): high and medium on a changed file block, low on one is low, anything else is outside.
@@ -63,6 +71,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import re
 import shutil
@@ -83,11 +92,13 @@ try:
     from harness_lib.notify import notify
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
-    from harness_lib.autoland import (CONVERSATION, check_entries as lib_check_entries, evaluate, fetch_origin,
-                                      gate_settings, gather_facts, overall, review_counts)
+    from harness_lib.canary import SMOKE, run_canary
+    from harness_lib.autoland import (CONVERSATION, at_head, behind_main, check_entries as lib_check_entries,
+                                      evaluate, fetch_origin, gate_settings, gather_facts, overall, review_counts)
     from harness_lib.routing import load_routing
     from harness_lib.reviews import (add_rulings, add_ticket, finding_key, latest_round, load_rounds, load_tickets,
                                      reviews_dir, save_round)
+    from harness_lib.settings import setting, settings_env
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -129,7 +140,7 @@ TOOL_TIMEOUT = 180
 ULTRA_MINUTES = 30
 EXHAUSTED_HOURS = 24
 DEFAULT_CHECKED = "the diff against the ticket's definition of done"
-LAND_FIELDS = "isDraft,mergeable,headRefName,closingIssuesReferences,statusCheckRollup,title,url,state"
+LAND_FIELDS = "isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state"
 RULING_LINE = re.compile(r"^[ \t]*(?:- )?(Ruling:.*\S)[ \t]*$", re.M)
 OUTSIDE_NOTE = "(outside the files this ticket changed)"
 SENTENCE_END = re.compile(r"[.!?](?= |$)")
@@ -140,6 +151,7 @@ INCIDENT = "incident"
 NEEDS_INPUT = "**Needs your input**"     # harness-board's needs-input comments start with it
 DEFAULT_REASON = "no reason given"
 EVIDENCE_TAIL_LINES = 40
+SMOKE_TIMEOUT = 300.0        # seconds it may take (HARNESS_SMOKE_TIMEOUT)
 
 
 def plural(n, word):
@@ -510,7 +522,9 @@ def render(template, values):
     return PLACEHOLDER.sub(lambda m: values.get(m.group(1), m.group(0)), template)
 
 
-def pr_body(number, ticket, red, verify_text, findings, notes=None):
+def pr_body(number, ticket, red, verify_text, findings, notes=None, review=None):
+    """The PR body from the template; `review`, when given, is an open PR's Review section text, kept in place of
+    the summary of `findings`."""
     sections = ticket.get("sections") if isinstance(ticket.get("sections"), dict) else {}
     dod = [str(x).strip() for x in sections.get("definition_of_done") or [] if str(x).strip()]
     tests = [str(x).strip() for x in sections.get("tests") or [] if str(x).strip()]
@@ -527,7 +541,7 @@ def pr_body(number, ticket, red, verify_text, findings, notes=None):
         else fence_safe(tail(red.get("tail"), RED_TAIL_LINES)) if red else "No red run recorded on this branch.",
         "verify_tail": fence_safe(tail(verify_text, VERIFY_TAIL_LINES)) if verify_text is not None
         else "No verify log attached.",
-        "review_summary": review_summary(findings),
+        "review_summary": review if review is not None else review_summary(findings),
         "risks": HIGH_RISK if risky else NO_RISK,
     }
     path = TEMPLATES / "pr_body.md"
@@ -564,18 +578,24 @@ def cmd_open(args):
                       "use `###` or put it in a code fence")
     findings = load_findings(args.review) if args.review else None
     ticket = show_ticket(repo, number)
-    body = pr_body(number, ticket, red_record(repo), verify_text, findings, notes)
+    red = red_record(repo)
     title = f"{ticket.get('title') or f'Ticket {number}'} (#{number})"
 
     push = git(repo.root, "push", "-u", "origin", branch, timeout=PUSH_TIMEOUT)
     if push.returncode != 0:
         raise Problem(f"git push -u origin {branch} failed: {last_line(push.stderr) or f'exit {push.returncode}'}")
-    existing = gh_json(["pr", "list", "--head", branch, "--state", "open", "--json", "number,url"], repo.root)
+    existing = gh_json(["pr", "list", "--head", branch, "--state", "open", "--json", "number,url,body"], repo.root)
     existing = [p for p in existing if isinstance(p, dict) and p.get("number")] if isinstance(existing, list) else []
     if existing:
         pr, url = int(existing[0]["number"]), existing[0].get("url") or ""
+        kept = body_sections(existing[0].get("body"))      # an absent --review / --notes keeps the PR's section
+        review = None if args.review else kept.get("review") or None
+        if not args.notes:
+            notes = kept.get("notes") or None
+        body = pr_body(number, ticket, red, verify_text, findings, notes, review)
         gh(["pr", "edit", str(pr), "--body-file", "-"], repo.root, stdin=body)
     else:
+        body = pr_body(number, ticket, red, verify_text, findings, notes)
         out = gh(["pr", "create", "--draft", "--base", "main", "--head", branch, "--title", title, "--body-file", "-"],
                  repo.root, stdin=body)
         pr, url = created_pr(out)
@@ -1112,11 +1132,12 @@ def review_gate(repo, number):
             unlisted)
 
 
-def unaddressed(number, review, blocking, unlisted):
-    """The refusal: the high and medium findings listed, then a line for those the summary counts beyond them."""
+def unaddressed(number, review, blocking, unlisted, after="no commit after it"):
+    """The refusal: the high and medium findings listed, then a line for those the summary counts beyond them;
+    `after` says what came after the review."""
     items = blocking + ([f"{unlisted} more high or medium not listed (see the review)"] if unlisted else [])
     return (f"PR #{number}: the latest harness review ({review.get('submitted_at')}) has "
-            f"{plural(len(blocking) + unlisted, 'high or medium finding')} and no commit after it: " + "; ".join(items))
+            f"{plural(len(blocking) + unlisted, 'high or medium finding')} and {after}: " + "; ".join(items))
 
 
 # --------------------------------------------------------------- ready
@@ -1665,22 +1686,118 @@ def merge_preconditions(repo, number, view):
     return view
 
 
-def land_gate(repo, number, accept):
-    """Refuse a PR whose latest harness review has high or medium findings and no newer commit, and fail closed
-    when gh cannot tell; with --accept-findings, warn instead. Low findings never refuse."""
+def land_gate(repo, number, view, accept):
+    """The head checks, autoland's rules that hold for any land, at the view's headRefOid: not behind main; the
+    latest harness review at the head (of the head itself, or of a commit the head adds only clean merges of main
+    to: autoland.at_head, after a fetch of origin in the main checkout); and that review's high or medium findings,
+    judged at the head whatever the commit dates (review_gate's date rule is ready's only). No harness review
+    proceeds; low findings never refuse. A failed read the head checks need refuses whatever the flags;
+    --accept-findings turns only the findings refusal, or a failed read of the review's inline comments, into a
+    warning."""
+    main, head, branch = repo.main, str(view.get("headRefOid") or ""), str(view.get("headRefName") or "")
     try:
-        review, blocking, _lows, unlisted = review_gate(repo, number)
+        if not head:
+            raise Problem(f"gh pr view {number} printed no headRefOid")
+        slug = repo.slug()
+        behind = behind_main(main, slug, head)
+    except Problem as err:
+        raise Problem(f"cannot check whether PR #{number} is behind main: {err}") from None
+    if behind:
+        raise Problem(f"PR #{number} is behind main by {plural(behind, 'commit')} at {head[:7]}; merge origin/main "
+                      f"into {branch or 'its branch'} and push, then harness-pr land {number} once the checks at "
+                      "the new head are green")
+    try:
+        review = latest_harness_review(api_list(repo, f"repos/{slug}/pulls/{number}/reviews"))
+        reviewed = str(review.get("commit_id") or "") if review else ""
+        covered = review is None or reviewed == head
+        if not covered:
+            commits = [c for c in api_list(repo, f"repos/{slug}/pulls/{number}/commits") if isinstance(c, dict)]
+            fetch_origin(main)                    # at_head reads origin/main
+            covered = at_head(main, reviewed, head, branch, commits)
+    except Problem as err:
+        raise Problem(f"cannot check whether the latest harness review of PR #{number} covers its head "
+                      f"{head[:7]}: {err}") from None
+    if not covered:
+        raise Problem(f"PR #{number}: the latest harness review ({review.get('submitted_at')}) is of "
+                      f"{reviewed[:7] or 'no commit'}, and the head {head[:7]} is not that commit with only clean "
+                      f"merges of main after it; review the head again, then harness-pr land {number}")
+    if review is None:
+        return
+    try:
+        found, unlisted = review_findings(repo, slug, number, review)
     except Problem as err:
         if not accept:
             raise Problem(f"cannot check the harness review findings of PR #{number}: {err}") from None
         warn("harness-pr",
              f"cannot check the harness review findings of PR #{number} ({err}); landing it (--accept-findings)")
         return
-    if (blocking or unlisted) and not accept:
-        raise Problem(unaddressed(number, review, blocking, unlisted)
-                      + f"; fix them and push, or harness-pr land {number} --accept-findings to land it anyway")
-    if blocking or unlisted:
-        warn("harness-pr", unaddressed(number, review, blocking, unlisted) + "; landing it (--accept-findings)")
+    blocking = [text for sev, text in found if sev != "low"]
+    if not blocking and not unlisted:
+        return
+    said = unaddressed(number, review, blocking, unlisted,
+                       "no commit after it" if reviewed == head else "only clean merges of main after it")
+    if not accept:
+        raise Problem(said + f"; fix them and push, or harness-pr land {number} --accept-findings to land it anyway")
+    warn("harness-pr", said + "; landing it (--accept-findings)")
+
+
+def smoke_limit(main):
+    """HARNESS_SMOKE_TIMEOUT in seconds: the environment, else `env` in the main checkout's .claude/settings.json
+    (never the cwd's: a land may run from the ticket worktree it removes), else 300. A value that is not a positive
+    finite number is one warning and the default."""
+    raw = setting("HARNESS_SMOKE_TIMEOUT", settings_env(main, ("settings.json",)))
+    if raw is None:
+        return SMOKE_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if value > 0 and math.isfinite(value):
+        return value
+    warn("harness-pr", f"HARNESS_SMOKE_TIMEOUT={raw!r} is not a positive number of seconds; using {SMOKE_TIMEOUT:g}")
+    return SMOKE_TIMEOUT
+
+
+def land_canary(repo, number, sha, tickets):
+    """The canary after a land that pulled the main checkout (harness_lib.canary's run_canary): healthy changes
+    nothing; degraded is one warning and a comment on each ticket, nothing reverted; failed reverts the merge `sha`
+    on main as `revert` does (revert_landed, the canary's output as the evidence). (summary lines, problems): a
+    revert is a problem, so the land exits 1 naming it."""
+    ran = run_canary(repo.main, smoke_limit(repo.main))
+    if ran is None:
+        return [], []
+    verdict, said, output = ran
+    if verdict == "healthy":
+        return [f"Canary: {SMOKE} {said}."], []
+    if verdict == "degraded":
+        warn("harness-pr", f"{SMOKE} {said} after PR #{number} landed: degraded, nothing reverted")
+        landed = f"landed in {sha[:7]}" if sha else "landed"
+        body = f"`{SMOKE}` {said} in the main checkout after PR #{number} {landed}: degraded, nothing reverted."
+        shown = tail(output, EVIDENCE_TAIL_LINES)
+        if shown:
+            body += f"\n\n```\n{fence_safe(shown)}\n```"
+        problems = []
+        for n in tickets:
+            try:
+                board(repo, "comment", str(n), "--body", body)
+            except Problem as err:
+                problems.append(f"ticket #{n}: the canary comment failed: {err}")
+        return [f"Canary: {SMOKE} {said}: degraded, nothing reverted."], problems
+    if not sha:
+        return ([f"Canary: {SMOKE} {said}; nothing reverted."],
+                [f"{SMOKE} {said}, but the merge commit is unknown, so nothing was reverted; "
+                 f"harness-pr revert {number}"])
+    try:
+        result = revert_landed(repo, sha, f"{SMOKE} {said} in the main checkout after the land", output or None)
+    except Problem as err:
+        return ([f"Canary: {SMOKE} {said}; the revert failed."],
+                [f"{SMOKE} {said}, and reverting {sha[:7]} failed: {err}; harness-pr revert {number} once that is "
+                 "fixed"])
+    revert, ticket = result["revert"], result["ticket"]
+    asked = f", ticket #{ticket} needs input" if ticket else ""
+    return ([f"Canary: {SMOKE} {said}, so the land was reverted:"] + [f"  {line}" for line in result["summary"]],
+            [f"{SMOKE} {said} in the main checkout, so the merge was reverted in {revert[:7]} "
+             f"(bug #{result['bug']}{asked})"])
 
 
 def cmd_land(args):
@@ -1701,7 +1818,7 @@ def cmd_land(args):
         raise Problem(f"PR #{number} is {state.lower()}, not open")
     else:
         view = merge_preconditions(repo, number, view)
-        land_gate(repo, number, args.accept_findings)
+        land_gate(repo, number, view, args.accept_findings)
     tickets = closing_numbers(view)
     if not tickets:
         warn("harness-pr", f"PR #{number} closes no issue (no Closes #N in its body); no ticket to close")
@@ -1763,6 +1880,7 @@ def cmd_land(args):
         problems.append(f"git fetch --prune failed: {last_line(fetched.stderr)}")
     on = current_branch(main)
     cleaned = []
+    pulled_main = False                       # the main checkout now holds the landed content: the canary runs
     if on == "main":
         # what the pull brings in: main's upstream after the fetch, else the merge commit; no sha, no comparison
         identical, blocking, restored = [], [], None
@@ -1788,6 +1906,7 @@ def cmd_land(args):
             pulled = git(main, "pull", "--ff-only", timeout=PUSH_TIMEOUT)
             if pulled.returncode != 0:
                 problems.append(f"git pull --ff-only failed: {last_line(pulled.stderr)}")
+            pulled_main = pulled.returncode == 0
             main_line = "fetched and fast-forwarded main" if pulled.returncode == 0 else "fetched; main not pulled"
     else:
         main_line = f"fetched; on {on or 'a detached HEAD'}, so main was not pulled"
@@ -1822,6 +1941,10 @@ def cmd_land(args):
         if error:
             problems.append(f"ticket #{n}: {error}")
     summary.append("Ticket: " + ("; ".join(ticket_lines) if ticket_lines else "none linked") + ".")
+    if pulled_main:                           # after the ticket steps: a revert reopens the ticket they closed
+        lines, trouble = land_canary(repo, number, sha, tickets)
+        summary.extend(lines)
+        problems.extend(trouble)
     print("\n".join(summary))
     if problems:
         sys.stdout.flush()
@@ -2197,7 +2320,7 @@ def parser():
     ld.add_argument("--yes", action="store_true", help="accepted and ignored (the land skill confirms)")
     ld.add_argument("--discard", action="store_true", help="remove the worktree even with uncommitted changes")
     ld.add_argument("--accept-findings", action="store_true",
-                    help="land even though the latest harness review has findings and no newer commit")
+                    help="land even though the latest harness review has high or medium findings at the head")
 
     gt = sub.add_parser("gate", help="the auto-land verdict: land, wait, fix or manual, and why")
     gt.add_argument("number", type=number_arg, metavar="P")

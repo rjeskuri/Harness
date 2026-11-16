@@ -11,7 +11,7 @@ Usage:
                          [--effort low|medium|high|xhigh|max]
     harness-work stage N <stage> pass|fail [--tier T] [--effort E]
     harness-work cost N [--pr P] [--json | --markdown]
-    harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run]
+    harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run] [--only N[,N...]]
     harness-work runs [--sweep] [--all]
     harness-work waves [--all] [--refresh]
     harness-work wave drop ID N
@@ -71,10 +71,14 @@ answers (the owner's replies; [] unless the ticket was needs-input) and waiting 
 
 dispatch: sweeps the runs, then starts and launches each ready ticket (and each in-progress ticket whose last
 run ended without a ready pull request, a draft counting as none, until 3 runs of it ended in the last 7 days,
-a billing or auth run not counting) that has no live run, up to --max minus the live runs. When the branch has an
+a billing or auth run not counting) that has no live run, up to --max minus the live runs. --only N[,N...] plans just
+the named tickets through the same path; a named ticket that is not such a ticket, or has a live run, is skipped
+with its reason (printed, and in "skipped"). When the branch has an
 open draft PR, the prompt and the start comment name it and say the worktree may hold uncommitted work from the
 previous run. Launched sessions get neither
-the dispatching session's identity nor ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN. bg, the
+the dispatching session's identity nor ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN; when the
+session is another project's (harness_lib.settings.other_project), CLAUDE_VERIFY_CMD and HARNESS_TEST_CMD are this
+repository's from its .claude settings, left out where they set none (#299). bg, the
 default whatever the budgets say, runs on the subscription: `claude --bg -n "<repo> #N <title>" --permission-mode
 auto "/harness:work N"`.
 headless, only with --venue headless or its alias --api (--api with --venue bg is an error): `claude -p
@@ -116,15 +120,17 @@ with a warning. One command asks gh once per ticket and branch.
 A cloud run ends on the latest marker comment (first line `<!-- harness-cloud: done -->` or `<!-- harness-cloud:
 blocked -->`) by the gh user after the run's start, at that comment's time: done is `ok` (never early), blocked is
 `blocked` and asks the owner (`harness-board needs-input` with the comment's other lines); else, when its ticket is
-finished, `ok`; else, 24 h after its start, `unknown`. A failing gh call is one warning and leaves it open. An unended
-cloud run is live.
+closed or a pull request of its branch merged, `ok`; else, 24 h after its start, `unknown`. Its status label never
+ends it. A failing gh call is one warning and leaves it open. An unended cloud run is live.
 
 cloud: refuses, before anything starts, a needs-local ticket (run it here with /harness:work N), an exhausted cloud
-budget, an unended cloud run of the ticket, and what start refuses; then starts the ticket (venue cloud), pushes its
-branch with upstream (a failed push launches nothing) and runs `claude --cloud <prompt> --on-branch <branch>` in the
-worktree with its stdout on a pseudo-terminal (claude starts a new cloud session only from a terminal), without the
-credentials above. The prompt is self-contained: repository, ticket, branch, the verify command (CLAUDE_VERIFY_CMD,
-else HARNESS_TEST_CMD), `gh api` REST for comments and the two markers; the session loads no harness plugin, hooks or
+budget, an unended cloud run of the ticket, a needs-input ticket with no answer since its question, and what start
+refuses; then starts the ticket (venue cloud), pushes its branch with upstream (a failed push launches nothing) and
+runs `claude --cloud <prompt> --on-branch <branch>` in the worktree with its stdout on a pseudo-terminal (claude
+starts a new cloud session only from a terminal), without the credentials above. The prompt is self-contained:
+repository, ticket, branch, the verify command (CLAUDE_VERIFY_CMD, else HARNESS_TEST_CMD, through project_setting:
+from another project's session only this repository's settings count), `gh api` REST for comments and the two
+markers; the session loads no harness plugin, hooks or
 tests-first gate. claude's output without ANSI escapes and carriage returns is the run's log; the session id comes
 from its claude.ai/code URL. The run record gets venue cloud, cloud_id and url, and the URL is commented on the
 ticket. A failed launch, or one without a session id, ends the record in error with claude's last line; billing
@@ -171,6 +177,7 @@ try:
     from harness_lib.repo import NotARepository, RepoError, repo_facts, worktree_entries
     from harness_lib.routing import EFFORTS, cached_code_route, code_route, load_routing, next_route, review_route
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, patterns, setting, settings_env
+    from harness_lib.settings import other_project, project_setting, setting_from
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
     from harness_lib import backups, cost, reviews, waves
     from harness_lib.text import age_text as ago_text
@@ -252,6 +259,9 @@ SESSION_ENV = ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CL
                "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_EXECPATH", "CLAUDE_PID", "CLAUDE_EFFORT")
 # Credentials a launched session must not inherit: headless bills through apiKeyHelper, bg through the login.
 CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+# A project's own commands: a session launched for another repository than the dispatching session's takes them from
+# that repository's settings, never from the dispatching session's environment (#299).
+PROJECT_ENV = ("CLAUDE_VERIFY_CMD", "HARNESS_TEST_CMD")
 
 
 def warn(text):
@@ -330,10 +340,20 @@ def claude_exe():
     return os.environ.get("HARNESS_CLAUDE", "claude")
 
 
-def child_env():
+def child_env(repo=None):
     """The environment for a launched session: ours, without the dispatching session's identity and without
-    credentials that would bill instead of the apiKeyHelper (headless) or the subscription login (bg)."""
-    return {k: v for k, v in os.environ.items() if k not in SESSION_ENV and k not in CREDENTIAL_ENV}
+    credentials that would bill instead of the apiKeyHelper (headless) or the subscription login (bg). When `repo`
+    is another project's than the session's (other_project), PROJECT_ENV comes from `repo`'s settings alone, a name
+    they do not set left out."""
+    env = {k: v for k, v in os.environ.items() if k not in SESSION_ENV and k not in CREDENTIAL_ENV}
+    if repo is not None and other_project(repo.main):
+        file_env = settings_env(repo.main)
+        for name in PROJECT_ENV:
+            env.pop(name, None)
+            value = setting_from(name, file_env)
+            if value:
+                env[name] = value
+    return env
 
 
 # --------------------------------------------------------------- the repository
@@ -890,9 +910,11 @@ def mtime_iso(path):
         return iso(now())
 
 
-def sweep(records, agents, as_json=False):
+def sweep(records, agents, as_json=False, dry_run=False):
     """Close the records whose run has ended; a billing or auth failure marks the api budget. A listed bg session
-    whose ticket is finished has ended whatever its state says: it is stopped and its record closed. Saves."""
+    whose ticket is finished has ended whatever its state says: it is stopped and its record closed. Saves. Under
+    `dry_run` (dispatch --dry-run, #335) such a session is not stopped and its record is closed in memory only, with
+    a `would stop session <id> (#N <state>)` line, so the plan still counts its slot free."""
     repos, logins = {}, {}
     for record in records:
         if record.get("ended_at"):
@@ -911,7 +933,12 @@ def sweep(records, agents, as_json=False):
                 finished = ticket_finished(record, repos)
             if entry is not None and not state_ended(state) and not finished:
                 continue
-            if finished:
+            if finished and dry_run:
+                n = record.get("ticket")
+                print(f"would stop session {record.get('bg_id')} (#{n} "
+                      f"{finished_as(ticket_issue(record_repo(record, repos), n))})",
+                      file=sys.stderr if as_json else sys.stdout, flush=True)
+            elif finished:
                 stop_session(record, as_json)
             record["ended_at"] = iso(now())
             if finished and not state_ended(state):
@@ -937,7 +964,8 @@ def sweep(records, agents, as_json=False):
         record["outcome"] = outcome
         if outcome in ("billing", "auth") and not is_bg(record):
             exhaust(load_budgets(), "api", f"{outcome}: {reason}", EXHAUST_HOURS)
-        save_run(record)
+        if not (dry_run and finished):
+            save_run(record)
 
 
 def gh_login(repo, logins):
@@ -972,10 +1000,30 @@ def cloud_marker(issue, login, since):
     return found
 
 
+def branch_merged(repo, branch, since):
+    """Whether a pull request of `branch` (in any state) merged at or after `since`; False when the run names no
+    branch. Branch names are reused (a reverted ticket starts a new run on the same t/<n>-x), so one merged before
+    the run started is an earlier run's, and one without a readable mergedAt does not count (#295)."""
+    if not branch:
+        return False
+    prs = gh_json(repo, ["pr", "list", "--head", str(branch), "--state", "all", "--json", "number,state,mergedAt",
+                         "--limit", str(PR_ROWS)])
+    rows = prs if isinstance(prs, list) else []
+    for pr in rows:
+        if not isinstance(pr, dict) or str(pr.get("state", "")).upper() != "MERGED":
+            continue
+        when = parse_iso(pr.get("mergedAt"))
+        if when is not None and when >= since:
+            return True
+    return False
+
+
 def sweep_cloud(record, repos, logins):
     """Close a cloud run from its ticket: the newest marker comment by the gh user since the start (done: ok;
-    blocked: blocked, the owner asked through harness-board needs-input), else a finished ticket (ok), else 24 h
-    since the start (unknown). A failing gh call is one warning and leaves the run open. Saves when it closes."""
+    blocked: blocked, the owner asked through harness-board needs-input), else a closed ticket or a pull request of
+    its branch merged since the start (ok), else 24 h since the start (unknown). Its status label never ends it: a cloud session
+    can still be working on a ticket left needs-input or ready (#295). A failing gh call is one warning and leaves
+    the run open. Saves when it closes."""
     n = record.get("ticket")
     if not isinstance(n, int):
         return
@@ -1000,12 +1048,20 @@ def sweep_cloud(record, repos, logins):
                 warn(f"#{n}: its cloud run is blocked, but the question could not be asked: {err}")
                 return
         outcome, ended = ("blocked" if kind == CLOUD_BLOCKED else "ok"), iso(when)
-    elif issue_finished(issue):
+    elif str(issue.get("state", "")).upper() == "CLOSED":
         outcome, ended = "ok", iso(now())
-    elif now() - started >= CLOUD_SILENCE:
-        outcome, ended = "unknown", iso(now())
     else:
-        return
+        try:
+            merged = branch_merged(repo, record.get("branch"), started)
+        except Problem as err:
+            warn(f"#{n}: cannot tell whether a pull request of its cloud run merged: {err}")
+            return
+        if merged:
+            outcome, ended = "ok", iso(now())
+        elif now() - started >= CLOUD_SILENCE:
+            outcome, ended = "unknown", iso(now())
+        else:
+            return
     record.update(ended_at=ended, outcome=outcome)
     save_run(record)
 
@@ -1043,6 +1099,14 @@ def issue_finished(issue):
     state = str(issue.get("state", "")).upper()
     labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
     return state == "CLOSED" or (state == "OPEN" and any(lb in FINISHED_STATUSES for lb in labels))
+
+
+def finished_as(issue):
+    """Why issue_finished says a ticket's turn is over: `closed`, or its finished status label."""
+    if str(issue.get("state", "")).upper() == "CLOSED":
+        return "closed"
+    labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
+    return next((lb for lb in labels if lb in FINISHED_STATUSES), "finished")
 
 
 def ticket_finished(record, repos):
@@ -1130,7 +1194,7 @@ def launch(repo, ticket, venue, effort=None):
         try:
             with open(log, "ab") as out:
                 proc = subprocess.Popen(argv, cwd=ticket["worktree"], start_new_session=True, stdout=out,
-                                        stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=child_env())
+                                        stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=child_env(repo))
         except OSError as err:
             return failed(record, f"cannot launch {argv[0]}: {err.strerror or err}")
         record["pid"] = proc.pid
@@ -1142,7 +1206,7 @@ def launch(repo, ticket, venue, effort=None):
         argv.append(prompt)
         try:
             done = subprocess.run(argv, cwd=ticket["worktree"], capture_output=True, text=True, errors="replace",
-                                  stdin=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT, env=child_env())
+                                  stdin=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT, env=child_env(repo))
         except (OSError, subprocess.SubprocessError) as err:
             return failed(record, f"cannot launch {argv[0]} --bg: {err}")
         try:
@@ -1336,17 +1400,19 @@ def ask_without_pr(repo, n, branch):
     return dict(issue, draft_pr=drafts[0] if drafts else None)
 
 
-def redispatch_candidates(repo, records, live, *, capped_only=False):
+def redispatch_candidates(repo, records, live, *, capped_only=False, only=None):
     """In-progress tickets whose last run ended (within the window) without a ready pull request: dispatched again,
     unless REDISPATCH_MAX runs of the ticket ended within the window, billing and auth runs not counting (the
     budget's failure, not the ticket's). (candidates, skipped, the id of the record each skipped ticket's cap rests
     on: its latest started). `capped_only` skips the gh check for tickets under the cap, whose answer the caller
-    would discard."""
+    would discard. `only` (a set of ticket numbers) considers just those tickets."""
     cutoff = now() - REDISPATCH_WINDOW
     latest, ended_runs = {}, {}
     for record in records:
         n = record.get("ticket")
         if not isinstance(n, int):
+            continue
+        if only is not None and n not in only:
             continue
         if n not in latest or str(record.get("started_at")) > str(latest[n].get("started_at")):
             latest[n] = record
@@ -1417,16 +1483,21 @@ def cmd_cloud(repo, args):
     if unended:
         raise Problem(f"#{n} already has a cloud run that has not ended: {unended[0].get('id')} "
                       f"({unended[0].get('url')}); follow it with harness-work runs --sweep")
-    if "needs-local" in issue_labels(repo, n):
+    labels = issue_labels(repo, n)
+    if "needs-local" in labels:
         raise Problem(f"#{n} is labelled needs-local: it needs this machine; run it here with /harness:work {n}")
+    if "status:needs-input" in labels and not board_json(repo, "answers", n, "--json"):
+        raise Problem(f"#{n} is status:needs-input with no answer since its question; nothing started. Answer it "
+                      f"on the ticket, then run harness-work cloud {n} again")
     if shutil.which(claude_exe()) is None:
         raise Problem(f"claude not found ({claude_exe()}); nothing started")
     found = gh_json(repo, ["repo", "view", "--json", "nameWithOwner"])
     slug = found.get("nameWithOwner") if isinstance(found, dict) else None
     if not isinstance(slug, str) or "/" not in slug:
         raise Problem("gh repo view printed no owner/name; nothing started")
-    file_env = settings_env(repo.main)
-    verify = setting("CLAUDE_VERIFY_CMD", file_env) or setting("HARNESS_TEST_CMD", file_env)
+    file_env, foreign = settings_env(repo.main), other_project(repo.main)
+    verify = (project_setting("CLAUDE_VERIFY_CMD", file_env, foreign)
+              or project_setting("HARNESS_TEST_CMD", file_env, foreign))
     ticket = start_ticket(repo, n, "cloud")
     branch = ticket["branch"]
     pushed = git(ticket["worktree"], "push", "-u", "origin", branch)
@@ -1660,7 +1731,7 @@ def cmd_dispatch(repo, args):
     effort = routing["code_effort"]
     agents = Agents()
     records = load_runs()
-    sweep(records, agents, wants_json(args))
+    sweep(records, agents, wants_json(args), dry_run=args.dry_run)
     mine = [r for r in records if of_repo(r, repo)]
     api_until = exhausted_until(load_budgets()["api"])    # after the sweep, which can be what exhausts it
     if args.venue == "headless" and api_until:
@@ -1671,15 +1742,22 @@ def cmd_dispatch(repo, args):
     live = live_runs(mine, agents)
     ready = board_json(repo, "ready", "--json")
     ready = [r for r in ready if isinstance(r, dict)] if isinstance(ready, list) else []
-    again, capped, _ = redispatch_candidates(repo, mine, live)
+    only = set(args.only) if args.only else None
+    again, capped, _ = redispatch_candidates(repo, mine, live, only=only)
     candidates, seen = [], set()
     for row in again + ready:
         n = row.get("number")
-        if isinstance(n, int) and n not in seen:
+        if isinstance(n, int) and n not in seen and (only is None or n in only):
             seen.add(n)
             candidates.append(row)
     slots = args.max - len(live)
     plan, skipped = [], list(capped)
+    for n in args.only or []:       # a named ticket that is no candidate: say why, launch nothing for it
+        if n in seen or any(s["number"] == n for s in skipped):
+            continue
+        seen.add(n)
+        skipped.append({"number": n, "why": f"live run {live[n]['id']}" if n in live else
+                        "not ready, and not in progress with an ended run to redispatch"})
     for row in candidates:
         if row["number"] in live:
             skipped.append({"number": row["number"], "why": f"live run {live[row['number']]['id']}"})
@@ -1706,17 +1784,18 @@ def cmd_dispatch(repo, args):
             extra["wave"] = {"id": None, "tickets": sorted(group)}
         lines += [f"skip #{s['number']}: {s['why']}" for s in skipped]
         if not candidates:
-            lines.append("No ready tickets.")
+            lines.append("None of the named tickets can be planned." if only is not None else "No ready tickets.")
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "dry_run": True,
                                      "live": [r["id"] for r in live.values()], "plan": plan, "skipped": skipped},
                                     **extra), "\n".join(lines))
         return
     if not args.json:
-        for s in capped:
+        for s in (skipped if only is not None else capped):
             print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
-                                     "skipped": skipped}, **extra), "No ready tickets.")
+                                     "skipped": skipped}, **extra),
+             "None of the named tickets can be launched." if only is not None else "No ready tickets.")
         return
     if slots <= 0:
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
@@ -1727,7 +1806,7 @@ def cmd_dispatch(repo, args):
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
                                      "skipped": skipped}, **extra),
              "Nothing to launch: " + "; ".join(f"#{s['number']} has a {s['why']}" for s in skipped
-                                               if s not in capped) + ".")
+                                               if s not in capped and s["why"].startswith("live run")) + ".")
         return
     if shutil.which(claude_exe()) is None:
         raise Problem(f"claude not found ({claude_exe()}); nothing started")
@@ -2166,6 +2245,16 @@ def cmd_worktree_remove(repo, args):
 
 
 # --------------------------------------------------------------- arguments
+def ticket_list(text):
+    """An argparse `type=`: issue numbers separated by commas, in the order given, once each."""
+    out = []
+    for part in text.split(","):
+        n = issue_number(part.strip())
+        if n not in out:
+            out.append(n)
+    return out
+
+
 def parser():
     repo_help = "the project (default: CLAUDE_PROJECT_DIR, else the cwd's repository)"
     with_repo = argparse.ArgumentParser(add_help=False)
@@ -2226,6 +2315,9 @@ def parser():
     dispatch.add_argument("--api", action="store_true",
                           help="alias for --venue headless: runs headless, billed to the API key")
     dispatch.add_argument("--dry-run", action="store_true", help="print the plan; start and launch nothing")
+    dispatch.add_argument("--only", type=ticket_list, metavar="N[,N...]",
+                          help="consider only these tickets (each ready, or in progress with an ended run); "
+                               "any other is skipped with the reason")
 
     cloud = sub.add_parser("cloud", parents=[with_repo, with_json],
                            help="start a ticket, push its branch and launch a Claude cloud session on it")
