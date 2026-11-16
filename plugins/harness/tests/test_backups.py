@@ -41,6 +41,23 @@ Choices the ticket leaves open, fixed here:
 - list's age is checked by its number and unit (`3h`, `1d`), its size only for totals near 1.2 MB and 1.9 MB
   (one decimal, read the same in MB and MiB); the header line and column widths are not pinned.
 
+Refs (ticket #328). A manifest's `refs` lists what backup_gate.py kept as git refs, each {"ref", "sha", "what",
+"name", "worktree"} with ref refs/harness-backup/<id>/<what>[/<name>] in the repository. `backup restore ID` never
+touches a working tree for a ref: `branch` recreates the branch <name> at the sha (refused when it exists), `head`
+creates the branch harness-restore/<id> at it, `changes` and `stash` go into the stash list (`git stash store -m
+"harness-backup <id>" <sha>`) and the output names `git stash apply` as the next step. `backup list` counts refs as
+items.
+
+Choices #328 leaves open, fixed here:
+- The fixtures write the refs (git update-ref) and the manifest themselves, as backup_gate.py leaves them, so restore
+  and list are tested apart from the hook; `name` is null for head and changes.
+- "Never touches a working tree": the files (.git aside), `git status --ignored`, the index and HEAD of the
+  recorded worktree and of the main checkout are what they were, with uncommitted, staged and untracked files in both.
+- Every ref is checked before anything is written: an existing branch, or an existing harness-restore/<id>, refuses
+  the whole restore in one line naming it, exit 1, nothing stored or created, the branch left where it is. An entry
+  the restore stored applies with `git stash apply` next to the session's own uncommitted edits.
+- ITEMS in `backup list` is the items plus the refs, in the table; `--json` prints the refs as the manifest holds them.
+
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_backups.py" -v
 """
 from __future__ import annotations
@@ -968,6 +985,172 @@ class List(BackupTest):
         by_id = {x["id"]: x for x in self.ok_json("backup", "list", "--all", cwd=s["a"])}
         self.assertIsNone(by_id[s["m"]["null"]["id"]]["repo"])
         self.assertEqual(by_id[s["m"]["b"]["id"]]["repo"], s["b"])
+
+
+# ================================================================ refs (#328)
+class Refs(BackupTest):
+    """Snapshots that hold git refs, written as backup_gate.py writes them."""
+
+    def text(self):
+        return "".join(f"{self.word()} {self.word()}\n" for _ in range(self.rng.randint(1, 5))).encode()
+
+    def rev(self, repo, rev="HEAD"):
+        return self.git(repo, "rev-parse", "--verify", "-q", rev + "^{commit}")
+
+    def branch_at(self, repo, name):
+        p = subprocess.run([GIT, "-C", repo, "rev-parse", "--verify", "-q", "refs/heads/" + name], env=self.env(),
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+        return p.stdout.strip() if p.returncode == 0 else None
+
+    def stash(self, repo):
+        """[(sha, subject)] of the stash list, newest first."""
+        out = self.git(repo, "stash", "list", "--format=%H%x09%gs")
+        return [tuple(line.split("\t", 1)) for line in out.splitlines() if line.strip()]
+
+    def state(self, repo):
+        files = {k: v for k, v in tree(repo).items() if k != ".git" and not k.startswith(".git/")}
+        return {"files": files, "status": self.git(repo, "status", "--porcelain=v1", "-uall", "--ignored"),
+                "index": self.git(repo, "ls-files", "-s"), "head": self.git(repo, "rev-parse", "HEAD"),
+                "branch": self.git(repo, "rev-parse", "--symbolic-full-name", "HEAD")}
+
+    def commit(self, repo, rel=None):
+        self.put(os.path.join(repo, rel or f"src/w_{self.word()}.py"), data=self.text())
+        self.git(repo, "add", "-A")
+        self.git(repo, "commit", "-q", "-m", "Work")
+        return self.rev(repo)
+
+    def with_refs(self, main, cwd, refs, items=(), when=None, command=None):
+        """A snapshot in the global store as backup_gate.py leaves one: each (what, name, sha, worktree) of `refs`
+        written with git update-ref at refs/harness-backup/<id>/<what>[/<name>] and listed in the manifest, each
+        (path, bytes) of `items` copied to files/<k>. Returns the manifest."""
+        when = when or self.now
+        sid = f"{when.strftime('%Y%m%dT%H%M%SZ')}-{self.rng.getrandbits(24):06x}"
+        folder = os.path.join(self.global_store(), sid)
+        os.makedirs(os.path.join(folder, "files"))
+        os.chmod(self.global_store(), 0o700)
+        os.chmod(folder, 0o700)
+        listed = []
+        for what, name, sha, worktree in refs:
+            ref = f"refs/harness-backup/{sid}/{what}" + ("" if name is None else f"/{name}")
+            self.git(worktree, "update-ref", ref, sha)
+            listed.append({"ref": ref, "sha": sha, "what": what, "name": name, "worktree": worktree})
+        copies = []
+        for k, (path, data) in enumerate(items):
+            with open(os.path.join(folder, "files", str(k)), "wb") as fh:
+                fh.write(data)
+            copies.append({"path": path, "copy": f"files/{k}", "kind": "file", "bytes": len(data)})
+        manifest = {"id": sid, "at": when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "repo": main,
+                    "cwd": cwd, "command": command or f"git reset --hard {self.word()}", "session": None,
+                    "sensitive": False, "items": copies, "refs": listed}
+        with open(os.path.join(folder, "manifest.json"), "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+        return manifest
+
+    def test_restore_of_refs_never_touches_the_worktree(self):
+        main = self.make_repo("proj")
+        for rel in ("src/a.py", "src/b.py", "docs/c.md"):
+            self.put(os.path.join(main, rel), data=self.text())
+        self.git(main, "add", "-A")
+        self.git(main, "commit", "-q", "-m", "Files")
+        wt = self.add_worktree(main, "t-1-wt")
+        mine = self.git(wt, "rev-parse", "--abbrev-ref", "HEAD")
+        base = self.rev(wt)
+        # head: the commit a reset --hard left behind
+        head = self.commit(wt)
+        self.git(wt, "reset", "-q", "--hard", base)
+        # branch: a deleted branch's tip
+        gone = f"t/{self.rng.randint(10, 99)}-{self.word()}"
+        self.git(wt, "switch", "-q", "-c", gone)
+        self.commit(wt)
+        tip = self.commit(wt)
+        self.git(wt, "switch", "-q", mine)
+        self.git(wt, "branch", "-q", "-D", gone)
+        # changes: git stash create's commit of edits the reset discarded
+        edits = {"src/a.py": self.text(), "src/b.py": self.text()}
+        for rel, data in edits.items():
+            self.put(os.path.join(wt, rel), data=data)
+        self.git(wt, "add", "src/b.py")
+        changes = self.git(wt, "stash", "create")
+        self.assertRegex(changes, r"^[0-9a-f]{40}$")
+        self.git(wt, "reset", "-q", "--hard")
+        # stash: an entry pushed, then dropped
+        self.put(os.path.join(wt, "src", "a.py"), data=self.text())
+        self.git(wt, "stash", "push", "-q", "-m", f"wip {self.word()}")
+        dropped = self.rev(wt, "stash@{0}")
+        self.git(wt, "stash", "drop", "-q")
+        self.assertEqual(self.stash(wt), [])
+        n = str(self.rng.randint(0, 4))
+        m = self.with_refs(main, wt, [("head", None, head, wt), ("changes", None, changes, wt),
+                                      ("branch", gone, tip, wt), ("stash", n, dropped, wt)])
+        sid = m["id"]
+
+        # The worktree and the main checkout as a session left them: an edit, a staged new file, untracked files.
+        self.put(os.path.join(wt, "docs", "c.md"), data=self.text())
+        staged = os.path.join("docs", f"staged_{self.word()}.md")
+        self.put(os.path.join(wt, staged), data=self.text())
+        self.git(wt, "add", staged)
+        self.put(os.path.join(wt, f"notes-{self.word()}.txt"), data=self.text())
+        self.put(os.path.join(main, "README.md"), data=self.text())
+        self.put(os.path.join(main, f"scratch-{self.word()}.txt"), data=self.text())
+        before = {r: self.state(r) for r in (wt, main)}
+
+        p = self.ok("backup", "restore", sid, cwd=main)
+        self.assertEqual({r: self.state(r) for r in (wt, main)}, before, "a ref's restore touched a working tree")
+        self.assertIn("git stash apply", p.stdout, "the restore does not name the next step")
+        self.assertEqual(self.branch_at(main, gone), tip, "the deleted branch is not back at its tip")
+        self.assertEqual(self.branch_at(main, f"harness-restore/{sid}"), head)
+        self.assertEqual(self.branch_at(main, mine), base, "the restore moved the worktree's branch")
+        self.assertEqual(sorted(sha for sha, subject in self.stash(wt) if subject == f"harness-backup {sid}"),
+                         sorted([changes, dropped]))
+        self.assertEqual(len(self.stash(wt)), 2)
+
+        # Again: the branch exists (and has moved since), so the whole restore is refused and nothing is written.
+        self.git(main, "branch", "-q", "-f", gone, base)
+        stash_now = self.stash(wt)
+        p = self.work("backup", "restore", sid, cwd=main)
+        self.assertRefused(p)
+        self.assertTrue(gone in p.stderr or f"harness-restore/{sid}" in p.stderr, p.stderr)
+        self.assertEqual(self.stash(wt), stash_now, "a refused restore stored a stash entry")
+        self.assertEqual(self.branch_at(main, gone), base)
+        self.assertEqual(self.branch_at(main, f"harness-restore/{sid}"), head)
+        self.assertEqual({r: self.state(r) for r in (wt, main)}, before)
+        only = self.with_refs(main, wt, [("branch", gone, tip, wt)])
+        self.assertRefused(self.work("backup", "restore", only["id"], cwd=main), gone)
+        self.assertEqual(self.branch_at(main, gone), base)
+
+        # The stored entry applies next to the session's own edits.
+        shas = [sha for sha, _subject in self.stash(wt)]
+        self.git(wt, "stash", "apply", "-q", f"stash@{{{shas.index(changes)}}}")
+        for rel, data in edits.items():
+            with open(os.path.join(wt, rel), "rb") as fh:
+                self.assertEqual(fh.read(), data, rel)
+
+    def test_list_counts_refs_as_items(self):
+        main = self.make_repo("proj")
+        wt = self.add_worktree(main, "t-1-wt")
+        head = self.rev(wt)
+        made = []
+        for k in range(3):
+            n_items, n_refs = self.rng.randint(0, 3), self.rng.randint(1, 4)
+            items = [(os.path.join(wt, f"f{j}-{self.word()}.txt"), self.text()) for j in range(n_items)]
+            refs = [("branch", f"t/{j}-{self.word()}", head, wt) for j in range(n_refs)]
+            m = self.with_refs(main, wt, refs, items, when=self.ago(hours=k + 1),
+                               command=f"git branch -D {self.word()}")
+            made.append((m, n_items + n_refs))
+        f = os.path.join(main, f"plain-{self.word()}.txt")
+        self.put(f)
+        made.append((self.create([f], main=main, cwd=main, now=self.ago(hours=5)), 1))      # refs: []
+        rows = dict(self.rows(self.ok("backup", "list", cwd=main).stdout))
+        self.assertEqual(set(rows), {m["id"] for m, _count in made})
+        for m, count in made:
+            line = rows[m["id"]]
+            found = re.match(rf"^\s*{re.escape(m['id'])}\s+(?P<age>.+?)\s+(?P<items>\d+)\s+(?P<size>.+?)\s+"
+                             rf"{re.escape(m['command'])}\s*$", line)
+            self.assertIsNotNone(found, f"not id, age, items, size, command: {line!r}")
+            self.assertEqual(int(found.group("items")), count, f"{line!r} (seed {self.seed})")
+        listed = {x["id"]: x for x in self.ok_json("backup", "list", cwd=main)}
+        for m, _count in made:
+            self.assertEqual(listed[m["id"]]["refs"], m["refs"])
 
 
 if __name__ == "__main__":
