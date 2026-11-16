@@ -142,7 +142,8 @@ def find(main, snapshot_id):
 def _copy(src, dst, skip=None):
     """Copy the file, folder tree or symlink `src` to the new path `dst`: links copied as links, never followed;
     bytes, modes and times kept, a folder's own mode set after its contents. On macOS `cp -c` clones where it
-    can; elsewhere, or when cp fails, the copy is made here. `skip` holds (st_dev, st_ino) of folders left out."""
+    can; elsewhere, or when cp fails, the copy is made here. `skip` holds (st_dev, st_ino) of folders left out,
+    and paths (spelled from `src` down) of entries left out."""
     st = os.lstat(src)
     if stat.S_ISLNK(st.st_mode):
         os.symlink(os.readlink(src), dst)
@@ -164,6 +165,8 @@ def _cp(src, dst, tree):
 
 
 def _copy_here(src, dst, skip):
+    if src in skip:
+        return
     st = os.lstat(src)
     if stat.S_ISLNK(st.st_mode):
         os.symlink(os.readlink(src), dst)
@@ -283,11 +286,12 @@ def _new_folder(store, when):
     raise BackupError(f"no free snapshot id in {store} for {stamp}")
 
 
-def _take(store, repo, paths, pats, *, cwd, command, session, now):
+def _take(store, repo, paths, pats, *, cwd, command, session, now, leave_out=()):
     """The snapshot of `paths` in `store` with `repo` as its repository; its manifest. A failure leaves no folder."""
     cwd = os.path.abspath(cwd)
     when = now or dt.datetime.now(dt.timezone.utc)
     when = (when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)).astimezone(dt.timezone.utc)
+    left = {os.path.normpath(os.path.join(cwd, p)) for p in leave_out}
     doing, folder = f"create the store {store}", None
     try:
         items = _existing(paths, cwd)
@@ -297,9 +301,11 @@ def _take(store, repo, paths, pats, *, cwd, command, session, now):
         tops, listed, sensitive = {}, [], False
         for k, (path, kind) in enumerate(items):
             doing, copy = f"copy {path}", os.path.join(folder, "files", str(k))
+            skip = {p for p in left if p != path and _within(p, path)}
             # A folder holding the store (rm -rf ~/.claude) is copied without this snapshot's own folder.
-            _copy(path, copy, {(own.st_dev, own.st_ino)} if _within(os.path.realpath(folder), os.path.realpath(path))
-                  else None)
+            if _within(os.path.realpath(folder), os.path.realpath(path)):
+                skip.add((own.st_dev, own.st_ino))
+            _copy(path, copy, skip or None)
             listed.append({"path": path, "copy": f"files/{k}", "kind": kind, "bytes": _bytes(copy)})
             sensitive = sensitive or _sensitive(path, copy, pats, tops)
         manifest = {"id": os.path.basename(folder), "at": when.strftime("%Y-%m-%dT%H:%M:%SZ"), "repo": repo,
@@ -319,13 +325,15 @@ def _take(store, repo, paths, pats, *, cwd, command, session, now):
     return manifest
 
 
-def create(paths, *, main, cwd, command, session=None, now=None):
+def create(paths, *, main, cwd, command, session=None, now=None, leave_out=()):
     """Snapshot each existing path of `paths` (a relative one taken from `cwd`, a missing one skipped) into the
     store of `main` (the main checkout, or None outside a repository); writes and returns the manifest
-    {id, at, repo, cwd, command, session, sensitive, items: [{path, copy, kind, bytes}], refs}."""
+    {id, at, repo, cwd, command, session, sensitive, items: [{path, copy, kind, bytes}], refs}. `leave_out` names
+    entries inside folder items (spelled from the item's path down, a relative one taken from `cwd`) that the copy
+    leaves out, with everything under them."""
     pats = sensitive_patterns(main)
     return _take(_store(main, pats), canonical_path(main) if main else None, paths, pats, cwd=cwd,
-                 command=command, session=session, now=now)
+                 command=command, session=session, now=now, leave_out=leave_out)
 
 
 # --------------------------------------------------------------- restore
