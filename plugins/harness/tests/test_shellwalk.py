@@ -491,6 +491,37 @@ REDIRECTIONS = [
     ("> out.txt", [([], ["out.txt"], [], "> out.txt", "")]),
     ("cat < in.txt <<< here", [(["cat"], [], [], "cat < in.txt <<< here", "")]),
 ]
+# An input redirection whose target is a process substitution, < <(...), ends with it (#364
+# review): the commands after it, in the same part or the next, keep their own words and
+# redirections. (the prefix, as a command; how a separator joins it to what follows:
+# heredoc prefixes put their body after the first line.)
+INPUT_SUBSTITUTION_PREFIXES = (
+    "while read f; do echo $f; done < <(git ls-files)",
+    "sort < <(ls)",
+    "mapfile -t a < <(ls)",
+    "exec 3< <(ls)",
+    "sort 0< <(git ls-files)",
+    "cat <<< <(ls)",
+    'cat <<< "$(ls)"',
+    "cat <<EOF",
+)
+INPUT_SUBSTITUTION_SEPARATORS = ("; ", " && ", " || ", " | ", "\n")
+# The command after the prefix: (its text, words, inputs, targets).
+AFTER_INPUT_SUBSTITUTION = (
+    ("rm -rf src", ["rm", "-rf", "src"], [], []),
+    ("rm -rf src > out.txt", ["rm", "-rf", "src"], [], ["out.txt"]),
+    ("bash -s < tools/gen.sh", ["bash", "-s"], ["tools/gen.sh"], []),
+    ("git push --force origin t/12-fix-login", ["git", "push", "--force", "origin", "t/12-fix-login"], [], []),
+)
+
+
+def after_prefix(prefix: str, sep: str, command: str) -> str:
+    """`prefix` `sep` `command` as one command line; a heredoc prefix's body ends it."""
+    if not prefix.endswith("<<EOF"):
+        return prefix + sep + command
+    if sep == "\n":
+        return prefix + "\nhi\nEOF\n" + command
+    return prefix + sep + command + "\nhi\nEOF"
 
 
 class LibShellwalkTests(unittest.TestCase):
@@ -656,6 +687,34 @@ class LibShellwalkTests(unittest.TestCase):
         ):
             with self.subTest(words=words):
                 self.assertEqual(self.lib.command_words(words), expected)
+
+    def test_a_process_substitution_on_stdin_ends_with_its_redirection(self):
+        """`done < <(git ls-files); rm -rf src` is two commands: rm is the second's name,
+        not a file the first reads, whatever separator follows and whatever the second
+        redirects itself."""
+        for prefix in INPUT_SUBSTITUTION_PREFIXES:
+            for sep in INPUT_SUBSTITUTION_SEPARATORS:
+                for text, words, inputs, targets in AFTER_INPUT_SUBSTITUTION:
+                    command = after_prefix(prefix, sep, text)
+                    with self.subTest(command=command):
+                        found = [
+                            (p.words, p.inputs, p.targets)
+                            for p in self.lib.split_command(command)
+                            if not p.marker and p.text == text
+                        ]
+                        self.assertEqual(found, [(words, inputs, targets)])
+        # and in the same part: the words after it are the command's arguments
+        for command, text, words, targets in (
+            ("sort < <(ls) -r", "sort < <(ls) -r", ["sort", "-r"], []),
+            ("sort < <(ls) -r > out.txt", "sort < <(ls) -r > out.txt", ["sort", "-r"], ["out.txt"]),
+            ("cat <<< <(ls) -n", "cat <<< <(ls) -n", ["cat", "-n"], []),
+            ("while read f; do :; done < <(ls) 2>/dev/null", "done < <(ls) 2>/dev/null", ["done"], ["/dev/null"]),
+        ):
+            with self.subTest(command=command):
+                found = [p for p in self.lib.split_command(command) if not p.marker and p.text == text]
+                self.assertEqual([(p.words, p.targets) for p in found], [(words, targets)])
+                self.assertNotIn("-r", found[0].inputs)
+                self.assertNotIn("-n", found[0].inputs)
 
     def test_stdin_program(self):
         for args, expected in (

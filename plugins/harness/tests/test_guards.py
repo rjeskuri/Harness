@@ -401,6 +401,35 @@ class BranchGuardBashTests(GuardTestCase):
         self.assertIsNone(self.bash("git commit -m first", cwd=empty))
         self.assertIsNone(self.bash("echo x > y.txt", cwd=self.outside))
 
+    def test_a_process_substitution_on_stdin_does_not_hide_the_next_command(self):
+        """`done < <(git ls-files); rm -rf src` runs rm: whatever reads a process
+        substitution first, the command after it is refused on main as it is alone (#364
+        review), after any separator, and a force push on any branch."""
+        prefixes = (
+            "while read f; do echo $f; done < <(git ls-files)",
+            "sort < <(ls)",
+            "mapfile -t a < <(ls)",
+            "exec 3< <(ls)",
+            "cat <<< <(ls)",
+            "sort 0< <(git ls-files)",
+        )
+        seps = ("; ", " && ", " || ", " | ", "\n")
+        commands = (
+            "rm -rf src",
+            f"git push --force origin {BRANCH}",
+            "git commit -m x",
+            "echo hi > notes.txt",
+            "git push origin main",
+        )
+        alone = {c: self.bash(c) for c in commands}
+        for c, reason in alone.items():
+            self.assertIsNotNone(reason, c)
+        for i, prefix in enumerate(prefixes):
+            for j, sep in enumerate(seps):
+                command = commands[(i + j) % len(commands)]  # each separator meets each command
+                with self.subTest(command=prefix + sep + command):
+                    self.assertEqual(self.bash(prefix + sep + command), alone[command])
+
     def test_force_push_is_refused_on_every_branch(self):
         wt = self.worktree(self.repo)
         for command, cwd in (

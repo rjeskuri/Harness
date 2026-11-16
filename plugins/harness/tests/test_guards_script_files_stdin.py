@@ -464,6 +464,29 @@ LATER_PARTS = (
     ("cd tests/helpers && cat gen.sh | bash -s", ("cat gen.sh", "bash -s", "cat gen.sh | bash -s")),
     ('cd {o} && python3 - <<< "$(cat w.py)"', ('python3 - <<< "$(cat w.py)"', "cat w.py")),
 )
+# A process substitution read on stdin first (< <(...)) does not hide the program file the
+# next command runs ({f}; the file's extension), whatever separates them (#364 review).
+AFTER_INPUT_SUBSTITUTION = (
+    ("sort < <(ls) && bash -s < {f}", "sh"),
+    ("while read f; do :; done < <(git ls-files); python3 - < {f}", "py"),
+    ("mapfile -t a < <(ls)\ncat {f} | python3", "py"),
+    ("exec 3< <(ls) || source {f}", "sh"),
+    ("cat <<< <(ls); {f} a", ""),
+    ("sort 0< <(git ls-files) && ruby < {f}", "rb"),
+    ('sort < <(ls); node <<< "$(cat {f})"', "mjs"),
+    ("while read f; do echo $f; done < <(ls)\nperl - < {f}", "pl"),
+    ("sort < <(ls) && php < {f}", "php"),
+)
+
+
+def after_input_substitution(command: str) -> tuple:
+    """The parts the reason may name: those of the command after the `< <(...)` prefix."""
+    rest = re.split(r"\)(?:; |\n| && | \|\| )", command, maxsplit=1)[1]
+    if " | " in rest:
+        return piped(rest)
+    return here_string(rest) if "$(" in rest else (rest,)
+
+
 # The definition of done's commands, verbatim: the hook judges the command, so the files need
 # not exist (parts the reason may name).
 LITERAL = (
@@ -546,6 +569,13 @@ class StdinProgramTests(ProgramFormCase):
 
     def test_the_definition_of_done_commands_are_refused_to_each_role(self):
         self.expect_refused(LITERAL)
+
+    def test_a_process_substitution_on_stdin_does_not_hide_the_next_command(self):
+        """sort < <(ls) && bash -s < f runs f: the input redirect of the first command ends
+        with it. The tracked file after the same prefix still runs."""
+        self.expect_rotated(AFTER_INPUT_SUBSTITUTION, after_input_substitution)
+        self.expect_tracked_runs(AFTER_INPUT_SUBSTITUTION)
+        self.expect_allowed(["while read f; do echo $f; done < <(git ls-files)", "sort < <(ls) | head -n 3"])
 
     def test_a_later_part_and_another_directory_are_judged_where_they_run(self):
         self.expect_refused([(self.fill(c), tuple(self.fill(p) for p in parts)) for c, parts in LATER_PARTS])

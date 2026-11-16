@@ -142,11 +142,11 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
         word, redirect, opened, quoted = None, "", "", False
 
     def end_part(end: int, op: str = "") -> None:
-        nonlocal part, start, redirect, lead, stages
+        nonlocal part, start, redirect, opened, lead, stages
         end_word()
         if redirect in ("out", "dup"):
             part.targets.append("")  # a redirection with no target
-        redirect = ""
+        redirect, opened = "", ""
         part.text = command[start:end].strip()
         part.sep = op
         part.lead = lead
@@ -221,6 +221,8 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
             i = closing(command, i) + 1
         elif c in "<>" and command.startswith("(", i + 1):  # process substitution
             end_word()
+            if redirect == "in":  # the target of a < or <<<: that redirection ends with it
+                redirect, opened = "", ""
             k = closing(command, i + 1)
             nested.append(command[i + 2 : k])
             i = k + 1
