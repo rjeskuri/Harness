@@ -645,6 +645,16 @@ class ClaimedSpareEnv(Repos, unittest.TestCase):
             ("a plain environment, no other project", "worktree", None, self.recorder_cmd(plain), None, plain),
             ("a plain environment, this repository's own session", "worktree", "main checkout",
              self.recorder_cmd(plain), None, plain),
+            # the same repository or another, by what git says, not by how the paths begin
+            ("stray from a sibling repository sharing the worktree's path prefix", "worktree", "sibling repository",
+             self.recorder_cmd(stray), None, None),
+            ("a plain environment, another worktree of this repository elsewhere", "worktree", "worktree elsewhere",
+             self.recorder_cmd(plain), None, plain),
+            ("a plain environment, a folder inside that worktree", "worktree", "inside the worktree elsewhere",
+             self.recorder_cmd(plain), None, plain),
+            # this project's settings name HARNESS_TEST_CMD only outside `env`: that sets nothing
+            ("stray named only outside env in this project's settings", "worktree", "other repository",
+             self.recorder_cmd(stray), ("named outside env", None), None),
         ]
 
     def claimed_session(self, project, session, test_cmd, own):
@@ -664,13 +674,30 @@ class ClaimedSpareEnv(Repos, unittest.TestCase):
                   json.dumps({"env": {"HARNESS_TEST_CMD": self.recorder_cmd(own[1])}}))
         elif own and own[0] == "user":       # Claude Code overlays the user's settings: the inherited value is theirs
             write(os.path.join(home, ".claude", "settings.json"), json.dumps({"env": {"HARNESS_TEST_CMD": test_cmd}}))
+        elif own and own[0] == "named outside env":
+            write(os.path.join(home, ".claude", "settings.json"), json.dumps({
+                "permissions": {"allow": ["Bash(HARNESS_TEST_CMD=* harness-red run)"]},
+                "env": {"HARNESS_TEST_CMD_EXTRA": "--verbose"}}))
+            write(os.path.join(wt, ".claude", "settings.local.json"), json.dumps({
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": 'test -n "$HARNESS_TEST_CMD"'}]}]}}))
 
-        if session == "other repository":   # OkinawaDream: a repository of its own whose settings set the command
-            other = os.path.join(self.tmp, f"OkinawaDream{n}")
+        project_dir = wt if project == "worktree" else repo
+        if session in ("other repository", "sibling repository"):
+            # OkinawaDream, a repository of its own whose settings set the command; or one beside this project's
+            # folder whose path starts with it
+            other = (os.path.join(self.tmp, f"OkinawaDream{n}") if session == "other repository"
+                     else project_dir + "-old")
             write(os.path.join(other, ".claude", "settings.json"), json.dumps({"env": {"HARNESS_TEST_CMD": test_cmd}}))
             self.git(self.tmp, "init", "-q", other)
             self.git(other, "add", "-A")
             self.git(other, "commit", "-q", "-m", "other project")
+        elif session in ("worktree elsewhere", "inside the worktree elsewhere"):
+            # a worktree of this repository whose path shares no prefix with the project's
+            elsewhere = os.path.join(self.tmp, f"elsewhere{n}", "wt-345")
+            self.git(repo, "worktree", "add", "-q", elsewhere, "-b", f"t/345-elsewhere-{n}", "origin/main")
+            other = elsewhere if session == "worktree elsewhere" else os.path.join(elsewhere, "lib")
+            os.makedirs(other, exist_ok=True)
         elif session == "outside":
             other = os.path.join(self.tmp, f"outside{n}")
             os.makedirs(other)
@@ -682,7 +709,6 @@ class ClaimedSpareEnv(Repos, unittest.TestCase):
         inherited = {"HOME": home, "HARNESS_TEST_CMD": test_cmd}
         if other is not None:
             inherited["HARNESS_SESSION_PROJECT"] = other
-        project_dir = wt if project == "worktree" else repo
         env_file = write(os.path.join(self.tmp, "envfiles", f"env-{n}.sh"), "")
         hook_env = dict(self.env, **inherited)
         hook_env.update(CLAUDE_PROJECT_DIR=project_dir, CLAUDE_ENV_FILE=env_file)

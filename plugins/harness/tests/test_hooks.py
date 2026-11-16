@@ -809,11 +809,30 @@ class ForeignSessionEnvTests(HookTestCase):
                 self.assertEqual(seen.get("HARNESS_SESSION_PROJECT"), str(project))
                 self.assertEqual(seen.get("EARLIER_HOOK_VALUE"), "kept")
 
+    @staticmethod
+    def names(text: str, key: str) -> bool:
+        """Does `text` name `key` as a whole name (HARNESS_TEST_CMD_EXTRA does not name HARNESS_TEST_CMD)?"""
+        return re.search(rf"(?<![A-Za-z0-9_]){re.escape(key)}(?![A-Za-z0-9_])", text) is not None
+
+    def assertBriefNames(self, brief: str, dropped, not_named, source_project=None):
+        for key in dropped:
+            self.assertTrue(self.names(brief, key), f"the brief does not name the dropped {key}: {brief!r}")
+        for key in not_named:
+            self.assertFalse(self.names(brief, key), f"the brief names {key}, which was not dropped: {brief!r}")
+        if source_project is not None:
+            self.assertIn(str(source_project), brief)
+
+    def plain_brief(self, project: Path) -> str:
+        """The brief of a start with no harness key and no session project in the environment."""
+        r, _ = self.start({}, project=project)
+        return self.brief_of(r)
+
     # ---- broad: every harness key only the other project set is dropped, and named in the brief
 
     def test_drops_each_harness_key_only_another_project_set(self):
         outside = self.tmp / "loose folder"  # no repository: GIT_CEILING_DIRECTORIES stops at self.tmp
         outside.mkdir()
+        plain = self.plain_brief(self.proj)
         for other, n in ((self.other, 1), (outside, 2)):
             with self.subTest(other=other.name):
                 random_key = "HARNESS_X" + uuid.uuid4().hex[:8].upper()
@@ -837,10 +856,9 @@ class ForeignSessionEnvTests(HookTestCase):
                 inherited = dict(strays, **others, HARNESS_SESSION_PROJECT=str(other))
                 r, env_file = self.start(inherited)
                 self.assertSourced(env_file, inherited, dropped=strays, kept=others, project=self.proj)
-                brief = self.brief_of(r)
-                for key in strays:
-                    self.assertIn(key, brief)
-                self.assertIn(str(other), brief)
+                # Absence below means something only because the plain brief names none of these keys.
+                self.assertBriefNames(plain, dropped=[], not_named=[*strays, *others])
+                self.assertBriefNames(self.brief_of(r), dropped=strays, not_named=others, source_project=other)
 
     def test_keeps_the_keys_this_projects_settings_set(self):
         user = self.home / ".claude" / "settings.json"
@@ -848,6 +866,7 @@ class ForeignSessionEnvTests(HookTestCase):
         local = self.proj / ".claude" / "settings.local.json"
         harness_keys = ("HARNESS_PROJECT", "HARNESS_TEST_CMD", "HARNESS_ULTRAREVIEW", "CLAUDE_VERIFY_CMD",
                         "CLAUDE_VERIFY_TIMEOUT")
+        self.assertBriefNames(self.plain_brief(self.proj), dropped=[], not_named=harness_keys)
         for name, sets in (
             ("user settings", {user: ["HARNESS_PROJECT"]}),
             ("project settings", {project: ["HARNESS_TEST_CMD"]}),
@@ -863,13 +882,46 @@ class ForeignSessionEnvTests(HookTestCase):
                     self.write(path, json.dumps({"permissions": {"allow": []},
                                                  "env": {k: inherited[k] for k in keys}}))
                 kept = [k for keys in sets.values() for k in keys]
+                dropped = [k for k in harness_keys if k not in kept]
                 try:
-                    _, env_file = self.start(inherited)
-                    self.assertSourced(env_file, inherited, dropped=[k for k in harness_keys if k not in kept],
-                                       kept=kept, project=self.proj)
+                    r, env_file = self.start(inherited)
+                    self.assertSourced(env_file, inherited, dropped=dropped, kept=kept, project=self.proj)
+                    self.assertBriefNames(self.brief_of(r), dropped=dropped, not_named=kept,
+                                          source_project=self.other)
                 finally:
                     for path in sets:
                         path.unlink()
+
+    def test_a_key_named_only_outside_env_is_still_dropped(self):
+        # This project's settings name the strays only in permission rules, hook and status-line commands, an env
+        # value or a longer env key: none of that sets them, so each is still dropped. The env keys it does set stay.
+        user = self.home / ".claude" / "settings.json"
+        project = self.proj / ".claude" / "settings.json"
+        local = self.proj / ".claude" / "settings.local.json"
+        kept = {"HARNESS_PROJECT": "reads HARNESS_REVIEW_TIER", "HARNESS_TEST_CMD_EXTRA": "--verbose",
+                "HARNESS_X" + uuid.uuid4().hex[:6].upper(): "CLAUDE_VERIFY_TIMEOUT=60"}
+        extra_key = [k for k in kept if k.startswith("HARNESS_X")][0]
+        self.write(user, json.dumps({
+            "permissions": {"allow": ["Bash(HARNESS_TEST_CMD=* harness-red run)"]},
+            "statusLine": {"type": "command", "command": "echo $HARNESS_ULTRAREVIEW"},
+            "env": {"HARNESS_PROJECT": kept["HARNESS_PROJECT"]},
+        }))
+        self.write(project, json.dumps({
+            "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": 'test -n "$CLAUDE_VERIFY_CMD"'}]}]},
+            "env": {"HARNESS_TEST_CMD_EXTRA": kept["HARNESS_TEST_CMD_EXTRA"]},
+        }))
+        self.write(local, json.dumps({
+            "permissions": {"deny": ["Bash(export CLAUDE_VERIFY_TIMEOUT=*)"]},
+            "env": {extra_key: kept[extra_key]},
+        }))
+        strays = {"HARNESS_TEST_CMD": "npm test -- {files}", "HARNESS_ULTRAREVIEW": "1",
+                  "HARNESS_REVIEW_TIER": "sonnet", "CLAUDE_VERIFY_CMD": "scripts/verify.sh",
+                  "CLAUDE_VERIFY_TIMEOUT": "900"}
+        inherited = dict(strays, **kept, HARNESS_SESSION_PROJECT=str(self.other))
+        r, env_file = self.start(inherited)
+        self.assertSourced(env_file, inherited, dropped=strays, kept=kept, project=self.proj)
+        self.assertBriefNames(self.brief_of(r), dropped=strays, not_named=kept, source_project=self.other)
 
     def test_only_a_session_project_of_another_repository_drops_keys(self):
         wt = self.tmp / "proj-wt"
@@ -882,6 +934,18 @@ class ForeignSessionEnvTests(HookTestCase):
         os.symlink(self.proj, link)
         outside = self.tmp / "outside"
         outside.mkdir()
+        # A worktree of this repository whose path shares no prefix with it, and a folder inside it.
+        elsewhere = self.tmp / "elsewhere" / "wt-345"
+        elsewhere.parent.mkdir()
+        self.git(self.proj, "worktree", "add", "-q", str(elsewhere), "-b", "t/345-elsewhere")
+        (elsewhere / "lib").mkdir()
+        # Other repositories and a plain folder whose paths start with this project's path or its worktree's.
+        proj2, proj_old, wt_old = self.make_repo("proj2"), self.make_repo("proj-old"), self.make_repo("proj-wt-old")
+        proj_notes = self.tmp / "proj_notes"
+        proj_notes.mkdir()
+        for project in (self.proj, wt):
+            self.assertBriefNames(self.plain_brief(project), dropped=[],
+                                  not_named=["HARNESS_TEST_CMD", "HARNESS_TEST_TIMEOUT", "CLAUDE_VERIFY_CMD"])
         rows = [
             # (label, CLAUDE_PROJECT_DIR, inherited HARNESS_SESSION_PROJECT (None: unset), another project?)
             ("unset", self.proj, None, False),
@@ -899,6 +963,16 @@ class ForeignSessionEnvTests(HookTestCase):
             ("a folder outside any repository", self.proj, str(outside), True),
             ("a folder git cannot read", self.proj, str(self.tmp / "gone" / "OkinawaDream"), True),
             ("another repository, from a worktree session", wt, str(self.other), True),
+            # the same repository, whatever the paths look like
+            ("a worktree of it elsewhere", self.proj, str(elsewhere), False),
+            ("a folder inside the worktree elsewhere", self.proj, str(elsewhere / "lib"), False),
+            ("another, differently named worktree, from a worktree session", wt, str(elsewhere), False),
+            ("the worktree elsewhere's folder, from a worktree session", wt, str(elsewhere / "lib"), False),
+            # another repository or folder, however much of the path it shares
+            ("a sibling repository sharing the prefix", self.proj, str(proj2), True),
+            ("a dashed sibling repository", self.proj, str(proj_old), True),
+            ("a folder sharing the prefix outside any repository", self.proj, str(proj_notes), True),
+            ("a sibling repository sharing the worktree's prefix", wt, str(wt_old), True),
         ]
         for label, project, session_project, foreign in rows:
             with self.subTest(label):
@@ -909,10 +983,15 @@ class ForeignSessionEnvTests(HookTestCase):
                 }
                 if session_project is not None:
                     inherited["HARNESS_SESSION_PROJECT"] = session_project
-                _, env_file = self.start(inherited, project=project)
+                r, env_file = self.start(inherited, project=project)
                 keys = [k for k in inherited if k != "HARNESS_SESSION_PROJECT"]
                 self.assertSourced(env_file, inherited, dropped=keys if foreign else [],
                                    kept=[] if foreign else keys, project=project, shells=["/bin/bash"])
+                if foreign:
+                    self.assertBriefNames(self.brief_of(r), dropped=keys, not_named=[],
+                                          source_project=session_project)
+                else:  # the plain brief names none of these keys (checked above), so neither may this one
+                    self.assertBriefNames(self.brief_of(r), dropped=[], not_named=keys)
 
     def test_drops_on_every_source_and_beside_a_projects_own_session_start_hook(self):
         inherited = {"HARNESS_SESSION_PROJECT": str(self.other), "HARNESS_TEST_CMD": "npm test -- {files}",
