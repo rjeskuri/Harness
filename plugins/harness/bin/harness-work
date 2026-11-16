@@ -908,9 +908,11 @@ def mtime_iso(path):
         return iso(now())
 
 
-def sweep(records, agents, as_json=False):
+def sweep(records, agents, as_json=False, dry_run=False):
     """Close the records whose run has ended; a billing or auth failure marks the api budget. A listed bg session
-    whose ticket is finished has ended whatever its state says: it is stopped and its record closed. Saves."""
+    whose ticket is finished has ended whatever its state says: it is stopped and its record closed. Saves. Under
+    `dry_run` (dispatch --dry-run, #335) such a session is not stopped and its record is closed in memory only, with
+    a `would stop session <id> (#N <state>)` line, so the plan still counts its slot free."""
     repos, logins = {}, {}
     for record in records:
         if record.get("ended_at"):
@@ -929,7 +931,12 @@ def sweep(records, agents, as_json=False):
                 finished = ticket_finished(record, repos)
             if entry is not None and not state_ended(state) and not finished:
                 continue
-            if finished:
+            if finished and dry_run:
+                n = record.get("ticket")
+                print(f"would stop session {record.get('bg_id')} (#{n} "
+                      f"{finished_as(ticket_issue(record_repo(record, repos), n))})",
+                      file=sys.stderr if as_json else sys.stdout, flush=True)
+            elif finished:
                 stop_session(record, as_json)
             record["ended_at"] = iso(now())
             if finished and not state_ended(state):
@@ -955,7 +962,8 @@ def sweep(records, agents, as_json=False):
         record["outcome"] = outcome
         if outcome in ("billing", "auth") and not is_bg(record):
             exhaust(load_budgets(), "api", f"{outcome}: {reason}", EXHAUST_HOURS)
-        save_run(record)
+        if not (dry_run and finished):
+            save_run(record)
 
 
 def gh_login(repo, logins):
@@ -1089,6 +1097,14 @@ def issue_finished(issue):
     state = str(issue.get("state", "")).upper()
     labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
     return state == "CLOSED" or (state == "OPEN" and any(lb in FINISHED_STATUSES for lb in labels))
+
+
+def finished_as(issue):
+    """Why issue_finished says a ticket's turn is over: `closed`, or its finished status label."""
+    if str(issue.get("state", "")).upper() == "CLOSED":
+        return "closed"
+    labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
+    return next((lb for lb in labels if lb in FINISHED_STATUSES), "finished")
 
 
 def ticket_finished(record, repos):
@@ -1711,7 +1727,7 @@ def cmd_dispatch(repo, args):
     effort = routing["code_effort"]
     agents = Agents()
     records = load_runs()
-    sweep(records, agents, wants_json(args))
+    sweep(records, agents, wants_json(args), dry_run=args.dry_run)
     mine = [r for r in records if of_repo(r, repo)]
     api_until = exhausted_until(load_budgets()["api"])    # after the sweep, which can be what exhausts it
     if args.venue == "headless" and api_until:
