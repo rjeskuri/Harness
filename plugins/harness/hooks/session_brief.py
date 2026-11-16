@@ -7,7 +7,13 @@ CLAUDE_PROJECT_DIR are both set and not blank, it appends one line
 its own, never truncating it), so the session's Bash calls, which Claude Code gives no
 CLAUDE_PROJECT_DIR, know the session's project (harness_lib.settings.other_project); a file
 that cannot be written is skipped silently, and the export happens even where the brief does
-not. Adds at most 40 lines of context:
+not. Then, when its own HARNESS_SESSION_PROJECT (which a hook process only has when it came with
+the process, from a spare another project's session started: #345) names another project than
+CLAUDE_PROJECT_DIR, it appends `unset <KEY>` for each harness key (HARNESS_* but
+HARNESS_SESSION_PROJECT, CLAUDE_VERIFY_CMD, CLAUDE_VERIFY_TIMEOUT) in its environment that no
+`env` of ~/.claude/settings.json or the project's .claude/settings.json and settings.local.json
+sets, and the brief names those keys and that project right after the heading (or alone, where
+the project has its own SessionStart hook). Adds at most 40 lines of context:
   ## Session brief: <repo> on <branch>, <n> uncommitted, last commit <age>: <subject>
   - on a ticket branch (t/<N>-...): Ticket #N: <title> (<status>, tier <tier>), up to six
     definition-of-done lines and Red run: <kind> at <time> (or none), from the ticket
@@ -32,7 +38,7 @@ cannot be loaded does it still print the one harness_lib warning line there. Out
 git repo the heading carries no git facts, and the sections are read from the directory
 itself. Fails open: an error means a shorter brief or none, never a blocked session.
 Without harness_lib it writes one line to stderr, puts one Warning: line naming
-harness_lib in the brief, and leaves out the ticket state.
+harness_lib in the brief, and leaves out the ticket state and the unset of inherited keys.
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -49,6 +55,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 
@@ -61,7 +68,7 @@ try:
     from harness_lib.hookio import emit, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.repo import main_checkout
-    from harness_lib.settings import claude_project_dir
+    from harness_lib.settings import claude_project_dir, other_project, settings_env
     from harness_lib.text import one_line, read_json
 
     LIB_PROBLEM = ""
@@ -151,6 +158,11 @@ HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
 LABEL_RE = re.compile(r"^(\s*)(?:[-*+]\s+)?\*\*([^*]+?)\*\*\s*:?\s*(.*)$")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 LIST_PREFIX_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
+
+# The keys a session claimed from another project's spare may carry over (#345): every HARNESS_*
+# but the session project itself, and the two verify keys. Only names a shell can unset count.
+VERIFY_KEYS = ("CLAUDE_VERIFY_CMD", "CLAUDE_VERIFY_TIMEOUT")
+SHELL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 def git(
@@ -662,30 +674,103 @@ def extras(
 # ---------- main ----------
 
 
-def export_session_project() -> None:
-    """Append `export HARNESS_SESSION_PROJECT=<CLAUDE_PROJECT_DIR>` to CLAUDE_ENV_FILE, which each
-    later Bash call of the session sources first. Nothing when either is unset or blank or the
-    file cannot be written; a last line without a newline gets one first."""
+def append_to_env_file(lines: list[str]) -> bool:
+    """Append `lines` to CLAUDE_ENV_FILE, which each later Bash call of the session sources first;
+    a last line without a newline gets one first, and the file is never truncated. False when
+    CLAUDE_ENV_FILE is unset or blank or the file cannot be written."""
     target = os.environ.get("CLAUDE_ENV_FILE") or ""
-    project = claude_project_dir() or ""
-    if not target.strip() or not project.strip():
-        return
-    line = os.fsencode(f"export HARNESS_SESSION_PROJECT={shlex.quote(project)}\n")
+    if not target.strip():
+        return False
+    text = os.fsencode("".join(f"{line}\n" for line in lines))
     try:
         with open(target, "ab+") as fh:  # appends; makes the file, never its folder
             fh.seek(0, os.SEEK_END)
             if fh.tell():
                 fh.seek(-1, os.SEEK_END)
                 if fh.read(1) != b"\n":
-                    line = b"\n" + line
-            fh.write(line)
-    except Exception:  # fail open: no export rather than a broken brief
-        pass
+                    text = b"\n" + text
+            fh.write(text)
+    except Exception:  # fail open: nothing written rather than a broken brief
+        return False
+    return True
+
+
+def export_session_project() -> None:
+    """Append `export HARNESS_SESSION_PROJECT=<CLAUDE_PROJECT_DIR>` to CLAUDE_ENV_FILE. Nothing when
+    either is unset or blank or the file cannot be written."""
+    project = claude_project_dir() or ""
+    if project.strip():
+        append_to_env_file([f"export HARNESS_SESSION_PROJECT={shlex.quote(project)}"])
+
+
+def is_harness_key(name: str) -> bool:
+    return SHELL_NAME_RE.match(name) is not None and (
+        (name.startswith("HARNESS_") and name != "HARNESS_SESSION_PROJECT")
+        or name in VERIFY_KEYS
+    )
+
+
+def inherited_project(project: str) -> str | None:
+    """The HARNESS_SESSION_PROJECT this hook's own environment carries, when it names another
+    project than `project` (CLAUDE_PROJECT_DIR). Hook processes never source CLAUDE_ENV_FILE, so
+    such a value came with the process, from a spare another project's session started (#345).
+    In a repository, other_project decides by git: its main checkout in any spelling, a worktree
+    of it or a folder inside one is this project, and a folder git cannot read is another.
+    Outside any repository, only that folder or one inside it is this project. None when it is
+    unset or blank, names this project, or git is too slow to name this project's main checkout."""
+    session = (os.environ.get("HARNESS_SESSION_PROJECT") or "").strip()
+    if not session:
+        return None
+    try:
+        main = main_checkout(project, timeout=EXTRA_GIT_TIMEOUT, raise_timeout=True)
+    except subprocess.TimeoutExpired:
+        return None
+    if main is not None:
+        return session if other_project(main, timeout=EXTRA_GIT_TIMEOUT) else None
+    here, there = canonical_path(project), canonical_path(session)
+    inside = there == here or there.startswith(here.rstrip(os.sep) + os.sep)
+    return None if inside else session
+
+
+def drop_strays() -> list[str]:
+    """When the session came from another project's session (inherited_project), append
+    `unset <KEY>` to CLAUDE_ENV_FILE for each harness key in this environment that none of this
+    project's settings files (~/.claude/settings.json, <CLAUDE_PROJECT_DIR>/.claude/settings.json
+    and settings.local.json) sets in its `env`: Claude Code overlays those, so any other one came
+    with the process. Returns the brief lines naming the keys and that project; nothing without
+    the lib, which alone tells repositories apart."""
+    project = claude_project_dir() or ""
+    if LIB_PROBLEM or not project.strip():
+        return []
+    source = inherited_project(project)
+    if source is None:
+        return []
+    user = settings_env(os.path.expanduser("~"), ("settings.json",))
+    own = set(user) | set(settings_env(project))
+    strays = sorted(k for k in os.environ if is_harness_key(k) and k not in own)
+    if not strays:
+        return []
+    came = (
+        f"inherited from another project's session ({source}) and set by none of"
+        " this project's settings files"
+    )
+    if append_to_env_file([f"unset {key}" for key in strays]):
+        head = f"Unset for this session's Bash calls, {came}:"
+    else:
+        head = f"Warning: {came}, but not unset (no writable CLAUDE_ENV_FILE):"
+    keys = textwrap.wrap(
+        ", ".join(strays), MAX_LINE_CHARS, break_long_words=False, break_on_hyphens=False
+    )
+    return [head, *keys]
 
 
 def main() -> int:
     started = time.monotonic()
     export_session_project()
+    try:
+        dropped = drop_strays()
+    except Exception:  # fail open: the brief goes on without the notice
+        dropped = []
     data = read_input()
     cwd = Path(hook_cwd(data))
     git_root = repo_root(cwd)
@@ -696,11 +781,13 @@ def main() -> int:
             f"Warning: {LIB_PROBLEM}; the guard hooks allow every call"
             " and this brief has no ticket state."
         )
+    notices = [*warning, *dropped]
     if declares_session_start(root):
-        # The project's own hook replaces the brief and its title, but not the warning.
-        if not warning:
+        # The project's own hook replaces the brief and its title, but not the notices.
+        if not notices:
             return 0
-        out = {"hookEventName": "SessionStart", "additionalContext": clip(warning[0])}
+        context = "\n".join(clip(ln) for ln in notices)
+        out = {"hookEventName": "SessionStart", "additionalContext": context}
         emit({"hookSpecificOutput": out})
         return 0
     name = root.name or str(root)
@@ -708,7 +795,7 @@ def main() -> int:
     head, branch = f"## Session brief: {name}", None
     if git_root is not None:
         head, branch = heading(git_root, name)
-    lines = [head, *warning, *extras(git_root, branch, started, cwd), *sections(root)]
+    lines = [head, *notices, *extras(git_root, branch, started, cwd), *sections(root)]
     brief = "\n".join(clip(ln) for ln in lines[:MAX_LINES])
 
     out = {"hookEventName": "SessionStart", "additionalContext": brief}
