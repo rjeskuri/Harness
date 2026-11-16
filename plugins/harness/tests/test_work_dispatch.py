@@ -1542,5 +1542,156 @@ class DispatchDryRunStopsNothing(WorkTest):
                     self.assertIsNone(saved[self.record_id(n)]["ended_at"])
 
 
+# =========================================================================== dispatch --only N[,N...] (#336)
+class DispatchOnly(WorkTest):
+    """`dispatch --only` plans only the named tickets, through the normal path: run record, start, launch."""
+
+    TITLES = {5: "Five", 7: "Seven", 9: "Nine", 11: "Eleven"}
+
+    def board(self, ready=(5, 7, 9), extra_issues=()):
+        titles = self.TITLES
+        self.scenario(issues=[issue(n, title=titles[n]) for n in ready] + list(extra_issues),
+                      ready=[ready_row(n, titles[n]) for n in ready])
+
+    def sleeper(self, ticket):
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"/harness:work {ticket}"])
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        return live.pid
+
+    def launched_tickets(self):
+        return sorted(int(c["argv"][-1].split()[1]) for c in self.claude_calls())
+
+    def started_tickets(self):
+        """Tickets whose start comment or status edit reached the board."""
+        return {int(argv[2]) for argv in self.gh_calls() if argv[:2] in (["issue", "edit"], ["issue", "comment"])}
+
+    def assertSaysWhy(self, p, n):
+        text = p.stdout + p.stderr
+        self.assertNotIn("unrecognized arguments", text)    # an unknown argument is not a reason
+        self.assertRegex(text, rf"#{n}\b", text)
+
+    def test_only_one_of_three_ready_tickets_launches_that_one_with_its_run_record(self):
+        self.board()
+        p = self.ok("dispatch", "--only", "7", env=self.env(FAKECLAUDE_BG_ID="only7", **CREDENTIALS))
+        self.assertRegex(p.stdout, r"(?m)^#7 bg on t/7-\S+ \(id only7\)$")
+        self.assertNotRegex(p.stdout, r"#5\b|#9\b")
+        [call] = self.claude_calls()
+        self.assertEqual(call["argv"], ["--bg", "-n", "proj #7 Seven", "--permission-mode", "auto",
+                                        "/harness:work 7"])
+        [record] = self.run_records()
+        self.assertEqual((record["ticket"], record["venue"], record["bg_id"], record["ended_at"]),
+                         (7, "bg", "only7", None))
+        self.assertTrue(record["id"].startswith(f"{self.key}-7-"), record["id"])
+        self.assertTrue(record["branch"].startswith("t/7-"), record["branch"])
+        self.assertEqual(os.path.realpath(call["cwd"]), os.path.realpath(record["worktree"]))
+        self.assertEqual(self.started_tickets(), {7})     # the start comment and status edit: #7 only
+        self.assertTrue(os.path.isdir(record["worktree"]))
+
+    def test_a_different_named_ticket_is_the_one_launched(self):
+        self.board()
+        self.ok("dispatch", "--only", "9", env=self.env(**CREDENTIALS))
+        self.assertEqual(self.launched_tickets(), [9])
+        self.assertEqual([r["ticket"] for r in self.run_records()], [9])
+        self.assertEqual(self.started_tickets(), {9})
+
+    def test_only_with_a_comma_list_launches_exactly_those_tickets(self):
+        self.board(ready=(5, 7, 9, 11))
+        p = self.ok("dispatch", "--only", "11,5", env=self.env(**CREDENTIALS))
+        self.assertEqual(self.launched_tickets(), [5, 11])
+        self.assertEqual(sorted(r["ticket"] for r in self.run_records()), [5, 11])
+        self.assertEqual(self.started_tickets(), {5, 11})
+        for n in (5, 11):
+            self.assertRegex(p.stdout, rf"(?m)^#{n} bg on ")
+        self.assertNotRegex(p.stdout, r"#7\b|#9\b")
+
+    def test_only_a_ticket_that_is_not_ready_launches_nothing_and_says_why(self):
+        proposed = issue(8, labels=("task", "status:proposed", "size:S", "risk:low"), title="Proposed")
+        waiting = issue(10, labels=NEEDS_INPUT, title="Waiting")
+        working = issue(13, labels=IN_PROGRESS, title="Working")        # in progress, no run record at all
+        for n in (8, 10, 13, 99):                                        # 99 is not on the board
+            with self.subTest(only=n):
+                self.board(extra_issues=[proposed, waiting, working])
+                p = self.work("dispatch", "--only", str(n), env=self.env(**CREDENTIALS))
+                self.assertSaysWhy(p, n)
+                self.assertEqual(self.claude_calls(), [])
+                self.assertEqual(self.run_records(), [])
+                self.assertEqual(self.started_tickets(), set())
+                self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+
+    def test_only_a_ticket_with_a_live_run_launches_nothing_and_says_why(self):
+        self.write_run(13, pid=self.sleeper(13))
+        self.board(extra_issues=[issue(13, labels=IN_PROGRESS, title="Working")])
+        before = self.run_records()
+        p = self.work("dispatch", "--only", "13", env=self.env(**CREDENTIALS))
+        self.assertSaysWhy(p, 13)
+        self.assertEqual(self.claude_calls(), [])
+        self.assertEqual(self.run_records(), before)
+        self.assertEqual(self.started_tickets(), set())
+
+    def test_a_ready_ticket_that_is_live_is_not_launched_again_but_the_other_named_one_is(self):
+        self.write_run(5, pid=self.sleeper(5))
+        self.board()
+        p = self.work("dispatch", "--only", "5,7", env=self.env(**CREDENTIALS))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertSaysWhy(p, 5)
+        self.assertEqual(self.launched_tickets(), [7])
+        self.assertEqual(self.started_tickets(), {7})
+
+    def test_a_not_ready_name_does_not_stop_the_ready_one_beside_it(self):
+        self.board(extra_issues=[issue(8, labels=("task", "status:proposed", "size:S", "risk:low"))])
+        p = self.work("dispatch", "--only", "8,9", env=self.env(**CREDENTIALS))
+        self.assertEqual(self.launched_tickets(), [9])
+        self.assertSaysWhy(p, 8)
+        self.assertEqual([r["ticket"] for r in self.run_records()], [9])
+        self.assertEqual(self.started_tickets(), {9})
+
+    def test_only_redispatches_an_in_progress_ticket_whose_run_ended_without_a_pr(self):
+        for n in (13, 14):
+            self.write_run(n, pid=self.dead_pid(), started_at=iso_ago(hours=3), ended_at=iso_ago(hours=2),
+                           outcome="error")
+        self.board(extra_issues=[issue(13, labels=IN_PROGRESS, title="Working"),
+                                 issue(14, labels=IN_PROGRESS, title="Other")])
+        p = self.ok("dispatch", "--only", "13", env=self.env(**CREDENTIALS))
+        self.assertRegex(p.stdout, r"(?m)^#13 bg on ")
+        self.assertEqual(self.launched_tickets(), [13])
+        fresh = [r for r in self.run_records() if not r.get("ended_at")]
+        self.assertEqual([r["ticket"] for r in fresh], [13])     # #14 ended too, but was not named
+        self.assertEqual(self.started_tickets(), {13})
+
+    def test_only_with_dry_run_plans_the_named_tickets_and_starts_nothing(self):
+        self.board(ready=(5, 7, 9, 11))
+        p = self.ok("dispatch", "--dry-run", "--only", "7,11")
+        starts = [ln for ln in p.stdout.splitlines() if ln.startswith("would start #")]
+        self.assertEqual(sorted(ln.split()[2] for ln in starts), ["#11", "#7"], p.stdout)
+        for n in (5, 9):
+            self.assertNotRegex(p.stdout, rf"#{n}\b")
+        data = self.ok_json("dispatch", "--dry-run", "--only", "7,11", "--json")
+        self.assertEqual(sorted(row["number"] for row in data["plan"]), [7, 11])
+        self.assertTrue(data["dry_run"])
+        data = self.ok_json("dispatch", "--dry-run", "--only", "9", "--json")
+        self.assertEqual([row["number"] for row in data["plan"]], [9])
+        self.assertEqual(self.claude_calls(), [])
+        self.assertEqual(self.run_records(), [])
+        self.assertEqual(self.started_tickets(), set())
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+
+    def test_only_with_dry_run_says_why_a_named_ticket_is_not_planned(self):
+        self.write_run(13, pid=self.sleeper(13))
+        self.board(extra_issues=[issue(8, labels=("task", "status:proposed", "size:S", "risk:low")),
+                                 issue(13, labels=IN_PROGRESS, title="Working")])
+        for n in (8, 13):
+            with self.subTest(only=n):
+                p = self.work("dispatch", "--dry-run", "--only", f"{n},5")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn(f"would start #{n}", p.stdout)
+                self.assertIn("would start #5", p.stdout)
+                self.assertSaysWhy(p, n)
+                data = json.loads(self.work("dispatch", "--dry-run", "--only", f"{n},5", "--json").stdout)
+                self.assertEqual([row["number"] for row in data["plan"]], [5])
+                self.assertIn(n, [s["number"] for s in data["skipped"]])
+        self.assertEqual(self.claude_calls(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
