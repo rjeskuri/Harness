@@ -30,7 +30,8 @@ PR_URL = "https://github.com/o/r/pull/34"
 SHA = "abc123def4567890abc123def4567890abc12345"
 REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
 HIGH_RISK = "High risk: review the data and live-system paths before merging."
-LAND_FIELDS = "isDraft,mergeable,headRefName,closingIssuesReferences,statusCheckRollup,title,url,state"
+# What `land` reads of the PR before merging; headRefOid is the head the checks judge (#337).
+LAND_FIELDS = "isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state"
 
 STUB = """import json, os, sys
 name, argv = os.path.basename(sys.argv[1]), sys.argv[2:]
@@ -731,12 +732,37 @@ class UltraSettingBase:
 
 
 # =========================================================================== land
+# The head checks (#337): the fixtures the land modules share (#348). The PR's head in the fake-only land fixtures:
+# the commit harness_review's reviews are of, so by default the latest harness review is at the head.
+HEAD_SHA = harness_review(1, at(1))[0]["commit_id"]
+
+
 def land_view(**over):
-    view = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": BRANCH,
+    """What `gh pr view --json LAND_FIELDS` answers: the head's sha is HEAD_SHA unless `over` names another."""
+    view = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": BRANCH, "headRefOid": HEAD_SHA,
             "closingIssuesReferences": [{"number": 12}], "statusCheckRollup": GREEN, "title": "Add the widget (#12)",
             "url": PR_URL, "state": "OPEN"}
     view.update(over)
     return view
+
+
+def compare_calls(head, behind):
+    """fakegh entries for `gh api repos/o/r/compare/main...<head>`: `behind` commits of main the head lacks. Only the
+    head's sha is answered (asked by the branch name, the fake has no answer), through `--jq .behind_by` or as the
+    whole comparison."""
+    endpoint = f"repos/o/r/compare/main...{head}"
+    return [{"contains": ["api", endpoint, "--jq"], "stdout": f"{behind}\n"},
+            {"contains": ["api", endpoint], "stdout_json": {"behind_by": behind, "ahead_by": 1,
+                                                            "status": "diverged" if behind else "ahead"}}]
+
+
+def land_gate_calls(reviews=(), commits=(), pull=PULL, head=HEAD_SHA, behind=0):
+    """What `land` reads before the gate's reads (gate_calls): the compare of main with `head` and the authenticated
+    account (the one the harness reviews are by, should the land judge reviews by it as `harness-pr gate` does)."""
+    return compare_calls(head, behind) + [
+        {"match": ["api", "user"], "contains": ["--jq"], "stdout": "rjeskuri\n"},
+        {"match": ["api", "user"], "stdout_json": {"login": "rjeskuri", "type": "User"}},
+    ] + gate_calls(reviews, commits, pull)
 
 
 HARNESS_MARK = "<!-- harness -->"     # the last line of every comment harness-board posts
