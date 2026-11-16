@@ -137,13 +137,17 @@ ticket. A failed launch, or one without a session id, ends the record in error w
 wording there marks the cloud budget exhausted for 24 h.
 
 backup list: this repository's snapshots (harness_lib/backups.py: its project store, <git common dir>/harness-backups/,
-and its own in ~/.claude/harness/backups/), newest first, as ID, AGE, ITEMS, SIZE and COMMAND; --all adds every
+and its own in ~/.claude/harness/backups/), newest first, as ID, AGE, ITEMS (paths and git refs), SIZE and COMMAND; --all adds every
 snapshot in ~/.claude/harness/backups/, and outside a repository list acts as --all; --json prints the manifests;
 none is `No backups.`. backup restore ID: every item back at its path (`restored <path>` each), or with --path only
 those at or under P, or with --to under DIR at its path relative to the snapshot's repository (else to its own
 working tree, else its basename). Every target is checked first: an unknown id, or a target that exists, is one line,
 exit 1 and nothing written; --force first snapshots the existing targets (into the snapshot's project store when it
-sat in one, else where its repository's snapshots go now) and prints that snapshot's id. --path and --to are taken from the cwd. --json prints {id, restored, replaced, saved} at the end.
+sat in one, else where its repository's snapshots go now) and prints that snapshot's id. --path and --to are taken from the cwd.
+Its git refs (not with --path) never touch a working tree: a branch comes back at its sha, HEAD as the branch
+harness-restore/<ID>, changes and stash entries into the stash list (`git stash store`, the line naming the
+`git stash apply` to run); a branch that exists refuses the restore, --force or not. --json prints {id, restored,
+replaced, saved, refs} at the end.
 
 A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through to stderr, in order,
 except a routing problem dispatch already printed (those children load the same settings; REPORTED); its other
@@ -2193,8 +2197,9 @@ def cmd_backup_list(main, args):
     for manifest in found:
         then = parse_iso_seconds(manifest.get("at"))
         items = [i for i in manifest["items"] if isinstance(i, dict)]
+        refs = [r for r in manifest.get("refs") or [] if isinstance(r, dict)]
         size = sum(i["bytes"] for i in items if isinstance(i.get("bytes"), int) and not isinstance(i["bytes"], bool))
-        rows.append((manifest["id"], ago_text(then, current) if then is not None else "?", str(len(items)),
+        rows.append((manifest["id"], ago_text(then, current) if then is not None else "?", str(len(items) + len(refs)),
                      size_text(size), one_line(manifest.get("command") or "")))
     print(table(rows))
 
@@ -2207,6 +2212,8 @@ def cmd_backup_restore(main, args):
             count = len(value["items"])
             print(f"backup {value['id']} holds the {count} path{'' if count == 1 else 's'} this restore replaces",
                   flush=True)
+        elif kind == "ref":
+            print(value, flush=True)
         else:
             print(f"restored {value}", flush=True)
 
