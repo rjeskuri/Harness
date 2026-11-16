@@ -2190,6 +2190,9 @@ class GitTargets(GitGate):
             ("git restore -s {tc} {spec}", wt, changes),                       # fix round 2, low: every spelling
             ("git restore -Ws{tc} {spec}", wt, changes),
             ("git restore --so {tc} {spec}", wt, changes),
+            ("git restore -SW --source={tc} {spec}", wt, changes),             # fix round 3: --staged keeps the source
+            ("git restore --source={tc} --staged --worktree {spec}", wt, changes),
+            ("git restore -SWs{tc} {spec}", wt, changes),
             ("git checkout {tc} {spec}", wt, changes),
             ("git checkout -f {tc} -- .", wt, changes),
             ("git switch --detach -f {tc}", wt, changes),
@@ -2377,6 +2380,176 @@ class GitTargets(GitGate):
         nothing(then_clean(("git reset --hard", "git checkout -- .", "git restore .",
                             f"git checkout -- {sub}/.gitignore", f"git restore {sub}/.gitignore",
                             f"git checkout HEAD -- {sub}/.gitignore")), "nested, deleted")
+
+    STAGED = ("--staged --worktree", "--worktree --staged", "-SW", "-WS", "-S -W", "--stag --worktree")
+
+    def test_clean_after_a_staged_restore_that_puts_back_heads_gitignore_gets_nothing(self):
+        """Fix round 3 on PR #361: restore --staged --worktree with no --source takes the files from HEAD, not the
+        index, so a .gitignore change that is only staged (the index and the disk agree, HEAD does not) is put back
+        and the clean after it removes what its dry run saw ignored."""
+        main = self.make_project()
+        wt = self.add_worktree(main, "t-1-x", "t/1-x")
+        head = self.rev(wt)
+
+        def fresh():
+            self.git(wt, "reset", "-q", "--hard")
+            self.git(wt, "clean", "-q", "-f", "-d", "-x")
+            app = self.edit(wt, "src/app.py")
+            notes = os.path.join(wt, f"notes-{self.word()}.txt")
+            self.put(notes)
+            self.put(os.path.join(wt, f"scratch-{self.word()}.tmp"))
+            return app, notes
+
+        def only_staged(rel):
+            """`rel` differs from HEAD on disk, and the index holds what the disk does."""
+            self.assertEqual(self.git(wt, "diff", "--name-only", "--", rel), "", f"{rel} is not staged as it is")
+            self.assertEqual(self.git(wt, "diff", "--name-only", "HEAD", "--", rel), rel, f"{rel} is HEAD's")
+
+        def nothing(cases, why):
+            for command, cwd in cases:
+                with self.subTest(command=command, cwd=cwd, gitignore=why):
+                    before, refs, there = self.snapshots(), self.backup_refs(wt), self.state(wt)
+                    self.expect_none(self.run_gate(command, cwd, main), before, refs, command, wt)
+                    self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
+
+        def allowed(cases, why):
+            for command, cwd, want, paths in cases:
+                with self.subTest(command=command, cwd=cwd, gitignore=why, allowed=True):
+                    before, there = self.snapshots(), self.state(wt)
+                    self.expect_refs(self.run_gate(command, cwd, main), before, command, wt, wt, want, paths=paths)
+                    self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
+
+        def loses(cases, folder):
+            """One of `cases`, run by a real shell in the worktree, removes `folder`, ignored before it runs."""
+            files = [os.path.join(folder, n) for n in os.listdir(os.path.join(wt, folder))]
+            self.assertTrue(files and all(self.ignored(wt, f) for f in files), f"{folder} is not ignored now")
+            command = self.rng.choice([c for c, _cwd in cases])
+            argv = [SHELL, "-f", "-c", command] if os.path.basename(SHELL) == "zsh" else [SHELL, "-c", command]
+            subprocess.run(argv, cwd=wt, env=self.env(), capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+            self.assertFalse(os.path.lexists(os.path.join(wt, folder)), f"{command!r} left {folder} (seed {self.seed})")
+
+        def forms(pathspec, spellings=None):
+            """(`git restore <spelling> <pathspec> && git clean -fd`, cwd) for each of `spellings`; with none named,
+            every spelling and the `;` and -C shapes."""
+            if spellings is not None:
+                return [(f"git restore {s} {pathspec} && git clean -fd", wt) for s in spellings]
+            return forms(pathspec, self.STAGED) + [
+                (f"git restore -SW {pathspec}; git clean -fdq", wt),
+                (f"git -C {wt} restore -WS {pathspec} && git -C {wt} clean -f -d", main)]
+
+        # The root .gitignore edited to ignore a folder already on disk, and the edit staged.
+        app, notes = fresh()
+        reports = "reports-" + self.word()
+        path = os.path.join(wt, ".gitignore")
+        root = self.put(path, data=self.read(path) + (reports + "/\n").encode())
+        self.git(wt, "add", "--", ".gitignore")
+        self.fill(os.path.join(wt, reports), files=2)
+        only_staged(".gitignore")
+        cases = forms(".") + forms(".gitignore", ("-SW", "--stag --worktree")) + [
+            ("git restore --source=HEAD -SW . && git clean -fd", wt)]
+        nothing(cases, "root, staged")
+        edits = {("changes", None): self.changes_of(wt, head, {"src/app.py": app, ".gitignore": root},
+                                                    {".gitignore": root})}
+        allowed([(f"git restore {s} .", wt, edits, []) for s in self.STAGED[::2]]             # no clean: as before
+                + [("git clean -fd && git restore -SW .", wt, edits, [notes]),                # the clean runs first
+                   ("git restore -SW src && git clean -fd", wt, edits, [notes]),            # its pathspec leaves it out
+                   ("git clean -fd", wt, {}, [notes])], "root, staged")
+        loses(cases, reports)
+
+        # A new nested .gitignore, only staged: the restore from HEAD takes it away.
+        app, notes = fresh()
+        gen = "gen-" + self.word()
+        out = f"{gen}/out-{self.word()}"
+        self.put(os.path.join(wt, gen, ".gitignore"), data=(os.path.basename(out) + "/\n").encode())
+        self.git(wt, "add", "--", f"{gen}/.gitignore")
+        self.fill(os.path.join(wt, out), files=2)
+        only_staged(f"{gen}/.gitignore")
+        cases = forms(".", ("--worktree --staged", "-WS")) + forms(gen, ("-SW", "-S -W"))
+        nothing(cases, "new, staged")
+        loses(cases, out)
+
+        # The root .gitignore edited and not staged: the index and HEAD agree, and the restore puts that back too.
+        app, notes = fresh()
+        cache = "cache-" + self.word()
+        self.put(path, data=self.read(path) + (cache + "/\n").encode())
+        self.fill(os.path.join(wt, cache), files=2)
+        nothing(forms(".", ("-SW", "--stag --worktree")), "root, edited")
+
+        # No .gitignore differs between HEAD and the worktree, only a staged edit of a source file: backed up as before.
+        app, notes = fresh()
+        self.git(wt, "add", "--", "src/app.py")
+        doc = self.edit(wt, "docs/a.md")
+        self.assertEqual(self.git(wt, "diff", "--name-only", "HEAD"), "docs/a.md\nsrc/app.py")
+        mine = {("changes", None): self.changes_of(wt, head, {"src/app.py": app, "docs/a.md": doc},
+                                                   {"src/app.py": app})}
+        allowed([(c, cwd, mine, [notes]) for c, cwd in forms(".") + forms(".gitignore", ("-WS",))], "none differs")
+
+    def test_a_staged_restore_over_what_stash_create_lacks_gets_nothing(self):
+        """Fix round 3 on PR #361: restore --staged --worktree with no --source writes HEAD's files, so where HEAD
+        tracks a folder over an untracked or ignored file, or a file over an untracked folder (the index having
+        dropped them), it removes what git stash create never holds."""
+        main = self.make_project()
+        wt = self.add_worktree(main, "t-1-x", "t/1-x")
+        w = self.word()
+        vendor, gen, cache = f"vendor-{w}", f"gen-{w}", f"cache-{w}.tmp"            # cache-*.tmp: ignored by *.tmp
+        for rel in (vendor + "/lib.py", gen, cache + "/lib.py"):
+            self.put(os.path.join(wt, rel), data=self.text())
+        self.git(wt, "add", "-f", "--", vendor, gen, cache)
+        self.git(wt, "commit", "-q", "-m", "Vendored")
+        head = self.rev(wt)
+        self.git(wt, "rm", "-q", "-r", "--cached", "--", vendor, gen, cache)       # staged deletions; HEAD tracks them
+        for rel in (vendor, gen, cache):
+            remove(os.path.join(wt, rel))
+        mine = {"src/app.py": self.edit(wt, "src/app.py")}
+        self.put(os.path.join(wt, f"notes-{self.word()}.txt"))                    # untracked, where HEAD has none
+        self.put(os.path.join(wt, f"scratch-{self.word()}.tmp"))                  # ignored, likewise
+        changes = {("changes", None): self.changes_of(wt, head, mine)}
+        kinds = {"untracked file, HEAD's folder": (vendor, vendor),
+                 "untracked folder, HEAD's file": (f"{gen}/out-{self.word()}.txt", gen),
+                 "ignored file, HEAD's folder": (cache, cache)}
+        forms = [(f"git restore {s} .", wt) for s in self.STAGED[:3]] + [
+            (f"git restore {s} {{spec}}", wt) for s in self.STAGED[3:]] + [
+            (f"git -C {wt} restore -SW .", main), ("cd src && git restore --staged --worktree -- ..", wt)]
+
+        def lacks(rel):
+            """git stash create's commit holds neither the path `rel` nor its bytes, in its tree or its index's."""
+            sha = self.git(wt, "stash", "create")
+            self.assertTrue(sha, "git stash create made no commit")
+            blob = self.git(wt, "hash-object", "--", rel)
+            for rev in (sha, sha + "^2"):
+                listing = [line.split("\t", 1) for line in self.git(wt, "ls-tree", "-r", rev).splitlines()]
+                self.assertNotIn(rel, [name for _meta, name in listing], f"{rev} holds {rel}")
+                self.assertNotIn(blob, [meta.split()[2] for meta, _name in listing], f"{rev} holds {rel}'s bytes")
+
+        for n, (kind, (local, spec)) in enumerate(kinds.items()):
+            path = os.path.join(wt, local)
+            data = self.put(path, data=self.text())
+            self.assertEqual(self.ignored(wt, local), kind.startswith("ignored"), local)
+            self.assertFalse(self.tracked(wt, local), local)
+            lacks(local)
+            for shape, cwd in (forms[(3 * n + j) % len(forms)] for j in range(4)):   # each form for some kind
+                command = shape.format(spec=spec)
+                with self.subTest(command=command, cwd=cwd, collides=kind):
+                    before, refs, there = self.snapshots(), self.backup_refs(wt), self.state(wt)
+                    self.expect_none(self.run_gate(command, cwd, main), before, refs, command, wt)
+                    self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
+            self.assertEqual(self.read(path), data)
+            remove(os.path.join(wt, local.split("/")[0]))
+
+        # Nothing on disk where HEAD tracks a path the index dropped: backed up and allowed, as before.
+        for shape, cwd in forms:
+            command = shape.format(spec=vendor)
+            with self.subTest(command=command, cwd=cwd, collides=None):
+                before, there = self.snapshots(), self.state(wt)
+                self.expect_refs(self.run_gate(command, cwd, main), before, command, wt, wt, changes)
+                self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
+
+        # The loss: the real restore puts HEAD's folder where the untracked file was, and nothing holds the file.
+        path = os.path.join(wt, vendor)
+        self.put(path, data=self.text())
+        self.git(wt, "restore", "--staged", "--worktree", ".")
+        self.assertTrue(os.path.isdir(path), "the restore left the untracked file")
+        self.assertEqual(self.read(os.path.join(path, "lib.py")), self.blob(wt, "HEAD", vendor + "/lib.py"))
 
 
 class GitBranchNames(GitGate):

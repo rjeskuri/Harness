@@ -409,25 +409,30 @@ def clean_listing(rest, where, here):
 
 def restore_source(rest):
     """The tree-ish git restore takes the files from (-s, --source or a prefix of it down to --so, the last one
-    given), None for the index."""
-    found, k = None, 0
+    given); with none, HEAD when it restores the index too (-S, --staged or a prefix of it down to --st, unless a
+    later --no-staged), else None for the index."""
+    found, staged, k = None, False, 0
     while k < len(rest) and rest[k] != "--":
         a, k = rest[k], k + 1
         option, eq, value = a.partition("=")
         if len(option) >= 4 and "--source".startswith(option):
             found = value if eq else rest[k] if k < len(rest) else None
             k += 0 if eq else 1
-        elif a.startswith("-") and not a.startswith("--") and "s" in a[1:]:
-            value = a[a.index("s", 1) + 1 :]  # -s takes the rest of the word, or the next word
-            found = value or (rest[k] if k < len(rest) else None)
-            k += 0 if value else 1
-    return found
+        elif len(a) >= 4 and "--staged".startswith(a) or len(a) >= 7 and "--no-staged".startswith(a):
+            staged = not a.startswith("--no")
+        elif a.startswith("-") and not a.startswith("--"):
+            letters, s, value = a[1:].partition("s")  # -s takes the rest of the word, or the next word
+            staged = staged or "S" in letters
+            if s:
+                found = value or (rest[k] if k < len(rest) else None)
+                k += 0 if value else 1
+    return found if found is not None or not staged else "HEAD"
 
 
 def git_target(guard, sub, rest, where):
     """The commit or tree-ish a reset, a forced checkout or switch, or a checkout or restore of paths takes the
-    worktree's files from, as written: HEAD for a reset, checkout -f or switch naming none; None for git rm and for
-    the path forms naming none, which take the index."""
+    worktree's files from, as written: HEAD for a reset, checkout -f or switch naming none and for restore --staged
+    naming none; None for git rm and for the other path forms naming none, which take the index."""
     if sub == "restore":
         return restore_source(rest)
     if sub == "checkout" and "--" in rest:
