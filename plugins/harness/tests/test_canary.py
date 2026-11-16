@@ -74,11 +74,12 @@ PLUGIN = os.path.dirname(HERE)
 REPO = os.path.dirname(os.path.dirname(PLUGIN))
 SMOKE = os.path.join(REPO, "scripts", "smoke.sh")
 BIN_TOOLS = sorted(name for name in os.listdir(os.path.join(PLUGIN, "bin")) if name.startswith("harness-"))
-HOOKS = sorted(name for name in os.listdir(os.path.join(PLUGIN, "hooks")) if name.endswith(".py"))
+# land_ask.py (#330) is named whether or not its file is there yet: the canary must run a case for it.
+HOOKS = sorted({name for name in os.listdir(os.path.join(PLUGIN, "hooks")) if name.endswith(".py")} | {"land_ask.py"})
 CORE_TOOLS = ("harness-pr", "harness-board", "harness-work", "harness-red")
-# The hook cases the ticket lists: branch_guard 4, readonly_bash, tests_first, session_brief, notify, after_edit,
-# verify_on_stop 1 each.
-HOOK_CASES = 10
+# The hook cases the tickets list: branch_guard 4, readonly_bash, tests_first, session_brief, notify, after_edit,
+# verify_on_stop and land_ask (#330) 1 each.
+HOOK_CASES = 11
 RUN_TIMEOUT = 600
 BUDGET = 120
 
