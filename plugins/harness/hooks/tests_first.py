@@ -40,7 +40,19 @@ a ticket branch, writes whose paths cannot be seen are refused: an inline python
 program (-c, -e or a heredoc) that writes files, patch without a file argument or -o
 (the diff names the files), and find with -delete or an -exec, -execdir, -ok or -okdir
 command that writes files (as the walker judges a part), runs git on paths, or is a
-shell or an interpreter.
+shell or an interpreter. For the same three roles, an interpreter or shell run on a program
+file (harness_lib/programs.py: python, node, deno, bun, ruby, perl, php, sh, bash and zsh,
+and the wrappers uv run, poetry run, npx and bunx, on a file behind any option; a preload
+such as node -r or ruby -r; python -m resolved to a file from the part's directory and its
+PYTHONPATH, set on the part or exported earlier in the command; the standard library's pdb,
+cProfile, profile, trace, doctest and runpy by what they run) is refused unless the file is
+a blob at the worktree's HEAD (the index does not count), judged against the hook's worktree
+from whatever directory the part runs in; one whose path cannot be known ($F, a module on a
+PYTHONPATH entry the hook cannot expand) is refused too, and when git cannot say in time
+whether HEAD tracks the file, the run is refused, not judged. A test runner (pytest,
+unittest, node --test, deno test, bun test, vitest; npm test and npm run are not judged) is
+refused only a test path, directory or config outside the worktree: its in-tree files run,
+tracked or new, as do its output paths anywhere.
 
 <key> is the first 12 hex digits of the sha1 of the real path of the main working tree
 with each component spelled as its parent directory lists it, so a linked worktree
@@ -74,6 +86,7 @@ if _LIB not in sys.path:
 try:
     from harness_lib.hookio import deny, edited_path, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
+    from harness_lib.programs import note_exports, program_files
     from harness_lib.redproof import record_state
     from harness_lib.repo import main_checkout
     from harness_lib.settings import (
@@ -131,6 +144,16 @@ FIND_OPTIONS = {"-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"}
 # writers, since what their program writes cannot be seen.
 INTERPRETERS = {"perl", "ruby", "php", "awk", "gawk", "lua", "Rscript", "osascript"}
 INLINE = "Write files with Edit or Write so the tests-first rules can see the path."
+PROGRAM_UNTRACKED = (
+    "{name} runs {file}, a program file the worktree does not track at HEAD, so what it "
+    "writes cannot be seen"
+)
+PROGRAM_OUTSIDE = "{name} runs {file}, a program file outside the worktree, so what it writes cannot be seen"
+PROGRAM_UNKNOWN = "{name} runs {file}, a program file whose path cannot be known, so what it writes cannot be seen"
+PROGRAM_UNVERIFIED = (
+    "git did not say in time whether the worktree tracks {file}, so this run of {name} is "
+    "refused, not judged; retry it"
+)
 
 
 # ---------- globs ----------
@@ -546,12 +569,56 @@ def unseen_writes(guard, part, name: str, args: list[str], here: str | None):
     return guard.code_writes(name, args, part), []
 
 
+def program_refusal(
+    name: str, args: list[str], part, here: str | None, cwd: str, exports: dict, cache: dict
+) -> str | None:
+    """Why the program files `part` runs (harness_lib/programs.py) may not run: one whose
+    path cannot be known, one outside the worktree, or, unless a test runner is given it,
+    one that is not a blob at HEAD (a git call out of time refuses too). The worktree is the
+    part's directory's when that is guarded, else the hook's; None off the guarded branches
+    or when the part runs no program file."""
+    found = program_files(name, args, part.words, here, exports)
+    if not found:
+        return None
+    facts = None
+    for directory in (here, cwd):
+        if directory is None:
+            continue
+        candidate = facts_at(existing_dir(directory), cache)
+        if guarded(candidate) is not None:
+            facts = candidate
+            break
+    if facts is None:
+        return None
+    top = str(facts["top"])
+    for prog in found:
+        if prog.path is None:
+            return PROGRAM_UNKNOWN.format(name=name, file=prog.text)
+        rel = relative_path(prog.path, facts["top"])
+        if rel is None and prog.runner and os.path.isdir(prog.path):
+            if canonical_path(prog.path) == top:  # the worktree itself, as a test directory
+                continue
+        if rel is None:
+            return PROGRAM_OUTSIDE.format(name=name, file=prog.path)
+        if prog.runner:
+            continue
+        try:
+            out = git(top, "cat-file", "-t", f"HEAD:{rel}")
+        except (OSError, subprocess.SubprocessError):
+            return PROGRAM_UNVERIFIED.format(name=name, file=rel)
+        if out.stdout.strip() != "blob":
+            return PROGRAM_UNTRACKED.format(name=name, file=rel)
+    return None
+
+
 def check_bash(command: str, cwd: str, role: str) -> None:
     guard = branch_guard()
     state = {"cwd": cwd, "repos": {}}
     cache: dict = {}
+    exports: dict = {}
     for part, name, args in guard.walk(state, command):
         here = state["cwd"]
+        note_exports(part.words, name, args, exports)
         paths = [p for _, p, _, exact in guard.writes(part, name, args, here) if exact]
         bulk, where = False, here
         if name == "git":
@@ -578,6 +645,10 @@ def check_bash(command: str, cwd: str, role: str) -> None:
             if (not dirs or None in dirs) and here is not None and os.path.isdir(here):
                 places.append(here)
             if why and any(guarded(facts_at(p, cache)) is not None for p in places):
+                deny(f'Refused "{guard.shown(part.text)}": {why}. {INLINE}')
+                return
+            why = program_refusal(name, args, part, here, cwd, exports, cache)
+            if why:
                 deny(f'Refused "{guard.shown(part.text)}": {why}. {INLINE}')
                 return
 
