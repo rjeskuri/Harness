@@ -1657,7 +1657,10 @@ class DispatchOnly(WorkTest):
         self.assertEqual(self.launched_tickets(), [13])
         fresh = [r for r in self.run_records() if not r.get("ended_at")]
         self.assertEqual([r["ticket"] for r in fresh], [13])     # #14 ended too, but was not named
-        self.assertEqual(self.started_tickets(), {13})
+        self.assertNotIn(14, self.started_tickets())             # nothing on the board touches #14
+        self.assertTrue(os.path.isdir(fresh[0]["worktree"]))
+        worktrees = os.path.join(self.repo, ".claude", "worktrees")
+        self.assertEqual([d for d in os.listdir(worktrees) if d.startswith("t-14-")], [])
 
     def test_only_with_dry_run_plans_the_named_tickets_and_starts_nothing(self):
         self.board(ready=(5, 7, 9, 11))
