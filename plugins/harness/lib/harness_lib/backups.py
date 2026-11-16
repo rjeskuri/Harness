@@ -1,9 +1,10 @@
-"""The backup store: the snapshot a destructive command leaves of what it destroys, and its restore.
+"""The backup store: the snapshot a destructive command leaves of what it destroys, its restore, and the
+sweep that removes it after KEEP_DAYS days.
 A snapshot is <store>/<id>/: files/<k>, one copy per item (a file, a whole folder tree, or a symlink
 kept as a link and never followed), and manifest.json. The store is ~/.claude/harness/backups/, or
 <git common dir>/harness-backups/ for a project with any HARNESS_SENSITIVE_PATHS pattern, so that
-project's copies never leave it. harness-work's `backup list` and `backup restore` read it. See
-docs/design.md (State, harness-work).
+project's copies never leave it. harness-work's `backup list` and `backup restore` read it; the
+SessionStart hook (session_brief.py) sweeps it. See docs/design.md (State, harness-work).
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -17,9 +18,11 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from harness_lib.paths import canonical_path
@@ -28,9 +31,12 @@ from harness_lib.text import harness_home, read_json, write_json
 
 SETTING = "HARNESS_SENSITIVE_PATHS"
 PROJECT_STORE = "harness-backups"           # the in-project store's folder in the git common dir
+REF_ROOT = "refs/harness-backup"            # a snapshot's refs: refs/harness-backup/<id>/...
+KEEP_DAYS = 14                              # what sweep keeps: snapshots and refs this many days old or newer
 ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}")
 ID_TRIES = 100                              # suffixes tried for one second before giving up
 GIT_TIMEOUT = 10                            # seconds one git call may take
+KILL_GRACE = 0.3                            # seconds a git sent TERM gets to remove its lock files before KILL
 PRIVATE = 0o700                             # the store folders' mode
 
 
@@ -67,19 +73,62 @@ def _store(main, pats):
     return global_store()
 
 
-def _git(cwd, *args):
-    """git's stripped stdout, or None when it fails, prints nothing or cannot run."""
-    try:
-        done = subprocess.run(["git", "-C", cwd, *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                              encoding="utf-8", errors="surrogateescape", timeout=GIT_TIMEOUT)
-    except (OSError, subprocess.SubprocessError):
+def _run_git(cwd, args, deadline=None):
+    """(exit code, stdout) of git in `cwd`, or None when it cannot run or runs past GIT_TIMEOUT or `deadline` (a
+    time.monotonic() instant). It runs in a process group of its own, and nothing returns or raises here before
+    it has exited and been reaped: out of time (or on any other exception) the whole group is stopped first
+    (_stop_group), so no git, and nothing git started, outlives the call, and git gets to remove its lock files."""
+    left = GIT_TIMEOUT if deadline is None else min(GIT_TIMEOUT, deadline - time.monotonic())
+    if left <= 0:
         return None
-    return done.stdout.strip() if done.returncode == 0 and done.stdout.strip() else None
+    try:
+        proc = subprocess.Popen(["git", "-C", cwd, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+    except (OSError, ValueError):
+        return None
+    try:
+        out, _err = proc.communicate(timeout=left)
+    except BaseException as err:
+        _stop_group(proc)
+        if isinstance(err, subprocess.TimeoutExpired):
+            return None
+        raise
+    return proc.returncode, out.decode("utf-8", "surrogateescape")
 
 
-def _common_dir(main):
-    top = _git(main, "rev-parse", "--show-toplevel")
-    common = _git(top, "rev-parse", "--git-common-dir") if top else None
+def _stop_group(proc):
+    """End the process group `proc` leads, then reap `proc`: TERM first, which git catches to remove the lock files
+    it holds (packed-refs.lock, <ref>.lock; KILL would leave them, and every later ref update in the repository
+    would fail on them), then KILL to whatever is still alive once nothing in the group is left to signal or
+    KILL_GRACE seconds have passed, whichever comes first. The leader is reaped only after both signals, so the
+    group id is still git's for each. (Where a group of nothing but an unreaped leader can still be signalled, as
+    on Linux, the grace runs out in full.)"""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        until = time.monotonic() + KILL_GRACE
+        while time.monotonic() < until:
+            time.sleep(0.01)
+            os.killpg(proc.pid, 0)              # raises once nothing in the group can be signalled
+    except OSError:
+        pass
+    finally:                                    # interrupted in the grace, the group is still killed and reaped
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        proc.stdout.close()
+
+
+def _git(cwd, *args, deadline=None):
+    """git's stripped stdout, or None when it fails, prints nothing, cannot run or runs out of time."""
+    done = _run_git(cwd, args, deadline)
+    return done[1].strip() if done and done[0] == 0 and done[1].strip() else None
+
+
+def _common_dir(main, deadline=None):
+    top = _git(main, "rev-parse", "--show-toplevel", deadline=deadline)
+    common = _git(top, "rev-parse", "--git-common-dir", deadline=deadline) if top else None
     return os.path.normpath(os.path.join(top, common)) if common else None
 
 
@@ -477,3 +526,111 @@ def restore(main, snapshot_id, *, only=None, to=None, force=False, cwd=None, com
         if progress:
             progress("restored", target)
     return {"id": sid, "restored": restored, "replaced": existing, "saved": saved}
+
+
+# --------------------------------------------------------------- sweep
+class _Spent(Exception):
+    """The sweep's deadline has passed: nothing more starts."""
+
+
+def _due(deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _Spent
+
+
+def _id_time(name):
+    """The UTC time of snapshot id `name`; None for a name that is not a whole id or names no real time
+    (20260229T120000Z-abcdef, a month 13, a year 0)."""
+    if not (isinstance(name, str) and ID_RE.fullmatch(name)):
+        return None
+    try:
+        return dt.datetime(int(name[0:4]), int(name[4:6]), int(name[6:8]), int(name[9:11]), int(name[11:13]),
+                           int(name[13:15]), tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def _delete(path, deadline):
+    """Delete the file, link or folder tree at `path`, never following a link, each removal started only before
+    `deadline` (_Spent leaves the rest for the next sweep); a folder is opened up first when it is not rwx for its
+    owner, and its manifest.json goes before anything else in it, so a half-deleted snapshot is never listed."""
+    mode = os.lstat(path).st_mode
+    _due(deadline)
+    if not stat.S_ISDIR(mode):
+        os.unlink(path)
+        return
+    if (stat.S_IMODE(mode) & stat.S_IRWXU) != stat.S_IRWXU:
+        os.chmod(path, stat.S_IMODE(mode) | stat.S_IRWXU)
+    with os.scandir(path) as entries:
+        names = sorted((entry.name for entry in entries), key=lambda name: name != "manifest.json")
+    for name in names:
+        _delete(os.path.join(path, name), deadline)
+    _due(deadline)
+    os.rmdir(path)
+
+
+def _sweep_store(store, cutoff, deadline, removed):
+    """Delete each <store>/<id> whose id's time is before `cutoff`; a store that is not a folder, or not one this
+    process may write, is left alone, and a snapshot that cannot be deleted costs only itself."""
+    try:
+        names = sorted(os.listdir(store))
+    except OSError:
+        return
+    if not os.access(store, os.W_OK | os.X_OK):
+        return                              # nothing in it could go: none of its snapshots is emptied
+    for name in names:
+        when = _id_time(name)
+        if when is None or when >= cutoff:
+            continue
+        path = os.path.join(store, name)
+        try:
+            _delete(path, deadline)
+        except OSError:
+            continue
+        removed.append(path)
+
+
+def _sweep_refs(main, cutoff, deadline, removed):
+    """Delete main's refs under refs/harness-backup/<id>/ whose id's time is before `cutoff`, one git call each
+    (a symbolic ref as itself, never its target); one git cannot delete costs only itself."""
+    _due(deadline)
+    listed = _run_git(main, ["for-each-ref", "--format=%(refname)", REF_ROOT + "/"], deadline)
+    if listed is None or listed[0] != 0:
+        return
+    for name in listed[1].splitlines():
+        parts = name.split("/")
+        if len(parts) < 4 or "/".join(parts[:2]) != REF_ROOT:
+            continue
+        when = _id_time(parts[2])
+        if when is None or when >= cutoff:
+            continue
+        _due(deadline)
+        done = _run_git(main, ["update-ref", "--no-deref", "-d", name], deadline)
+        if done is not None and done[0] == 0:
+            removed.append(name)
+
+
+def sweep(main, *, days=KEEP_DAYS, now=None, deadline=None):
+    """Remove the snapshots and refs whose id's UTC time is more than `days` days before `now` (default: the current
+    time; a naive one is UTC): each <store>/<id> in the global store, whoever took it, and, with `main` (a working
+    tree of the repository, or None), in main's in-project store whatever its patterns say now, then main's refs
+    under refs/harness-backup/<id>/. Only a name that is a whole id with a real time is touched; an id that is a
+    symlink goes as a link, its target untouched. What cannot be removed is skipped. `deadline` (a time.monotonic()
+    instant) bounds the whole sweep: each git call gets what is left of it, and once it has passed no git call or
+    removal starts and the sweep returns. Returns what it removed: folders and links by their path in the store,
+    refs by their full name."""
+    when = now or dt.datetime.now(dt.timezone.utc)
+    when = (when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)).astimezone(dt.timezone.utc)
+    cutoff = when - dt.timedelta(days=days)
+    removed = []
+    try:
+        _sweep_store(str(global_store()), cutoff, deadline, removed)
+        if main:
+            _due(deadline)
+            common = _common_dir(main, deadline)
+            if common:
+                _sweep_store(os.path.join(common, PROJECT_STORE), cutoff, deadline, removed)
+            _sweep_refs(main, cutoff, deadline, removed)
+    except _Spent:
+        pass
+    return removed
