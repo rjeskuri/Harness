@@ -28,6 +28,7 @@ import tempfile
 import time
 import types
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -729,6 +730,210 @@ class SessionProjectExportTests(HookTestCase):
                     self.assertTrue(
                         any(b.startswith("## Session brief: registered proj") for b in briefs), briefs
                     )
+
+
+class ForeignSessionEnvTests(HookTestCase):
+    """Ticket #345: a background session claimed from a spare that another project's session started
+    inherits that project's settings `env` and its HARNESS_SESSION_PROJECT. Claude Code overlays this
+    project's settings, but a key only the other project set survives. So when the hook's own
+    HARNESS_SESSION_PROJECT names another project than CLAUDE_PROJECT_DIR, session_brief makes each
+    harness key (HARNESS_* other than HARNESS_SESSION_PROJECT, CLAUDE_VERIFY_CMD, CLAUDE_VERIFY_TIMEOUT)
+    that none of this project's settings files sets (~/.claude/settings.json, <project>/.claude/
+    settings.json and settings.local.json) disappear from the session's later Bash calls, through
+    CLAUDE_ENV_FILE, and the brief names each dropped key and the project it came from. Checked by what
+    a shell that sources the file sees (the inherited environment, then the file), never by its text."""
+
+    EARLIER = "export EARLIER_HOOK_VALUE='kept'\n"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.shells = [s for s in ("/bin/bash", "/bin/zsh", "/bin/sh") if os.path.exists(s)]
+        self.assertIn("/bin/bash", self.shells)
+        self.proj = self.make_repo("proj")
+        self.other = self.make_repo("okinawa")  # the project whose session started the spare
+        self.files = 0
+
+    def env_file(self) -> Path:
+        self.files += 1
+        return self.write(self.tmp / "envfiles" / f"env-{self.files}.sh", self.EARLIER)
+
+    def start(self, inherited: dict, project: Path | None = None, source: str = "startup"):
+        """session_brief at SessionStart in a claimed spare: CLAUDE_PROJECT_DIR is this session's project,
+        everything in `inherited` came with the spare. Returns (the hook's result, the env file)."""
+        project = project or self.proj
+        env_file = self.env_file()
+        payload = {
+            "session_id": "sess-345",
+            "transcript_path": "/dev/null",
+            "cwd": str(project),
+            "permission_mode": "default",
+            "hook_event_name": "SessionStart",
+            "source": source,
+        }
+        env = dict(inherited, CLAUDE_PROJECT_DIR=str(project), CLAUDE_ENV_FILE=str(env_file))
+        r = self.run_hook("session_brief.py", payload, env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        return r, env_file
+
+    def brief_of(self, r) -> str:
+        out = json.loads(r.stdout)["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "SessionStart")
+        return out["additionalContext"]
+
+    def sourced(self, env_file: Path, inherited: dict, shell: str = "/bin/bash") -> dict:
+        """The environment a later Bash call's child process sees: `shell` starts with the inherited
+        environment, sources the env file, then runs the interpreter, which prints its own environment."""
+        probe = "import json, os; print(json.dumps(dict(os.environ)))"
+        r = subprocess.run(
+            [shell, "-c", '. "$1" && exec "$2" -c "$3"', "sh", str(env_file), sys.executable, probe],
+            capture_output=True,
+            text=True,
+            env=dict(self.env, **inherited),
+            cwd=str(self.tmpdir),
+            timeout=30,
+        )
+        self.assertEqual(r.returncode, 0, f"{shell} could not source {env_file}: {r.stderr}")
+        return json.loads(r.stdout)
+
+    def assertSourced(self, env_file: Path, inherited: dict, dropped, kept, project: Path, shells=None):
+        self.assertTrue(env_file.read_text(encoding="utf-8").startswith(self.EARLIER), "the env file was truncated")
+        for shell in shells or self.shells:
+            with self.subTest(shell=shell):
+                seen = self.sourced(env_file, inherited, shell)
+                for key in dropped:
+                    self.assertFalse(key in seen, f"{key}={seen.get(key)!r} is still exported after sourcing the "
+                                                  f"env file in {shell}")
+                for key in kept:
+                    self.assertEqual(seen.get(key), inherited[key], f"{key} was not kept in {shell}")
+                self.assertEqual(seen.get("HARNESS_SESSION_PROJECT"), str(project))
+                self.assertEqual(seen.get("EARLIER_HOOK_VALUE"), "kept")
+
+    # ---- broad: every harness key only the other project set is dropped, and named in the brief
+
+    def test_drops_each_harness_key_only_another_project_set(self):
+        outside = self.tmp / "loose folder"  # no repository: GIT_CEILING_DIRECTORIES stops at self.tmp
+        outside.mkdir()
+        for other, n in ((self.other, 1), (outside, 2)):
+            with self.subTest(other=other.name):
+                random_key = "HARNESS_X" + uuid.uuid4().hex[:8].upper()
+                strays = {
+                    "HARNESS_TEST_CMD": f"npm test -- {{files}} --shard={n}",
+                    "HARNESS_TEST_TIMEOUT": str(600 + n),
+                    ("HARNESS_ULTRAREVIEW" if n == 1 else "HARNESS_REVIEW_TIER"): ("1" if n == 1 else "sonnet"),
+                    "CLAUDE_VERIFY_CMD": f"scripts/verify-{n}.sh",
+                    "CLAUDE_VERIFY_TIMEOUT": str(900 + n),
+                    random_key: uuid.uuid4().hex,
+                }
+                # Not harness keys: whatever else the other project set stays, near-miss names included.
+                others = {
+                    "OKINAWA_API_BASE": f"https://api.example.invalid/{n}",
+                    "MY_HARNESS_TEST_CMD": f"make test {n}",
+                    "CLAUDE_VERIFY_CMDS": f"verify both {n}",
+                    "NODE_ENV": "development" if n == 1 else "test",
+                }
+                # The other project's own settings set the strays: that never makes them this project's.
+                self.write(other / ".claude" / "settings.json", json.dumps({"env": strays}))
+                inherited = dict(strays, **others, HARNESS_SESSION_PROJECT=str(other))
+                r, env_file = self.start(inherited)
+                self.assertSourced(env_file, inherited, dropped=strays, kept=others, project=self.proj)
+                brief = self.brief_of(r)
+                for key in strays:
+                    self.assertIn(key, brief)
+                self.assertIn(str(other), brief)
+
+    def test_keeps_the_keys_this_projects_settings_set(self):
+        user = self.home / ".claude" / "settings.json"
+        project = self.proj / ".claude" / "settings.json"
+        local = self.proj / ".claude" / "settings.local.json"
+        harness_keys = ("HARNESS_PROJECT", "HARNESS_TEST_CMD", "HARNESS_ULTRAREVIEW", "CLAUDE_VERIFY_CMD",
+                        "CLAUDE_VERIFY_TIMEOUT")
+        for name, sets in (
+            ("user settings", {user: ["HARNESS_PROJECT"]}),
+            ("project settings", {project: ["HARNESS_TEST_CMD"]}),
+            ("local settings", {local: ["CLAUDE_VERIFY_CMD"]}),
+            ("all three", {user: ["HARNESS_PROJECT"], project: ["HARNESS_ULTRAREVIEW"],
+                           local: ["CLAUDE_VERIFY_TIMEOUT", "HARNESS_TEST_CMD"]}),
+        ):
+            with self.subTest(name):
+                # Claude Code has overlaid these: the environment holds the settings' own values.
+                inherited = {key: f"{key.lower()}-{uuid.uuid4().hex[:6]}" for key in harness_keys}
+                inherited["HARNESS_SESSION_PROJECT"] = str(self.other)
+                for path, keys in sets.items():
+                    self.write(path, json.dumps({"permissions": {"allow": []},
+                                                 "env": {k: inherited[k] for k in keys}}))
+                kept = [k for keys in sets.values() for k in keys]
+                try:
+                    _, env_file = self.start(inherited)
+                    self.assertSourced(env_file, inherited, dropped=[k for k in harness_keys if k not in kept],
+                                       kept=kept, project=self.proj)
+                finally:
+                    for path in sets:
+                        path.unlink()
+
+    def test_only_a_session_project_of_another_repository_drops_keys(self):
+        wt = self.tmp / "proj-wt"
+        self.git(self.proj, "worktree", "add", "-q", str(wt), "-b", "feature")
+        other_wt = self.tmp / "okinawa-wt"
+        self.git(self.other, "worktree", "add", "-q", str(other_wt), "-b", "feature")
+        for sub in (self.proj / "src", wt / "pkg"):
+            sub.mkdir()
+        link = self.tmp / "proj-link"
+        os.symlink(self.proj, link)
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        rows = [
+            # (label, CLAUDE_PROJECT_DIR, inherited HARNESS_SESSION_PROJECT (None: unset), another project?)
+            ("unset", self.proj, None, False),
+            ("blank", self.proj, "", False),
+            ("whitespace", self.proj, "   ", False),
+            ("the project dir", self.proj, str(self.proj), False),
+            ("trailing slash", self.proj, str(self.proj) + "/", False),
+            ("a symlink to it", self.proj, str(link), False),
+            ("a folder inside the main checkout", self.proj, str(self.proj / "src"), False),
+            ("a worktree of it", self.proj, str(wt), False),
+            ("a folder inside a worktree", self.proj, str(wt / "pkg"), False),
+            ("the main checkout, from a worktree session", wt, str(self.proj), False),
+            ("another repository", self.proj, str(self.other), True),
+            ("a worktree of another repository", self.proj, str(other_wt), True),
+            ("a folder outside any repository", self.proj, str(outside), True),
+            ("a folder git cannot read", self.proj, str(self.tmp / "gone" / "OkinawaDream"), True),
+            ("another repository, from a worktree session", wt, str(self.other), True),
+        ]
+        for label, project, session_project, foreign in rows:
+            with self.subTest(label):
+                inherited = {
+                    "HARNESS_TEST_CMD": f"npm test -- {{files}} # {label}",
+                    "HARNESS_TEST_TIMEOUT": "777",
+                    "CLAUDE_VERIFY_CMD": f"scripts/verify.sh {uuid.uuid4().hex[:6]}",
+                }
+                if session_project is not None:
+                    inherited["HARNESS_SESSION_PROJECT"] = session_project
+                _, env_file = self.start(inherited, project=project)
+                keys = [k for k in inherited if k != "HARNESS_SESSION_PROJECT"]
+                self.assertSourced(env_file, inherited, dropped=keys if foreign else [],
+                                   kept=[] if foreign else keys, project=project, shells=["/bin/bash"])
+
+    def test_drops_on_every_source_and_beside_a_projects_own_session_start_hook(self):
+        inherited = {"HARNESS_SESSION_PROJECT": str(self.other), "HARNESS_TEST_CMD": "npm test -- {files}",
+                     "CLAUDE_VERIFY_TIMEOUT": "1200"}
+        for source in ("startup", "resume", "clear", "compact", "fork"):
+            with self.subTest(source=source):
+                _, env_file = self.start(inherited, source=source)
+                self.assertSourced(env_file, inherited, dropped=["HARNESS_TEST_CMD", "CLAUDE_VERIFY_TIMEOUT"],
+                                   kept=[], project=self.proj, shells=["/bin/bash"])
+
+        # A project with its own SessionStart hook gets no brief, but the strays still go; its own key stays.
+        own = self.make_repo("own hook")
+        self.write(own / ".claude" / "settings.json", json.dumps({
+            "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}]},
+            "env": {"HARNESS_REVIEW_TIER": "opus"},
+        }))
+        inherited = dict(inherited, HARNESS_REVIEW_TIER="opus")
+        r, env_file = self.start(inherited, project=own)
+        self.assertNotIn("Session brief", r.stdout)
+        self.assertSourced(env_file, inherited, dropped=["HARNESS_TEST_CMD", "CLAUDE_VERIFY_TIMEOUT"],
+                           kept=["HARNESS_REVIEW_TIER"], project=own)
 
 
 class BriefSourcesTests(unittest.TestCase):
