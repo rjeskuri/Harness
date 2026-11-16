@@ -9,7 +9,8 @@ with.
   functions over pipelines and lists, quoting, substitutions, heredocs and redirections.
   The expected parts are written out by hand from the shell grammar as branch_guard's
   walker reads it: marker parts around subshells and substitutions, the operator after
-  each part in `sep`, substitutions last.
+  each part in `sep`, substitutions last; and each part's `lead` from Part's definition,
+  a line continuation alone on its line holding nothing (#357).
 - One walker: no def anywhere in the plugin but shellwalk.py's own shares half or more of
   its statements with the lib's walker (names, arguments and attributes normalised, so a
   renamed copy padded with no-op statements still matches); neither guard defines the
@@ -523,6 +524,46 @@ def after_prefix(prefix: str, sep: str, command: str) -> str:
         return prefix + "\nhi\nEOF\n" + command
     return prefix + sep + command + "\nhi\nEOF"
 
+# Each: (command, (words, lead) of each part split_command gives, marker parts left out). Part.lead written out
+# from its definition: the operators since the last part that holds anything, joined, a newline adding none; an
+# arithmetic command or a part that only redirects input holds something; blanks, a comment or a line
+# continuation alone on its line hold nothing (#357), so the operator before them carries on to the next command.
+LEADS = [
+    ("true && cd sub; rm x", [(["true"], ""), (["cd", "sub"], "&&"), (["rm", "x"], ";")]),
+    ("true &&\n\ncd sub", [(["true"], ""), (["cd", "sub"], "&&")]),
+    ("true\ncd sub", [(["true"], ""), (["cd", "sub"], "")]),
+    ("true && # note\ncd sub", [(["true"], ""), (["cd", "sub"], "&&")]),
+    ("true && \\\ncd sub", [(["true"], ""), (["cd", "sub"], "&&")]),
+    ("(( 0 )) || cd sub", [(["cd", "sub"], "||")]),
+    ("(true) && cd sub", [(["true"], "("), (["cd", "sub"], ")&&")]),
+    # a line continuation, then lines holding nothing (#357)
+    (
+        "test -d nope && \\\n\ncd sub; rm -f x",
+        [(["test", "-d", "nope"], ""), (["cd", "sub"], "&&"), (["rm", "-f", "x"], ";")],
+    ),
+    ("test -d nope || \\\n\n\ncd sub", [(["test", "-d", "nope"], ""), (["cd", "sub"], "||")]),
+    ("test -d nope && \\\n   \n\t\ncd sub", [(["test", "-d", "nope"], ""), (["cd", "sub"], "&&")]),
+    ("test -d nope && \\\n\n# c\ncd sub", [(["test", "-d", "nope"], ""), (["cd", "sub"], "&&")]),
+    ("test -d nope && \\\n# c\ncd sub", [(["test", "-d", "nope"], ""), (["cd", "sub"], "&&")]),
+    ("test -d nope && \\\n\\\n\ncd sub", [(["test", "-d", "nope"], ""), (["cd", "sub"], "&&")]),
+    ("test -d nope &&\\\n\ncd sub", [(["test", "-d", "nope"], ""), (["cd", "sub"], "&&")]),
+    (
+        "test -d nope && \\\n\ncd sub\nrm -rf d",
+        [(["test", "-d", "nope"], ""), (["cd", "sub"], "&&"), (["rm", "-rf", "d"], "")],
+    ),
+    ("(( 0 )) && \\\n\ncd sub", [(["cd", "sub"], "&&")]),
+    ("< in.txt || \\\n\ncd sub", [(["cd", "sub"], "||")]),
+    ("> out.txt && \\\n\ncd sub", [([], ""), (["cd", "sub"], "&&")]),
+    ("true | \\\n\ncd sub", [(["true"], ""), (["cd", "sub"], "|")]),
+    ("(true) && \\\n\ncd sub", [(["true"], "("), (["cd", "sub"], ")&&")]),
+    ("true; \\\n\ncd sub", [(["true"], ""), (["cd", "sub"], ";")]),
+    ("true & \\\n\ncd sub", [(["true"], ""), (["cd", "sub"], "&")]),
+    ("pwd\n\\\n\ncd sub", [(["pwd"], ""), (["cd", "sub"], "")]),
+    ("cd sub && \\\n\nrm -rf d", [(["cd", "sub"], ""), (["rm", "-rf", "d"], "&&")]),
+    ("ls \\\n  -a; \\\n \ncd sub", [(["ls", "-a"], ""), (["cd", "sub"], ";")]),
+    ("cd sub \\\n\nrm -f y", [(["cd", "sub"], ""), (["rm", "-f", "y"], "")]),
+]
+
 
 class LibShellwalkTests(unittest.TestCase):
     """The walker, imported from lib/harness_lib/shellwalk.py, through its public functions."""
@@ -655,6 +696,12 @@ class LibShellwalkTests(unittest.TestCase):
 
     def test_split_command_redirections(self):
         self.check(REDIRECTIONS)
+
+    def test_split_command_lead(self):
+        for command, expected in LEADS:
+            with self.subTest(command=command):
+                parts = self.lib.split_command(command)
+                self.assertEqual([(p.words, p.lead) for p in parts if not p.marker], expected)
 
     def test_substitutions_nest_eight_deep_and_no_further(self):
         for depth, found in ((1, True), (7, True), (8, True), (9, False), (12, False)):

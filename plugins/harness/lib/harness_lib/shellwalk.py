@@ -147,14 +147,17 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
         if redirect in ("out", "dup"):
             part.targets.append("")  # a redirection with no target
         redirect, opened = "", ""
-        part.text = command[start:end].strip()
+        raw = command[start:end]
+        part.text = raw.strip()
         part.sep = op
         part.lead = lead
         if part.words or part.targets:
             part.piped = stages
             stages = stages + [part] if op == "|" else []
             parts.append(part)
-        bare = part.text.replace("\\\n", "").strip()[:1] in ("", "#")  # blanks, a comment
+        # blanks, a comment, line continuations; from the raw text, as a strip
+        # would cut the newline of a trailing continuation (#357)
+        bare = raw.replace("\\\n", "").strip()[:1] in ("", "#")
         lead = op if part.words or part.targets or not bare else lead + op
         part, start = Part(), end + max(len(op), 1)
 
