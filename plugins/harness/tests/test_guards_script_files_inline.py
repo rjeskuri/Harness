@@ -120,6 +120,34 @@ PHP = (
     ("php -r 'include \"build/gen.php\";'", None),
     ("php -r 'require \"{wt}/tools/staged.php\";'", None),
 )
+# A loader whose path the inline program takes from outside its own text, an argument or
+# the environment: the hook cannot know what it loads ({f} the program file; its
+# extension). Each runs on three places, one per role.
+UNKNOWN = (
+    ("python3 -c 'import sys; exec(open(sys.argv[1]).read())' {f}", "py"),
+    ("F={f} python3 -c 'import os; exec(open(os.environ[\"F\"]).read())'", "py"),
+    ("python3 -c 'import runpy, sys; runpy.run_path(sys.argv[1])' {f}", "py"),
+    ("python3 -c 'import sys; exec(compile(open(sys.argv[1]).read(), \"w\", \"exec\"))' {f}", "py"),
+    ("node -e 'require(process.argv[1])' {f}", "cjs"),
+    ("F={f} node -e 'import(process.env.F)'", "mjs"),
+    ("ruby -e 'load ARGV[0]' {f}", "rb"),
+    ("perl -e 'do $ARGV[0]' {f}", "pl"),
+    ("php -r 'include $argv[1];' {f}", "php"),
+)
+# Dynamic imports in python: importlib and __import__, by name.
+DYNAMIC = (
+    ("python3 -c 'import importlib; importlib.import_module(\"tools.gen\")'", None),
+    ("python3 -c \"__import__('tools.gen')\"", None),
+    ("python3 -c 'from importlib import import_module; import_module(\"tests.helpers.gen\")'", None),
+    ("python3 -c 'import importlib; importlib.import_module(\"w\")'", None),
+    ("python3 -c \"g = __import__('build.gen')\"", None),
+    ("python3 -c 'import importlib; importlib.import_module(\"tools.staged\")'", None),
+    ("PYTHONPATH={o} python3 -c \"__import__('w')\"", None),
+    ("cd {o} && python3 -c \"import importlib; importlib.import_module('w')\"", "python3 -c \"import importlib; importlib.import_module('w')\""),
+    ("cd ~ && python3 -c \"__import__('w')\"", "python3 -c \"__import__('w')\""),
+    # a module name the hook cannot know
+    ("python3 -c 'import importlib, sys; importlib.import_module(sys.argv[1])' tools.gen", None),
+)
 # The outline's commands, verbatim: the hook judges the command, so the files outside the
 # worktree need not exist.
 LITERAL = (
@@ -162,6 +190,25 @@ INLINE_ALLOWED = (
     "php -r 'include \"scripts/tool.php\";'",
     "php -r 'require_once \"./scripts/tool.php\";'",
     "php -r 'echo 1;'",
+    # dynamic imports of tracked or installed modules
+    "python3 -c 'import importlib; importlib.import_module(\"scripts.tool\")'",
+    "python3 -c \"__import__('scripts.tool')\"",
+    "python3 -c \"__import__('json')\"",
+    "python3 -c 'import importlib; print(importlib.import_module(\"json\").dumps(1))'",
+    # arguments and the environment read, nothing loaded from them
+    "python3 -c 'import sys; print(sys.argv[1])' tools/gen.py",
+    "F={o}/w.py python3 -c 'import os; print(os.environ[\"F\"])'",
+    "node -e 'console.log(process.argv[1])' tools/gen.cjs",
+    # data read, not run: a file outside the worktree, or a program file read as text
+    "python3 -c 'print(open(\"/tmp/x.txt\").read())'",
+    "python3 -c 'print(open(\"{o}/input.txt\").read())'",
+    "python3 -c 'import json; print(json.load(open(\"tests/fixtures/data.json\")))'",
+    "python3 -c 'import sys; print(open(sys.argv[1]).read())' {o}/w.py",
+    "node -e 'console.log(require(\"fs\").readFileSync(\"/tmp/x.json\",\"utf8\"))'",
+    "node -e 'console.log(require(\"fs\").readFileSync(\"{o}/data.json\", \"utf8\"))'",
+    "ruby -e 'puts File.read(\"{o}/input.txt\")'",
+    "perl -ne 'print' {o}/input.txt",
+    "php -r 'echo file_get_contents(\"{o}/input.txt\");'",
 )
 # A test runner given an untracked file that is neither a test nor test configuration.
 RUNNER_REFUSED = (
@@ -203,6 +250,8 @@ RUNNER_ALLOWED = (
     "npx jest -c web/jest.config.js tests/",
     "python3 -m unittest scripts/tool.py",
     "node --test scripts/tool.mjs",
+    # #321's row: a virtual environment's python by its path, with no environment behind it
+    ".venv/bin/python -m pytest tests/test_new.py",
 )
 
 
@@ -231,6 +280,14 @@ class InlineLoaderTests(ProgramFormCase):
 
     def test_an_inline_ruby_perl_or_php_program_loading_an_untracked_file_is_refused(self):
         self.expect_refused(self.cases(RUBY + PERL + PHP))
+
+    def test_a_loader_whose_path_comes_from_outside_the_program_is_refused(self):
+        """exec(open(sys.argv[1]).read()), require(process.argv[1]), load ARGV[0]: the path
+        is not in the program's text, so the hook cannot know it, wherever the file is."""
+        self.expect_rotated(UNKNOWN, lambda c: (c,))
+
+    def test_a_dynamic_python_import_of_an_untracked_module_is_refused(self):
+        self.expect_refused(self.cases(DYNAMIC))
 
     def test_the_outline_commands_are_refused_to_each_role(self):
         self.expect_refused([(c, (c,)) for c in LITERAL])
@@ -347,6 +404,7 @@ class InlineLoaderTests(ProgramFormCase):
         untracked = {
             "python3 - < tools/gen.py": ("python3 - < tools/gen.py",),
             "cat tools/gen.py | python3": piped("cat tools/gen.py | python3"),
+            "sed -n p tools/gen.sh | bash": piped("sed -n p tools/gen.sh | bash"),
             "source tools/gen.sh": ("source tools/gen.sh",),
             "./tools/gen.sh": ("./tools/gen.sh",),
             "python3 -c 'import tools.gen'": ("python3 -c 'import tools.gen'",),

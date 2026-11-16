@@ -323,9 +323,11 @@ def piped(command: str) -> tuple:
 
 
 def here_string(command: str) -> tuple:
-    """`interpreter <<< "$(cat f)"`: the reason names the command or the substitution."""
-    inner = re.search(r"\$\((.*)\)", command).group(1)
-    return (command, inner)
+    """`interpreter <<< "$(cat f)"`, or a heredoc whose body is `$(cat f)`: the reason names
+    the command, its first line (a heredoc's part) or the substitution ($(...) or `...`)."""
+    m = re.search(r"\$\((.*?)\)|`(.*?)`", command)
+    inner = m.group(1) if m.group(1) is not None else m.group(2)
+    return (command, command.split("\n", 1)[0], inner)
 
 
 # An interpreter or shell reading its program from stdin, redirected from the program file
@@ -353,6 +355,19 @@ REDIRECTS = (
     ("perl < {f}", "pl"),
     ("perl - < {f}", "pl"),
     ("php < {f}", "php"),
+    # an option that takes a value before stdin: the value is not a program file
+    ("python3 -X utf8 - < {f}", "py"),
+    ("python3 -W ignore < {f}", "py"),
+    ("python3 -X dev -W error < {f}", "py"),
+    ("bash -o errexit < {f}", "sh"),
+    ("bash -o pipefail -s < {f}", ""),
+    ("bash --rcfile /dev/null < {f}", "sh"),
+    ("ruby -I lib < {f}", "rb"),
+    ("ruby -r json < {f}", "rb"),
+    ("perl -I lib - < {f}", "pl"),
+    ("perl -Mstrict < {f}", "pl"),
+    ("node --conditions development < {f}", "mjs"),
+    ("php -d display_errors=1 < {f}", "php"),
 )
 # The same program piped in: cat writes it, the interpreter reads its program from stdin.
 PIPES = (
@@ -371,6 +386,22 @@ PIPES = (
     ("cat {f} | ruby", "rb"),
     ("cat {f} | perl", "pl"),
     ("cat {f} | php", "php"),
+    # any writer that copies the file to the pipe, not only cat
+    ("head -n 999 {f} | python3", "py"),
+    ("tail -n +1 {f} | python3 -", "py"),
+    ("head -c 99999 {f} | node", "mjs"),
+    ("sed -n p {f} | bash", "sh"),
+    ("sed 's/x/y/' {f} | bash -s", ""),
+    ("cat < {f} | sh", "sh"),
+    ("tr -d '\\r' < {f} | bash", "sh"),
+    ("awk 1 {f} | ruby", "rb"),
+    ("cut -c1- {f} | perl", "pl"),
+    ("grep -v '^#!' {f} | php", "php"),
+    # and a reader with an option that takes a value
+    ("cat {f} | python3 -X utf8", "py"),
+    ("cat {f} | python3 -W ignore -", "py"),
+    ("cat {f} | bash -o errexit -s", "sh"),
+    ("head -n 999 {f} | ruby -I lib", "rb"),
 )
 # A here-string of the program file's contents.
 HERE_STRINGS = (
@@ -384,6 +415,42 @@ HERE_STRINGS = (
     ('sh -s -- a <<< "$(cat {f})"', ""),
     ('node <<< "$(cat {f})"', "mjs"),
     ('ruby <<< "$(cat {f})"', "rb"),
+    # other writers, backticks, and options that take a value
+    ('python3 <<< "$(head -c 99999 {f})"', "py"),
+    ('bash <<< "`cat {f}`"', "sh"),
+    ("bash -s <<< `cat {f}`", ""),
+    ('python3 - <<< "$(sed -n p {f})"', "py"),
+    ('perl <<< "$(tail -n +1 {f})"', "pl"),
+    ('python3 -W ignore <<< "$(cat {f})"', "py"),
+    ('ruby -I lib <<< "$(< {f})"', "rb"),
+)
+# A heredoc (delimiter unquoted, so the shell expands it) whose body is the program file's
+# contents: the reason names the command, its first line or the substitution.
+HEREDOCS = (
+    ("python3 - <<EOF\n$(cat {f})\nEOF", "py"),
+    ("python3 <<PY\nimport sys\n$(cat {f})\nPY", "py"),
+    ("bash <<EOF\n$(cat {f})\nEOF", "sh"),
+    ("bash -s <<END\n`cat {f}`\nEND", ""),
+    ("node <<JS\n$(head -c 99999 {f})\nJS", "mjs"),
+    ("ruby <<RB\n$(< {f})\nRB", "rb"),
+    ("python3 -X utf8 - <<EOF\n$(cat {f})\nEOF", "py"),
+    ("perl - <<PL\n$(sed -n p {f})\nPL", "pl"),
+    ("php <<PHP\n$(cat {f})\nPHP", "php"),
+)
+# An inline program on stdin that writes, behind an option that takes a value: the existing
+# rule for inline programs that write (#321 and before) must see the heredoc there too
+# (command, the part the reason names).
+HEREDOC_WRITES = (
+    (heredoc("open('src/app.py', 'w').write('')", "python3 -W ignore"), "python3 -W ignore <<'PY'"),
+    (heredoc("open('tests/test_app.py', 'w').write('')", "python3 -X utf8 -"), "python3 -X utf8 - <<'PY'"),
+    (
+        heredoc("import pathlib; pathlib.Path('src/app.py').write_text('')", "python3 -X dev -W error"),
+        "python3 -X dev -W error <<'PY'",
+    ),
+    (
+        heredoc("require('fs').writeFileSync('src/app.py', '')", "node --conditions development", "JS"),
+        "node --conditions development <<'JS'",
+    ),
 )
 # The same forms in a later part, or in a directory the command moves to (command, the parts
 # the reason may name; {o} the temp directory).
@@ -428,6 +495,17 @@ DATA = (
     "grep -c fixture < {o}/w.sh",
     "wc -l < build/gen.py",
     "python3 - <<< 'print(1)'",
+    "head -n 5 tools/gen.py | grep import",
+    "sed -n 1p {o}/w.sh | wc -c",
+    "head -c 100 {o}/w.py | python3 scripts/tool.py",
+    "python3 -W ignore scripts/tool.py < {o}/w.py",
+    "python3 -X utf8 -m json.tool < tests/fixtures/data.json",
+    "bash -o errexit scripts/tool.sh < tools/gen.sh",
+    "ruby -I lib scripts/tool.rb < tools/gen.rb",
+    "cat {o}/input.txt | bash -o errexit -c 'wc -l'",
+    "python3 - <<EOF\nprint(1)\nEOF",
+    # a quoted delimiter: the body is literal text, nothing is substituted
+    "python3 - <<'PY'\nprint('$(cat tools/gen.py)')\nPY",
 )
 
 
@@ -443,12 +521,27 @@ class StdinProgramTests(ProgramFormCase):
     def test_a_here_string_of_a_program_file_is_refused_to_each_role(self):
         self.expect_rotated(HERE_STRINGS, here_string)
 
+    def test_a_heredoc_of_a_program_file_is_refused_to_each_role(self):
+        self.expect_rotated(HEREDOCS, here_string)
+
+    def test_an_inline_program_that_writes_on_stdin_behind_an_option_value_is_refused(self):
+        """python3 -W ignore <<'PY' reads its program from the heredoc as python3 <<'PY'
+        does: the value of -W, -X or --conditions is not a program file."""
+        self.expect_refused([(c, (p,)) for c, p in HEREDOC_WRITES])
+
     def test_each_place_a_program_file_is_not_tracked_is_refused(self):
         """Outside the worktree, in another repository, new, ignored, a new test file and
         only staged: none is a blob at the worktree's HEAD."""
         self.expect_everywhere(
-            (("python3 - < {f}", "py"), ("cat {f} | bash -s", "sh"), ('node <<< "$(cat {f})"', "mjs")),
-            lambda c: piped(c) if " | " in c else (here_string(c) if "<<<" in c else whole(c)),
+            (
+                ("python3 - < {f}", "py"),
+                ("cat {f} | bash -s", "sh"),
+                ('node <<< "$(cat {f})"', "mjs"),
+                ("sed -n p {f} | bash", ""),
+                ("python3 -X utf8 - < {f}", "py"),
+                ("ruby <<RB\n`cat {f}`\nRB", "rb"),
+            ),
+            lambda c: piped(c) if " | " in c else (here_string(c) if "<<" in c else whole(c)),
         )
 
     def test_the_definition_of_done_commands_are_refused_to_each_role(self):
@@ -477,7 +570,7 @@ class StdinProgramTests(ProgramFormCase):
     # ---- still allowed
 
     def test_the_same_forms_on_a_tracked_program_file_still_run(self):
-        self.expect_tracked_runs(REDIRECTS + PIPES + HERE_STRINGS)
+        self.expect_tracked_runs(REDIRECTS + PIPES + HERE_STRINGS + HEREDOCS)
 
     def test_data_on_stdin_and_pipes_into_no_interpreter_still_run(self):
         self.expect_allowed([self.fill(c) for c in DATA])

@@ -27,6 +27,12 @@ import unittest
 from guards_support import *  # noqa: F401,F403
 from test_guards_script_files_stdin import ROLES, ProgramFormCase, whole
 
+# What python3 -m venv writes as bin/activate, cut short ({name} the environment's directory).
+ACTIVATE = (
+    "# This file must be used with \"source bin/activate\" *from bash*\n"
+    "VIRTUAL_ENV=\"$(cd \"$(dirname \"${{BASH_SOURCE[0]}}\")/..\" && pwd)\"\n"
+    "export VIRTUAL_ENV\nPATH=\"$VIRTUAL_ENV/bin:$PATH\"\nexport PATH\n# {name}\n"
+)
 # A shell sourcing the program file ({f}; the file's extension, "" for none).
 SOURCES = (
     ("source {f}", "sh"),
@@ -129,6 +135,50 @@ LOOP = (
     "{red} run --worktree {wt}",
     "{bin}/harness-board show 12 --markdown",
     "git status && ls tools",
+    # a virtual environment under another name, ignored by its own .gitignore
+    "source venv/bin/activate",
+    ". venv/bin/activate && python3 -m pytest tests/test_new.py",
+)
+# A file named activate is not a virtual environment's: one with no pyvenv.cfg behind it,
+# and any other script inside a virtual environment, is judged like any program file
+# (command, the part the reason names; {o} the temp directory).
+ACTIVATE_REFUSED = (
+    ("source tools/activate", "source tools/activate"),
+    ("source {o}/activate", "source {o}/activate"),
+    (". ~/activate", ". ~/activate"),
+    (". tools/bin/activate", ". tools/bin/activate"),
+    ("source {o}/bin/activate", "source {o}/bin/activate"),
+    ("source tests/helpers/bin/activate", "source tests/helpers/bin/activate"),
+    ("source .venv/bin/other.sh", "source .venv/bin/other.sh"),
+    (". .venv/bin/other.sh a", ". .venv/bin/other.sh a"),
+    ("source venv/bin/other.sh", "source venv/bin/other.sh"),
+    ("cd tools && source activate", "source activate"),
+    ("source .venv/bin/activate && . tools/bin/activate", ". tools/bin/activate"),
+)
+# A text script named like an interpreter, run by its path: its name does not make it the
+# interpreter (command, the part; {elsewhere} is another repository).
+NAMED_LIKE_INTERPRETERS = (
+    ("./tools/python3 -m pytest tests/test_new.py", None),
+    ("tools/python3 scripts/tool.py", None),
+    ("{o}/node --test tests/", None),
+    ("{o}/node scripts/tool.mjs", None),
+    ("~/ruby scripts/tool.rb", None),
+    ("{elsewhere}/bash scripts/tool.sh", None),
+    ("./build/perl -e 1", None),
+    ("tests/helpers/python -c 'print(1)'", None),
+    ("./tools/staged-bin/php -r 'echo 1;'", None),
+    ("{wt}/tools/python3 -m unittest tests/test_new.py", None),
+    ("cd tools && ./python3 -m unittest discover", "./python3 -m unittest discover"),
+    ("cd {o} && ./node -e 0", "./node -e 0"),
+)
+# The same, tracked, and a virtual environment's own interpreter.
+NAMED_LIKE_INTERPRETERS_TRACKED = (
+    "./scripts/python3 -m pytest tests/test_new.py",
+    "{wt}/scripts/python3 scripts/tool.py",
+    "cd scripts && ./python3 tool.py",
+    "scripts/node --test tests/",
+    ".venv/bin/python -m pytest tests/test_new.py",
+    "venv/bin/python scripts/tool.py",
 )
 
 
@@ -137,10 +187,42 @@ class SourceAndShebangTests(ProgramFormCase):
         super().setUp()
         # a virtual environment, ignored, as python3 -m venv leaves it: its python a link
         # to the interpreter, its activate script for the shell
-        venv = self.wt / ".venv"
-        self.write(venv / "pyvenv.cfg", f"home = {Path(sys.executable).parent}\nversion = 3.12.0\n")
-        self.write(venv / "bin/activate", 'VIRTUAL_ENV="$(pwd)/.venv"\nexport VIRTUAL_ENV\n')
-        os.symlink(os.path.realpath(sys.executable), venv / "bin/python")
+        for name in (".venv", "venv"):
+            venv = self.wt / name
+            self.write(venv / "pyvenv.cfg", f"home = {Path(sys.executable).parent}\nversion = 3.12.0\n")
+            self.write(venv / "bin/activate", ACTIVATE.format(name=name))
+            os.symlink(os.path.realpath(sys.executable), venv / "bin/python")
+        self.write(self.wt / "venv/.gitignore", "*\n")  # as python3 -m venv writes it since 3.13
+        # an activate script with no virtual environment behind it, and another script in one
+        for path in (
+            self.wt / "tools/activate",
+            self.outside / "activate",
+            self.home / "activate",
+            self.wt / "tools/bin/activate",
+            self.outside / "bin/activate",
+            self.wt / "tests/helpers/bin/activate",
+        ):
+            self.write(path, ACTIVATE.format(name=path.parent.name))
+        self.program(self.wt / ".venv/bin/other.sh", "sh")
+        self.program(self.wt / "venv/bin/other.sh", "sh")
+        # text scripts named like interpreters: tracked, and not
+        self.program(self.wt / "scripts/python3", "")
+        self.program(self.wt / "scripts/node", "")
+        self.git(self.wt, "add", "scripts/python3", "scripts/node")
+        self.git(self.wt, "commit", "-q", "-m", "Interpreter wrappers")
+        for path in (
+            self.wt / "tools/python3",
+            self.outside / "node",
+            self.home / "ruby",
+            self.elsewhere / "bash",
+            self.wt / "build/perl",
+            self.wt / "tests/helpers/python",
+            self.wt / "tools/staged-bin/php",
+        ):
+            self.program(path, "")
+        self.git(self.elsewhere, "add", "bash")
+        self.git(self.elsewhere, "commit", "-q", "-m", "A script named bash")
+        self.git(self.wt, "add", "tools/staged-bin/php")
         # untracked: at the worktree's top, without a shebang, not executable yet
         self.program(self.wt / "w.sh", "sh")
         for path in (self.wt / "tools/noshebang", self.outside / "noshebang"):
@@ -170,6 +252,21 @@ class SourceAndShebangTests(ProgramFormCase):
 
     def test_a_sourced_file_whose_path_is_not_known_is_refused(self):
         self.expect_refused([(c, (p,)) for c, p in UNKNOWN])
+
+    def test_an_activate_script_with_no_virtual_environment_behind_it_is_refused(self):
+        """source .venv/bin/activate runs because .venv is a virtual environment (its
+        pyvenv.cfg), not because the file is called activate: tools/activate, ~/activate
+        and a bin/activate with no pyvenv.cfg beside bin/ are program files like any other,
+        as is any other script inside a virtual environment."""
+        self.expect_refused([(self.fill(c), (self.fill(p),)) for c, p in ACTIVATE_REFUSED])
+
+    def test_a_script_named_like_an_interpreter_is_judged_as_the_script_it_is(self):
+        """./tools/python3 -m pytest runs tools/python3, a text script the worktree does not
+        track, whatever it is called; a binary interpreter (the virtual environment's
+        python) and a tracked wrapper still run."""
+        rows = [(self.fill(c), (self.fill(p) if p else self.fill(c),)) for c, p in NAMED_LIKE_INTERPRETERS]
+        self.expect_refused(rows)
+        self.expect_allowed([self.fill(c) for c in NAMED_LIKE_INTERPRETERS_TRACKED])
 
     def test_the_breaker_scratch_worktree_follows_the_same_rule(self):
         scratch = self.state / "scratch" / "t-12-fix-login"
@@ -325,6 +422,24 @@ class SourceAndShebangTests(ProgramFormCase):
             "perl -e 'require \"\"'",
             "php -r 'include'",
             "php -r 'require_once \"\";'",
+            "head -n | python3",
+            "sed | bash",
+            "cat < | sh",
+            "bash <<EOF",
+            "python3 - <<EOF\n$(cat",
+            "python3 - <<EOF\n`cat\nEOF",
+            "bash <<< \"`\"",
+            "python3 -X",
+            "python3 -W ignore <",
+            "bash -o",
+            "ruby -I lib <",
+            "python3 -c '__import__('",
+            "python3 -c 'import importlib; importlib.import_module()'",
+            "python3 -c 'import sys; exec(open(sys.argv[1]).read())'",
+            "node -e 'require(process.argv[1])'",
+            "./tools/python3",
+            "tools/activate",
+            "source .venv/bin/",
         ):
             with self.subTest(command=command):
                 self.hook_contract(command)
