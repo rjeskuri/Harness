@@ -8,9 +8,13 @@ PATH as `gh`, driven by a scenario file and logging every call; nothing touches 
 network or ~/.claude. The sweep tests run the hook the way hooks.json wires it (its
 command and args, ${CLAUDE_PLUGIN_ROOT} filled in, its timeout); the snapshots are folders
 written in backups.py's layout with an id of the age wanted, the refs made with
-`git update-ref`. A git that hangs for every call the brief itself does not make stands
-in for a sweep that overruns; the brief is compared whole, its last commit dated long
-ago so that its age reads the same on every run.
+`git update-ref`. A git that hangs on update-ref alone (the reads answer), with many old
+refs to delete, stands in for a sweep that overruns: a timeout per call adds up, a
+deadline does not. A ref under another git's lock, a store that is a file and a read-only
+store stand in for a sweep that fails part way: the rest is still swept. The brief is
+compared whole, its last commit dated long ago so that its age reads the same every run.
+Rulings on #329: the sweep runs only where the brief runs (a project whose own
+SessionStart hook replaces the brief is not tested here).
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_session_brief_v2.py" -v
 """
@@ -63,10 +67,11 @@ HOOKS_JSON = PLUGIN_ROOT / "hooks" / "hooks.json"
 DAY = dt.timedelta(days=1)
 LONG_AGO = "2015-06-15T12:00:00+0000"  # `last commit 11 years ago` on every run
 SWEEP_BUDGET = 2  # seconds the brief gives the sweep (ticket #329)
-TIMING_MARGIN = 4  # seconds on top, for a slow CI machine
+TIMING_MARGIN = 3  # seconds on top, for a loaded CI machine
+HANGING_REFS = 64  # old refs: a timeout per deletion, even 0.1 s, adds up past the margin
 REAL_GIT = shutil.which("git", path=SYSTEM_PATH) or "/usr/bin/git"
-# git for the calls the brief makes itself (rev-parse --show-toplevel, status, log, remote);
-# any other call, the sweep's, is logged and hangs.
+# The real git for every call but update-ref (the sweep's deletions), which is logged and hangs:
+# the sweep's reads (rev-parse, for-each-ref, worktree list) answer, so it has refs to delete.
 HANGING_GIT = """#!/bin/sh
 sub=""
 skip=""
@@ -78,15 +83,11 @@ for a in "$@"; do
     *) sub="$a"; break ;;
   esac
 done
-case "$sub" in
-  status|log|remote) exec "@GIT@" "$@" ;;
-  rev-parse)
-    for a in "$@"; do
-      if [ "$a" = "--show-toplevel" ]; then exec "@GIT@" "$@"; fi
-    done ;;
-esac
-if [ -n "$HANG_LOG" ]; then echo "$*" >> "$HANG_LOG"; fi
-exec sleep 20
+if [ "$sub" = "update-ref" ]; then
+  if [ -n "$HANG_LOG" ]; then echo "$*" >> "$HANG_LOG"; fi
+  exec sleep 20
+fi
+exec "@GIT@" "$@"
 """
 
 _SHARED: dict = {}
@@ -459,15 +460,18 @@ class BriefV2Tests(unittest.TestCase):
         )
         run_env.update(env or {})
         started = time.monotonic()
-        r = subprocess.run(
-            argv,
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            env=run_env,
-            cwd=str(self.tmp),
-            timeout=hook["timeout"],
-        )
+        try:
+            r = subprocess.run(
+                argv,
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                env=run_env,
+                cwd=str(self.tmp),
+                timeout=hook["timeout"],
+            )
+        except subprocess.TimeoutExpired:
+            self.fail(f"the hook ran past the {hook['timeout']} s hooks.json gives it")
         took = time.monotonic() - started
         self.assertEqual((r.returncode, r.stderr), (0, ""))
         out = json.loads(r.stdout)["hookSpecificOutput"]
@@ -516,6 +520,24 @@ class BriefV2Tests(unittest.TestCase):
         name = f"refs/harness-backup/{self.backup_id(when)}/0"
         self.git(repo, "update-ref", name, "HEAD")
         return name
+
+    def backup_refs(self, repo: Path, count: int, age: dt.timedelta) -> list[str]:
+        """`count` refs under refs/harness-backup/, each id about `age` old, made in one git call."""
+        sha = self.git(repo, "rev-parse", "HEAD")
+        when = dt.datetime.now(dt.timezone.utc) - age
+        names = [
+            f"refs/harness-backup/{self.backup_id(when - dt.timedelta(seconds=k))}/0"
+            for k in range(count)
+        ]
+        subprocess.run(
+            ["git", "-C", str(repo), "update-ref", "--stdin"],
+            input="".join(f"create {name} {sha}\n" for name in names),
+            check=True,
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        return names
 
     def refs(self, repo: Path) -> set[str]:
         return set(self.git(repo, "for-each-ref", "--format=%(refname)").splitlines())
@@ -606,30 +628,44 @@ class BriefV2Tests(unittest.TestCase):
         self.assertIn(new_ref, self.refs(self.repo))
         self.assertEqual(self.session_start(self.repo)[0], clean)  # nothing left to sweep
 
-        # A sweep that fails adds no line: a ref git cannot delete (another git holds its lock),
+        # A sweep that fails part way adds no line and still sweeps the rest: a ref git cannot
+        # delete (another git holds its lock), between two old refs, beside an old snapshot,
+        before = self.backup_ref(self.repo, 25 * DAY)  # ids sort by time: before, locked, after
         locked = self.backup_ref(self.repo, 20 * DAY)
+        after = self.backup_ref(self.repo, 16 * DAY)
+        stale = self.snapshot(g, 16 * DAY, self.repo)
         lock = self.repo / ".git" / (locked + ".lock")
         lock.write_text("")
         self.assertEqual(self.session_start(self.repo)[0], clean)
+        self.assertIn(locked, self.refs(self.repo))
+        self.assertEqual({before, after} & self.refs(self.repo), set(), "a locked ref stopped the rest")
+        self.assertNotIn(stale, self.listing(g), "a locked ref stopped the store's sweep")
         lock.unlink()
-        # a store that is not a folder,
+        # a store that is not a folder (the refs still go),
         shutil.rmtree(g)
         g.write_text("not a folder\n")
+        old = self.backup_ref(self.repo, 18 * DAY)
         self.assertEqual(self.session_start(self.repo)[0], clean)
         self.assertEqual(g.read_text(), "not a folder\n")
+        self.assertNotIn(old, self.refs(self.repo), "a store that is a file stopped the refs' sweep")
         g.unlink()
-        # an old snapshot that cannot be removed (permissions do not bind root).
+        # an old snapshot that cannot be removed (permissions do not bind root; the refs still go).
         if os.geteuid() != 0:
             self.snapshot(g, 20 * DAY, self.repo)
             g.chmod(0o500)
             self.addCleanup(g.chmod, 0o700)
+            old = self.backup_ref(self.repo, 18 * DAY)
             self.assertEqual(self.session_start(self.repo)[0], clean)
+            self.assertNotIn(old, self.refs(self.repo), "a read-only store stopped the refs' sweep")
 
     def test_a_hanging_sweep_adds_no_delay_past_its_budget(self):
         self.pin_commit_date(self.repo)
-        self.backup_ref(self.repo, 15 * DAY)
         clean, took = self.session_start(self.repo)
-        self.backup_ref(self.repo, 15 * DAY)
+        again, took_again = self.session_start(self.repo)
+        self.assertEqual(again, clean)
+        took = max(took, took_again)  # nothing to sweep: the brief's own time, twice
+        # Many old refs, and a git whose every read answers but whose update-ref hangs.
+        self.backup_refs(self.repo, HANGING_REFS, 15 * DAY)
         self.snapshot(self.global_store(), 15 * DAY, self.repo)
         hang_log = self.tmp / "hang.log"
         hang = {
@@ -640,7 +676,7 @@ class BriefV2Tests(unittest.TestCase):
         self.assertEqual(out, clean)
         self.assertTrue(
             hang_log.is_file() and hang_log.read_text().strip(),
-            "the sweep made no git call of its own",
+            "the sweep tried to delete no ref",
         )
         self.assertLess(
             hung,

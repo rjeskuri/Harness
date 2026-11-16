@@ -54,6 +54,10 @@ main's in-project store, and deletes main's refs under refs/harness-backup/<id>/
 - Only a name that is a whole id is touched: a folder or file named like a near-id (`.bak`, upper-case hex, 5 or 7
   hex digits, a prefix) or not like one, and an id one level down, stay, in a store and among refs
   (refs/harness-backups/, refs/heads/<id-like>). An old id that is a symlink goes as a link; its target stays.
+- Ruling on #329: a name with the id's pattern but no real UTC time (`20261399T250000Z-abcdef`, 29 February 2026,
+  year 0) is not an id: never removed, as a folder or as refs/harness-backup/<it>/x, and the sweep goes on.
+- What cannot be removed (a ref under another git's lock, a snapshot in a read-only store) costs only itself: the
+  sweep removes the rest, leaves it out of what it returns and raises nothing.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_backups.py" -v
 """
@@ -987,6 +991,10 @@ class List(BackupTest):
 # ================================================================ sweep (#329)
 DAY = dt.timedelta(days=1)
 HOUR = dt.timedelta(hours=1)
+# The id's pattern but no real UTC time (ruling on #329: not an id, never removed); the first two sort before
+# every real id, so a sweep that stops at one would leave the old ids after it.
+NOT_TIMES = ["00000000T000000Z-abcdef", "19991232T000000Z-abcdef", "20260229T120000Z-abcdef",
+             "20261399T250000Z-abcdef"]
 
 
 def stamp(when):
@@ -1148,6 +1156,7 @@ class Sweep(BackupTest):
                   f"refs/harness-backup/{oldest}-abcde/0", "refs/harness-backup/not-an-id/0",
                   f"refs/harness-backup/x/{oldest}-abcdef/0", f"refs/harness-backups/{oldest}-abcdef/0",
                   f"refs/backup/{oldest}-abcdef/0", f"refs/heads/{oldest}-abcdef", f"refs/tags/{oldest}-abcdef"]
+        decoys += [f"refs/harness-backup/{name}/x" for name in NOT_TIMES]
         for name in decoys:
             self.git(main, "update-ref", name, "HEAD")
         other_old = self.backup_ref(other, self.new_id(self.now - 30 * DAY))
@@ -1195,7 +1204,7 @@ class Sweep(BackupTest):
         oldest = stamp(self.now - 400 * DAY)
         # Names that are not snapshot ids, however old they look: folders and files.
         decoy_dirs = [f"{oldest}-abcdef.bak", f"{oldest}-ABCDEF", f"{oldest}-abcde", f"{oldest}-abcdef0",
-                      f"x{oldest}-abcdef", oldest, "notes", ".harness-backup-tmp"]
+                      f"x{oldest}-abcdef", oldest, "notes", ".harness-backup-tmp"] + NOT_TIMES
         decoy_files = [f"{oldest}-abcdef.json", ".DS_Store", "README"]
         for name in decoy_dirs:
             self.put(os.path.join(store, name, "manifest.json"), data=b"{}\n")
@@ -1289,6 +1298,41 @@ class Sweep(BackupTest):
         self.assertEqual(removed, sorted(self.spelled(f) for f in swept))
         self.assertEqual(self.listing(store), names([f for f in v_new if ages[f] <= DAY]) | decoys)
         self.assertEqual(self.listing(everyone), set())
+
+    def test_sweep_goes_on_past_what_it_cannot_remove(self):
+        """A ref git cannot delete, a store it cannot empty, a name that is no real time: each costs only itself;
+        the sweep goes on, returns what it did remove and raises nothing."""
+        vault = self.make_repo("vault")
+        self.commit_settings(vault, {"HARNESS_SENSITIVE_PATHS": "secrets/**"})
+        store, everyone = self.project_store(vault), self.global_store()
+        g_old = [self.snap(None, 20 * DAY), self.snap(None, 15 * DAY)]
+        g_new = self.snap(None, DAY)
+        v_old = [self.snap(vault, 25 * DAY), self.snap(vault, 15 * DAY)]
+        v_new = self.snap(vault, 2 * DAY)
+        for name in NOT_TIMES:
+            self.put(os.path.join(store, name, "files", "0"))
+            self.put(os.path.join(everyone, name, "files", "0"))
+            self.git(vault, "update-ref", f"refs/harness-backup/{name}/x", "HEAD")
+        # Old refs on both sides of one whose lock another git holds (ids sort by time).
+        first = self.backup_ref(vault, self.new_id(self.now - 30 * DAY))
+        locked = self.backup_ref(vault, self.new_id(self.now - 20 * DAY))
+        last = self.backup_ref(vault, self.new_id(self.now - 15 * DAY))
+        self.backup_ref(vault, self.new_id(self.now - DAY))
+        with open(os.path.join(vault, ".git", locked + ".lock"), "w", encoding="utf-8"):
+            pass
+        stuck = os.geteuid() != 0                   # a read-only store binds everyone but root
+        if stuck:
+            os.chmod(everyone, 0o500)               # open_up gives it back before the cleanup
+        refs_before = self.all_refs(vault)
+
+        removed = self.sweep(vault, now=self.now)
+
+        gone = v_old + ([] if stuck else g_old)
+        self.assertEqual(removed, sorted([self.spelled(f) for f in gone] + [first, last]))
+        self.assertEqual(self.all_refs(vault), refs_before - {first, last})
+        self.assertEqual(self.listing(store), {os.path.basename(v_new)} | set(NOT_TIMES))
+        kept = [g_new] + (g_old if stuck else [])
+        self.assertEqual(self.listing(everyone), {os.path.basename(f) for f in kept} | set(NOT_TIMES))
 
 
 if __name__ == "__main__":
