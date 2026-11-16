@@ -22,9 +22,12 @@ The contract these tests read from the ticket:
     carries over to the parts after it, as in the shell, and a cd inside a ( ... ) subshell ends with it): one
     land that asks makes the command ask, in any position, and an override flag in any part asks with no gh
     call; harness-pr by its path ($CLAUDE_PLUGIN_ROOT/bin/harness-pr, an absolute path) is the same command;
-  - `cd <dir> && harness-pr land P` is judged in the main checkout of <dir>; `harness-pr ready P`,
-    `harness-pr land --help`, `harness-pr land` without a number and commands without harness-pr print nothing
-    and call no gh;
+  - `cd <dir> && harness-pr land P` is judged in the main checkout of <dir>; a land inside a child shell
+    (`sh -c '...'`, `bash -c "..."`, `eval ...`, a heredoc a shell reads) is judged like one written out, in the
+    directory the child is in (a cd inside the child stays in the child); a cd whose target cannot be resolved
+    (`cd "$(cat where)"`, `cd $UNSET`, `cd -`) makes the land's directory unknown, and an unknown directory asks
+    with no gh call; `harness-pr ready P`, `harness-pr land --help`, `harness-pr land` without a number and
+    commands without harness-pr print nothing and call no gh;
   - without its lib, or on an error of its own: one stderr line, exit 0, no decision;
   - hooks.json runs it before every Bash call, with 10 s.
 
@@ -358,6 +361,12 @@ class LandAskTests(unittest.TestCase):
                 reason = self.ask(command)
                 self.assertTrue(names_number(reason, high), f"the reason does not name #{high}: {reason}")
                 self.assertIn("risk:high", reason)
+                # The risk:low tickets are not the cause: none of them is the ticket named right before
+                # "risk:high" ("closes #8, a risk:high ticket" is wrong; "#8 (risk:low), #93 (risk:high)" and
+                # "closes #93, a risk:high ticket" are fine).
+                for low in (n for n in tickets if n != high):
+                    self.assertNotRegex(reason, rf"(?<!\d){low}(?!\d)[^#\d]*risk:high",
+                                        f"the reason presents #{low} (risk:low) as the risk:high ticket: {reason}")
 
     def test_risk_low_ticket_passes_silently(self):
         cases = [
@@ -625,6 +634,18 @@ class LandAskTests(unittest.TestCase):
             (self.tmp, "cd proj && (cd ../other && harness-pr land 12) && harness-pr land 12", 40,
              {(12, away), (12, home)}),
             (other, f"(cd {repo} && harness-pr land 7); harness-pr land 12", None, {(7, home), (12, away)}),
+            # a land inside a child shell (sh -c, bash -c, eval, a heredoc a shell reads) is the same land, judged
+            # in the directory the child is in; a cd inside the child stays in the child. A hook that looks only
+            # at the words of each part sees sh, bash or eval and stays silent on the asks.
+            (self.repo, "sh -c 'harness-pr land 12'", 40, {(12, home)}),
+            (self.repo, 'bash -c "harness-pr land 7 && harness-pr land 12"', 40, {(7, home), (12, home)}),
+            (self.repo, f'bash -c "cd {there} && harness-pr land 12"', None, {(12, away)}),
+            (other, f'bash -c "cd {repo} && harness-pr land 12"', 40, {(12, home)}),
+            (self.repo, "eval harness-pr land 12", 40, {(12, home)}),
+            (other, "eval harness-pr land 12", None, {(12, away)}),
+            (self.repo, "sh <<'EOF'\nharness-pr land 12\nEOF", 40, {(12, home)}),
+            (self.repo, f'bash -c "cd {there} && harness-pr land 12"; harness-pr land 12', 40,
+             {(12, away), (12, home)}),
         ]
         for cwd, command, high, views in chains:
             with self.subTest(cwd=cwd.name, command=command):
@@ -641,6 +662,21 @@ class LandAskTests(unittest.TestCase):
         for command in ("harness-pr land 7 && harness-pr land abc", "harness-pr land 9; harness-pr land '#x'"):
             with self.subTest(command=command):
                 self.ask(command)
+        # A cd whose target cannot be told before the command runs (a substitution, an unset variable, `cd -`)
+        # leaves the land's directory unknown: the hook cannot tell which repo it lands in, so it asks, naming
+        # the PR or the unknown directory, and calls no gh. From the other repo, where PR 12 is risk:low, a hook
+        # that falls back to the session's directory (or to a made-up path) stays silent or fails open instead.
+        (other / "where").write_text(f"{self.repo}\n", encoding="utf-8")
+        for command in (
+            'cd "$(cat where)" && harness-pr land 12',
+            "cd $LANDASK_UNSET_DIR && harness-pr land 12",
+            "cd - && harness-pr land 12",
+        ):
+            with self.subTest(cwd="other", command=command):
+                reason = self.ask(command, cwd=other)
+                self.assertTrue(names_number(reason, 12) or "director" in reason,
+                                f"the reason names neither PR 12 nor the unknown directory: {reason}")
+                self.assertEqual(self.gh_calls(), [], "an unknown directory must ask without calling gh")
         # An override flag in any part asks, naming it, before any gh call: every land but PR 12 in this repo is
         # risk:low, so the flag alone is what asks, wherever it stands.
         flagged = [
