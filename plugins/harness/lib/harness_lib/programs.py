@@ -1,12 +1,13 @@
 """The program files a Bash part runs through an interpreter, a shell, a test runner or a
-wrapper, for tests_first.py (#321): what the hook judges against the worktree, since what a
-program writes cannot be seen. `program_files(name, args, words, cwd, exports)` lists them for
+wrapper, for tests_first.py (#321, #364): what the hook judges against the worktree, since what
+a program writes cannot be seen. `program_files(name, args, part, cwd, exports)` lists them for
 one part as `Program(path, text, kind, runner)`: `path` absolute, or None when it cannot be
 known (an unexpanded variable, an unknown directory, a module on a PYTHONPATH entry the hook
-cannot expand); `kind` "program", "preload", "module" or "target"; `runner` True when a test
-runner is given it (a test file, directory or config: judged for being in the worktree, not
-for being tracked). `note_exports(words, name, args, exports)` records the PYTHONPATH a part
-exports for the parts after it. Pure parsing: no git, no refusal text, no reading of files.
+cannot expand, a loader's argument that is no literal); `kind` "program", "preload", "module",
+"target", "source" or "stdin"; `runner` True when a test runner is given it (a test file,
+directory or config: judged by the hook's rule for runners). `note_exports(words, name, args,
+exports)` records the PYTHONPATH a part exports for the parts after it. Parsing: no git, no
+refusal text; the only file read is the first four bytes of one run by its path.
 
 What is found: the first non-option word of python, node (and tsx, ts-node), deno run, bun,
 ruby, perl, php and the shells when it names a program file (an extension of the family, a
@@ -27,17 +28,37 @@ the subcommand (uv -q run, poetry -C . run). An installed module (the standard l
 runner) found nowhere is no program; one not found with a PYTHONPATH entry the hook cannot
 expand (a variable or substitution, $PWD included: the hook's is not the part's) is not known.
 
+#364 adds four shapes. An interpreter that reads its program from stdin (python, node, ruby,
+perl and php given no program file, module or inline program, or given -, /dev/stdin; a shell
+with none or -s) reads the files of its < redirections, what the commands substituted into
+its here-strings and unquoted heredocs read ($(cat f), $(<f), `head f`), and else what the
+parts before it in its pipeline read: their words that name a file and, for a command that
+copies its input (READERS: cat, head, sed, awk, tr, grep...), a word spelled as a path, known
+or not (kind "stdin"). source f and . f run f (kind "source"). A command run by its path (a
+word with a /) that is a text file, with a shebang or none, runs as a script whatever it is
+called (kind "program", alongside what its name would run); a binary (ELF, Mach-O), a
+directory or a path that does not exist is no program file. An inline program (-c, -e, -p,
+-r, a heredoc on stdin) runs what it loads: python's import, from ... import,
+importlib.import_module, __import__ and runpy.run_module resolved like -m (with __init__.py
+for a package), exec or eval of open(f) and runpy.run_path(f); node's require(), import() and
+import ... from on a relative or absolute specifier; ruby's require (a path), require_relative
+and load; perl's do and require (a path); php's include and require; each a literal, or a
+path that cannot be known. The files the commands substituted into an inline program or eval
+read are its program too (python3 -c "$(cat f)").
+
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
 
 from __future__ import annotations
 
+import ast
 import os
 import re
+import stat
 import sys
 from typing import NamedTuple, Optional
 
-from harness_lib.shellwalk import ASSIGNMENT, PYTHON, SHELLS
+from harness_lib.shellwalk import ASSIGNMENT, PYTHON, SHELLS, command_words, split_command, substitutions
 
 PY_EXT = {".py", ".pyw", ".pyc"}
 JS_EXT = {".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".jsx", ".tsx"}
@@ -96,6 +117,25 @@ KNOWN_INSTALLED = STDLIB | frozenset(
     "pre_commit sphinx IPython jupyter virtualenv pipx uv poetry pdm hatch nuitka Cython numpy pandas "
     "django flask uvicorn gunicorn celery alembic".split()
 )
+# Commands that copy what they read to their output, filtered or not.
+READERS = frozenset(
+    "cat head tail sed gsed awk gawk tr cut grep egrep fgrep sort uniq tac rev nl fold expand paste "
+    "iconv column strings base64 xxd od dd tee less more fmt pr".split()
+)
+STDIN_FILES = {"/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
+# The first bytes of a binary the system runs (ELF; Mach-O, thin and universal, either order).
+MAGIC = {b"\x7fELF", b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",
+         b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}
+JS_CALL = re.compile(r"(?<![\w.$])(?:require|import)\s*\(([^)]*)")
+JS_FROM = re.compile(r"""(?<![\w.$])(?:import|export)\s*(?:[\w$*{}\s,]+?\s*from\s*)?(["'])(.*?)\1""")
+JS_LITERAL = re.compile(r"""\s*(["'`])(.*?)\1\s*$""")
+# ruby's, perl's and php's loaders: the call, its literal argument, the character after the
+# call when there is none, and how an argument the hook cannot know starts (ARGV[0], $f).
+SCRIPT_LOADERS = {
+    "ruby": (re.compile(r"(?<![\w.:])(require_relative|require|load)\b[\s(]*(?:(['\"])(.*?)\2)?(.?)"), "[A-Za-z_$@]"),
+    "perl": (re.compile(r"(?<![\w>:$])(do|require)\b[\s(]*(?:(['\"])(.*?)\2)?(.?)"), "[$@]"),
+    "php": (re.compile(r"(?<![\w>:$])(include|require)(?:_once)?\b[\s(]*(?:(['\"])(.*?)\2)?(.?)"), "[$]"),
+}
 
 
 class Program(NamedTuple):
@@ -113,10 +153,15 @@ class Spec:
     `stops` the search when the words after it belong to the program (python -c, sh -c);
     `module_letters`/`module_long`: python -m; `program_letters`: an option whose value is the
     program (php -f); `entries`: the entry files a directory runs as; `cluster`: short options
-    stack (-wIlib) rather than stand alone (node -r x); `runner_flags`: node --test."""
+    stack (-wIlib) rather than stand alone (node -r x); `runner_flags`: node --test; `family`:
+    the language of its inline programs; `stdin`: given no program it reads one from stdin, as
+    it does after one of `stdin_letters` (sh -s)."""
 
     def __init__(self, exts, **kw) -> None:
         self.exts = exts
+        self.family = kw.get("family", "")
+        self.stdin = kw.get("stdin", False)
+        self.stdin_letters = kw.get("stdin_letters", "")
         self.letters = kw.get("letters", "")
         self.values = set(kw.get("values", ()))
         self.preloads = set(kw.get("preloads", ()))
@@ -135,12 +180,13 @@ class Spec:
 
 
 PYTHON_SPEC = Spec(
-    PY_EXT, letters="WXcmQ", inline="c", stops=True, module_letters="m",
+    PY_EXT, letters="WXcmQ", inline="c", stops=True, module_letters="m", family="python", stdin=True,
     values={"--check-hash-based-pycs"}, entries=("__main__.py",),
 )
 NODE_PRELOADS = {"-r", "--require", "--import", "--loader", "--experimental-loader"}
 NODE_SPEC = Spec(
     JS_EXT, cluster=False, preloads=NODE_PRELOADS, inline_long={"-e", "--eval", "-p", "--print"},
+    family="node", stdin=True,
     runner_flags={"--test"}, entries=("index.js", "index.mjs", "index.cjs", "index.ts"),
     values=set(
         "-C --conditions --input-type --env-file --env-file-if-exists --test-reporter "
@@ -160,7 +206,7 @@ DENO_SPEC = Spec(
     ),
 )
 BUN_SPEC = Spec(
-    JS_EXT, cluster=False, preloads={"--preload", "-r"}, inline_long={"-e", "--eval", "-p", "--print"},
+    JS_EXT, cluster=False, preloads={"--preload", "-r"}, inline_long={"-e", "--eval", "-p", "--print"}, family="node",
     entries=("index.ts", "index.js", "index.mjs"),
     values=set(
         "--cwd --timeout --config -c --env-file --port --reporter --reporter-outfile -t --test-name-pattern "
@@ -169,12 +215,18 @@ BUN_SPEC = Spec(
     ),
 )
 RUBY_SPEC = Spec(
-    RB_EXT, letters="IrCEFKe", preload_letters="r", inline="e",
+    RB_EXT, letters="IrCEFKe", preload_letters="r", inline="e", family="ruby", stdin=True,
     values={"--encoding", "--external-encoding", "--internal-encoding", "--disable", "--enable"},
 )
-PERL_SPEC = Spec(PL_EXT, letters="IMmeE", inline="eE")
-PHP_SPEC = Spec(PHP_EXT, letters="cdfFBREzStr", inline="r", stops=True, program_letters="fF", define_letters="d")
-SHELL_SPEC = Spec(SH_EXT, letters="oOc", inline="c", stops=True, plus=True, values={"--rcfile", "--init-file"})
+PERL_SPEC = Spec(PL_EXT, letters="IMmeE", inline="eE", family="perl", stdin=True)
+PHP_SPEC = Spec(
+    PHP_EXT, letters="cdfFBREzStr", inline="r", stops=True, program_letters="fF", define_letters="d",
+    family="php", stdin=True,
+)
+SHELL_SPEC = Spec(
+    SH_EXT, letters="oOc", inline="c", stops=True, plus=True, values={"--rcfile", "--init-file"},
+    family="shell", stdin=True, stdin_letters="s",
+)
 PHP_PRELOAD_KEYS = {"auto_prepend_file", "auto_append_file"}
 # The standard library's runners: options with values, the module option, and the program.
 STDLIB_SPECS = {
@@ -301,12 +353,14 @@ def path_like(word: str) -> bool:
 def program_word(spec: Spec, word: str, cwd: str | None) -> Program | None:
     """`word` as the program an interpreter runs, or None when it is no program file (an
     option's value the tables do not know): a directory with one of `spec.entries`, a path,
-    an existing file."""
+    an existing file. /dev/stdin is stdin."""
     if not word or word == "-":
         return None
     full = resolve(word, cwd)
     if full is None:
         return Program(None, word, "program") if path_like(word) else None
+    if full in STDIN_FILES:
+        return Program(None, spec.family, "stdin-program")
     if os.path.isdir(full):
         for entry in spec.entries:
             if os.path.isfile(os.path.join(full, entry)):
@@ -432,11 +486,13 @@ def take_value(rest: str, args: list[str], k: int) -> tuple[str, int]:
 def interpreter_programs(spec: Spec, args: list[str], cwd: str | None, roots: list, found: list, depth: int = 0) -> None:
     """The programs an interpreter spelled by `spec` runs given `args`: its preloads, its
     module (python -m) or the first non-option word naming a program file; the words after
-    the program are its arguments. node --test turns what is found into runner targets."""
+    the program are its arguments; an inline program runs what it loads (inline_programs).
+    node --test turns what is found into runner targets. Given none of these, or -, one that
+    reads its program from stdin (spec.stdin) leaves a "stdin-program" mark for program_files."""
     if depth > 4:
         return
     start = len(found)
-    inline = runner = False
+    inline = runner = ran = reads = False
     k = 0
     while k < len(args):
         a = args[k]
@@ -446,8 +502,10 @@ def interpreter_programs(spec: Spec, args: list[str], cwd: str | None, roots: li
                 prog = program_word(spec, args[k], cwd)
                 if prog:
                     found.append(prog)
+                    ran = True
             break
         if a == "-" or not a:
+            reads, ran = a == "-", True
             break
         if a.startswith("--") or (not spec.cluster and a.startswith("-")):
             opt, eq, val = a.partition("=")
@@ -458,11 +516,13 @@ def interpreter_programs(spec: Spec, args: list[str], cwd: str | None, roots: li
             elif opt in spec.inline_long:
                 inline = True
                 if not eq:
-                    k += 1
+                    val, k = take_value("", args, k)
+                inline_programs(spec.family, val, cwd, roots, found)
             elif opt in spec.module_long:
                 if not eq:
                     val, k = take_value("", args, k)
                 module_programs(val, args[k:], cwd, roots, found, depth)
+                ran = True
                 break
             elif opt in spec.runner_flags:
                 runner = True
@@ -477,11 +537,16 @@ def interpreter_programs(spec: Spec, args: list[str], cwd: str | None, roots: li
                 if ch in spec.module_letters:
                     val, k = take_value(rest, args, k)
                     module_programs(val, args[k:], cwd, roots, found, depth)
-                    stop = True
+                    stop = ran = True
                     break
                 if ch in spec.inline:
                     inline = True
+                    val, k = take_value(rest, args, k)
+                    inline_programs(spec.family, val, cwd, roots, found)
                     stop = spec.stops
+                    break
+                if ch in spec.stdin_letters:
+                    stop = reads = True
                     break
                 if ch in spec.preload_letters:
                     val, k = take_value(rest, args, k)
@@ -492,7 +557,7 @@ def interpreter_programs(spec: Spec, args: list[str], cwd: str | None, roots: li
                     prog = program_word(spec, val, cwd)
                     if prog:
                         found.append(prog)
-                    stop = True
+                    stop = ran = True
                     break
                 if ch in spec.define_letters:
                     val, k = take_value(rest, args, k)
@@ -514,10 +579,134 @@ def interpreter_programs(spec: Spec, args: list[str], cwd: str | None, roots: li
         prog = program_word(spec, a, cwd)
         if prog:
             found.append(prog)
+            ran = True
             break
     if runner:
         implicit_target(cwd, found, start)
         found[start:] = [Program(p.path, p.text, p.kind, True) for p in found[start:]]
+    elif spec.stdin and not inline and (reads or not ran):
+        found.append(Program(None, spec.family, "stdin-program"))
+
+
+# ---------- what an inline program loads ----------
+
+
+def inline_programs(family: str, code: str, cwd: str | None, roots: list, found: list) -> None:
+    """What the inline program `code` (python -c, node -e, ruby -e, perl -e, php -r, sh -c)
+    runs besides itself: the files the commands substituted into it read (python3 -c "$(cat
+    f)" runs f), and what it loads (loads)."""
+    for feed in substitutions(code):
+        feed_reads(feed, cwd, found)
+    loads(family, code, cwd, roots, found)
+
+
+def loads(family: str, code: str, cwd: str | None, roots: list, found: list) -> None:
+    """The files and modules the program `code` in `family`'s language loads and runs."""
+    if family == "python":
+        python_loads(code, roots, cwd, found)
+    elif family == "node":
+        for m in JS_CALL.finditer(code):  # require(x), import(x)
+            literal = JS_LITERAL.match(m.group(1))
+            if literal and "${" not in literal.group(2):
+                js_file(literal.group(2), cwd, found)
+            elif m.group(1).strip():
+                found.append(Program(None, m.group(1).strip(), "program"))
+        for m in JS_FROM.finditer(code):  # import x from "y", import "y"
+            js_file(m.group(2), cwd, found)
+    elif family in SCRIPT_LOADERS:
+        pattern, unknown = SCRIPT_LOADERS[family]
+        for m in pattern.finditer(code):
+            call, literal = m.group(1), m.group(3)
+            if literal is None:
+                if re.match(unknown, m.group(4)):  # load ARGV[0], do $f, include $argv[1]
+                    found.append(Program(None, code[m.start() :].split(";")[0].strip()[:80], "program"))
+            # require "json" and do "Foo.pm" search the load path: a library, not a file here
+            elif literal and (
+                call in ("load", "require_relative") or family == "php" or literal.startswith(("/", "./", "../", "~"))
+            ):
+                full = resolve(literal, cwd)
+                if full is not None and family == "ruby" and not extension(literal) and os.path.isfile(full + ".rb"):
+                    full += ".rb"
+                found.append(Program(full, literal, "program"))
+
+
+def python_loads(code: str, roots: list, cwd: str | None, found: list) -> None:
+    """python's imports (import, from ... import, importlib.import_module, __import__,
+    runpy.run_module) resolved on `roots`, and the files it runs: exec or eval of what
+    open(f) or Path(f) reads, runpy.run_path(f); exec of sys.stdin reads its program from
+    stdin. An argument that is no literal cannot be known. Code that does not parse loads
+    nothing: it does not run."""
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                import_programs(alias.name, roots, found)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            import_programs(node.module, roots, found)
+            for alias in node.names:  # from tools import gen imports tools/gen.py
+                import_programs(f"{node.module}.{alias.name}", roots, found, quiet=True)
+        elif isinstance(node, ast.Call) and node.args:
+            name = called(node)
+            calls = [node] if name in ("import_module", "__import__", "run_module", "run_path") else []
+            if name in ("exec", "eval", "execfile"):
+                inner = list(ast.walk(node))
+                calls = [c for c in inner if isinstance(c, ast.Call) and called(c) in ("open", "Path") and c.args]
+                if any(isinstance(n, ast.Attribute) and n.attr == "stdin" for n in inner):
+                    found.append(Program(None, "python", "stdin-program"))  # exec(sys.stdin.read())
+            for call in calls:
+                arg = call.args[0]
+                if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+                    found.append(Program(None, ast.get_source_segment(code, arg) or name, "program"))
+                elif arg.value and called(call) in ("run_path", "open", "Path"):
+                    found.append(Program(resolve(arg.value, cwd), arg.value, "program"))
+                elif arg.value:
+                    import_programs(arg.value, roots, found)
+
+
+def called(call) -> str:
+    """The name a call calls: f for f(), the attribute for x.f()."""
+    func = call.func
+    return func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+
+
+def import_programs(module: str, roots: list, found: list, quiet: bool = False) -> None:
+    """The files `import module` runs on `roots`: each package's __init__.py and the module,
+    every place found. Found nowhere, it is installed, or not known when a root is not known
+    and it is not installed (unless `quiet`: from x import name, where name need not be a
+    module)."""
+    if not MODULE_NAME.match(module):
+        return
+    names = module.split(".")
+    files, unknown = [], False
+    for root in roots:
+        if root is None:
+            unknown = True
+            continue
+        for i in range(1, len(names) + 1):
+            base = os.path.join(root, *names[:i])
+            for f in (base + ".py", os.path.join(base, "__init__.py")):
+                if os.path.isfile(f) and f not in files:
+                    files.append(f)
+    found.extend(Program(f, module, "module") for f in files)
+    if not files and unknown and not quiet and names[0] not in KNOWN_INSTALLED:
+        found.append(Program(None, module, "module"))
+
+
+def js_file(specifier: str, cwd: str | None, found: list) -> None:
+    """A relative or absolute specifier node loads (a bare one is a package or a built-in):
+    the file it resolves to, by itself, with an extension or as a directory's index.js."""
+    if not specifier.startswith(("./", "../", "/")):
+        return
+    full = resolve(specifier, cwd)
+    if full is not None:
+        for f in [full] + [full + e for e in (".js", ".mjs", ".cjs", ".json")] + [os.path.join(full, "index.js")]:
+            if os.path.isfile(f):
+                full = f
+                break
+    found.append(Program(full, specifier, "program"))
 
 
 # ---------- runners ----------
@@ -674,10 +863,104 @@ def dispatch(word: str, args: list[str], cwd: str | None, roots: list, found: li
     return True
 
 
-def program_files(name: str, args: list[str], words: list[str], cwd: str | None, exports: dict) -> list:
-    """The programs the part `words` (command `name`, its `args`) runs in `cwd`, as Program
-    records; [] for a command that runs none."""
+# ---------- stdin, source and scripts run by their path ----------
+
+
+def stdin_reads(part, cwd: str | None, found: list) -> None:
+    """What `part` reads on stdin besides a pipe: the files of its < redirections and what the
+    commands substituted into its here-strings and unquoted heredocs read."""
+    for word in part.inputs:
+        found.append(Program(resolve(word, cwd), word, "stdin"))
+    for feed in part.feeds:
+        feed_reads(feed, cwd, found)
+
+
+def stage_reads(part, cwd: str | None, found: list) -> None:
+    """What `part`, before an interpreter in a pipeline or substituted into its stdin, writes
+    out: the files its words name and, for one of READERS, a word spelled as a path that does
+    not exist or cannot be known (not an option, a pattern or a sed script), and its stdin."""
+    words = command_words(part.words)
+    reader = bool(words) and os.path.basename(words[0]) in READERS
+    for word in words[1:]:
+        if word.startswith("-"):
+            continue
+        full = resolve(word, cwd)
+        if full is None and reader:
+            found.append(Program(None, word, "stdin"))
+        elif full is not None and (
+            (os.path.exists(full) and not os.path.isdir(full))
+            or (reader and (extension(word) in PROGRAM_EXT or word.startswith(("/", "~", "./", "../"))))
+        ):
+            found.append(Program(full, word, "stdin"))
+    stdin_reads(part, cwd, found)
+
+
+def feed_reads(feed: str, cwd: str | None, found: list) -> None:
+    """What the command `feed`, substituted into a text ($(cat f), `head f`), reads."""
+    text = feed.strip()
+    if text.startswith("<") and not text.startswith("<<"):
+        text = "cat " + text  # $(< f) is $(cat f)
+    for part in split_command(text):
+        if not part.marker:
+            stage_reads(part, cwd, found)
+
+
+def script_run(word: str, cwd: str | None) -> Program | None:
+    """The script a command run by its path (`word` holds a /) is: a text file, with a shebang
+    or none, whatever it is called; None for a binary (ELF, Mach-O), a directory or a path that
+    does not exist, and for a command substitution's output (the shell's own text in a
+    heredoc a child shell reads). Only a regular file is read, and only its first four bytes."""
+    if "/" not in word or "$(" in word or "`" in word:
+        return None
+    full = resolve(word, cwd)
+    if full is None:
+        return Program(None, word, "program")
+    try:
+        mode = os.stat(full).st_mode
+    except OSError:  # it does not exist (a virtual environment's python with none there)
+        return None
+    if stat.S_ISDIR(mode):
+        return None
+    if stat.S_ISREG(mode):
+        try:
+            fd = os.open(full, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                head = os.read(fd, 4)
+            finally:
+                os.close(fd)
+        except OSError:  # unreadable: no binary the hook knows
+            head = b""
+        if head in MAGIC:
+            return None
+    return Program(full, word, "program")
+
+
+def program_files(name: str, args: list[str], part, cwd: str | None, exports: dict) -> list:
+    """The programs the Part `part` (command `name`, its `args`) runs in `cwd`, as Program
+    records; [] for a command that runs none. One that reads its program from stdin is
+    given what it reads: stdin_reads, else the pipe's (stage_reads), and its heredocs'
+    loads."""
     found: list = []
-    roots = python_roots(cwd, part_pythonpath(words, len(args), exports))
-    dispatch(name, args, cwd, roots, found)
+    roots = python_roots(cwd, part_pythonpath(part.words, len(args), exports))
+    script = script_run(part.words[-len(args) - 1] if name else "", cwd)
+    if script:
+        found.append(script)
+    if name in ("source", "."):
+        plain = args[1:] if args[:1] == ["--"] else args
+        full = resolve(plain[0], cwd) if plain and plain[0] not in ("", "-") else ""
+        if full is None or (full and not os.path.isdir(full)):
+            found.append(Program(full, plain[0], "source"))
+    elif name == "eval":
+        for feed in substitutions(" ".join(args)):
+            feed_reads(feed, cwd, found)
+    else:
+        dispatch(name, args, cwd, roots, found)
+    marks = [p for p in found if p.kind == "stdin-program"]
+    if marks:
+        found = [p for p in found if p.kind != "stdin-program"]
+        stdin_reads(part, cwd, found)
+        for stage in part.piped:
+            stage_reads(stage, cwd, found)
+        for body in part.heredocs:
+            loads(marks[0].text, body, cwd, roots, found)
     return found

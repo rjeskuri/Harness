@@ -2,8 +2,9 @@
 with: `split_command` cuts a command into simple commands (on ;, &&, ||, |, & and newlines,
 with marker parts around (...) subshells, and the commands inside $(...), backticks and
 <(...) last, each between its own markers), `command_words` finds the command's name behind
-assignments, keywords and wrappers, and `stdin_program` says whether a shell or python reads
-its program from stdin. See docs/design.md (lib).
+assignments, keywords and wrappers, `stdin_program` says whether a shell, python or node reads
+its program from stdin, and `substitutions` lists the commands a text's $(...) and `...` run.
+See docs/design.md (lib).
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -50,7 +51,10 @@ class Part:
     command or on a new line, "&&" after `true &&` and a newline, "(" first in a
     subshell, ")&&" after a subshell and &&. A part split_command leaves out (an
     arithmetic command, one that only redirects input) holds something; blanks, a
-    comment or a line continuation alone do not."""
+    comment or a line continuation alone do not. What it reads on stdin: `inputs`, the
+    files its < redirections name; `feeds`, the commands substituted into its here-strings
+    and its heredocs with an unquoted delimiter, whose output is that text; `piped`, the
+    parts before it in its pipeline, at its own level (none unless a pipe feeds it)."""
 
     def __init__(self, marker: str = "") -> None:
         self.words: list[str] = []
@@ -60,6 +64,9 @@ class Part:
         self.sep = ""
         self.lead = ""
         self.marker = marker
+        self.inputs: list[str] = []
+        self.feeds: list[str] = []
+        self.piped: list[Part] = []
 
 
 def closing(text: str, i: int) -> int:
@@ -106,15 +113,18 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
     substitutions come last, each in its own subshell."""
     parts: list[Part] = []
     nested: list[str] = []
-    heredocs: list[tuple[str, bool, Part]] = []
+    heredocs: list[tuple[str, bool, Part, bool]] = []
     part, start = Part(), 0
     word: str | None = None
     redirect = ""  # what the next word is: "out", "dup", "in", "heredoc" or "heredoc-"
+    opened, mark = "", 0  # the redirection operator, and len(nested) when it was read
+    quoted = False  # the word holds a quote or a backslash: as a heredoc delimiter, literal
     lead = ""  # the operators since the last part that holds anything (Part.lead)
+    stages: list[Part] = []  # the parts piped into the next one (Part.piped)
     i, n = 0, len(command)
 
     def end_word() -> None:
-        nonlocal word, redirect
+        nonlocal word, redirect, opened, quoted
         if word is None:
             return
         if redirect == "out" or (
@@ -122,13 +132,17 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
         ):
             part.targets.append(word)
         elif redirect.startswith("heredoc"):
-            heredocs.append((word, redirect == "heredoc-", part))
+            heredocs.append((word, redirect == "heredoc-", part, quoted))
+        elif opened == "<<<":
+            part.feeds.extend(nested[mark:])
+        elif opened == "<":
+            part.inputs.append(word)
         elif not redirect:
             part.words.append(word)
-        word, redirect = None, ""
+        word, redirect, opened, quoted = None, "", "", False
 
     def end_part(end: int, op: str = "") -> None:
-        nonlocal part, start, redirect, lead
+        nonlocal part, start, redirect, lead, stages
         end_word()
         if redirect in ("out", "dup"):
             part.targets.append("")  # a redirection with no target
@@ -137,6 +151,8 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
         part.sep = op
         part.lead = lead
         if part.words or part.targets:
+            part.piped = stages
+            stages = stages + [part] if op == "|" else []
             parts.append(part)
         bare = part.text.replace("\\\n", "").strip()[:1] in ("", "#")  # blanks, a comment
         lead = op if part.words or part.targets or not bare else lead + op
@@ -150,7 +166,7 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
         elif c == "\n":
             end_part(i)
             i += 1
-            for delimiter, tabs, owner in heredocs:  # their bodies follow this line
+            for delimiter, tabs, owner, literal in heredocs:  # their bodies follow this line
                 body = []
                 while i < n:
                     j = command.find("\n", i)
@@ -160,6 +176,8 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
                         break
                     body.append(line)
                 owner.heredocs.append("\n".join(body))
+                if not literal:  # an unquoted delimiter: the shell expands the body
+                    owner.feeds.extend(substitutions(owner.heredocs[-1]))
             heredocs.clear()
             start = i
         elif c == "#" and word is None:
@@ -168,13 +186,16 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
         elif c == "\\":
             if command[i + 1 : i + 2] != "\n":
                 word = (word or "") + command[i + 1 : i + 2]
+                quoted = True
             i += 2
         elif c == "'":
             j = command.find("'", i + 1)
             j = n if j < 0 else j
             word = (word or "") + command[i + 1 : j]
+            quoted = True
             i = j + 1
         elif c == '"':
+            quoted = True
             j, buf = i + 1, []
             while j < n and command[j] != '"':
                 if command[j] == "\\" and j + 1 < n:
@@ -208,7 +229,7 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
                 word = None  # a file descriptor number, as in 2>
             end_word()
             op = REDIRECT.match(command, i).group(0)
-            redirect = REDIRECTS[op]
+            redirect, opened, mark = REDIRECTS[op], op, len(nested)
             i += len(op)
         elif c in ";|&()":
             op = command[i : i + 2] if command.startswith(("&&", "||"), i) else c
@@ -248,11 +269,52 @@ def command_words(words: list[str]) -> list[str]:
     return words[k:]
 
 
-def stdin_program(args: list[str]) -> bool:
-    """True when a shell or python given `args` reads its program from stdin."""
-    for a in args:
+# Options whose value is the next word, by interpreter: python3 -W ignore, bash -o errexit
+# and node --conditions x read their program from stdin all the same.
+STDIN_VALUES = {
+    "python": {"-W", "-X", "--check-hash-based-pycs"},
+    "shell": {"-o", "-O", "+o", "+O", "--rcfile", "--init-file"},
+    "node": set(
+        "-r --require --import --loader --experimental-loader --input-type -C --conditions "
+        "--env-file --title --stack-trace-limit".split()
+    ),
+}
+
+
+def stdin_program(args: list[str], name: str = "") -> bool:
+    """True when a shell or python (or node, given its `name`) given `args` reads its program
+    from stdin. Given the interpreter's `name`, an option's value is not taken for a program
+    file, a shell's -s reads stdin whatever follows, and node's -e and -p are inline."""
+    family = "python" if PYTHON.match(name) else "shell" if name in SHELLS else ""
+    family = "node" if name in ("node", "nodejs", "bun") else family
+    values = STDIN_VALUES.get(family, set())
+    k = 0
+    while k < len(args):
+        a = args[k]
+        k += 1
         if a == "-":
             return True
-        if not a.startswith("-") or a.startswith(("-c", "-m")):
+        if a in values:
+            k += 1
+        elif family == "shell" and re.match(r"-[A-Za-z]+$", a) and ("c" in a or "s" in a):
+            return "c" not in a
+        elif family == "node" and a.startswith(("-e", "-p", "--eval", "--print")):
+            return False
+        elif not a.startswith(("-", "+") if family == "shell" else "-") or a.startswith(("-c", "-m")):
             return False
     return True
+
+
+def substitutions(text: str) -> list[str]:
+    """The commands in `text`'s $(...) and `...`, as the shell finds them expanding an
+    unquoted heredoc's body: a backslash escapes the character after it."""
+    nested: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+        elif text[i] == "`" or text.startswith("$(", i):
+            i = substitution(text, i, nested)
+        else:
+            i += 1
+    return nested

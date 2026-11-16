@@ -53,10 +53,25 @@ hook cannot expand: a variable or substitution, $PWD included, since the hook's 
 session's directory, not the part's after a cd) is refused too, and when git cannot say in
 time whether HEAD tracks the file, the run is refused, not judged. A test runner (pytest,
 unittest, node --test, deno test, bun test, vitest, jest, mocha; npm test and npm run are
-not judged) is refused only a test path, directory or config outside the worktree, the
+not judged) is refused a test path, directory or config outside the worktree, the
 directory it collects from when given no target (cd /tmp && pytest) and the JS configs
-vitest, jest and mocha execute (--config, -c) included: its in-tree files run, tracked or
-new, as do its output paths anywhere.
+vitest, jest and mocha execute (--config, -c) included; in the worktree its directories run,
+and a file (a target, a dotted module, a config, a preload such as node --import) runs when
+HEAD tracks it, the project's test patterns call it a test, or it is test configuration (the
+ruling of #364: python3 -m unittest tools/gen.py is refused). Its output paths anywhere run.
+#364 brings four more shapes under the same rule (programs.py): an interpreter or shell
+reading its program from stdin (python3 - < f, bash -s < f, cat f | tr -d x | python3, a
+here-string or an unquoted heredoc of $(cat f) or $(<f), python3 /dev/stdin), judged by
+the files its < redirections, those substitutions and the parts piped into it read; source
+f and . f; a script run by its path (/tmp/w.py, ./w.sh, ~/w.sh, tools/python3 -m pytest),
+judged as the text file it is, with a shebang or none, whatever it is called (a binary, a
+directory or a path that does not exist is not judged); and what an inline program or a
+heredoc on stdin loads (python -c 'import tools.gen', importlib, __import__, runpy,
+exec(open(f).read()); node -e require or import; ruby require, require_relative, load; perl
+do, require; php include, require), with a path it cannot know (sys.argv[1], ARGV[0],
+$argv[1]) refused and data reads (print(open(f).read())) not judged. The plugin's own bin/
+tools and a virtual environment's activate script (<dir>/bin/activate beside
+<dir>/pyvenv.cfg, under any name) run.
 
 <key> is the first 12 hex digits of the sha1 of the real path of the main working tree
 with each component spelled as its parent directory lists it, so a linked worktree
@@ -102,6 +117,7 @@ except Exception as exc:  # fail open, like the __main__ wrapper below: one line
     sys.exit(0)
 
 GIT_TIMEOUT = 3
+OWN_BIN = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "bin"))
 # One deadline for the whole run: hooks.json gives the hook 10 s, a hook killed at it prints nothing (the
 # write goes through), and interpreter start and imports come out of the same 10 s. Every git call gets
 # at most GIT_TIMEOUT of what is left, the red proof all of it.
@@ -573,15 +589,39 @@ def unseen_writes(guard, part, name: str, args: list[str], here: str | None):
     return guard.code_writes(name, args, part), []
 
 
+def own_or_venv(path: str) -> bool:
+    """True for the plugin's own tools (its bin/, by their real path) and a virtual
+    environment's own activate script (<dir>/bin/activate beside <dir>/pyvenv.cfg)."""
+    if os.path.dirname(os.path.realpath(path)) == OWN_BIN:
+        return True
+    bindir = os.path.dirname(path)
+    return (
+        os.path.basename(path) == "activate"
+        and os.path.basename(bindir) == "bin"
+        and os.path.isfile(os.path.join(os.path.dirname(bindir), "pyvenv.cfg"))
+    )
+
+
+def runner_may_run(rel: str, facts: dict) -> bool:
+    """True when a test runner may run the in-tree `rel` untracked: a test by the project's
+    patterns (the main checkout's tracked settings, as for an edit) or test configuration.
+    With the main checkout unknown (out of time), HEAD decides."""
+    if facts["main"] is None:
+        return False
+    return role_kind(rel, classify(rel, settings_env(facts["main"], ("settings.json",)))) in ("test", "config")
+
+
 def program_refusal(
     name: str, args: list[str], part, here: str | None, cwd: str, exports: dict, cache: dict
 ) -> str | None:
     """Why the program files `part` runs (harness_lib/programs.py) may not run: one whose
-    path cannot be known, one outside the worktree, or, unless a test runner is given it,
-    one that is not a blob at HEAD (a git call out of time refuses too). The worktree is the
-    part's directory's when that is guarded, else the hook's; None off the guarded branches
-    or when the part runs no program file."""
-    found = program_files(name, args, part.words, here, exports)
+    path cannot be known, one outside the worktree, or one that is not a blob at HEAD (a git
+    call out of time refuses too), unless a test runner is given it and it is a directory, a
+    test or test configuration (runner_may_run). The plugin's own tools and a virtual
+    environment's activate script run. The worktree is the part's directory's when that is
+    guarded, else the hook's; None off the guarded branches or when the part runs no program
+    file."""
+    found = program_files(name, args, part, here, exports)
     if not found:
         return None
     facts = None
@@ -598,13 +638,15 @@ def program_refusal(
     for prog in found:
         if prog.path is None:
             return PROGRAM_UNKNOWN.format(name=name, file=prog.text)
+        if own_or_venv(prog.path):
+            continue
         rel = relative_path(prog.path, facts["top"])
         if rel is None and prog.runner and os.path.isdir(prog.path):
             if canonical_path(prog.path) == top:  # the worktree itself, as a test directory
                 continue
         if rel is None:
             return PROGRAM_OUTSIDE.format(name=name, file=prog.path)
-        if prog.runner:
+        if prog.runner and (os.path.isdir(prog.path) or runner_may_run(rel, facts)):
             continue
         try:
             out = git(top, "cat-file", "-t", f"HEAD:{rel}")

@@ -358,7 +358,7 @@ def shell_script(name: str, args: list[str], part: Part) -> str | None:
     ]
     if flags:
         return args[flags[0] + 1] if flags[0] + 1 < len(args) else None
-    if stdin_program(args) and part.heredocs:
+    if stdin_program(args, name) and part.heredocs:
         return "\n".join(part.heredocs)
     return None
 
@@ -1091,7 +1091,7 @@ def inline_programs(name: str, args: list[str], part: Part) -> list[str]:
             break
         elif a == "-m" or a == "-" or not a.startswith("-"):
             break
-    if not programs and stdin_program(args):
+    if not programs and stdin_program(args, name):
         programs.extend(part.heredocs)
     return programs
 
