@@ -24,7 +24,9 @@ not. Adds at most 40 lines of context:
   - Latest spec: the newest file in docs/agent/specs/;
   - the first three `"passes": false` items of docs/plans/feature_list.json;
   - Hours this month: the sum of this month's rows in worklog/worklog.csv.
-On startup it also names the session after the repo (sessionTitle).
+On startup it also names the session after the repo (sessionTitle). Once the brief is out it
+sweeps the backups older than 14 days (harness_lib.backups.sweep) for the session's repository,
+in one 2 s budget, silently; it adds nothing to the brief.
 
 When the project's .claude/settings.json declares its own SessionStart hook, it prints
 no brief, so a project with a bespoke brief is not briefed twice; only when harness_lib
@@ -127,6 +129,10 @@ STATUS_TIMEOUT = 8
 EXTRA_GIT_TIMEOUT = 2
 GH_TIMEOUT = 3
 EXTRAS_DEADLINE = 14
+# The backup sweep, once the brief is out: one budget for all of it, and over by SWEEP_BY seconds
+# from the start whatever the brief took, so the hook always ends inside its 20 s.
+SWEEP_BUDGET = 2
+SWEEP_BY = 18
 
 TICKET_BRANCH = re.compile(r"^t/(\d+)-")
 DOD_LINES = 6
@@ -683,6 +689,23 @@ def export_session_project() -> None:
         pass
 
 
+def sweep_backups(git_root: Path | None, started: float) -> None:
+    """Remove the backups older than 14 days (harness_lib.backups.sweep): the global store's, and
+    the session repository's in-project store and refs, within SWEEP_BUDGET seconds and before
+    SWEEP_BY from the start. Silent: an error or overrun just ends it. Without the lib, none."""
+    if LIB_PROBLEM:
+        return
+    deadline = min(time.monotonic() + SWEEP_BUDGET, started + SWEEP_BY)
+    if deadline <= time.monotonic():
+        return
+    try:
+        from harness_lib import backups  # here, so a broken backups.py costs the brief nothing
+
+        backups.sweep(str(git_root) if git_root else None, deadline=deadline)
+    except Exception:
+        pass
+
+
 def main() -> int:
     started = time.monotonic()
     export_session_project()
@@ -715,6 +738,7 @@ def main() -> int:
     if data.get("source") == "startup":
         out["sessionTitle"] = name
     emit({"hookSpecificOutput": out})
+    sweep_backups(git_root, started)
     return 0
 
 
