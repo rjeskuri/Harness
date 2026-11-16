@@ -17,6 +17,29 @@ NO_KIND = (
     "The red record for t/12 does not say how the tests failed; run harness-red check "
     "again, or harness-red reprove once the branch has source changes."
 )
+# #348: files below a tests/ directory under the top (support modules, fakes, helpers, fixtures), Harness's own
+# layout first. Under the default patterns each is a test.
+NESTED_TESTS = (
+    "plugins/harness/tests/pr_support.py",
+    "plugins/harness/tests/guards_support.py",
+    "plugins/harness/tests/fakegh.py",
+    "pkg/tests/x_support.py",
+    "pkg/tests/fakegh.py",
+    "svc/api/tests/helpers/builders.py",
+    "svc/api/tests/fixtures/rows.json",
+)
+# Source outside every tests/ directory, whatever the name says: a _support.py or a fakegh.py elsewhere included.
+NOT_UNDER_TESTS = (
+    "plugins/harness/lib/x.py",
+    "plugins/harness/lib/harness_lib/x_support.py",
+    "plugins/harness/fakegh.py",
+    "pkg/testsuite/x_support.py",
+    "pkg/tests_helper.py",
+    "src/compat_support.py",
+)
+# This checkout: its tracked settings and its own support modules and fake, by their real names.
+CHECKOUT = HOOKS.parent.parent.parent
+CHECKOUT_TESTS = HOOKS.parent / "tests"
 
 
 # ---------------------------------------------------------------- tests_first.py
@@ -987,6 +1010,78 @@ class TestsFirstTests(GuardTestCase):
         }
         self.write(state / "red/t-12-solo.json", json.dumps(record))
         self.assertIsNone(self.edit("src/app.py", root=repo))
+
+    # ---- test files under a nested tests/ directory (#348)
+
+    def test_files_under_nested_tests_directories_are_tests_for_every_role(self):
+        self.cache()
+        self.red()  # a current red run: only the role rules can refuse
+        for rel in NESTED_TESTS:
+            with self.subTest(rel=rel, agent="harness:test-author"):
+                self.assertIsNone(self.change("Edit", rel, "harness:test-author"))
+            with self.subTest(rel=rel, agent="harness:coder"):
+                for tool in ("Edit", "Write"):
+                    self.assertEqual(self.change(tool, rel, "harness:coder"), CODER_ON_TEST)
+            with self.subTest(rel=rel, agent="harness:test-breaker"):
+                self.assertEqual(self.change("Edit", rel, "harness:test-breaker"), BREAKER_ON_TEST)
+            command = f"echo x > {rel}"
+            with self.subTest(rel=rel, tool="Bash"):
+                self.assertEqual(self.bash(command, "harness:coder"), refusal(command, CODER_ON_TEST))
+
+    def test_nested_test_files_need_no_red_run_and_source_elsewhere_still_does(self):
+        self.cache()
+        for rel in NESTED_TESTS:  # before any red run: a test edit passes
+            with self.subTest(rel=rel):
+                self.assertIsNone(self.edit(rel))
+        for rel in NOT_UNDER_TESTS:  # source: the red run first, and never the test-author's
+            with self.subTest(rel=rel, red=False):
+                self.assertEqual(self.edit(rel), NO_RED)
+                self.assertEqual(self.edit(rel, "harness:test-author"), AUTHOR_ON_SOURCE)
+        self.red()
+        for rel in NOT_UNDER_TESTS:  # after it, the coder's
+            with self.subTest(rel=rel, red=True):
+                self.assertIsNone(self.edit(rel, "harness:coder"))
+
+    def test_bulk_forms_reach_test_files_under_nested_tests_directories(self):
+        # no test_*.py and no root tests/: the only tests are a support module and a fake below tests/ directories
+        files = {
+            "README.md": "hi\n",
+            "plugins/harness/bin/tool": "echo tool\n",
+            "plugins/harness/tests/fakegh.py": "ANSWERS = []\n",
+            "pkg/tests/x_support.py": "WIDTH = 3\n",
+        }
+        wt = self.other_ticket_worktree("nested", files)  # a no-tests chore: only the role rules refuse
+        for command in ("git stash", "git reset --hard", "git checkout -- .", "git restore .", "git clean -fd"):
+            with self.subTest(command=command, agent="harness:coder"):
+                self.assertRefusedAs(self.bash(command, "harness:coder", cwd=wt), command, CODER_ON_TEST)
+            with self.subTest(command=command, agent="harness:test-breaker"):
+                self.assertRefusedAs(
+                    self.bash(command, "harness:test-breaker", cwd=wt), command, BREAKER_ON_TEST
+                )
+            with self.subTest(command=command, agent="harness:test-author"):
+                self.assertIsNone(self.bash(command, "harness:test-author", cwd=wt))
+
+    def test_this_checkouts_settings_make_its_support_modules_tests(self):
+        support = sorted(p.name for p in CHECKOUT_TESTS.glob("*_support.py")) + ["fakegh.py"]
+        self.assertIn("pr_support.py", support)  # the layout #348 is about
+        self.assertGreaterEqual(len(support), 4)
+        tests = {f"plugins/harness/tests/{name}": "X = 1\n" for name in support}
+        sources = {
+            "plugins/harness/lib/harness_lib/settings.py": "X = 1\n",
+            "plugins/harness/hooks/tests_first.py": "X = 1\n",
+            "plugins/harness/bin/harness-red": "X = 1\n",
+        }
+        settings = (CHECKOUT / ".claude/settings.json").read_text(encoding="utf-8")
+        files = dict(tests, **sources, **{".claude/settings.json": settings, "README.md": "hi\n"})
+        wt = self.other_ticket_worktree("harness", files)  # a no-tests chore: only the role rules refuse
+        for rel in tests:
+            with self.subTest(rel=rel):
+                self.assertIsNone(self.change("Edit", rel, "harness:test-author", root=wt))
+                self.assertEqual(self.change("Edit", rel, "harness:coder", root=wt), CODER_ON_TEST)
+        for rel in sources:
+            with self.subTest(rel=rel):
+                self.assertEqual(self.change("Edit", rel, "harness:test-author", root=wt), AUTHOR_ON_SOURCE)
+                self.assertIsNone(self.change("Edit", rel, "harness:coder", root=wt))
 
     def test_bad_input_fails_open(self):
         for stdin in (

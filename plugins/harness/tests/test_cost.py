@@ -939,7 +939,7 @@ DEFAULT_KINDS = [
     ("tests/fixtures/f{i}.json", "test"),                   # tests/** before the exempt **/*.json
     ("src/m{i}.py", "source"),
     ("plugins/harness/bin/tool{i}", "source"),
-    ("plugins/harness/tests/helper{i}.py", "source"),       # tests/ not at the root, not test_*.py
+    ("plugins/harness/tests/helper{i}.py", "test"),         # below a tests/ directory at any depth (#348)
     ("web/app{i}.ts", "source"),
     ("assets/logo{i}.svg", "source"),
     ("docs/img{i}.png", "other"),
@@ -1082,13 +1082,14 @@ class CostExtras(CostBase):
         files = default_kind_files()
         self.assertEqual([len(p) for p in file_pages(files)], [100, 23], "fixture: two pages")
         self.assertNotEqual(lines_of(files), lines_of(files[:100]), "fixture: the second page counts")
-        small = [("README.md", 5, 1, "other"), ("plugins/harness/tests/fakegh.py", 7, 2, "source"),
+        small = [("README.md", 5, 1, "other"), ("plugins/harness/lib/gh.py", 7, 2, "source"),
+                 ("plugins/harness/tests/fakegh.py", 4, 3, "test"),         # below a tests/ directory (#348)
                  ("tests/fixtures/data.json", 9, 0, "test")]
         self.ticket(91, branch="t/91-lines")
         self.ticket(92, branch="t/92-lines")
         self.scenario(gh_pr_view(pr_json(157, "2026-10-20T09:00:00Z", None, "t/91-lines")), gh_files(157, files),
                       gh_pr_view(pr_json(158, "2026-10-20T09:00:00Z", None, "t/92-lines")), gh_files(158, small))
-        self.assertEqual(lines_of(small), {"test": {"added": 9, "removed": 0}, "source": {"added": 7, "removed": 2},
+        self.assertEqual(lines_of(small), {"test": {"added": 13, "removed": 3}, "source": {"added": 7, "removed": 2},
                                            "other": {"added": 5, "removed": 1}})
         for n, pr, fixture in ((91, 157, files), (92, 158, small)):
             with self.subTest(ticket=n):
@@ -1101,7 +1102,7 @@ class CostExtras(CostBase):
                 self.assertEqual([x for x in extra_lines(out) if x.startswith("Lines:")], [lines_line(want)])
                 self.assertExtras(self.cost(n, "--pr", pr, "--markdown"), [lines_line(want)])
                 self.assertEqual(json.loads(self.cost(n, "--pr", pr, "--json"))["lines"], want)
-        self.assertIn("Lines: tests +9 -0, source +7 -2, other +5 -1", self.cost(92, "--pr", 158).splitlines())
+        self.assertIn("Lines: tests +13 -3, source +7 -2, other +5 -1", self.cost(92, "--pr", 158).splitlines())
 
     def test_patterns_come_from_the_main_checkouts_settings(self):
         # (path, additions, deletions); the kinds per settings are written out by hand below

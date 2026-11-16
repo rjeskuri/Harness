@@ -750,6 +750,66 @@ class GlobMatchTests(unittest.TestCase):
                 self.assertEqual(got, want)
 
 
+# ================================================================ nested tests/ directories (#348)
+
+
+class DefaultTestPatternsReachNestedTestsTests(unittest.TestCase):
+    """#348: under the lib's default patterns (a project that sets no HARNESS_TEST_PATTERNS) every file below a
+    tests/ directory, at any depth and whatever its name, is a test: a support module or fake beside the test modules
+    (Harness's plugins/harness/tests/*_support.py and fakegh.py) as much as a test_*.py. A file outside every tests/
+    directory is not, whatever its name says. Classified as tests_first and harness-red do: the test patterns first,
+    then the exempt ones, else source."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.lib = load_settings()
+
+    def kind(self, rel: str) -> str:
+        lib = self.lib
+        if any(lib.glob_match(p, rel) for p in lib.patterns(lib.DEFAULT_TEST_PATTERNS)):
+            return "test"
+        if any(lib.glob_match(p, rel) for p in lib.patterns(lib.DEFAULT_SOURCE_EXEMPT)):
+            return "exempt"
+        return "source"
+
+    def test_a_file_is_a_test_by_its_tests_directory_not_by_its_name(self):
+        # this checkout's own support modules and fake, by their real names
+        real = sorted(p.name for p in TESTS.glob("*_support.py")) + ["fakegh.py"]
+        self.assertIn("pr_support.py", real)  # the fixture is the layout #348 is about
+        self.assertGreaterEqual(len(real), 4)
+        cases = [f"plugins/harness/tests/{name}" for name in real] + [
+            "pkg/tests/x_support.py",
+            "pkg/tests/fakegh.py",
+            "svc/api/tests/helpers/builders.py",
+            "web/tests/setup.mjs",
+            "a/b/c/tests/d/e/deep_support.py",
+            "svc/api/tests/fixtures/rows.json",  # a test before the exempt **/*.json
+            "svc/api/tests/README.md",  # and before **/*.md
+        ]
+        for rel in cases:
+            with self.subTest(rel=rel):
+                self.assertEqual(self.kind(rel), "test")
+        # outside every tests/ directory a file keeps its kind: the name alone (a _support.py, a fakegh.py, "tests"
+        # in a file or directory name) makes no test
+        for rel, want in [
+            ("plugins/harness/lib/x.py", "source"),
+            ("plugins/harness/lib/harness_lib/settings.py", "source"),
+            ("plugins/harness/lib/harness_lib/x_support.py", "source"),
+            ("plugins/harness/hooks/tests_first.py", "source"),
+            ("plugins/harness/bin/harness-red", "source"),
+            ("plugins/harness/fakegh.py", "source"),
+            ("src/compat_support.py", "source"),
+            ("pkg/testsuite/x_support.py", "source"),
+            ("pkg/mytests/fakegh.py", "source"),
+            ("pkg/tests_helper.py", "source"),
+            ("pkg/tests.py", "source"),
+            ("pkg/testsuite/notes.md", "exempt"),
+            ("plugins/harness/templates/settings.json", "exempt"),
+        ]:
+            with self.subTest(rel=rel):
+                self.assertEqual(self.kind(rel), want)
+
+
 # ================================================================ one copy
 
 

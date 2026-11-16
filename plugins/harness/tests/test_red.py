@@ -871,6 +871,71 @@ exit 254
         self.assertLess(time.monotonic() - started, 20)
         self.assertOneLineError(p, "timed out after 1s", "no red run recorded")
 
+    # ------------------------------------------------------------ files under a nested tests/ directory (#348)
+    # Under the default patterns (the fixture's main settings set none) every file below a tests/ directory, at any
+    # depth, is a test file of the proof: the support modules, fakes and helpers beside a test module are hashed with
+    # it, never count as source, and an edit of any of them after the red run leaves the record not current.
+    NESTED_RED = "F\nAssertionError: the widget is not built\nFAILED (failures=1)\n"
+
+    def assert_test_files_of_the_proof(self, files, run_files):
+        """Put `files` (path -> text) and run check with a runner that fails as an assertion: every one of them is a
+        test file of the record and `run_files` alone are run; then each other file, edited, makes the record not
+        current, and put back, current again."""
+        for rel, text in files.items():
+            self.put(rel, text)
+        p = self.red("check", **self.fake_runner(self.NESTED_RED, 1))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout.splitlines()[0], f"red (assertion): {len(files)} test files, exit 1")
+        rec = self.record()
+        self.assertEqual(rec["test_files"], sorted(files))
+        self.assertEqual(rec["run_files"], run_files)
+        self.assertEqual(rec["test_hash"], expected_hash(self.wt, files))
+        self.assertEqual(self.current(), "current: yes")
+        for rel, text in sorted(files.items()):
+            if rel in run_files:
+                continue
+            with self.subTest(edited=rel):
+                self.put(rel, text + "# edited after the red run\n")
+                self.assertEqual(self.current(), "current: no")
+                self.put(rel, text)
+                self.assertEqual(self.current(), "current: yes")
+
+    def test_support_modules_under_nested_tests_directories_are_test_files(self):
+        self.assert_test_files_of_the_proof({
+            "plugins/harness/tests/test_widget.py": TEST_ADD,
+            "plugins/harness/tests/widget_support.py": "WIDTH = 3\n",
+            "plugins/harness/tests/fakegh.py": "ANSWERS = []\n",
+            "svc/api/tests/x_support.py": "ROWS = 2\n",
+            "svc/api/tests/helpers/builders.py": "def build():\n    return 1\n",
+            "svc/api/tests/fixtures/rows.json": "[1, 2]\n",
+        }, ["plugins/harness/tests/test_widget.py"])
+
+    def test_source_outside_tests_directories_is_still_refused_before_the_red_run(self):
+        for rel, text in (("pkg/tests/test_widget.py", TEST_ADD), ("pkg/tests/widget_support.py", "WIDTH = 3\n"),
+                          ("pkg/tests/fakegh.py", "ANSWERS = []\n")):
+            self.put(rel, text)
+        # the name alone (a _support.py, a fakegh.py, "tests" in a file or directory name) is no test
+        sources = ["pkg/fakegh.py", "pkg/testsuite/x_support.py", "pkg/tests_helper.py",
+                   "plugins/harness/lib/harness_lib/x_support.py", "src/compat_support.py"]
+        for rel in sources:
+            self.put(rel, "X = 1\n")
+        p = self.red("check", **self.fake_runner(self.NESTED_RED, 1))
+        self.assertEqual(self.refused_sources(p), sorted(sources))
+        self.assertFalse(os.path.exists(self.record_path))
+
+    def test_this_checkouts_settings_make_its_support_modules_test_files(self):
+        plugin = os.path.dirname(BIN)
+        support = sorted(n for n in os.listdir(os.path.join(plugin, "tests")) if n.endswith("_support.py"))
+        support.append("fakegh.py")
+        self.assertIn("pr_support.py", support)              # the layout #348 is about
+        self.assertGreaterEqual(len(support), 4)
+        checkout = os.path.dirname(os.path.dirname(plugin))
+        write(os.path.join(self.repo, ".claude", "settings.json"),       # what classifies is the main checkout's
+              read(os.path.join(checkout, ".claude", "settings.json")))
+        files = {"plugins/harness/tests/test_widget.py": TEST_ADD}
+        files.update({f"plugins/harness/tests/{name}": f"NAME = {name!r}\n" for name in support})
+        self.assert_test_files_of_the_proof(files, ["plugins/harness/tests/test_widget.py"])
+
     # ------------------------------------------------------------ status
     def test_status_current(self):
         self.assertOneLineError(self.red("status"), f"No red run recorded for {BRANCH}")

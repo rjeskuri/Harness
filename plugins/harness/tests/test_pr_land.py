@@ -1888,5 +1888,35 @@ class OpenNotes(WorktreeTest):
         self.assertNotIn("Notes", found[0][2])
 
 
+# ------------------------------------------------------------------ the shared fixtures stay shared (#348)
+class FixturesLiveInPrSupport(unittest.TestCase):
+    """pr_support.py is a test file to the tests-first rules (#348), so the land modules take its fixtures as they are
+    and bind none of its names themselves: a redefinition after `from pr_support import *` shadows the shared fixture
+    in that one module, and the next change to pr_support misses it."""
+
+    def test_the_land_modules_redefine_none_of_pr_supports_names(self):
+        import ast
+
+        def bound(name):
+            """The names the top level of tests/`name` binds itself: assignments, functions, classes; not imports."""
+            with open(os.path.join(HERE, name), encoding="utf-8") as fh:
+                tree = ast.parse(fh.read(), name)
+            names = set()
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names.add(node.name)
+                elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    names |= {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+            return {n for n in names if not n.startswith("__")}
+
+        shared = bound("pr_support.py")
+        for name in ("LAND_FIELDS", "land_view", "gate_calls", "PrTest"):  # the parser sees pr_support's fixtures
+            self.assertIn(name, shared)
+        for module in ("test_pr_land.py", "test_pr_ultra.py"):
+            with self.subTest(module=module):
+                self.assertEqual(sorted(bound(module) & shared), [])
+
+
 if __name__ == "__main__":
     unittest.main()
