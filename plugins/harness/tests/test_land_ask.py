@@ -15,11 +15,13 @@ The contract these tests read from the ticket:
     stdout, no stderr, exit 0) when every ticket is risk:low;
   - ask, each with its own reason, for a ticket without a risk label, a PR with no ticket (it closes nothing and
     its head is not t/<N>-), a failing gh, a gh slower than 3 s and gh calls past 8 s in all (inside the 10 s
-    hook timeout); the ticket comes from a t/<N>- head only when the PR closes nothing;
+    hook timeout); the 8 s are one deadline for the whole command, however many lands it holds; the ticket
+    comes from a t/<N>- head only when the PR closes nothing;
   - ask, naming the flag, with no gh call, for --accept-findings or --discard;
   - every `harness-pr land P` in a command is judged, each in the main checkout of its own directory (a cd
-    carries over to the parts after it, as in the shell): one land that asks makes the command ask, in any
-    position, and an override flag in any part asks with no gh call;
+    carries over to the parts after it, as in the shell, and a cd inside a ( ... ) subshell ends with it): one
+    land that asks makes the command ask, in any position, and an override flag in any part asks with no gh
+    call; harness-pr by its path ($CLAUDE_PLUGIN_ROOT/bin/harness-pr, an absolute path) is the same command;
   - `cd <dir> && harness-pr land P` is judged in the main checkout of <dir>; `harness-pr ready P`,
     `harness-pr land --help`, `harness-pr land` without a number and commands without harness-pr print nothing
     and call no gh;
@@ -474,6 +476,21 @@ class LandAskTests(unittest.TestCase):
         self.assertEqual(sorted(reasons), ["gh failing", "gh slow", "no risk label", "no ticket"])
         self.assertEqual(len(set(reasons.values())), 4, f"the causes share a reason: {reasons}")
 
+    def test_gh_deadline_is_shared_across_lands(self):
+        # Two lands in one command, each closing three risk:low tickets, gh at 1.5 s a call: eight calls, 12 s or
+        # more. The 8 s are one deadline for the whole command: the hook asks, naming gh, inside the 10 s Claude
+        # Code gives it. A hook that gives each land its own 8 s finishes both (6 s each) near 12 s: Claude Code
+        # has killed it by then, and both lands run unasked. Here that hook is silent (every ticket is risk:low)
+        # and over ALL_CALLS_LIMIT.
+        self.scenario(pr_call(12, [21, 22, 23]), pr_call(7, [31, 32, 33]),
+                      *(issue_call(n, "risk:low") for n in (21, 22, 23, 31, 32, 33)),
+                      pace={"pr": CALL_DELAY, "issue": CALL_DELAY})
+        command = "harness-pr land 12 && harness-pr land 7"
+        code, out, err, seconds = self.run_hook(command)
+        reason = self.ask_reason(command, code, out, err)
+        self.assertLess(seconds, ALL_CALLS_LIMIT, f"gh took {seconds:.1f} s to answer across two lands")
+        self.assertRegex(reason, r"\bgh\b", "the reason does not say gh ran out of time")
+
     def test_ticket_from_the_head_branch_when_nothing_closes(self):
         cases = [
             # (PR, head, ticket labels on gh, expected: the ticket the ask names, or None for silence)
@@ -550,6 +567,14 @@ class LandAskTests(unittest.TestCase):
             (other, f"cd {shlex.quote(str(worktree))} && harness-pr land 12", True),
             (self.repo, "git fetch -q && harness-pr land 12 2>&1 | tail -5", True),
             (self.repo, "harness-pr ready 12 && harness-pr land 12", True),
+            # harness-pr by its path: the plugin's bin by variable or absolute path, as a session off PATH runs
+            # it (the allow rule names the bare word only, but auto mode can let a path through)
+            (self.repo, '"$CLAUDE_PLUGIN_ROOT/bin/harness-pr" land 12', True),
+            (self.repo, f"{shlex.quote(str(PLUGIN / 'bin' / 'harness-pr'))} land 12", True),
+            (self.repo, f"cd {there} && {shlex.quote(str(PLUGIN / 'bin' / 'harness-pr'))} land 12", False),
+            # in a subshell
+            (self.repo, "(harness-pr land 12)", True),
+            (self.repo, f"(cd {there} && harness-pr land 12)", False),
         ]
         for cwd, command, asks in judged:
             with self.subTest(cwd=cwd.name, command=command):
@@ -589,6 +614,17 @@ class LandAskTests(unittest.TestCase):
             (self.repo, f"harness-pr land 7 && cd {there} && harness-pr land 12", None, {(7, home), (12, away)}),
             (self.tmp, "cd proj && harness-pr land 9; cd ../other && harness-pr land 12", None,
              {(9, home), (12, away)}),
+            # a cd inside ( ... ) ends with the subshell: the land after the ) runs where the command started (or
+            # where the last cd outside the parentheses left it), so it is judged there, risk:high in this repo.
+            # A hook that carries the cd past the ) judges both lands in the other repo and stays silent on the
+            # first two; one that goes back to the session's directory at the ) misses the cd before the ( on
+            # the third.
+            (self.repo, f"(cd {there} && harness-pr land 12) && harness-pr land 12", 40, {(12, away), (12, home)}),
+            (self.tmp, "(cd other && harness-pr land 12); cd proj && harness-pr land 12", 40,
+             {(12, away), (12, home)}),
+            (self.tmp, "cd proj && (cd ../other && harness-pr land 12) && harness-pr land 12", 40,
+             {(12, away), (12, home)}),
+            (other, f"(cd {repo} && harness-pr land 7); harness-pr land 12", None, {(7, home), (12, away)}),
         ]
         for cwd, command, high, views in chains:
             with self.subTest(cwd=cwd.name, command=command):
