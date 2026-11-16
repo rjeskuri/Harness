@@ -137,18 +137,23 @@ ticket. A failed launch, or one without a session id, ends the record in error w
 wording there marks the cloud budget exhausted for 24 h.
 
 backup list: this repository's snapshots (harness_lib/backups.py: its project store, <git common dir>/harness-backups/,
-and its own in ~/.claude/harness/backups/), newest first, as ID, AGE, ITEMS, SIZE and COMMAND; --all adds every
+and its own in ~/.claude/harness/backups/), newest first, as ID, AGE, ITEMS (paths and git refs), SIZE and COMMAND; --all adds every
 snapshot in ~/.claude/harness/backups/, and outside a repository list acts as --all; --json prints the manifests;
 none is `No backups.`. backup restore ID: every item back at its path (`restored <path>` each), or with --path only
 those at or under P, or with --to under DIR at its path relative to the snapshot's repository (else to its own
 working tree, else its basename). Every target is checked first: an unknown id, or a target that exists, is one line,
 exit 1 and nothing written; --force first snapshots the existing targets (into the snapshot's project store when it
-sat in one, else where its repository's snapshots go now) and prints that snapshot's id. --path and --to are taken from the cwd. --json prints {id, restored, replaced, saved} at the end.
+sat in one, else where its repository's snapshots go now) and prints that snapshot's id. --path and --to are taken from the cwd.
+Its git refs (not with --path) never touch a working tree: a branch comes back at its sha, HEAD as the branch
+harness-restore/<ID>, changes and stash entries into the stash list (`git stash store`, the line naming the
+`git stash apply` to run); a branch that exists refuses the restore, --force or not. --json prints {id, restored,
+replaced, saved, refs} at the end.
 
 A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through to stderr, in order,
 except a routing problem dispatch already printed (those children load the same settings; REPORTED); its other
 stderr stays hidden. Siblings (harness-board) are found on PATH, else next to this script. gh is HARNESS_GH when set, else `gh`;
-claude is HARNESS_CLAUDE when set, else `claude`.
+claude is HARNESS_CLAUDE when set, else `claude`. Now is HARNESS_NOW (`%Y-%m-%dT%H:%M:%SZ`, UTC) when set and not
+empty, else the real clock; an unreadable value is one line, exit 1, before any subcommand runs.
 """
 from __future__ import annotations
 
@@ -269,7 +274,15 @@ def warn(text):
 
 
 def now():
-    return dt.datetime.now(dt.timezone.utc)
+    """The tool's clock: HARNESS_NOW (a UTC stamp `%Y-%m-%dT%H:%M:%SZ`) when set and not empty, else the real clock
+    (#356). An unreadable HARNESS_NOW is Problem; main checks it before any command runs."""
+    pinned = os.environ.get("HARNESS_NOW", "")
+    if not pinned:
+        return dt.datetime.now(dt.timezone.utc)
+    try:
+        return dt.datetime.strptime(pinned, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        raise Problem(f"HARNESS_NOW must be a UTC stamp YYYY-MM-DDTHH:MM:SSZ, not {pinned!r}") from None
 
 
 def iso(when):
@@ -2184,8 +2197,9 @@ def cmd_backup_list(main, args):
     for manifest in found:
         then = parse_iso_seconds(manifest.get("at"))
         items = [i for i in manifest["items"] if isinstance(i, dict)]
+        refs = [r for r in manifest.get("refs") or [] if isinstance(r, dict)]
         size = sum(i["bytes"] for i in items if isinstance(i.get("bytes"), int) and not isinstance(i["bytes"], bool))
-        rows.append((manifest["id"], ago_text(then, current) if then is not None else "?", str(len(items)),
+        rows.append((manifest["id"], ago_text(then, current) if then is not None else "?", str(len(items) + len(refs)),
                      size_text(size), one_line(manifest.get("command") or "")))
     print(table(rows))
 
@@ -2198,6 +2212,8 @@ def cmd_backup_restore(main, args):
             count = len(value["items"])
             print(f"backup {value['id']} holds the {count} path{'' if count == 1 else 's'} this restore replaces",
                   flush=True)
+        elif kind == "ref":
+            print(value, flush=True)
         else:
             print(f"restored {value}", flush=True)
 
@@ -2390,6 +2406,7 @@ def main():
             ap.error("dispatch: --api is --venue headless and cannot go with --venue bg")
         args.venue = "headless"
     try:
+        now()  # an unreadable HARNESS_NOW stops here, before any command has written anything
         if args.cmd == "runs":
             cmd_runs(args)
         elif args.cmd == "budget":

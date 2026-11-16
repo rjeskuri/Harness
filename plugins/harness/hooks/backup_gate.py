@@ -1,10 +1,29 @@
 #!/usr/bin/env python3
-"""PreToolUse hook (matcher: Bash): back up, then allow, rm in the project.
+"""PreToolUse hook (matcher: Bash): back up, then allow, rm and git's destructive forms in the project.
 
 A command whose parts run rm, unlink or rmdir (branch_guard.py's walker: each part in the
 directory it runs in) gets what they remove snapshotted with harness_lib/backups.py's create,
 then allow, so a removal that can be undone runs without a prompt. What cannot be backed up
 gets ask (over the size cap) or no decision at all, which leaves it to Claude Code's own rules.
+
+Git (#328), in the repository git runs in (branch_guard's git_split after the walker's cd): reset
+--hard or --merge keeps HEAD as `head` and git stash create's commit (tracked and staged
+changes; none on a clean tree) as `changes`; checkout of paths, checkout -f, switch -f or
+--discard-changes, restore of the worktree and git rm (not --cached) keep `changes`; branch -D,
+-d or --delete keeps each branch's tip as `branch/<name>`; stash drop [stash@{n} | n] and stash
+clear keep each dropped entry as `stash/<n>` (its index before the command). Each is the ref
+refs/harness-backup/<id>/<what>[/<name>], in the same snapshot as the copies. clean (not -n, -i
+or -ff) copies what `git clean -n` lists with its options and pathspecs, a glob word read both
+as written and as expanded, through the file rules below. Nothing for the whole command: a
+repository other than the main checkout or its worktrees, a word with $, a backtick, a brace
+expansion or a leading ~, --git-dir, --work-tree, -c core.*, a GIT_ assignment, a branch main or
+master or one that is not a plain existing branch (@{-1}, a missing one), another stash spelling,
+a reset after a branch switch in the same worktree, a reset, forced switch or path form whose
+target (the commit or tree-ish named; HEAD for a reset or forced switch naming none) would
+overwrite an untracked or ignored path (at, under or over a path it tracks), a clean after a
+move to another tree or a form that rewrites a tracked .gitignore in the same worktree, or after
+an rm of a .gitignore, or a failed git call. status, log, diff, show, rev-parse, stash list and a
+branch listing are harmless.
 
 No decision and no snapshot: plan mode; HARNESS_BACKUP=off (the environment first, then `env`
 in the main checkout's .claude/settings.json and settings.local.json); a command branch_guard
@@ -40,13 +59,15 @@ dist, build, __pycache__, .pytest_cache, .mypy_cache, .ruff_cache or .tox is reb
 only the secret-shaped paths inside it copied; everything else is copied. Inside a copied
 folder each folder with such a name is judged on its own: holding a sensitive match, it is
 copied (its own named folders judged in turn); holding secret-shaped paths, only they are kept;
-otherwise it is left out of the copy and of the size.
+otherwise it is left out of the copy and of the size. A folder target (not itself secret-shaped
+or sensitive) holding only what is left out is build output itself: nothing to copy.
 
 The size (the regular files' st_size the copy keeps, links not followed) over
 HARNESS_BACKUP_CAP_MB (default 200, MB being 10^6 bytes; the environment, then the settings as
 for HARNESS_BACKUP) gets ask and no snapshot. Otherwise one snapshot of what is copied, then
 allow when every other part is harmless (cd, pushd, popd, pwd, true, :, ls, echo, printf, test,
-[ or a bare shell keyword, and no part redirects but to /dev/null or a descriptor), the reason
+[, the read-only git parts or a bare shell keyword, and no part redirects but to /dev/null or a
+descriptor; a push never is), the reason
 naming the snapshot id, also as additionalContext since an allow's reason never reaches the
 model; with any other part the snapshot stays and there is no decision. Nothing to copy
 (rebuildable or missing): allow on the same rule, no snapshot.
@@ -101,7 +122,14 @@ OPENERS = {"if", "while", "until", "for", "select", "case", "{"}
 CLOSERS = {"fi", "done", "esac", "}"}
 LOOPS = {"while", "until", "for", "select"}
 RESERVED = KEYWORDS | OPENERS | CLOSERS
-RM_WORD = re.compile(r"\b(?:rm|unlink|rmdir)\b")
+RM_WORD = re.compile(r"\b(?:rm|unlink|rmdir|git)\b")
+READERS = {"status", "log", "diff", "show", "rev-parse"}
+LISTING = re.compile(r"-[arvl]+\Z|--(?:all|remotes|verbose|list|show-current|ignore-case|no-color|no-column)\Z"
+                     r"|--(?:color|column|sort|format|abbrev)=")
+GIT_UNREAD = re.compile(r"[$`]|\{[^{}]*(?:,|\.\.)[^{}]*\}|\A~")
+GIT_ELSEWHERE = re.compile(r"(?:--git-dir|--work-tree|--namespace|--config-env|--bare)(?:=|\Z)")
+STASH_ENTRY = re.compile(r"stash@\{(\d+)\}\Z|(\d+)\Z")
+SWITCH_VALUE_OPTIONS = {"-c", "-C", "--create", "--force-create", "--orphan"}
 GLOB = re.compile(r"[*?[]")
 UNREAD = re.compile(r"[$`^#]|\*\*|\[\^|\[\[[:=.]|(?<=.)~(?=.)|\A=|\{[^{}]*(?:,|\.\.)[^{}]*\}")
 SUBSTITUTION = re.compile(r"\$\(|`|[<>]\(")
@@ -126,14 +154,17 @@ def branch_guard():
     return guard
 
 
-def git(cwd, *args):
-    """git's stripped stdout, or None when it fails or does not answer in time."""
+def git(cwd, *args, names=False):
+    """git's stripped stdout (with `names`, the NUL-separated names it lists), or None when it fails or does not
+    answer in time."""
     try:
         done = subprocess.run(["git", "-C", cwd, *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
                               encoding="utf-8", errors="surrogateescape", timeout=GIT_TIMEOUT)
     except (OSError, subprocess.SubprocessError):
         return None
-    return done.stdout.strip() if done.returncode == 0 else None
+    if done.returncode != 0:
+        return None
+    return [name for name in done.stdout.split("\0") if name] if names else done.stdout.strip()
 
 
 # ---------- the command ----------
@@ -142,8 +173,8 @@ def git(cwd, *args):
 def steps(guard, command, cwd, moves):
     """(part, name, args, its directory or None, run by xargs) for each simple command, in the walker's order. After
     a cd or pushd the walker's directory is kept only where `landing` gives it (each such folder goes into `moves`);
-    otherwise, and after popd, it is unknown until the subshell or child shell holding the cd ends. A removal inside
-    a loop is unknown too: a later pass may run it elsewhere."""
+    otherwise, and after popd, it is unknown until the subshell or child shell holding the cd ends. A removal or a git
+    part inside a loop is unknown too: a later pass may run it elsewhere."""
     state = {"cwd": cwd, "repos": {}}
     opened = []  # the compound commands open around this part
     for part, name, args in guard.walk(state, command):
@@ -152,7 +183,7 @@ def steps(guard, command, cwd, moves):
                 opened.append(word)
             elif word in CLOSERS and opened:
                 opened.pop()
-        here = None if name in REMOVERS and LOOPS.intersection(opened) else state["cwd"]
+        here = None if name in REMOVERS | {"git"} and LOOPS.intersection(opened) else state["cwd"]
         wrappers = part.words[: max(len(part.words) - len(args) - 1, 0)]
         yield part, name, args, here, any(os.path.basename(w) == "xargs" for w in wrappers)
         if name in ("cd", "pushd", "popd"):
@@ -276,14 +307,312 @@ def named_paths(word, here):
     return found or None
 
 
-def harmless(part, name):
-    """A part whose only effect is to move or to print: one of HARMLESS (or a removal, or a bare keyword such as fi)
-    redirecting to nothing but /dev/null or a descriptor."""
+def harmless(part, name, form):
+    """A part whose only effect is to move or to print: one of HARMLESS (or a removal, a git part with a form, or a
+    bare keyword such as fi) redirecting to nothing but /dev/null or a descriptor."""
     if not all(QUIET.match(target) for target in part.targets):
         return False
     if name:
-        return name in HARMLESS or name in REMOVERS
+        return name in HARMLESS or name in REMOVERS or form is not None
     return all(word in KEYWORDS for word in part.words)
+
+
+# ---------- git ----------
+
+
+def git_form(guard, args, here):
+    """(form, where, sub, rest) of a git part, as branch_guard's git_split reads it: form "read" for a read-only part
+    (status, log, diff, show, rev-parse, stash list, a branch listing; none writing --output), "reset", "paths",
+    "branch", "drop", "clear" or "clean" for one whose loss can be kept, None for any other."""
+    where, sub, rest = guard.git_split(args, here)
+    action = guard.stash_action(rest) if sub == "stash" else None
+    forced = "--force" in rest or guard.short_flag(rest, "f")
+    deletes = sub == "branch" and ("--delete" in rest or guard.short_flag(rest, "d") or guard.short_flag(rest, "D"))
+    listing = sub == "branch" and not deletes and all(LISTING.match(a) for a in rest if a.startswith("-")) and (
+        not guard.plain_args(rest) or "--list" in rest or guard.short_flag(rest, "l"))
+    form = None
+    if sub in READERS or action == "list" or listing:
+        form = None if any(a.startswith("--output") for a in rest) else "read"
+    elif sub == "reset" and ("--hard" in rest or "--merge" in rest):
+        form = "reset"
+    elif (sub in ("checkout", "restore", "rm") and guard.git_paths(sub, rest, where) or sub == "checkout" and forced
+          or sub == "switch" and (forced or "--discard-changes" in rest)):
+        form = "paths"
+    elif deletes and not ("--remotes" in rest or guard.short_flag(rest, "r")):
+        form = "branch"
+    elif action in ("drop", "clear"):
+        form = action
+    elif sub == "clean" and not guard.dry_run(rest) and "--interactive" not in rest and not guard.short_flag(rest, "i"):
+        form = "clean"
+    return form, where, sub, rest
+
+
+def clean_args(rest):
+    """git clean's options and pathspecs for its dry run: `rest` without -f, -i and -q (long forms too); None when -f
+    is given twice, which removes nested repositories as well."""
+    out, forces, k = [], 0, 0
+    while k < len(rest):
+        a, k = rest[k], k + 1
+        if a == "--":
+            out += rest[k - 1 :]
+            break
+        if a in ("--force", "--interactive", "--quiet"):
+            forces += a == "--force"
+        elif a in ("-e", "--exclude"):
+            out += rest[k - 1 : k + 1]
+            k += 1
+        elif a.startswith("-") and not a.startswith("--") and len(a) > 1:
+            letters, value = a[1:], ""
+            if "e" in letters:  # -e's value is the rest of the word, or the next word
+                letters, value = letters[: letters.index("e")], letters[letters.index("e") :]
+            forces += letters.count("f")
+            letters = "".join(c for c in letters if c not in "fiq")
+            if letters or value:
+                out.append("-" + letters + value)
+            if value == "e":
+                out += rest[k : k + 1]
+                k += 1
+        else:
+            out.append(a)
+    return None if forces > 1 else out
+
+
+def clean_listing(rest, where, here):
+    """The absolute paths `git clean <rest>` in `where` removes, as its dry run lists them with the same options and
+    pathspecs, a word with a glob character read both as written and as the shell expands it from `here`; None when
+    they cannot be known (a dry run that fails, a name git quotes)."""
+    words = clean_args(rest)
+    if words is None:
+        return None
+    expanded = []
+    for w in words:
+        found = expand(w, here) if GLOB.search(w) and not w.startswith("-") else []
+        expanded += [m if os.path.isabs(w) else os.path.relpath(m, here) for m in found] or [w]
+    listed = set()
+    for variant in [words] + ([expanded] if expanded != words else []):
+        try:
+            done = subprocess.run(["git", "-C", where, "-c", "core.quotePath=false", "clean", "-n", *variant],
+                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8",
+                                  errors="surrogateescape", timeout=GIT_TIMEOUT, env=dict(os.environ, LC_ALL="C"))
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if done.returncode != 0:
+            return None
+        for line in done.stdout.splitlines():
+            name = line[len("Would remove ") :] if line.startswith("Would remove ") else None
+            if name is not None and name.startswith('"'):
+                return None  # a name git quotes: not read back here
+            if name:
+                listed.add(os.path.normpath(os.path.join(where, name)))
+    return sorted(listed)
+
+
+def restore_source(rest):
+    """The tree-ish git restore takes the files from (-s, --source or a prefix of it down to --so, the last one
+    given); with none, HEAD when it restores the index too (-S, --staged or a prefix of it down to --st, unless a
+    later --no-staged), else None for the index."""
+    found, staged, k = None, False, 0
+    while k < len(rest) and rest[k] != "--":
+        a, k = rest[k], k + 1
+        option, eq, value = a.partition("=")
+        if len(option) >= 4 and "--source".startswith(option):
+            found = value if eq else rest[k] if k < len(rest) else None
+            k += 0 if eq else 1
+        elif len(a) >= 4 and "--staged".startswith(a) or len(a) >= 7 and "--no-staged".startswith(a):
+            staged = not a.startswith("--no")
+        elif a.startswith("-") and not a.startswith("--"):
+            letters, s, value = a[1:].partition("s")  # -s takes the rest of the word, or the next word
+            staged = staged or "S" in letters
+            if s:
+                found = value or (rest[k] if k < len(rest) else None)
+                k += 0 if value else 1
+    return found if found is not None or not staged else "HEAD"
+
+
+def git_target(guard, sub, rest, where):
+    """The commit or tree-ish a reset, a forced checkout or switch, or a checkout or restore of paths takes the
+    worktree's files from, as written: HEAD for a reset, checkout -f or switch naming none and for restore --staged
+    naming none; None for git rm and for the other path forms naming none, which take the index."""
+    if sub == "restore":
+        return restore_source(rest)
+    if sub == "checkout" and "--" in rest:
+        named = guard.plain_args(rest[: rest.index("--")], guard.CHECKOUT_VALUE_OPTIONS)
+        return named[0] if named else None
+    if sub == "checkout":
+        named = guard.plain_args(rest, guard.CHECKOUT_VALUE_OPTIONS)
+        if len(named) == 1 and guard.checkout_paths(rest, where):
+            return None  # a lone existing path, from the index
+        if len(named) > 1 and git(where, "rev-parse", "--verify", "-q", named[0] + "^{tree}") is None:
+            return None  # no tree-ish first: git reads every word as a path, from the index
+    elif sub in ("reset", "switch"):
+        named = guard.plain_args(rest, SWITCH_VALUE_OPTIONS if sub == "switch" else ())
+    else:
+        return None
+    return named[0] if named else "HEAD"
+
+
+def fold(name):
+    """`name` as a case-insensitive disk compares it (macOS's), Unicode form included: a name git lists in another
+    case or form is the same entry there."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def in_the_way(top, name):
+    """Whether something on disk stands where git writes the tracked path `name` of `top`: anything at `name`
+    itself, or a file or link where it needs a folder."""
+    path, bits = top, name.split("/")
+    for k, bit in enumerate(bits):
+        path = os.path.join(path, bit)
+        if not os.path.lexists(path):
+            return False
+        if k == len(bits) - 1 or os.path.islink(path) or not os.path.isdir(path):
+            return True
+    return False
+
+
+def overwrites(top, target):
+    """Whether taking `top`'s files from the tree-ish `target` overwrites an untracked or ignored path, which git
+    stash create never holds: one the target tracks, one under a path it tracks as a file (a folder's file where it
+    has a file), or a file or link where it tracks a folder (a wholly untracked folder only when a path it writes
+    there is already on disk). None when git cannot tell."""
+    names = git(top, "ls-tree", "-r", "-z", "--name-only", "--full-tree", target, names=True)
+    # without --exclude-standard, ignored paths count as others; a folder with nothing tracked comes as `dir/`
+    others = git(top, "ls-files", "-z", "--others", "--directory", "--no-empty-directory", names=True)
+    if names is None or others is None:
+        return None
+    folded = [(fold(name), name) for name in names]
+    tracked, folders = {f for f, _name in folded}, set()
+    for f in tracked:
+        while "/" in f:
+            f = f.rsplit("/", 1)[0]
+            if f in folders:
+                break
+            folders.add(f)
+    for other in others:
+        path = fold(other.rstrip("/"))
+        bits = path.split("/")
+        if any("/".join(bits[:k]) in tracked for k in range(1, len(bits) + 1)):
+            return True
+        if path in folders and (not other.endswith("/") or any(
+                in_the_way(top, name) for f, name in folded if f.startswith(path + "/"))):
+            return True
+    return False
+
+
+def rewrites_ignore(guard, sub, rest, where, target):
+    """Whether the reset or path form `sub rest`, run in `where`, writes or deletes a tracked .gitignore (root,
+    nested, deleted from disk or only staged) that differs on disk from what it writes there: `git diff` of its
+    source (`target`; None, the index) against the worktree, the whole tree for a reset or a branch switch, else
+    within its pathspec; for git rm, any tracked .gitignore within it. None when git cannot tell."""
+    if sub == "rm":
+        names = git(where, "ls-files", "-z", "--", *guard.git_paths(sub, rest, where), names=True)
+    else:
+        if sub in ("reset", "switch") or sub == "checkout" and not guard.checkout_paths(rest, where):
+            spec = []
+        elif sub == "checkout" and target is None and "--" not in rest:
+            spec = guard.plain_args(rest, guard.CHECKOUT_VALUE_OPTIONS)  # every word a path, as git_target reads it
+        else:
+            spec = guard.git_paths(sub, rest, where)  # a word too many (restore's -Ws X) only widens it
+        names = git(where, "diff", "--name-only", "-z", "--no-renames", "--no-relative", "--no-color",
+                    *([target] if target else []), "--", *spec, names=True)
+    if names is None:
+        return None
+    return any(name.rsplit("/", 1)[-1] == ".gitignore" for name in names)
+
+
+def git_keeps(guard, kept, forms, roots):
+    """({(what, name): {what, name, sha, worktree}} of the refs the destroying git parts `kept` need, [the paths their
+    git clean removes]); None when any of them cannot be kept: an unknown directory or word ($, a backtick, a brace
+    expansion, a leading ~), git pointed elsewhere (--git-dir, --work-tree, -c core.*, a GIT_ assignment), a repository
+    that is not the main checkout or one of its worktrees, main or master deleted, a branch name that is not a plain
+    existing branch (@{-1}, a missing one), a stash named otherwise than stash@{n} or n, a reset after a branch
+    switch in the same worktree, an untracked or ignored path the target of a reset, checkout or switch overwrites
+    (`overwrites`), a clean after files are taken from another tree, or after a part that puts back or takes away a
+    .gitignore (`rewrites_ignore`), in the same worktree (its dry run reads the ignore rules that replaces), two
+    different shas for one ref, or a git call that fails. Each is judged against
+    the state before the command: HEAD and git stash create once per working tree, the stash list once, each drop
+    taking its entry out of it."""
+    keeps, clean, stack, cache, switched, moved, hits = {}, [], None, {}, set(), set(), {}
+    cleaning = any(forms[id(step[0])][0] == "clean" for step in kept)
+
+    def once(top, *args):
+        if (top, args) not in cache:
+            cache[top, args] = git(top, *args)
+        return cache[top, args]
+
+    def keep(what, name, sha, top):
+        entry = {"what": what, "name": name, "sha": sha, "worktree": top}
+        return sha is None or keeps.setdefault((what, name), entry)["sha"] == sha
+
+    for part, _name, args, here, xargs in kept:
+        form, where, sub, rest = forms[id(part)]
+        wrappers = part.words[: max(len(part.words) - len(args) - 1, 0)]
+        if here is None or xargs or part.sep == "(" or where is None or not os.path.isdir(where):
+            return None
+        if any(GIT_UNREAD.search(a) or GIT_ELSEWHERE.match(a) for a in args) or any(
+                a == "-c" and args[k + 1 : k + 2] and args[k + 1].lower().startswith("core.") for k, a in enumerate(args)
+        ) or any(w.startswith("GIT_") and "=" in w for w in wrappers):
+            return None
+        top = git(where, "rev-parse", "--show-toplevel")
+        top = canonical_path(top) if top else None
+        if top not in roots:
+            return None
+        if form == "reset" and top in switched:
+            return None  # HEAD before the command is not the HEAD this reset moves
+        target = git_target(guard, sub, rest, where) if form in ("reset", "paths") else None
+        if target is not None:
+            if (top, target) not in hits:
+                hits[top, target] = overwrites(top, target)
+            if hits[top, target] is not False:
+                return None  # git stash create holds no untracked or ignored file
+            tree = once(top, "rev-parse", "--verify", "-q", target + "^{tree}")
+            if tree is None:
+                return None
+            if tree != once(top, "rev-parse", "--verify", "-q", "HEAD^{tree}"):
+                moved.add(top)
+        if form in ("reset", "paths") and cleaning and top not in moved and (
+                rewrites_ignore(guard, sub, rest, where, target) is not False):
+            moved.add(top)  # it puts back or takes away a .gitignore a later clean's dry run reads as it is now
+        if form == "reset" and not keep("head", None, once(top, "rev-parse", "--verify", "-q", "HEAD^{commit}"), top):
+            return None
+        if form in ("reset", "paths"):
+            changes = once(top, "stash", "create")  # writes no ref and changes nothing
+            if changes is None or not keep("changes", None, changes or None, top):
+                return None
+        if form == "paths" and sub in ("checkout", "switch") and not guard.checkout_paths(rest, where) and (
+                guard.plain_args(rest, guard.CHECKOUT_VALUE_OPTIONS)):
+            switched.add(top)
+        if form == "branch":
+            for name in guard.plain_args(rest):
+                if name in guard.PROTECTED or GLOB.search(name):
+                    return None
+                # git deletes the branch @{-1} names, which refs/heads/@{-1} is not: a plain existing branch only
+                tip = git(top, "show-ref", "--verify", "--hash", "refs/heads/" + name)
+                if tip is None or not keep("branch", name, tip, top):
+                    return None
+        if form in ("drop", "clear"):
+            if stack is None:
+                shas = git(top, "stash", "list", "--format=%H")
+                if shas is None:
+                    return None
+                stack = list(enumerate(shas.split()))
+            given = guard.plain_args(rest[1:])
+            entry = STASH_ENTRY.match(given[0]) if len(given) == 1 else None
+            if form == "drop" and (len(given) > 1 or given and entry is None):
+                return None
+            n = int(entry.group(1) or entry.group(2)) if entry else 0
+            dropped, stack = (stack, []) if form == "clear" else (stack[n : n + 1], stack[:n] + stack[n + 1 :])
+            for k, sha in dropped:
+                if not keep("stash", str(k), sha, top):
+                    return None
+        if form == "clean":
+            if top in moved:
+                return None  # its dry run reads the ignore rules before the move, not after it
+            listed = clean_listing(rest, where, here)
+            if listed is None:
+                return None
+            clean += listed
+    return keeps, clean
 
 
 # ---------- where a target is ----------
@@ -461,8 +790,14 @@ def judge(loc, rel, pats, items, leave):
         return st.st_size if stat.S_ISREG(st.st_mode) else 0
     node = scan(loc, rel, pats)
     if protected or node.sensitive or not rebuildable:
+        dropped = []
+        size = kept(node, dropped)
+        names = os.listdir(loc)
+        if not protected and names and set(dropped) >= {os.path.join(loc, n) for n in names}:
+            return 0  # it holds only what the copy leaves out: build output itself
         items.append(loc)
-        return kept(node, leave)
+        leave += dropped
+        return size
     return secrets(node, items, None) if node.secret else 0
 
 
@@ -511,28 +846,39 @@ def decide(data, command):
     guard = branch_guard()
     moves = []
     parts = list(steps(guard, command, cwd, moves))
+    forms = {id(step[0]): git_form(guard, step[2], step[3]) for step in parts if step[1] == "git"}
     paths, removals = [], [step for step in parts if step[1] in REMOVERS]
-    if not removals:
+    kept = [step for step in parts if forms.get(id(step[0]), (None,))[0] not in (None, "read")]
+    if not removals and not kept:
         return None
     if SUBSTITUTION.search(command) and any(step[1] in ("cd", "pushd", "popd") for step in parts):
         return None  # the walker runs what a substitution holds after the whole command, where its cds left it
+    cleans = [k for k, step in enumerate(parts) if forms.get(id(step[0]), (None,))[0] == "clean"]
     for part, name, args, here, xargs in removals:
         # ( after the words: a zsh glob qualifier or an extglob
         if here is None or not os.path.isdir(here) or xargs or part.sep == "(":
             return None
         words = operands(name, args)
+        at = next(k for k, step in enumerate(parts) if step[0] is part)
         for word in words:
             found = named_paths(word, here)
             if found is None:
                 return None
             paths += found
+            if any(k > at for k in cleans) and any(os.path.basename(p.rstrip("/")).lower() == ".gitignore"
+                                                   for p in found):
+                return None  # a later git clean's dry run reads the ignore rules this takes away
         # unlink and rmdir count as rm: where branch_guard refuses rm of the word, they get nothing either
         if name != "rm" and any(guard.bash_refusal("rm -- " + shlex.quote(w), here) for w in words if w):
             return None
     if guard.bash_refusal(command, cwd):
         return None
     roots, home, tops, places = project_roots(main), canonical_path(os.path.expanduser("~")), {}, {}
-    for path in paths:
+    found = git_keeps(guard, kept, forms, roots) if kept else ({}, [])
+    if found is None:
+        return None
+    keeps, cleaned = found
+    for path in paths + cleaned:  # what git clean removes is judged as a removal's targets are
         loc = locate(path)
         rel = place(loc, roots, home, tops) if loc is not None else None
         if rel is None:
@@ -552,7 +898,7 @@ def decide(data, command):
         if not any(loc.startswith(folder + os.sep) for folder in folders):  # else judged with its folder
             total += judge(loc, rel, pats, items, leave)
     sid = None
-    if items:
+    if items or keeps:
         cap = cap_mb(file_env)
         if total > cap * MB:
             return answer("ask", f"Not backed up: what this removes holds {size_text(total)} ({total:,} bytes) to "
@@ -560,14 +906,17 @@ def decide(data, command):
                                  "it need not be undone.")
         session = data.get("session_id")
         manifest = backups.create(items, main=main, cwd=cwd, command=command, leave_out=leave,
-                                  session=session if isinstance(session, str) else None)
-        sid, count = manifest["id"], len(manifest["items"])
-    if not all(harmless(part, name) for part, name, _args, _here, _xargs in parts):
+                                  session=session if isinstance(session, str) else None, refs=list(keeps.values()))
+        sid, count, refs = manifest["id"], len(manifest["items"]), len(manifest["refs"])
+    if not all(harmless(part, name, forms.get(id(part), (None,))[0]) for part, name, _a, _h, _x in parts):
         return None
     if sid is None:
-        return answer("allow", "Nothing to back up: what this removes is build output or not there.")
-    return answer("allow", f"Backed up {count} path{'' if count == 1 else 's'} as {sid}; "
-                           f"harness-work backup restore {sid} undoes it.")
+        return answer("allow", "Nothing to back up: what this destroys is build output, not there, or committed.")
+    held = [f"{count} path{'' if count == 1 else 's'}"] if count or not refs else []
+    held += [f"{refs} git ref{'' if refs == 1 else 's'}"] if refs else []
+    return answer("allow", f"Backed up {' and '.join(held)} as {sid}; harness-work backup restore {sid} undoes it"
+                           + (" (a ref comes back as a branch or a stash entry, never into a working tree)." if refs
+                              else "."))
 
 
 def main() -> int:

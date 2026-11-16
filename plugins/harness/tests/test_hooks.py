@@ -32,6 +32,8 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
+from gitrepo_support import copy_repo, make_template
+
 HOOKS = Path(__file__).resolve().parent.parent / "hooks"
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -138,22 +140,7 @@ def setUpModule() -> None:
     )
     no_common.chmod(0o755)
     template = base / "template"
-    template.mkdir()
-    env = dict(GIT_IDENTITY, HOME=str(base), PATH=SYSTEM_PATH)
-    for args in (
-        ("init", "-q"),
-        ("symbolic-ref", "HEAD", "refs/heads/main"),
-        ("add", "README.md"),
-        ("commit", "-q", "-m", "Initial commit"),
-    ):
-        if args[0] == "add":
-            (template / "README.md").write_text("hello\n")
-        subprocess.run(
-            ["git", "-C", str(template), *args],
-            check=True,
-            capture_output=True,
-            env=env,
-        )
+    make_template(template, dict(GIT_IDENTITY, HOME=str(base), PATH=SYSTEM_PATH))
     _SHARED["template"] = template
 
 
@@ -218,7 +205,7 @@ class HookTestCase(unittest.TestCase):
         """A git repo on branch main: README.md in one commit "Initial commit", or empty."""
         repo = self.tmp / name
         if commit:
-            shutil.copytree(_SHARED["template"], repo, symlinks=True)
+            copy_repo(_SHARED["template"], repo)
         else:
             repo.mkdir(parents=True)
             self.git(repo, "init", "-q")
