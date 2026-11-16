@@ -966,7 +966,9 @@ exit 254
 
     def test_this_checkouts_settings_make_its_support_modules_test_files(self):
         plugin = os.path.dirname(BIN)
-        support = sorted(n for n in os.listdir(os.path.join(plugin, "tests")) if n.endswith("_support.py"))
+        # a test_<x>_support.py is a runnable test module, not a fixture module, so it is not support
+        support = sorted(n for n in os.listdir(os.path.join(plugin, "tests"))
+                         if n.endswith("_support.py") and not n.startswith("test_"))
         support.append("fakegh.py")
         self.assertIn("pr_support.py", support)              # the layout #348 is about
         self.assertGreaterEqual(len(support), 4)
