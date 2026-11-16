@@ -45,7 +45,12 @@ class Part:
     """One simple command: its words without quotes, where its output goes, the bodies
     of its heredocs, its text as written and the operator after it (;, &&, ||, |, &, or
     "" at a newline or the end). A marker part, with no words, opens ("(") or closes
-    (")") a subshell."""
+    (")") a subshell. `lead` is the operators written between it and the last part
+    before it that holds anything, joined, a newline adding none: "" first in the
+    command or on a new line, "&&" after `true &&` and a newline, "(" first in a
+    subshell, ")&&" after a subshell and &&. A part split_command leaves out (an
+    arithmetic command, one that only redirects input) holds something; blanks, a
+    comment or a line continuation alone do not."""
 
     def __init__(self, marker: str = "") -> None:
         self.words: list[str] = []
@@ -53,6 +58,7 @@ class Part:
         self.heredocs: list[str] = []
         self.text = ""
         self.sep = ""
+        self.lead = ""
         self.marker = marker
 
 
@@ -104,6 +110,7 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
     part, start = Part(), 0
     word: str | None = None
     redirect = ""  # what the next word is: "out", "dup", "in", "heredoc" or "heredoc-"
+    lead = ""  # the operators since the last part that holds anything (Part.lead)
     i, n = 0, len(command)
 
     def end_word() -> None:
@@ -121,15 +128,18 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
         word, redirect = None, ""
 
     def end_part(end: int, op: str = "") -> None:
-        nonlocal part, start, redirect
+        nonlocal part, start, redirect, lead
         end_word()
         if redirect in ("out", "dup"):
             part.targets.append("")  # a redirection with no target
         redirect = ""
         part.text = command[start:end].strip()
         part.sep = op
+        part.lead = lead
         if part.words or part.targets:
             parts.append(part)
+        bare = part.text.replace("\\\n", "").strip()[:1] in ("", "#")  # blanks, a comment
+        lead = op if part.words or part.targets or not bare else lead + op
         part, start = Part(), end + max(len(op), 1)
 
     while i < n:
