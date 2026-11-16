@@ -5,14 +5,31 @@ python, node, deno, bun, ruby, perl, php, sh, bash or zsh on a program file that
 tracked at the worktree's HEAD (in /tmp, the scratchpad, ~, another repository, or new in
 the worktree): what it writes cannot be seen. Tracked means in HEAD's tree, not the
 index. A test runner given a program file outside the worktree is refused the same way.
-The program file is judged wherever it stands: behind an option whose value names a
-tracked path (ruby -I lib, perl -I lib, php -c dir, node -r file, deno --config file),
-as a preload run next to a tracked program (node -r, --require, --import, --loader;
-ruby -r; bun --preload, -r), or as a module python resolves from the part's directory or
-its PYTHONPATH. A load path or a runner's output path is not a program: ruby -I /tmp/gems
-on a tracked program, pytest --junitxml /tmp/r.xml, PYTHONPATH=x python3 -m pytest run.
-Tracked program files, the test runners on the worktree's files, npm and harness-red
-still run, and off a ticket branch nothing changes. The fixtures are in guards_support.py.
+The program file is judged wherever it stands and whatever option precedes it: behind an
+option whose value names a tracked path or directory (ruby -I lib, -C dir; perl -I lib;
+php -c dir, -d k=v; node -r file, --env-file; deno --config, -c, --import-map), as a
+preload run next to a tracked program or next to nothing (node -r, --require, --import,
+--loader; ruby -r; bun --preload, -r; php -d auto_prepend_file=), as a module python
+resolves from the part's directory or its PYTHONPATH (on the part or exported in an
+earlier part; separate or attached: -m w, -mw, -Imw), through a standard-library module
+that runs a file or a module (pdb, cProfile, profile, trace, doctest, runpy), behind a
+wrapper (uv run, poetry run, npx, bunx) or a bare runner (pytest, vitest), as a tracked
+directory whose entry file is untracked (tracked means a blob at HEAD, not a tree), and
+from any directory the part runs in (cd /tmp && python3 f). A PYTHONPATH entry the hook
+cannot expand ($PWD, $(pwd)) with a module that is not installed is not known, so it is
+refused like python3 $F. A test runner's test directory, working directory or config
+outside the worktree is refused; a load path or a runner's output path is not a program:
+ruby -I /tmp/gems on a tracked program, pytest --junitxml /tmp/r.xml, PYTHONPATH=x
+python3 -m pytest run. A runner on the worktree's own files, tracked or new, as a path or
+a dotted module (python3 -m unittest tests.test_new), still runs, as do tracked program
+files, npm and harness-red; off a ticket branch nothing changes.
+
+Left to follow-up tickets: a program on stdin or a pipe (python3 - < f, bash < f,
+cat f | python3, <<<), source f and . f, inline loaders (python3 -c 'import tools.gen',
+exec(open(..)), node -e 'import(..)', ruby -e 'require ..', php -r 'include ..'), and the
+admitted hole that an in-tree untracked program runs under a runner (python3 -m unittest
+tools/gen.py, node --import ./tools/gen.mjs --test tests/): the test-author's new files
+must run. The fixtures are in guards_support.py.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_guards_script_files.py" -v
 """
@@ -60,6 +77,8 @@ INTERPRETERS = (
 SPELLINGS = (
     ("python3 -I {f}", "py"),
     ("python3 -u -B {f}", "py"),
+    ("python3 -- {f}", "py"),
+    ("python3 -W ignore -- {f}", "py"),
     ("python3 -W ignore {f}", "py"),
     ("python3 -X utf8 {f}", "py"),
     ("python3.12 {f}", "py"),
@@ -110,6 +129,32 @@ RUNNERS = (
     "bun test tests/new.test.ts",
     "python3 -m pytest tests/test_app.py",  # tracked, in the worktree
     "node --test scripts/tool.mjs",
+    # a runner's test target, config or working directory in the worktree
+    "python3 -m pytest tests/",
+    "python3 -m pytest -c pytest.ini tests/",
+    "python3 -m pytest --rootdir . tests/",
+    "python3 -m pytest --rootdir {wt} -c pytest.ini tests/test_new.py",
+    "python3 -m unittest tests.test_new",  # the new test as a dotted module
+    "python3 -m unittest -v tests.test_new tests.test_app",
+    "python3 -m pytest --pyargs tests.test_new",
+    "node --test ./tests/",
+    "node --test {wt}/tests/",
+    "deno test tests/",
+    "bun test --cwd tests",
+    "bun test --cwd . tests/new.test.ts",
+    # wrappers and bare runners on the worktree's files
+    "uv run python scripts/tool.py",
+    "uv run scripts/tool.py",
+    "uv run python -m pytest tests/test_new.py",
+    "uv run python -m unittest tests/test_new.py",
+    "uv run pytest tests/",
+    "poetry run python scripts/tool.py",
+    "poetry run pytest tests/",
+    "npx tsx scripts/tool.ts",
+    "bunx tsx scripts/tool.ts",
+    "pytest tests/test_new.py",
+    "pytest -q tests/",
+    "vitest run tests/new.test.ts",
     "harness-red run --worktree {wt}",
     "harness-red check",
     "{red} run --worktree {wt}",
@@ -127,15 +172,31 @@ MODULES = (
     "python3 -m timeit pass",
     "python3 -m site",
     "python3 -m json.tool tests/fixtures/data.json",
+    # the standard library's runners of a file, given a tracked one
+    "python3 -m pdb scripts/tool.py",
+    "python3 -m cProfile -o /tmp/prof scripts/tool.py",
+    "python3 -m cProfile -s cumtime scripts/tool.py",
+    "python3 -m trace --trace scripts/tool.py",
+    "python3 -m doctest scripts/tool.py",
+    "python3 -m runpy scripts.tool",
 )
-# Tracked program files run in other spellings ({wt} is the worktree): behind options,
-# some taking a value; as modules, resolved from the directory the part runs in; the last
-# is the project's test command (HARNESS_TEST_CMD in the main checkout's tracked settings).
+# Tracked program files run in other spellings ({wt} is the worktree, {o} the outside
+# directory): behind options, some taking a value; from another directory; as modules,
+# resolved from the directory the part runs in; as a directory with a tracked entry file;
+# the last is the project's test command (HARNESS_TEST_CMD in the main checkout's tracked
+# settings).
 TRACKED_SPELLINGS = (
     "python3 ./scripts/tool.py",
     "python3 {wt}/scripts/tool.py",
     "cd scripts && python3 tool.py",
+    "cd {o} && python3 {wt}/scripts/tool.py",
+    "cd /tmp && bash {wt}/scripts/tool.sh",
     "env python3 scripts/tool.py",
+    "python3 -mscripts.tool",
+    "python3 -Imscripts.tool",
+    "python3 scripts/pkg",
+    "node scripts/app",
+    "node ./scripts/app/",
     "python3 -I scripts/tool.py",
     "python3 -W ignore scripts/tool.py",
     "python3 -X utf8 scripts/tool.py",
@@ -162,14 +223,26 @@ VALUE_OPTION_SPELLINGS = (
     ("perl -I scripts {f}", "pl"),
     ("perl -I lib {f}", "pl"),
     ("perl -Ilib -w {f}", "pl"),
+    ("perl -Mlib=scripts {f}", "pl"),
+    ("perl -I scripts -Mlib=lib {f}", "pl"),
     ("php -c scripts {f}", "php"),
+    ("php -d display_errors=1 {f}", "php"),
+    ("php -c scripts -d display_errors=1 {f}", "php"),
     ("node -r scripts/setup.cjs {f}", "mjs"),
     ("node --require scripts/setup.cjs {f}", "mjs"),
     ("node --import scripts/setup.mjs {f}", "mjs"),
     ("node --import=./scripts/setup.mjs {f}", "mjs"),
+    ("node --env-file .env {f}", "mjs"),
+    ("node --env-file=.env {f}", "mjs"),
     ("deno run --config deno.json {f}", "ts"),
+    ("deno run -c deno.json {f}", "ts"),
+    ("deno run --config=deno.json -A {f}", "ts"),
+    ("deno run --import-map deno.json {f}", "ts"),
     ("bun --preload scripts/setup.ts {f}", "ts"),
     ("python3 -W ignore -X utf8 {f}", "py"),
+    # a value that is a directory: a working directory, a load path
+    ("ruby -C scripts {f}", "rb"),
+    ("ruby -C scripts -I lib {f}", "rb"),
 )
 # A preload is a program the interpreter runs before the one it is given: an untracked
 # or out-of-tree preload next to a tracked program ({f} is the preload).
@@ -186,20 +259,37 @@ PRELOAD_SPELLINGS = (
     ("bun --preload {f} scripts/tool.ts", "ts"),
     ("bun --preload={f} scripts/tool.ts", "ts"),
     ("bun -r {f} scripts/tool.ts", "ts"),
+    ("php -d auto_prepend_file={f} scripts/tool.php", "php"),
     ("node --import {f} --test tests/", "mjs"),  # and next to a runner
     ("node -r {f} --test", "cjs"),
+    # and with no program file after it: an inline program, or nothing
+    ("node -r {f} -e 0", "cjs"),
+    ("node --import {f} -p 1", "mjs"),
+    ("ruby -r{f} -e 1", "rb"),
 )
 # The same options with tracked values and tracked programs, or a value that is a load
-# path and not a program at all ({o} is the untracked directory outside the worktree).
+# path and not a program at all ({o} is the untracked directory outside the worktree,
+# {wt} the worktree).
 VALUE_OPTION_TRACKED = (
     "ruby -I lib scripts/tool.rb",
     "ruby -Ilib -w scripts/tool.rb",
     "ruby -I {o}/gems scripts/tool.rb",
     "ruby -r ./scripts/setup.rb scripts/tool.rb",
+    "ruby -r ./scripts/setup.rb -e 1",
+    "ruby -C scripts {wt}/scripts/tool.rb",
     "perl -I lib scripts/tool.pl",
     "perl -I ~/perl5/lib scripts/tool.pl",
+    "perl -Mlib=scripts scripts/tool.pl",
     "php -c scripts scripts/tool.php",
+    "php -d display_errors=1 scripts/tool.php",
+    "php -d auto_prepend_file=scripts/setup.php scripts/tool.php",
     "node -r scripts/setup.cjs scripts/tool.mjs",
+    "node -r scripts/setup.cjs -e 0",
+    "node --import ./scripts/setup.mjs -p 1",
+    "node --env-file .env scripts/tool.mjs",
+    "node --env-file=.env scripts/tool.mjs",
+    "deno run -c deno.json scripts/tool.ts",
+    "deno run --import-map deno.json scripts/tool.ts",
     "node --require ./scripts/setup.cjs scripts/tool.mjs",
     "node --import ./scripts/setup.mjs scripts/tool.mjs",
     "node --import=./scripts/setup.mjs scripts/tool.mjs",
@@ -224,10 +314,21 @@ PYTHONPATH_MODULES = (
     ("PYTHONPATH={home} python3 -m w", None),
     ("cd tests && PYTHONPATH=helpers python3 -m gen", "PYTHONPATH=helpers python3 -m gen"),
     ("cd scripts && PYTHONPATH=../tools python3 -m gen", "PYTHONPATH=../tools python3 -m gen"),
+    # exported in an earlier part of the same command
+    ("export PYTHONPATH=tools && python3 -m gen", "python3 -m gen"),
+    ("export PYTHONPATH=tools; python3 -m gen", "python3 -m gen"),
+    ("export PYTHONPATH=tests/helpers\npython3 -m gen", "python3 -m gen"),
+    ("export PYTHONPATH={o}; python3 -m w", "python3 -m w"),
+    # an entry the hook cannot expand, with a module that is not installed: not known
+    ("PYTHONPATH=$PWD/tools python3 -m gen", None),
+    ('PYTHONPATH="$PWD/tools" python3 -m gen', None),
+    ("PYTHONPATH=$(pwd)/tools python3 -m gen", None),
+    ("PYTHONPATH=$PWD/tools:$PYTHONPATH python3 -m gen", None),
 )
 # PYTHONPATH that leads to a tracked module, or to no module of that name at all (the
 # runner is installed), and PYTHONPATH on a tracked program file: the load path does not
-# decide, the program does.
+# decide, the program does; an entry the hook cannot expand does not matter to a program
+# file or an installed module either.
 PYTHONPATH_ALLOWED = (
     "PYTHONPATH=scripts python3 -m tool",
     "env PYTHONPATH=scripts python3 -m tool",
@@ -237,6 +338,66 @@ PYTHONPATH_ALLOWED = (
     "PYTHONPATH=tools python3 -m json.tool tests/fixtures/data.json",
     "PYTHONPATH=tools python3 scripts/tool.py",
     "PYTHONPATH={o} python3 scripts/tool.py",
+    "export PYTHONPATH=tools && python3 -m unittest tests/test_new.py",
+    "export PYTHONPATH=tools && python3 scripts/tool.py",
+    "PYTHONPATH=$PWD/tools python3 -m pytest tests/test_new.py",
+    "PYTHONPATH=$PWD/tools python3 -m json.tool tests/fixtures/data.json",
+    "PYTHONPATH=$(pwd)/tools python3 scripts/tool.py",
+)
+# The standard library's modules that run a program file or a module: pdb, cProfile,
+# profile, trace and doctest take a file, runpy a module; and a module given to a runner
+# resolves like -m does, so one outside the worktree is a program outside the worktree
+# ({o} is the outside directory; the part the reason quotes, or None for the whole).
+STDLIB_RUNNERS = (
+    ("python3 -m pdb {o}/w.py", None),
+    ("python3 -m pdb tools/gen.py", None),
+    ("python3 -m cProfile {o}/w.py", None),
+    ("python3 -m cProfile -o /tmp/prof tools/gen.py", None),
+    ("python3 -m profile {o}/w.py", None),
+    ("python3 -m trace --trace {o}/w.py", None),
+    ("python3 -m trace -t tools/gen.py", None),
+    ("python3 -m doctest {o}/w.py", None),
+    ("python3 -m doctest tools/gen.py", None),
+    ("python3 -m runpy w", None),
+    ("python3 -m runpy tools.gen", None),
+    ("python3 -m runpy genpkg", None),
+    ("PYTHONPATH={o} python3 -m unittest w", None),
+    ("PYTHONPATH={o} python3 -m pytest --pyargs w", None),
+    ("cd {o} && python3 -m unittest w", "python3 -m unittest w"),
+)
+# A test runner given a test directory, a config or a working directory outside the
+# worktree: the runner imports what it finds there ({o} holds test_w.py, w.test.mjs and
+# pytest.ini; {home} is ~).
+RUNNER_OUTSIDE = (
+    "node --test {o}",
+    "node --test {o}/",
+    "node --test {home}/",
+    "python3 -m pytest {o}",
+    "python3 -m pytest {o}/",
+    "python3 -m pytest -c {o}/pytest.ini tests/",
+    "python3 -m pytest --rootdir {o} -c {o}/pytest.ini tests/",
+    "deno test {o}/",
+    "bun test --cwd {o}",
+    "pytest {o}",
+)
+# Wrappers that run what follows them, and bare runners: judged by the program file they
+# are given ({o} is the outside directory).
+WRAPPERS = (
+    "uv run python {o}/w.py",
+    "uv run {o}/w.py",
+    "uv run python -m pytest {o}/w.py",
+    "uv run pytest {o}/w.py",
+    "uv run python tools/gen.py",
+    "uv run tools/gen.py",
+    "poetry run python {o}/w.py",
+    "poetry run python tools/gen.py",
+    "npx tsx {o}/w.ts",
+    "npx ts-node {o}/w.ts",
+    "npx tsx tools/gen.ts",
+    "bunx tsx {o}/w.ts",
+    "pytest {o}/w.py",
+    "pytest -q {o}/w.py",
+    "vitest run {o}/w.ts",
 )
 # A test runner's options whose values are out-of-tree non-program paths (a report, a
 # temp directory, a cache): the loop writes those, so they stay allowed ({o} is the
@@ -279,12 +440,16 @@ class ScriptFileTests(GuardTestCase):
         self.write(self.wt / "scripts/run_tests.py", "import sys\nsys.exit(0)\n")
         self.write(self.wt / "scripts/pkg/__init__.py", "")
         self.write(self.wt / "scripts/pkg/__main__.py", PROGRAMS["py"])
-        # tracked values for the options that take one: preloads, load paths, a config
-        for ext in ("mjs", "cjs", "rb", "ts"):
-            self.write(self.wt / f"scripts/setup.{ext}", "// setup\n" if ext != "rb" else "# setup\n")
+        # tracked values for the options that take one: preloads, load paths, configs
+        for ext in ("mjs", "cjs", "rb", "ts", "php"):
+            comment = {"rb": "# setup\n", "php": "<?php\n"}.get(ext, "// setup\n")
+            self.write(self.wt / f"scripts/setup.{ext}", comment)
+        self.write(self.wt / "scripts/app/index.js", "// app\n")  # a directory node runs
         self.write(self.wt / "lib/util.rb", "module Util; end\n")
         self.write(self.wt / "lib/Util.pm", "package Util;\n1;\n")
         self.write(self.wt / "deno.json", "{}\n")
+        self.write(self.wt / "pytest.ini", "[pytest]\n")
+        self.write(self.wt / ".env", "TZ=UTC\n")
         self.git(self.wt, "add", "-A")
         self.git(self.wt, "commit", "-q", "-m", "Add the project's scripts")
         # untracked: outside any repository (the temp directory, ~) and in the worktree
@@ -298,7 +463,14 @@ class ScriptFileTests(GuardTestCase):
         self.write(self.wt / "w.py", PROGRAMS["py"])
         self.write(self.wt / "genpkg/__init__.py", "")
         self.write(self.wt / "genpkg/__main__.py", PROGRAMS["py"])
-        # outside the worktree, not programs: a load path, runner output, temp and cache dirs
+        # untracked entry files in a tracked directory: `python3 scripts`, `node scripts`
+        self.write(self.wt / "scripts/__main__.py", PROGRAMS["py"])
+        self.write(self.wt / "scripts/index.js", PROGRAMS["cjs"])
+        # outside the worktree: a test directory with its config, and not programs: a load
+        # path, runner output, temp and cache dirs
+        self.write(self.outside / "test_w.py", PROGRAMS["py"])
+        self.write(self.outside / "w.test.mjs", PROGRAMS["mjs"])
+        self.write(self.outside / "pytest.ini", "[pytest]\n")
         for d in ("gems", "pt", "pc"):
             (self.outside / d).mkdir()
         self.write(self.outside / "r.xml", "<testsuites/>\n")
@@ -408,11 +580,20 @@ class ScriptFileTests(GuardTestCase):
             ("python3 ./tools/gen.py", None),
             (f"python3 {self.wt}/tools/gen.py", None),
             ("cd tools && python3 gen.py", "python3 gen.py"),
-            # -m with a module the worktree does not track
+            # -m with a module the worktree does not track, separate or attached
             ("python3 -m tools.gen", None),
             ("python3 -m genpkg", None),
             ("python3 -m w", None),
             ("cd tools && python3 -m gen", "python3 -m gen"),
+            ("python3 -mtools.gen", None),
+            ("python3 -mw", None),
+            ("python3 -Imtools.gen", None),
+            # a tracked directory run as the program: its entry file is untracked
+            ("python3 scripts", None),
+            ("python3 ./scripts/", None),
+            ("python3 -m scripts", None),
+            ("node scripts", None),
+            ("node ./scripts/", None),
         ]
         for command, part in cases:
             for agent in ROLES:
@@ -484,7 +665,10 @@ class ScriptFileTests(GuardTestCase):
             "node --import ./tests/helpers/gen.mjs scripts/tool.mjs",
             "ruby -r ./tools/gen.rb scripts/tool.rb",
             "bun --preload tools/gen.ts scripts/tool.ts",
+            "php -d auto_prepend_file=tools/gen.php scripts/tool.php",
             f"node --import {self.home}/w.mjs scripts/tool.mjs",
+            "node -r tools/gen.cjs -e 0",
+            "ruby -r ./tools/gen.rb -e 1",
         ]
         for command in commands:
             for agent in ROLES:
@@ -499,10 +683,13 @@ class ScriptFileTests(GuardTestCase):
                     self.assertRefused(self.bash(command, agent), part or command)
 
     def test_a_test_runner_given_a_program_file_outside_the_worktree_is_refused(self):
-        """A runner imports and runs the files it is given: one outside the worktree is the
-        same bypass. Runners on the worktree's own files, tracked or new, still run."""
+        """A runner imports and runs the files it is given, and what it finds in the test
+        directory, working directory or config it is given: any of them outside the
+        worktree is the same bypass. Runners on the worktree's own files, tracked or new,
+        still run."""
         o = self.outside
-        for command in (
+        outside = [t.format(o=o, home=self.home) for t in RUNNER_OUTSIDE]
+        for command in outside + [
             "node --test /tmp/w.mjs",
             f"node --test {o}/w.mjs",
             f"node --test tests/ {o}/w.mjs",
@@ -515,7 +702,25 @@ class ScriptFileTests(GuardTestCase):
             f"deno test -A {o}/w.ts",
             "bun test /tmp/w.ts",
             f"bun test {o}/w.ts",
-        ):
+        ]:
+            for agent in ROLES:
+                with self.subTest(command=command, agent=agent):
+                    self.assertRefused(self.bash(command, agent), command)
+
+    def test_a_stdlib_module_that_runs_a_file_or_module_is_judged_by_it(self):
+        """python3 -m pdb /tmp/w.py runs /tmp/w.py, -m runpy w runs w.py: the module
+        after -m is the standard library's, the program is what it is given."""
+        for template, part in STDLIB_RUNNERS:
+            command = template.format(o=self.outside)
+            for agent in ROLES:
+                with self.subTest(command=command, agent=agent):
+                    self.assertRefused(self.bash(command, agent), part or command)
+
+    def test_a_wrapper_or_bare_runner_is_judged_by_the_program_file_it_runs(self):
+        """uv run python /tmp/w.py, npx tsx /tmp/w.ts, pytest /tmp/w.py: the wrapper runs
+        what follows it, and a runner installed on the PATH is the same runner."""
+        for template in WRAPPERS:
+            command = template.format(o=self.outside)
             for agent in ROLES:
                 with self.subTest(command=command, agent=agent):
                     self.assertRefused(self.bash(command, agent), command)
@@ -525,14 +730,18 @@ class ScriptFileTests(GuardTestCase):
             ("python3 $F", "python3 $F"),
             ('bash "$SCRIPT"', 'bash "$SCRIPT"'),
             ("F=/tmp/w.py; node $F", "node $F"),
+            ('python3 "$HOME/w.py"', 'python3 "$HOME/w.py"'),
         ):
             for agent in ROLES:
                 with self.subTest(command=command, agent=agent):
                     self.assertRefused(self.bash(command, agent), part)
 
     def test_each_part_of_a_command_is_judged_where_it_runs(self):
-        py, sh = self.outside / "w.py", self.outside / "w.sh"
-        mjs, rb, pl = self.outside / "w.mjs", self.outside / "w.rb", self.outside / "w.pl"
+        """Including a part that runs outside the worktree: the program file is judged
+        against the hook's worktree from any directory."""
+        o = self.outside
+        py, sh = o / "w.py", o / "w.sh"
+        mjs, rb, pl = o / "w.mjs", o / "w.rb", o / "w.pl"
         for k, (cwd, command, part) in enumerate(
             (
                 (self.wt, f"cd tests && python3 {py}", f"python3 {py}"),
@@ -541,6 +750,11 @@ class ScriptFileTests(GuardTestCase):
                 (self.wt, f"echo start; ruby {rb}", f"ruby {rb}"),
                 (self.wt, f"sh -c 'python3 {py}'", None),
                 (self.repo, f"cd {self.wt} && perl {pl}", f"perl {pl}"),
+                (self.wt, f"cd {o} && python3 w.py", "python3 w.py"),
+                (self.wt, f"cd /tmp && python3 {py}", f"python3 {py}"),
+                (self.wt, f"(cd {o}; bash w.sh)", "bash w.sh"),
+                (self.wt, "cd ~ && node w.mjs", "node w.mjs"),
+                (self.wt, f"cd {o} && python3 -m w", "python3 -m w"),
             )
         ):
             agent = ROLES[k % len(ROLES)]
@@ -583,7 +797,7 @@ class ScriptFileTests(GuardTestCase):
                 with self.subTest(command=command, agent=agent):
                     self.assertIsNone(self.bash(command, agent))
         for k, template in enumerate(TRACKED_SPELLINGS):
-            command = template.format(wt=self.wt)
+            command = template.format(wt=self.wt, o=self.outside)
             agent = ROLES[k % len(ROLES)]
             with self.subTest(command=command, agent=agent):
                 self.assertIsNone(self.bash(command, agent))
@@ -601,7 +815,7 @@ class ScriptFileTests(GuardTestCase):
         is no program, and PYTHONPATH that leads to a tracked module, to an installed one
         or to nothing the program run depends on."""
         for k, template in enumerate(VALUE_OPTION_TRACKED + PYTHONPATH_ALLOWED):
-            command = template.format(o=self.outside)
+            command = template.format(o=self.outside, wt=self.wt)
             agent = ROLES[k % len(ROLES)]
             with self.subTest(command=command, agent=agent):
                 self.assertIsNone(self.bash(command, agent))
@@ -675,6 +889,21 @@ class ScriptFileTests(GuardTestCase):
             "PYTHONPATH= python3 -m gen",
             "PYTHONPATH=tools python3 -m",
             "PYTHONPATH=: python3 -m w",
+            "export PYTHONPATH=",
+            "export PYTHONPATH=tools &&",
+            "python3 -m runpy",
+            "python3 -m pdb",
+            "python3 -m pytest -c",
+            "python3 -mI",
+            "bun test --cwd",
+            "node --test --test-reporter-destination",
+            "uv run",
+            "poetry run",
+            "npx",
+            "pytest",
+            "ruby -C",
+            "php -d",
+            "node --env-file",
             "bash -",
             "env",
             "deno run",
