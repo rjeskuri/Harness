@@ -24,15 +24,15 @@ not. Adds at most 40 lines of context:
   - Latest spec: the newest file in docs/agent/specs/;
   - the first three `"passes": false` items of docs/plans/feature_list.json;
   - Hours this month: the sum of this month's rows in worklog/worklog.csv.
-On startup it also names the session after the repo (sessionTitle). Once the brief is out it
+On startup it also names the session after the repo (sessionTitle). Once its output is out it
 sweeps the backups older than 14 days (harness_lib.backups.sweep) for the session's repository,
 in one 2 s budget, silently; it adds nothing to the brief.
 
 When the project's .claude/settings.json declares its own SessionStart hook, it prints
 no brief, so a project with a bespoke brief is not briefed twice; only when harness_lib
-cannot be loaded does it still print the one harness_lib warning line there. Outside a
-git repo the heading carries no git facts, and the sections are read from the directory
-itself. Fails open: an error means a shorter brief or none, never a blocked session.
+cannot be loaded does it still print the one harness_lib warning line there. The sweep
+runs there all the same. Outside a git repo the heading carries no git facts, and the
+sections are read from the directory itself. Fails open: an error means a shorter brief or none, never a blocked session.
 Without harness_lib it writes one line to stderr, puts one Warning: line naming
 harness_lib in the brief, and leaves out the ticket state.
 
@@ -720,11 +720,11 @@ def main() -> int:
             " and this brief has no ticket state."
         )
     if declares_session_start(root):
-        # The project's own hook replaces the brief and its title, but not the warning.
-        if not warning:
-            return 0
-        out = {"hookEventName": "SessionStart", "additionalContext": clip(warning[0])}
-        emit({"hookSpecificOutput": out})
+        # The project's own hook replaces the brief and its title, but not the warning, nor the sweep.
+        if warning:
+            out = {"hookEventName": "SessionStart", "additionalContext": clip(warning[0])}
+            emit({"hookSpecificOutput": out})
+        sweep_backups(git_root, started)
         return 0
     name = root.name or str(root)
     # Outside a git repo the heading has no git facts; the sections come from the cwd.

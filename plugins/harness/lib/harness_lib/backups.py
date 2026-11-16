@@ -36,6 +36,7 @@ KEEP_DAYS = 14                              # what sweep keeps: snapshots and re
 ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}")
 ID_TRIES = 100                              # suffixes tried for one second before giving up
 GIT_TIMEOUT = 10                            # seconds one git call may take
+KILL_GRACE = 0.3                            # seconds a git sent TERM gets to remove its lock files before KILL
 PRIVATE = 0o700                             # the store folders' mode
 
 
@@ -75,8 +76,8 @@ def _store(main, pats):
 def _run_git(cwd, args, deadline=None):
     """(exit code, stdout) of git in `cwd`, or None when it cannot run or runs past GIT_TIMEOUT or `deadline` (a
     time.monotonic() instant). It runs in a process group of its own, and nothing returns or raises here before
-    it has exited and been reaped: out of time (or on any other exception) the whole group is killed first, so no
-    git, and nothing git started, outlives the call."""
+    it has exited and been reaped: out of time (or on any other exception) the whole group is stopped first
+    (_stop_group), so no git, and nothing git started, outlives the call, and git gets to remove its lock files."""
     left = GIT_TIMEOUT if deadline is None else min(GIT_TIMEOUT, deadline - time.monotonic())
     if left <= 0:
         return None
@@ -88,16 +89,35 @@ def _run_git(cwd, args, deadline=None):
     try:
         out, _err = proc.communicate(timeout=left)
     except BaseException as err:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)     # not reaped yet, so the group id is still git's
-        except OSError:
-            pass
-        proc.wait()
-        proc.stdout.close()
+        _stop_group(proc)
         if isinstance(err, subprocess.TimeoutExpired):
             return None
         raise
     return proc.returncode, out.decode("utf-8", "surrogateescape")
+
+
+def _stop_group(proc):
+    """End the process group `proc` leads, then reap `proc`: TERM first, which git catches to remove the lock files
+    it holds (packed-refs.lock, <ref>.lock; KILL would leave them, and every later ref update in the repository
+    would fail on them), then KILL to whatever is still alive once nothing in the group is left to signal or
+    KILL_GRACE seconds have passed, whichever comes first. The leader is reaped only after both signals, so the
+    group id is still git's for each. (Where a group of nothing but an unreaped leader can still be signalled, as
+    on Linux, the grace runs out in full.)"""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        until = time.monotonic() + KILL_GRACE
+        while time.monotonic() < until:
+            time.sleep(0.01)
+            os.killpg(proc.pid, 0)              # raises once nothing in the group can be signalled
+    except OSError:
+        pass
+    finally:                                    # interrupted in the grace, the group is still killed and reaped
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        proc.stdout.close()
 
 
 def _git(cwd, *args, deadline=None):

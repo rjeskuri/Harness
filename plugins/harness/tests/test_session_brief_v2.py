@@ -13,8 +13,11 @@ refs to delete, stands in for a sweep that overruns: a timeout per call adds up,
 deadline does not. A ref under another git's lock, a store that is a file and a read-only
 store stand in for a sweep that fails part way: the rest is still swept. The brief is
 compared whole, its last commit dated long ago so that its age reads the same every run.
-Rulings on #329: the sweep runs only where the brief runs (a project whose own
-SessionStart hook replaces the brief is not tested here).
+A project whose own SessionStart hook replaces the brief is swept all the same, silently:
+the hook's stdout there is what it is with nothing to sweep. A git whose update-ref takes
+the ref's lock file, removes it only on a TERM it traps (as real git does: never on KILL),
+and waits on a child that ignores TERM stands in for a deletion cut off by the deadline:
+git gets to clean up its lock, and neither it nor its child outlives the hook.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_session_brief_v2.py" -v
 """
@@ -27,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -89,6 +93,34 @@ if [ "$sub" = "update-ref" ]; then
 fi
 exec "@GIT@" "$@"
 """
+# The real git for every call but update-ref, which does what git does to a ref it deletes:
+# takes <git dir>/<ref>.lock, and removes it only on a signal it can catch (TERM; KILL leaves
+# it), then waits on a child that ignores TERM. Each pid goes to $TERM_LOG as it starts.
+TERM_GIT = """#!/bin/sh
+sub=""
+skip=""
+for a in "$@"; do
+  if [ -n "$skip" ]; then skip=""; continue; fi
+  case "$a" in
+    -C|-c) skip=1 ;;
+    -*) ;;
+    *) sub="$a"; break ;;
+  esac
+done
+if [ "$sub" = "update-ref" ]; then
+  for ref in "$@"; do :; done
+  lock="$LOCK_DIR/$ref.lock"
+  trap 'rm -f "$lock"; exit 143' TERM
+  echo "git $$" >> "$TERM_LOG"
+  : > "$lock"
+  (trap '' TERM; exec sleep 30) &
+  echo "child $!" >> "$TERM_LOG"
+  wait
+  exit 1
+fi
+exec "@GIT@" "$@"
+"""
+PS = shutil.which("ps", path=SYSTEM_PATH) or "/bin/ps"
 
 _SHARED: dict = {}
 
@@ -110,10 +142,11 @@ def setUpModule() -> None:
             gh.write_text(source)
         gh.chmod(0o755)
     (base / "bin-none").mkdir()
-    (base / "bin-hang").mkdir()
-    git = base / "bin-hang" / "git"
-    git.write_text(HANGING_GIT.replace("@GIT@", REAL_GIT))
-    git.chmod(0o755)
+    for folder, source in (("bin-hang", HANGING_GIT), ("bin-term", TERM_GIT)):
+        (base / folder).mkdir()
+        git = base / folder / "git"
+        git.write_text(source.replace("@GIT@", REAL_GIT))
+        git.chmod(0o755)
 
 
 def tearDownModule() -> None:
@@ -432,6 +465,16 @@ class BriefV2Tests(unittest.TestCase):
     ) -> tuple[dict, float]:
         """The SessionStart hook run as hooks.json wires it for `source`, killed at its timeout;
         (hookSpecificOutput, seconds it took). It must exit 0 and print nothing on stderr."""
+        stdout, took = self.session_start_stdout(cwd, source, env)
+        out = json.loads(stdout)["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "SessionStart")
+        return out, took
+
+    def session_start_stdout(
+        self, cwd: Path, source: str = "startup", env: dict | None = None
+    ) -> tuple[str, float]:
+        """As session_start, but (the hook's whole stdout, seconds it took): a project's own
+        SessionStart hook leaves the brief out, so the stdout may be empty."""
         config = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
         hooks = [
             hook
@@ -474,9 +517,7 @@ class BriefV2Tests(unittest.TestCase):
             self.fail(f"the hook ran past the {hook['timeout']} s hooks.json gives it")
         took = time.monotonic() - started
         self.assertEqual((r.returncode, r.stderr), (0, ""))
-        out = json.loads(r.stdout)["hookSpecificOutput"]
-        self.assertEqual(out["hookEventName"], "SessionStart")
-        return out, took
+        return r.stdout, took
 
     def global_store(self) -> Path:
         return self.home / ".claude/harness/backups"
@@ -683,6 +724,104 @@ class BriefV2Tests(unittest.TestCase):
             took + SWEEP_BUDGET + TIMING_MARGIN,
             f"a hanging sweep held the brief {hung:.1f} s (a normal run took {took:.1f} s)",
         )
+
+    def test_a_project_with_its_own_session_start_hook_is_swept_silently(self):
+        own = {
+            "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}]},
+            "env": {"HARNESS_SENSITIVE_PATHS": "secrets/**"},  # its snapshots stay in it
+        }
+        self.write(self.repo / ".claude/settings.json", json.dumps(own))
+        self.git(self.repo, "add", ".claude/settings.json")
+        self.git(self.repo, "commit", "-q", "-m", "Own SessionStart hook")
+        loose = self.tmp / "loose-own"  # not a repository, with its own hook too
+        self.write(loose / ".claude/settings.json", json.dumps(own))
+        quiet = {
+            "repo": self.session_start_stdout(self.repo, "startup")[0],
+            "loose": self.session_start_stdout(loose, "compact")[0],
+        }
+        self.assertEqual(quiet, {"repo": "", "loose": ""})  # the brief steps aside, as before
+        g, p = self.global_store(), self.project_store(self.repo)
+        g_new = {self.snapshot(g, 13 * DAY, self.repo), self.snapshot(g, 13 * DAY, None)}
+        self.snapshot(g, 15 * DAY, self.repo)
+        self.snapshot(g, 15 * DAY, None)
+        p_new = self.snapshot(p, 13 * DAY, self.repo)
+        self.snapshot(p, 15 * DAY, self.repo)
+        old_ref = self.backup_ref(self.repo, 15 * DAY)
+        new_ref = self.backup_ref(self.repo, 13 * DAY)
+
+        out, _ = self.session_start_stdout(self.repo, "startup")
+        self.assertEqual(self.listing(g), g_new, "the global store was not swept")
+        self.assertEqual(self.listing(p), {p_new}, "the project's own store was not swept")
+        self.assertNotIn(old_ref, self.refs(self.repo), "the project's refs were not swept")
+        self.assertIn(new_ref, self.refs(self.repo))
+        self.assertEqual(out, quiet["repo"], "the sweep changed the hook's output")
+
+        # Outside any repository the global store is swept all the same, as silently.
+        self.snapshot(g, 15 * DAY, None)
+        out, _ = self.session_start_stdout(loose, "compact")
+        self.assertEqual(self.listing(g), g_new, "the global store was not swept")
+        self.assertEqual(self.listing(p), {p_new})
+        self.assertEqual(out, quiet["loose"], "the sweep changed the hook's output")
+
+    def test_a_git_cut_off_by_the_deadline_cleans_up_its_lock_and_nothing_outlives_it(self):
+        self.pin_commit_date(self.repo)
+        term_log = self.tmp / "term.log"
+        term = {
+            "PATH": f"{_SHARED['base'] / 'bin-term'}:{_SHARED['base'] / 'bin-fake'}:{SYSTEM_PATH}",
+            "LOCK_DIR": str(self.repo / ".git"),
+            "TERM_LOG": str(term_log),
+        }
+        clean, took = self.session_start(self.repo, env=term)
+        again, took_again = self.session_start(self.repo, env=term)
+        self.assertEqual(again, clean)
+        took = max(took, took_again)  # nothing to sweep: the brief's own time, twice
+        self.assertFalse(term_log.exists(), "update-ref ran with nothing to sweep")
+        old = self.backup_ref(self.repo, 15 * DAY)
+        new = self.backup_ref(self.repo, 13 * DAY)
+        lock = self.repo / ".git" / (old + ".lock")
+
+        out, hung = self.session_start(self.repo, env=term)
+        self.assertEqual(out, clean)
+        started = {}  # "git" -> the update-ref shell's pid, "child" -> its child's
+        for ln in term_log.read_text().splitlines() if term_log.exists() else []:
+            role, pid = ln.split()
+            started[role] = int(pid)
+        self.assertIn("git", started, "the sweep tried to delete no ref")
+        left = self.still_running(started.values())
+        self.assertEqual(left, [], "a git the deadline cut off, or what it started, outlived the hook")
+        self.assertFalse(
+            lock.exists(),
+            "git was killed before it could remove its lock (a catchable signal first, then a grace)",
+        )
+        self.assertLess(
+            hung,
+            took + SWEEP_BUDGET + TIMING_MARGIN,
+            f"a cut-off git held the brief {hung:.1f} s (a normal run took {took:.1f} s)",
+        )
+        # No stale lock breaks the next deletion: the next SessionStart, git as it is, sweeps the ref.
+        self.assertEqual(self.session_start(self.repo)[0], clean)
+        self.assertNotIn(old, self.refs(self.repo), "the old ref outlived the next sweep")
+        self.assertIn(new, self.refs(self.repo))
+
+    @staticmethod
+    def still_running(pids) -> list[int]:
+        """Those of `pids` alive after up to 2 s (a zombie is not alive); each is killed."""
+        def alive(pid: int) -> bool:
+            r = subprocess.run([PS, "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+            state = r.stdout.strip()
+            return bool(state) and not state.startswith("Z")
+
+        pids = list(pids)
+        until = time.monotonic() + 2
+        while any(alive(pid) for pid in pids) and time.monotonic() < until:
+            time.sleep(0.05)
+        left = [pid for pid in pids if alive(pid)]
+        for pid in left:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        return left
 
 
 if __name__ == "__main__":
