@@ -208,8 +208,9 @@ class SourceAndShebangTests(ProgramFormCase):
         # text scripts named like interpreters: tracked, and not
         self.program(self.wt / "scripts/python3", "")
         self.program(self.wt / "scripts/node", "")
+        # only these: tools/staged.* stay staged and not committed (ProgramFormCase)
         self.git(self.wt, "add", "scripts/python3", "scripts/node")
-        self.git(self.wt, "commit", "-q", "-m", "Interpreter wrappers")
+        self.git(self.wt, "commit", "-q", "-m", "Interpreter wrappers", "--", "scripts/python3", "scripts/node")
         for path in (
             self.wt / "tools/python3",
             self.outside / "node",
