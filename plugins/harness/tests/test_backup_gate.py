@@ -77,6 +77,10 @@ Choices the ticket leaves open, fixed here:
   Also unknown (review round 2): a cd behind `command` (zsh runs the external cd, bash the builtin) or spelled as
   a path (a child process in every shell), and a cd joined by && or || to an arithmetic command or to a part that
   only redirects input. A cd behind `builtin`, or bare after ; or a newline, still moves the directory.
+  A line continuation alone on its line holds nothing (#357): a cd after `&& \`, `|| \` or `| \` followed by blank
+  lines, lines of only spaces and tabs, a comment or another continuation is as conditional as one right after the
+  operator (unknown, whichever way the condition goes, after a command, an arithmetic or a bare redirect); after
+  `; \`, `& \` or a newline, or with a continuation inside its own line, a cd still moves the directory.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p test_backup_gate.py -v
 """
@@ -1139,6 +1143,32 @@ class Directory(GateTest):
             ("(( 1 )) || cd {sub}; rm -f {y}", "", ["{y}"]),
             ("< {nope} && cd {sub}; rm -f {x}", "", ["{x}"]),
             ("< docs/a.md || cd {sub}; rm -f {y}", "", ["{y}"]),
+            # The same after a line continuation and a line holding nothing (#357).
+            ("(( 0 )) && \\\n\ncd {sub}; rm -f {x}", "", ["{x}"]),
+            ("((1)) || \\\n\n\ncd {sub}\nrm -rf {d}", "", ["{d}"]),
+            ("(( 1 )) && \\\n \t\ncd {sub}; rm -f {y}", "", ["{sub}/{y}"]),
+            ("< {nope} && \\\n\ncd {sub}; rm -f {x}", "", ["{x}"]),
+        ))
+
+    def test_a_cd_after_a_line_continuation_and_an_empty_line_may_not_run(self):
+        # `\` and a newline join the lines, so the cd stands right after the && or || (or |): what follows a dangling
+        # operator, blank lines and comments included, is its right-hand side. #357: `test -d nope && \`, a blank
+        # line, `cd sub; rm -f x` was allowed with a snapshot of sub/x while the shell removes ./x.
+        zsh = os.path.basename(SHELL) == "zsh"
+        self.expect_unknown((
+            ("test -d {nope} && \\\n\ncd {sub}; rm -f {x}", "", ["{x}"]),                # the ticket's command
+            ("test -d {sub} && \\\n\n\n\ncd {sub}; rm -f {y}", "", ["{sub}/{y}"]),       # three blank lines; it runs
+            ("test -d {sub} || \\\n\ncd {sub}; rm -f {x}", "", ["{x}"]),
+            ("[ -e {nope} ] || \\\n\ncd {sub}; rm -rf {d}", "", ["{sub}/{d}"]),
+            ("test -d {nope} && \\\n   \n\t \ncd {sub}; rm -f {x}", "", ["{x}"]),        # lines of blanks
+            ("test -d {nope} && \\\n\n# {sub}\ncd {sub}; rm -f {y}", "", ["{y}"]),       # a blank line, a comment
+            ("test -d {nope} && \\\n# {sub}\ncd {sub}; rm -f {x}", "", ["{x}"]),         # a comment right after
+            ("test -d {nope} && \\\n\\\n\ncd {sub}; rm -f {x}", "", ["{x}"]),            # two continuations
+            ("test -d {nope} &&\\\n\ncd {sub}; rm -f {y}", "", ["{y}"]),
+            ("test -d {nope} && \\\n\ncd {sub}\nrm -rf {d}", "", ["{d}"]),               # a newline after the cd
+            ("[ -d {sub} ] && \\\n\n\ncd {sub}\nrm -f {x} {y}", "", ["{sub}/{x}", "{sub}/{y}"]),
+            # zsh runs a pipeline's last command in this shell, bash in a subshell.
+            ("true | \\\n\ncd {sub}; rm -f {x}", "", ["{sub}/{x}"] if zsh else ["{x}"]),
         ))
 
     def test_a_builtin_or_bare_cd_that_surely_runs_is_still_backed_up(self):
@@ -1148,6 +1178,14 @@ class Directory(GateTest):
             ("builtin pushd {sub}; rm -f {y}", "", ["{sub}/{y}"]),
             ("true; cd {sub}; rm -f {x}", "", ["{sub}/{x}"]),
             ("pwd\ncd {sub} && rm -rf {d}", "", ["{sub}/{d}"]),
+            # A line continuation with no && or || dangling before it changes nothing (#357).
+            ("true; \\\n\ncd {sub}; rm -f {x}", "", ["{sub}/{x}"]),
+            ("pwd\n\\\n\n\ncd {sub} && rm -rf {d}", "", ["{sub}/{d}"]),
+            ("ls \\\n  -a; \\\n \ncd {sub}; rm -f {y}", "", ["{sub}/{y}"]),
+            ("true & \\\n\ncd {sub}; rm -rf {d}", "", ["{sub}/{d}"]),
+            ("cd {sub} \\\n&& rm -rf {d}", "", ["{sub}/{d}"]),                            # inside the cd's line
+            ("cd {sub} && \\\n\nrm -f {x}", "", ["{sub}/{x}"]),
+            ("builtin cd {sub} \\\n\nrm -f {y}", "", ["{sub}/{y}"]),
         ))
 
     def expect_moved(self, cases):
