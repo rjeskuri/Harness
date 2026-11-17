@@ -37,8 +37,10 @@ import inspect
 import io
 import json
 import os
+import random
 import re
 import shutil
+import string
 import subprocess
 import sys
 import tempfile
@@ -748,6 +750,133 @@ class GlobMatchTests(unittest.TestCase):
             )
             with self.subTest(path=path):
                 self.assertEqual(got, want)
+
+
+# ================================================================ nested tests/ directories (#348)
+
+
+# Names a real project has above its tests/ (none of the fixtures' literal parents, so a made-up path never repeats
+# one). Mixed with the made-up shapes below: a pattern that names the real ones (src/tests/**) misses the made-up
+# ones, one that names a made-up shape (d*/**/tests/**) misses the real ones; only every tests/ directory passes.
+REAL_PARENTS = ("src", "app", "lib", "services", "packages", "internal", "core", "api", "cli", "backend", "server")
+
+
+def real_parent() -> str:
+    """One directory name a real project uses, drawn for this run."""
+    return random.choice(REAL_PARENTS)
+
+
+def segment() -> str:
+    """One directory name made up for this run, in no fixed shape: a real project's, one with a suffix, or hex digits
+    after any letter, upper or lower, or a digit, with a - or . inside. None contains "test", "spec" or "docs", so no
+    pattern matches one by its name, and no list or shape written in advance names them all."""
+    h = uuid.uuid4().hex[:8]
+    return random.choice((
+        real_parent(),
+        real_parent() + "_" + h[:4],
+        random.choice(string.ascii_lowercase) + h,
+        random.choice(string.ascii_uppercase) + h[:6],
+        random.choice(string.digits) + h[:3] + "-" + h[3:],
+        "v" + random.choice(string.digits) + "." + h[:4],
+    ))
+
+
+def generated(n: int) -> str:
+    """`n` directory names made up for this run (see segment), /-joined ("" for none)."""
+    return "/".join(segment() for _ in range(n))
+
+
+class DefaultTestPatternsReachNestedTestsTests(unittest.TestCase):
+    """#348: under the lib's default patterns (a project that sets no HARNESS_TEST_PATTERNS) every file below a
+    tests/ directory, at any depth and whatever its name, is a test: a support module or fake beside the test modules
+    (Harness's plugins/harness/tests/*_support.py and fakegh.py) as much as a test_*.py. A file outside every tests/
+    directory is not, whatever its name says. Classified as tests_first and harness-red do: the test patterns first,
+    then the exempt ones, else source."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.lib = load_settings()
+
+    def kind(self, rel: str) -> str:
+        lib = self.lib
+        if any(lib.glob_match(p, rel) for p in lib.patterns(lib.DEFAULT_TEST_PATTERNS)):
+            return "test"
+        if any(lib.glob_match(p, rel) for p in lib.patterns(lib.DEFAULT_SOURCE_EXEMPT)):
+            return "exempt"
+        return "source"
+
+    def test_a_file_is_a_test_by_its_tests_directory_not_by_its_name(self):
+        # this checkout's own support modules and fake, by their real names
+        real = sorted(p.name for p in TESTS.glob("*_support.py")) + ["fakegh.py"]
+        self.assertIn("pr_support.py", real)  # the fixture is the layout #348 is about
+        self.assertGreaterEqual(len(real), 4)
+        cases = [f"plugins/harness/tests/{name}" for name in real] + [
+            "pkg/tests/x_support.py",
+            "pkg/tests/fakegh.py",
+            "svc/api/tests/helpers/builders.py",
+            "web/tests/setup.mjs",
+            "a/b/c/tests/d/e/deep_support.py",
+            "svc/api/tests/fixtures/rows.json",  # a test before the exempt **/*.json
+            "svc/api/tests/README.md",  # and before **/*.md
+        ]
+        # parents no list can know: made up for this run in mixed shapes, 1 to 14 directories above tests/ (deeper
+        # than a depth-by-depth list goes) and 0 to 3 below it; then a real project's name right above tests/
+        names = ("x.py", "fakegh.py", f"{generated(1)}_support.py", f"{generated(1)}.json", "README.md", "setup.mjs")
+        for k, (above, below) in enumerate((a, b) for a in (1, 2, 3, 5, 8, 14) for b in (0, 1, 2, 3)):
+            cases.append("/".join(p for p in (generated(above), "tests", generated(below), names[k % 6]) if p))
+        for k, name in enumerate(names):
+            cases += [f"{real_parent()}/tests/{name}", f"{generated(k)}/{real_parent()}/tests/{name}".lstrip("/")]
+        for rel in cases:
+            with self.subTest(rel=rel):
+                self.assertEqual(self.kind(rel), "test")
+        # outside every tests/ directory a file keeps its kind: the name alone (a _support.py, a fakegh.py, "tests"
+        # in a file or directory name) makes no test
+        for rel, want in [
+            ("plugins/harness/lib/x.py", "source"),
+            ("plugins/harness/lib/harness_lib/settings.py", "source"),
+            ("plugins/harness/lib/harness_lib/x_support.py", "source"),
+            ("plugins/harness/hooks/tests_first.py", "source"),
+            ("plugins/harness/bin/harness-red", "source"),
+            ("plugins/harness/fakegh.py", "source"),
+            ("src/compat_support.py", "source"),
+            ("pkg/testsuite/x_support.py", "source"),
+            ("pkg/mytests/fakegh.py", "source"),
+            ("pkg/tests_helper.py", "source"),
+            ("pkg/tests.py", "source"),
+            ("pkg/testsuite/notes.md", "exempt"),
+            ("plugins/harness/templates/settings.json", "exempt"),
+            # the same under parents made up for this run
+            (f"{generated(1)}/testsuite/{generated(1)}_support.py", "source"),
+            (f"{generated(2)}/tests_helper.py", "source"),
+            (f"{generated(3)}/{generated(1)}_support.py", "source"),
+            (f"{generated(2)}/fakegh.py", "source"),
+            (f"{real_parent()}/{generated(1)}_support.py", "source"),
+            (f"{real_parent()}/{real_parent()}/testsuite/fakegh.py", "source"),
+            (f"{generated(1)}/{real_parent()}/{real_parent()}tests/x.py", "source"),
+            (f"{generated(1)}/{generated(1)}tests/x.py", "source"),
+            (f"{generated(4)}/testsuite/notes.md", "exempt"),
+        ]:
+            with self.subTest(rel=rel):
+                self.assertEqual(self.kind(rel), want)
+
+    def test_a_tests_directory_makes_tests_at_every_depth(self):
+        # Depth is not a dimension of the rule: a tests/ directory 0 to 64 parents down (made up for this run, in
+        # mixed shapes) makes every file below it a test, and the same parents without a tests/ directory leave a
+        # file source (or exempt by its suffix), so no list of fixed depths and no catch-all passes. In-process:
+        # 65 depths cost nothing.
+        tails = ("x_support.py", "fakegh.py", f"{generated(1)}/helpers.py", "fixtures/rows.json")
+        for depth in range(65):
+            parents = generated(depth)
+            tail = tails[depth % len(tails)]
+            under_tests = "/".join(p for p in (parents, "tests", tail) if p)
+            beside_tests = "/".join(p for p in (parents, "testsuite", tail) if p)
+            no_tests = "/".join(p for p in (parents, f"{generated(1)}_support.py") if p)
+            with self.subTest(depth=depth, rel=under_tests):
+                self.assertEqual(self.kind(under_tests), "test")
+            with self.subTest(depth=depth, rel=beside_tests):
+                self.assertEqual(self.kind(beside_tests), "exempt" if tail.endswith(".json") else "source")
+            with self.subTest(depth=depth, rel=no_tests):
+                self.assertEqual(self.kind(no_tests), "source")
 
 
 # ================================================================ one copy

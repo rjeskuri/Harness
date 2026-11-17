@@ -11,12 +11,6 @@ import unittest
 
 from pr_support import *  # noqa: F401,F403
 
-# #337: `land` reads the PR's head sha with the rest (headRefOid) and how far that head is behind main (the compare of
-# main with it). pr_support.py counts as source to the tests-first hook, so this module's land fields are here, as in
-# test_pr_land.py.
-LAND_FIELDS = "isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state"
-LAND_HEAD = "c" * 40
-
 
 # =========================================================================== ultra
 class Ultra(PrTest):
@@ -344,16 +338,11 @@ class LandCost(WorktreeTest):
         pr, sha = str(fx["pr"]), fx["sha"]
         url = f"https://github.com/o/r/pull/{pr}"
         comments = comments or {}
-        compare = f"repos/o/r/compare/main...{LAND_HEAD}"
-        calls = [{"contains": ["api", compare, "--jq"], "stdout": "0\n"},
-                 {"contains": ["api", compare], "stdout_json": {"behind_by": 0, "ahead_by": 1, "status": "ahead"}},
-                 {"match": ["api", "user"], "contains": ["--jq"], "stdout": "rjeskuri\n"},
-                 {"match": ["api", "user"], "stdout_json": {"login": "rjeskuri", "type": "User"}}]
-        calls += gate_calls(commits=[pr_commit("a", at(9))], pull=f"repos/o/r/pulls/{pr}") + [
+        # the head checks (#337): the head, HEAD_SHA, level with main and with no harness review
+        calls = land_gate_calls(commits=[pr_commit("a", at(9))], pull=f"repos/o/r/pulls/{pr}") + [
             {"match": ["pr", "view", pr, "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": sha}}},
             {"match": ["pr", "view", pr, "--json", LAND_FIELDS],
-             "stdout_json": land_view(url=url, state=state, headRefOid=LAND_HEAD,
-                                      closingIssuesReferences=[{"number": n} for n in tickets])},
+             "stdout_json": land_view(url=url, state=state, closingIssuesReferences=[{"number": n} for n in tickets])},
             REPO_VIEW,
             {"match": ["pr", "merge", pr], "stdout": ""}]
         for n in tickets:

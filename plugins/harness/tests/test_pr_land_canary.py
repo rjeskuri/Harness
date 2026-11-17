@@ -24,13 +24,9 @@ import signal
 import time
 import unittest
 
-import pr_support
 from pr_support import *  # noqa: F401,F403
 
-# ------------------------------------------------------------------ the land fixtures (as test_pr_land's, #337)
-# pr_support.py counts as source to the tests-first hook, so the head-check fixtures live here, as in test_pr_land.
-LAND_FIELDS = "isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state"
-HEAD_SHA = harness_review(1, at(1))[0]["commit_id"]
+# The head-check fixtures (#337: LAND_FIELDS, HEAD_SHA, land_view, land_gate_calls) are pr_support's (#348).
 SMOKE = "scripts/smoke.sh"
 BUG = 40
 SLOW = 2            # seconds every slow canary takes before it exits
@@ -53,20 +49,6 @@ fi
 if [ -f canary/sleep ]; then sleep "$(cat canary/sleep)"; fi
 exit "$(cat canary/status)"
 """
-
-
-def land_view(**over):
-    return pr_support.land_view(**dict({"headRefOid": HEAD_SHA}, **over))
-
-
-def gate_calls():
-    """The head checks' reads for a head that is not behind main and has no harness review: the land proceeds."""
-    endpoint = f"repos/o/r/compare/main...{HEAD_SHA}"
-    return [{"contains": ["api", endpoint, "--jq"], "stdout": "0\n"},
-            {"contains": ["api", endpoint], "stdout_json": {"behind_by": 0, "ahead_by": 1, "status": "ahead"}},
-            {"match": ["api", "user"], "contains": ["--jq"], "stdout": "rjeskuri\n"},
-            {"match": ["api", "user"], "stdout_json": {"login": "rjeskuri", "type": "User"}},
-            ] + pr_support.gate_calls((), [pr_commit("a", at(9))])
 
 
 class LandCanary(WorktreeTest):
@@ -134,7 +116,8 @@ class LandCanary(WorktreeTest):
         after = {"number": 12, "state": "CLOSED", "labels": [{"name": "task"}], "comments": [],
                  "title": "Add the widget", "body": TICKET_12_BODY, "url": "https://github.com/o/r/issues/12"}
         merged = dict(pr_data(FIXTURE_A), mergeCommit={"oid": sha}, state="MERGED")
-        return gate_calls() + [
+        # the head checks: the head, HEAD_SHA, level with main and with no harness review, so the land proceeds
+        return land_gate_calls(commits=[pr_commit("a", at(9))]) + [
             {"match": ["pr", "view", "34", "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": sha}}},
             {"match": ["pr", "view", "34", "--json", LAND_FIELDS], "stdout_json": land_view()},
             REPO_VIEW, {"match": ["pr", "merge", "34"], "stdout": ""},

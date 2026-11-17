@@ -13,42 +13,12 @@ import pr_support
 from pr_support import *  # noqa: F401,F403
 
 # ------------------------------------------------------------------ the land fixtures of the head checks (#337)
-# pr_support.py counts as source to the tests-first hook, so the fixtures the head checks need live here and shadow
-# pr_support's names in this module.
-# What `land` reads of the PR before merging; headRefOid is the head the checks judge.
-LAND_FIELDS = "isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state"
-# The PR's head in the fake-only land fixtures: the commit pr_support's harness reviews are of, so by default the
-# latest harness review is at the head.
-HEAD_SHA = harness_review(1, at(1))[0]["commit_id"]
+# LAND_FIELDS, HEAD_SHA, land_view, compare_calls and land_gate_calls are pr_support's (#348).
 
 
-def land_view(**over):
-    """pr_support's land view with the head's sha: HEAD_SHA unless `over` names another."""
-    return pr_support.land_view(**dict({"headRefOid": HEAD_SHA}, **over))
-
-
-def compare_calls(head, behind):
-    """fakegh entries for `gh api repos/o/r/compare/main...<head>`: `behind` commits of main the head lacks. Only the
-    head's sha is answered (asked by the branch name, the fake has no answer), through `--jq .behind_by` or as the
-    whole comparison."""
-    endpoint = f"repos/o/r/compare/main...{head}"
-    return [{"contains": ["api", endpoint, "--jq"], "stdout": f"{behind}\n"},
-            {"contains": ["api", endpoint], "stdout_json": {"behind_by": behind, "ahead_by": 1,
-                                                            "status": "diverged" if behind else "ahead"}}]
-
-
-def gate_calls(reviews=(), commits=(), pull=PULL, head=HEAD_SHA, behind=0):
-    """pr_support's gate reads (the reviews, their inline comments, the PR's commits), after the compare of main with
-    `head` and the authenticated account (the one the harness reviews are by, should the land judge reviews by it as
-    `harness-pr gate` does)."""
-    return compare_calls(head, behind) + [
-        {"match": ["api", "user"], "contains": ["--jq"], "stdout": "rjeskuri\n"},
-        {"match": ["api", "user"], "stdout_json": {"login": "rjeskuri", "type": "User"}},
-    ] + pr_support.gate_calls(reviews, commits, pull)
-
-
-def compare_failure(head=HEAD_SHA):
-    """The compare of main with `head` failing; placed first in a scenario so it wins."""
+def compare_failure(head=None):
+    """The compare of main with `head` (HEAD_SHA unless given) failing; placed first in a scenario so it wins."""
+    head = HEAD_SHA if head is None else head
     return gate_failure({"contains": ["api", f"repos/o/r/compare/main...{head}"]})
 
 
@@ -197,17 +167,18 @@ class BranchHistory:
 
 
 class Land(WorktreeTest):
-    def land_calls(self, views=None, issue_state="OPEN", comments=(), reviews=(), commits=None, head=HEAD_SHA,
+    def land_calls(self, views=None, issue_state="OPEN", comments=(), reviews=(), commits=None, head=None,
                    behind=0):
         """The land conversation: the review gate's reads first (no harness review by default, so the gate
-        passes; `head` and `behind` the compare of main with the head), then the land; the last entries answer the
-        PR's body and files, the ticket's other fields and a comment posted straight through gh, so the land may
-        read and post the Resolution either way."""
+        passes; `head` (HEAD_SHA unless given) and `behind` the compare of main with the head), then the land; the
+        last entries answer the PR's body and files, the ticket's other fields and a comment posted straight through
+        gh, so the land may read and post the Resolution either way."""
+        head = HEAD_SHA if head is None else head
         views = views or [land_view(headRefOid=head)]
         commits = [pr_commit("a", at(9))] if commits is None else commits
         issue = {"state": issue_state, "labels": [{"name": "task"}, {"name": "status:in-review"}],
                  "comments": list(comments)}
-        return gate_calls(reviews, commits, head=head, behind=behind) + [
+        return land_gate_calls(reviews, commits, head=head, behind=behind) + [
                 {"match": ["pr", "view", "34", "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": SHA}}},
                 {"match": ["pr", "view", "34", "--json", LAND_FIELDS],
                  "responses": [{"stdout_json": v} for v in views]},
@@ -672,7 +643,7 @@ class LandResolution(Land):
         rest = [{"body": c["body"], "user": {"login": c["author"]["login"]}, "created_at": c["createdAt"]}
                 for c in comments]
         # the review gate's reads: no harness review, so the gate lets the land through
-        gate = gate_calls(commits=[pr_commit("a", at(9))], pull=f"repos/o/r/pulls/{pr}")
+        gate = land_gate_calls(commits=[pr_commit("a", at(9))], pull=f"repos/o/r/pulls/{pr}")
         return gate + [
                 {"match": ["pr", "view", pr, "--json", "mergeCommit"],
                  **({"stderr": "GraphQL: timeout\n", "exit": 1} if no_sha == "fail"
@@ -1262,7 +1233,7 @@ class LandRefusals(WorktreeTest):
                  ("closed unmerged", land_view(state="CLOSED"), "closed without being merged")]
         for name, view, needle in cases:
             with self.subTest(name):
-                self.scenario(gate_calls(commits=[pr_commit("a", at(9))])
+                self.scenario(land_gate_calls(commits=[pr_commit("a", at(9))])
                               + [{"match": ["pr", "view", "34"], "stdout_json": view}, REPO_VIEW,
                                  {"match": ["pr", "merge"], "stdout": ""}])
                 self.assertOneLineError(self.pr("land", "34"), needle)
@@ -1886,6 +1857,93 @@ class OpenNotes(WorktreeTest):
         found = self.resolutions()
         self.assertEqual(len(found), 1)
         self.assertNotIn("Notes", found[0][2])
+
+
+# ------------------------------------------------------------------ the shared fixtures stay shared (#348)
+MOVED = ("LAND_FIELDS", "HEAD_SHA", "land_view", "compare_calls", "land_gate_calls")
+
+
+class FixturesLiveInPrSupport(unittest.TestCase):
+    """pr_support.py is a test file to the tests-first rules (#348), so the land modules take its fixtures as they are
+    and bind none of its names themselves: a redefinition after `from pr_support import *` shadows the shared fixture
+    in that one module, and the next change to pr_support misses it."""
+
+    def test_the_land_modules_redefine_none_of_pr_supports_names(self):
+        import ast
+
+        def bound(name):
+            """The names the top level of tests/`name` binds itself: assignments, functions, classes; not imports."""
+            with open(os.path.join(HERE, name), encoding="utf-8") as fh:
+                tree = ast.parse(fh.read(), name)
+            names = set()
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names.add(node.name)
+                elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    names |= {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+            return {n for n in names if not n.startswith("__")}
+
+        shared = bound("pr_support.py")
+        for name in ("LAND_FIELDS", "land_view", "gate_calls", "PrTest"):  # the parser sees pr_support's fixtures
+            self.assertIn(name, shared)
+        shared |= set(MOVED)  # the head-check fixtures #348 moves there, whether or not they are there yet
+        for module in ("test_pr_land.py", "test_pr_ultra.py", "test_pr_land_canary.py"):
+            with self.subTest(module=module):
+                self.assertEqual(sorted(bound(module) & shared), [])
+
+    def gh(self, calls, *argv):
+        """(exit, stdout) of fakegh asked `gh argv` with `calls` as its scenario."""
+        tmp = tempfile.mkdtemp(prefix="harness-pr-support-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        scenario = os.path.join(tmp, "scenario.json")
+        with open(scenario, "w", encoding="utf-8") as fh:
+            json.dump({"calls": calls}, fh)
+        p = subprocess.run([sys.executable, FAKEGH, *argv], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                           env=dict(os.environ, FAKEGH_SCENARIO=scenario), timeout=60)
+        return p.returncode, p.stdout
+
+    def test_pr_support_provides_the_head_check_fixtures(self):
+        """What the land modules take from pr_support since #348, asked of fakegh as `harness-pr land` asks it."""
+        missing = [name for name in MOVED if not hasattr(pr_support, name)]
+        self.assertEqual(missing, [], "pr_support does not define these")
+        # what land reads of the PR: the head's sha among the rest
+        fields = pr_support.LAND_FIELDS.split(",")
+        for field in ("isDraft", "mergeable", "headRefName", "headRefOid", "closingIssuesReferences",
+                      "statusCheckRollup", "title", "url", "state"):
+            self.assertIn(field, fields)
+        # the head: the commit pr_support's harness reviews are of, so the latest review is at the head by default
+        self.assertEqual(pr_support.HEAD_SHA, harness_review(7, at(3))[0]["commit_id"])
+        self.assertEqual(pr_support.land_view()["headRefOid"], pr_support.HEAD_SHA)
+        view = pr_support.land_view(headRefOid="d" * 40, state="MERGED")
+        self.assertEqual((view["headRefOid"], view["state"], view["headRefName"]), ("d" * 40, "MERGED", BRANCH))
+        # the compare of main with a head: answered for that head alone, through --jq or whole
+        for head, behind in (("a" * 40, 0), ("b" * 40, 3), (pr_support.HEAD_SHA, 7)):
+            endpoint = f"repos/o/r/compare/main...{head}"
+            for name, calls in (("compare_calls", pr_support.compare_calls(head, behind)),
+                                ("land_gate_calls", pr_support.land_gate_calls(head=head, behind=behind))):
+                with self.subTest(name, head=head, behind=behind):
+                    self.assertEqual(self.gh(calls, "api", endpoint, "--jq", ".behind_by"), (0, f"{behind}\n"))
+                    code, out = self.gh(calls, "api", endpoint)
+                    self.assertEqual((code, json.loads(out)["behind_by"]), (0, behind))
+                    other = "repos/o/r/compare/main...t/12-add-the-widget"
+                    self.assertEqual(self.gh(calls, "api", other, "--jq", ".behind_by")[0], 1)  # no answer
+        # land_gate_calls: by default the head is HEAD_SHA, level with main; the account; then gate_calls' reads
+        calls = pr_support.land_gate_calls()
+        self.assertEqual(self.gh(calls, "api", f"repos/o/r/compare/main...{pr_support.HEAD_SHA}", "--jq", "."),
+                         (0, "0\n"))
+        self.assertEqual(self.gh(calls, "api", "user", "--jq", ".login"), (0, "rjeskuri\n"))
+        self.assertEqual(json.loads(self.gh(calls, "api", "user")[1])["login"], "rjeskuri")
+        reviews, commits = [harness_review(101, at(10), inline=[FROBS])], [pr_commit("e", at(9))]
+        pull = "repos/o/r/pulls/57"
+        calls = pr_support.land_gate_calls(reviews, commits, pull, head="f" * 40, behind=2)
+        for read in (f"{pull}/reviews/101/comments", f"{pull}/reviews", f"{pull}/commits"):
+            with self.subTest(read=read):
+                self.assertEqual(self.gh(calls, "api", read), self.gh(pr_support.gate_calls(reviews, commits, pull),
+                                                                       "api", read))
+                self.assertEqual(self.gh(calls, "api", read)[0], 0)
+        # gate_calls itself stays the gate's reads alone, as test_pr.py uses it
+        self.assertEqual(self.gh(pr_support.gate_calls(), "api", "user")[0], 1)
 
 
 if __name__ == "__main__":

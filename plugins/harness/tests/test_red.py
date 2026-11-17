@@ -15,13 +15,16 @@ import hashlib
 import importlib.util
 import json
 import os
+import random
 import shlex
 import shutil
+import string
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import uuid
 from importlib.machinery import SourceFileLoader
 from unittest import mock
 
@@ -171,6 +174,37 @@ def moved_to_end(text, block):
 def line_moved_into(text, line, anchor):
     """`text` with `line` taken out of its test and put after `anchor`, in another one."""
     return once(once(text, line, ""), anchor, anchor + line)
+
+
+# Names a real project has above its tests/ (none of the fixtures' literal parents, so a made-up path never repeats
+# one). Mixed with the made-up shapes below: a pattern that names the real ones (src/tests/**) misses the made-up
+# ones, one that names a made-up shape (d*/**/tests/**) misses the real ones; only every tests/ directory passes (#348).
+REAL_PARENTS = ("src", "app", "lib", "services", "packages", "internal", "core", "api", "cli", "backend", "server")
+
+
+def real_parent():
+    """One directory name a real project uses, drawn for this run."""
+    return random.choice(REAL_PARENTS)
+
+
+def segment():
+    """One directory name made up for this run, in no fixed shape: a real project's, one with a suffix, or hex digits
+    after any letter, upper or lower, or a digit, with a - or . inside. None contains "test", "spec" or "docs", so no
+    pattern matches one by its name, and no list or shape written in advance names them all."""
+    h = uuid.uuid4().hex[:8]
+    return random.choice((
+        real_parent(),
+        real_parent() + "_" + h[:4],
+        random.choice(string.ascii_lowercase) + h,
+        random.choice(string.ascii_uppercase) + h[:6],
+        random.choice(string.digits) + h[:3] + "-" + h[3:],
+        "v" + random.choice(string.digits) + "." + h[:4],
+    ))
+
+
+def generated(n):
+    """`n` directory names made up for this run (see segment), /-joined ("" for none)."""
+    return "/".join(segment() for _ in range(n))
 
 
 def expected_hash(root, files):
@@ -873,6 +907,80 @@ exit 254
         p = self.red("check")
         self.assertLess(time.monotonic() - started, 20)
         self.assertOneLineError(p, "timed out after 1s", "no red run recorded")
+
+    # ------------------------------------------------------------ files under a nested tests/ directory (#348)
+    # Under the default patterns (the fixture's main settings set none) every file below a tests/ directory, at any
+    # depth, is a test file of the proof: the support modules, fakes and helpers beside a test module are hashed with
+    # it, never count as source, and an edit of any of them after the red run leaves the record not current.
+    NESTED_RED = "F\nAssertionError: the widget is not built\nFAILED (failures=1)\n"
+
+    def assert_test_files_of_the_proof(self, files, run_files):
+        """Put `files` (path -> text) and run check with a runner that fails as an assertion: every one of them is a
+        test file of the record and `run_files` alone are run; then each other file, edited, makes the record not
+        current, and put back, current again."""
+        for rel, text in files.items():
+            self.put(rel, text)
+        p = self.red("check", **self.fake_runner(self.NESTED_RED, 1))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout.splitlines()[0], f"red (assertion): {len(files)} test files, exit 1")
+        rec = self.record()
+        self.assertEqual(rec["test_files"], sorted(files))
+        self.assertEqual(rec["run_files"], run_files)
+        self.assertEqual(rec["test_hash"], expected_hash(self.wt, files))
+        self.assertEqual(self.current(), "current: yes")
+        for rel, text in sorted(files.items()):
+            if rel in run_files:
+                continue
+            with self.subTest(edited=rel):
+                self.put(rel, text + "# edited after the red run\n")
+                self.assertEqual(self.current(), "current: no")
+                self.put(rel, text)
+                self.assertEqual(self.current(), "current: yes")
+
+    def test_support_modules_under_nested_tests_directories_are_test_files(self):
+        self.assert_test_files_of_the_proof({
+            "plugins/harness/tests/test_widget.py": TEST_ADD,
+            "plugins/harness/tests/widget_support.py": "WIDTH = 3\n",
+            "plugins/harness/tests/fakegh.py": "ANSWERS = []\n",
+            "svc/api/tests/x_support.py": "ROWS = 2\n",
+            "svc/api/tests/helpers/builders.py": "def build():\n    return 1\n",
+            "svc/api/tests/fixtures/rows.json": "[1, 2]\n",
+            f"{generated(1)}/{real_parent()}/tests/z_support.py": "DEPTH = 2\n",   # parents made up for this run
+            f"{generated(random.randint(15, 40))}/tests/{generated(2)}/fakegh.py": "ANSWERS = [1]\n",  # depth per run
+            f"{real_parent()}/tests/w_support.py": "COLS = 4\n",                 # a real name right above tests/
+        }, ["plugins/harness/tests/test_widget.py"])
+
+    def test_source_outside_tests_directories_is_still_refused_before_the_red_run(self):
+        for rel, text in (("pkg/tests/test_widget.py", TEST_ADD), ("pkg/tests/widget_support.py", "WIDTH = 3\n"),
+                          ("pkg/tests/fakegh.py", "ANSWERS = []\n"),
+                          (f"{generated(2)}/tests/{generated(1)}/y_support.py", "ROWS = 1\n"),
+                          (f"{real_parent()}/tests/z_support.py", "ROWS = 2\n")):
+            self.put(rel, text)
+        # the name alone (a _support.py, a fakegh.py, "tests" in a file or directory name) is no test
+        sources = ["pkg/fakegh.py", "pkg/testsuite/x_support.py", "pkg/tests_helper.py",
+                   "plugins/harness/lib/harness_lib/x_support.py", "src/compat_support.py",
+                   f"{generated(2)}/testsuite/x_support.py", f"{generated(1)}/tests_helper.py",
+                   f"{real_parent()}/{generated(1)}_support.py"]
+        for rel in sources:
+            self.put(rel, "X = 1\n")
+        p = self.red("check", **self.fake_runner(self.NESTED_RED, 1))
+        self.assertEqual(self.refused_sources(p), sorted(sources))
+        self.assertFalse(os.path.exists(self.record_path))
+
+    def test_this_checkouts_settings_make_its_support_modules_test_files(self):
+        plugin = os.path.dirname(BIN)
+        # a test_<x>_support.py is a runnable test module, not a fixture module, so it is not support
+        support = sorted(n for n in os.listdir(os.path.join(plugin, "tests"))
+                         if n.endswith("_support.py") and not n.startswith("test_"))
+        support.append("fakegh.py")
+        self.assertIn("pr_support.py", support)              # the layout #348 is about
+        self.assertGreaterEqual(len(support), 4)
+        checkout = os.path.dirname(os.path.dirname(plugin))
+        write(os.path.join(self.repo, ".claude", "settings.json"),       # what classifies is the main checkout's
+              read(os.path.join(checkout, ".claude", "settings.json")))
+        files = {"plugins/harness/tests/test_widget.py": TEST_ADD}
+        files.update({f"plugins/harness/tests/{name}": f"NAME = {name!r}\n" for name in support})
+        self.assert_test_files_of_the_proof(files, ["plugins/harness/tests/test_widget.py"])
 
     # ------------------------------------------------------------ status
     def test_status_current(self):

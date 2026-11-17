@@ -19,9 +19,11 @@ from harness_lib.repo import TIMEOUT as CHECKOUT_TIMEOUT, main_checkout
 
 GIT_TIMEOUT = 10  # seconds committed_env's git show may take
 # The defaults of HARNESS_TEST_PATTERNS and HARNESS_SOURCE_EXEMPT when a project sets none: the one
-# definition that tests_first, harness-red, the auto-land gate and harness-work cost all read.
-DEFAULT_TEST_PATTERNS = ("tests/**,test/**,**/test_*.py,**/*_test.py,**/conftest.py,**/*_test.js,**/*.test.js,"
-                         "**/*.test.ts,**/*_test.ts,spec/**")
+# definition that tests_first, harness-red, the auto-land gate and harness-work cost all read. **/tests/** makes
+# every file below a tests/ directory at any depth a test, whatever its name (a project's support modules, fakes
+# and fixtures beside its test modules, #348), before the exempt suffixes count.
+DEFAULT_TEST_PATTERNS = ("tests/**,test/**,**/tests/**,**/test_*.py,**/*_test.py,**/conftest.py,**/*_test.js,"
+                         "**/*.test.js,**/*.test.ts,**/*_test.ts,spec/**")
 DEFAULT_SOURCE_EXEMPT = ("docs/**,**/*.md,.claude/**,.github/**,.githooks/**,**/*.toml,**/*.cfg,**/*.ini,**/*.json,"
                          "**/*.yaml,**/*.yml,**/*.txt,**/*.lock,.gitignore,.worktreeinclude,LICENSE*")
 # Configuration that decides which tests run and how, matched with glob_match (an entry without / matches
