@@ -444,7 +444,10 @@ exit 254
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(p.stdout.splitlines()[0], "red (assertion): 1 test files, exit 1", p.stdout)
         rec = self.record()
-        self.assertEqual(rec["cmd"], cmd)
+        if cmd is None:         # the detected default, which may also put the test directories on the path (#346)
+            self.assertRegex(rec["cmd"], r"python3 -m unittest .*tests/test_calc\.py")
+        else:
+            self.assertEqual(rec["cmd"], cmd)
         self.assertIn(said, rec["tail"])
 
     def test_another_projects_test_cmd_in_the_environment_does_not_reach_this_worktree(self):
@@ -481,7 +484,7 @@ exit 254
                  ("worktree settings.local.json over it", {"HARNESS_TEST_CMD": own_cmd("tracked")},
                   {"HARNESS_TEST_CMD": own_cmd("local")},
                   own_cmd("local").replace("{files}", "tests/test_calc.py"), "own runner local"),
-                 ("no test command: the detected default", {}, None, self.OWN_CMD, "AssertionError: None != 5")]
+                 ("no test command: the detected default", {}, None, None, "AssertionError: None != 5")]
         for name, env, local_env, expected, said in cases:
             with self.subTest(name):
                 write(tracked, json.dumps({"env": env}))
@@ -1796,8 +1799,13 @@ class RedHelpers(unittest.TestCase):
         self.assertEqual(detect(py, uv_lock=""), "uv run pytest -q {files}")
         self.assertEqual(detect(py, pyproject_toml="[tool.pytest.ini_options]\n"), "python3 -m pytest -q {files}")
         self.assertEqual(detect(py, pytest_ini="[pytest]\n"), "python3 -m pytest -q {files}")
-        self.assertEqual(detect(py, pyproject_toml="[project]\nname = 'x'\n"), "python3 -m unittest {files}")
-        self.assertEqual(detect(["pkg/x_test.py"]), "python3 -m unittest {files}")
+        # unittest, which may also put the test files' directories on the import path (#346)
+        for files, project in ((py, {"pyproject_toml": "[project]\nname = 'x'\n"}), (["pkg/x_test.py"], {}),
+                               (["tests/test_a.py", "tests/unit/test_b.py"], {})):
+            cmd = detect(files, **project)
+            self.assertIn("python3 -m unittest", cmd, files)
+            self.assertIn("{files}", cmd, files)
+            self.assertNotIn("pytest", cmd, files)
         self.assertEqual(detect(["tests/a.test.js"], package_json='{"scripts": {"test": "node --test"}}'),
                          "npm test -- {files}")
         self.assertEqual(detect(["tests/a.test.js"], package_json='{"scripts": {}}'), "node --test {files}")
