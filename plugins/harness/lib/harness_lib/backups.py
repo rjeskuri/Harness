@@ -3,7 +3,9 @@ sweep that removes it after KEEP_DAYS days.
 A snapshot is <store>/<id>/: files/<k>, one copy per item (a file, a whole folder tree, or a symlink
 kept as a link and never followed), and manifest.json. The store is ~/.claude/harness/backups/, or
 <git common dir>/harness-backups/ for a project with any HARNESS_SENSITIVE_PATHS pattern, so that
-project's copies never leave it. harness-work's `backup list` and `backup restore` read it; the
+project's copies never leave it. What git keeps itself (backup_gate.py's git forms) is a ref
+refs/harness-backup/<id>/<what>[/<name>] in the repository, listed in the manifest's `refs`; its
+restore never touches a working tree. harness-work's `backup list` and `backup restore` read it; the
 SessionStart hook (session_brief.py) sweeps it. See docs/design.md (State, harness-work).
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
@@ -35,6 +37,8 @@ REF_ROOT = "refs/harness-backup"            # a snapshot's refs: refs/harness-ba
 KEEP_DAYS = 14                              # what sweep keeps: snapshots and refs this many days old or newer
 ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}")
 ID_TRIES = 100                              # suffixes tried for one second before giving up
+REF_KINDS = ("head", "changes", "branch", "stash")  # what a kept ref is (State)
+SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 GIT_TIMEOUT = 10                            # seconds one git call may take
 KILL_GRACE = 0.3                            # seconds a git sent TERM gets to remove its lock files before KILL
 PRIVATE = 0o700                             # the store folders' mode
@@ -74,26 +78,27 @@ def _store(main, pats):
 
 
 def _run_git(cwd, args, deadline=None):
-    """(exit code, stdout) of git in `cwd`, or None when it cannot run or runs past GIT_TIMEOUT or `deadline` (a
-    time.monotonic() instant). It runs in a process group of its own, and nothing returns or raises here before
-    it has exited and been reaped: out of time (or on any other exception) the whole group is stopped first
-    (_stop_group), so no git, and nothing git started, outlives the call, and git gets to remove its lock files."""
+    """(exit code, stdout, stderr) of git in `cwd`, or None when it cannot run or runs past GIT_TIMEOUT or
+    `deadline` (a time.monotonic() instant). It runs in a process group of its own, and nothing returns or raises
+    here before it has exited and been reaped: out of time (or on any other exception) the whole group is stopped
+    first (_stop_group), so no git, and nothing git started, outlives the call, and git gets to remove its lock
+    files."""
     left = GIT_TIMEOUT if deadline is None else min(GIT_TIMEOUT, deadline - time.monotonic())
     if left <= 0:
         return None
     try:
         proc = subprocess.Popen(["git", "-C", cwd, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, start_new_session=True)
+                                stderr=subprocess.PIPE, start_new_session=True)
     except (OSError, ValueError):
         return None
     try:
-        out, _err = proc.communicate(timeout=left)
+        out, errs = proc.communicate(timeout=left)
     except BaseException as err:
         _stop_group(proc)
         if isinstance(err, subprocess.TimeoutExpired):
             return None
         raise
-    return proc.returncode, out.decode("utf-8", "surrogateescape")
+    return proc.returncode, out.decode("utf-8", "surrogateescape"), errs.decode("utf-8", "surrogateescape")
 
 
 def _stop_group(proc):
@@ -118,12 +123,24 @@ def _stop_group(proc):
             pass
         proc.wait()
         proc.stdout.close()
+        proc.stderr.close()
 
 
 def _git(cwd, *args, deadline=None):
     """git's stripped stdout, or None when it fails, prints nothing, cannot run or runs out of time."""
     done = _run_git(cwd, args, deadline)
     return done[1].strip() if done and done[0] == 0 and done[1].strip() else None
+
+
+def _git_ok(cwd, *args):
+    """(ok, git's last stderr line) of a git call judged by its exit (a ref write, check-ref-format), through
+    _run_git, so one stopped past GIT_TIMEOUT gets to remove its lock files; one that cannot run or runs out of
+    time is not ok."""
+    done = _run_git(cwd, args)
+    if done is None:
+        return False, f"git did not run, or ran past {GIT_TIMEOUT} s"
+    lines = done[2].strip().splitlines()
+    return done[0] == 0, lines[-1] if lines else f"exit {done[0]}"
 
 
 def _common_dir(main, deadline=None):
@@ -335,13 +352,19 @@ def _new_folder(store, when):
     raise BackupError(f"no free snapshot id in {store} for {stamp}")
 
 
-def _take(store, repo, paths, pats, *, cwd, command, session, now, leave_out=()):
-    """The snapshot of `paths` in `store` with `repo` as its repository; its manifest. A failure leaves no folder."""
+def _ref_name(snapshot_id, what, name):
+    return f"{REF_ROOT}/{snapshot_id}/{what}" + ("" if name is None else f"/{name}")
+
+
+def _take(store, repo, paths, pats, *, cwd, command, session, now, leave_out=(), refs=()):
+    """The snapshot of `paths` in `store` with `repo` as its repository, and each of `refs` ({what, name, sha,
+    worktree}) written as refs/harness-backup/<id>/<what>[/<name>] in its worktree's repository; its manifest. A
+    failure leaves no folder and no ref."""
     cwd = os.path.abspath(cwd)
     when = now or dt.datetime.now(dt.timezone.utc)
     when = (when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)).astimezone(dt.timezone.utc)
     left = {os.path.normpath(os.path.join(cwd, p)) for p in leave_out}
-    doing, folder = f"create the store {store}", None
+    doing, folder, written = f"create the store {store}", None, []
     try:
         items = _existing(paths, cwd)
         folder = _new_folder(os.fspath(store), when)
@@ -357,12 +380,23 @@ def _take(store, repo, paths, pats, *, cwd, command, session, now, leave_out=())
             _copy(path, copy, skip or None)
             listed.append({"path": path, "copy": f"files/{k}", "kind": kind, "bytes": _bytes(copy)})
             sensitive = sensitive or _sensitive(path, copy, pats, tops)
+        kept = []
+        for keep in refs:
+            what, name, sha, worktree = keep["what"], keep.get("name"), keep["sha"], keep["worktree"]
+            ref = _ref_name(os.path.basename(folder), what, name)
+            ok, why = _git_ok(worktree, "update-ref", ref, sha, "")    # "": the ref must not exist yet
+            if not ok:
+                raise BackupError(f"cannot write {ref} in {worktree}: {why}; no snapshot taken")
+            written.append((worktree, ref))
+            kept.append({"ref": ref, "sha": sha, "what": what, "name": name, "worktree": worktree})
         manifest = {"id": os.path.basename(folder), "at": when.strftime("%Y-%m-%dT%H:%M:%SZ"), "repo": repo,
                     "cwd": cwd, "command": command, "session": session, "sensitive": sensitive, "items": listed,
-                    "refs": []}
+                    "refs": kept}
         doing = f"write {folder}/manifest.json"
         write_json(os.path.join(folder, "manifest.json"), manifest, prefix=".harness-backup-")
     except BaseException as err:
+        for worktree, ref in written:
+            _git_ok(worktree, "update-ref", "-d", ref)
         if folder:
             try:
                 _remove(folder)
@@ -374,15 +408,17 @@ def _take(store, repo, paths, pats, *, cwd, command, session, now, leave_out=())
     return manifest
 
 
-def create(paths, *, main, cwd, command, session=None, now=None, leave_out=()):
+def create(paths, *, main, cwd, command, session=None, now=None, leave_out=(), refs=()):
     """Snapshot each existing path of `paths` (a relative one taken from `cwd`, a missing one skipped) into the
     store of `main` (the main checkout, or None outside a repository); writes and returns the manifest
-    {id, at, repo, cwd, command, session, sensitive, items: [{path, copy, kind, bytes}], refs}. `leave_out` names
-    entries inside folder items (spelled from the item's path down, a relative one taken from `cwd`) that the copy
-    leaves out, with everything under them."""
+    {id, at, repo, cwd, command, session, sensitive, items: [{path, copy, kind, bytes}], refs: [{ref, sha, what,
+    name, worktree}]}. `leave_out` names entries inside folder items (spelled from the item's path down, a relative
+    one taken from `cwd`) that the copy leaves out, with everything under them. Each of `refs` ({what, name, sha,
+    worktree}; what one of REF_KINDS) becomes refs/harness-backup/<id>/<what>[/<name>], written with git update-ref
+    in `worktree`'s repository."""
     pats = sensitive_patterns(main)
     return _take(_store(main, pats), canonical_path(main) if main else None, paths, pats, cwd=cwd,
-                 command=command, session=session, now=now, leave_out=leave_out)
+                 command=command, session=session, now=now, leave_out=leave_out, refs=refs)
 
 
 # --------------------------------------------------------------- restore
@@ -472,14 +508,90 @@ def _put(source, target, replace):
         _remove(aside)
 
 
+def _ref_plan(manifest, repo, snapshot_id):
+    """(what, name, sha, where, target) for each of the manifest's refs, every one checked before anything is
+    written: `where` is the recorded worktree (else the snapshot's repository) git acts in, `target` the branch a
+    head or branch ref makes (None for changes and stash). BackupError for a damaged entry, a sha that is not a
+    commit there, or a branch that exists."""
+    plan, targets = [], set()
+    for entry in manifest.get("refs") or []:
+        entry = entry if isinstance(entry, dict) else {}
+        what, name, sha, worktree = (entry.get(k) for k in ("what", "name", "sha", "worktree"))
+        label = what if name is None else f"{what}/{name}"
+        if what not in REF_KINDS or not (isinstance(sha, str) and SHA_RE.fullmatch(sha)) or (
+                what == "branch" and not (isinstance(name, str) and name)):
+            raise BackupError(f"backup {snapshot_id} is damaged: a ref entry names no {label or 'ref'} to restore")
+        where = next((d for d in (worktree, repo) if isinstance(d, str) and os.path.isdir(d)
+                      and _git(d, "rev-parse", "--git-dir")), None)
+        if where is None:
+            raise BackupError(f"cannot restore {label} of backup {snapshot_id}: {worktree} is no repository now")
+        if _git(where, "cat-file", "-t", sha) != "commit":
+            raise BackupError(f"backup {snapshot_id} is damaged: {label} names {sha}, not a commit in {where}")
+        target = {"branch": f"refs/heads/{name}", "head": f"refs/heads/harness-restore/{snapshot_id}"}.get(what)
+        if target is not None:
+            branch = target[len("refs/heads/"):]
+            if not _git_ok(where, "check-ref-format", target)[0]:
+                raise BackupError(f"backup {snapshot_id} is damaged: {branch!r} is no branch name")
+            if target in targets or _git(where, "rev-parse", "--verify", "-q", target):
+                raise BackupError(f"branch {branch} exists; backup {snapshot_id} recreates it only where it is gone "
+                                  "(rename or delete it first)")
+            targets.add(target)
+        plan.append((what, name, sha, where, target))
+    return plan
+
+
+def _restore_refs(plan, snapshot_id, progress):
+    """Each planned ref back without touching a working tree: a branch (head: harness-restore/<id>) created at its
+    sha, changes and stash entries stored in the stash list (the oldest first, changes on top), one already there
+    left as it is. Returns [{what, name, sha, to}]."""
+    done = []
+
+    def tell(line):
+        if progress:
+            progress("ref", line)
+
+    for what, name, sha, where, target in plan:
+        if target is None:
+            continue
+        ok, why = _git_ok(where, "update-ref", "-m", f"harness-work backup restore {snapshot_id}", target, sha, "")
+        branch = target[len("refs/heads/"):]
+        if not ok:
+            raise BackupError(f"cannot create branch {branch}: {why} ({len(done)} refs of backup {snapshot_id} "
+                              "restored)")
+        done.append({"what": what, "name": name, "sha": sha, "to": target})
+        tell(f"restored branch {branch} at {sha[:12]}" if what == "branch" else
+             f"restored HEAD {sha[:12]} as branch {branch}")
+    entries = sorted((p for p in plan if p[4] is None),
+                     key=lambda p: (p[0] == "changes", -int(p[1]) if str(p[1]).isdigit() else 0))
+    held = set()
+    for what, name, sha, where, _target in entries:
+        if sha in (_git(where, "stash", "list", "--format=%H") or "").split():
+            held.add(sha)
+        else:
+            ok, why = _git_ok(where, "stash", "store", "-m", f"harness-backup {snapshot_id}", sha)
+            if not ok:
+                raise BackupError(f"cannot store {sha} in the stash list: {why} ({len(done)} refs of backup "
+                                  f"{snapshot_id} restored)")
+        done.append({"what": what, "name": name, "sha": sha, "to": "stash"})
+    for what, name, sha, where, _target in entries:
+        shas = (_git(where, "stash", "list", "--format=%H") or "").split()
+        at = f"stash@{{{shas.index(sha)}}}" if sha in shas else sha[:12]
+        verb = "was already" if sha in held else "stored"
+        tell(f"{what if name is None else f'{what} {name}'} {sha[:12]} {verb} in the stash list as {at}; "
+             f"git stash apply {at} (in {where}) brings it back")
+    return done
+
+
 def restore(main, snapshot_id, *, only=None, to=None, force=False, cwd=None, command="", session=None,
             progress=None):
     """Put snapshot `snapshot_id`'s items back: each at its original path, or under `to` (see _target); with `only`,
     the items at or under it. `only` and `to` are taken from `cwd` (default: the process's). Every target is checked
     before anything is written; an existing one refuses the restore unless `force`, which first snapshots the
     existing targets with the snapshot's repo: into its project store when the snapshot sat in one, else into the
-    store that repo's snapshots go to now (store_dir). `progress(kind, value)` hears ("saved", that
-    snapshot's manifest) and ("restored", target) as each happens. Returns {id, restored, replaced, saved}."""
+    store that repo's snapshots go to now (store_dir). The manifest's refs come back too (not with `only`), checked
+    with the items and never touching a working tree (_ref_plan, _restore_refs); `force` replaces items only, never
+    a branch. `progress(kind, value)` hears ("saved", that snapshot's manifest), ("restored", target) and ("ref",
+    a line) as each happens. Returns {id, restored, replaced, saved, refs}."""
     found = _locate(main, snapshot_id)
     if found is None:
         raise BackupError(f"no backup {snapshot_id}")
@@ -499,6 +611,7 @@ def restore(main, snapshot_id, *, only=None, to=None, force=False, cwd=None, com
     tops = {}
     plan = sorted((_target(path, repo, root, tops), path, source) for path, source in items)
     _check(plan, root, sid)
+    refs = _ref_plan(manifest, repo, sid) if only is None else []
     existing = [target for target, _path, _source_ in plan if os.path.lexists(target)]
     replace = set(existing)
     if existing and not force:
@@ -525,7 +638,8 @@ def restore(main, snapshot_id, *, only=None, to=None, force=False, cwd=None, com
         restored.append(target)
         if progress:
             progress("restored", target)
-    return {"id": sid, "restored": restored, "replaced": existing, "saved": saved}
+    return {"id": sid, "restored": restored, "replaced": existing, "saved": saved,
+            "refs": _restore_refs(refs, sid, progress)}
 
 
 # --------------------------------------------------------------- sweep
