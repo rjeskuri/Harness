@@ -58,7 +58,8 @@ def wired(name: str, timeout: int) -> tuple:
     return ("command", "python3", [f"{PLUGIN_ROOT}/hooks/{name}"], timeout)
 
 
-# Every hook's wiring before #385, land_ask.py's line taken out: event -> [(matcher, [hook, ...]), ...] in order.
+# Every hook's wiring before #385, land_ask.py's line taken out, and readonly_allow.py last for Bash since #392:
+# event -> [(matcher, [hook, ...]), ...] in order.
 EXPECTED_WIRING = {
     "Notification": [
         ("permission_prompt|idle_prompt|agent_needs_input|agent_completed", [wired("notify.py", 30)]),
@@ -68,7 +69,7 @@ EXPECTED_WIRING = {
     ],
     "PreToolUse": [
         ("Bash", [wired("readonly_bash.py", 10), wired("branch_guard.py", 10), wired("tests_first.py", 10),
-                  wired("backup_gate.py", 30)]),
+                  wired("backup_gate.py", 30), wired("readonly_allow.py", 10)]),
         ("Edit|Write|NotebookEdit", [wired("branch_guard.py", 10), wired("tests_first.py", 10)]),
     ],
     "PostToolUse": [

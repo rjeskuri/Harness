@@ -15,7 +15,7 @@ Three steps, one line per check on stdout; a passing check's line starts with "o
      backup_gate gives no decision on `git status`; session_brief answers SessionStart with an
      additionalContext; notify, with no notifier on PATH, prints
      the bell; after_edit and verify_on_stop exit 0 without blocking; land_ask makes no decision on
-     `git status`. A case fails on a timeout, a non-zero
+     `git status`; readonly_allow answers allow to `git status`. A case fails on a timeout, a non-zero
      exit, a traceback, an error line on stderr (a hook failing open) or a wrong answer.
   3. `<tool> --help` for every file in bin/: exit 0 with usage on stdout.
 
@@ -208,6 +208,11 @@ def expect_allow(stdout: str) -> str | None:
     return None if found in (None, "allow") else f"answered {found!r}, not allow"
 
 
+def expect_allow_decision(stdout: str) -> str | None:
+    found = decision(stdout)
+    return None if found == "allow" else f"answered {found or 'no decision'}, not allow"
+
+
 def expect_no_decision(stdout: str) -> str | None:
     found = decision(stdout)
     return None if found is None else f"answered {found!r}, not no decision"
@@ -266,6 +271,8 @@ def hook_cases(repo: str) -> list:
         ("verify_on_stop.py", "exits 0 at a stop", event("Stop", stop_hook_active=False), expect_no_block, False),
         ("land_ask.py", "makes no decision on Bash `git status`", pre("Bash", {"command": "git status"}),
          expect_no_decision, False),
+        ("readonly_allow.py", "allows Bash `git status`", pre("Bash", {"command": "git status"}),
+         expect_allow_decision, False),
     ]
 
 

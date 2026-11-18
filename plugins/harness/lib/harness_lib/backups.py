@@ -58,6 +58,14 @@ def sensitive_patterns(main):
     return list(dict.fromkeys(found))
 
 
+def secret(rel):
+    """Secret-shaped, in any case: .env, .env.*, *.pem, *.key, or credentials/ and under (`rel` with /
+    separators, relative to its own working tree); backup_gate.py and readonly_allow.py judge paths by it."""
+    parts = rel.lower().split("/")
+    name = parts[-1]
+    return "credentials" in parts or name == ".env" or name.startswith(".env.") or name.endswith((".pem", ".key"))
+
+
 def global_store():
     return Path(harness_home("backups"))
 

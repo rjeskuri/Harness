@@ -42,9 +42,10 @@ REDIRECTS = {
 
 
 class Part:
-    """One simple command: its words without quotes, where its output goes, the bodies
-    of its heredocs, its text as written and the operator after it (;, &&, ||, |, &, or
-    "" at a newline or the end). A marker part, with no words, opens ("(") or closes
+    """One simple command: its words without quotes, where its output goes, the words its
+    input redirections name (`inputs`: after <, <& and <<<), the bodies of its heredocs,
+    its text as written and the operator after it (;, &&, ||, |, &, or "" at a newline
+    or the end). A marker part, with no words, opens ("(") or closes
     (")") a subshell. `lead` is the operators written between it and the last part
     before it that holds anything, joined, a newline adding none: "" first in the
     command or on a new line, "&&" after `true &&` and a newline, "(" first in a
@@ -55,6 +56,7 @@ class Part:
     def __init__(self, marker: str = "") -> None:
         self.words: list[str] = []
         self.targets: list[str] = []
+        self.inputs: list[str] = []
         self.heredocs: list[str] = []
         self.text = ""
         self.sep = ""
@@ -123,6 +125,8 @@ def split_command(command: str, depth: int = 0) -> list[Part]:
             part.targets.append(word)
         elif redirect.startswith("heredoc"):
             heredocs.append((word, redirect == "heredoc-", part))
+        elif redirect == "in":
+            part.inputs.append(word)
         elif not redirect:
             part.words.append(word)
         word, redirect = None, ""
