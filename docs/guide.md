@@ -52,7 +52,7 @@ One session per project. `claude agents` in a terminal lists every session, incl
 | Start | `harness-work start N` | Branch `t/N-<slug>`, a worktree under `.claude/worktrees/`, label `status:in-progress`, a comment on the ticket |
 | Tests | `test-author` at the ticket's tier | Writes the tests the ticket names, broad behavior first, and runs them |
 | Red proof | `harness-red check` | Runs the new tests against unchanged source. They must fail; the record is written |
-| Break | `test-breaker` | In a scratch copy, tries to pass the tests with a cheat. If it can, the tests go back to the author, at most twice |
+| Break | `test-breaker` | In a scratch copy, tries once to pass the tests with a cheat, only on a risk:high ticket that changes a hook's decision path or a tool that destroys or rewrites data. Its gaps go to the coder as requirements and to the reviewer as check items |
 | Code | `coder` at the tier | Changes source only, until the new tests and the ticket's own tests pass, and commits |
 | Review | `reviewer`, Opus (xhigh for risk:high), unless the project sets `HARNESS_REVIEW_TIER` | Checks the branch against the definition of done. High and medium findings go back to the coder, at most twice |
 | PR | `harness-pr open`, `harness-pr review` | Pushes the branch, opens a draft PR, posts the findings as a review |
