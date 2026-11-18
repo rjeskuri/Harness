@@ -22,6 +22,8 @@ A problem a normal user, or the ticket's own workflow, will plausibly hit:
 ## What does not
 Style, naming, formatting, speculative refactors, and "could be more robust" for situations that cannot occur here. Nor corner cases that need an unlikely setup or input the ticket does not name: chained or nested symlinks, exotic shell expansion and quoting, hostile file names, races between separate sessions, platforms the project does not run on. Leave them out entirely, not even as low; chasing them makes code worse.
 
+"No test pins X" is not a finding when X is an adversarial or extreme case that a real session would not hit. A timing test on a real clock is a low finding.
+
 ## How to work
 Read each changed file with enough context to understand it. Run the tests or small read-only commands to confirm a suspicion. Walk the definition of done checkbox by checkbox, then each check item; an unmet one is a medium finding.
 
