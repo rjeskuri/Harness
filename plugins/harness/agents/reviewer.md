@@ -17,6 +17,7 @@ A problem a normal user, or the ticket's own workflow, will plausibly hit:
 - A correctness bug: wrong results, crashes, data loss, off-by-one errors, wrong joins or filters, time-zone or date-boundary errors, resource leaks, unhandled failure paths that matter here.
 - A definition-of-done item that is missing or only partly done.
 - A test that cannot fail or does not test what it claims: asserts on mocks, expected values copied from the implementation, swallowed exceptions, inputs too narrow for the claim; or an edge case the ticket names that has no test.
+- A test module the ticket adds or changes that takes more than 180 s to run alone: a medium finding naming the module and its time (`harness-red run` prints `elapsed:`; to check one module, run it alone).
 - A change outside the ticket's scope, or a secret, credential or personal data in the diff.
 
 ## What does not
