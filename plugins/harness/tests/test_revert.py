@@ -1,5 +1,5 @@
 """Tests for `harness-pr revert` (ticket #153, epic #133): revert a landed PR on main through the main checkout,
-file a risk:high incident bug under the ticket's epic, reopen the ticket as needs-input and notify.
+file a risk:high, status:proposed incident bug under the ticket's epic, reopen the ticket, park it (#391), notify.
 
     python3 -m unittest discover -s plugins/harness/tests -p "test_revert.py" -v
 
@@ -35,6 +35,7 @@ PR_URL = "https://github.com/o/r/pull/34"
 REASON = "the canary failed: harness-pr --help exited 1"
 EVIDENCE = "ok compile\nFAIL harness-pr --help: exit 1\nTraceback (most recent call last)\n"
 NEEDS_INPUT = "**Needs your input**"
+PARKED = "**Parked**"      # the first line of the comment `harness-board park` posts
 
 STUB = """import json, os, sys
 name, argv = os.path.basename(sys.argv[1]), sys.argv[2:]
@@ -203,7 +204,7 @@ class RevertTest(unittest.TestCase):
         write(self.stub_outputs, json.dumps({"harness-board": {
             "task create": {"stdout": json.dumps({"number": 40, "url": "https://github.com/o/r/issues/40"}),
                             "read_stdin": self.bug_stdin},
-            "needs-input": {"stdout": "https://github.com/o/r/issues/12#issuecomment-9\n"}}}))
+            "park": {"stdout": "#12 parked; follow-up #40\n"}}}))
 
     def pr(self, *args, **env):
         return subprocess.run([sys.executable, TOOL] + list(args), cwd=self.main, env=self.env(**env),
@@ -257,7 +258,7 @@ class RevertTest(unittest.TestCase):
 
 
 class Revert(RevertTest):
-    def test_reverts_files_bug_reopens_ticket_and_notifies(self):
+    def test_revert_files_proposed_bug_and_parks_ticket(self):
         p = self.ok("revert", "34", "--reason", REASON, "--evidence-file", self.evidence, "--json")
         # one revert commit on origin/main, on top of the merge, and the main checkout at it
         reverts = self.reverts_on_origin()
@@ -267,7 +268,7 @@ class Revert(RevertTest):
         self.assertIn(f"This reverts commit {self.sha}", self.git(self.origin, "log", "-1", "--format=%B", revert))
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), revert)
         self.assertFalse(os.path.exists(os.path.join(self.main, "widget.py")))
-        # one incident bug under the ticket's epic, its body in the task template
+        # one incident bug under the ticket's epic, filed as a proposal (never ready), its body in the task template
         creates = self.board_argv(["task", "create"])
         self.assertEqual(len(creates), 1, self.board_calls())
         create = creates[0]
@@ -275,7 +276,9 @@ class Revert(RevertTest):
                             ("--title", f"Reverted: {PR_TITLE}")):
             self.assertEqual(create[create.index(flag) + 1], value, create)
         self.assertEqual(create[create.index("--body-file") + 1], "-")
-        body = self.jsonl(self.bug_stdin)[0]
+        self.assertIn("--proposed", create)
+        self.assertNotIn("ready", " ".join(create).lower())
+        body =self.jsonl(self.bug_stdin)[0]
         for heading in ("## Request", "## Outline", "## Definition of done", "## Tests that must pass", "## Context"):
             self.assertIn(heading, body)
         self.assertLess(body.index("## Request"), body.index("## Context"))
@@ -285,34 +288,41 @@ class Revert(RevertTest):
         self.assertIn("#34", body)
         self.assertIn("FAIL harness-pr --help: exit 1", body)
         self.assertIn(["issue", "edit", "40", "--add-label", "incident"], self.gh_argv())
-        # the ticket reopened, then asked
+        # the ticket reopened, then parked with the revert sha and reason, the bug as its follow-up and the
+        # evidence; never asked
         self.assertIn(["issue", "reopen", "12"], self.gh_argv())
-        asks = self.board_argv(["needs-input", "12"])
-        self.assertEqual(len(asks), 1, self.board_calls())
-        ask = asks[0]
-        self.assertEqual(ask[ask.index("--question") + 1],
-                         f"Reverted in {revert[:7]}: {REASON}. Bug #40 tracks the fix.")
-        self.assertIn("--evidence-file", ask)
-        self.assertEqual(next(c for c in self.board_calls() if c["argv"][0] == "needs-input")["evidence"], EVIDENCE)
+        parks = self.board_argv(["park", "12"])
+        self.assertEqual(len(parks), 1, self.board_calls())
+        park = parks[0]
+        self.assertEqual(park[park.index("--reason") + 1], f"Reverted in {revert[:7]}: {REASON}")
+        self.assertEqual(park[park.index("--follow-up") + 1].lstrip("#"), "40")
+        self.assertIn("--evidence-file", park)
+        self.assertEqual(next(c for c in self.board_calls() if c["argv"][0] == "park")["evidence"], EVIDENCE)
+        self.assertEqual(self.board_argv(["needs-input"]), [])
         order = self.order()
         reopen = next(i for i, line in enumerate(order) if line.startswith("gh issue reopen 12"))
-        needs = next(i for i, line in enumerate(order) if line.startswith("harness-board needs-input 12"))
-        self.assertLess(reopen, needs)
+        parked = next(i for i, line in enumerate(order) if line.startswith("harness-board park 12"))
+        self.assertLess(reopen, parked)
         # notified, and the JSON summary
         notes = self.jsonl(self.notify_log)
         self.assertTrue(any(f"proj reverted PR #34: {REASON}" in " ".join(n) for n in notes), notes)
         out = json.loads(p.stdout)
         self.assertEqual(out, {"pr": 34, "sha": self.sha, "revert": revert, "ticket": 12, "bug": 40})
 
-    def test_second_run_is_idempotent(self):
+    def parked_comment(self, revert, reason=REASON, first=PARKED):
+        return {"author": {"login": "rjeskuri"}, "createdAt": "2026-10-26T11:00:00Z",
+                "body": f"{first}\n\nReverted in {revert[:7]}: {reason}\n\nFollow-up: #40\n"
+                        "Retry #12: `harness-board status 12 ready`"}
+
+    def test_revert_again_parks_once(self):
         self.ok("revert", "34", "--reason", REASON)
+        self.assertEqual(len(self.board_argv(["park", "12"])), 1, self.board_calls())
         revert = self.reverts_on_origin()[0].split(" ", 1)[0]
-        question = f"Reverted in {revert[:7]}: {REASON}. Bug #40 tracks the fix."
         incident = {"number": 40, "title": f"Reverted: {PR_TITLE}",
                     "body": f"## Context\nMerge commit: {self.sha}\n", "labels": [{"name": "incident"}]}
-        asked = {"author": {"login": "rjeskuri"}, "createdAt": "2026-10-26T11:00:00Z",
-                 "body": f"{NEEDS_INPUT}\n\n{question}\n\nReply in a comment; /harness:work 12 picks it up."}
-        self.scenario(self.calls(incidents=[[incident]], comments=[[asked]], issue_state="OPEN"))
+        # the ticket is open and blocked, with the Parked comment the first run's park posted
+        self.scenario(self.calls(incidents=[[incident]], comments=[[self.parked_comment(revert)]],
+                                 issue_state="OPEN"))
         before = self.origin_log()
         p = self.ok("revert", "34", "--reason", REASON, "--json")
         self.assertEqual(self.origin_log(), before)
@@ -320,6 +330,15 @@ class Revert(RevertTest):
                              for line in self.order()))
         self.assertNothingFiled()
         self.assertEqual(json.loads(p.stdout), {"pr": 34, "sha": self.sha, "revert": revert, "ticket": 12, "bug": 40})
+        # a newest Parked comment holding another reason, or a needs-input comment holding this one, does not
+        # stop the park
+        for name, comment in (("another reason", self.parked_comment(revert, "the canary timed out")),
+                              ("a needs-input comment", self.parked_comment(revert, first=NEEDS_INPUT))):
+            with self.subTest(comment=name):
+                self.scenario(self.calls(incidents=[[incident]], comments=[[comment]], issue_state="OPEN"))
+                self.ok("revert", "34", "--reason", REASON)
+                self.assertEqual(len(self.board_argv(["park", "12"])), 1, self.board_calls())
+                self.assertEqual(self.board_argv(["task", "create"]), [])
 
     def test_refuses_an_unmerged_pr(self):
         for state in ("OPEN", "CLOSED"):
@@ -363,7 +382,7 @@ class Revert(RevertTest):
         self.assertEqual(len(self.reverts_on_origin()), 1)
         out = json.loads(p.stdout)
         self.assertEqual((out["pr"], out["ticket"], out["sha"]), (None, None, self.sha))
-        self.assertEqual(self.board_argv(["needs-input"]), [])
+        self.assertEqual(self.board_argv(["needs-input"]) + self.board_argv(["park"]), [])
         self.assertFalse([a for a in self.gh_argv() if a[:2] == ["issue", "reopen"]])
         create = self.board_argv(["task", "create"])[0]
         self.assertNotIn("--parent", create)
@@ -375,7 +394,10 @@ class Revert(RevertTest):
         p = self.ok("revert", self.sha[:12], "--reason", REASON, "--json")
         out = json.loads(p.stdout)
         self.assertEqual((out["pr"], out["ticket"], out["sha"]), (34, 12, self.sha))
-        self.assertEqual(len(self.board_argv(["needs-input", "12"])), 1)
+        parks = self.board_argv(["park", "12"])
+        self.assertEqual(len(parks), 1)
+        self.assertNotIn("--evidence-file", parks[0])
+        self.assertEqual(self.board_argv(["needs-input"]), [])
 
     def test_rejected_push_rebases_once(self):
         other = os.path.join(self.tmp, "other")
