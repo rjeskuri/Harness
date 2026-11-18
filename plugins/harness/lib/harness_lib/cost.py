@@ -251,41 +251,43 @@ COVERAGE = ("A lower bound: only the transcripts on this Mac are read, and the o
             "sessions are left out")
 HEADER = "**Cost** (tokens and model time from the transcripts, a lower bound)"
 TABLE_HEAD = ("Stage", "Model", "Rounds", "Tokens", "Output", "Model time", "Agent time")
-ROUND_KEYS = {"retry": "retry", "escalate": "escalate", "needs-input": "needs_input"}
+ROUND_KEYS = {"retry": "retry", "escalate": "escalate", "park": "park"}
 
 
 def attempt_action(stage, result, failures):
     """What `harness-work attempt` answers for a stage's attempt, `failures` being that stage's run of
-    consecutive fails ending with it: done on a pass, then retry, escalate, needs-input (fix: retry, then
-    needs-input, never an escalation; breaker: done on every fail, #375, its one round's gaps going to the
-    coder as requirements). The tier of an escalation is the caller's (routing.next_route), and when nothing
-    is above the attempt's tier and effort the caller answers needs-input instead."""
+    consecutive fails ending with it: done on a pass, then retry, escalate, park (fix: retry, then park, never
+    an escalation; breaker: done on every fail, #375, its one round's gaps going to the coder as requirements).
+    The tier of an escalation is the caller's (routing.next_route), and when nothing is above the attempt's tier
+    and effort the caller answers park instead. Park replaced needs-input as the final answer in #387."""
     if result == "pass" or stage == "breaker":
         return "done"
     if failures == 1:
         return "retry"
     if stage != "fix" and failures == 2:
         return "escalate"
-    return "needs-input"
+    return "park"
 
 
 def rounds(attempts):
-    """The attempt store replayed: {"stages": {stage: {"runs", "fails", "retry", "escalate", "needs_input"}},
+    """The attempt store replayed: {"stages": {stage: {"runs", "fails", "retry", "escalate", "park"}},
     "breaker_rerounds", "fix_rounds"}, each stage counted on its own as `harness-work attempt` answered;
-    stages never attempted are absent. Breaker re-rounds are breaker fails, fix rounds fix attempts."""
+    stages never attempted are absent. Breaker re-rounds are breaker fails, fix rounds fix attempts. The answers
+    are replayed from the policy, not read from the store, so a final failure recorded before #387 (answered
+    needs-input then) counts as a park."""
     stages, run = {}, {}
     for entry in attempts or []:
         stage = entry.get("stage") if isinstance(entry, dict) else None
         if not isinstance(stage, str):
             continue
-        counts = stages.setdefault(stage, {"runs": 0, "fails": 0, "retry": 0, "escalate": 0, "needs_input": 0})
+        counts = stages.setdefault(stage, {"runs": 0, "fails": 0, "retry": 0, "escalate": 0, "park": 0})
         counts["runs"] += 1
         failed = entry.get("result") == "fail"
         counts["fails"] += failed
         run[stage] = run.get(stage, 0) + 1 if failed else 0
         action = attempt_action(stage, entry.get("result"), run[stage])
         if action == "escalate" and "effort" in entry and next_route(entry.get("tier"), entry.get("effort")) is None:
-            action = "needs-input"      # #239 records carry effort: nothing above opus xhigh or a named fable
+            action = "park"             # #239 records carry effort: nothing above opus xhigh or a named fable
         key = ROUND_KEYS.get(action)
         if key:
             counts[key] += 1
@@ -477,7 +479,7 @@ def notes(record):
         tally = {key: sum(s[key] for s in r["stages"].values()) for key in ROUND_KEYS.values()}
         lines.append(f"Rounds: breaker re-rounds {r['breaker_rerounds']}, fix rounds {r['fix_rounds']}; "
                      f"retries {tally['retry']}, escalations {tally['escalate']}, "
-                     f"needs-input {tally['needs_input']}")
+                     f"parked {tally['park']}")
     lines += extras(record)
     shared = [s["id"][:8] for s in record["sessions"] if not s["own"]]
     if shared:
