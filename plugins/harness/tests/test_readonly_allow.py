@@ -191,6 +191,9 @@ NO_DECISION = (
     ("git --work-tree=. status", "main"),
     ("git diff --output=diff.txt", "wt"),
     ("git log -p --ext-diff", "main"),
+    # git grep -O<pager> runs the pager on the matches: refused in any spelling, its value stuck or in a cluster
+    ("git grep -O'touch /tmp/x' login", "wt"),
+    ("git grep -nO./x.sh -e login", "main"),
     ("git push", "wt"),
     ("git push origin main", "main"),
     ("git commit -m x", "wt"),
@@ -244,6 +247,9 @@ SECRET_SENSITIVE_OUTSIDE = (
     ("cat `echo README.md`", "wt"),
     ("git log -- $X", "main"),
     ("git diff $(git merge-base HEAD main)", "wt"),
+    # a substitution in a harness tool's words reads too, in the folder the tool runs in (not after a later cd)
+    ('harness-board show 1 "$(< .env)"', "main"),
+    ('harness-board show 1 "`cat {vault}/notes.txt`"; cd src', "main"),
 )
 
 # The same shapes on paths that are none of those: allowed, so the rows above turn on the path alone.
@@ -383,6 +389,11 @@ class ReadonlyAllowTests(GuardTestCase):
     def test_no_decision_for_secret_sensitive_or_outside_paths(self):
         self.check(SECRET_SENSITIVE_OUTSIDE, allow=False)
         self.check(PATH_CONTROLS, allow=True)
+        # A grep over ~/.claude/harness (HOME the fixture's real home folder here) must not walk into the global
+        # backup store, whose snapshots keep each file as files/<k>: a backed-up .env is not secret by its name.
+        self.write(self.home / ".claude/harness/backups" / f"20261118T101500Z-{self.tok[:6]}" / "files" / "0",
+                   f"TOKEN={self.tok}\n")
+        self.check([("grep -rn TOKEN ~/.claude/harness", "main")], allow=False, env={"HOME": str(self.home)})
 
     def test_off_plan_mode_and_fail_open(self):
         shapes = [(c, "wt") for c in OUTAGE_SHAPES]

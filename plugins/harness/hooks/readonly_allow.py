@@ -18,10 +18,15 @@ its bare name, with no assignment, keyword or wrapper in front:
   - git with nothing in front but -C <dir>, --no-pager, -P or --no-optional-locks, running status, log, diff, show,
     rev-parse, rev-list, merge-base, ls-files, ls-tree, blame, grep, stash list, worktree list or a branch listing,
     never with --output, -o, --ext-diff or --no-index (git grep: nor -O, --open-files-in-pager, --untracked or
-    --no-exclude-standard), in the main checkout or one of its worktrees;
+    --no-exclude-standard; -O found as git reads it, in a cluster or with a value stuck to it), in the main
+    checkout or one of its worktrees;
   - one of the nine harness bin tools (any words: permissions.allow already allows them one by one).
-The whole command: no heredoc and no (( )) or $(( )); every output redirection to /dev/null, /dev/stdout,
-/dev/stderr, /dev/fd/N or a descriptor; no $ or backtick in a reader's or git's words (but sed's <n>,$p).
+The whole command: no heredoc and no (( )) or $(( )); no command or process substitution ($( ), backtick, <( ),
+>( )) anywhere, since split_command walks it after the command's own parts (a later cd misplaces it) and drops a
+part that only redirects input ("$(< .env)"); no simple command starting with a redirection (`pwd; < .env`, which
+zsh's READNULLCMD prints, or `(cat) < .env`), a part split_command leaves out; every output redirection to
+/dev/null, /dev/stdout, /dev/stderr, /dev/fd/N or a descriptor; no $ or backtick in a reader's or git's words (but
+sed's <n>,$p). A harness tool's words may hold a variable ("$PWD"), never a substitution.
 
 What is read must lie in the session's project (the main checkout of CLAUDE_PROJECT_DIR, else of the event's cwd,
 and its worktrees), ~/.claude/harness/ (not its backups/) or a temp directory ($TMPDIR, /tmp, /private/tmp), never
@@ -32,8 +37,9 @@ none: its folder), each input redirection, grep's -f file, each git operand (a p
 one) relative to the folder git runs in, and each path in a rev:path word relative to the working tree. A word
 holding a glob, a brace expansion or a leading = names no known file: no decision. A folder grep reads (any file
 operand that is a folder, as ugrep recurses into one, and with -r, -R or -d recurse and no file, the folder it runs
-in) holds no symlink and nothing secret-shaped or matched by HARNESS_SENSITIVE_PATHS (each entry judged as an
-operand is), within 20,000 entries. git grep is judged by its operands and pathspecs alone.
+in) holds no symlink, nothing secret-shaped or matched by HARNESS_SENSITIVE_PATHS and nothing outside the places a
+read may go (so no backup store: ~/.claude/harness/backups/ keeps files as files/<k>), each entry judged as an
+operand is, within 20,000 entries. git grep is judged by its operands and pathspecs alone.
 
 No decision (nothing on stdout, exit 0) otherwise, in plan mode, and with HARNESS_READONLY_ALLOW=off (the
 environment first, then `env` in the main checkout's .claude/settings.json and settings.local.json). Fails open:
@@ -110,6 +116,12 @@ BRANCH_FLAG = re.compile(r"-[arvli]+\Z|--(?:all|remotes|verbose|list|show-curren
                          r"|no-merged|points-at)=")
 BRANCH_VALUES = {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format"}
 EXPANSION = re.compile(r"[$`]")
+# A command or process substitution: split_command walks its parts after the command's own, so a later cd misplaces
+# them, and drops a part that only redirects input, as in "$(< .env)".
+SUBSTITUTION = re.compile(r"\$\(|`|[<>]\(")
+# A simple command that starts with a redirection: one that only redirects (zsh runs READNULLCMD on `< f`) or a
+# subshell's (`(cat) < f`) is a part split_command leaves out, so its input would never be judged.
+BARE_REDIRECT = re.compile(r"(?:\A|[;&|()\n])(?:\s|\\\n)*\d*[<>]")
 QUIET = re.compile(r"/dev/(?:null|stdout|stderr|fd/\d+)\Z")
 SED_SCRIPT = re.compile(r"\d+(?:,(?:\d+|\$))?p\Z")
 SED_FLAGS = re.compile(r"-([nEr]*)(?:e(.*))?\Z", re.S)
@@ -332,10 +344,12 @@ def git_reads(args, here, need) -> bool:
             break
         if a.startswith("--") and refused_long(a.split("=", 1)[0], refused):
             return False
-        if guard.SHORT_CLUSTER.match(a) and ("o" in a[1:] or sub == "grep" and "O" in a[1:]):
-            return False
+        if guard.SHORT_CLUSTER.match(a) and "o" in a[1:]:
+            return False  # no -o here takes a value (git 2.39 rejects -o<file>), so a stuck one hides none
     if sub == "grep":
         options, operands = scan(rest, "efABCm", GIT_GREP_VALUES)
+        if any(o == "-O" for o, _v in options):
+            return False  # -O[<pager>] runs its pager, a value stuck to it or the option inside a cluster too
         patterned = any(o in ("-e", "-f") or long_is(o, "--regexp") or long_is(o, "--file") for o, _v in options)
         files = [v for o, v in options if v is not None and (o == "-f" or long_is(o, "--file"))]
         values = [v for o, v in options if v is not None and v not in files and o != "-e"
@@ -448,7 +462,8 @@ class Places:
         return self.allowed(real) and self.clean(os.path.normpath(path)) and self.clean(real)
 
     def tree(self, word, base) -> bool:
-        """A folder grep reads whole: no symlink, nothing secret-shaped or sensitive and no backup store in it."""
+        """A folder grep reads whole: no symlink, nothing secret-shaped or sensitive, and nothing outside the places
+        a read may go (no backup store) in it."""
         real = canonical_path(self.absolute(word, base))
         if not os.path.isdir(real):
             return True
@@ -459,7 +474,7 @@ class Places:
                 entry = os.path.join(folder, name)
                 if count > WALK_LIMIT or time.monotonic() > DEADLINE or os.path.islink(entry):
                     return False
-                if name == PROJECT_STORE or not self.clean(entry):
+                if not self.allowed(entry) or not self.clean(entry):
                     return False
         return True
 
@@ -491,8 +506,8 @@ class Places:
 
 def decide(data, command) -> bool:
     cwd = hook_cwd(data)
-    if "((" in command or not os.path.isdir(cwd):
-        return False  # an arithmetic command or expansion runs what the walker cannot see
+    if "((" in command or SUBSTITUTION.search(command) or BARE_REDIRECT.search(command) or not os.path.isdir(cwd):
+        return False  # an arithmetic command or expansion, or a substitution, runs what the walker cannot place
     state, need, parts = {"cwd": cwd}, [], 0
     for part, name, args in guard.walk(state, command):
         parts += 1
