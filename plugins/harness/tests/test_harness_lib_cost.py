@@ -1484,5 +1484,69 @@ class FixRounds(Base):
         ])
 
 
+class Rounds(unittest.TestCase):
+    """#387: attempt_action answers park where it answered needs-input, and rounds counts it under `park` in each
+    stage's counts (no `needs_input` key there); the Rounds line says `parked P`. The record's own needs_input (the
+    ticket's questions) is untouched."""
+
+    TIERS = [("sonnet", None), ("opus", None), ("opus", "high"), ("opus", "xhigh"), ("opus", "max"), ("fable", None)]
+
+    @staticmethod
+    def has_step_above(tier, effort):
+        """The escalation ladder from first principles: sonnet to opus, opus below xhigh to opus xhigh, nothing
+        above opus xhigh or max or a named fable."""
+        return tier == "sonnet" or (tier == "opus" and effort in (None, "low", "medium", "high"))
+
+    def answer(self, stage, failures, tier, effort):
+        """The policy's answer to the failures-th failure in a row (the caller's tier step included)."""
+        if stage == "breaker":
+            return "done"
+        if failures == 1:
+            return "retry"
+        if stage != "fix" and failures == 2 and self.has_step_above(tier, effort):
+            return "escalate"
+        return "park"
+
+    def test_rounds_count_park(self):
+        c = load_cost()
+        # attempt_action alone: the tier step is the caller's, so the second failure of a non-fix stage escalates
+        for stage in ("tests", "breaker", "code", "review", "fix", "ci"):
+            for failures in (1, 2, 3, 4):
+                with self.subTest(action=stage, failures=failures):
+                    self.assertEqual(c.attempt_action(stage, "fail", failures),
+                                     self.answer(stage, failures, "sonnet", None))
+            self.assertEqual(c.attempt_action(stage, "pass", 0), "done")
+
+        # rounds: every stage x tier and effort x run length, replayed from a record that carries `effort`
+        parked_seen = set()
+        for stage in ("tests", "breaker", "code", "review", "fix", "ci"):
+            for tier, effort in self.TIERS:
+                for fails in (1, 2, 3, 4):
+                    with self.subTest(stage=stage, tier=tier, effort=effort, fails=fails):
+                        attempts = [{"stage": stage, "tier": tier, "effort": effort, "result": "fail",
+                                     "at": "2026-11-18T%02d:00:00Z" % (9 + i)} for i in range(fails)]
+                        attempts.append({"stage": "code", "tier": "sonnet", "effort": None, "result": "pass",
+                                         "at": "2026-11-18T20:00:00Z"})
+                        answers = [self.answer(stage, k, tier, effort) for k in range(1, fails + 1)]
+                        want = {"runs": fails, "fails": fails, "retry": answers.count("retry"),
+                                "escalate": answers.count("escalate"), "park": answers.count("park")}
+                        got = c.rounds(attempts)["stages"]
+                        if stage == "code":
+                            want["runs"] += 1
+                        self.assertEqual(got[stage], want)
+                        parked_seen.add(want["park"])
+
+                        record = {"session_totals": None, "rounds": c.rounds(attempts), "sessions": [],
+                                  "lines": None, "elapsed": None, "ci": None, "needs_input": fails + 4}
+                        notes = c.notes(record)
+                        [line] = [x for x in notes if x.startswith("Rounds:")]
+                        self.assertRegex(line, rf"\bparked {want['park']}(?!\d)")
+                        self.assertRegex(line, rf"\bretries {want['retry']}(?!\d)")
+                        self.assertRegex(line, rf"\bescalations {want['escalate']}(?!\d)")
+                        self.assertNotIn("needs-input", line)
+                        self.assertIn(f"Needs input: {fails + 4}", notes)     # the questions' count, unchanged
+        self.assertEqual(parked_seen, {0, 1, 2, 3})
+
+
 if __name__ == "__main__":
     unittest.main()
