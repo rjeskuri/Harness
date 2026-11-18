@@ -4,10 +4,15 @@ harness-pr, --github through fakegh.py (including the 403 on rulesets), --regist
 
     python3 -m unittest discover -s plugins/harness/tests -v
 
-The tool runs as a subprocess in a temporary folder with a temporary HOME and a PATH of `fakebin`, a
-folder holding only git and python3, /usr/bin and /bin, so nothing reads ~/.claude or the network,
-and no uv, npm, ruff, gh or harness tool is found unless a test puts a stub in `fakebin`. Stubs and the fake gh append one
-JSON line per call to the same log, so a test can check the order across tools.
+The tool runs in a temporary folder with a temporary HOME and a PATH of `fakebin`, a folder holding only
+python3, git's own folder (gitrepo_support.GIT: the git binary itself, not macOS's xcrun shim), /usr/bin
+and /bin, so nothing reads ~/.claude or the network, and no uv, npm, ruff, gh or harness tool is found
+unless a test puts a stub in `fakebin`. Stubs and the fake gh append one JSON line per call to the same
+log, so a test can check the order across tools.
+
+Each test's first run of the tool is a real process (exit code, stdout, stderr); its later runs go
+through gitrepo_support.run_in_process, the same script in this process with the same arguments,
+environment and folder (ticket #378).
 """
 from __future__ import annotations
 
@@ -24,12 +29,14 @@ import unittest
 
 sys.dont_write_bytecode = True
 
+from gitrepo_support import GIT, run_in_process  # noqa: E402  (GIT: the git binary itself, not macOS's xcrun shim)
+
 TESTS = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = os.path.dirname(TESTS)
 SCAFFOLD = os.path.join(PLUGIN, "bin", "harness-scaffold")
 TEMPLATES = os.path.join(PLUGIN, "templates")
 FAKEGH = os.path.join(TESTS, "fakegh.py")
-GIT = shutil.which("git")
+GIT_BIN = os.path.dirname(GIT)   # on the tool's PATH as a folder: a symlink to Apple's git loses its exec path
 RUFF = shutil.which("ruff")      # the real ruff, looked up on the PATH the suite runs with, never the fakebin
 NO_RULESET = ("Branch protection is unavailable on this plan for a private repo; "
               "the local branch guard is the only block.")
@@ -80,10 +87,10 @@ class ScaffoldTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home = self.mk("home")
         self.fakebin = self.mk("fakebin")
-        self.toolbin = self.mk("toolbin")            # git and python3 only, not the rest of their folders
-        os.symlink(GIT, os.path.join(self.toolbin, "git"))
+        self.toolbin = self.mk("toolbin")            # python3 only, not the rest of its folder
         os.symlink(sys.executable, os.path.join(self.toolbin, "python3"))
         self.log = os.path.join(self.tmp, "calls.jsonl")
+        self.ran_a_process = False                   # the test's first scaffold run is a real process
 
     # ------------------------------------------------------------ helpers
     def mk(self, *parts):
@@ -107,14 +114,22 @@ class ScaffoldTest(unittest.TestCase):
         env = {k: v for k, v in os.environ.items()
                if k not in ("CLAUDE_PROJECT_DIR", "HARNESS_SESSION_PROJECT", "HARNESS_GH", "GIT_DIR", "GIT_WORK_TREE",
                             "GIT_INDEX_FILE")}
-        path = [self.fakebin, self.toolbin, "/usr/bin", "/bin"]
+        path = [self.fakebin, self.toolbin] + ([GIT_BIN] if GIT_BIN not in ("/usr/bin", "/bin") else []) \
+            + ["/usr/bin", "/bin"]
         env.update(HOME=self.home, PATH=os.pathsep.join(path), GIT_CEILING_DIRECTORIES=self.tmp,
                    GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@localhost",
-                   GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@localhost")
+                   GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@localhost",
+                   # no `git maintenance run --auto` process after each commit (ticket #378)
+                   GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="maintenance.auto", GIT_CONFIG_VALUE_0="false")
         env.update(extra)
         return env
 
     def scaffold(self, *args, env=None):
+        """harness-scaffold with these arguments in self.tmp: a real process the first time in a test, then in this
+        process (ticket #378); either way an object with returncode, stdout and stderr."""
+        if self.ran_a_process:
+            return run_in_process(SCAFFOLD, args, cwd=self.tmp, env=env or self.env())
+        self.ran_a_process = True
         return subprocess.run([sys.executable, SCAFFOLD] + list(args), cwd=self.tmp, env=env or self.env(),
                               capture_output=True, text=True, timeout=120)
 
@@ -272,14 +287,16 @@ class Render(ScaffoldTest):
     def test_harness_own_settings_allow_the_nine_not_the_wildcard(self):
         """Harness's own .claude/settings.json follows the template: the nine rules, no wildcard.
 
-        Its env holds exactly the verify command, the test map (#264) and ultrareview off (#283); any other
-        key fails."""
+        Its env holds exactly the verify command, the test map (#264), ultrareview off (#283) and the red-run
+        timeout (#378: the own-tests run of a wide ticket outlasts the 300 s default); any other key fails."""
         data = json.loads(self.read(REPO, ".claude", "settings.json"))
         allow = data["permissions"]["allow"]
         self.assertNotIn(WILDCARD, allow)
         self.assertEqual(allow, BASE_ALLOW + HARNESS_NINE)
         env = data["env"]
-        self.assertEqual(set(env), {"CLAUDE_VERIFY_CMD", "HARNESS_TEST_MAP", "HARNESS_ULTRAREVIEW"})
+        self.assertEqual(set(env), {"CLAUDE_VERIFY_CMD", "HARNESS_TEST_MAP", "HARNESS_ULTRAREVIEW",
+                                    "HARNESS_TEST_TIMEOUT"})
+        self.assertEqual(float(env["HARNESS_TEST_TIMEOUT"]), 900)
         self.assertEqual(env["HARNESS_ULTRAREVIEW"], "off")
         self.assertEqual(env["CLAUDE_VERIFY_CMD"], "python3 scripts/run_suite.py")
         pairs = env["HARNESS_TEST_MAP"].split(",")
@@ -1428,15 +1445,19 @@ class KeptSettings(ScaffoldTest):
     key verbatim and says its kind (ask, deny, allow, env). A file that cannot be read as settings gets
     one warn line."""
 
+    _REFERENCE: dict = {}   # (stack, verify) -> (allow, env), rendered once for the class (ticket #378)
+
     def reference(self, stack, verify=None):
-        """(allow list, env) of the settings.json the scaffold itself renders for this stack and verify."""
-        cache = self.__dict__.setdefault("_reference", {})
+        """(allow list, env) of the settings.json the scaffold itself renders for this stack and verify; a copy, so a
+        test cannot change what the next one is given."""
+        cache = KeptSettings._REFERENCE
         if (stack, verify) not in cache:
             root = os.path.join(self.tmp, f"reference-{len(cache)}")
             self.ok("init", root, "--name", "ref", "--stack", stack, *(["--verify", verify] if verify else []))
             data = self.settings(root)
             cache[(stack, verify)] = (list(data["permissions"]["allow"]), dict(data["env"]))
-        return cache[(stack, verify)]
+        allow, env = cache[(stack, verify)]
+        return list(allow), dict(env)
 
     def kept(self, name, stack="none", verify=None, ask=(), deny=(), allow=None, env=None, text=None, raw=None):
         """A folder holding the project's own settings.json (by default the stack's complete one, plus
@@ -1514,18 +1535,27 @@ class KeptSettings(ScaffoldTest):
 
     # ---------------------------------------------------------------- blocking asks and denies
     def test_asks_that_stop_a_dispatched_run_are_reported(self):
+        # One representative of each family as an ask and as a deny, a different rule each time (ticket #378: the
+        # generated groups below put every loop command's blocking rules and near misses in one file each): a loop
+        # rule, a broader and a narrower one block; a near miss does not.
+        representatives = [
+            (LOOP_RULES, "ask", "Bash(git commit:*)"), (LOOP_RULES, "deny", "Bash(harness-pr:*)"),
+            (BROADER_RULES, "ask", "Bash(git:*)"), (BROADER_RULES, "deny", "Bash"),
+            (NARROWER_RULES, "ask", "Bash(git push --force:*)"), (NARROWER_RULES, "deny", "Bash(harness-work:*)"),
+            (NEAR_MISSES, "ask", "Bash(git committer:*)"), (NEAR_MISSES, "deny", "Read(./git commit notes/**)"),
+        ]
         n = 0
-        for kind in ("ask", "deny"):
-            for rule in LOOP_RULES + BROADER_RULES + NARROWER_RULES:
-                n += 1
-                with self.subTest(rule=rule, kind=kind):
-                    for mode, p in self.both_runs(f"block{n}", **{kind: [rule]}):
-                        self.assertWarns(mode, p, [(rule, kind)])
-            for rule in NEAR_MISSES:
-                n += 1
+        for family, kind, rule in representatives:
+            self.assertIn(rule, family)
+            n += 1
+            if family is NEAR_MISSES:
                 with self.subTest(near_miss=rule, kind=kind):
                     for mode, p in self.both_runs(f"miss{n}", **{kind: [rule]}):
                         self.assertWarns(mode, p, [])
+            else:
+                with self.subTest(rule=rule, kind=kind):
+                    for mode, p in self.both_runs(f"block{n}", **{kind: [rule]}):
+                        self.assertWarns(mode, p, [(rule, kind)])
 
         # several offenders at once: one line each, each naming only its own rule and its own kind
         ask = ["Bash(git commit:*)", "Bash(git push --force:*)", "Bash(harness-*:*)", "Read(./notes/**)"]
@@ -1541,21 +1571,23 @@ class KeptSettings(ScaffoldTest):
             for mode, p in self.both_runs("jotform", ask=["Bash(git commit:*)"], allow=allow):
                 self.assertWarns(mode, p, [("Bash(git commit:*)", "ask"), ("Bash(harness-pr:*)", "allow")])
 
-        # the verify command is the project's own (the rendered CLAUDE_VERIFY_CMD), not a fixed one
+        # the verify command is the project's own (the rendered CLAUDE_VERIFY_CMD), not a fixed one; each rule once,
+        # as an ask or a deny in turn (ticket #378: so do the generated verify commands below)
         table = [("make check", ["Bash(make check:*)", "Bash(make check)", "Bash(make:*)"],
                   ["Bash(make checkout:*)", "Bash(tox:*)"]),
                  ("tox -q", ["Bash(tox -q)", "Bash(tox:*)"], ["Bash(make check:*)", "Bash(make:*)"])]
         for verify, blocking, harmless in table:
-            for kind in ("ask", "deny"):
-                for rule in blocking + harmless:
-                    n += 1
-                    with self.subTest(verify=verify, rule=rule, kind=kind):
-                        for mode, p in self.both_runs(f"verify{n}", "python", verify, **{kind: [rule]}):
-                            self.assertWarns(mode, p, [(rule, kind)] if rule in blocking else [])
+            for i, rule in enumerate(blocking + harmless):
+                kind = ("ask", "deny")[i % 2]
+                n += 1
+                with self.subTest(verify=verify, rule=rule, kind=kind):
+                    for mode, p in self.both_runs(f"verify{n}", "python", verify, **{kind: [rule]}):
+                        self.assertWarns(mode, p, [(rule, kind)] if rule in blocking else [])
 
         # generated: for every loop command, rules built from it with random suffixes, with and without :*,
         # and every shorter prefix of it all block; near misses mixed into the same file do not. One file
-        # per command and kind: N blocking rules give exactly N warn lines.
+        # per command, as asks or as denies in turn (ticket #378: each rule once, both kinds across the groups):
+        # N blocking rules give exactly N warn lines.
         rng = random.Random(31)
         groups = [(" ".join(words), blocking_rules(rng, words), near_miss_rules(rng, words))
                   for words in LOOP_COMMANDS]
@@ -1566,35 +1598,35 @@ class KeptSettings(ScaffoldTest):
                                     "Bash(harness-board show:*)", "Bash(git commit)", "Bash(*)"],
                        ["Bash(git status:*)", "Bash(gh repo:*)", "Bash(git commitx:*)", "Bash(harness:*)",
                         "Bash(git push-all:*)"]))
-        for label, blocking, misses in groups:
+        for i, (label, blocking, misses) in enumerate(groups):
             self.assertFalse(set(blocking) & set(misses), label)
-            for kind in ("ask", "deny"):
-                n += 1
-                rules = list(blocking + misses)
-                rng.shuffle(rules)
-                with self.subTest(generated=label, kind=kind, blocking=blocking, misses=misses):
-                    for mode, p in self.both_runs(f"gen{n}", **{kind: rules}):
-                        self.assertWarns(mode, p, [(r, kind) for r in blocking])
+            kind = ("ask", "deny")[i % 2]
+            n += 1
+            rules = list(blocking + misses)
+            rng.shuffle(rules)
+            with self.subTest(generated=label, kind=kind, blocking=blocking, misses=misses):
+                for mode, p in self.both_runs(f"gen{n}", **{kind: rules}):
+                    self.assertWarns(mode, p, [(r, kind) for r in blocking])
 
         # generated: the verify command varies; its exact form, its :* form, the program alone with :*
         # (broader) and the command with more arguments (narrower) all block; the same program with another
-        # first argument does not
+        # first argument does not; asks or denies in turn, as above
         verifies = [("pytest -q", "python"), ("npm test", "node"), ("./ci/run.sh --fast", "python"),
                     ("python3 -m unittest discover -s tests", "python")]
         for _ in range(2):
             program = rng.choice(["make", "tox", "just", "bin/check", "./scripts/ci.sh", "cargo", "nox", "rake"])
             verifies.append((" ".join([program] + rng.sample(["check", "lint", "ci", "py311", "--all", "quick"],
                                                               rng.randint(1, 2))), "python"))
-        for verify, stack in verifies:
+        for i, (verify, stack) in enumerate(verifies):
             self.assertEqual(self.reference(stack, verify)[1]["CLAUDE_VERIFY_CMD"], verify)
             blocking, misses = verify_rules(rng, verify)
-            for kind in ("ask", "deny"):
-                n += 1
-                rules = blocking + misses
-                rng.shuffle(rules)
-                with self.subTest(verify=verify, kind=kind, blocking=blocking, misses=misses):
-                    for mode, p in self.both_runs(f"genverify{n}", stack, verify, **{kind: rules}):
-                        self.assertWarns(mode, p, [(r, kind) for r in blocking])
+            kind = ("ask", "deny")[i % 2]
+            n += 1
+            rules = blocking + misses
+            rng.shuffle(rules)
+            with self.subTest(verify=verify, kind=kind, blocking=blocking, misses=misses):
+                for mode, p in self.both_runs(f"genverify{n}", stack, verify, **{kind: rules}):
+                    self.assertWarns(mode, p, [(r, kind) for r in blocking])
 
         # stack none renders CLAUDE_VERIFY_CMD as scripts/verify.sh even with --verify: that is the command
         # a run asks for, and the --verify text (which verify.sh runs) is not
@@ -1614,14 +1646,14 @@ class KeptSettings(ScaffoldTest):
         # pins: an exact `git` or `gh` alone is not a loop command; a trailing ` *` is a prefix rule like `:*`
         pins = ["Bash(git commit *)", "Bash(gh *)"]
         pin_harmless = ["Bash(git)", "Bash(gh)"]
-        for label, blocking, misses in (("mid-pattern-glob", globs, harmless), ("pins", pins, pin_harmless)):
-            for kind in ("ask", "deny"):
-                n += 1
-                rules = blocking + misses
-                rng.shuffle(rules)
-                with self.subTest(label=label, kind=kind):
-                    for mode, p in self.both_runs(f"glob{n}", "python", **{kind: rules}):
-                        self.assertWarns(mode, p, [(r, kind) for r in blocking])
+        for label, blocking, misses, kind in (("mid-pattern-glob", globs, harmless, "ask"),
+                                              ("pins", pins, pin_harmless, "deny")):
+            n += 1
+            rules = blocking + misses
+            rng.shuffle(rules)
+            with self.subTest(label=label, kind=kind):
+                for mode, p in self.both_runs(f"glob{n}", "python", **{kind: rules}):
+                    self.assertWarns(mode, p, [(r, kind) for r in blocking])
 
     # ---------------------------------------------------------------- missing allows and env keys
     def test_missing_template_allows_and_env_keys_are_reported(self):

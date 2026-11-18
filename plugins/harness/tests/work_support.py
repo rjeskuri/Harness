@@ -21,10 +21,14 @@ import unittest
 
 sys.dont_write_bytecode = True
 
+import gitrepo_support  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(os.path.dirname(HERE), "bin", "harness-work")
 FAKEGH = os.path.join(HERE, "fakegh.py")
-GIT = shutil.which("git")
+GIT = gitrepo_support.GIT  # the git binary itself, not macOS's xcrun shim (#378)
+# The wrappers' shell (#378): dash when there is one, since macOS's /bin/sh re-executes bash.
+SH = "/bin/dash" if os.path.exists("/bin/dash") else "/bin/sh"
 TITLE = "Add the board tool"
 BRANCH = "t/12-add-the-board-tool"
 SECRET = "fake-key-value-7f3a9c"   # what the key command prints; must never reach argv or env
@@ -56,7 +60,7 @@ Add the board tool.
 - [ ] `harness-board ready` lists unblocked tickets
 """
 
-FAKE_CLAUDE = """#!{python}
+FAKE_CLAUDE = """#!{python} -IS
 import json, os, sys, time
 argv = sys.argv[1:]
 log = os.environ.get("FAKECLAUDE_LOG")
@@ -131,7 +135,7 @@ sys.exit(2)
 # and after; its exit code is the real one's. With NOISY_WARN set, a `show` also ends with a warning line of its own,
 # `harness-board: warning: <NOISY_WARN> from show <number> <format>`.
 CHATTER = ("harness-board: note: chatter before the call", "warning: chatter without the harness-board prefix")
-NOISY_BOARD = """#!/bin/sh
+NOISY_BOARD = """#!{sh}
 printf '%s\\n' "$*" >> "$NOISY_LOG"
 printf '%s\\n' "{before}" >&2
 "{{python}}" "{{board}}" "$@"
@@ -141,7 +145,7 @@ if [ "$1" = show ] && [ -n "$NOISY_WARN" ]; then
     printf 'harness-board: warning: %s from show %s %s\\n' "$NOISY_WARN" "$2" "$3" >&2
 fi
 exit $rc
-""".format(before=CHATTER[0], after=CHATTER[1])
+""".format(sh=SH, before=CHATTER[0], after=CHATTER[1])
 WARNING = "harness-board: warning: "
 
 
@@ -178,23 +182,35 @@ BINS = {}
 
 
 def setUpModule():
-    """fakebin: gh and claude; toolbin: git and python3 only (symlinks), so PATH holds nothing else of ours."""
+    """fakebin: gh and claude; toolbin: git (a wrapper) and python3 (a symlink) only, so PATH holds nothing else of
+    ours."""
     root = os.path.realpath(tempfile.mkdtemp(prefix="harness-work-bin-"))
     fakebin, toolbin = os.path.join(root, "fakebin"), os.path.join(root, "toolbin")
-    executable(os.path.join(fakebin, "gh"), f'#!/bin/sh\nexec "{sys.executable}" "{FAKEGH}" "$@"\n')
+    # The Python stand-ins start with -I -S (#378): no site, no user site, no PYTHON* variables.
+    executable(os.path.join(fakebin, "gh"), f'#!{SH}\nexec "{sys.executable}" -I -S "{FAKEGH}" "$@"\n')
     executable(os.path.join(fakebin, "claude"), FAKE_CLAUDE.format(python=sys.executable))
     for name in ("terminal-notifier", "osascript"):     # harness-board needs-input (a cloud run's blocked marker)
-        executable(os.path.join(fakebin, name), "#!/bin/sh\nexit 0\n")
+        executable(os.path.join(fakebin, name), f"#!{SH}\nexit 0\n")
     os.makedirs(toolbin)
-    os.symlink(GIT, os.path.join(toolbin, "git"))
+    # A wrapper, never a link (#378): Apple's git finds its exec path and templates through the path it was started
+    # by, so a link to GIT in toolbin would lose them.
+    executable(os.path.join(toolbin, "git"), f'#!{SH}\nexec "{GIT}" "$@"\n')
     os.symlink(sys.executable, os.path.join(toolbin, "python3"))
     noisybin = os.path.join(root, "noisybin")       # only on PATH when a test puts it there
     executable(os.path.join(noisybin, "harness-board"), NOISY_BOARD.format(
         python=sys.executable, board=os.path.join(os.path.dirname(TOOL), "harness-board")))
-    BINS.update(root=root, fakebin=fakebin, toolbin=toolbin, noisybin=noisybin)
+    # One bytecode folder per module (#378): the tools this module runs and the rows run in this process compile
+    # harness_lib once, even under PYTHONDONTWRITEBYTECODE=1, and never into the checkout.
+    pycache = os.path.join(root, "pycache")
+    os.makedirs(pycache)
+    BINS.update(root=root, fakebin=fakebin, toolbin=toolbin, noisybin=noisybin, pycache=pycache,
+                saved_prefix=sys.pycache_prefix)
+    sys.pycache_prefix = pycache
 
 
 def tearDownModule():
+    if "saved_prefix" in BINS:
+        sys.pycache_prefix = BINS.pop("saved_prefix")
     shutil.rmtree(BINS.get("root", ""), True)
 
 
@@ -277,6 +293,8 @@ class WorkTest(unittest.TestCase):
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("CLAUDE", "HARNESS_", "GIT_", "FAKEGH_", "FAKECLAUDE_"))}
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
+        env["PYTHONPYCACHEPREFIX"] = BINS["pycache"]
         env.update(HOME=self.home, PATH=os.pathsep.join([BINS["fakebin"], BINS["toolbin"], "/usr/bin", "/bin"]),
                    GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@localhost",
                    GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@localhost",

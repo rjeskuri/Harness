@@ -1,6 +1,8 @@
 """tests_first.py and harness-red status after a merge of main: when the red record stays current, and the hook's time budget.
 
-Split from test_guards.py; the fixtures are in guards_support.py.
+Split from test_guards.py; the fixtures are in guards_support.py. A ticket scenario (ticket())
+is built once per module for each base, test-author edit and object format, and later tests
+get a copy at their own paths, git's worktree links and the harness records moved with it.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_guards_main_merge.py" -v
 """
@@ -9,7 +11,16 @@ from __future__ import annotations
 
 import unittest
 
+import guards_support
+from gitrepo_support import copy_repo
 from guards_support import *  # noqa: F401,F403
+
+_TICKETS: dict = {}  # ticket()'s key -> its first build, saved in the module's folder (save_ticket)
+
+
+def tearDownModule() -> None:
+    _TICKETS.clear()  # the saved builds go with the module's folder
+    guards_support.tearDownModule()
 
 
 class TestsFirstMainMergeTests(GuardTestCase):
@@ -27,6 +38,7 @@ class TestsFirstMainMergeTests(GuardTestCase):
         self.env["HARNESS_TEST_CMD"] = (
             shlex.quote(sys.executable) + " -c " + shlex.quote(FAILING_RUN) + " {files}"
         )
+        self.red_ran_a_process = False  # the test's first harness-red run is a real process
 
     # ---- the scenario
 
@@ -34,7 +46,12 @@ class TestsFirstMainMergeTests(GuardTestCase):
         self.git(root, "add", "-A")
         self.git(root, "commit", "-q", "-m", message)
 
-    def harness_red(self, wt: Path, *args: str) -> subprocess.CompletedProcess:
+    def harness_red(self, wt: Path, *args: str):
+        """harness-red `args` in `wt`: the test's first run as its own process, every later
+        one in this process (run_in_process), with the same environment, cwd and argv."""
+        if self.red_ran_a_process:
+            return self.run_in_process(RED_TOOL, args=args, cwd=wt)
+        self.red_ran_a_process = True
         return subprocess.run(
             [sys.executable, str(RED_TOOL), *args],
             cwd=str(wt),
@@ -50,33 +67,78 @@ class TestsFirstMainMergeTests(GuardTestCase):
         """(main checkout, ticket worktree) after the red run and the coder's commit.
         Main's test files hold `base`; the test-author applies `author` to each (default:
         test_case_5's assert becomes BRANCH_LINE_5). `object_format` "sha256" makes the
-        repo a SHA-256 one."""
+        repo a SHA-256 one. Each (base, the author's text, object format) is built once per
+        module (build_ticket); a later test gets a copy of that build, its worktree links
+        and harness records moved to its own paths (copy_ticket), and the coder's edit is
+        checked allowed there too."""
         if author is None:
             author = lambda t: replaced(t, MAIN_LINE_5, BRANCH_LINE_5)  # noqa: E731
-        repo = self.make_repo(name, object_format=object_format)
-        for rel in MERGE_TEST_FILES:
-            self.write(repo / rel, base)
-        self.commit_all(repo, "the tests so far")
-        key = hashlib.sha1(str(repo.resolve()).encode()).hexdigest()[:12]
-        ticket = {"number": 12, "title": "Fix login", "type": "task", "flags": []}
-        ticket["labels"] = ["task", "status:in-progress"]
-        self.write(
-            self.home / ".claude/harness/repos" / key / "tickets/12.json",
-            json.dumps(ticket),
-        )
-        wt = self.worktree(repo, name=f"{name}-wt")
-        for rel in MERGE_TEST_FILES:  # the test-author
-            path = wt / rel
-            self.write(path, author(path.read_text()))
-        self.commit_all(wt, "tests for login")
-        r = self.harness_red(wt, "check")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("red (assertion)", r.stdout)
-        self.assertIsNone(self.edit(wt, "src/app.py"))  # the record is current
-        self.write(wt / "src/app.py", "def login():\n    return 'ok'\n")  # the coder
-        self.commit_all(wt, "login")
-        self.assertIsNone(self.edit(wt, "src/app.py", "harness:coder"))
+        key = (base, author(base), object_format)
+        repo, wt = self.tmp / name, self.tmp / f"{name}-wt"
+        if key in _TICKETS:
+            self.copy_ticket(_TICKETS[key], repo, wt)
+            self.assertIsNone(self.edit(wt, "src/app.py", "harness:coder"))
+        else:
+            self.build_ticket(name, base, author, object_format)
+            _TICKETS[key] = self.save_ticket(repo, wt)
         return repo, wt
+
+    def build_ticket(self, name: str, base: str, author, object_format: str | None) -> None:
+        """ticket()'s scenario built at <tmp>/<name> and <tmp>/<name>-wt, every git call in it
+        (harness-red's too) with background maintenance and auto gc off, so the copy
+        save_ticket takes never catches one mid-run (#365)."""
+        saved = dict(self.env)
+        self.env.update(GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="maintenance.auto",
+                        GIT_CONFIG_VALUE_0="false", GIT_CONFIG_KEY_1="gc.auto", GIT_CONFIG_VALUE_1="0")
+        try:
+            repo = self.make_repo(name, object_format=object_format)
+            for rel in MERGE_TEST_FILES:
+                self.write(repo / rel, base)
+            self.commit_all(repo, "the tests so far")
+            ticket = {"number": 12, "title": "Fix login", "type": "task", "flags": []}
+            ticket["labels"] = ["task", "status:in-progress"]
+            self.write(self.records(repo) / "tickets/12.json", json.dumps(ticket))
+            wt = self.worktree(repo, name=f"{name}-wt")
+            for rel in MERGE_TEST_FILES:  # the test-author
+                path = wt / rel
+                self.write(path, author(path.read_text()))
+            self.commit_all(wt, "tests for login")
+            r = self.harness_red(wt, "check")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("red (assertion)", r.stdout)
+            self.assertIsNone(self.edit(wt, "src/app.py"))  # the record is current
+            self.write(wt / "src/app.py", "def login():\n    return 'ok'\n")  # the coder
+            self.commit_all(wt, "login")
+            self.assertIsNone(self.edit(wt, "src/app.py", "harness:coder"))
+        finally:
+            self.env.clear()
+            self.env.update(saved)
+
+    def records(self, repo: Path) -> Path:
+        """The folder of `repo`'s harness records (ticket cache, red record, side file)."""
+        key = hashlib.sha1(str(repo.resolve()).encode()).hexdigest()[:12]
+        return self.home / ".claude/harness/repos" / key
+
+    def save_ticket(self, repo: Path, wt: Path) -> dict:
+        """A copy of a ticket() just built, in the module's folder: the main checkout, the
+        worktree, its records, and the name of the worktree's folder under .git/worktrees."""
+        store = Path(tempfile.mkdtemp(prefix="ticket-", dir=_SHARED["base"]))
+        copy_repo(repo, store / "repo")
+        copy_repo(wt, store / "wt")
+        shutil.copytree(self.records(repo), store / "records")
+        (admin,) = os.listdir(repo / ".git" / "worktrees")
+        return {"store": store, "admin": admin}
+
+    def copy_ticket(self, saved: dict, repo: Path, wt: Path) -> None:
+        """The saved ticket at `repo` and `wt`: git's links between the two rewritten to the
+        new paths (as `git worktree add` writes them) and the records under the new main
+        checkout's key."""
+        copy_repo(saved["store"] / "repo", repo)
+        copy_repo(saved["store"] / "wt", wt)
+        admin = repo / ".git" / "worktrees" / saved["admin"]
+        (admin / "gitdir").write_text(f"{wt / '.git'}\n")
+        (wt / ".git").write_text(f"gitdir: {admin}\n")
+        shutil.copytree(saved["store"] / "records", self.records(repo))
 
     def on_main(self, repo: Path, changes: dict, message: str = "main moves on") -> None:
         """Commit on main: each path gets a function of its old text (None when it is

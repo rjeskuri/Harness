@@ -25,6 +25,8 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
+import gitrepo_support
+
 HOOKS = Path(__file__).resolve().parent.parent / "hooks"
 SHOWN_LIMIT = 160  # a refused part is displayed cut to 160 characters
 
@@ -38,6 +40,9 @@ def as_shown(part: str) -> str:
 
 
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+# git's own folder first (#378): the git binary itself, not macOS's /usr/bin/git xcrun shim.
+if os.path.dirname(gitrepo_support.GIT) not in SYSTEM_PATH.split(os.pathsep):
+    SYSTEM_PATH = os.path.dirname(gitrepo_support.GIT) + os.pathsep + SYSTEM_PATH
 GIT_IDENTITY = {
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_AUTHOR_NAME": "Test",
@@ -278,17 +283,37 @@ class GuardTestCase(unittest.TestCase):
 
     # ---- running a hook
 
-    def run_hook(self, name: str, payload, env: dict | None = None):
-        stdin = payload if isinstance(payload, str) else json.dumps(payload)
-        r = subprocess.run(
-            [sys.executable, str(HOOKS / name)],
-            input=stdin,
-            capture_output=True,
-            text=True,
+    # Each test is a new instance: its first run_hook is a process of its own (#378).
+    _ran_a_hook_process = False
+
+    def run_in_process(self, script, stdin: str = "", args=(), cwd=None, env: dict | None = None):
+        """`script` run in this process (gitrepo_support.run_in_process) with the test's
+        environment plus `env`, in `cwd` (default: the test's folder)."""
+        return gitrepo_support.run_in_process(
+            script,
+            args=args,
+            stdin=stdin,
+            cwd=cwd or self.tmp,
             env=dict(self.env, **(env or {})),
-            cwd=str(self.tmp),
-            timeout=60,
         )
+
+    def run_hook(self, name: str, payload, env: dict | None = None):
+        """The hook `name` given `payload`: the test's first call a real process, every later
+        one in this process; either way it exits 0 with nothing on stderr."""
+        stdin = payload if isinstance(payload, str) else json.dumps(payload)
+        if self._ran_a_hook_process:
+            r = self.run_in_process(HOOKS / name, stdin, env=env)
+        else:
+            self._ran_a_hook_process = True
+            r = subprocess.run(
+                [sys.executable, str(HOOKS / name)],
+                input=stdin,
+                capture_output=True,
+                text=True,
+                env=dict(self.env, **(env or {})),
+                cwd=str(self.tmp),
+                timeout=60,
+            )
         self.assertEqual((r.returncode, r.stderr), (0, ""))
         return r
 

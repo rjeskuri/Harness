@@ -10,7 +10,101 @@ from __future__ import annotations
 import unittest
 
 import pr_support
+from gitrepo_support import copy_repo, run_in_process
 from pr_support import *  # noqa: F401,F403
+
+
+# ------------------------------------------------------------------ the rows of a test run in this process (#378)
+class RowsInProcess:
+    """A test's first `harness-pr` run is a process of its own, as PrTest.pr runs it: the exit code and the output of
+    the process contract. Every later run, the rows of its table and the runs that only set up a later one, runs the
+    tool in this process (gitrepo_support.run_in_process) with the same argv, cwd and environment, so a row pays for
+    neither a Python start nor a compile of the tool. What the tool runs (git, gh, harness-board and the stubs) is still
+    its own process either way."""
+
+    ran_a_process = False            # each test is a new instance, so each test's first run is a process
+
+    def pr(self, *args, cwd=None, stubs=True, **env):
+        if not self.ran_a_process:
+            self.ran_a_process = True
+            return super().pr(*args, cwd=cwd, stubs=stubs, **env)
+        return run_in_process(TOOL, args=args, cwd=cwd or self.main, env=self.env(stubs=stubs, **env))
+
+
+# ------------------------------------------------------------------ the repositories, built once per class (#378)
+class CopiedWorktree:
+    """WorktreeTest's repositories (pr_support), built once per test class and copied into each test's folder: the
+    bare origin; the main checkout `proj` (README.md, `.claude/worktrees/` in .git/info/exclude, the commit "First")
+    pushed to it; the ticket worktree on BRANCH at proj/.claude/worktrees/t-12-add-the-widget from origin/main, with
+    widget.py and tests/test_widget.py committed as "Add the widget". A class whose every test starts from more history
+    adds it in `extend_template`, run once on the template.
+
+    The template is built with git's background gc and maintenance off (on the command line and in each repository's
+    config, so its copies carry it too): nothing changes under a copy while it is taken (#365). A copy's links that
+    name the template by its path (the origin remote, the worktree's .git file, the main checkout's record of the
+    worktree, FETCH_HEAD) are rewritten to name the copy, which is what `git worktree repair` and `git remote set-url`
+    would write."""
+
+    WORKTREE = "t-12-add-the-widget"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        root = os.path.realpath(tempfile.mkdtemp(prefix="harness-pr-land-template-"))
+        cls.addClassCleanup(shutil.rmtree, root, True)
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("HARNESS_", "FAKEGH_", "GIT_", "CLAUDE_"))}
+        env.update(HOME=os.path.join(root, "home"), PATH=os.pathsep.join(["/usr/bin", "/bin"]),
+                   GIT_CEILING_DIRECTORIES=root, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Test",
+                   GIT_AUTHOR_EMAIL="test@localhost", GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@localhost")
+
+        def git(repo, *args):
+            p = subprocess.run([GIT, "-C", repo, "-c", "commit.gpgsign=false", "-c", "maintenance.auto=false",
+                                "-c", "gc.auto=0", *args], env=env, capture_output=True, text=True)
+            if p.returncode != 0:
+                raise AssertionError(f"template: git {' '.join(args)}: {p.stderr}")
+            return p.stdout.strip()
+
+        origin, main = os.path.join(root, "origin.git"), os.path.join(root, "proj")
+        wt = os.path.join(main, ".claude", "worktrees", cls.WORKTREE)
+        os.makedirs(origin)
+        os.makedirs(main)
+        git(origin, "init", "-q", "--bare", "-b", "main")
+        git(main, "init", "-q", "-b", "main")
+        for repo in (origin, main):
+            git(repo, "config", "gc.auto", "0")
+            git(repo, "config", "maintenance.auto", "false")
+        write(os.path.join(main, "README.md"), "# proj\n")
+        write(os.path.join(main, ".git", "info", "exclude"), ".claude/worktrees/\n")
+        git(main, "add", "-A")
+        git(main, "commit", "-q", "-m", "First")
+        git(main, "remote", "add", "origin", origin)
+        git(main, "push", "-q", "-u", "origin", "main")
+        git(main, "worktree", "add", "-q", "-b", BRANCH, wt, "origin/main")
+        write(os.path.join(wt, "widget.py"), "def frob():\n    return 2\n")
+        write(os.path.join(wt, "tests", "test_widget.py"), "def test_frob():\n    assert True\n")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "Add the widget")
+        cls.extend_template(git, origin, main, wt)
+        cls.template_root = root
+
+    @classmethod
+    def extend_template(cls, git, origin, main, wt):
+        """More history every test of the class starts from; `git(repo, *args)` runs git on the template."""
+
+    def make_repos(self):
+        root = type(self).template_root
+        for name in ("origin.git", "proj"):
+            copy_repo(os.path.join(root, name), os.path.join(self.tmp, name))
+        self.origin, self.main = os.path.join(self.tmp, "origin.git"), os.path.join(self.tmp, "proj")
+        self.wt = os.path.join(self.main, ".claude", "worktrees", self.WORKTREE)
+        admin = os.path.join(self.main, ".git", "worktrees", self.WORKTREE)
+        for path in (os.path.join(self.main, ".git", "config"), os.path.join(self.main, ".git", "FETCH_HEAD"),
+                     os.path.join(self.wt, ".git"), os.path.join(admin, "gitdir"), os.path.join(admin, "FETCH_HEAD")):
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as fh:
+                    text = fh.read()
+                write(path, text.replace(root + os.sep, self.tmp + os.sep))
+
 
 # ------------------------------------------------------------------ the land fixtures of the head checks (#337)
 # LAND_FIELDS, HEAD_SHA, land_view, compare_calls and land_gate_calls are pr_support's (#348).
@@ -45,31 +139,40 @@ class BranchHistory:
         return self.branch_head()
 
     def elsewhere(self):
-        """The second clone of origin, on main and up to date."""
+        """The second clone of origin, on main and up to date. Only this clone moves origin's main (other PRs
+        landing), and side_merge switches it back to main, so a clone made once stays on origin's main; it is made
+        with git's background maintenance and auto gc off, as the template is (#365, #378)."""
         clone = os.path.join(self.tmp, "elsewhere")
         if not os.path.isdir(clone):
-            subprocess.run([GIT, "clone", "-q", self.origin, clone], env=self.env(), check=True, capture_output=True)
-        self.git(clone, "switch", "-q", "main")
-        self.git(clone, "pull", "-q", "--ff-only")
+            subprocess.run([GIT, "clone", "-q", "-c", "maintenance.auto=false", "-c", "gc.auto=0", self.origin,
+                            clone], env=self.env(), check=True, capture_output=True)
         return clone
 
     def advance_main(self, n=1):
         """`n` new commits on origin's main, the k-th move adding elsewhere/change_<k>.py (`CHANGE = <k>`), fetched
-        into the shared repository (the worktree's and the main checkout's origin/main); origin/main's new sha."""
+        into the shared repository (the worktree's and the main checkout's origin/main); origin/main's new sha. The
+        `n` commits are pushed together, as `n` PRs landing between two fetches."""
         self.moves = getattr(self, "moves", 0)
+        commits = []
         for _ in range(n):
             self.moves += 1
-            self.main_commit({f"elsewhere/change_{self.moves}.py": f"CHANGE = {self.moves}\n"},
-                             f"Another PR lands ({self.moves})")
-        return self.git(self.wt, "rev-parse", "origin/main")
+            commits.append(({f"elsewhere/change_{self.moves}.py": f"CHANGE = {self.moves}\n"},
+                            f"Another PR lands ({self.moves})"))
+        return self.main_commits(commits)
 
     def main_commit(self, files, message):
         """One commit of `files` (path: text) on origin's main, fetched into the shared repository; its sha."""
+        return self.main_commits([(files, message)])
+
+    def main_commits(self, commits):
+        """A commit on origin's main for each (files, message) in order, `files` path: text; pushed at once and
+        fetched into the shared repository; origin/main's new sha."""
         clone = self.elsewhere()
-        for path, text in files.items():
-            write(os.path.join(clone, path), text)
-        self.git(clone, "add", "-A")
-        self.git(clone, "commit", "-q", "-m", message)
+        for files, message in commits:
+            for path, text in files.items():
+                write(os.path.join(clone, path), text)
+            self.git(clone, "add", "-A")
+            self.git(clone, "commit", "-q", "-m", message)
         self.git(clone, "push", "-q", "origin", "main")
         self.git(self.wt, "fetch", "-q", "origin")
         return self.git(self.wt, "rev-parse", "origin/main")
@@ -155,7 +258,7 @@ class BranchHistory:
         """The PR's commits as GitHub lists them (origin/main..head, oldest first, with their parents): the reviewed
         commit and its ancestors dated at(9), before the review at(10); every later one at(11), after it."""
         out = self.git(self.wt, "rev-list", "--reverse", "--parents", "origin/main..HEAD")
-        before = set(self.git(self.wt, "rev-list", reviewed).split())
+        before = self.ancestry(reviewed)
         commits = []
         for line in out.splitlines():
             sha, *parents = line.split()
@@ -165,8 +268,19 @@ class BranchHistory:
                                        "committer": {"name": "Test", "date": when}}})
         return commits
 
+    def ancestry(self, sha):
+        """`sha` and every commit before it (git rev-list): a commit's history never changes, so each is read once
+        per test."""
+        known = self.__dict__.setdefault("ancestries", {})
+        if sha not in known:
+            known[sha] = set(self.git(self.wt, "rev-list", sha).split())
+        return known[sha]
 
-class Land(WorktreeTest):
+
+class LandBase(RowsInProcess, CopiedWorktree, WorktreeTest):
+    """The land conversation and the ticket's cache, without tests of its own: Land and LandResolution each run only
+    their own tests on it (LandResolution once inherited Land's and ran each of them a second time, unchanged)."""
+
     def land_calls(self, views=None, issue_state="OPEN", comments=(), reviews=(), commits=None, head=None,
                    behind=0):
         """The land conversation: the review gate's reads first (no harness review by default, so the gate
@@ -203,6 +317,8 @@ class Land(WorktreeTest):
         return subprocess.run([GIT, "-C", self.main, "rev-parse", "--verify", "--quiet", f"refs/heads/{BRANCH}"],
                               capture_output=True, env=self.env()).returncode == 0
 
+
+class Land(LandBase):
     def test_land_merges_then_cleans_up_in_order(self):
         self.scenario(self.land_calls(views=[land_view(mergeable="UNKNOWN"), land_view()]))
         p = self.ok("land", "34", "--yes", cwd=self.wt)
@@ -355,7 +471,7 @@ class Land(WorktreeTest):
         self.assertFalse(self.branch_exists())
 
 
-class LandDirtyMain(WorktreeTest):
+class LandDirtyMain(RowsInProcess, CopiedWorktree, WorktreeTest):
     """The main checkout has uncommitted changes when `land` fast-forwards it. The squash merge is a real commit
     on origin/main (pushed from a second clone, as GitHub's merge would be), and gh reports its sha, so the land's
     fetch brings it and `git pull --ff-only` has something to apply. A dirty path whose bytes equal the landed
@@ -364,25 +480,31 @@ class LandDirtyMain(WorktreeTest):
 
     land_calls = Land.land_calls
 
+    @classmethod
+    def extend_template(cls, git, origin, main, wt):
+        """Main tracks the worklog, the rates and the notes: committed and pushed to origin's main."""
+        write(os.path.join(main, WORKLOG), WORKLOG_BEFORE)
+        write(os.path.join(main, "data", "rates.tsv"), "client\trate\nacme\t120\n")
+        write(os.path.join(main, "docs", "notes.md"), "# Notes\n")
+        git(main, "add", "-A")
+        git(main, "commit", "-q", "-m", "Track the worklog")
+        git(main, "push", "-q", "origin", "main")
+
     def setUp(self):
         super().setUp()
         self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}}})
         write(self.state_path("tickets", "12.json"),
               json.dumps({"number": 12, "parent": {"number": 3, "title": "Widgets", "goal": ""}}))
-        write(os.path.join(self.main, WORKLOG), WORKLOG_BEFORE)
-        write(os.path.join(self.main, "data", "rates.tsv"), "client\trate\nacme\t120\n")
-        write(os.path.join(self.main, "docs", "notes.md"), "# Notes\n")
-        self.git(self.main, "add", "-A")
-        self.git(self.main, "commit", "-q", "-m", "Track the worklog")
-        self.git(self.main, "push", "-q", "origin", "main")
 
     def landed(self, files):
         """Push the squash merge of PR #34 to origin/main, changing `files` (path: content, None deletes it);
         return its sha."""
         clone = os.path.join(self.tmp, "github")
-        if not os.path.isdir(clone):
-            subprocess.run([GIT, "clone", "-q", self.origin, clone], env=self.env(), check=True, capture_output=True)
-        self.git(clone, "pull", "-q", "--ff-only")
+        if not os.path.isdir(clone):          # a fresh clone is up to date; made with maintenance off (#365)
+            subprocess.run([GIT, "clone", "-q", "-c", "maintenance.auto=false", "-c", "gc.auto=0", self.origin,
+                            clone], env=self.env(), check=True, capture_output=True)
+        else:
+            self.git(clone, "pull", "-q", "--ff-only")
         for path, text in files.items():
             if text is None:
                 os.unlink(os.path.join(clone, path))
@@ -621,7 +743,11 @@ class LandDirtyMain(WorktreeTest):
         self.assertNotIn("docs/notes.md", text)
 
 
-class LandResolution(Land):
+# (the fixture as JSON, no_sha): the bodies its land posts on a fresh ticket; LandResolution.fresh_landing fills it.
+FRESH_LANDINGS = {}
+
+
+class LandResolution(LandBase):
     """`land` leaves one `**Resolution**` comment on the ticket, posted through `harness-board comment` before the
     `Landed in` comment. These run the real harness-board (no stubs), so every comment reaches the fake gh's log."""
 
@@ -850,10 +976,26 @@ class LandResolution(Land):
     # ------------------------------------------------------------------ a reopened ticket's second landing (#24)
     REOPENED = "Reopened: the first pass broke the hooks."
 
+    def fresh_landing(self, fx, no_sha=False):
+        """The bodies a land of `fx` (GitHub reporting no merge commit when `no_sha`) posts on a ticket with no
+        comments yet, in order: what a first pass leaves on the ticket, or this landing's own first run. They depend
+        on nothing but the fixture's PR (resolution_body, `Landed in`), so each is landed once per module run and
+        kept for the tests that start from it (#378)."""
+        key = (json.dumps(fx, sort_keys=True), no_sha)
+        if key not in FRESH_LANDINGS:
+            self.land(fx, no_sha=no_sha)
+            FRESH_LANDINGS[key] = [b for _, _, b in self.posted(12)]
+        return list(FRESH_LANDINGS[key])
+
+    @staticmethod
+    def split_landing(bodies):
+        """(the Resolutions, the `Landed in` comments) among `bodies`, as resolutions() and landed() tell them."""
+        return ([b for b in bodies if b.lstrip().startswith(RESOLUTION)],
+                [b for b in bodies if b.lstrip().startswith("Landed in")])
+
     def first_pass(self, fx):
         """Land `fx` on a fresh ticket and return the bodies it posted: its Resolution and `Landed in`."""
-        self.land(fx)
-        bodies = [b for _, _, b in self.posted(12)]
+        bodies = self.fresh_landing(fx)
         self.assertEqual(len(bodies), 2, f"the first pass posts a Resolution and Landed in: {bodies}")
         return bodies
 
@@ -937,9 +1079,7 @@ class LandResolution(Land):
         landing's Landed comment too. Run with the fixtures both ways round."""
         for old, new in ((FIXTURE_A, FIXTURE_B), (FIXTURE_B, FIXTURE_A)):
             first = self.first_pass(old) + [self.REOPENED]
-            self.land(new)                                   # this landing's own comments, as the land posts them
-            res = [b for _, _, b in self.resolutions(12)]
-            mine = [b for _, _, b in self.landed(12)]
+            res, mine = self.split_landing(self.fresh_landing(new))   # this landing's own comments, as posted
             self.assertEqual((len(res), len(mine)), (1, 1))
             by_pr = f"Landed in PR #{new['pr']}\n\n{HARNESS_MARK}"
             cases = [("this Resolution only", res, [f"Landed in {new['sha']}"]),
@@ -982,9 +1122,7 @@ class LandResolution(Land):
         for old, new in ((FIXTURE_A, FIXTURE_B), (FIXTURE_B, FIXTURE_A)):
             by_pr = f"Landed in PR #{new['pr']}"
             first = self.first_pass(old) + [f"Landed in PR #{new['pr']}0\n\n{HARNESS_MARK}", self.REOPENED]
-            self.land(new, no_sha=True)                      # this landing's own comments, as the land posts them
-            res = [b for _, _, b in self.resolutions(12)]
-            mine = [b for _, _, b in self.landed(12)]
+            res, mine = self.split_landing(self.fresh_landing(new, no_sha=True))   # this landing's own, as posted
             self.assertEqual(len(res), 1)
             self.assertNotIn("Squash commit", res[0], "no merge sha, no squash line")
             with self.subTest(old=old["pr"], new=new["pr"], case="second landing"):
@@ -1016,9 +1154,7 @@ class LandResolution(Land):
         that, only `Landed in PR #<pr>` is posted. Both ways round."""
         for old, new in ((FIXTURE_A, FIXTURE_B), (FIXTURE_B, FIXTURE_A)):
             first = self.first_pass(old) + [self.REOPENED]
-            self.land(new)                                   # the first run of this landing, sha known
-            res = [b for _, _, b in self.resolutions(12)]
-            mine = [b for _, _, b in self.landed(12)]
+            res, mine = self.split_landing(self.fresh_landing(new))   # the first run of this landing, sha known
             self.assertIn(f"Squash commit: {new['sha']}", res[0])
             self.assertEqual([b.replace(HARNESS_MARK, "").strip() for b in mine], [f"Landed in {new['sha']}"])
             for how in (True, "fail"):
@@ -1219,7 +1355,7 @@ class LandResolution(Land):
         self.assertLess(index, landed[0][0], "the Resolution goes before Landed in")
 
 
-class LandRefusals(WorktreeTest):
+class LandRefusals(RowsInProcess, CopiedWorktree, WorktreeTest):
     """A real origin (WorktreeTest), so a land that fetches before its checks can."""
 
     def test_land_refuses_before_merging(self):
@@ -1240,7 +1376,7 @@ class LandRefusals(WorktreeTest):
                 self.assertFalse(any(a[:2] == ["pr", "merge"] for a in self.gh_argv()))
 
 
-class LandGate(GateAsserts, WorktreeTest):
+class LandGate(GateAsserts, RowsInProcess, CopiedWorktree, WorktreeTest):
     """`harness-pr land P` refuses a PR whose latest harness review, at the head (HEAD_SHA here), has high or medium
     findings, unless --accept-findings; it lands the PR when that review is clean or has only low findings, or there
     is no harness review. A review of another commit than the head: LandAtHead."""
@@ -1359,19 +1495,27 @@ class LandGate(GateAsserts, WorktreeTest):
         self.assertIn(GATE_FAILURE_TEXT, p.stderr)                           # the warning names the failure
 
 
-class LandAtHead(GateAsserts, BranchHistory, WorktreeTest):
+class LandAtHead(GateAsserts, BranchHistory, RowsInProcess, CopiedWorktree, WorktreeTest):
     """#337: before merging, `land` checks that the PR's CI and its latest harness review cover the head being merged
     with today's main: the head not behind main (the compare of main with the head's sha answers behind_by 0), the
     review at the head (of the head itself, or of a commit the head adds only clean merges of main to: real commits
     here, judged by git in the main checkout), and green checks at the head. A refusal merges nothing and leaves the
     worktree, the branch and the ticket as they were; --accept-findings skips none of these checks."""
 
+    @classmethod
+    def extend_template(cls, git, origin, main, wt):
+        """The ticket branch pushed to origin and fetched back, as push_branch does; its head, the same commit in
+        every copy."""
+        git(wt, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
+        git(wt, "fetch", "-q", "origin")
+        cls.template_head = git(wt, "rev-parse", "HEAD")
+
     def setUp(self):
         super().setUp()
         self.outputs(**{"harness-board": {"epic-check": {"stdout": EPIC_SAID}}})
         write(self.state_path("tickets", "12.json"),
               json.dumps({"number": 12, "parent": {"number": 3, "title": "Widgets", "goal": ""}}))
-        self.reviewed = self.push_branch()               # the commit the harness review is of, unless a case says
+        self.reviewed = self.template_head               # the pushed head the harness review is of, unless a case says
 
     def land(self, *flags, review="clean", behind=0, checks=None, mergeable="MERGEABLE", first=()):
         """`harness-pr land 34` at the branch's head as origin has it now. `review`: the latest harness review (a
@@ -1616,7 +1760,7 @@ class LandAtHead(GateAsserts, BranchHistory, WorktreeTest):
         self.assertIn(["close", "12", "--repo", self.main], self.stub_calls("harness-board"))
 
 
-class OpenNotes(WorktreeTest):
+class OpenNotes(RowsInProcess, CopiedWorktree, WorktreeTest):
     """`harness-pr open N --notes F`: the file's markdown becomes a `## Notes` section of the PR body between
     Summary and Definition of done, and the Resolution comment `land` posts repeats it."""
 
@@ -1899,8 +2043,8 @@ class FixturesLiveInPrSupport(unittest.TestCase):
         scenario = os.path.join(tmp, "scenario.json")
         with open(scenario, "w", encoding="utf-8") as fh:
             json.dump({"calls": calls}, fh)
-        p = subprocess.run([sys.executable, FAKEGH, *argv], capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                           env=dict(os.environ, FAKEGH_SCENARIO=scenario), timeout=60)
+        p = subprocess.run([sys.executable, "-I", "-S", FAKEGH, *argv], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, env=dict(os.environ, FAKEGH_SCENARIO=scenario), timeout=60)
         return p.returncode, p.stdout
 
     def test_pr_support_provides_the_head_check_fixtures(self):

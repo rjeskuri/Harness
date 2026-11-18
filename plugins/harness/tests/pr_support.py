@@ -20,10 +20,14 @@ import unittest
 
 sys.dont_write_bytecode = True
 
+import gitrepo_support  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(os.path.dirname(HERE), "bin", "harness-pr")
 FAKEGH = os.path.join(HERE, "fakegh.py")
-GIT = shutil.which("git")
+GIT = gitrepo_support.GIT  # the git binary itself, not macOS's xcrun shim (#378)
+# The wrappers' shell (#378): dash when there is one, since macOS's /bin/sh re-executes bash.
+SH = "/bin/dash" if os.path.exists("/bin/dash") else "/bin/sh"
 MARKER = "<!-- harness-review -->"
 BRANCH = "t/12-add-the-widget"
 PR_URL = "https://github.com/o/r/pull/34"
@@ -111,23 +115,31 @@ def setUpModule():
     fakebin, stubbin = os.path.join(root, "fakebin"), os.path.join(root, "stubbin")
     stub, claude, recorder = (write(os.path.join(root, n), t) for n, t in
                               (("stub.py", STUB), ("claude.py", CLAUDE), ("recorder.py", RECORDER)))
+    # The Python stand-ins start with -I -S (#378): no site, no user site, no PYTHON* variables.
     executable(os.path.join(fakebin, "gh"),
-               f'#!/bin/sh\nprintf \'%s\\n\' "gh $*" >> "$ORDER_LOG"\nexec "{py}" "{FAKEGH}" "$@"\n')
+               f'#!{SH}\nprintf \'%s\\n\' "gh $*" >> "$ORDER_LOG"\nexec "{py}" -I -S "{FAKEGH}" "$@"\n')
     executable(os.path.join(fakebin, "git"),
-               f'#!/bin/sh\nprintf \'%s\\n\' "git $*" >> "$ORDER_LOG"\nexec "{GIT}" "$@"\n')
-    executable(os.path.join(fakebin, "claude"), f'#!/bin/sh\nexec "{py}" "{claude}" "$@"\n')
+               f'#!{SH}\nprintf \'%s\\n\' "git $*" >> "$ORDER_LOG"\nexec "{GIT}" "$@"\n')
+    executable(os.path.join(fakebin, "claude"), f'#!{SH}\nexec "{py}" -I -S "{claude}" "$@"\n')
     for name in ("terminal-notifier", "osascript"):
-        executable(os.path.join(fakebin, name), f'#!/bin/sh\nexec "{py}" "{recorder}" "$0" "$@"\n')
+        executable(os.path.join(fakebin, name), f'#!{SH}\nexec "{py}" -I -S "{recorder}" "$0" "$@"\n')
     os.symlink(py, os.path.join(fakebin, "python3"))
     for name in ("harness-board", "harness-red"):
-        executable(os.path.join(stubbin, name), f'#!/bin/sh\nexec "{py}" "{stub}" "$0" "$@"\n')
+        executable(os.path.join(stubbin, name), f'#!{SH}\nexec "{py}" -I -S "{stub}" "$0" "$@"\n')
     # harness-work goes in fakebin, on PATH with or without the stubs: the land tests that run the real
     # harness-board must not run the real `harness-work cost` either.
-    executable(os.path.join(fakebin, "harness-work"), f'#!/bin/sh\nexec "{py}" "{stub}" "$0" "$@"\n')
-    BINS.update(root=root, fakebin=fakebin, stubbin=stubbin)
+    executable(os.path.join(fakebin, "harness-work"), f'#!{SH}\nexec "{py}" -I -S "{stub}" "$0" "$@"\n')
+    # One bytecode folder per module (#378): the tools this module runs and the rows run in this process compile
+    # harness_lib once, even under PYTHONDONTWRITEBYTECODE=1, and never into the checkout.
+    pycache = os.path.join(root, "pycache")
+    os.makedirs(pycache)
+    BINS.update(root=root, fakebin=fakebin, stubbin=stubbin, pycache=pycache, saved_prefix=sys.pycache_prefix)
+    sys.pycache_prefix = pycache
 
 
 def tearDownModule():
+    if "saved_prefix" in BINS:
+        sys.pycache_prefix = BINS.pop("saved_prefix")
     shutil.rmtree(BINS.get("root", ""), True)
 
 
@@ -184,6 +196,8 @@ class PrTest(unittest.TestCase):
 
     def env(self, stubs=True, **extra):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("HARNESS_", "FAKEGH_", "GIT_", "CLAUDE_"))}
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
+        env["PYTHONPYCACHEPREFIX"] = BINS["pycache"]
         path = ([BINS["stubbin"]] if stubs else []) + [BINS["fakebin"], "/usr/bin", "/bin"]
         env.update(HOME=self.home, PATH=os.pathsep.join(path), GIT_CEILING_DIRECTORIES=self.tmp,
                    GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@localhost",
