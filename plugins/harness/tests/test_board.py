@@ -969,11 +969,24 @@ class Ready(BoardTest):
                                          "number,title,labels,blockedBy", "--limit", "200"]])
         self.assertEqual([r["number"] for r in rows], [9, 3, 6, 8])
         self.assertEqual(rows[0], {"number": 9, "title": "Ticket 9", "type": "task", "size": "L", "risk": None,
-                                   "tier": "opus", "flags": ["priority:high"]})          # #239: size:L is opus
+                                   "tier": "opus", "flags": ["priority:high"], "blocked_by": []})  # #239, #389
         self.assertEqual([r["tier"] for r in rows], ["opus", "sonnet", "opus", "opus"])
         table = self.ok("ready").stdout.splitlines()
         self.assertTrue(table[0].startswith("#"))
         self.assertEqual([line.split()[0] for line in table[1:]], ["9", "3", "6", "8"])
+
+    def test_ready_json_lists_blocked_by(self):
+        # #389: each row carries the numbers of its (all closed) blockers; the text table keeps its columns
+        def item(number, blockers):
+            return {"number": number, "title": f"Ticket {number}",
+                    "labels": [{"name": n} for n in ("task", "status:ready", "size:S", "risk:low")],
+                    "blockedBy": [{"number": b, "state": "CLOSED"} for b in blockers]}
+        cases = {3: [], 4: [2], 6: [1, 5], 7: [10], 8: [2, 10]}
+        self.scenario([{"match": ["issue", "list"], "stdout_json": [item(n, b) for n, b in cases.items()]}])
+        rows = json.loads(self.ok("ready", "--json").stdout)
+        self.assertEqual({r["number"]: r.get("blocked_by") for r in rows}, cases)
+        header = self.ok("ready").stdout.splitlines()[0]
+        self.assertEqual(header.split(), ["#", "TITLE", "TYPE", "SIZE", "RISK", "TIER", "FLAGS"])
 
 
 # ======================================================================= status, comment, close, needs-input
@@ -3471,9 +3484,11 @@ class TierRouting(BoardTest):
         self.assertEqual(p.stderr, "")
         self.assertEqual(json.loads(p.stdout), [
             {"number": 4, "title": "T4", "type": "task", "size": "L", "risk": "low", "tier": "opus",
-             "flags": ["priority:high"]},
-            {"number": 2, "title": "T2", "type": "task", "size": "S", "risk": "low", "tier": "sonnet", "flags": []},
-            {"number": 3, "title": "T3", "type": "bug", "size": "M", "risk": "low", "tier": "opus", "flags": []}])
+             "flags": ["priority:high"], "blocked_by": []},
+            {"number": 2, "title": "T2", "type": "task", "size": "S", "risk": "low", "tier": "sonnet", "flags": [],
+             "blocked_by": []},
+            {"number": 3, "title": "T3", "type": "bug", "size": "M", "risk": "low", "tier": "opus", "flags": [],
+             "blocked_by": []}])  # #389: every row carries blocked_by
         p = self.ok("ready")
         self.assertEqual(p.stderr, "")
         self.assertEqual([line.split() for line in p.stdout.splitlines()],

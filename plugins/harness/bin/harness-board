@@ -753,11 +753,13 @@ def cmd_ready(repo, args):
         names = label_names(item.get("labels"))
         if "epic" in names or "status:proposed" in names:
             continue
-        if any(str(b.get("state", "")).upper() != "CLOSED" for b in as_list(item.get("blockedBy"))):
+        blockers = as_list(item.get("blockedBy"))
+        if any(str(b.get("state", "")).upper() != "CLOSED" for b in blockers):
             continue
         kind = classify(repo, names)
         rows.append({"number": item.get("number"), "title": item.get("title") or "", "type": kind["type"],
-                     "size": kind["size"], "risk": kind["risk"], "tier": kind["tier"], "flags": kind["flags"]})
+                     "size": kind["size"], "risk": kind["risk"], "tier": kind["tier"], "flags": kind["flags"],
+                     "blocked_by": [int(b["number"]) for b in blockers if b.get("number")]})
     rows.sort(key=lambda r: ("priority:high" not in r["flags"], r["number"] or 0))
     if args.json:
         emit(args.json, rows, "")

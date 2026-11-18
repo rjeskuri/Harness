@@ -4,7 +4,7 @@
 - Keep replies short. For code changes I will review inline, show before/after snippets of the changed lines rather than whole files.
 - I am on macOS with zsh, Homebrew and VS Code. macOS ships BSD `sed`, `grep` and `date`: no `grep -P`, `sed -i` needs `''`, and `date -d` does not exist. There is no bare `python`, only `python3` or the project's own interpreter.
 - When you finish a task, show the evidence (the command you ran and its result) and say plainly what you could not verify.
-- Ask before adding dependencies or doing anything else hard to undo, except what the loop below allows; a destructive local command runs after an automatic backup kept 14 days, and `harness-work backup list` and `harness-work backup restore <id>` undo it. Never put a secret on a command line; read it from the environment, a file or the keychain.
+- Ask me first before three kinds of action: deleting backups or history (removing harness backups, force-pushing or rewriting a remote branch, deleting a GitHub repo or release); money or outside messages (payments, email or messages to people, posting publicly); credentials and secrets (setting or deleting secrets, rotating keys, changing auth). A project's own rules still hold, and deleting live records in Salesforce or Jotform still asks (auto mode's Sensitive remote targets). Everything recoverable runs without asking: git history, harness backups, files in repos and worktrees, reports, deploys with revert. A destructive local command runs after an automatic backup kept 14 days, and `harness-work backup list` and `harness-work backup restore <id>` undo it. Never put a secret on a command line; read it from the environment, a file or the keychain.
 
 ## The board is the context
 
