@@ -1735,6 +1735,26 @@ def cmd_cost(repo, args):
         emit(wants_json(args), record, f"{cost.render_text(record)}\nSaved {path}")
 
 
+def after_tickets(n, ready, live):
+    """--after N: (the tickets to dispatch as --only would, the `after` record). The ready tickets whose blockers
+    include N, else the first ready ticket in ready's order without a live run, else none."""
+    unblocked = [r["number"] for r in ready if isinstance(r.get("number"), int)
+                 and n in (r.get("blocked_by") if isinstance(r.get("blocked_by"), list) else [])]
+    nxt = None
+    if not unblocked:
+        nxt = next((r["number"] for r in ready if isinstance(r.get("number"), int) and r["number"] not in live),
+                   None)
+    return (unblocked or ([nxt] if nxt is not None else [])), {"ticket": n, "unblocked": unblocked, "next": nxt}
+
+
+def after_text(after):
+    if after["unblocked"]:
+        return f"after #{after['ticket']}: {', '.join(f'#{n}' for n in after['unblocked'])} unblocked"
+    if after["next"] is not None:
+        return f"after #{after['ticket']}: none unblocked; next ready #{after['next']}"
+    return f"after #{after['ticket']}: nothing ready"
+
+
 def cmd_dispatch(repo, args):
     if args.max < 1:
         raise Problem("--max must be at least 1")
@@ -1756,7 +1776,10 @@ def cmd_dispatch(repo, args):
     live = live_runs(mine, agents)
     ready = board_json(repo, "ready", "--json")
     ready = [r for r in ready if isinstance(r, dict)] if isinstance(ready, list) else []
-    only = set(args.only) if args.only else None
+    named, after = args.only, None
+    if args.after is not None:      # --only's path, with the tickets N unblocked, else the next ready one
+        named, after = after_tickets(args.after, ready, live)
+    only = set(named) if named is not None else None
     again, capped, _ = redispatch_candidates(repo, mine, live, only=only)
     candidates, seen = [], set()
     for row in again + ready:
@@ -1766,7 +1789,7 @@ def cmd_dispatch(repo, args):
             candidates.append(row)
     slots = args.max - len(live)
     plan, skipped = [], list(capped)
-    for n in args.only or []:       # a named ticket that is no candidate: say why, launch nothing for it
+    for n in named or []:           # a named ticket that is no candidate: say why, launch nothing for it
         if n in seen or any(s["number"] == n for s in skipped):
             continue
         seen.add(n)
@@ -1788,9 +1811,12 @@ def cmd_dispatch(repo, args):
 
     wave_tier = routing["wave_tier"]
     extra = {"wave": None} if wave_tier else {}     # without HARNESS_WAVE_REVIEW the output is as before #180
+    if after is not None:
+        extra["after"] = after
     if args.dry_run:
         shown = f"effort {effort}, " if effort else ""
         lines = [f"Dry run: venue {venue}, {shown}{len(live)} live, {max(0, slots)} of {args.max} slots free."]
+        lines += [after_text(after)] if after is not None else []
         lines += [f"would start {describe(row)} and launch {venue}" for row in plan]
         group = [row["number"] for row in plan if open_wave(repo, row["number"]) is None] if wave_tier else []
         if group:
@@ -1798,18 +1824,20 @@ def cmd_dispatch(repo, args):
             extra["wave"] = {"id": None, "tickets": sorted(group)}
         lines += [f"skip #{s['number']}: {s['why']}" for s in skipped]
         if not candidates:
-            lines.append("None of the named tickets can be planned." if only is not None else "No ready tickets.")
+            lines.append("None of the named tickets can be planned." if args.only else "No ready tickets.")
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "dry_run": True,
                                      "live": [r["id"] for r in live.values()], "plan": plan, "skipped": skipped},
                                     **extra), "\n".join(lines))
         return
     if not args.json:
+        if after is not None:
+            print(after_text(after), flush=True)
         for s in (skipped if only is not None else capped):
             print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
                                      "skipped": skipped}, **extra),
-             "None of the named tickets can be launched." if only is not None else "No ready tickets.")
+             "None of the named tickets can be launched." if args.only else "No ready tickets.")
         return
     if slots <= 0:
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
@@ -2332,9 +2360,13 @@ def parser():
     dispatch.add_argument("--api", action="store_true",
                           help="alias for --venue headless: runs headless, billed to the API key")
     dispatch.add_argument("--dry-run", action="store_true", help="print the plan; start and launch nothing")
-    dispatch.add_argument("--only", type=ticket_list, metavar="N[,N...]",
-                          help="consider only these tickets (each ready, or in progress with an ended run); "
-                               "any other is skipped with the reason")
+    pick = dispatch.add_mutually_exclusive_group()
+    pick.add_argument("--only", type=ticket_list, metavar="N[,N...]",
+                      help="consider only these tickets (each ready, or in progress with an ended run); "
+                           "any other is skipped with the reason")
+    pick.add_argument("--after", type=issue_number, metavar="N",
+                      help="consider the ready tickets ticket N blocked, else the first ready ticket without a "
+                           "live run")
 
     cloud = sub.add_parser("cloud", parents=[with_repo, with_json],
                            help="start a ticket, push its branch and launch a Claude cloud session on it")
