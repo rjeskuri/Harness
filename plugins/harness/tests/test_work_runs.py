@@ -1347,6 +1347,39 @@ class EndedEarly(WorkTest):
         return json.dumps([{"id": bg_id, "kind": "background", "state": state, "cwd": self.repo,
                             "name": f"proj #{n} {TITLE}"} for n, (bg_id, state) in cases.items()])
 
+    def test_sweep_stops_session_of_blocked_ticket(self):
+        # #387: a parked ticket (status:blocked) is finished, as in-review and needs-input are: the sweep stops its
+        # live bg session once and closes the record `ok`. A status:in-progress ticket's live session is untouched:
+        # not stopped, its record open.
+        blocked = ("task", "status:blocked", "size:S", "risk:low")
+        cases = {   # n: (bg id, agents state, labels, open PRs, PRs of any state, stopped and closed ok)
+            60: ("s-pk60", "idle", blocked, [], [], True),
+            61: ("s-pk61", "blocked", blocked, draft(161), draft(161), True),
+            62: ("s-ip62", "idle", IN_PROGRESS, [], [], False),
+            63: ("s-ip63", "running", IN_PROGRESS, draft(163), draft(163), False),
+        }
+        agents = self.bg_runs({n: c[:2] for n, c in cases.items()})
+        self.write_scenario({n: c[2:5] for n, c in cases.items()})
+
+        p = self.work("runs", "--sweep", env=self.env(FAKECLAUDE_AGENTS=agents))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        stops = {}
+        for call in self.claude_calls():
+            if call["argv"][:1] == ["stop"]:
+                for arg in call["argv"][1:]:
+                    if not arg.startswith("-"):
+                        stops[arg] = stops.get(arg, 0) + 1
+        self.assertEqual(stops, {c[0]: 1 for c in cases.values() if c[5]}, p.stdout + p.stderr)
+        saved = {r["ticket"]: r for r in self.run_records()}
+        for n, c in cases.items():
+            with self.subTest(ticket=n, state=c[1], labels=c[2]):
+                if c[5]:
+                    self.assertTrue(saved[n]["ended_at"], saved[n])
+                    self.assertEqual(saved[n]["outcome"], "ok", saved[n])
+                else:
+                    self.assertIsNone(saved[n]["ended_at"], saved[n])
+                    self.assertIsNone(saved[n]["outcome"], saved[n])
+
     def test_a_done_bg_run_on_an_in_progress_ticket_without_a_ready_pr_ended_early(self):
         # The same facts that make a headless `ok` early make a bg `done` early: the issue OPEN, status:in-progress,
         # and no ready PR of its branch in any state (none, or only drafts). The early run keeps the newest open

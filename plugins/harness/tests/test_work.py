@@ -1,10 +1,10 @@
 """Tests for harness-work: start (branch and worktree from origin/main, an existing remote branch reused, the
 exclude line, the worktree setup, .worktreeinclude copies, refusals), attempt's retry, escalate and
-needs-input sequence, dispatch (dry-run plan, bg on the subscription by default whatever the api budget says,
+park sequence, dispatch (dry-run plan, bg on the subscription by default whatever the api budget says,
 --venue headless billed through apiKeyHelper and refused while the api budget is exhausted, re-dispatch of a run
 that ended without a PR), runs --sweep's outcome
-classification and the budget it marks, the sweep stopping the bg session of a ticket that is in review, needs input or
-closed (#123), budget status, exhaust and reset, worktrees and worktree remove.
+classification and the budget it marks, the sweep stopping the bg session of a ticket that is in review, needs input,
+blocked or closed (#123), budget status, exhaust and reset, worktrees and worktree remove.
 
     python3 -m unittest discover -s plugins/harness/tests -v
 
@@ -297,20 +297,20 @@ class Start(WorkTest):
 
 # =========================================================================== attempt
 class Attempt(WorkTest):
-    def test_retry_escalate_needs_input_and_tier_progression(self):
+    def test_retry_escalate_park_and_tier_progression(self):
         write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
         sequence = [
             (["code", "fail"], "retry"),
             (["code", "fail"], "escalate opus"),
-            (["code", "fail"], "needs-input"),
-            (["code", "fail"], "needs-input"),
+            (["code", "fail"], "park"),
+            (["code", "fail"], "park"),
             (["tests", "fail"], "retry"),                    # each stage counts its own failures
             (["code", "pass"], "done"),
             (["code", "fail"], "retry"),                     # a pass ends the stage's run of failures
             (["review", "fail", "--tier", "opus"], "retry"),
             (["review", "fail", "--tier", "opus"], "escalate opus xhigh"),     # #239: opus goes to opus xhigh
             (["ci", "fail", "--tier", "fable"], "retry"),
-            (["ci", "fail", "--tier", "fable"], "needs-input"),    # #239: nothing above an explicit Fable
+            (["ci", "fail", "--tier", "fable"], "park"),    # #239: nothing above an explicit Fable
         ]
         for argv, expected in sequence:
             with self.subTest(argv=argv):
@@ -347,18 +347,18 @@ class Attempt(WorkTest):
     def test_attempt_without_a_cache_says_to_start(self):
         self.assertOneLineError(self.work("attempt", "12", "code", "fail"), "harness-work start 12")
 
-    def test_fix_stage_allows_two_rounds_then_needs_input(self):
+    def test_fix_stage_allows_two_rounds_then_park(self):
         write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
         sequence = [
             (["fix", "fail"], "retry"),
-            (["fix", "fail"], "needs-input"),                # two rounds at most, never an escalation
-            (["fix", "fail"], "needs-input"),
+            (["fix", "fail"], "park"),                # two rounds at most, never an escalation
+            (["fix", "fail"], "park"),
             (["fix", "pass"], "done"),
             (["fix", "fail"], "retry"),                      # a pass ends the run of fix failures
-            (["fix", "fail", "--tier", "opus"], "needs-input"),
+            (["fix", "fail", "--tier", "opus"], "park"),
             (["fix", "pass", "--tier", "fable"], "done"),
             (["fix", "fail", "--tier", "fable"], "retry"),
-            (["fix", "fail", "--tier", "fable"], "needs-input"),
+            (["fix", "fail", "--tier", "fable"], "park"),
         ]
         for argv, expected in sequence:
             with self.subTest(argv=argv):
@@ -374,14 +374,14 @@ class Attempt(WorkTest):
 
         # --json on a fresh run: the tier never moves and no next tier is named
         write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
-        for failures, action in ((1, "retry"), (2, "needs-input"), (3, "needs-input")):
+        for failures, action in ((1, "retry"), (2, "park"), (3, "park")):
             with self.subTest(json_failures=failures):
                 data = self.ok_json("attempt", "12", "fix", "fail", "--json")
                 self.assertEqual((data["stage"], data["action"], data["failures"], data["tier"], data["next_tier"]),
                                  ("fix", action, failures, "sonnet", None))
         data = self.ok_json("attempt", "12", "fix", "pass", "--json")
         self.assertEqual((data["action"], data["failures"], data["next_tier"]), ("done", 0, None))
-        for failures, action in ((1, "retry"), (2, "needs-input")):
+        for failures, action in ((1, "retry"), (2, "park")):
             with self.subTest(json_opus_failures=failures):
                 data = self.ok_json("attempt", "12", "fix", "fail", "--tier", "opus", "--json")
                 self.assertEqual((data["action"], data["failures"], data["tier"], data["next_tier"]),
@@ -389,7 +389,7 @@ class Attempt(WorkTest):
 
     def test_breaker_failure_answers_done(self):
         """#375: one breaker round; a failure goes to code with the gaps as requirements. A breaker fail answers
-        done at any tier and however often it repeats: never retry, escalate or needs-input. The breaker's
+        done at any tier and however often it repeats: never retry, escalate or park. The breaker's
         failures do not count for code."""
         write(self.cache_path(), json.dumps({"number": 12, "title": TITLE, "tier": "sonnet", "attempts": []}))
         sequence = [
@@ -431,22 +431,22 @@ class Attempt(WorkTest):
                                      ("breaker", "fail", "done", failures, tier, None, None))
 
     def test_ci_and_tests_answer_by_the_default_rule_and_count_apart(self):
-        """`ci` and `tests` are answered by the default rule: retry, escalate, needs-input; a pass ends the run.
+        """`ci` and `tests` are answered by the default rule: retry, escalate, park; a pass ends the run.
         Their failures count apart, and neither counts for code."""
         sequence = [
             (["fail"], "retry"),
             (["fail"], "escalate opus"),
-            (["fail"], "needs-input"),
-            (["fail"], "needs-input"),
+            (["fail"], "park"),
+            (["fail"], "park"),
             (["pass"], "done"),
             (["fail"], "retry"),
             (["fail", "--tier", "opus"], "escalate opus xhigh"),
             (["pass", "--tier", "opus"], "done"),
             (["fail", "--tier", "opus", "--effort", "xhigh"], "retry"),
-            (["fail", "--tier", "opus", "--effort", "xhigh"], "needs-input"),
+            (["fail", "--tier", "opus", "--effort", "xhigh"], "park"),
             (["pass", "--tier", "fable"], "done"),
             (["fail", "--tier", "fable"], "retry"),
-            (["fail", "--tier", "fable"], "needs-input"),
+            (["fail", "--tier", "fable"], "park"),
         ]
         answers = {}
         for stage in ("ci", "tests"):
@@ -480,12 +480,12 @@ class Attempt(WorkTest):
             (["tests", "fail"], "escalate opus"),           # ci's failure did not reset verify
             (["code", "fail"], "retry"),                     # nor does either count for code
             (["ci", "pass"], "done"),
-            (["tests", "fail"], "needs-input"),             # a ci pass does not end tests' run
+            (["tests", "fail"], "park"),             # a ci pass does not end tests' run
             (["ci", "fail"], "retry"),
             (["tests", "pass"], "done"),
             (["ci", "fail"], "escalate opus"),               # a tests pass does not end ci's run
             (["tests", "fail"], "retry"),
-            (["ci", "fail"], "needs-input"),
+            (["ci", "fail"], "park"),
             (["tests", "fail", "--tier", "opus"], "escalate opus xhigh"),
         ]
         for argv, expected in interleaved:
@@ -501,14 +501,14 @@ class Attempt(WorkTest):
             (["review", "fail", "--tier", "opus"], "retry"),
             (["fix", "fail"], "retry"),                      # review's failure is not fix's
             (["review", "fail", "--tier", "opus"], "escalate opus xhigh"),   # fix's failure did not reset review
-            (["fix", "fail"], "needs-input"),                # review's failures did not advance or reset fix
+            (["fix", "fail"], "park"),                # review's failures did not advance or reset fix
             (["code", "fail"], "retry"),                     # nor does either count for code
-            (["review", "fail", "--tier", "fable"], "needs-input"),
+            (["review", "fail", "--tier", "fable"], "park"),
             (["fix", "pass"], "done"),
-            (["review", "fail", "--tier", "fable"], "needs-input"),     # a fix pass does not end review's run
+            (["review", "fail", "--tier", "fable"], "park"),     # a fix pass does not end review's run
             (["fix", "fail", "--tier", "opus"], "retry"),
             (["review", "pass", "--tier", "fable"], "done"),
-            (["fix", "fail", "--tier", "opus"], "needs-input"),         # a review pass does not end fix's run
+            (["fix", "fail", "--tier", "opus"], "park"),         # a review pass does not end fix's run
             (["review", "fail", "--tier", "opus"], "retry"),
         ]
         for argv, expected in sequence:
@@ -527,11 +527,67 @@ class Attempt(WorkTest):
                 self.assertEqual(p.stdout, "")
         self.assertEqual(self.read_json(self.cache_path())["attempts"], attempts)
 
+    def test_attempt_final_failure_answers_park(self):
+        """#387: a stage's final failure answers park (text `park`, --json action "park", no next tier or effort)
+        where it answered needs-input: fix's second failure, any stage's third, and a second failure with nothing above
+        it (opus xhigh, or an explicit fable). Every other answer is unchanged. The first row runs as a real process,
+        the rest in process."""
+        def expected(stage, tier, effort, failures):
+            """The policy, from the ticket: retry first; fix never escalates; the third failure is final; the second
+            escalates one step (sonnet to opus, opus to opus xhigh) or parks when nothing is above."""
+            if failures == 1:
+                return "retry", None, None
+            if stage == "fix" or failures >= 3:
+                return "park", None, None
+            nxt = escalation_of(tier, effort)
+            return ("escalate",) + nxt if nxt else ("park", None, None)
+
+        def answer_of(action, next_tier, next_effort):
+            return " ".join(x for x in (action, next_tier, next_effort) if x)
+
+        first = [True]
+
+        def attempt(n, *argv):
+            args = ["attempt", str(n), *argv]
+            if first[0]:
+                first[0] = False
+                p = self.work(*args)
+            else:
+                p = gitrepo_support.run_in_process(TOOL, args, cwd=self.repo, env=self.env())
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            return p.stdout
+
+        tiers = [("sonnet", None), ("opus", None), ("opus", "xhigh"), ("fable", None)]
+        seen = set()
+        n = 500
+        for stage in ("tests", "code", "review", "fix", "ci"):
+            for tier, effort in tiers:
+                flags = ["--tier", tier] + (["--effort", effort] if effort else [])
+                for output in ("text", "json"):
+                    n += 1
+                    # an S/low task: its code and review routes name no effort, so the flags alone decide
+                    write(self.cache_path(n), json.dumps({
+                        "number": n, "title": TITLE, "type": "task", "size": "S", "risk": "low", "flags": [],
+                        "labels": ["task", "status:in-progress", "size:S", "risk:low"], "tier": "sonnet",
+                        "attempts": []}))
+                    for failures in (1, 2, 3):
+                        want = expected(stage, tier, effort, failures)
+                        with self.subTest(stage=stage, tier=tier, effort=effort, failures=failures, output=output):
+                            if output == "text":
+                                self.assertEqual(attempt(n, stage, "fail", *flags).strip(), answer_of(*want))
+                            else:
+                                data = json.loads(attempt(n, stage, "fail", *flags, "--json"))
+                                self.assertEqual((data["action"], data["next_tier"], data["next_effort"],
+                                                  data["failures"], data["tier"], data["effort"]),
+                                                 want + (failures, tier, effort))
+                        seen.add(want[0])
+        self.assertEqual(seen, {"retry", "escalate", "park"})
+
 
 class AttemptEffort(WorkTest):
     """Ticket #239: `harness-work attempt` knows the effort a stage ran at (`--effort`, else the ticket's own route
     for that stage) and never escalates to Fable: sonnet goes to opus (`escalate opus`), opus to opus at xhigh
-    (`escalate opus xhigh`), and a stage already at opus xhigh (or max), or on an explicit fable, goes to needs-input
+    (`escalate opus xhigh`), and a stage already at opus xhigh (or max), or on an explicit fable, goes to park
     on its second failure. --json carries `effort` and `next_effort` beside `tier` and `next_tier`. WorkTest.env drops
     every HARNESS_* variable of the real environment."""
 
@@ -568,7 +624,7 @@ class AttemptEffort(WorkTest):
                 n = 100 + i
                 self.put_ticket(n, kind, size, risk)
                 answers = [self.attempt(n, "code", "fail") for _ in range(3)]
-                self.assertEqual(answers, ["retry", escalation_text(tier, effort), "needs-input"])
+                self.assertEqual(answers, ["retry", escalation_text(tier, effort), "park"])
                 self.assertNotIn("fable", " ".join(answers))
                 attempts = self.attempts(n)
                 self.assertEqual([(a["stage"], a["tier"], a["effort"], a["result"]) for a in attempts],
@@ -585,16 +641,16 @@ class AttemptEffort(WorkTest):
                 nxt = escalation_of(tier, effort)
                 self.assertEqual({k: second[k] for k in ("tier", "effort", "action", "failures", "next_tier",
                                                          "next_effort")},
-                                 {"tier": tier, "effort": effort, "action": "escalate" if nxt else "needs-input",
+                                 {"tier": tier, "effort": effort, "action": "escalate" if nxt else "park",
                                   "failures": 2, "next_tier": nxt[0] if nxt else None,
                                   "next_effort": nxt[1] if nxt else None})
                 done = self.attempt_json(n, "code", "pass")
                 self.assertEqual((done["action"], done["next_tier"], done["next_effort"]), ("done", None, None))
         # the spread reaches all three answers
-        self.assertEqual(seen, {"escalate opus", "escalate opus xhigh", "needs-input"})
+        self.assertEqual(seen, {"escalate opus", "escalate opus xhigh", "park"})
 
-    def test_size_l_and_risk_high_run_at_opus_xhigh_and_go_to_needs_input(self):
-        # DoD: a failure at opus xhigh gives needs-input; nothing prints fable. Every retrying stage alike
+    def test_size_l_and_risk_high_run_at_opus_xhigh_and_go_to_park(self):
+        # DoD: a failure at opus xhigh gives park; nothing prints fable. Every retrying stage alike
         # (the breaker stage never retries: its failure answers done, pinned in test_work_stage.py).
         for n, (kind, size, risk) in ((31, ("task", "L", "low")), (32, ("bug", "M", "high")),
                                       (33, ("chore", "S", "high"))):
@@ -604,8 +660,8 @@ class AttemptEffort(WorkTest):
                     self.assertEqual(self.attempt(n, stage, "fail"), "retry")
                     data = self.attempt_json(n, stage, "fail")
                     self.assertEqual((data["tier"], data["effort"], data["action"], data["next_tier"],
-                                      data["next_effort"]), ("opus", "xhigh", "needs-input", None, None))
-                    self.assertEqual(self.attempt(n, stage, "fail"), "needs-input")
+                                      data["next_effort"]), ("opus", "xhigh", "park", None, None))
+                    self.assertEqual(self.attempt(n, stage, "fail"), "park")
 
     def test_a_second_failure_at_opus_says_escalate_opus_xhigh(self):
         # DoD: an M/low ticket runs at opus with no effort; its second failure escalates to opus at xhigh
@@ -614,8 +670,8 @@ class AttemptEffort(WorkTest):
                 self.put_ticket(n, kind, "M", "low")
                 self.assertEqual(self.attempt(n, "code", "fail"), "retry")
                 self.assertEqual(self.attempt(n, "code", "fail"), "escalate opus xhigh")
-                # the escalated run, recorded at opus xhigh, fails again: needs-input
-                self.assertEqual(self.attempt(n, "code", "fail", "--tier", "opus", "--effort", "xhigh"), "needs-input")
+                # the escalated run, recorded at opus xhigh, fails again: park
+                self.assertEqual(self.attempt(n, "code", "fail", "--tier", "opus", "--effort", "xhigh"), "park")
 
     # ----------------------------------------------------------- explicit --tier and --effort
     def test_every_explicit_tier_and_effort(self):
@@ -635,7 +691,7 @@ class AttemptEffort(WorkTest):
                         self.assertEqual((second["action"], second["next_tier"]), ("escalate", "opus"))
                     else:
                         self.assertEqual((second["action"], second["next_tier"], second["next_effort"]),
-                                         ("escalate" if nxt else "needs-input", nxt[0] if nxt else None,
+                                         ("escalate" if nxt else "park", nxt[0] if nxt else None,
                                           nxt[1] if nxt else None))
                     attempts = self.attempts(n)
                     self.assertEqual([(a["tier"], a["effort"]) for a in attempts], [(tier, effort)] * 2)
@@ -656,14 +712,14 @@ class AttemptEffort(WorkTest):
         # ran at none. The review stage's route is the review's, not the coder's.
         cases = [
             # (labels, stage, flags, second answer)
-            (("task", "L", "low"), "code", ["--tier", "opus"], "needs-input"),            # code route: opus xhigh
+            (("task", "L", "low"), "code", ["--tier", "opus"], "park"),            # code route: opus xhigh
             (("task", "L", "low"), "review", ["--tier", "opus"], "escalate opus xhigh"),  # review route: opus
-            (("task", "M", "high"), "review", ["--tier", "opus"], "needs-input"),        # review route: opus xhigh
-            (("task", "M", "high"), "code", ["--tier", "opus"], "needs-input"),
+            (("task", "M", "high"), "review", ["--tier", "opus"], "park"),        # review route: opus xhigh
+            (("task", "M", "high"), "code", ["--tier", "opus"], "park"),
             (("task", "M", "low"), "review", ["--tier", "opus"], "escalate opus xhigh"),
             (("task", "L", "low"), "code", ["--tier", "sonnet"], "escalate opus"),       # not the route's tier
             (("task", "L", "low"), "code", ["--tier", "opus", "--effort", "high"], "escalate opus xhigh"),
-            (("task", "M", "high"), "review", ["--tier", "fable"], "needs-input"),
+            (("task", "M", "high"), "review", ["--tier", "fable"], "park"),
         ]
         for i, ((kind, size, risk), stage, flags, want) in enumerate(cases):
             with self.subTest(labels=(kind, size, risk), stage=stage, flags=flags):
@@ -689,14 +745,14 @@ class AttemptEffort(WorkTest):
     # ----------------------------------------------------------- settings and stale caches
     def test_a_pre_239_cache_that_says_fable_never_escalates_to_fable(self):
         # A cache written before #239 holds the old rubric's tier (fable for size:L or risk:high). The labels decide
-        # now: opus at xhigh, and needs-input on the second failure.
+        # now: opus at xhigh, and park on the second failure.
         for n, (kind, size, risk) in ((51, ("task", "L", "high")), (52, ("task", "M", "high")),
                                       (53, ("bug", "L", "low"))):
             with self.subTest(kind=kind, size=size, risk=risk):
                 self.put_ticket(n, kind, size, risk, tier="fable")
                 first = self.attempt_json(n, "code", "fail")
                 self.assertEqual((first["tier"], first["effort"]), ("opus", "xhigh"))
-                self.assertEqual(self.attempt(n, "code", "fail"), "needs-input")
+                self.assertEqual(self.attempt(n, "code", "fail"), "park")
                 self.assertNotIn("fable", json.dumps(self.read_json(self.cache_path(n))["attempts"]))
 
     def test_explicit_fable_from_the_settings_still_runs_fable_and_tops_out(self):
@@ -713,14 +769,14 @@ class AttemptEffort(WorkTest):
                 self.assertEqual(first["tier"], "fable")
                 second = self.attempt_json(n, "code", "fail", env=env)
                 self.assertEqual((second["tier"], second["action"], second["next_tier"]),
-                                 ("fable", "needs-input", None))
+                                 ("fable", "park", None))
 
     def test_the_code_effort_setting_is_the_effort_a_stage_ran_at(self):
         # HARNESS_CODE_EFFORT wins over the labels' xhigh, as it does for `harness-board tier`
         cases = [("low", ("task", "L", "low"), "escalate opus xhigh"),
                  ("high", ("bug", "M", "high"), "escalate opus xhigh"),
-                 ("max", ("task", "M", "low"), "needs-input"),
-                 ("xhigh", ("task", "M", "low"), "needs-input"),
+                 ("max", ("task", "M", "low"), "park"),
+                 ("xhigh", ("task", "M", "low"), "park"),
                  ("medium", ("task", "S", "low"), "escalate opus")]
         for i, (level, (kind, size, risk), want) in enumerate(cases):
             with self.subTest(level=level, labels=(kind, size, risk)):
@@ -753,17 +809,17 @@ class AttemptEffort(WorkTest):
                 self.put_ticket(n + 10, kind, size, risk, tier="opus")
                 env2 = self.env(HARNESS_CODE_TIER="opus", HARNESS_CODE_EFFORT="xhigh")
                 self.assertEqual(self.attempt_json(n + 10, "code", "fail", env=env2)["effort"], "xhigh")
-                self.assertEqual(self.attempt(n + 10, "code", "fail", env=env2), "needs-input")
+                self.assertEqual(self.attempt(n + 10, "code", "fail", env=env2), "park")
 
     def test_a_review_tier_override_drops_the_labels_xhigh(self):
         # Ruling: HARNESS_REVIEW_TIER replaces the labels' review rule, their xhigh included. A risk:high review
-        # recorded at `--tier opus` ran at opus xhigh by the labels (needs-input on the second failure), but at opus
+        # recorded at `--tier opus` ran at opus xhigh by the labels (park on the second failure), but at opus
         # with no effort under HARNESS_REVIEW_TIER=opus (escalate opus xhigh). HARNESS_REVIEW_TIER=fable runs at
         # fable xhigh and tops out.
         cases = [
-            (None, "opus", "xhigh", "needs-input"),
+            (None, "opus", "xhigh", "park"),
             ({"HARNESS_REVIEW_TIER": "opus"}, "opus", None, "escalate opus xhigh"),
-            ({"HARNESS_REVIEW_TIER": "fable"}, "fable", "xhigh", "needs-input"),
+            ({"HARNESS_REVIEW_TIER": "fable"}, "fable", "xhigh", "park"),
         ]
         for i, (settings, tier, effort, want) in enumerate(cases):
             for where in (("settings.json", "environment") if settings else (None,)):
@@ -781,7 +837,7 @@ class AttemptEffort(WorkTest):
                     second = self.attempt_json(n, "review", "fail", "--tier", tier, env=env)
                     nxt = escalation_of(tier, effort)
                     self.assertEqual((second["action"], second["next_tier"], second["next_effort"]),
-                                     ("escalate" if nxt else "needs-input", nxt[0] if nxt else None,
+                                     ("escalate" if nxt else "park", nxt[0] if nxt else None,
                                       nxt[1] if nxt else None))
                     self.put_ticket(n + 10, "task", "M", "high")
                     self.assertEqual(self.attempt(n + 10, "review", "fail", "--tier", tier, env=env), "retry")
@@ -789,7 +845,7 @@ class AttemptEffort(WorkTest):
 
     def test_a_cache_without_labels_that_says_fable_reads_as_opus_xhigh(self):
         # Agrees with `harness-board tier` on the same cache: a stored fable without labels is the pre-#239 rubric's
-        # answer for size:L or risk:high, so the attempt runs at opus xhigh and the second failure is needs-input.
+        # answer for size:L or risk:high, so the attempt runs at opus xhigh and the second failure is park.
         for n, stage in ((85, "code"), (86, "tests"), (87, "ci")):
             with self.subTest(stage=stage):
                 write(self.cache_path(n), json.dumps({"number": n, "title": TITLE, "tier": "fable", "attempts": []}))
@@ -797,13 +853,13 @@ class AttemptEffort(WorkTest):
                 self.assertEqual((first["tier"], first["effort"], first["action"]), ("opus", "xhigh", "retry"))
                 second = self.attempt_json(n, stage, "fail")
                 self.assertEqual((second["tier"], second["effort"], second["action"], second["next_tier"],
-                                  second["next_effort"]), ("opus", "xhigh", "needs-input", None, None))
+                                  second["next_effort"]), ("opus", "xhigh", "park", None, None))
                 self.assertEqual([(a["tier"], a["effort"]) for a in self.attempts(n)], [("opus", "xhigh")] * 2)
                 self.assertNotIn("fable", json.dumps([dict(first), dict(second)]))
                 self.assertNotIn("fable", json.dumps(self.read_json(self.cache_path(n))["attempts"]))
                 write(self.cache_path(n + 10), json.dumps({"number": n + 10, "title": TITLE, "tier": "fable",
                                                            "attempts": []}))
-                self.assertEqual([self.attempt(n + 10, stage, "fail") for _ in range(2)], ["retry", "needs-input"])
+                self.assertEqual([self.attempt(n + 10, stage, "fail") for _ in range(2)], ["retry", "park"])
         # the board agrees on the same cache
         board = os.path.join(os.path.dirname(TOOL), "harness-board")
         p = subprocess.run([sys.executable, board, "tier", "85", "--json"], cwd=self.repo, env=self.env(),
@@ -815,7 +871,7 @@ class AttemptEffort(WorkTest):
         write(self.cache_path(88), json.dumps({"number": 88, "title": TITLE, "tier": "fable", "attempts": []}))
         env = self.env(HARNESS_CODE_TIER="fable")
         self.assertEqual(self.attempt_json(88, "code", "fail", env=env)["tier"], "fable")
-        self.assertEqual(self.attempt(88, "code", "fail", env=env), "needs-input")
+        self.assertEqual(self.attempt(88, "code", "fail", env=env), "park")
 
     def test_a_cache_without_labels_keeps_its_tier(self):
         # Caches written by hand or by old tools carry no labels: the cached tier stands, with no effort.
