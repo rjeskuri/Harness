@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ticket work: a branch and worktree per ticket, the failure policy (retry, escalate, needs-input), dispatch
+Ticket work: a branch and worktree per ticket, the failure policy (retry, escalate, park), dispatch
 of a headless or background session per ready ticket, a Claude cloud session on one ticket, the run records, the
 budgets and the worktree list.
 
@@ -37,12 +37,12 @@ opus (a cached fable is the pre-#239 rubric's and yields to the route; a cache w
 as `harness-board tier` does, a cached fable reading as opus xhigh). The
 effort is --effort, else the route's effort when the attempt ran at the route's tier, else none (null). The second
 failure in a row escalates: sonnet prints `escalate opus`, opus with no effort or below xhigh `escalate opus xhigh`;
-a stage already at opus xhigh or max, or on an explicitly named fable, gets needs-input instead. No escalation goes to
-fable. fix never escalates: retry, then needs-input. A breaker failure answers done at any tier, however often (one
+a stage already at opus xhigh or max, or on an explicitly named fable, gets park instead. No escalation goes to
+fable. fix never escalates: retry, then park. A breaker failure answers done at any tier, however often (one
 round; its gaps go to the coder as requirements). --json adds effort, next_tier and next_effort.
 
 stage: records as attempt does (the same code, store and answer), then prints `next: <step>` on a second line
-(--json: attempt's object plus "next"). retry and escalate repeat the stage; needs-input names needs-input; done
+(--json: attempt's object plus "next"). retry and escalate repeat the stage; park names park; done
 goes tests -> breaker (risk:high) or code, breaker (pass or fail) -> code, code -> review,
 review and fix -> fix while the latest review round (harness_lib.reviews) has blocking findings, else ci,
 ci -> `ultra, then ready` (risk:high) or ready. Risk and flags come from the ticket cache (risk,
@@ -257,7 +257,7 @@ LIVE_STATES = ("running", "working", "blocked", "idle", "busy", "waiting", "star
 ENDED_STATES = {"done": "ok", "failed": "error", "stopped": "stopped"}   # outcome; another ended state is kept as is
 # A ticket whose turn is over: its issue CLOSED, or OPEN with one of these. The bg supervisor marks a finished session
 # `blocked` when its summary of the final reply suggests a next step for the user (#123), so the ticket decides.
-FINISHED_STATUSES = ("status:in-review", "status:needs-input")
+FINISHED_STATUSES = ("status:in-review", "status:needs-input", "status:blocked")   # blocked: parked (#387)
 PID_SLACK = 120               # seconds: a process younger than its run record by more is a recycled pid
 # The dispatching session's own identity, which a detached run must not inherit.
 SESSION_ENV = ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION",
@@ -1106,8 +1106,8 @@ def record_repo(record, repos):
 
 
 def issue_finished(issue):
-    """Whether a ticket's turn is over: its issue CLOSED (whatever labels it kept), or OPEN with status:in-review or
-    status:needs-input. In progress, ready, blocked or without a status, it is not."""
+    """Whether a ticket's turn is over: its issue CLOSED (whatever labels it kept), or OPEN with status:in-review,
+    status:needs-input or status:blocked (parked, #387). In progress, ready or without a status, it is not."""
     if not isinstance(issue, dict):
         return False
     state = str(issue.get("state", "")).upper()
@@ -1581,14 +1581,14 @@ def record_attempt(repo, cache, args):
     action = cost.attempt_action(args.stage, args.result, failures)     # fix: two rounds, never escalate; breaker: done
     nxt = next_route(tier, effort) if action == "escalate" else None
     if action == "escalate" and nxt is None:
-        action = "needs-input"          # nothing above opus xhigh or an explicit fable
+        action = "park"                 # nothing above opus xhigh or an explicit fable
     next_tier, next_effort = nxt or (None, None)
     return {"number": n, "stage": args.stage, "result": args.result, "tier": tier, "effort": effort,
             "failures": failures, "action": action, "next_tier": next_tier, "next_effort": next_effort}
 
 
 def answer_text(data):
-    """attempt's text answer: `done`, `retry`, `escalate <tier> [<effort>]` or `needs-input`."""
+    """attempt's text answer: `done`, `retry`, `escalate <tier> [<effort>]` or `park`."""
     return " ".join(x for x in (data["action"], data["next_tier"], data["next_effort"]) if x)
 
 
@@ -1627,11 +1627,11 @@ def stage_refusal(n, stage, result, marks, found):
 
 
 def next_step(data, marks, found):
-    """The work loop's step after the attempt `data`: the same stage on retry or escalate, needs-input, or the
+    """The work loop's step after the attempt `data`: the same stage on retry or escalate, park, or the
     stage done leads to (a breaker failure is done: code, with the gaps as requirements)."""
     stage, action = data["stage"], data["action"]
-    if action == "needs-input":
-        return "needs-input"
+    if action == "park":
+        return "park"
     if action != "done":
         return stage
     if stage in ("review", "fix"):
@@ -1735,6 +1735,26 @@ def cmd_cost(repo, args):
         emit(wants_json(args), record, f"{cost.render_text(record)}\nSaved {path}")
 
 
+def after_tickets(n, ready, live):
+    """--after N: (the tickets to dispatch as --only would, the `after` record). The ready tickets whose blockers
+    include N, else the first ready ticket in ready's order without a live run, else none."""
+    unblocked = [r["number"] for r in ready if isinstance(r.get("number"), int)
+                 and n in (r.get("blocked_by") if isinstance(r.get("blocked_by"), list) else [])]
+    nxt = None
+    if not unblocked:
+        nxt = next((r["number"] for r in ready if isinstance(r.get("number"), int) and r["number"] not in live),
+                   None)
+    return (unblocked or ([nxt] if nxt is not None else [])), {"ticket": n, "unblocked": unblocked, "next": nxt}
+
+
+def after_text(after):
+    if after["unblocked"]:
+        return f"after #{after['ticket']}: {', '.join(f'#{n}' for n in after['unblocked'])} unblocked"
+    if after["next"] is not None:
+        return f"after #{after['ticket']}: none unblocked; next ready #{after['next']}"
+    return f"after #{after['ticket']}: nothing ready"
+
+
 def cmd_dispatch(repo, args):
     if args.max < 1:
         raise Problem("--max must be at least 1")
@@ -1756,7 +1776,10 @@ def cmd_dispatch(repo, args):
     live = live_runs(mine, agents)
     ready = board_json(repo, "ready", "--json")
     ready = [r for r in ready if isinstance(r, dict)] if isinstance(ready, list) else []
-    only = set(args.only) if args.only else None
+    named, after = args.only, None
+    if args.after is not None:      # --only's path, with the tickets N unblocked, else the next ready one
+        named, after = after_tickets(args.after, ready, live)
+    only = set(named) if named is not None else None
     again, capped, _ = redispatch_candidates(repo, mine, live, only=only)
     candidates, seen = [], set()
     for row in again + ready:
@@ -1766,7 +1789,7 @@ def cmd_dispatch(repo, args):
             candidates.append(row)
     slots = args.max - len(live)
     plan, skipped = [], list(capped)
-    for n in args.only or []:       # a named ticket that is no candidate: say why, launch nothing for it
+    for n in named or []:           # a named ticket that is no candidate: say why, launch nothing for it
         if n in seen or any(s["number"] == n for s in skipped):
             continue
         seen.add(n)
@@ -1788,9 +1811,12 @@ def cmd_dispatch(repo, args):
 
     wave_tier = routing["wave_tier"]
     extra = {"wave": None} if wave_tier else {}     # without HARNESS_WAVE_REVIEW the output is as before #180
+    if after is not None:
+        extra["after"] = after
     if args.dry_run:
         shown = f"effort {effort}, " if effort else ""
         lines = [f"Dry run: venue {venue}, {shown}{len(live)} live, {max(0, slots)} of {args.max} slots free."]
+        lines += [after_text(after)] if after is not None else []
         lines += [f"would start {describe(row)} and launch {venue}" for row in plan]
         group = [row["number"] for row in plan if open_wave(repo, row["number"]) is None] if wave_tier else []
         if group:
@@ -1798,18 +1824,20 @@ def cmd_dispatch(repo, args):
             extra["wave"] = {"id": None, "tickets": sorted(group)}
         lines += [f"skip #{s['number']}: {s['why']}" for s in skipped]
         if not candidates:
-            lines.append("None of the named tickets can be planned." if only is not None else "No ready tickets.")
+            lines.append("None of the named tickets can be planned." if args.only else "No ready tickets.")
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "dry_run": True,
                                      "live": [r["id"] for r in live.values()], "plan": plan, "skipped": skipped},
                                     **extra), "\n".join(lines))
         return
     if not args.json:
+        if after is not None:
+            print(after_text(after), flush=True)
         for s in (skipped if only is not None else capped):
             print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
                                      "skipped": skipped}, **extra),
-             "None of the named tickets can be launched." if only is not None else "No ready tickets.")
+             "None of the named tickets can be launched." if args.only else "No ready tickets.")
         return
     if slots <= 0:
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
@@ -2294,8 +2322,8 @@ def parser():
 
     attempt = sub.add_parser("attempt", parents=[with_repo, with_json],
                              help="record a stage's result; prints done, retry, escalate <tier> [<effort>] or "
-                                  "needs-input (escalate opus, then escalate opus xhigh, then needs-input; fix "
-                                  "retries, then needs-input; a breaker failure is done)")
+                                  "park (escalate opus, then escalate opus xhigh, then park; fix retries, then "
+                                  "park; a breaker failure is done)")
     attempt.add_argument("number", type=issue_number, metavar="N")
     attempt.add_argument("stage", choices=STAGES)
     attempt.add_argument("result", choices=("pass", "fail"))
@@ -2332,9 +2360,13 @@ def parser():
     dispatch.add_argument("--api", action="store_true",
                           help="alias for --venue headless: runs headless, billed to the API key")
     dispatch.add_argument("--dry-run", action="store_true", help="print the plan; start and launch nothing")
-    dispatch.add_argument("--only", type=ticket_list, metavar="N[,N...]",
-                          help="consider only these tickets (each ready, or in progress with an ended run); "
-                               "any other is skipped with the reason")
+    pick = dispatch.add_mutually_exclusive_group()
+    pick.add_argument("--only", type=ticket_list, metavar="N[,N...]",
+                      help="consider only these tickets (each ready, or in progress with an ended run); "
+                           "any other is skipped with the reason")
+    pick.add_argument("--after", type=issue_number, metavar="N",
+                      help="consider the ready tickets ticket N blocked, else the first ready ticket without a "
+                           "live run")
 
     cloud = sub.add_parser("cloud", parents=[with_repo, with_json],
                            help="start a ticket, push its branch and launch a Claude cloud session on it")

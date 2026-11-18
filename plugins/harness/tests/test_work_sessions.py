@@ -119,7 +119,7 @@ class StopFinishedSessions(WorkTest):
             (IN_REVIEW, "CLOSED", MERGED, True),
             (READY, "OPEN", [], False),
             (IN_PROGRESS, "CLOSED", MERGED, True),          # closed wins over a leftover in-progress label
-            (BLOCKED_STATUS, "OPEN", draft(153), False),
+            (BLOCKED_STATUS, "OPEN", draft(153), True),     # #387: a parked ticket is finished
         ]
         tickets = {9: "s-x1", 23: "s-k4", 58: "s-q7", 104: "s-m2", 311: "s-z9", 412: "s-p3", 77: "s-w8"}
         for k in range(len(statuses)):
@@ -136,13 +136,14 @@ class StopFinishedSessions(WorkTest):
                 self.assertEqual({n: bool(r["ended_at"]) for n, r in self.records().items()},
                                  {n: s[3] for n, s in plan.items()})
 
-    def test_only_in_review_needs_input_or_closed_end_a_session_and_an_unreadable_ticket_stays_live(self):
-        # The finished set is exactly status:in-review, status:needs-input or a CLOSED issue (closed wins over any
-        # leftover label, status:in-progress included). An OPEN ticket with status:ready, status:blocked or no status
-        # label is not finished: its live session is never stopped and holds a slot. Nor is a ticket gh cannot read.
+    def test_only_in_review_needs_input_blocked_or_closed_end_a_session_and_an_unreadable_ticket_stays_live(self):
+        # The finished set is exactly status:in-review, status:needs-input, status:blocked (#387) or a CLOSED issue
+        # (closed wins over any leftover label, status:in-progress included). An OPEN ticket with status:ready or no
+        # status label is not finished: its live session is never stopped and holds a slot. Nor is a ticket gh cannot
+        # read.
         cases = {   # n: (bg id, agents state, labels, issue state, PRs, finished)
             120: ("s-rd0", "blocked", READY, "OPEN", [], False),
-            121: ("s-bk1", "blocked", BLOCKED_STATUS, "OPEN", draft(190), False),
+            121: ("s-bk1", "blocked", BLOCKED_STATUS, "OPEN", draft(190), True),
             122: ("s-ns2", "blocked", NO_STATUS, "OPEN", [], False),
             123: ("s-ci3", "blocked", IN_PROGRESS, "CLOSED", MERGED, True),
             124: ("s-gf4", "blocked", IN_REVIEW, "OPEN", ready_pr(191), False),     # gh issue view fails (below)

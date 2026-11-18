@@ -1804,5 +1804,139 @@ class DispatchOnly(RowsInProcess, CopiedProject, WorkTest):
         self.assertEqual(self.claude_calls(), [])
 
 
+# =========================================================================== dispatch --after N (#389)
+def blocked_row(number, title, blockers=(), labels=READY):
+    """A ready row as `gh issue list` gives it, its blockers all closed (harness-board ready drops any other)."""
+    return {"number": number, "title": title, "labels": [{"name": n} for n in labels],
+            "blockedBy": [{"number": b, "state": "CLOSED"} for b in blockers]}
+
+
+class DispatchAfter(RowsInProcess, CopiedProject, WorkTest):
+    """`dispatch --after N` launches the ready tickets whose blockers include N, or else the first ready ticket
+    without a live run, through --only's path (slots, run records, start comments, --dry-run)."""
+
+    # ticket: (title, its closed blockers)
+    BOARD = {5: ("Five", ()), 11: ("Eleven", (10,)), 12: ("Twelve", (8, 10)), 13: ("Thirteen", (9,))}
+
+    def board(self, numbers=(5, 11, 12, 13), high=()):
+        rows, issues = [], []
+        for n in numbers:
+            title, blockers = self.BOARD[n]
+            labels = READY + (("priority:high",) if n in high else ())
+            rows.append(blocked_row(n, title, blockers, labels))
+            issues.append(issue(n, labels=labels, title=title,
+                                blocked_by=[{"number": b, "state": "CLOSED"} for b in blockers]))
+        self.scenario(issues=issues, ready=rows)
+
+    sleeper = DispatchOnly.sleeper
+    launched_tickets = DispatchOnly.launched_tickets
+    started_tickets = DispatchOnly.started_tickets
+
+    def assertNothingStarted(self, records_before=()):
+        self.assertEqual(self.claude_calls(), [])
+        self.assertEqual(self.started_tickets(), set())
+        self.assertEqual(sorted(r["id"] for r in self.run_records()), sorted(records_before))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+
+    def test_after_launches_unblocked_tickets(self):
+        # #12 waits on #8 and #10, #13 on #9, #5 on nothing: only the tickets that #N blocked are launched
+        for after, unblocked, line in ((10, [11, 12], "after #10: #11, #12 unblocked"),
+                                       (9, [13], "after #9: #13 unblocked")):
+            with self.subTest(after=after):
+                self.setUp()
+                self.board()
+                p = self.ok("dispatch", "--after", str(after), env=self.env(**CREDENTIALS))
+                self.assertIn(line, p.stdout.splitlines())
+                for n in unblocked:
+                    self.assertRegex(p.stdout, rf"(?m)^#{n} bg on t/{n}-\S+ ")
+                self.assertEqual(self.launched_tickets(), unblocked)
+                self.assertEqual(sorted(r["ticket"] for r in self.run_records()), unblocked)
+                self.assertEqual(self.started_tickets(), set(unblocked))
+            with self.subTest(after=after, json=True):
+                self.setUp()
+                self.board()
+                data = self.ok_json("dispatch", "--after", str(after), "--json", env=self.env(**CREDENTIALS))
+                self.assertEqual(data["after"], {"ticket": after, "unblocked": unblocked, "next": None})
+                self.assertEqual(sorted(r["ticket"] for r in data["launched"]), unblocked)
+                self.assertEqual(self.launched_tickets(), unblocked)
+
+    def test_after_falls_back_to_next_ready(self):
+        # nothing on the board waited on #20: exactly one launch, the first ready ticket in ready's order not live
+        for live, high, expected in (((), (), 5), ((5,), (), 11), ((), (13,), 13)):   # priority:high leads ready
+            with self.subTest(live=live, high=high):
+                self.setUp()
+                before = [self.write_run(n, pid=self.sleeper(n))["id"] for n in live]
+                self.board((5, 11, 13), high)
+                p = self.ok("dispatch", "--after", "20", env=self.env(**CREDENTIALS))
+                self.assertIn(f"after #20: none unblocked; next ready #{expected}", p.stdout.splitlines())
+                self.assertEqual(self.launched_tickets(), [expected])
+                self.assertEqual(self.started_tickets(), {expected})
+                self.assertEqual([r["ticket"] for r in self.run_records() if r["id"] not in before], [expected])
+            with self.subTest(live=live, high=high, json=True):
+                self.setUp()
+                for n in live:
+                    self.write_run(n, pid=self.sleeper(n))
+                self.board((5, 11, 13), high)
+                data = self.ok_json("dispatch", "--after", "20", "--json", env=self.env(**CREDENTIALS))
+                self.assertEqual(data["after"], {"ticket": 20, "unblocked": [], "next": expected})
+                self.assertEqual([r["ticket"] for r in data["launched"]], [expected])
+        with self.subTest(ready="none"):            # no ready ticket: nothing launched, exit 0
+            self.setUp()
+            self.board(())
+            p = self.ok("dispatch", "--after", "20", env=self.env(**CREDENTIALS))
+            self.assertIn("after #20: nothing ready", p.stdout.splitlines())
+            self.assertNothingStarted()
+            data = self.ok_json("dispatch", "--after", "20", "--json", env=self.env(**CREDENTIALS))
+            self.assertEqual(data["after"], {"ticket": 20, "unblocked": [], "next": None})
+            self.assertEqual(data["launched"], [])
+            self.assertNothingStarted()
+
+    def test_after_respects_slots_and_dry_run(self):
+        # --max filled by live runs on other tickets: nothing launched, and it says so, unblocked or not
+        for after in (10, 20):
+            with self.subTest(after=after, live=2, max=2):
+                self.setUp()
+                before = [self.write_run(n, pid=self.sleeper(n))["id"] for n in (40, 41)]
+                self.board()
+                p = self.ok("dispatch", "--after", str(after), "--max", "2", env=self.env(**CREDENTIALS))
+                self.assertIn("--max 2 reached", p.stdout)
+                self.assertNothingStarted(before)
+        with self.subTest(after=10, live=1, max=2):         # one free slot: the first unblocked ticket only
+            self.setUp()
+            self.write_run(40, pid=self.sleeper(40))
+            self.board()
+            self.ok("dispatch", "--after", "10", "--max", "2", env=self.env(**CREDENTIALS))
+            self.assertEqual(self.launched_tickets(), [11])
+        # --dry-run plans what a real run would launch and launches nothing
+        for after, plan, unblocked, nxt in ((10, [11, 12], [11, 12], None), (20, [5], [], 5)):
+            with self.subTest(after=after, dry_run=True):
+                self.setUp()
+                self.board()
+                p = self.ok("dispatch", "--after", str(after), "--dry-run")
+                starts = sorted(int(ln.split()[2][1:]) for ln in p.stdout.splitlines()
+                                if ln.startswith("would start #"))
+                self.assertEqual(starts, plan, p.stdout)
+                data = self.ok_json("dispatch", "--after", str(after), "--dry-run", "--json")
+                self.assertTrue(data["dry_run"])
+                self.assertEqual(sorted(row["number"] for row in data["plan"]), plan)
+                self.assertEqual(data["after"], {"ticket": after, "unblocked": unblocked, "next": nxt})
+                self.assertNothingStarted()
+
+    def test_after_with_only_is_an_error(self):
+        self.board()
+        p = self.ok("dispatch", "--after", "10", "--dry-run")           # the control: --after alone is accepted
+        self.assertIn("would start #11", p.stdout)
+        for flags in (("--after", "10", "--only", "11"), ("--only", "11", "--after", "10")):
+            for extra in ((), ("--dry-run",)):
+                with self.subTest(flags=flags, extra=extra):
+                    p = self.work("dispatch", *flags, *extra, env=self.env(**CREDENTIALS))
+                    self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertNotIn("unrecognized", p.stderr)
+                    self.assertIn("--after", p.stderr)
+                    self.assertIn("--only", p.stderr)
+                    self.assertNotIn("would start", p.stdout)
+                    self.assertNothingStarted()
+
+
 if __name__ == "__main__":
     unittest.main()

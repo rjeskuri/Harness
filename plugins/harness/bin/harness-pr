@@ -14,19 +14,26 @@ Usage:
     harness-pr comments P [--since ISO] [--unresolved] [--json]
     harness-pr awaiting [--all-projects] [--json]
     harness-pr ultra P [--post] [--force]
-    harness-pr land P [--yes] [--discard] [--accept-findings]
+    harness-pr land P [--yes] [--discard] [--accept-findings] [--catch-up [--rounds 3] [--timeout 420]]
     harness-pr gate P [--json]
     harness-pr revert P|SHA [--reason TEXT] [--evidence-file F] [--json]
 
 revert undoes a landed PR on main through the main checkout (on main, no tracked changes, no commit origin/main lacks
 but this revert; fetched and fast-forwarded first): `git revert --no-edit` of its merge commit and `git push origin main` (a rejected push gets one
-`git pull --rebase`), an incident bug under the ticket's epic, the ticket reopened as needs-input, a notification.
+`git pull --rebase`), an incident bug under the ticket's epic, the ticket reopened and parked, a notification.
 A step an earlier run did is skipped. autoland, and land after a failed canary, call revert_landed() in-process.
 
 land, once it has pulled the main checkout, runs that checkout's scripts/smoke.sh there when it is an executable
 file, under HARNESS_SMOKE_TIMEOUT seconds (the environment, else the main checkout's .claude/settings.json `env`, else
 300), its whole process group killed at the limit. Exit 0 lands as before; 2 or the limit is one warning and a
 comment on each ticket; any other exit reverts the merge (revert_landed) and the land exits 1 naming the revert.
+
+land --catch-up, before the preconditions: while the head is behind main and --rounds allow, the head branch's
+worktree (clean and at the head, else refuse) runs `git fetch origin`, `git merge-tree --write-tree` of the head and
+origin/main (a conflict refuses naming the files, nothing merged), `git merge` of it and `git push`; then the checks
+at the head, once GitHub shows the pushed merge as headRefOid, are polled as checks --wait polls them, main moving
+meanwhile taking another round. Red checks refuse naming them, behind with no round left refuses naming the rounds,
+and --timeout seconds (one deadline for every wait) used up exits 8 saying to run the same command again.
 
 ready refuses a PR whose latest harness review (the newest review carrying the harness marker) has high or
 medium findings and no commit newer than it, naming those findings, and refuses when gh cannot tell. land judges
@@ -64,7 +71,7 @@ gate prints the auto-land verdict (harness_lib/autoland.py) and exits 0 whatever
 fails gives `wait: <call> failed: <first stderr line>`.
 
 Exit status: 0 done; 1 a bad invocation, a failed precondition or call (one line on stderr), failed checks, or
-a land whose cleanup stopped; 8 checks still pending (as gh pr checks).
+a land whose cleanup stopped; 8 checks still pending (as gh pr checks; land --catch-up at its --timeout).
 """
 from __future__ import annotations
 
@@ -148,10 +155,12 @@ TITLE_SENTENCE = 60          # an out-of-scope ticket's title: at most this much
 AWAIT_FIELDS = "number,title,isDraft,createdAt,url,headRefName,closingIssuesReferences,statusCheckRollup"
 SHA_TEXT = re.compile(r"[0-9a-fA-F]{7,40}")
 INCIDENT = "incident"
-NEEDS_INPUT = "**Needs your input**"     # harness-board's needs-input comments start with it
+PARKED = "**Parked**"                    # the first line of the comment `harness-board park` posts
 DEFAULT_REASON = "no reason given"
 EVIDENCE_TAIL_LINES = 40
 SMOKE_TIMEOUT = 300.0        # seconds it may take (HARNESS_SMOKE_TIMEOUT)
+CATCH_UP_ROUNDS = 3          # land --catch-up: merges of main at most
+CATCH_UP_TIMEOUT = 420.0     # land --catch-up: seconds for all its check waits, one call under the Bash tool's 600 s
 
 
 def plural(n, word):
@@ -1741,6 +1750,131 @@ def land_gate(repo, number, view, accept):
     warn("harness-pr", said + "; landing it (--accept-findings)")
 
 
+def catch_up_worktree(main, number, branch, head):
+    """The worktree to merge main in for PR `number`: the one with `branch` checked out, clean (nothing git status
+    lists), its HEAD the PR's head `head`; else Problem, before anything changes."""
+    wt = worktree_for(main, branch) if branch else None
+    if not wt or not os.path.isdir(wt):
+        raise Problem(f"PR #{number} is behind main, but no worktree has {branch or 'its branch'} checked out to "
+                      "merge origin/main in; nothing merged")
+    dirty = dirty_files(wt)
+    if dirty:
+        raise Problem(f"PR #{number} is behind main, but its worktree {wt} has uncommitted changes: "
+                      f"{listing(dirty)}; nothing merged")
+    at = git_ok(wt, "rev-parse", "HEAD").strip()
+    if at != head:
+        raise Problem(f"PR #{number} is behind main, but its worktree {wt} is at {at[:7]}, not the PR's head "
+                      f"{head[:7]}; nothing merged")
+    return wt
+
+
+def merge_main_into(repo, number, branch, head):
+    """One catch-up round in the head branch's worktree (catch_up_worktree): git fetch origin; git merge-tree of
+    the head and origin/main, whose conflicts refuse naming the files before the worktree changes; git merge of that
+    origin/main and git push of the branch (a failed push undoes the merge). The pushed merge commit's sha."""
+    wt = catch_up_worktree(repo.main, number, branch, head)
+    fetched = git(wt, "fetch", "origin", timeout=PUSH_TIMEOUT)
+    if fetched.returncode != 0:
+        raise Problem(f"git fetch origin failed in {wt}: {last_line(fetched.stderr) or f'exit {fetched.returncode}'}"
+                      "; nothing merged")
+    tip = git_ok(wt, "rev-parse", "--verify", "origin/main^{commit}").strip()
+    tried = git(wt, "merge-tree", "--write-tree", "--name-only", "-z", head, tip)
+    if tried.returncode == 1:                 # the tree's oid, then the conflicted files, then an empty field
+        names = tried.stdout.split("\0")[1:]
+        names = names[:names.index("")] if "" in names else names
+        raise Problem(f"merging origin/main ({tip[:7]}) into {branch} conflicts in {listing(names) or 'some files'}; "
+                      f"nothing merged: merge it in {wt} and push, then harness-pr land {number} --catch-up")
+    if tried.returncode != 0:
+        raise Problem(f"git merge-tree failed in {wt}: {last_line(tried.stderr) or f'exit {tried.returncode}'}; "
+                      "nothing merged")
+    merged = git(wt, "merge", "--no-ff", "--no-edit", "-m", f"Merge origin/main into {branch}", tip)
+    if merged.returncode != 0:
+        if git(wt, "rev-parse", "--quiet", "--verify", "MERGE_HEAD").returncode == 0:
+            git(wt, "merge", "--abort")
+        raise Problem(f"git merge of origin/main failed in {wt}: "
+                      f"{last_line(merged.stderr) or last_line(merged.stdout) or f'exit {merged.returncode}'}; "
+                      "nothing pushed")
+    sha = git_ok(wt, "rev-parse", "HEAD").strip()
+    pushed = git(wt, "push", "origin", branch, timeout=PUSH_TIMEOUT)
+    if pushed.returncode != 0:
+        undone = git(wt, "reset", "--quiet", "--keep", head).returncode == 0
+        raise Problem(f"git push origin {branch} failed: {last_line(pushed.stderr) or f'exit {pushed.returncode}'}; "
+                      + ("the merge was undone, nothing pushed" if undone else f"the merge {sha[:7]} is in {wt}, "
+                                                                               "not pushed"))
+    print(f"Merged origin/main ({tip[:7]}) into {branch} as {sha[:7]} and pushed it.")
+    sys.stdout.flush()
+    return sha
+
+
+def catch_up_command(args):
+    """The land --catch-up command as given, to run again after exit 8."""
+    words = ["harness-pr", "land", str(args.number), "--catch-up"]
+    if args.rounds != CATCH_UP_ROUNDS:
+        words += ["--rounds", str(args.rounds)]
+    if args.timeout != CATCH_UP_TIMEOUT:
+        words += ["--timeout", f"{args.timeout:g}"]
+    return " ".join(words + [f for f, on in (("--discard", args.discard),
+                                             ("--accept-findings", args.accept_findings)) if on])
+
+
+def catch_up(repo, number, view, args):
+    """land --catch-up, before the land's preconditions, from the PR view `view`. Each round, while the head is
+    behind main and --rounds allows: merge origin/main into the branch and push it (merge_main_into). Then the
+    checks at the head, read only from a view whose headRefOid is the pushed merge, polled as checks --wait polls
+    (no checks yet at a pushed merge waits NO_CHECKS_POLLS polls); main moving in the meantime takes another round.
+    Red checks at a pushed merge, or at a head that is not behind, refuse naming them; behind with no round left
+    refuses naming the rounds. The latest view once the head is not behind and its checks are done; None, the way
+    forward printed, when --timeout seconds (one deadline for every round's waits) run out first."""
+    main, slug = repo.main, repo.slug()
+    interval, started = poll_interval(), time.monotonic()
+    deadline = started + args.timeout
+    left, want, empty = args.rounds, None, 0
+    while True:
+        if str(view.get("state") or "OPEN").upper() != "OPEN":
+            return view                       # merged or closed meanwhile: the land says what that means
+        head = str(view.get("headRefOid") or "")
+        if not head:
+            raise Problem(f"gh pr view {number} printed no headRefOid")
+        if want is None or head == want:      # until GitHub shows the pushed merge, its checks are not these
+            entries = check_entries(view.get("statusCheckRollup"))
+            checks = overall(entries)
+            red = f"checks are red on PR #{number} at {head[:7]}: " + ", ".join(
+                f"{e['name']} ({e['state'].lower()})" for e in entries if e["bucket"] == "fail") + "; nothing landed"
+            if want and checks == "failure":
+                raise Problem(red)
+            try:
+                behind = behind_main(main, slug, head)
+            except Problem as err:
+                raise Problem(f"cannot check whether PR #{number} is behind main: {err}") from None
+            if behind and not left:
+                raise Problem(f"PR #{number} is still behind main by {plural(behind, 'commit')} at {head[:7]} after "
+                              f"{plural(args.rounds, 'catch-up round')} (--rounds {args.rounds}); nothing landed; "
+                              f"{catch_up_command(args)} once main is quieter")
+            if behind:
+                branch = str(view.get("headRefName") or "")
+                want, left, empty = merge_main_into(repo, number, branch, head), left - 1, 0
+            elif checks == "failure":
+                raise Problem(red)
+            else:
+                empty = empty + 1 if checks == "none" else 0
+                if checks == "success" or (checks == "none" and (want is None or empty >= NO_CHECKS_POLLS)):
+                    if checks == "success" and want:
+                        print(f"checks green at {head[:7]}")
+                        sys.stdout.flush()
+                    return view
+        if time.monotonic() + interval > deadline:
+            waited = f"after {round(time.monotonic() - started)} s"
+            if want and head != want:
+                print(f"PR #{number}: GitHub does not show the pushed merge {want[:7]} as its head yet {waited}")
+            else:
+                pending = ", ".join(e["name"] for e in entries if e["bucket"] == "pending") or "none registered yet"
+                print(f"PR #{number}: checks pending at {head[:7]} {waited}: {pending}")
+            print(f"Run the same command again: {catch_up_command(args)}")
+            return None
+        time.sleep(interval)
+        view = pr_view(repo, number, LAND_FIELDS, main)
+
+
 def smoke_limit(main):
     """HARNESS_SMOKE_TIMEOUT in seconds: the environment, else `env` in the main checkout's .claude/settings.json
     (never the cwd's: a land may run from the ticket worktree it removes), else 300. A value that is not a positive
@@ -1794,7 +1928,7 @@ def land_canary(repo, number, sha, tickets):
                 [f"{SMOKE} {said}, and reverting {sha[:7]} failed: {err}; harness-pr revert {number} once that is "
                  "fixed"])
     revert, ticket = result["revert"], result["ticket"]
-    asked = f", ticket #{ticket} needs input" if ticket else ""
+    asked = f", ticket #{ticket} parked" if ticket else ""
     return ([f"Canary: {SMOKE} {said}, so the land was reverted:"] + [f"  {line}" for line in result["summary"]],
             [f"{SMOKE} {said} in the main checkout, so the merge was reverted in {revert[:7]} "
              f"(bug #{result['bug']}{asked})"])
@@ -1808,6 +1942,11 @@ def cmd_land(args):
     number = args.number
     view = pr_view(repo, number, LAND_FIELDS, main)
     state = str(view.get("state") or "OPEN").upper()
+    if args.catch_up and state == "OPEN":
+        view = catch_up(repo, number, view, args)
+        if view is None:
+            return 8
+        state = str(view.get("state") or "OPEN").upper()
     resume = state == "MERGED"
     if resume:
         print("already merged, finishing cleanup")
@@ -2118,8 +2257,8 @@ def bug_body(sha, revert, pr, ticket, reason, evidence):
 
 
 def file_bug(repo, title, body, epic):
-    """`harness-board task create` for the incident bug, then the `incident` label; its number."""
-    args = (["task", "create", "--type", "bug", "--risk", "high", "--size", "S"]
+    """`harness-board task create --proposed` for the incident bug, then the `incident` label; its number."""
+    args = (["task", "create", "--proposed", "--type", "bug", "--risk", "high", "--size", "S"]
             + (["--parent", str(epic)] if epic else []) + ["--title", title, "--body-file", "-", "--json"])
     done = board_run(repo, args, check=False, stdin=body)
     try:
@@ -2137,32 +2276,32 @@ def file_bug(repo, title, body, epic):
     return n
 
 
-def ask_ticket(repo, number, question, evidence):
-    """Reopen the ticket when it is closed and ask `question` there, unless it is already the newest needs-input
-    question; what was done."""
+def park_ticket(repo, number, reason, evidence, bug):
+    """Reopen the ticket when it is closed and park it on `reason` with the bug as its follow-up, unless its newest
+    Parked comment already holds that reason; what was done."""
     info = gh_json(["issue", "view", str(number), "--json", "state,comments"], repo.main)
     info = info if isinstance(info, dict) else {}
     done = []
     if str(info.get("state") or "").upper() != "OPEN":
         gh(["issue", "reopen", str(number)], repo.main)
         done.append("reopened")
-    asked = [b for b in ((c.get("body") or "").lstrip() for c in as_list(info.get("comments")))
-             if b.startswith(NEEDS_INPUT)]
-    if asked and question in asked[-1]:
-        return done + ["already asked"]
-    args = ["needs-input", str(number), "--question", question]
+    parked = [b for b in ((c.get("body") or "").lstrip() for c in as_list(info.get("comments")))
+              if b.startswith(PARKED)]
+    if parked and reason in parked[-1]:
+        return done + ["already parked"]
+    args = ["park", str(number), "--reason", reason, "--follow-up", str(bug)]
     with tempfile.TemporaryDirectory(prefix="harness-revert-") as folder:
         if evidence and evidence.strip():
             path = os.path.join(folder, "evidence.log")
             write_text(path, evidence, prefix=".harness-pr-")
             args += ["--evidence-file", path]
         board(repo, *args)
-    return done + ["asked"]
+    return done + ["parked"]
 
 
 def revert_landed(repo, sha, reason, evidence):
     """Revert the landed commit `sha` on main through the main checkout and push it, file the incident bug under the
-    ticket's epic, reopen the ticket as needs-input and notify; each step skipped when an earlier run did it.
+    ticket's epic, reopen the ticket and park it on the bug, notify; each step skipped when an earlier run did it.
     `evidence` is text (or None). Returns {pr, sha, revert, ticket, bug, summary}; Problem on a refusal."""
     main = repo.main
     os.environ["HARNESS_ALLOW_MAIN"] = "1"  # the revert commit and its push: the git hooks refuse main otherwise
@@ -2198,9 +2337,8 @@ def revert_landed(repo, sha, reason, evidence):
         summary.append(f"Bug: #{bug} filed" + (f" under #{epic}" if epic else "") + ", labelled incident.")
 
     if ticket:
-        question = f"Reverted in {revert[:7]}: {reason}. Bug #{bug} tracks the fix."
-        done = ask_ticket(repo, ticket, question, evidence)
-        acted = acted or done != ["already asked"]
+        done = park_ticket(repo, ticket, f"Reverted in {revert[:7]}: {reason}", evidence, bug)
+        acted = acted or done != ["already parked"]
         summary.append(f"Ticket: #{ticket} {', '.join(done)}.")
     else:
         summary.append("Ticket: none (no PR names one).")
@@ -2258,6 +2396,12 @@ def seconds_arg(text):
     if not value > 0:
         raise argparse.ArgumentTypeError(f"not a positive number of seconds: {text!r}")
     return value
+
+
+def rounds_arg(text):
+    if not text.isdigit() or int(text) <= 0:
+        raise argparse.ArgumentTypeError(f"not a positive number of rounds: {text!r}")
+    return int(text)
 
 
 def parser():
@@ -2321,6 +2465,13 @@ def parser():
     ld.add_argument("--discard", action="store_true", help="remove the worktree even with uncommitted changes")
     ld.add_argument("--accept-findings", action="store_true",
                     help="land even though the latest harness review has high or medium findings at the head")
+    ld.add_argument("--catch-up", action="store_true",
+                    help="while behind main, merge origin/main in the ticket worktree and push; wait for the "
+                         "checks; then land")
+    ld.add_argument("--rounds", type=rounds_arg, default=CATCH_UP_ROUNDS, metavar="N",
+                    help=f"with --catch-up: merges of main at most ({CATCH_UP_ROUNDS})")
+    ld.add_argument("--timeout", type=seconds_arg, default=CATCH_UP_TIMEOUT, metavar="SECONDS",
+                    help=f"with --catch-up: for all its check waits together, then exit 8 ({CATCH_UP_TIMEOUT:g})")
 
     gt = sub.add_parser("gate", help="the auto-land verdict: land, wait, fix or manual, and why")
     gt.add_argument("number", type=number_arg, metavar="P")
