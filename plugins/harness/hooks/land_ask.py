@@ -27,7 +27,10 @@ Every ticket risk:low: no decision at all (no stdout, no stderr, exit 0).
 gh runs through harness_lib's gh_run (HARNESS_GH honored), one call at a time, each bounded by
 the lesser of 3 s and what is left of one 8 s budget for the whole run (hooks.json gives the hook
 10 s; a hook killed there makes no decision, and the land runs unasked); the git lookups count
-against the same budget. Out of time, the hook asks, naming gh.
+against the same budget. Out of time, the hook asks, naming gh (or git) and the seconds in force.
+HARNESS_LAND_ASK_TIMESCALE, for tests only, is a factor s in (0, 1] on both (3*s a call, 8*s for
+the run); any other value (unset, empty, over 1, 0, negative, nan, not a number) leaves 3 s and 8 s
+and prints nothing. It never lengthens a deadline.
 
 An ask prints {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
 "permissionDecisionReason": "..."}} and exits 0. Fails open: without its lib, or on any error of
@@ -48,6 +51,7 @@ NAME = "land_ask.py"
 TOOL = "harness-pr"
 BUDGET = 8.0  # seconds of gh and git for the whole run, inside hooks.json's 10 s
 CALL_TIMEOUT = 3.0  # at most, for each gh or git call
+TIMESCALE = "HARNESS_LAND_ASK_TIMESCALE"  # tests only: a factor in (0, 1] on both deadlines
 OVERRIDES = ("--accept-findings", "--discard")
 TICKET_BRANCH = re.compile(r"^t/(\d+)-")
 RYAN_LANDS = ": Ryan lands it."
@@ -68,6 +72,21 @@ def command_of(data: dict) -> str:
     tool_input = data.get("tool_input")
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     return command if isinstance(command, str) else ""
+
+
+def timescale() -> float:
+    """HARNESS_LAND_ASK_TIMESCALE when it is a number in (0, 1], else 1: the knob only ever shortens the
+    deadlines, since past hooks.json's 10 s Claude Code kills the hook with no decision and the land runs."""
+    try:
+        scale = float(os.environ.get(TIMESCALE, ""))
+    except ValueError:
+        return 1.0
+    return scale if 0 < scale <= 1 else 1.0
+
+
+def seconds(value: float) -> str:
+    """`value` seconds as a reason names them: 8, 0.75, 2.4."""
+    return f"{round(value, 2):g}"
 
 
 def ask(reason: str) -> None:
@@ -114,10 +133,13 @@ def lands(guard, cwd: str, command: str) -> list:
 
 
 class Judge:
-    """The gh and git calls of one run, under one deadline."""
+    """The gh and git calls of one run, under one deadline: `budget` seconds from `started`, each call at most
+    `call` seconds of it (BUDGET and CALL_TIMEOUT, scaled by the test knob)."""
 
-    def __init__(self, deadline: float, gh_run, problem) -> None:
-        self.deadline = deadline
+    def __init__(self, started: float, budget: float, call: float, gh_run, problem) -> None:
+        self.deadline = started + budget
+        self.budget = budget
+        self.call = call
         self.gh_run = gh_run
         self.problem = problem
         self.mains: dict = {}
@@ -125,19 +147,30 @@ class Judge:
     def left(self) -> float:
         return self.deadline - time.monotonic()
 
+    def out_of_time(self) -> str:
+        return f"{seconds(self.budget)} s for the whole command"
+
+    def cut_off(self, left: float) -> str:
+        """What a call given `left` seconds of the run was cut off by: its own limit, or the last of the run's."""
+        if left < self.call:
+            return f", the last of the {self.out_of_time()}"
+        return ""
+
     def main_checkout(self, directory: str) -> tuple:
         """(main checkout, None) of the repository holding `directory`, or (None, why)."""
         if directory in self.mains:
             return self.mains[directory]
         left = self.left()
         if left <= 0:
-            return None, "git ran out of time finding its main checkout"
+            return None, f"git ran out of time finding its main checkout ({self.out_of_time()})"
+        timeout = min(self.call, left)
         try:
             out = subprocess.run(["git", "-C", directory, "rev-parse", "--git-common-dir"], stdin=subprocess.DEVNULL,
                                  capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                 timeout=min(CALL_TIMEOUT, left))
+                                 timeout=timeout)
         except subprocess.TimeoutExpired:
-            return None, "git was too slow finding its main checkout"
+            limit = f"{seconds(timeout)} s{self.cut_off(left)}"
+            return None, f"git was too slow finding its main checkout (cut off after {limit})"
         except OSError as err:
             return None, f"git cannot run ({err.strerror or err})"
         common = out.stdout.strip()
@@ -152,9 +185,10 @@ class Judge:
         """(gh's JSON answer, None), or (None, why) naming gh."""
         left = self.left()
         if left <= 0:
-            return None, f"gh ran out of time ({BUDGET:g} s for the whole command)"
+            return None, f"gh ran out of time ({self.out_of_time()})"
+        texts = {"timed_out": "{call} timed out after {timeout} s" + self.cut_off(left)}
         try:
-            done = self.gh_run(args, cwd, timeout=round(min(CALL_TIMEOUT, left), 2))
+            done = self.gh_run(args, cwd, timeout=round(min(self.call, left), 2), texts=texts)
         except self.problem as exc:
             return None, str(exc)
         call = "gh " + " ".join(args[:3])
@@ -234,7 +268,8 @@ def main() -> int:
         if land.number is None:
             ask(f"`{land.text}`: {land.given} is not a PR number{RYAN_LANDS}")
             return 0
-    judge = Judge(started + BUDGET, gh_run, Problem)
+    scale = timescale()
+    judge = Judge(started, BUDGET * scale, CALL_TIMEOUT * scale, gh_run, Problem)
     for land in found:
         reason = judge.reason(land)
         if reason:

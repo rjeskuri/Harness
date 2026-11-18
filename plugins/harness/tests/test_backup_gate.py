@@ -39,14 +39,18 @@ harness-restore/<id>. A push is never backed up and never harmless. A git form b
 
 Fixtures: a temporary HOME per test (and one for the whole process, so nothing here can reach the real ~/.claude),
 real git repositories (`git init -b main`, one commit holding README.md, src/, docs/, docs/agent/, .gitignore,
-.claude/settings.json, .claude/agents/, .githooks/ and .github/workflows/) and linked worktrees made with
+.claude/settings.json, .claude/agents/, .githooks/ and .github/workflows/; each name, branch and settings built once
+per module with git's background maintenance off and copied into each test) and linked worktrees made with
 `git worktree add`, random names and contents. GIT_CEILING_DIRECTORIES keeps git from finding a repository above
-the test's folder. The hook runs as hooks.json runs it: `python3 <hook>` with the event JSON on stdin and
-CLAUDE_PROJECT_DIR in its environment, from a folder outside every fixture repository; its answer is read as
-Claude Code reads it (stdout parsed as JSON, hookSpecificOutput.permissionDecision; nothing on stdout is no
-decision). A snapshot is any new folder in the global store (<HOME>/.claude/harness/backups/) or in a fixture
-repository's project store (<git common dir>/harness-backups/); the round trip removes the target itself, then runs
-`harness-work backup restore <id>` and compares every entry (bytes, modes, link targets) with what was there.
+the test's folder. Each test's first hook run is as hooks.json runs it: `python3 <hook>` with the event JSON on
+stdin and CLAUDE_PROJECT_DIR in its environment, from a folder outside every fixture repository, exit 0 and nothing
+on stderr; its later runs execute the same script as __main__ in this process, with the same stdin, environment,
+cwd and argv, and are held to the same exit status and empty stderr. Its answer is read as Claude Code reads it
+(stdout parsed as JSON, hookSpecificOutput.permissionDecision; nothing on stdout is no decision). A snapshot is any
+new folder in the global store (<HOME>/.claude/harness/backups/) or in a fixture repository's project store
+(<git common dir>/harness-backups/); the round trip removes the target itself, then runs `harness-work backup
+restore <id>` (a test's first restore as its own process, later ones in this process as the hook's are, exit 0
+either way) and compares every entry (bytes, modes, link targets) with what was there.
 backup_gate is run alone: tests_first.py, which judges rm on a ticket branch as a source edit, is another hook.
 Git state is read through git itself (`git for-each-ref refs/harness-backup/`, `git stash list`, `git rev-parse`,
 `git show <sha>:<path>`), and the hook must leave a worktree's files, `git status`, index, HEAD, branches and stash
@@ -180,19 +184,25 @@ Run: python3 -m unittest discover -s plugins/harness/tests -p test_backup_gate.p
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import random
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
+
+from gitrepo_support import GIT, copy_repo  # noqa: E402  (GIT: the git binary itself, not macOS's xcrun shim)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = os.path.dirname(HERE)
@@ -201,7 +211,6 @@ HOOK = os.path.join(HOOKS_DIR, "backup_gate.py")
 GUARD = os.path.join(HOOKS_DIR, "branch_guard.py")
 HOOKS_JSON = os.path.join(HOOKS_DIR, "hooks.json")
 TOOL = os.path.join(PLUGIN, "bin", "harness-work")
-GIT = shutil.which("git") or "/usr/bin/git"
 PATH = os.pathsep.join([os.path.dirname(GIT), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
 SHELL = shutil.which("zsh", path=PATH) or shutil.which("bash", path=PATH) or "/bin/bash"   # as the Bash tool runs
 ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}")
@@ -227,6 +236,16 @@ runpy.run_path(path, run_name="__main__")
 '''
 
 _SAVED = {}
+_TEMPLATES = {}     # (name, branch, settings) -> a project repository built once per module, copied by each test
+_CODE = {}          # a hook's path -> its compiled code, for the runs in this process
+
+
+def hook_code(path):
+    """The hook script at `path` compiled once per process, without this module's __future__ flags."""
+    if path not in _CODE:
+        with open(path, encoding="utf-8") as fh:
+            _CODE[path] = compile(fh.read(), path, "exec", dont_inherit=True)
+    return _CODE[path]
 
 
 def setUpModule():
@@ -348,6 +367,8 @@ class GateTest(unittest.TestCase):
         self.rng = random.Random(seed)
         self.seed = seed
         self.mains = []
+        self.ran_a_process = False          # the test's first hook run is a real process, the rest run in process
+        self.ran_a_restore = False          # and so is its first harness-work backup restore
 
     # ----------------------------------------------------------- files and repositories
     def mk(self, *parts):
@@ -400,9 +421,24 @@ class GateTest(unittest.TestCase):
 
     def make_project(self, name="proj", branch="main", settings=None):
         """A repository with one commit on main, then on `branch`; `settings` is the `env` of its tracked
-        .claude/settings.json."""
-        main = self.mk(name)
-        self.git(main, "init", "-q", "-b", "main")
+        .claude/settings.json. Each (name, branch, settings) is built once per module (build_project) and copied
+        here, so two projects of one test still differ in their files and commits."""
+        key = (name, branch, json.dumps(settings or {}, sort_keys=True))
+        if key not in _TEMPLATES:
+            template = os.path.join(_SAVED["root"], "templates", str(len(_TEMPLATES)))
+            self.build_project(template, name, branch, settings)
+            _TEMPLATES[key] = template
+        main = os.path.join(self.tmp, name)
+        copy_repo(_TEMPLATES[key], main)
+        self.mains.append(main)
+        return main
+
+    def build_project(self, main, name, branch, settings):
+        """make_project's repository built at `main`, git's background maintenance and auto gc off for every call
+        (a copy must never catch one mid-run, #365)."""
+        os.makedirs(main)
+        quiet = ("-c", "maintenance.auto=false", "-c", "gc.auto=0")
+        self.git(main, *quiet, "init", "-q", "-b", "main")
         files = {
             "README.md": f"# {name} {self.word()}\n",
             "src/app.py": f"def login():\n    return {self.word()!r}\n",
@@ -418,12 +454,10 @@ class GateTest(unittest.TestCase):
         }
         for rel, text in files.items():
             self.put(os.path.join(main, rel), data=text.encode(), mode=0o755 if rel.startswith(".githooks") else 0o644)
-        self.git(main, "add", "-A")
-        self.git(main, "commit", "-q", "-m", "First")
+        self.git(main, *quiet, "add", "-A")
+        self.git(main, *quiet, "commit", "-q", "-m", "First")
         if branch != "main":
-            self.git(main, "switch", "-q", "-c", branch)
-        self.mains.append(main)
-        return main
+            self.git(main, *quiet, "switch", "-q", "-c", branch)
 
     def commit_settings(self, main, settings):
         self.put(os.path.join(main, ".claude", "settings.json"), data=(json.dumps({"env": settings}) + "\n").encode())
@@ -458,9 +492,50 @@ class GateTest(unittest.TestCase):
                               env=self.env(CLAUDE_PROJECT_DIR=project, **(env or {})), cwd=self.neutral,
                               timeout=90)
 
+    def in_process(self, stdin, project, env=None, hook=None, args=(), cwd=None):
+        """run_raw's run in this process: the script's code (default the hook) run as __main__ with `stdin` on its
+        stdin, os.environ replaced by the same environment, the same cwd (default the neutral folder) and argv
+        (the script, then `args`); harness_lib stays imported between runs. A CompletedProcess of its exit status
+        and what it wrote."""
+        path = hook or HOOK
+        out, err = io.StringIO(), io.StringIO()
+        status, here, alarm = 0, os.getcwd(), signal.getsignal(signal.SIGALRM)
+        stdin_file = io.TextIOWrapper(io.BytesIO(stdin.encode("utf-8")), encoding="utf-8")
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, self.env(CLAUDE_PROJECT_DIR=project, **(env or {})),
+                                                    clear=True))
+                stack.enter_context(mock.patch.object(sys, "stdin", stdin_file))
+                stack.enter_context(mock.patch.object(sys, "argv", [path, *args]))
+                stack.enter_context(contextlib.redirect_stdout(out))
+                stack.enter_context(contextlib.redirect_stderr(err))
+                os.chdir(cwd or self.neutral)
+                try:
+                    exec(hook_code(path), {"__name__": "__main__", "__file__": path})
+                except SystemExit as exc:
+                    if exc.code is None or isinstance(exc.code, int):
+                        status = exc.code or 0
+                    else:                                           # sys.exit("text"): the text on stderr, 1
+                        err.write(f"{exc.code}\n")
+                        status = 1
+        finally:
+            os.chdir(here)
+            if hasattr(signal, "setitimer"):
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, alarm)
+        return subprocess.CompletedProcess([sys.executable, path, *args], status, out.getvalue(), err.getvalue())
+
+    def hook_run(self, stdin, project, env=None):
+        """backup_gate.py on `stdin`: the test's first run as hooks.json runs it (run_raw, a real process: its exit
+        status and stderr are the process's own), every later one in this process (in_process)."""
+        if self.ran_a_process:
+            return self.in_process(stdin, project, env)
+        self.ran_a_process = True
+        return self.run_raw(stdin, project, env)
+
     def run_gate(self, command, cwd, project, mode="auto", env=None):
         """The hook's run on a Bash `command` in `cwd`; exit 0 and nothing on stderr."""
-        p = self.run_raw(json.dumps(self.event(command, cwd, mode)), project, env)
+        p = self.hook_run(json.dumps(self.event(command, cwd, mode)), project, env)
         last = p.stderr.strip().splitlines()[-1:] or [""]
         self.assertEqual((p.returncode, p.stderr), (0, ""),
                          f"backup_gate.py on {command!r} exited {p.returncode}: {last[0]} (seed {self.seed})")
@@ -534,8 +609,14 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.snapshots() - before, set(), f"{command!r}: a snapshot was made (seed {self.seed})")
 
     def restore(self, sid, cwd):
-        p = subprocess.run([sys.executable, TOOL, "backup", "restore", sid], cwd=cwd, env=self.env(),
-                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
+        """`harness-work backup restore <sid>` from `cwd`, exit 0: the test's first restore as its own process, every
+        later one in this process (in_process), with the same environment, cwd and argv."""
+        if self.ran_a_restore:
+            p = self.in_process("", None, hook=TOOL, args=("backup", "restore", sid), cwd=cwd)
+        else:
+            self.ran_a_restore = True
+            p = subprocess.run([sys.executable, TOOL, "backup", "restore", sid], cwd=cwd, env=self.env(),
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
         self.assertEqual(p.returncode, 0, f"harness-work backup restore {sid}: {p.stdout}{p.stderr}")
         return p
 
@@ -1126,7 +1207,7 @@ class Nothing(GateTest):
         for stdin in raw:
             with self.subTest(stdin=stdin[:60]):
                 before = self.snapshots()
-                p = self.run_raw(stdin, main)
+                p = self.hook_run(stdin, main)
                 self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "", ""), stdin[:60])
                 self.assertEqual(self.snapshots() - before, set())
 
@@ -1334,7 +1415,7 @@ class GitGate(GateTest):
         self.assertEqual(self.backup_refs(repo), refs_before, f"{command!r}: a ref was written (seed {self.seed})")
 
     def guard_denies(self, command, cwd, project, env=None):
-        p = self.run_raw(json.dumps(self.event(command, cwd)), project, env=env, hook=GUARD)
+        p = self.in_process(json.dumps(self.event(command, cwd)), project, env=env, hook=GUARD)
         out = json.loads(p.stdout) if p.stdout.strip() else {}
         return out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
 

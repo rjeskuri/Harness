@@ -1798,12 +1798,21 @@ class VerifyOnStopTests(HookTestCase):
         self.addCleanup(hook.kill)
         hook.stdin.write(json.dumps(payload).encode())
         hook.stdin.close()
-        deadline = time.monotonic() + 10
-        while not (pidfile.exists() and pidfile.read_text().strip()):
-            self.assertLess(
-                time.monotonic(), deadline, "the verify command never started"
-            )
+
+        def started() -> bool:
+            return pidfile.exists() and bool(pidfile.read_text().strip())
+
+        # Wait for the verify command to start. The window is wide: on a loaded machine
+        # the hook's interpreter, its git calls and the shell can take many seconds to
+        # get there (#378: 10 s was not enough). The pidfile is read once more after the
+        # loop, so the last poll racing the deadline is not a failure; a hook that exits
+        # first ends the wait at once.
+        deadline = time.monotonic() + 30
+        while not started() and time.monotonic() < deadline and hook.poll() is None:
             time.sleep(0.02)
+        self.assertTrue(
+            started(), f"the verify command never started (hook exit {hook.poll()})"
+        )
         pid = int(pidfile.read_text())
         hook.terminate()  # what Claude Code does to a hook it gives up on
         self.assertEqual(hook.wait(timeout=10), 0)

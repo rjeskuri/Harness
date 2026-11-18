@@ -9,11 +9,114 @@ from __future__ import annotations
 
 import unittest
 
+from gitrepo_support import copy_repo, run_in_process
 from work_support import *  # noqa: F401,F403
 
 
+# ===================================================================== the rows of a test run in this process (#378)
+class RowsInProcess:
+    """A test's first `harness-work` run is a process of its own, as WorkTest.work runs it: the exit code and the
+    output of the process contract. Every later run, the rows of its table and the runs that only set up a later one,
+    runs the tool in this process (gitrepo_support.run_in_process) with the same argv, cwd and environment, so a row
+    pays for neither a Python start nor a compile of the tool; a call of setUp inside a test (a fresh project) does not
+    make the next run a process again. What the tool runs (git, gh, harness-board, the fake claude) is still its own
+    process either way, and a run that starts a headless session is always a process of its own: the `claude -p` it
+    launches (start_new_session) outlives the run and must not be left a child of this process."""
+
+    ran_a_process = False            # each test is a new instance, so each test's first run is a process
+
+    @staticmethod
+    def starts_a_headless_session(args):
+        """`dispatch --venue headless` or `dispatch --api`, not a dry run: it may launch `claude -p` in the background."""
+        return (tuple(args[:1]) == ("dispatch",) and "--dry-run" not in args
+                and any(a == "--api" or "headless" in a for a in args))
+
+    def work(self, *args, env=None, cwd=None):
+        if not self.ran_a_process or self.starts_a_headless_session(args):
+            self.ran_a_process = True
+            return super().work(*args, env=env, cwd=cwd)
+        p = run_in_process(TOOL, args=args, cwd=cwd or self.repo, env=env or self.env())
+        self.assertNotIn("Traceback", p.stderr)
+        return p
+
+
+# ===================================================================== the repositories, built once per class (#378)
+class CopiedProject:
+    """WorkTest.setUp (work_support) with its repositories built once per test class and copied for each setUp: the
+    bare origin and the main checkout `proj` (README.md, a .gitignore of .env and *.log, a .worktreeinclude naming
+    .env and .env.*, all committed as "First" ten days ago) pushed to it. A class whose every setUp makes more
+    repositories adds them in `extend_template`, run once on the template; every folder in the template is copied.
+
+    The template is built with git's background gc and maintenance off (on the command line and in each repository's
+    config, so its copies carry it too): nothing changes under a copy while it is taken (#365). A copy's origin remote
+    is rewritten to name the copied origin, as `git remote set-url` would. The rest is WorkTest.setUp's own: a fresh
+    folder, home, logs and scenario, and the key of the copy's path, on every call (tests call setUp again for a
+    fresh project)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        root = os.path.realpath(tempfile.mkdtemp(prefix="harness-work-template-"))
+        cls.addClassCleanup(shutil.rmtree, root, True)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("CLAUDE", "HARNESS_", "GIT_", "FAKEGH_", "FAKECLAUDE_"))}
+        env.update(HOME=os.path.join(root, "home"), PATH=os.pathsep.join(["/usr/bin", "/bin"]),
+                   GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@localhost",
+                   GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@localhost")
+
+        def git(repo, *args, **extra):
+            p = subprocess.run([GIT, "-C", repo, "-c", "commit.gpgsign=false", "-c", "maintenance.auto=false",
+                                "-c", "gc.auto=0", *args], env=dict(env, **extra), capture_output=True, text=True)
+            if p.returncode != 0:
+                raise AssertionError(f"template: git {' '.join(args)}: {p.stderr}")
+            return p.stdout.strip()
+
+        def init(repo, *flags):
+            os.makedirs(repo)
+            git(repo, "init", "-q", *flags, "-b", "main")
+            git(repo, "config", "gc.auto", "0")
+            git(repo, "config", "maintenance.auto", "false")
+
+        origin, repo = os.path.join(root, "origin.git"), os.path.join(root, "proj")
+        init(origin, "--bare")
+        init(repo)
+        write(os.path.join(repo, "README.md"), "# proj\n")
+        write(os.path.join(repo, ".gitignore"), ".env\n*.log\n")
+        write(os.path.join(repo, ".worktreeinclude"), "# copied into new worktrees\n.env\n.env.*\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "First", GIT_AUTHOR_DATE=TEN_DAYS_AGO, GIT_COMMITTER_DATE=TEN_DAYS_AGO)
+        git(repo, "remote", "add", "origin", origin)
+        git(repo, "push", "-q", "-u", "origin", "main")
+        cls.extend_template(root, git, init)
+        cls.template_root = root
+
+    @classmethod
+    def extend_template(cls, root, git, init):
+        """More repositories every setUp of the class starts with, made in `root`; `git(repo, *args)` runs git on
+        the template and `init(repo)` makes a repository there as the template's own are made."""
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="harness-work-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = self.mk("home")
+        self.scenario_path = os.path.join(self.tmp, "scenario.json")
+        self.gh_log = os.path.join(self.tmp, "gh.log")
+        self.claude_log = os.path.join(self.tmp, "claude.log")
+        root = type(self).template_root
+        for name in sorted(os.listdir(root)):
+            if name != "home":
+                copy_repo(os.path.join(root, name), os.path.join(self.tmp, name))
+        self.origin, self.repo = os.path.join(self.tmp, "origin.git"), os.path.join(self.tmp, "proj")
+        config = os.path.join(self.repo, ".git", "config")
+        with open(config, encoding="utf-8") as fh:
+            text = fh.read()
+        write(config, text.replace(os.path.join(root, "origin.git"), self.origin))
+        self.key = hashlib.sha1(os.path.realpath(self.repo).encode("utf-8")).hexdigest()[:12]
+        self.scenario()
+
+
 # =========================================================================== dispatch
-class Dispatch(WorkTest):
+class Dispatch(RowsInProcess, CopiedProject, WorkTest):
     def test_dry_run_prints_the_plan_and_starts_nothing(self):
         live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "/harness:work 13"])
         self.addCleanup(live.wait)
@@ -529,7 +632,7 @@ class Dispatch(WorkTest):
         self.assertIn("would start #12 Add the board tool (tier sonnet) and launch bg", p.stdout)
 
 
-class DispatchDefaultMax(WorkTest):
+class DispatchDefaultMax(RowsInProcess, CopiedProject, WorkTest):
     """Ticket #130: `harness-work dispatch` without `--max` allows ten live runs at once (it was three)."""
 
     def board(self, count):
@@ -688,7 +791,7 @@ class DispatchDefaultMax(WorkTest):
 
 
 
-class DispatchEffort(WorkTest):
+class DispatchEffort(RowsInProcess, CopiedProject, WorkTest):
     """Ticket #176: `harness-work dispatch` launches each session at the effort the project configures
     (HARNESS_CODE_EFFORT in the main checkout's .claude/settings.json), as `--effort <level>`; the dispatcher's own
     CLAUDE_EFFORT neither decides the flag nor reaches the child. Without the setting nothing changes. WorkTest.env
@@ -1136,7 +1239,7 @@ class DispatchEffort(WorkTest):
         self.settle()
 
 
-class DispatchRouteEffort(WorkTest):
+class DispatchRouteEffort(RowsInProcess, CopiedProject, WorkTest):
     """Ticket #239: with HARNESS_CODE_EFFORT unset, `harness-work dispatch` launches each ticket at its route's effort:
     a size:L or risk:high ticket gets `--effort xhigh` (bg and headless) and `effort: xhigh` in its run record; any
     other ticket launches as before, with no flag. HARNESS_CODE_EFFORT still wins when set; a HARNESS_CODE_TIER
@@ -1263,7 +1366,7 @@ class DispatchRouteEffort(WorkTest):
         self.assertEqual(again["effort"], "xhigh")
 
 
-class DispatchCrossProject(WorkTest):
+class DispatchCrossProject(RowsInProcess, CopiedProject, WorkTest):
     """#299: `harness-work dispatch --repo B` run from a session of project A (HARNESS_SESSION_PROJECT, else
     CLAUDE_PROJECT_DIR, naming A), whose CLAUDE_VERIFY_CMD and HARNESS_TEST_CMD are exported, gives the launched
     session (bg and headless) B's own values of those two from B's settings, and no value of A's where B sets none.
@@ -1274,14 +1377,19 @@ class DispatchCrossProject(WorkTest):
     A_TEST = "npm run alpha-tests -- {files}"
     KEEP = ("HARNESS_UNRELATED_KEEP", "kept-7c1e")      # any other exported setting still reaches the session
 
+    @classmethod
+    def extend_template(cls, root, git, init):
+        """Repo A: its own repository `alpha` beside proj, its settings.json committed as "Alpha"."""
+        alpha = os.path.join(root, "alpha")
+        init(alpha)
+        write(os.path.join(alpha, ".claude", "settings.json"),
+              json.dumps({"env": {"CLAUDE_VERIFY_CMD": cls.A_VERIFY, "HARNESS_TEST_CMD": cls.A_TEST}}))
+        git(alpha, "add", "-A")
+        git(alpha, "commit", "-q", "-m", "Alpha")
+
     def setUp(self):
         super().setUp()
-        self.alpha = self.mk("alpha")
-        self.git(self.alpha, "init", "-q", "-b", "main")
-        write(os.path.join(self.alpha, ".claude", "settings.json"),
-              json.dumps({"env": {"CLAUDE_VERIFY_CMD": self.A_VERIFY, "HARNESS_TEST_CMD": self.A_TEST}}))
-        self.git(self.alpha, "add", "-A")
-        self.git(self.alpha, "commit", "-q", "-m", "Alpha")
+        self.alpha = os.path.join(self.tmp, "alpha")
 
     def commit_settings(self, env):
         """B's settings.json, committed and pushed."""
@@ -1355,7 +1463,7 @@ class DispatchCrossProject(WorkTest):
 WOULD_STOP_RE = re.compile(r"would stop session ([A-Za-z0-9_-]+) \(#(\d+) [^)\n]+\)")
 
 
-class DispatchDryRunStopsNothing(WorkTest):
+class DispatchDryRunStopsNothing(RowsInProcess, CopiedProject, WorkTest):
     """#335: `dispatch --dry-run` runs dispatch's sweep without its effects: a finished ticket's bg session is not
     stopped and its record not written, a `would stop session <id> (#N <state>)` line says what a real dispatch would
     do, and the plan counts the slot as freed. A real dispatch and `runs --sweep` still stop and close."""
@@ -1543,7 +1651,7 @@ class DispatchDryRunStopsNothing(WorkTest):
 
 
 # =========================================================================== dispatch --only N[,N...] (#336)
-class DispatchOnly(WorkTest):
+class DispatchOnly(RowsInProcess, CopiedProject, WorkTest):
     """`dispatch --only` plans only the named tickets, through the normal path: run record, start, launch."""
 
     TITLES = {5: "Five", 7: "Seven", 9: "Nine", 11: "Eleven"}

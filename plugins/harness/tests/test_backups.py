@@ -19,8 +19,9 @@ destructive command's snapshot goes into, and the commands that list and restore
 
 Fixtures: a temporary HOME per test (the module's own one for the whole process, so nothing here can reach the
 real ~/.claude), real temporary git repositories and a linked worktree made with `git worktree add`, random file
-contents, umask 022 and modes with group and other bits a umask would drop. GIT_CEILING_DIRECTORIES keeps git
-from finding a repository above the test's folder. create runs in process (harness_lib from plugins/harness/lib,
+contents, umask 022 and modes with group and other bits a umask would drop (each named repository is built once per
+module, git's background maintenance off, and copied into each test). GIT_CEILING_DIRECTORIES keeps git from
+finding a repository above the test's folder. create runs in process (harness_lib from plugins/harness/lib,
 the environment replaced for the call); list and restore run harness-work as a subprocess.
 
 Choices the ticket leaves open, fixed here:
@@ -98,11 +99,12 @@ from unittest import mock
 
 sys.dont_write_bytecode = True  # loading the lib must not leave __pycache__ in the checkout
 
+from gitrepo_support import GIT, copy_repo  # noqa: E402  (GIT: the git binary itself, not macOS's xcrun shim)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = os.path.dirname(HERE)
 LIB = os.path.join(PLUGIN, "lib")
 TOOL = os.path.join(PLUGIN, "bin", "harness-work")
-GIT = shutil.which("git") or "/usr/bin/git"
 PATH = os.pathsep.join([os.path.dirname(GIT), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
 ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}")
 MANIFEST_KEYS = {"id", "at", "repo", "cwd", "command", "session", "sensitive", "items", "refs"}
@@ -110,6 +112,7 @@ ITEM_KEYS = {"path", "copy", "kind", "bytes"}
 UNKNOWN_ID = "20990101T000000Z-abcdef"
 
 _SAVED = {}
+_TEMPLATES = {}     # a repository's name -> make_repo's repository, built once per module and copied by each test
 
 
 def setUpModule():
@@ -241,12 +244,21 @@ class BackupTest(unittest.TestCase):
         return p.stdout.strip()
 
     def make_repo(self, name):
-        path = self.mk(name)
-        self.git(path, "init", "-q", "-b", "main")
-        self.put(os.path.join(path, "README.md"), data=f"# {name}\n".encode())
-        self.put(os.path.join(path, ".gitignore"), data=b".claude/worktrees/\n")
-        self.git(path, "add", "README.md", ".gitignore")
-        self.git(path, "commit", "-q", "-m", "First")
+        """A repository on main with one commit "First" of README.md and .gitignore, at <tmp>/<name>: built once per
+        module for each name, git's background maintenance and auto gc off (a copy must never catch one mid-run,
+        #365), and copied here."""
+        if name not in _TEMPLATES:
+            template = os.path.join(_SAVED["root"], "templates", str(len(_TEMPLATES)))
+            os.makedirs(template)
+            quiet = ("-c", "maintenance.auto=false", "-c", "gc.auto=0")
+            self.git(template, *quiet, "init", "-q", "-b", "main")
+            self.put(os.path.join(template, "README.md"), data=f"# {name}\n".encode())
+            self.put(os.path.join(template, ".gitignore"), data=b".claude/worktrees/\n")
+            self.git(template, *quiet, "add", "README.md", ".gitignore")
+            self.git(template, *quiet, "commit", "-q", "-m", "First")
+            _TEMPLATES[name] = template
+        path = os.path.join(self.tmp, name)
+        copy_repo(_TEMPLATES[name], path)
         return path
 
     def commit_settings(self, main, env):

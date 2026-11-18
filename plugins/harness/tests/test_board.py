@@ -7,11 +7,16 @@ contacted). A `fakebin` folder first on PATH holds `gh` (a wrapper around fakegh
 terminal-notifier and osascript, so nothing here reads the real ~/.claude, shows a notification or needs
 the network. The fake executables are written once for the module: macOS checks a new executable on its
 first run, which costs about half a second each time.
+
+Each test's first run of the tool is a real process (exit code, stdout, stderr); its later runs go through
+gitrepo_support.run_in_process, the same script in this process with the same arguments, environment and folder
+(ticket #378). git is gitrepo_support.GIT's folder on PATH: the git binary itself, not macOS's xcrun shim.
 """
 from __future__ import annotations
 
 import ast
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -21,11 +26,16 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+
+sys.dont_write_bytecode = True  # loading the lib and the tool must not leave __pycache__ in the checkout
+
+from gitrepo_support import GIT, run_in_process  # noqa: E402  (GIT: the git binary itself, not macOS's xcrun shim)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(os.path.dirname(HERE), "bin", "harness-board")
+LIB = os.path.join(os.path.dirname(HERE), "lib")
 FAKEGH = os.path.join(HERE, "fakegh.py")
-GIT = shutil.which("git")
 REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
 # The gh login show keeps comments from (#334: the owner's, the harness's under the same login, and the bot's).
 OWNER = {"match": ["api", "user"], "stdout": "rjeskuri\n"}
@@ -114,7 +124,16 @@ def setUpModule():
                      "    fh.write(json.dumps([os.path.basename(sys.argv[1])] + sys.argv[2:]) + '\\n')\n"
                      "sys.exit(int(os.environ.get('NOTIFY_EXIT', '0')))\n")
     fakebin, altbin, failbin = (os.path.join(root, d) for d in ("fakebin", "altbin", "failbin"))
-    executable(os.path.join(fakebin, "gh"), f'#!/bin/sh\nexec "{py}" "{FAKEGH}" "$@"\n')
+    # gh, the command every test runs most: fakegh.py run as __main__ by this python itself, without site and with no
+    # /bin/sh in front, which halves each call (ticket #378); behind /bin/sh only where a #! line cannot hold the path.
+    if " " in py:
+        executable(os.path.join(fakebin, "gh"), f'#!/bin/sh\nexec "{py}" "{FAKEGH}" "$@"\n')
+    else:
+        executable(os.path.join(fakebin, "gh"),
+                   f"#!{py} -SB\nimport sys\nsys.argv[0] = {FAKEGH!r}\n"
+                   f"with open({FAKEGH!r}, encoding='utf-8') as fh:\n"
+                   f"    code = compile(fh.read(), {FAKEGH!r}, 'exec')\n"
+                   f"exec(code, {{'__name__': '__main__', '__file__': {FAKEGH!r}}})\n")
     executable(os.path.join(altbin, "gh-alt"), f'#!/bin/sh\nFAKEGH_LOG="$ALT_LOG" exec "{py}" "{FAKEGH}" "$@"\n')
     for name in ("terminal-notifier", "osascript"):
         executable(os.path.join(fakebin, name), f'#!/bin/sh\nexec "{py}" "{recorder}" "$0" "$@"\n')
@@ -123,7 +142,10 @@ def setUpModule():
     # path, else the cwd's registered checkout) and logs {"repo", "argv"} to $REPOS_LOG; see ProjectSync.
     reposgh = write(os.path.join(root, "reposgh.py"), REPOS_GH.replace("@HERE@", repr(HERE)))
     reposbin = os.path.join(root, "reposbin")
-    executable(os.path.join(reposbin, "gh"), f'#!/bin/sh\nexec "{py}" "{reposgh}" "$@"\n')
+    if " " in py:
+        executable(os.path.join(reposbin, "gh"), f'#!/bin/sh\nexec "{py}" "{reposgh}" "$@"\n')
+    else:                                            # the script itself, as fakebin's gh above
+        executable(os.path.join(reposbin, "gh"), f"#!{py} -SB\n" + REPOS_GH.replace("@HERE@", repr(HERE)))
     BINS.update(root=root, fakebin=fakebin, altbin=altbin, failbin=failbin, reposbin=reposbin)
 
 
@@ -206,6 +228,7 @@ class BoardTest(unittest.TestCase):
         self.scenario_path = os.path.join(self.tmp, "scenario.json")
         self.log = os.path.join(self.tmp, "gh.log")
         self.notify_log = os.path.join(self.tmp, "notify.log")
+        self.ran_a_process = False                   # the test's first harness-board run is a real process
         self.git("init", "-q")
         self.git("remote", "add", "origin", "https://github.com/o/r.git")
         self.scenario([])
@@ -242,6 +265,11 @@ class BoardTest(unittest.TestCase):
                 os.unlink(leftover)
 
     def board(self, *args, cwd=None, **env):
+        """harness-board with these arguments: a real process the first time in a test, then in this process
+        (ticket #378); either way an object with returncode, stdout and stderr."""
+        if self.ran_a_process:
+            return run_in_process(TOOL, args, cwd=cwd or self.repo, env=self.env(**env))
+        self.ran_a_process = True
         return subprocess.run([sys.executable, TOOL] + list(args), cwd=cwd or self.repo, env=self.env(**env),
                               capture_output=True, text=True, timeout=60)
 
@@ -3136,6 +3164,20 @@ def ticket_labels(kind, size, risk, *extra):
     return [kind] + list(extra) + (["size:" + size] if size else []) + (["risk:" + risk] if risk else [])
 
 
+def loaded_routing(repo):
+    """(harness_lib.routing imported in this process from the plugin's lib, as test_harness_lib_routing.py imports it;
+    the routing settings it loads for `repo`, as harness-board loads them). The routing keys of the environment running
+    the tests are left out, as BoardTest.env leaves them out of the tool's (ticket #378: label-combination tables run
+    in this process, each with a `tier` run beside it)."""
+    if LIB not in sys.path:
+        sys.path.insert(0, LIB)
+    routing = importlib.import_module("harness_lib.routing")
+    with mock.patch.dict(os.environ):
+        for key in ROUTING_KEYS:
+            os.environ.pop(key, None)
+        return routing, routing.load_routing(repo)
+
+
 class TierRouting(BoardTest):
     OKINAWA = {"HARNESS_CODE_TIER": "opus", "HARNESS_CODE_EFFORT": "xhigh", "HARNESS_REVIEW_TIER": "opus"}
     SPREAD = [("task", "S", "low"), ("bug", "S", "low"), ("chore", "M", "low"), ("refactor", "L", "low"),
@@ -3519,22 +3561,36 @@ class TierEffort(BoardTest):
     review = TierRouting.review
 
     def test_every_label_combination_from_the_cache(self):
+        # Ticket #378: the label-combination table runs through harness_lib.routing in this process (harness-board's
+        # `tier` prints the routes it returns, test_board_defines_no_rubric_of_its_own), with the routing settings
+        # loaded as the tool loads them for this repo: none. Then `tier` itself, once for each tier and effort the
+        # table gives: the tier alone, the JSON keys in order, from the cache, no gh call.
+        route_keys = ("tier", "effort", "from", "labels_tier")
+        routing, settings = loaded_routing(self.repo)
         efforts = set()
         for kind in self.KINDS:
             for size in self.SIZES:
                 for risk in self.RISKS:
                     with self.subTest(kind=kind, size=size, risk=risk):
                         tier, effort = rubric(kind, size, risk), rubric_effort(kind, size, risk)
-                        self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk, "status:ready")})
-                        self.assertEqual(self.tier_out(12), tier + "\n")                 # the tier alone
-                        data = self.tier_json(12)
-                        self.assertEqual(data, self.code(12, tier, tier, effort=effort))
-                        self.assertEqual(list(data), TIER_KEYS)
-                        self.assertEqual(self.tier_out(12, "--stage", "review"), "opus\n")
-                        self.assertEqual(self.tier_json(12, "--stage", "review"),
-                                         self.review(12, "opus", "opus", effort=review_effort(risk)))
+                        code = self.code(12, tier, tier, effort=effort)
+                        self.assertEqual(routing.code_route(kind, size, risk, settings),
+                                         {k: code[k] for k in route_keys})
+                        review = self.review(12, "opus", "opus", effort=review_effort(risk))
+                        self.assertEqual(routing.review_route(risk, settings), {k: review[k] for k in route_keys})
                         efforts.add(effort)
         self.assertEqual(efforts, {None, "xhigh"})
+        for kind, size, risk in (("task", "S", "low"), ("refactor", "L", "high")):
+            with self.subTest(cli="tier", kind=kind, size=size, risk=risk):
+                tier, effort = rubric(kind, size, risk), rubric_effort(kind, size, risk)
+                self.put_cache(12, {"number": 12, "labels": ticket_labels(kind, size, risk, "status:ready")})
+                self.assertEqual(self.tier_out(12), tier + "\n")                 # the tier alone
+                data = self.tier_json(12)
+                self.assertEqual(data, self.code(12, tier, tier, effort=effort))
+                self.assertEqual(list(data), TIER_KEYS)
+                self.assertEqual(self.tier_out(12, "--stage", "review"), "opus\n")
+                self.assertEqual(self.tier_json(12, "--stage", "review"),
+                                 self.review(12, "opus", "opus", effort=review_effort(risk)))
         self.assertEqual(self.calls(), [])
 
     def test_fetched_labels_carry_the_effort_too(self):

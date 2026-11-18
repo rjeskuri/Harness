@@ -39,14 +39,24 @@ cases. The hook still follows the contract above; this module no longer pins a c
 child shell, `cd "$(cat where)"` and `cd -`, lands in two repositories in one command, a hanging issue view, or gh
 calls that are slow and still in time.
 
+Ticket #378 (epic #374) put the two timing cases on a scaled clock. HARNESS_LAND_ASK_TIMESCALE, set only by tests, is
+a factor in (0, 1] on both deadlines (3 s a call, gh and git; 8 s for the run), and the reason names the seconds in
+force on that clock; any other value (over 1, 0, negative, not a number, empty) leaves the real deadlines in force and
+the answer what it is without the knob. One wall-clock test runs the hook as Claude Code does with the knob at 0.25;
+the knob's table runs the hook in this process on a fake clock that only gh and git move (no real sleeping).
+
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_land_ask.py" -v
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import math
 import os
 import re
+import runpy
 import shlex
 import shutil
 import subprocess
@@ -56,6 +66,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 TESTS = Path(__file__).resolve().parent
 PLUGIN = TESTS.parent
@@ -71,14 +82,22 @@ GIT_IDENTITY = {
     "GIT_COMMITTER_EMAIL": "test@test.invalid",
 }
 HOOK_TIMEOUT = 10  # what hooks.json gives the hook
-# A gh that hangs is cut off after 3 s; 6 s leaves room for a loaded machine, not for an 8 s call.
-ONE_CALL_LIMIT = 6.0
-# gh calls share 8 s in all: the hook answers inside the 10 s Claude Code gives it.
-ALL_CALLS_LIMIT = 9.5
-# A slow gh call that is still in time: the fake's own start adds about 0.03 s a call on an idle Mac and up to 0.8 s
-# on a loaded one, so it does not come near the 3 s cut-off.
-CALL_DELAY = 1.5  # every call
-HANG = 30  # a gh that never answers in time
+# The real clock (ticket #330): each gh or git call is cut off after 3 s, and all of them share 8 s, inside the 10 s
+# Claude Code gives the hook.
+CALL_DEADLINE = 3.0
+RUN_DEADLINE = 8.0
+# The test-only knob (ticket #378): a factor in (0, 1] on both deadlines, so a test waits out 0.75 s and 2 s instead
+# of 3 s and 8 s. Any other value (over 1, 0, negative, not a number, empty) leaves the real deadlines in force: a
+# longer one would let Claude Code kill the hook at 10 s with no decision, and the land would run unasked.
+TIMESCALE = "HARNESS_LAND_ASK_TIMESCALE"
+SCALE = 0.25  # the wall-clock test's knob
+# A gh PR view slower than the scaled per-call deadline (0.75 s), with under 1 s of real sleep.
+SLOW_CALL = 0.9
+# Seconds of every gh call on the real clock, scaled with the knob: eight of them overrun the run's deadline, the
+# four of one land do not (a hook that gives each land its own deadline stays silent).
+CALL_DELAY = 1.5
+# The hook's own start and the fake gh's, which no knob scales: the hook answers within the scaled deadline plus this.
+OVERHEAD = 1.5
 
 # The fake gh. It logs the call and the directory it ran in, then answers as fakegh.py does from the scenario
 # LANDASK_DIRS maps this directory to ("*" for any other). A scenario's "pace" ({"pr": 2.0, "issue": 30}: seconds
@@ -126,6 +145,8 @@ DECOY = {
 }
 
 _SHARED: dict = {}
+# The real functions, before any test patches them for a run in this process.
+_REAL = {"run": subprocess.run, "monotonic": time.monotonic, "perf_counter": time.perf_counter, "time": time.time}
 
 
 def plugin_copy(root: Path, with_lib: bool = True) -> Path:
@@ -182,6 +203,84 @@ def tearDownModule() -> None:
 def names_number(text: str, number: int) -> bool:
     """`number` appears in `text` as a whole number: 40 is not found in 140 or 401."""
     return re.search(rf"(?<!\d){number}(?!\d)", text) is not None
+
+
+def seconds_named(text: str) -> list:
+    """Every number of seconds `text` names ("0.75 s", "2 s", "3.0s"), as floats."""
+    return [float(n) for n in re.findall(r"(?<![\w.#])(\d+(?:\.\d+)?) ?s\b", text)]
+
+
+class Killed(BaseException):
+    """Claude Code killed the hook at hooks.json's timeout: no decision, and the land runs unasked. A BaseException,
+    so the hook's own fail-open handlers do not catch it."""
+
+
+class FakeClock:
+    """gh and git for land_ask run in this process, on a fake clock (time.monotonic, time.perf_counter and time.time
+    run ahead by it) that only gh and git move, so a run decides the same however loaded the machine is.
+
+    gh answers from `calls` (fakegh.py's "contains" rule: every token anywhere in argv) after `pace[subcommand]` fake
+    seconds (absent: no time); paced None (never answers), or paced at or past its timeout, it takes its whole timeout
+    and raises TimeoutExpired, as subprocess.run does. git runs for real on no fake time (under a real timeout of its
+    own, so load cannot cut it), unless `git_hangs`, when it never answers. A call that would take the clock past
+    HOOK_TIMEOUT, or that has no finite timeout and never answers, raises Killed. No real sleeping."""
+
+    REAL_TIMEOUT = 60
+
+    def __init__(self, calls=(), pace=None, git_hangs: bool = False) -> None:
+        self.calls = list(calls)
+        self.pace = pace or {}
+        self.git_hangs = git_hangs
+        self.ahead = 0.0
+        self._monotonic = _REAL["monotonic"]()
+        self._perf_counter = _REAL["perf_counter"]()
+        self._time = _REAL["time"]()
+
+    def monotonic(self) -> float:
+        return self._monotonic + self.ahead
+
+    def perf_counter(self) -> float:
+        return self._perf_counter + self.ahead
+
+    def time(self) -> float:
+        return self._time + self.ahead
+
+    def spend(self, seconds: float) -> None:
+        if self.ahead + seconds > HOOK_TIMEOUT:
+            self.ahead = float(HOOK_TIMEOUT)
+            raise Killed()
+        self.ahead += seconds
+
+    def never_answers(self, argv: list, timeout) -> None:
+        """Wait out `timeout`, then raise TimeoutExpired; with no finite timeout the hook is killed first."""
+        if timeout is None or not math.isfinite(float(timeout)):
+            raise Killed()
+        self.spend(max(float(timeout), 0.0))
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    def run(self, args, *rest, **kwargs):
+        argv = [str(a) for a in args] if isinstance(args, (list, tuple)) else [str(args)]
+        program = os.path.basename(argv[0]) if argv else ""
+        timeout = kwargs.get("timeout")
+        if program == "git":
+            if self.git_hangs:
+                self.never_answers(argv, timeout)
+            if timeout is not None and float(timeout) <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if timeout is not None:
+                kwargs["timeout"] = self.REAL_TIMEOUT
+            return _REAL["run"](args, *rest, **kwargs)
+        if program != "gh":
+            return _REAL["run"](args, *rest, **kwargs)
+        rest_argv = argv[1:]
+        takes = self.pace.get(rest_argv[0] if rest_argv else "", 0.0)
+        if takes is None or (timeout is not None and takes >= float(timeout)):
+            self.never_answers(argv, timeout)
+        self.spend(takes)
+        for call in self.calls:
+            if all(tok in rest_argv for tok in call.get("contains", [])):
+                return subprocess.CompletedProcess(argv, 0, json.dumps(call["stdout_json"]), "")
+        return subprocess.CompletedProcess(argv, 1, "", "fakegh: no match for: gh " + " ".join(rest_argv) + "\n")
 
 
 def pr_call(number: int, closing=(), head: str = "feature/login") -> dict:
@@ -344,6 +443,41 @@ class LandAskTests(unittest.TestCase):
         code, out, err, _ = self.run_hook(command, cwd, env)
         self.assertEqual((code, out, err), (0, "", ""), f"{command!r} must get no output")
 
+    def run_on_fake_clock(self, command: str, fake: FakeClock, env: dict | None = None):
+        """(exit, stdout, stderr, killed) of land_ask run as its own __main__ in this process on `fake`'s clock, in
+        this test's environment plus `env`. harness_lib and branch_guard are imported afresh for the run, so nothing
+        one run reads at import time carries over to the next."""
+        ours = ("harness_lib", "branch_guard")
+        saved = {k: m for k, m in sys.modules.items() if k in ours or k.startswith("harness_lib.")}
+        for k in saved:
+            del sys.modules[k]
+        out, err = io.StringIO(), io.StringIO()
+        stdin = io.TextIOWrapper(io.BytesIO(json.dumps(self.event(command)).encode("utf-8")), encoding="utf-8")
+        code, killed = 0, False
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, dict(self.env, **(env or {})), clear=True))
+                stack.enter_context(mock.patch.object(subprocess, "run", fake.run))
+                stack.enter_context(mock.patch.object(time, "monotonic", fake.monotonic))
+                stack.enter_context(mock.patch.object(time, "perf_counter", fake.perf_counter))
+                stack.enter_context(mock.patch.object(time, "time", fake.time))
+                stack.enter_context(mock.patch.object(sys, "stdin", stdin))
+                stack.enter_context(mock.patch.object(sys, "path", list(sys.path)))
+                stack.enter_context(mock.patch.object(sys, "dont_write_bytecode", True))
+                stack.enter_context(contextlib.redirect_stdout(out))
+                stack.enter_context(contextlib.redirect_stderr(err))
+                try:
+                    runpy.run_path(str(HOOK), run_name="__main__")
+                except SystemExit as exc:
+                    code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+                except Killed:
+                    killed = True
+        finally:
+            for k in [k for k in sys.modules if k in ours or k.startswith("harness_lib.")]:
+                del sys.modules[k]
+            sys.modules.update(saved)
+        return code, out.getvalue(), err.getvalue(), killed
+
     # ---- risk:high asks, risk:low passes
 
     def test_risk_high_ticket_asks(self):
@@ -431,14 +565,13 @@ class LandAskTests(unittest.TestCase):
                 if cause == "pr view fails":
                     reasons["gh failing"] = reason
 
-        # A gh slower than 3 s on the PR's view: cut off, ask, naming gh. (gh calls past 8 s in all: see
-        # test_gh_deadline_is_shared_across_lands.)
+        # A gh slower than its per-call deadline on the PR's view: cut off, ask, naming gh. On the knob's scaled clock
+        # (0.75 s a call), as a 3.6 s view is on the real one. (How soon it answers, and gh calls past the run's
+        # deadline: see test_deadlines_on_a_scaled_clock.)
         tickets = (21, 22, 23, 24)
-        with self.subTest(cause="gh slow", hang="pr"):
-            self.scenario(pr_call(12, tickets), *(issue_call(n, "risk:low") for n in tickets), pace={"pr": HANG})
-            code, out, err, seconds = self.run_hook("harness-pr land 12")
-            reason = self.ask_reason("harness-pr land 12", code, out, err)
-            self.assertLess(seconds, ONE_CALL_LIMIT, f"a hanging gh pr call took {seconds:.1f} s to answer")
+        with self.subTest(cause="gh slow", slow="pr"):
+            self.scenario(pr_call(12, tickets), *(issue_call(n, "risk:low") for n in tickets), pace={"pr": SLOW_CALL})
+            reason = self.ask("harness-pr land 12", env={TIMESCALE: str(SCALE)})
             self.assertRegex(reason, r"\bgh\b", "the reason does not say gh was too slow")
             reasons["gh slow"] = reason
 
@@ -451,20 +584,85 @@ class LandAskTests(unittest.TestCase):
         self.assertEqual(sorted(reasons), ["gh failing", "gh slow", "no risk label", "no ticket"])
         self.assertEqual(len(set(reasons.values())), 4, f"the causes share a reason: {reasons}")
 
-    def test_gh_deadline_is_shared_across_lands(self):
-        # Two lands in one command, each closing three risk:low tickets, gh at 1.5 s a call: eight calls, 12 s or
-        # more. The 8 s are one deadline for the whole command: the hook asks, naming gh, inside the 10 s Claude
-        # Code gives it. A hook that gives each land its own 8 s finishes both (6 s each) near 12 s: Claude Code
-        # has killed it by then, and both lands run unasked. Here that hook is silent (every ticket is risk:low)
-        # and over ALL_CALLS_LIMIT.
-        self.scenario(pr_call(12, [21, 22, 23]), pr_call(7, [31, 32, 33]),
-                      *(issue_call(n, "risk:low") for n in (21, 22, 23, 31, 32, 33)),
-                      pace={"pr": CALL_DELAY, "issue": CALL_DELAY})
-        command = "harness-pr land 12 && harness-pr land 7"
-        code, out, err, seconds = self.run_hook(command)
-        reason = self.ask_reason(command, code, out, err)
-        self.assertLess(seconds, ALL_CALLS_LIMIT, f"gh took {seconds:.1f} s to answer across two lands")
-        self.assertRegex(reason, r"\bgh\b", "the reason does not say gh ran out of time")
+    # ---- the deadlines, and the knob that scales them
+
+    def deadline_cases(self, scale: float) -> list:
+        """(case, command, calls, pace) of the two timing cases, gh paced on a clock scaled by `scale`:
+          - cut-off call: the PR's view never answers (its tickets are risk:low), so it is cut off at the per-call
+            deadline and the hook asks, naming gh;
+          - shared across lands: two lands in one command, each closing three risk:low tickets, gh at 1.5 s a call:
+            eight calls, 12 s. The 8 s are one deadline for the whole command: the hook asks, naming gh, inside the
+            10 s Claude Code gives it. A hook that gives each land its own 8 s finishes both (6 s each) near 12 s:
+            Claude Code has killed it by then, and both lands run unasked."""
+        tickets = (21, 22, 23, 24)
+        cut_off = [pr_call(12, tickets)] + [issue_call(n, "risk:low") for n in tickets]
+        shared = ([pr_call(12, [21, 22, 23]), pr_call(7, [31, 32, 33])]
+                  + [issue_call(n, "risk:low") for n in (21, 22, 23, 31, 32, 33)])
+        delay = CALL_DELAY * scale
+        return [("cut-off call", "harness-pr land 12", cut_off, {"pr": None}),
+                ("shared across lands", "harness-pr land 12 && harness-pr land 7", shared,
+                 {"pr": delay, "issue": delay})]
+
+    def test_deadlines_on_a_scaled_clock(self):
+        # The one wall-clock test: the hook as Claude Code runs it, with the knob at SCALE in its environment (0.75 s
+        # a call, 2 s in all), so the two timing cases take a second or two, not 3 s and 8 s. A hook that ignores
+        # the knob lets the 0.9 s PR view through and finishes the eight 0.375 s calls inside its real 8 s: silent
+        # both times, every ticket being risk:low; so is a hook that gives each land its own deadline.
+        # The exact deadlines are test_timescale_knob_only_ever_shortens_the_deadlines'; here the hook answers within the
+        # scaled run's deadline plus its own start.
+        env = {TIMESCALE: str(SCALE)}
+        budget = RUN_DEADLINE * SCALE
+        for case, command, calls, pace in self.deadline_cases(SCALE):
+            if pace.get("pr", 0) is None:
+                pace = {"pr": SLOW_CALL}  # under 1 s of real sleep, past the scaled 0.75 s
+            with self.subTest(case=case):
+                self.scenario(*calls, pace=pace)
+                code, out, err, seconds = self.run_hook(command, env=env)
+                reason = self.ask_reason(command, code, out, err)
+                self.assertRegex(reason, r"\bgh\b", f"the reason does not say gh was too slow: {reason}")
+                self.assertLess(seconds, budget + OVERHEAD, f"{case}: the hook took {seconds:.2f} s to answer")
+                # The reason names the seconds in force on the scaled clock, never the real 3 s or 8 s.
+                named = seconds_named(reason)
+                self.assertTrue(named, f"the reason names no deadline in seconds: {reason}")
+                self.assertLessEqual(max(named), budget + 0.011, f"the reason names a real-clock deadline: {reason}")
+
+    def test_timescale_knob_only_ever_shortens_the_deadlines(self):
+        # land_ask in this process on a fake clock (no real sleeping): the knob's value, and the factor the hook must
+        # apply to both deadlines. A factor in (0, 1] scales them; anything else leaves the real 3 s and 8 s in force:
+        # a longer deadline runs past hooks.json's 10 s, where Claude Code kills the hook with no decision and the land
+        # runs unasked, and 0, a negative or a value that is not a number is no factor at all.
+        knobs = [(None, 1.0), ("1", 1.0), ("0.5", 0.5), ("0.1", 0.1),
+                 ("1.5", 1.0), ("inf", 1.0),
+                 ("0", 1.0), ("-1", 1.0), ("nan", 1.0), ("abc", 1.0), ("", 1.0)]
+        for knob, scale in knobs:
+            env = {} if knob is None else {TIMESCALE: knob}
+            call, budget = CALL_DEADLINE * scale, RUN_DEADLINE * scale
+            for case, command, calls, pace in self.deadline_cases(scale):
+                with self.subTest(knob=knob, case=case):
+                    fake = FakeClock(calls, pace)
+                    code, out, err, killed = self.run_on_fake_clock(command, fake, env)
+                    self.assertFalse(killed, "the hook ran past hooks.json's 10 s: no decision, the land runs unasked")
+                    reason = self.ask_reason(command, code, out, err)
+                    self.assertRegex(reason, r"\bgh\b", f"the reason does not say gh was too slow: {reason}")
+                    took = call if case == "cut-off call" else budget
+                    self.assertAlmostEqual(fake.ahead, took, delta=0.02,
+                                           msg=f"{case}: answered after {fake.ahead:.3f} s, not at the {took:g} s "
+                                               f"deadline: {reason}")
+                    named = seconds_named(reason)
+                    self.assertTrue(named, f"the reason names no deadline in seconds: {reason}")
+                    self.assertLessEqual(max(named), took + 0.011, f"the reason names a deadline not in force: {reason}")
+                    if case == "cut-off call":
+                        self.assertTrue(any(abs(s - call) <= 0.011 for s in named),
+                                        f"the reason does not name the {call:g} s per-call deadline: {reason}")
+            # git's lookup of the main checkout is on the same per-call deadline
+            with self.subTest(knob=knob, case="git never answers"):
+                fake = FakeClock(git_hangs=True)
+                code, out, err, killed = self.run_on_fake_clock("harness-pr land 12", fake, env)
+                self.assertFalse(killed, "the hook ran past hooks.json's 10 s: no decision, the land runs unasked")
+                reason = self.ask_reason("harness-pr land 12", code, out, err)
+                self.assertRegex(reason, r"\bgit\b", f"the reason does not say git was too slow: {reason}")
+                self.assertAlmostEqual(fake.ahead, call, delta=0.02,
+                                       msg=f"git cut off after {fake.ahead:.3f} s, not at the {call:g} s deadline")
 
     def test_ticket_from_the_head_branch_when_nothing_closes(self):
         cases = [
