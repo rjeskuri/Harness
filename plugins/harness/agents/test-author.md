@@ -19,8 +19,6 @@ The ticket context (Request, Outline, Definition of done, Tests that must pass, 
 6. Run the tests with the test command. They must fail for the right reason: an assertion on the missing behavior, or an import of the module the ticket says to create. A test that already passes is wrong or tests existing behavior: fix it or drop it, and say so.
 7. Write no implementation, stubs or placeholder modules. If the test needs a module that does not exist yet, the import error is the red state.
 
-If you were sent back by the test-breaker, its report names the cheat that passed; add the input variety or independent expectation that defeats it, and say what you added.
-
 ## Report
 - Each test: `file::name`, the definition-of-done item it covers, what it proves.
 - The red run: the exact command and the tail of its output, and why each failure is the expected one.

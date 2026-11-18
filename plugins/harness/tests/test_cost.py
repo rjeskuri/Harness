@@ -10,8 +10,8 @@ The contract under test (the ticket's Context):
   call failing (CostCommand's default scenario), lines, ci, needs_input and landed_at are null and elapsed holds
   no PR or ready time, so the Cost block gains no line.
 - Rounds: per stage, in attempt order, a fail extends that stage's run of failures; its first fail is a retry,
-  the second an escalate, the third and later needs-input (fix and breaker: retry, then needs-input), as `harness-work
-  attempt` answers; a pass ends the run; each stage counts on its own. breaker_rerounds = breaker fails,
+  the second an escalate, the third and later needs-input (fix: retry, then needs-input; breaker: every fail is
+  done, #375), as `harness-work attempt` answers; a pass ends the run; each stage counts on its own. breaker_rerounds = breaker fails,
   fix_rounds = fix attempts.
 - Number formats: tokens below 1,000 as the integer, below 1,000,000 as 12.3k, else 12.3M; durations 45s, 12m,
   1h05m; model names without a leading `claude-`.
@@ -241,7 +241,7 @@ WIDGET_ROWS = [
 ]
 WIDGET_TOTAL = ("23.5M", "127.1k", "1h28m")
 WIDGET_SESSION = "Session total (Claude Code's count): 23.7M tokens, 306.0k output, 3.0k thinking, 1h45m API time"
-WIDGET_ROUNDS = "Rounds: breaker re-rounds 1, fix rounds 2; retries 3, escalations 1, needs-input 0"
+WIDGET_ROUNDS = "Rounds: breaker re-rounds 1, fix rounds 2; retries 2, escalations 1, needs-input 0"
 WIDGET_NOT_COUNTED = "Not counted: the orchestrator of shared session 4b318caa"
 WIDGET_ATTEMPTS = [("tests", "pass"), ("breaker", "fail"), ("breaker", "pass"), ("code", "pass"),
                    ("review", "pass"), ("fix", "fail"), ("fix", "pass"), ("ci", "fail"), ("ci", "fail")]
@@ -252,7 +252,7 @@ def stage_counts(runs=0, fails=0, retry=0, escalate=0, needs_input=0):
 
 
 WIDGET_ROUNDS_RECORD = {
-    "stages": {"tests": stage_counts(1), "breaker": stage_counts(2, 1, retry=1), "code": stage_counts(1),
+    "stages": {"tests": stage_counts(1), "breaker": stage_counts(2, 1), "code": stage_counts(1),
                "review": stage_counts(1), "fix": stage_counts(2, 1, retry=1),
                "ci": stage_counts(2, 2, retry=1, escalate=1)},
     "breaker_rerounds": 1, "fix_rounds": 2}
@@ -502,7 +502,7 @@ class CostCommand(CostBase):
             self.assertIn(piece, session[0])
         rounds = [line for line in lines if "re-rounds" in line]
         self.assertEqual(len(rounds), 1, out)
-        for piece in ("breaker re-rounds 1", "fix rounds 2", "retries 3", "escalations 1", "needs-input 0"):
+        for piece in ("breaker re-rounds 1", "fix rounds 2", "retries 2", "escalations 1", "needs-input 0"):
             self.assertIn(piece, rounds[0])
         not_counted = [line for line in lines if "Not counted" in line]
         self.assertEqual(len(not_counted), 1, out)
@@ -612,13 +612,13 @@ class CostCommand(CostBase):
                  ("review", "fail"), ("review", "fail"), ("review", "fail"), ("review", "fail"), ("ci", "fail"),
                  ("tests", "pass")]
         cases = [
-            # #252: the breaker never escalates; its second and third fails are needs-input
+            # #375: every breaker fail is done: no retry, escalation or needs-input, still a re-round
             (82, "opus", seq82, {"stages": {"tests": stage_counts(3),
-                                            "breaker": stage_counts(3, 3, retry=1, needs_input=2),
+                                            "breaker": stage_counts(3, 3),
                                             "code": stage_counts(1), "review": stage_counts(1),
                                             "ci": stage_counts(1)},
                                  "breaker_rerounds": 3, "fix_rounds": 0},
-             "Rounds: breaker re-rounds 3, fix rounds 0; retries 1, escalations 0, needs-input 2"),
+             "Rounds: breaker re-rounds 3, fix rounds 0; retries 0, escalations 0, needs-input 0"),
             (83, "sonnet", seq83, {"stages": {"fix": stage_counts(2, 2, retry=1, needs_input=1),
                                               "code": stage_counts(3, 2, retry=2),
                                               "review": stage_counts(4, 4, 1, 1, 2), "ci": stage_counts(1, 1, 1),
@@ -634,7 +634,7 @@ class CostCommand(CostBase):
                 answers = [self.attempt(n, stage, result) for stage, result in seq]
                 if n == 82:
                     self.assertEqual([a for (s, _), a in zip(seq, answers) if s == "breaker"],
-                                     ["retry", "needs-input", "needs-input"])     # #252
+                                     ["done", "done", "done"])     # #375
                 self.assertEqual(tally(seq, answers), expected, "fixture: the attempt answers")
                 record = json.loads(self.cost(n, "--json"))
                 self.assertEqual(record["rounds"], expected)
@@ -678,10 +678,10 @@ class CostCommand(CostBase):
                 record = json.loads(self.cost(n, "--json"))
                 self.assertEqual(record["rounds"]["stages"], {"code": counts})
 
-    def test_rounds_count_a_second_breaker_fail_as_needs_input(self):
-        # #252: the breaker never escalates: replayed, its first fail in a run is a retry and the second and later
-        # needs-input, whatever the tier and effort, in records written by attempt and in older ones without an
-        # `effort` key. breaker_rerounds is still the breaker's fails; code beside it still escalates.
+    def test_rounds_count_a_breaker_fail_as_done(self):
+        # #375: replayed, every breaker fail is done (no retry, escalation or needs-input), whatever the tier and
+        # effort, in records written by attempt and in older ones without an `effort` key. breaker_rerounds is
+        # still the breaker's fails; code beside it still retries and escalates.
         seq = [("breaker", "fail"), ("tests", "pass"), ("breaker", "fail"), ("code", "fail"), ("breaker", "fail"),
                ("code", "fail"), ("breaker", "pass"), ("breaker", "fail"), ("breaker", "fail")]
         n = 701
@@ -689,14 +689,14 @@ class CostCommand(CostBase):
             Msg(f"msg_{n}_1", T("09:00:00.000"), T("09:00:45.000"), (1, 98, 0, 900))])])
         self.write_cache(n, size="S", tier="sonnet")
         answers = [self.attempt(n, stage, result) for stage, result in seq]
-        self.assertEqual(answers, ["retry", "done", "needs-input", "retry", "needs-input", "escalate opus", "done",
-                                   "retry", "needs-input"])
-        expected = {"stages": {"breaker": stage_counts(6, 5, retry=2, needs_input=3), "tests": stage_counts(1),
+        self.assertEqual(answers, ["done", "done", "done", "retry", "done", "escalate opus", "done",
+                                   "done", "done"])
+        expected = {"stages": {"breaker": stage_counts(6, 5), "tests": stage_counts(1),
                                "code": stage_counts(2, 2, retry=1, escalate=1)},
                     "breaker_rerounds": 5, "fix_rounds": 0}
         record = json.loads(self.cost(n, "--json"))
         self.assertEqual(record["rounds"], expected)
-        line = "Rounds: breaker re-rounds 5, fix rounds 0; retries 3, escalations 1, needs-input 3"
+        line = "Rounds: breaker re-rounds 5, fix rounds 0; retries 1, escalations 1, needs-input 0"
         md = self.cost(n, "--markdown")
         self.assertEqual(md.strip("\n"), block([("code", "opus-5-5", "1", "999", "98", "45s", "45s")],
                                                ("999", "98", "45s"), line))
@@ -712,12 +712,10 @@ class CostCommand(CostBase):
                          "at": "2026-10-25T%02d:00:00Z" % (9 + i)}, **effort)
 
         cases = [
-            (711, "sonnet", {"effort": None}, ["fail", "fail"], stage_counts(2, 2, retry=1, needs_input=1)),
-            (712, "opus", {"effort": None}, ["fail", "fail", "fail"], stage_counts(3, 3, retry=1, needs_input=2)),
-            (713, "opus", {"effort": "high"}, ["fail", "fail"], stage_counts(2, 2, retry=1, needs_input=1)),
-            (714, "sonnet", {}, ["fail", "fail"], stage_counts(2, 2, retry=1, needs_input=1)),     # pre-#239
-            (715, "opus", {}, ["fail", "fail", "pass", "fail"], stage_counts(4, 3, retry=2, needs_input=1)),
-            (716, "fable", {}, ["fail", "fail", "fail", "fail"], stage_counts(4, 4, retry=1, needs_input=3)),
+            (711, "sonnet", {"effort": None}, ["fail", "fail"], stage_counts(2, 2)),
+            (712, "opus", {"effort": "high"}, ["fail", "fail", "fail"], stage_counts(3, 3)),
+            (715, "opus", {}, ["fail", "fail", "pass", "fail"], stage_counts(4, 3)),     # pre-#239
+            (716, "fable", {}, ["fail", "fail", "fail", "fail"], stage_counts(4, 4)),
         ]
         for n, tier, effort, results, counts in cases:
             with self.subTest(ticket=n, tier=tier, effort=effort):

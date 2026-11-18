@@ -38,11 +38,12 @@ as `harness-board tier` does, a cached fable reading as opus xhigh). The
 effort is --effort, else the route's effort when the attempt ran at the route's tier, else none (null). The second
 failure in a row escalates: sonnet prints `escalate opus`, opus with no effort or below xhigh `escalate opus xhigh`;
 a stage already at opus xhigh or max, or on an explicitly named fable, gets needs-input instead. No escalation goes to
-fable. fix and breaker never escalate: retry, then needs-input. --json adds effort, next_tier and next_effort.
+fable. fix never escalates: retry, then needs-input. A breaker failure answers done at any tier, however often (one
+round; its gaps go to the coder as requirements). --json adds effort, next_tier and next_effort.
 
 stage: records as attempt does (the same code, store and answer), then prints `next: <step>` on a second line
-(--json: attempt's object plus "next"). retry and escalate repeat the stage, a breaker failure going back to tests;
-needs-input names needs-input; done goes tests -> breaker (risk:high) or code, breaker -> code, code -> review,
+(--json: attempt's object plus "next"). retry and escalate repeat the stage; needs-input names needs-input; done
+goes tests -> breaker (risk:high) or code, breaker (pass or fail) -> code, code -> review,
 review and fix -> fix while the latest review round (harness_lib.reviews) has blocking findings, else ci,
 ci -> `ultra, then ready` (risk:high) or ready. Risk and flags come from the ticket cache (risk,
 flags, labels). Refused, exit 1 and nothing recorded: tests or breaker on a no-tests ticket, breaker on one that is
@@ -1577,7 +1578,7 @@ def record_attempt(repo, cache, args):
         if entry.get("result") != "fail":
             break
         failures += 1
-    action = cost.attempt_action(args.stage, args.result, failures)     # fix, breaker: two rounds, never escalate
+    action = cost.attempt_action(args.stage, args.result, failures)     # fix: two rounds, never escalate; breaker: done
     nxt = next_route(tier, effort) if action == "escalate" else None
     if action == "escalate" and nxt is None:
         action = "needs-input"          # nothing above opus xhigh or an explicit fable
@@ -1626,13 +1627,13 @@ def stage_refusal(n, stage, result, marks, found):
 
 
 def next_step(data, marks, found):
-    """The work loop's step after the attempt `data`: the same stage on retry or escalate (tests after a breaker
-    failure, so the author tightens them), needs-input, or the stage a pass leads to."""
+    """The work loop's step after the attempt `data`: the same stage on retry or escalate, needs-input, or the
+    stage done leads to (a breaker failure is done: code, with the gaps as requirements)."""
     stage, action = data["stage"], data["action"]
     if action == "needs-input":
         return "needs-input"
     if action != "done":
-        return "tests" if stage == "breaker" else stage
+        return stage
     if stage in ("review", "fix"):
         return "fix" if found else "ci"
     high = "risk:high" in marks
@@ -2293,8 +2294,8 @@ def parser():
 
     attempt = sub.add_parser("attempt", parents=[with_repo, with_json],
                              help="record a stage's result; prints done, retry, escalate <tier> [<effort>] or "
-                                  "needs-input (escalate opus, then escalate opus xhigh, then needs-input; fix and "
-                                  "breaker retry, then needs-input; they never escalate)")
+                                  "needs-input (escalate opus, then escalate opus xhigh, then needs-input; fix "
+                                  "retries, then needs-input; a breaker failure is done)")
     attempt.add_argument("number", type=issue_number, metavar="N")
     attempt.add_argument("stage", choices=STAGES)
     attempt.add_argument("result", choices=("pass", "fail"))

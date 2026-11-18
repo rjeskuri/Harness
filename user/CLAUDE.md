@@ -15,11 +15,12 @@
 ## Tests first
 
 - On a ticket, the test-author writes the tests, `harness-red check` proves them red, and only then the coder changes source; a hook enforces the roles on ticket branches, and git hooks refuse commits and pushes on main. Never delete, skip or loosen a test to get green: a wrong test goes back to the test-author with the reason.
+- The test-breaker runs one round, only on a `risk:high` ticket that changes a hook's decision path or a tool that destroys or rewrites data. Its gaps go to the coder as `Requirement:` lines and to the reviewer as check items, never a second tests round or a needs-input stop.
 - The ticket's own tests run at every stage (`harness-red run`); CI runs the whole suite on the pull request. Do not run the full verify command by hand on a ticket branch.
 
 ## Model routing
 
-- Opus 5.5 at high effort is the default. For each agent in the loop, `harness-board tier N --json` (test-author, breaker, coder) and `harness-board tier N --stage review --json` (reviewer) print the `tier` to pass as `model` and the `effort` to pass when it is not null; `harness-work attempt` names the tier and effort of a retry or escalation. Fable runs only when I launch it or a project setting names it.
+- Opus 5.5 at high effort is the default. For each agent in the loop, `harness-board tier N --json` (test-author, breaker, coder) and `harness-board tier N --stage review --json` (reviewer) print the `tier` to pass as `model` and the `effort` to pass when it is not null; `harness-work attempt` names the tier and effort of a retry or escalation. Fable runs only when I launch it or a project setting names it; at the breaker, gaps go to the coder as requirements.
 - `/harness:work` with no number dispatches one background session per ready ticket. Say what you launched and why.
 
 ## Budgets
