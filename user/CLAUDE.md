@@ -12,7 +12,7 @@
 - A question the ticket, the epic and the code cannot answer becomes `harness-board needs-input N --question ...` only when it is about direction or product behavior, is hard to undo, or touches security, credentials or personal data; a stage that keeps failing is never a question. A reversible implementation choice is decided and recorded as a `Ruling:` line under `### Rulings` in the PR's Notes. I answer on the ticket; the next `/harness:work N` reads the answer.
 - New work: `/harness:plan <request>`. Tickets to pull requests: `/harness:work [N]`. The loop lands every PR, of any risk, with `harness-pr land --catch-up` once it is green, current with main and free of high and medium findings, and a session merges no other way. A session pushes `t/*` branches and opens PRs without asking. A quick fix outside a ticket goes on a branch too (`git switch -c t/<n>-<slug>`).
 - A ticket still stuck after its capped rounds is parked (`harness-board park`: `status:blocked`, a proposed follow-up, a notification), and the loop moves on.
-- Claude may file follow-up tickets, always `status:proposed` under the relevant epic and never blocking the current ticket. I decide what runs next with `harness-board promote N`, and unpark a ticket with `harness-board status N ready`.
+- Claude may file follow-up tickets, always `status:proposed` under the relevant epic and never blocking the current ticket. I decide what runs next with `harness-board promote N`, and unpark a ticket with `harness-board status`.
 
 ## Tests first
 
