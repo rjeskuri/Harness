@@ -98,6 +98,7 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib import backups
+    from harness_lib.backups import secret
     from harness_lib.hookio import emit, hook_cwd, read_input, run_fail_open
     from harness_lib.paths import canonical_path
     from harness_lib.repo import main_checkout, worktree_entries
@@ -693,13 +694,6 @@ def place(loc, roots, home, tops):
 
 
 # ---------- what to copy ----------
-
-
-def secret(rel):
-    """Secret-shaped, in any case: .env, .env.*, *.pem, *.key, or credentials/ and under."""
-    parts = rel.lower().split("/")
-    name = parts[-1]
-    return "credentials" in parts or name == ".env" or name.startswith(".env.") or name.endswith((".pem", ".key"))
 
 
 def sensitive(rel, pats):
