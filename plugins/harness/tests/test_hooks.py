@@ -1810,15 +1810,18 @@ class VerifyOnStopTests(HookTestCase):
         self.assertEqual(hook.stdout.read(), b"")
         hook.stdout.close()
         hook.stderr.close()
-        deadline = time.monotonic() + 5
+        # poll for the command's exit. The window is wide on purpose: a loaded CI runner
+        # can keep a dying process visible for a while after the hook returned, and the
+        # wait only runs to its end when the command really outlives its hook (the
+        # command itself sleeps 30 s)
+        deadline = time.monotonic() + 20
         while True:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
                 break
-            self.assertLess(
-                time.monotonic(), deadline, "the verify command outlived its hook"
-            )
+            if time.monotonic() >= deadline:
+                self.fail("the verify command outlived its hook")
             time.sleep(0.02)
 
     # ---- docs-and-config-only turns (#163)
