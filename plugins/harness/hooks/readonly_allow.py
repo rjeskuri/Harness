@@ -32,7 +32,8 @@ none: its folder), each input redirection, grep's -f file, each git operand (a p
 one) relative to the folder git runs in, and each path in a rev:path word relative to the working tree. A word
 holding a glob, a brace expansion or a leading = names no known file: no decision. A folder grep reads (any file
 operand that is a folder, as ugrep recurses into one, and with -r, -R or -d recurse and no file, the folder it runs
-in) holds no symlink and nothing secret-shaped, within 20,000 entries.
+in) holds no symlink and nothing secret-shaped or matched by HARNESS_SENSITIVE_PATHS (each entry judged as an
+operand is), within 20,000 entries. git grep is judged by its operands and pathspecs alone.
 
 No decision (nothing on stdout, exit 0) otherwise, in plan mode, and with HARNESS_READONLY_ALLOW=off (the
 environment first, then `env` in the main checkout's .claude/settings.json and settings.local.json). Fails open:
@@ -447,7 +448,7 @@ class Places:
         return self.allowed(real) and self.clean(os.path.normpath(path)) and self.clean(real)
 
     def tree(self, word, base) -> bool:
-        """A folder grep reads whole: no symlink, nothing secret-shaped and no backup store in it."""
+        """A folder grep reads whole: no symlink, nothing secret-shaped or sensitive and no backup store in it."""
         real = canonical_path(self.absolute(word, base))
         if not os.path.isdir(real):
             return True
@@ -458,7 +459,7 @@ class Places:
                 entry = os.path.join(folder, name)
                 if count > WALK_LIMIT or time.monotonic() > DEADLINE or os.path.islink(entry):
                     return False
-                if name == PROJECT_STORE or any(secret(rel) for rel in self.rels(entry)):
+                if name == PROJECT_STORE or not self.clean(entry):
                     return False
         return True
 

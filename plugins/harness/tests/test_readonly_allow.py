@@ -226,7 +226,9 @@ SECRET_SENSITIVE_OUTSIDE = (
     ("cat {vault}/notes.txt", "main"),
     ("cat {vault}/notes.txt", "wt"),
     ("grep -rn x {vault}", "main"),
-    ("head src/cache.{ext}", "wt"),
+    ("head data/cache.{ext}", "wt"),
+    # a recursive grep whose walk reaches a file matched by *.{ext} (src beside it holds none: allowed above)
+    ("grep -rn rows data", "wt"),
     ("cat {wt}/{vault}/notes.txt", "main"),
     ("git diff HEAD -- {vault}/notes.txt", "wt"),
     # outside the project, ~/.claude/harness/ and the temp directories
@@ -247,7 +249,7 @@ SECRET_SENSITIVE_OUTSIDE = (
 # The same shapes on paths that are none of those: allowed, so the rows above turn on the path alone.
 PATH_CONTROLS = (
     ("cat {vault}-old/notes.txt", "main"),
-    ("head src/cache.txt", "wt"),
+    ("head data/cache.txt", "wt"),
     ("cat certs/README.md", "main"),
     ("git diff HEAD -- src/app.py", "wt"),
     ("cd src && cat app.py", "main"),
@@ -288,8 +290,8 @@ class ReadonlyAllowTests(GuardTestCase):
         files = {
             "README.md": f"hello {self.tok}\n",
             "src/app.py": "def login():\n    return 'ok'\n",
-            "src/cache.txt": "cache\n",
-            f"src/cache.{self.ext}": "rows\n",
+            "data/cache.txt": "cache\n",
+            f"data/cache.{self.ext}": "rows\n",
             "certs/README.md": "certificates\n",
             "certs/server.pem": "-----BEGIN CERTIFICATE-----\n",
             f"{self.vault}/notes.txt": "private\n",
