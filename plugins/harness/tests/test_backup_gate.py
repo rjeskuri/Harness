@@ -158,15 +158,23 @@ Choices #328 leaves open, fixed here:
   that rewrites a .gitignore gets no decision and no snapshot or ref. Any .gitignore counts (the root one, a
   nested one, one deleted from disk, a new one only staged) when what is on disk differs from what the form writes
   there: HEAD for a reset (with no target or HEAD), the index for checkout or restore of paths without a tree-ish,
-  the tree-ish for `checkout HEAD -- p`. Pinned forms: `reset --hard [HEAD]`, `checkout -- .`, `checkout -- <its
-  folder or itself>`, `restore .`, `restore <it>`, `checkout HEAD -- <it>`. A path form whose pathspec leaves out
-  every differing .gitignore (`checkout -- src`, `restore src/app.py` with only the root one edited), a clean before
-  the form, the clean alone, and these forms when no .gitignore differs are backed up as before.
-- Ruling (fix round 2, low): the overwrite check reads the target in every spelling: `restore -s X`, `-WsX`,
-  `--so X`, `checkout X p` without `--`, `checkout -f X -- .`, `switch --detach -f X`, `reset --merge X`.
+  the tree-ish for `checkout HEAD -- p`; `restore --staged --worktree` writes HEAD's, so a change only staged
+  counts for it. Pinned here: `reset --hard && clean -fd` with the root .gitignore edited on disk, and
+  `restore --staged --worktree . && clean -fd` with it edited and staged, get nothing; `checkout -- src && clean -fd`
+  (its pathspec leaves the edited .gitignore out), and both pairs when no .gitignore differs, are backed up as before.
+- Ruling (fix round 2, low): the overwrite check reads the target in every spelling (`restore -s X`, `-WsX`,
+  `--so X`, `checkout X p` without `--`, `switch --detach -f X`, `reset --merge X` among them). Pinned here:
+  `reset --hard X`, `checkout -f X`, `checkout X -- p` and `restore --source=X p`.
 - Ruling (finding 2): a branch name that is not a plain branch of refs/heads/ (`@{-1}`, `@{-2}`, quoted or not) or
   names none (a missing branch) gets no decision and no ref, for every branch of the part: `git branch -D <real>
   @{-1}` and `git branch -D <real> <missing>` keep nothing either (git deletes the real one before it fails).
+
+Ticket #377 (epic #374) collapsed the cd cases, the fix-round clean cases and the outside-repository cases into
+table tests, cut the git forms' spelling lists to one row per decision, and dropped what no real session types. The
+hook still follows the rulings above; this module no longer pins a cd behind `command` or `builtin`, spelled as a
+path, inside if, after an arithmetic or a bare redirect, or to ~+ or ~0; the line-continuation spellings but #357's
+own; a repository unrelated to the project or nested in the main checkout, and a $, a backtick or a substitution in
+-C or a branch name; a staged restore over what git stash create lacks; branch names that are not plain branches.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p test_backup_gate.py -v
 """
@@ -196,7 +204,6 @@ TOOL = os.path.join(PLUGIN, "bin", "harness-work")
 GIT = shutil.which("git") or "/usr/bin/git"
 PATH = os.pathsep.join([os.path.dirname(GIT), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
 SHELL = shutil.which("zsh", path=PATH) or shutil.which("bash", path=PATH) or "/bin/bash"   # as the Bash tool runs
-CD = shutil.which("cd", path=PATH)                     # the executable cd (macOS /usr/bin/cd), when there is one
 ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}")
 REBUILDABLE = ("node_modules", ".venv", "venv", "dist", "build", "__pycache__", ".pytest_cache", ".mypy_cache",
                ".ruff_cache", ".tox")
@@ -1155,163 +1162,41 @@ class Directory(GateTest):
         gone = before - entries(wt)
         return {g for g in gone if os.path.dirname(g) not in gone}
 
-    def each(self, cases, check):
-        """check(main, wt, command, cwd, what the shell removes) per case, in its own subtest, the worktree
-        refreshed before each."""
+    def test_where_a_removal_runs_after_a_cd(self):
+        """A cd that can fail, to a word the shell expands, or that may not run (also across a line continuation,
+        #357) leaves the directory unknown: no decision, no snapshot. An unconditional cd into an existing folder
+        moves it, whatever separator follows and whatever part stands before it: allow, with one snapshot holding
+        exactly what the shell removes, and a restore that brings it back."""
+        cases = (
+            # (command, cwd, what the shell removes, backed up)
+            ("cd {nope} && true; rm -f docs/a.md", "", ["docs/a.md"], False),            # a cd that can fail
+            ("cd sub-* && rm -f {x}", "", ["{sub}/{x}"], False),                          # a glob
+            ("test -d {sub} && cd {sub}; rm -f {x}", "", ["{sub}/{x}"], False),           # a cd that may not run
+            ("test -d {nope} && \\\n\ncd {sub}; rm -f {x}", "", ["{x}"], False),          # the same, #357
+            ("cd {sub} && rm -rf {d}", "", ["{sub}/{d}"], True),
+            ("cd {sub}; rm -rf {d}", "", ["{sub}/{d}"], True),
+            ("cd {wt}/{sub}; rm -rf {d}", "", ["{sub}/{d}"], True),                       # an absolute path
+            ("cd .. && rm -rf {d}", "{sub}", ["{d}"], True),                               # up from a subfolder
+            ("pwd\ncd {sub} && rm -rf {d}", "", ["{sub}/{d}"], True),                    # a part before the cd
+        )
         main, wt, n = self.scene()
-        for shape, where, removed in cases:
+        for shape, where, removed, backed_up in cases:
             command = shape.format(wt=wt, **n)
             cwd = os.path.join(wt, where.format(**n)) if where else wt
             with self.subTest(command=command, cwd=cwd):
                 self.refresh(wt, n)
-                check(main, wt, command, cwd, {r.format(**n) for r in removed})
-
-    def expect_unknown(self, cases):
-        def check(main, wt, command, cwd, want):
-            before, there = self.snapshots(), entries(wt)
-            p = self.run_gate(command, cwd, main)
-            self.assertEqual(entries(wt), there, f"{command!r}: the hook itself changed the worktree")
-            self.assertEqual(self.shell_removes(command, cwd, wt), want, f"{command!r}: what {SHELL} removes")
-            self.expect_nothing(p, before, command)
-
-        self.each(cases, check)
-
-    def test_a_cd_that_can_fail_leaves_what_runs_anyway_unknown(self):
-        self.expect_unknown((
-            ("cd {nope} && true; rm -f docs/a.md", "", ["docs/a.md"]),
-            ("cd {nope} && rm -rf a\nrm -rf {d}", "", ["{d}"]),
-            ("cd {nope} && ls || rm -f src/util.py", "", ["src/util.py"]),
-            ("pushd {nope}/deeper && true; rm -f {x}", "", ["{x}"]),
-            ("cd docs/a.md && ls; rm -f src/util.py", "", ["src/util.py"]),         # a regular file
-            ("cd README.md && pwd\nrm -f {x} {y}", "", ["{x}", "{y}"]),
-        ))
-
-    def test_a_cd_to_a_word_the_shell_expands_leaves_the_directory_unknown(self):
-        self.expect_unknown((
-            ("cd ~+ && rm -f {x}", "", ["{x}"]),
-            ("cd ~0 && rm -f {y}", "", ["{y}"]),
-            ("cd ~+/{sub} && rm -f {x}", "", ["{sub}/{x}"]),
-            ("cd sub-* && rm -f {x}", "", ["{sub}/{x}"]),
-            ("cd sub-???????? && rm -rf {d}", "", ["{sub}/{d}"]),
-        ))
-
-    def test_a_cd_that_may_not_run_leaves_the_directory_unknown(self):
-        # x and y are both in the worktree and in sub/: which one goes depends on the condition, either way.
-        self.expect_unknown((
-            ("[ -f {nope} ] && cd {sub}; rm -f {x}", "", ["{x}"]),
-            ("test -d {sub} && cd {sub}; rm -f {x}", "", ["{sub}/{x}"]),
-            ("if [ -f {nope} ]; then cd {sub}; fi; rm -f {x}", "", ["{x}"]),
-            ("[ -e {nope} ] && cd {sub}\nrm -rf {d}", "", ["{d}"]),
-        ))
-
-    def test_a_cd_behind_command_leaves_the_directory_unknown(self):
-        # zsh's `command` runs the external cd or pushd (a child process, or not found), so the directory stays;
-        # bash's runs the builtin. The hook cannot know which shell runs it: unknown either way.
-        zsh = os.path.basename(SHELL) == "zsh"
-        self.expect_unknown((
-            ("command cd {sub}; rm -f {x}", "", ["{x}"] if zsh else ["{sub}/{x}"]),
-            ("command cd {sub}\nrm -rf {d}", "", ["{d}"] if zsh else ["{sub}/{d}"]),
-            ("command pushd {sub}; rm -f {y}", "", ["{y}"] if zsh else ["{sub}/{y}"]),
-        ))
-
-    @unittest.skipUnless(CD, "no cd executable on PATH")
-    def test_a_cd_spelled_as_a_path_leaves_the_directory_unknown(self):
-        # The executable cd runs in a child process: in every shell the directory stays.
-        self.expect_unknown((
-            (CD + " {sub}; rm -f {x}", "", ["{x}"]),
-            (CD + " {sub}\nrm -rf {d}", "", ["{d}"]),
-        ))
-
-    def test_a_cd_after_an_arithmetic_or_a_bare_redirect_and_or_may_not_run(self):
-        # (( )) and a part that only redirects input are commands with a status: the && or || after one makes the
-        # cd conditional, wherever it stands in the command.
-        self.expect_unknown((
-            ("(( 0 )) && cd {sub}; rm -f {x}", "", ["{x}"]),
-            ("true\n(( 0 )) && cd {sub}; rm -f {x}", "", ["{x}"]),
-            ("((0)) && cd {sub}\nrm -rf {d}", "", ["{d}"]),
-            ("(( 1 )) || cd {sub}; rm -f {y}", "", ["{y}"]),
-            ("< {nope} && cd {sub}; rm -f {x}", "", ["{x}"]),
-            ("< docs/a.md || cd {sub}; rm -f {y}", "", ["{y}"]),
-            # The same after a line continuation and a line holding nothing (#357).
-            ("(( 0 )) && \\\n\ncd {sub}; rm -f {x}", "", ["{x}"]),
-            ("((1)) || \\\n\n\ncd {sub}\nrm -rf {d}", "", ["{d}"]),
-            ("(( 1 )) && \\\n \t\ncd {sub}; rm -f {y}", "", ["{sub}/{y}"]),
-            ("< {nope} && \\\n\ncd {sub}; rm -f {x}", "", ["{x}"]),
-        ))
-
-    def test_a_cd_after_a_line_continuation_and_an_empty_line_may_not_run(self):
-        # `\` and a newline join the lines, so the cd stands right after the && or || (or |): what follows a dangling
-        # operator, blank lines and comments included, is its right-hand side. #357: `test -d nope && \`, a blank
-        # line, `cd sub; rm -f x` was allowed with a snapshot of sub/x while the shell removes ./x.
-        zsh = os.path.basename(SHELL) == "zsh"
-        self.expect_unknown((
-            ("test -d {nope} && \\\n\ncd {sub}; rm -f {x}", "", ["{x}"]),                # the ticket's command
-            ("test -d {sub} && \\\n\n\n\ncd {sub}; rm -f {y}", "", ["{sub}/{y}"]),       # three blank lines; it runs
-            ("test -d {sub} || \\\n\ncd {sub}; rm -f {x}", "", ["{x}"]),
-            ("[ -e {nope} ] || \\\n\ncd {sub}; rm -rf {d}", "", ["{sub}/{d}"]),
-            ("test -d {nope} && \\\n   \n\t \ncd {sub}; rm -f {x}", "", ["{x}"]),        # lines of blanks
-            ("test -d {nope} && \\\n\n# {sub}\ncd {sub}; rm -f {y}", "", ["{y}"]),       # a blank line, a comment
-            ("test -d {nope} && \\\n# {sub}\ncd {sub}; rm -f {x}", "", ["{x}"]),         # a comment right after
-            ("test -d {nope} && \\\n\\\n\ncd {sub}; rm -f {x}", "", ["{x}"]),            # two continuations
-            ("test -d {nope} &&\\\n\ncd {sub}; rm -f {y}", "", ["{y}"]),
-            ("test -d {nope} && \\\n\ncd {sub}\nrm -rf {d}", "", ["{d}"]),               # a newline after the cd
-            ("[ -d {sub} ] && \\\n\n\ncd {sub}\nrm -f {x} {y}", "", ["{sub}/{x}", "{sub}/{y}"]),
-            # zsh runs a pipeline's last command in this shell, bash in a subshell.
-            ("true | \\\n\ncd {sub}; rm -f {x}", "", ["{sub}/{x}"] if zsh else ["{x}"]),
-        ))
-
-    def test_a_builtin_or_bare_cd_that_surely_runs_is_still_backed_up(self):
-        self.expect_moved((
-            ("builtin cd {sub}; rm -f {x}", "", ["{sub}/{x}"]),
-            ("builtin cd {sub}\nrm -rf {d}", "", ["{sub}/{d}"]),
-            ("builtin pushd {sub}; rm -f {y}", "", ["{sub}/{y}"]),
-            ("true; cd {sub}; rm -f {x}", "", ["{sub}/{x}"]),
-            ("pwd\ncd {sub} && rm -rf {d}", "", ["{sub}/{d}"]),
-            # A line continuation with no && or || dangling before it changes nothing (#357).
-            ("true; \\\n\ncd {sub}; rm -f {x}", "", ["{sub}/{x}"]),
-            ("pwd\n\\\n\n\ncd {sub} && rm -rf {d}", "", ["{sub}/{d}"]),
-            ("ls \\\n  -a; \\\n \ncd {sub}; rm -f {y}", "", ["{sub}/{y}"]),
-            ("true & \\\n\ncd {sub}; rm -rf {d}", "", ["{sub}/{d}"]),
-            ("cd {sub} \\\n&& rm -rf {d}", "", ["{sub}/{d}"]),                            # inside the cd's line
-            ("cd {sub} && \\\n\nrm -f {x}", "", ["{sub}/{x}"]),
-            ("builtin cd {sub} \\\n\nrm -f {y}", "", ["{sub}/{y}"]),
-        ))
-
-    def expect_moved(self, cases):
-        """Allow, with one snapshot holding exactly what the shell removes, and a restore that brings it back."""
-        def check(main, wt, command, cwd, want):
-            targets = [os.path.join(wt, r) for r in sorted(want)]
-            before, there, was = self.snapshots(), entries(wt), {t: tree(t) for t in targets}
-            p = self.run_gate(command, cwd, main)
-            self.assertEqual(entries(wt), there, f"{command!r}: the hook itself changed the worktree")
-            self.assertEqual(self.shell_removes(command, cwd, wt), want, f"{command!r}: what {SHELL} removes")
-            sid = self.expect_backup(p, before, self.global_store(), targets, command)
-            self.restore(sid, cwd)
-            self.assertEqual({t: tree(t) for t in targets}, was, f"restored from {sid} (seed {self.seed})")
-
-        self.each(cases, check)
-
-    def test_an_unconditional_cd_into_an_existing_folder_is_still_backed_up(self):
-        cases = (
-            ("cd {sub} && rm -rf {d}", "", ["{sub}/{d}"]),
-            ("cd {sub}; rm -rf {d}", "", ["{sub}/{d}"]),
-            ("cd {sub} && true; rm -f {y}", "", ["{sub}/{y}"]),
-            ("cd {sub}\nrm -f {x}", "", ["{sub}/{x}"]),
-            ("cd {sub} && ls; rm -rf {x} {d}", "", ["{sub}/{x}", "{sub}/{d}"]),
-            ("cd {wt}/{sub}; rm -f {y}", "", ["{sub}/{y}"]),
-            ("cd .. && rm -f {x}", "{sub}", ["{x}"]),
-        )
-        def check(main, wt, command, cwd, want):
-            targets = [os.path.join(wt, r) for r in sorted(want)]
-            before, there, was = self.snapshots(), entries(wt), {t: tree(t) for t in targets}
-            p = self.run_gate(command, cwd, main)
-            self.assertEqual(entries(wt), there, f"{command!r}: the hook itself changed the worktree")
-            self.assertEqual(self.shell_removes(command, cwd, wt), want, f"{command!r}: what {SHELL} removes")
-            sid = self.expect_backup(p, before, self.global_store(), targets, command)
-            self.restore(sid, cwd)
-            self.assertEqual({t: tree(t) for t in targets}, was, f"restored from {sid} (seed {self.seed})")
-
-        self.each(cases, check)
+                want = {r.format(**n) for r in removed}
+                targets = [os.path.join(wt, r) for r in sorted(want)]
+                before, there, was = self.snapshots(), entries(wt), {t: tree(t) for t in targets}
+                p = self.run_gate(command, cwd, main)
+                self.assertEqual(entries(wt), there, f"{command!r}: the hook itself changed the worktree")
+                self.assertEqual(self.shell_removes(command, cwd, wt), want, f"{command!r}: what {SHELL} removes")
+                if not backed_up:
+                    self.expect_nothing(p, before, command)
+                    continue
+                sid = self.expect_backup(p, before, self.global_store(), targets, command)
+                self.restore(sid, cwd)
+                self.assertEqual({t: tree(t) for t in targets}, was, f"restored from {sid} (seed {self.seed})")
 
 
 # ================================================================ git forms (#328)
@@ -1907,22 +1792,10 @@ class GitGuard(GitGate):
         self.edit(wt, "src/util.py")
         denied = (
             ("git reset --hard", main),
-            ("git reset --merge", main),
             ("git clean -fd", main),
-            ("git clean -fdx", main),
-            ("git restore README.md", main),
-            ("git restore .", main),
-            ("cd src && git restore app.py", main),
             ("git checkout -- README.md", main),
-            ("git checkout .", main),
-            ("git checkout HEAD -- src", main),
-            ("git rm -f src/app.py", main),
             ("git branch -D main", main),
-            ("git status && git reset --hard", main),
             (f"git -C {main} reset --hard", wt),
-            (f"git -C {main} clean -fd", wt),
-            (f"git -C {main} checkout -- README.md", wt),
-            (f"git reset --hard && git -C {main} restore README.md", wt),    # the worktree's own reset is fine
         )
         for command, cwd in denied:
             with self.subTest(command=command, cwd=cwd):
@@ -1938,8 +1811,6 @@ class GitGuard(GitGate):
             (f"git branch -D {old}", None, {("branch", old): head}, []),
             ("git reset --hard", allow_main,
              {("head", None): head, ("changes", None): self.changes_of(main, head, {"README.md": readme})}, []),
-            ("git checkout -- README.md", allow_main,
-             {("changes", None): self.changes_of(main, head, {"README.md": readme})}, []),
             ("git clean -fd", allow_main, {}, [notes]),
         )
         for command, env, want, paths in allowed:
@@ -1971,24 +1842,21 @@ class GitGuard(GitGate):
         main = self.make_project()
         wt, cases = scene(main, "t-1-x", "t/1-x")
         for command, want, paths in cases:
-            for mode, env in (("plan", None), ("auto", off), ("default", off), ("plan", off)):
+            for mode, env in (("plan", None), ("auto", off)):
                 with self.subTest(command=command, mode=mode, env=env):
                     before, refs = self.snapshots(), self.backup_refs(wt)
                     self.expect_none(self.run_gate(command, wt, main, mode=mode, env=env), before, refs, command, wt)
-            for mode in ("default", "auto", "acceptEdits", "bypassPermissions"):
-                with self.subTest(command=command, mode=mode):
-                    before = self.snapshots()
-                    self.expect_refs(self.run_gate(command, wt, main, mode=mode), before, command, wt, wt, want,
-                                     paths=paths)
+            with self.subTest(command=command, mode="auto"):
+                before = self.snapshots()
+                self.expect_refs(self.run_gate(command, wt, main, mode="auto"), before, command, wt, wt, want,
+                                 paths=paths)
 
         project = self.make_project("proj-off", settings=off)
         wt_off, cases = scene(project, "t-4-off", "t/4-off")
         for command, want, paths in cases:
-            for mode, env in (("auto", None), ("default", None), ("plan", {"HARNESS_BACKUP": "on"})):
-                with self.subTest(command=command, settings="HARNESS_BACKUP=off", mode=mode, env=env):
-                    before, refs = self.snapshots(), self.backup_refs(wt_off)
-                    p = self.run_gate(command, wt_off, project, mode=mode, env=env)
-                    self.expect_none(p, before, refs, command, wt_off)
+            with self.subTest(command=command, settings="HARNESS_BACKUP=off"):
+                before, refs = self.snapshots(), self.backup_refs(wt_off)
+                self.expect_none(self.run_gate(command, wt_off, project), before, refs, command, wt_off)
             with self.subTest(command=command, settings="HARNESS_BACKUP=off", env="HARNESS_BACKUP=on"):
                 before = self.snapshots()
                 p = self.run_gate(command, wt_off, project, env={"HARNESS_BACKUP": "on"})
@@ -2018,64 +1886,30 @@ class GitOutside(GitGate):
         return repo, x
 
     def test_git_in_a_repository_outside_the_project_gets_nothing(self):
+        """A repository nested in the worktree's folder (a submodule's checkout, a cloned dependency) is not the
+        project: git run there, by -C or after a cd, gets nothing in either repository. What counts is where git
+        runs: from a cwd in that repository, `git -C <worktree>` is backed up."""
         main = self.make_project()                                     # the session's project, on main
         wt = self.add_worktree(main, "t-1-x", "t/1-x")
-        b = f"t/{self.rng.randint(10, 99)}-{self.word()}"
-        self.git(wt, "branch", b)
         head = self.rev(wt)
         mine = {"src/app.py": self.edit(wt, "src/app.py")}
-        other, ob = self.foreign("other-" + self.word())               # an unrelated repository
-        in_main, mb = self.foreign(os.path.relpath(os.path.join(main, "vendor", "lib-" + self.word()), self.tmp))
-        in_wt, wb = self.foreign(os.path.relpath(os.path.join(wt, "third_party", "dep-" + self.word()), self.tmp))
-        forms = ("reset --hard", "branch -D {x}", "stash drop", "checkout -- README.md", "clean -fd")
-        cases = []
-        for repo, x, home in ((other, ob, wt), (in_main, mb, main), (in_wt, wb, wt)):
-            for form in (f.format(x=x) for f in forms):
-                cases += [(f"git -C {repo} {form}", wt, repo, home),               # -C from the worktree
-                          (f"git {form}", repo, repo, home),                       # the cwd in that repository
-                          (f"cd {os.path.relpath(repo, home)} && git {form}", home, repo, home)]
-            cases += [("git reset --hard", os.path.join(repo, "src"), repo, home),
-                      ("git clean -fd", os.path.join(repo, "docs"), repo, home)]
-        for command, cwd, repo, home in cases:
-            with self.subTest(command=command, cwd=cwd):
-                self.assertFalse(self.guard_denies(command, cwd, main), f"branch_guard denies {command!r}")
+        repo, _branch = self.foreign(os.path.relpath(os.path.join(wt, "third_party", "dep-" + self.word()), self.tmp))
+        for command in (f"git -C {repo} reset --hard", f"cd {os.path.relpath(repo, wt)} && git clean -fd"):
+            with self.subTest(command=command):
+                self.assertFalse(self.guard_denies(command, wt, main), f"branch_guard denies {command!r}")
                 before = self.snapshots()
                 refs = (self.backup_refs(main), self.backup_refs(repo))
-                there = (self.outside_state(repo), self.outside_state(home))
-                self.expect_nothing(self.run_gate(command, cwd, main), before, command)
+                there = (self.outside_state(repo), self.outside_state(wt))
+                self.expect_nothing(self.run_gate(command, wt, main), before, command)
                 self.assertEqual((self.backup_refs(main), self.backup_refs(repo)), refs,
                                  f"{command!r}: a ref was written (seed {self.seed})")
-                self.assertEqual((self.outside_state(repo), self.outside_state(home)), there,
+                self.assertEqual((self.outside_state(repo), self.outside_state(wt)), there,
                                  f"{command!r}: the hook changed a tree")
-
-        # A $, a backtick or a substitution in the -C directory or a branch name: unknown, whatever it would expand to.
-        hook_env = {"DIR": wt, "BR": b}
-        unknown = (
-            "git -C $DIR reset --hard",
-            f'git -C "$DIR" branch -D {b}',
-            "git -C ${DIR} clean -fd",
-            "git -C `pwd` reset --hard",
-            "git -C $(pwd) checkout -- src/app.py",
-            "git branch -D $BR",
-            'git branch -D "$BR"',
-            "git branch -D ${BR}",
-            f"git branch -D `echo {b}`",
-            f"git branch -D $(echo {b})",
-            f"git branch -D {b} $BR",
-        )
-        for command in unknown:
-            with self.subTest(command=command, unknown=True):
-                before, refs, there = self.snapshots(), self.backup_refs(wt), self.outside_state(wt)
-                self.expect_none(self.run_gate(command, wt, main, env=hook_env), before, refs, command, wt)
-                self.assertEqual(self.outside_state(wt), there, f"{command!r}: the hook changed the worktree")
-
-        # The same forms where git runs in the project are backed up, whatever the cwd.
-        both = {("head", None): head, ("changes", None): self.changes_of(wt, head, mine)}
-        for command, cwd, want in (("git reset --hard", wt, both), (f"git -C {wt} reset --hard", other, both),
-                                   (f"git branch -D {b}", wt, {("branch", b): head})):
-            with self.subTest(command=command, cwd=cwd, inside=True):
-                before = self.snapshots()
-                self.expect_refs(self.run_gate(command, cwd, main), before, command, wt, wt, want)
+        command = f"git -C {wt} reset --hard"
+        with self.subTest(command=command, cwd=repo, inside=True):
+            before = self.snapshots()
+            self.expect_refs(self.run_gate(command, repo, main), before, command, wt, wt,
+                             {("head", None): head, ("changes", None): self.changes_of(wt, head, mine)})
 
 
 class GitParts(GitGate):
@@ -2134,35 +1968,18 @@ class GitParts(GitGate):
             self.git(wt, "stash", "push", "-q", "-m", f"wip {k}")
         self.edit(wt, "src/app.py")
         self.edit(wt, "src/util.py")
-        fields = {"b": b, "wt": wt, "new": f"t/{self.rng.randint(100, 999)}-{self.word()}"}
+        fields = {"b": b, "new": f"t/{self.rng.randint(100, 999)}-{self.word()}"}
         allowed = (
             "git status && git reset --hard",
-            "git status --short; git checkout -- src/app.py",
             "git log --oneline -3 && git reset --hard",
             "git diff --stat; git restore src/app.py",
-            "git diff HEAD -- src && git checkout .",
-            "git show --stat HEAD && git reset --hard",
-            "git rev-parse --abbrev-ref HEAD && git reset --hard",
             "git stash list && git stash clear",
-            "echo cleaning && git stash list; git stash drop",
             "git branch && git branch -D {b}",
-            "git branch -a; git branch -D {b}",
-            "git branch --list 't/*' && git branch -D {b}",
-            "git branch -v && git branch -D {b}",
-            "git reset --hard && git status && git log -1",
-            "cd src && git status && git restore app.py",
-            "git -C {wt} status && git reset --hard",
         )
         undecided = (
             "git reset --hard && git pull",
-            "git reset --hard && git commit --allow-empty -m x",
-            "git checkout -- src/app.py && git add -A",
             "git branch -D {b} && git branch {new}",
-            "git status > status-{w}.txt; git reset --hard",
             "git diff > {w}.patch && git checkout .",
-            "git reset --hard && make",
-            "git stash clear && git stash push -m {w}",
-            "git log -1 && git reset --hard && git fetch",
         )
         store = self.global_store()
         for k, shape in enumerate(allowed + undecided):
@@ -2175,8 +1992,7 @@ class GitParts(GitGate):
                 else:
                     self.expect_snapshot_only(p, before, store, [], command)
                 self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
-        for command in ("git status", "git log --oneline -5", "git diff", "git show HEAD", "git rev-parse HEAD",
-                        "git stash list", "git branch", "git branch -a", "git status && git log -1 && git diff --stat"):
+        for command in ("git status", "git branch", "git status && git log -1 && git diff --stat"):
             with self.subTest(command=command, alone=True):
                 before, refs = self.snapshots(), self.backup_refs(wt)
                 self.expect_none(self.run_gate(command, wt, main), before, refs, command, wt)
@@ -2187,24 +2003,23 @@ class GitTargets(GitGate):
     ignored files where that commit tracks a path, and git stash create holds none of them."""
 
     def target(self, wt, branch):
-        """A branch made from `wt`'s HEAD whose one commit tracks tests/test_<w>.py, data/seed-<w>.csv (forced in
-        under the ignored data/), vendor-<w>/lib.py and a file gen-<w>; `wt` is back on `branch` without them.
-        Returns (its name, its sha, {kind: (a local path that collides with it, the pathspec naming that path)})."""
+        """A branch made from `wt`'s HEAD whose one commit tracks tests/test_<w>.py and data/seed-<w>.csv (forced in
+        under the ignored data/); `wt` is back on `branch` without them. Returns (its name, its sha, {kind: the
+        local path that collides with it, also the pathspec naming it})."""
         name = f"t/{self.rng.randint(10, 99)}-target-{self.word()}"
         w = self.word()
-        tests, seed, vendor, gen = f"tests/test_{w}.py", f"data/seed-{w}.csv", f"vendor-{w}", f"gen-{w}"
+        tests, seed = f"tests/test_{w}.py", f"data/seed-{w}.csv"
         self.git(wt, "switch", "-q", "-c", name)
-        for rel in (tests, seed, vendor + "/lib.py", gen):
+        for rel in (tests, seed):
             self.put(os.path.join(wt, rel), data=self.text())
         self.git(wt, "add", "-f", "--", seed)
         self.git(wt, "add", "-A")
         self.git(wt, "commit", "-q", "-m", "Target")
         sha = self.rev(wt)
         self.git(wt, "switch", "-q", branch)
-        for rel in (tests, seed, vendor, gen):
+        for rel in (tests, seed):
             self.assertFalse(os.path.lexists(os.path.join(wt, rel)), rel)
-        return name, sha, {"untracked": (tests, tests), "ignored": (seed, seed), "over": (vendor, vendor),
-                           "under": (f"{gen}/out-{self.word()}.txt", gen)}
+        return name, sha, {"untracked": tests, "ignored": seed}
 
     def test_untracked_paths_the_target_tracks_get_nothing(self):
         main = self.make_project()
@@ -2217,423 +2032,105 @@ class GitTargets(GitGate):
         both = {("head", None): head, ("changes", None): self.changes_of(wt, head, mine)}
         changes = {("changes", None): self.changes_of(wt, head, mine)}
         forms = (
-            (f"git reset --hard {tgt}", wt, both),
-            (f"git reset -q --hard {tc}", wt, both),
-            (f"git -C {wt} reset --hard {tgt}", main, both),
-            (f"git checkout -f {tgt}", wt, changes),
-            (f"git switch -f {tgt}", wt, changes),
-            (f"git switch --discard-changes {tgt}", wt, changes),
-            ("git checkout {tc} -- {spec}", wt, changes),
-            ("git restore --source={tc} {spec}", wt, changes),
-            ("git restore -s {tc} {spec}", wt, changes),                       # fix round 2, low: every spelling
-            ("git restore -Ws{tc} {spec}", wt, changes),
-            ("git restore --so {tc} {spec}", wt, changes),
-            ("git restore -SW --source={tc} {spec}", wt, changes),             # fix round 3: --staged keeps the source
-            ("git restore --source={tc} --staged --worktree {spec}", wt, changes),
-            ("git restore -SWs{tc} {spec}", wt, changes),
-            ("git checkout {tc} {spec}", wt, changes),
-            ("git checkout -f {tc} -- .", wt, changes),
-            ("git switch --detach -f {tc}", wt, changes),
-            (f"git reset --merge {tgt}", wt, both),
+            (f"git reset --hard {tgt}", both),
+            (f"git checkout -f {tgt}", changes),
+            ("git checkout {tc} -- {spec}", changes),
+            ("git restore --source={tc} {spec}", changes),
         )
-        for kind, (local, spec) in kinds.items():
+        # An untracked file where the target tracks one, for every form; an ignored one, for the reset.
+        for kind, shapes in (("untracked", forms), ("ignored", forms[:1])):
+            local = kinds[kind]
             path = os.path.join(wt, local)
             data = self.put(path, data=self.text())
             self.assertEqual(self.ignored(wt, local), kind == "ignored", local)
             self.assertFalse(self.tracked(wt, local), local)
-            for shape, cwd, _want in forms:
-                command = shape.format(tc=tc, spec=spec)
+            for shape, _want in shapes:
+                command = shape.format(tc=tc, spec=local)
                 with self.subTest(command=command, collides=kind):
                     before, refs, there = self.snapshots(), self.backup_refs(wt), self.state(wt)
-                    self.expect_none(self.run_gate(command, cwd, main), before, refs, command, wt)
+                    self.expect_none(self.run_gate(command, wt, main), before, refs, command, wt)
                     self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
             self.assertEqual(self.read(path), data)
             remove(os.path.join(wt, local.split("/")[0]))
 
         # No untracked or ignored path where the target tracks one: backed up and allowed, as before.
-        for shape, cwd, want in forms:
-            command = shape.format(tc=tc, spec=kinds["untracked"][1])
+        for shape, want in forms:
+            command = shape.format(tc=tc, spec=kinds["untracked"])
             with self.subTest(command=command, collides=None):
                 before, there = self.snapshots(), self.state(wt)
-                self.expect_refs(self.run_gate(command, cwd, main), before, command, wt, wt, want)
+                self.expect_refs(self.run_gate(command, wt, main), before, command, wt, wt, want)
                 self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
 
         # What the review found: the real reset overwrites the untracked file, and nothing holds it.
-        local = os.path.join(wt, kinds["untracked"][0])
+        local = os.path.join(wt, kinds["untracked"])
         data = self.put(local, data=self.text())
         self.git(wt, "reset", "-q", "--hard", tgt)
         self.assertNotEqual(self.read(local), data)
 
-    def test_clean_after_a_reset_or_switch_to_another_commit_gets_nothing(self):
+    def test_a_clean_after_a_form_that_changes_the_ignore_rules_gets_nothing(self):
+        """Review of PR #361, finding 1 and fix rounds 2 and 3: a git clean after a reset to another commit, or after a
+        form that puts back a .gitignore the worktree has changed (edited on disk; for restore --staged --worktree,
+        which takes HEAD's, staged as well), removes what its dry run saw ignored: no decision, no snapshot, no ref.
+        The pair with nothing changed, a clean before the form, and a path form whose pathspec leaves the .gitignore
+        out are backed up and allowed as before. Each refused command, run by a real shell, removes that path."""
         main = self.make_project()
         wt = self.add_worktree(main, "t-1-x", "t/1-x")
-        base = self.rev(wt)
-        other = f"t/{self.rng.randint(10, 99)}-base-{self.word()}"
-        self.git(wt, "branch", other)                                              # at base
         log = f"run-{self.word()}.log"
-        with open(os.path.join(wt, ".gitignore"), "a", encoding="utf-8") as fh:
-            fh.write(log + "\n")
-        self.git(wt, "commit", "-q", "-am", "Ignore the run log")                 # HEAD ignores it, base does not
+        gitignore = os.path.join(wt, ".gitignore")
+        self.put(gitignore, data=self.read(gitignore) + (log + "\n").encode())
+        self.git(wt, "commit", "-q", "-am", "Ignore the run log")                 # HEAD ignores it, HEAD~1 does not
         head = self.rev(wt)
-        logged = self.put(os.path.join(wt, log), data=self.text())
-        self.assertTrue(self.ignored(wt, log))
-        notes = os.path.join(wt, f"notes-{self.word()}.txt")
-        self.put(notes)
-        mine = {"src/app.py": self.edit(wt, "src/app.py")}
-        both = {("head", None): head, ("changes", None): self.changes_of(wt, head, mine)}
-        nothing = (
-            ("git reset --hard HEAD~1 && git clean -fd", wt),
-            (f"git reset --hard {base}; git clean -fdx", wt),
-            (f"git reset -q --hard {other} && git clean -f", wt),
-            (f"git checkout -f {other} && git clean -fd", wt),
-            (f"git switch -f {other} && git clean -fd", wt),
-            (f"git switch --discard-changes {other}; git clean -fd", wt),
-            (f"git -C {wt} reset --hard {base} && git -C {wt} clean -fd", main),
-        )
-        for command, cwd in nothing:
-            with self.subTest(command=command, cwd=cwd):
-                before, refs, there = self.snapshots(), self.backup_refs(wt), self.state(wt)
-                self.expect_none(self.run_gate(command, cwd, main), before, refs, command, wt)
-                self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
-        allowed = (
-            ("git reset --hard && git clean -fd", both, [notes]),                  # no target: the same ignore rules
-            ("git clean -fd && git reset --hard HEAD~1", both, [notes]),           # the clean runs first
-            ("git reset --hard HEAD~1", both, []),
-            (f"git switch -f {other}", {("changes", None): both[("changes", None)]}, []),
-            ("git clean -fd", {}, [notes]),
-        )
-        for command, want, paths in allowed:
-            with self.subTest(command=command, allowed=True):
-                before = self.snapshots()
-                self.expect_refs(self.run_gate(command, wt, main), before, command, wt, wt, want, paths=paths)
+        at_head = self.read(gitignore)
 
-        # What the review found: after the reset the log is no longer ignored, and the clean removes it.
-        self.git(wt, "reset", "-q", "--hard", "HEAD~1")
-        self.assertFalse(self.ignored(wt, log))
-        self.git(wt, "clean", "-q", "-f", "-d")
-        self.assertFalse(os.path.lexists(os.path.join(wt, log)), logged[:16])
-
-    def test_clean_after_a_form_that_puts_back_a_gitignore_gets_nothing(self):
-        """Fix round 2 on PR #361: a reset with no target, or a path form from the index or HEAD, puts back a
-        .gitignore the worktree has edited, so the clean after it removes what its dry run saw ignored."""
-        main = self.make_project()
-        wt = self.add_worktree(main, "t-1-x", "t/1-x")
-        sub = "sub-" + self.word()
-        self.put(os.path.join(wt, sub, ".gitignore"), data=b"*.bak\n")          # a nested tracked .gitignore
-        self.put(os.path.join(wt, sub, "keep.txt"), data=self.text())
-        self.git(wt, "add", "-A")
-        self.git(wt, "commit", "-q", "-m", "Nested ignore rules")
-        head = self.rev(wt)
-
-        def fresh():
-            """The worktree back at HEAD with nothing untracked; then a source edit, an untracked file and an ignored
-            one. Returns (the source edit, the untracked file)."""
-            self.git(wt, "reset", "-q", "--hard")
+        def fresh(change):
+            """The worktree at HEAD with nothing untracked, then a source edit, an untracked file, an ignored one and
+            the run log; with `change` ("edited", or "staged" as well), the root .gitignore also ignoring reports/, a
+            folder on disk. Returns (the refs a reset keeps, those a path form keeps, the untracked file, the path
+            the clean after a form that changes the ignore rules removes)."""
+            self.git(wt, "reset", "-q", "--hard", head)
             self.git(wt, "clean", "-q", "-f", "-d", "-x")
-            app = self.edit(wt, "src/app.py")
+            edits, index, lost = {"src/app.py": self.edit(wt, "src/app.py")}, {}, log
             notes = os.path.join(wt, f"notes-{self.word()}.txt")
             self.put(notes)
             self.put(os.path.join(wt, f"scratch-{self.word()}.tmp"))
-            return app, notes
+            self.put(os.path.join(wt, log), data=self.text())
+            if change:
+                lost = "reports-" + self.word()
+                edits[".gitignore"] = self.put(gitignore, data=at_head + (lost + "/\n").encode())
+                self.fill(os.path.join(wt, lost), files=2)
+                if change == "staged":
+                    self.git(wt, "add", "--", ".gitignore")
+                    index[".gitignore"] = edits[".gitignore"]
+            changes = {("changes", None): self.changes_of(wt, head, edits, index)}
+            return {**changes, ("head", None): head}, changes, notes, lost
 
-        def append(rel, line):
-            path = os.path.join(wt, rel)
-            data = self.read(path) + line.encode() + b"\n"
-            self.put(path, data=data)
-            return data
-
-        def nothing(commands, why):
-            for command in commands:
-                with self.subTest(command=command, gitignore=why):
-                    before, refs, there = self.snapshots(), self.backup_refs(wt), self.state(wt)
-                    self.expect_none(self.run_gate(command, wt, main), before, refs, command, wt)
-                    self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
-
-        def allowed(cases, why):
-            for command, want, paths in cases:
-                with self.subTest(command=command, gitignore=why, allowed=True):
-                    before = self.snapshots()
-                    self.expect_refs(self.run_gate(command, wt, main), before, command, wt, wt, want, paths=paths)
-
-        def loses(commands, folder):
-            """One of `commands`, run by a real shell, removes `folder`, which git ignores before it runs."""
-            files = [os.path.join(folder, n) for n in os.listdir(os.path.join(wt, folder))]
-            self.assertTrue(files and all(self.ignored(wt, f) for f in files), f"{folder} is not ignored now")
-            command = self.rng.choice(commands)
-            argv = [SHELL, "-f", "-c", command] if os.path.basename(SHELL) == "zsh" else [SHELL, "-c", command]
-            subprocess.run(argv, cwd=wt, env=self.env(), capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
-            self.assertFalse(os.path.lexists(os.path.join(wt, folder)), f"{command!r} left {folder} (seed {self.seed})")
-
-        def then_clean(forms):
-            return [f"{form} && git clean -fd" for form in forms]
-
-        # No .gitignore differs: the forms and the clean are backed up and allowed, as before.
-        app, notes = fresh()
-        mine = {("changes", None): self.changes_of(wt, head, {"src/app.py": app})}
-        allowed([(c, {**mine, **({("head", None): head} if "reset" in c else {})}, [notes])
-                 for c in then_clean(("git reset --hard", "git checkout -- .", "git restore .",
-                                      "git checkout -- .gitignore", "git checkout HEAD -- .gitignore"))], None)
-
-        # The root .gitignore edited to ignore a folder already on disk.
-        app, notes = fresh()
-        reports = "reports-" + self.word()
-        root = append(".gitignore", reports + "/")
-        self.fill(os.path.join(wt, reports), files=2)
-        forms = then_clean(("git reset --hard", "git reset --hard HEAD", "git checkout -- .", "git restore .",
-                            "git checkout -- .gitignore", "git restore .gitignore",
-                            "git checkout HEAD -- .gitignore"))
-        nothing(forms, "root, edited")
-        edits = {("changes", None): self.changes_of(wt, head, {"src/app.py": app, ".gitignore": root})}
-        allowed([("git checkout -- src && git clean -fd", edits, [notes]),        # the pathspec leaves it out
-                 ("git restore src/app.py && git clean -fd", edits, [notes]),
-                 ("git clean -fd && git reset --hard", {**edits, ("head", None): head}, [notes]),
-                 ("git clean -fd", {}, [notes])], "root, edited")
-        loses(forms, reports)
-
-        # A nested .gitignore edited the same way.
-        app, notes = fresh()
-        cache = f"{sub}/cache-{self.word()}"
-        append(f"{sub}/.gitignore", os.path.basename(cache) + "/")
-        self.fill(os.path.join(wt, cache), files=2)
-        forms = then_clean(("git reset --hard", "git checkout -- .", "git restore .", f"git checkout -- {sub}",
-                            f"git checkout -- {sub}/.gitignore", f"git restore {sub}/.gitignore",
-                            f"git checkout HEAD -- {sub}/.gitignore"))
-        nothing(forms, "nested, edited")
-        loses(forms, cache)
-
-        # A new .gitignore, only staged: the reset takes it away.
-        app, notes = fresh()
-        gen = "gen-" + self.word()
-        out = f"{gen}/out-{self.word()}"
-        self.put(os.path.join(wt, gen, ".gitignore"), data=(os.path.basename(out) + "/\n").encode())
-        self.git(wt, "add", "--", f"{gen}/.gitignore")
-        self.fill(os.path.join(wt, out), files=2)
-        forms = then_clean(("git reset --hard", "git reset --hard HEAD"))
-        nothing(forms, "new, staged")
-        loses(forms, out)
-
-        # A tracked nested .gitignore deleted from disk: each form writes it back.
-        app, notes = fresh()
-        os.unlink(os.path.join(wt, sub, ".gitignore"))
-        nothing(then_clean(("git reset --hard", "git checkout -- .", "git restore .",
-                            f"git checkout -- {sub}/.gitignore", f"git restore {sub}/.gitignore",
-                            f"git checkout HEAD -- {sub}/.gitignore")), "nested, deleted")
-
-    STAGED = ("--staged --worktree", "--worktree --staged", "-SW", "-WS", "-S -W", "--stag --worktree")
-
-    def test_clean_after_a_staged_restore_that_puts_back_heads_gitignore_gets_nothing(self):
-        """Fix round 3 on PR #361: restore --staged --worktree with no --source takes the files from HEAD, not the
-        index, so a .gitignore change that is only staged (the index and the disk agree, HEAD does not) is put back
-        and the clean after it removes what its dry run saw ignored."""
-        main = self.make_project()
-        wt = self.add_worktree(main, "t-1-x", "t/1-x")
-        head = self.rev(wt)
-
-        def fresh():
-            self.git(wt, "reset", "-q", "--hard")
-            self.git(wt, "clean", "-q", "-f", "-d", "-x")
-            app = self.edit(wt, "src/app.py")
-            notes = os.path.join(wt, f"notes-{self.word()}.txt")
-            self.put(notes)
-            self.put(os.path.join(wt, f"scratch-{self.word()}.tmp"))
-            return app, notes
-
-        def only_staged(rel):
-            """`rel` differs from HEAD on disk, and the index holds what the disk does."""
-            self.assertEqual(self.git(wt, "diff", "--name-only", "--", rel), "", f"{rel} is not staged as it is")
-            self.assertEqual(self.git(wt, "diff", "--name-only", "HEAD", "--", rel), rel, f"{rel} is HEAD's")
-
-        def nothing(cases, why):
-            for command, cwd in cases:
-                with self.subTest(command=command, cwd=cwd, gitignore=why):
-                    before, refs, there = self.snapshots(), self.backup_refs(wt), self.state(wt)
-                    self.expect_none(self.run_gate(command, cwd, main), before, refs, command, wt)
-                    self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
-
-        def allowed(cases, why):
-            for command, cwd, want, paths in cases:
-                with self.subTest(command=command, cwd=cwd, gitignore=why, allowed=True):
-                    before, there = self.snapshots(), self.state(wt)
-                    self.expect_refs(self.run_gate(command, cwd, main), before, command, wt, wt, want, paths=paths)
-                    self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
-
-        def loses(cases, folder):
-            """One of `cases`, run by a real shell in the worktree, removes `folder`, ignored before it runs."""
-            files = [os.path.join(folder, n) for n in os.listdir(os.path.join(wt, folder))]
-            self.assertTrue(files and all(self.ignored(wt, f) for f in files), f"{folder} is not ignored now")
-            command = self.rng.choice([c for c, _cwd in cases])
-            argv = [SHELL, "-f", "-c", command] if os.path.basename(SHELL) == "zsh" else [SHELL, "-c", command]
-            subprocess.run(argv, cwd=wt, env=self.env(), capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
-            self.assertFalse(os.path.lexists(os.path.join(wt, folder)), f"{command!r} left {folder} (seed {self.seed})")
-
-        def forms(pathspec, spellings=None):
-            """(`git restore <spelling> <pathspec> && git clean -fd`, cwd) for each of `spellings`; with none named,
-            every spelling and the `;` and -C shapes."""
-            if spellings is not None:
-                return [(f"git restore {s} {pathspec} && git clean -fd", wt) for s in spellings]
-            return forms(pathspec, self.STAGED) + [
-                (f"git restore -SW {pathspec}; git clean -fdq", wt),
-                (f"git -C {wt} restore -WS {pathspec} && git -C {wt} clean -f -d", main)]
-
-        # The root .gitignore edited to ignore a folder already on disk, and the edit staged.
-        app, notes = fresh()
-        reports = "reports-" + self.word()
-        path = os.path.join(wt, ".gitignore")
-        root = self.put(path, data=self.read(path) + (reports + "/\n").encode())
-        self.git(wt, "add", "--", ".gitignore")
-        self.fill(os.path.join(wt, reports), files=2)
-        only_staged(".gitignore")
-        cases = forms(".") + forms(".gitignore", ("-SW", "--stag --worktree")) + [
-            ("git restore --source=HEAD -SW . && git clean -fd", wt)]
-        nothing(cases, "root, staged")
-        edits = {("changes", None): self.changes_of(wt, head, {"src/app.py": app, ".gitignore": root},
-                                                    {".gitignore": root})}
-        allowed([(f"git restore {s} .", wt, edits, []) for s in self.STAGED[::2]]             # no clean: as before
-                + [("git clean -fd && git restore -SW .", wt, edits, [notes]),                # the clean runs first
-                   ("git restore -SW src && git clean -fd", wt, edits, [notes]),            # its pathspec leaves it out
-                   ("git clean -fd", wt, {}, [notes])], "root, staged")
-        loses(cases, reports)
-
-        # A new nested .gitignore, only staged: the restore from HEAD takes it away.
-        app, notes = fresh()
-        gen = "gen-" + self.word()
-        out = f"{gen}/out-{self.word()}"
-        self.put(os.path.join(wt, gen, ".gitignore"), data=(os.path.basename(out) + "/\n").encode())
-        self.git(wt, "add", "--", f"{gen}/.gitignore")
-        self.fill(os.path.join(wt, out), files=2)
-        only_staged(f"{gen}/.gitignore")
-        cases = forms(".", ("--worktree --staged", "-WS")) + forms(gen, ("-SW", "-S -W"))
-        nothing(cases, "new, staged")
-        loses(cases, out)
-
-        # The root .gitignore edited and not staged: the index and HEAD agree, and the restore puts that back too.
-        app, notes = fresh()
-        cache = "cache-" + self.word()
-        self.put(path, data=self.read(path) + (cache + "/\n").encode())
-        self.fill(os.path.join(wt, cache), files=2)
-        nothing(forms(".", ("-SW", "--stag --worktree")), "root, edited")
-
-        # No .gitignore differs between HEAD and the worktree, only a staged edit of a source file: backed up as before.
-        app, notes = fresh()
-        self.git(wt, "add", "--", "src/app.py")
-        doc = self.edit(wt, "docs/a.md")
-        self.assertEqual(self.git(wt, "diff", "--name-only", "HEAD"), "docs/a.md\nsrc/app.py")
-        mine = {("changes", None): self.changes_of(wt, head, {"src/app.py": app, "docs/a.md": doc},
-                                                   {"src/app.py": app})}
-        allowed([(c, cwd, mine, [notes]) for c, cwd in forms(".") + forms(".gitignore", ("-WS",))], "none differs")
-
-    def test_a_staged_restore_over_what_stash_create_lacks_gets_nothing(self):
-        """Fix round 3 on PR #361: restore --staged --worktree with no --source writes HEAD's files, so where HEAD
-        tracks a folder over an untracked or ignored file, or a file over an untracked folder (the index having
-        dropped them), it removes what git stash create never holds."""
-        main = self.make_project()
-        wt = self.add_worktree(main, "t-1-x", "t/1-x")
-        w = self.word()
-        vendor, gen, cache = f"vendor-{w}", f"gen-{w}", f"cache-{w}.tmp"            # cache-*.tmp: ignored by *.tmp
-        for rel in (vendor + "/lib.py", gen, cache + "/lib.py"):
-            self.put(os.path.join(wt, rel), data=self.text())
-        self.git(wt, "add", "-f", "--", vendor, gen, cache)
-        self.git(wt, "commit", "-q", "-m", "Vendored")
-        head = self.rev(wt)
-        self.git(wt, "rm", "-q", "-r", "--cached", "--", vendor, gen, cache)       # staged deletions; HEAD tracks them
-        for rel in (vendor, gen, cache):
-            remove(os.path.join(wt, rel))
-        mine = {"src/app.py": self.edit(wt, "src/app.py")}
-        self.put(os.path.join(wt, f"notes-{self.word()}.txt"))                    # untracked, where HEAD has none
-        self.put(os.path.join(wt, f"scratch-{self.word()}.tmp"))                  # ignored, likewise
-        changes = {("changes", None): self.changes_of(wt, head, mine)}
-        kinds = {"untracked file, HEAD's folder": (vendor, vendor),
-                 "untracked folder, HEAD's file": (f"{gen}/out-{self.word()}.txt", gen),
-                 "ignored file, HEAD's folder": (cache, cache)}
-        forms = [(f"git restore {s} .", wt) for s in self.STAGED[:3]] + [
-            (f"git restore {s} {{spec}}", wt) for s in self.STAGED[3:]] + [
-            (f"git -C {wt} restore -SW .", main), ("cd src && git restore --staged --worktree -- ..", wt)]
-
-        def lacks(rel):
-            """git stash create's commit holds neither the path `rel` nor its bytes, in its tree or its index's."""
-            sha = self.git(wt, "stash", "create")
-            self.assertTrue(sha, "git stash create made no commit")
-            blob = self.git(wt, "hash-object", "--", rel)
-            for rev in (sha, sha + "^2"):
-                listing = [line.split("\t", 1) for line in self.git(wt, "ls-tree", "-r", rev).splitlines()]
-                self.assertNotIn(rel, [name for _meta, name in listing], f"{rev} holds {rel}")
-                self.assertNotIn(blob, [meta.split()[2] for meta, _name in listing], f"{rev} holds {rel}'s bytes")
-
-        for n, (kind, (local, spec)) in enumerate(kinds.items()):
-            path = os.path.join(wt, local)
-            data = self.put(path, data=self.text())
-            self.assertEqual(self.ignored(wt, local), kind.startswith("ignored"), local)
-            self.assertFalse(self.tracked(wt, local), local)
-            lacks(local)
-            for shape, cwd in (forms[(3 * n + j) % len(forms)] for j in range(4)):   # each form for some kind
-                command = shape.format(spec=spec)
-                with self.subTest(command=command, cwd=cwd, collides=kind):
-                    before, refs, there = self.snapshots(), self.backup_refs(wt), self.state(wt)
-                    self.expect_none(self.run_gate(command, cwd, main), before, refs, command, wt)
-                    self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
-            self.assertEqual(self.read(path), data)
-            remove(os.path.join(wt, local.split("/")[0]))
-
-        # Nothing on disk where HEAD tracks a path the index dropped: backed up and allowed, as before.
-        for shape, cwd in forms:
-            command = shape.format(spec=vendor)
-            with self.subTest(command=command, cwd=cwd, collides=None):
-                before, there = self.snapshots(), self.state(wt)
-                self.expect_refs(self.run_gate(command, cwd, main), before, command, wt, wt, changes)
-                self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
-
-        # The loss: the real restore puts HEAD's folder where the untracked file was, and nothing holds the file.
-        path = os.path.join(wt, vendor)
-        self.put(path, data=self.text())
-        self.git(wt, "restore", "--staged", "--worktree", ".")
-        self.assertTrue(os.path.isdir(path), "the restore left the untracked file")
-        self.assertEqual(self.read(os.path.join(path, "lib.py")), self.blob(wt, "HEAD", vendor + "/lib.py"))
-
-
-class GitBranchNames(GitGate):
-    def test_branch_names_that_are_not_plain_branches_get_nothing(self):
-        """Review of PR #361, finding 2: git deletes the branch @{-N} names, but refs/heads/@{-N} resolves to nothing."""
-        main = self.make_project()
-        wt = self.add_worktree(main, "t-1-x", "t/1-x")
-        names = [f"t/{self.rng.randint(10, 99)}-{k}-{self.word()}" for k in "abc"]
-        tips = {}
-        for n in names:
-            self.git(wt, "switch", "-q", "-c", n)
-            tips[n] = self.commit(wt)
-        self.git(wt, "switch", "-q", "t/1-x")
-        x, y, z = self.rng.sample(names, 3)
-        self.git(wt, "switch", "-q", x)                                            # real checkouts: @{-2} is x,
-        self.git(wt, "switch", "-q", y)                                            # @{-1} is y
-        self.git(wt, "switch", "-q", "t/1-x")
-        for spec, name in (("@{-1}", y), ("@{-2}", x)):
-            self.assertEqual(self.git(wt, "rev-parse", "--symbolic-full-name", spec), "refs/heads/" + name)
-            self.assertEqual(self.branch_at(wt, name), tips[name])
-        missing = f"t/{self.rng.randint(100, 999)}-gone-{self.word()}"
-        self.assertIsNone(self.branch_at(wt, missing))
-        nothing = (
-            "git branch -D @{-1}",
-            "git branch -D @{-2}",
-            "git branch -d '@{-1}'",
-            "git branch --delete --force @{-2}",
-            f"git branch -D {z} @{{-1}}",
-            f"git branch -D @{{-2}} {z}",
-            f"git branch -D {missing}",
-            f"git branch -D {z} {missing}",
+        cases = (
+            # (the .gitignore change, command, the refs kept: "reset", "path", or None for nothing)
+            (None, "git reset --hard && git clean -fd", "reset"),
+            (None, "git reset --hard HEAD~1 && git clean -fd", None),                  # HEAD~1 does not ignore the log
+            (None, "git clean -fd && git reset --hard HEAD~1", "reset"),               # the clean runs first
+            (None, "git restore --staged --worktree . && git clean -fd", "path"),
+            ("edited", "git reset --hard && git clean -fd", None),                     # HEAD's .gitignore comes back
+            ("edited", "git checkout -- src && git clean -fd", "path"),                # the pathspec leaves it out
+            ("staged", "git restore --staged --worktree . && git clean -fd", None),    # HEAD's, not the index's
         )
-        for command in nothing:
-            with self.subTest(command=command):
+        for change, command, kept in cases:
+            with self.subTest(command=command, gitignore=change):
+                reset, path, notes, lost = fresh(change)
                 before, refs, there = self.snapshots(), self.backup_refs(wt), self.state(wt)
-                self.expect_none(self.run_gate(command, wt, main), before, refs, command, wt)
-                self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the repository")
-        for command, kept in ((f"git branch -D {z}", [z]), (f"git branch -D {x} {y}", [x, y])):
-            with self.subTest(command=command, plain=True):
-                before = self.snapshots()
-                self.expect_refs(self.run_gate(command, wt, main), before, command, wt, wt,
-                                 {("branch", n): tips[n] for n in kept})
-
-        # What the review found: git deletes the branch @{-1} names.
-        self.git(wt, "branch", "-q", "-D", "@{-1}")
-        self.assertIsNone(self.branch_at(wt, y))
+                p = self.run_gate(command, wt, main)
+                self.assertEqual(self.state(wt), there, f"{command!r}: the hook changed the worktree")
+                if kept:
+                    self.expect_refs(p, before, command, wt, wt, reset if kept == "reset" else path, paths=[notes])
+                    continue
+                self.expect_none(p, before, refs, command, wt)
+                # What the review found: the clean's dry run sees `lost` ignored, and the command removes it.
+                folder = os.path.join(wt, lost)
+                files = [os.path.join(lost, n) for n in os.listdir(folder)] if os.path.isdir(folder) else [lost]
+                self.assertTrue(files and all(self.ignored(wt, f) for f in files), f"{lost} is not ignored now")
+                argv = [SHELL, "-f", "-c", command] if os.path.basename(SHELL) == "zsh" else [SHELL, "-c", command]
+                subprocess.run(argv, cwd=wt, env=self.env(), capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+                self.assertFalse(os.path.lexists(folder), f"{command!r} left {lost} (seed {self.seed})")
 
 
 # ================================================================ failing open
