@@ -1,7 +1,7 @@
 """harness-pr land runs the project's canary (#338): after the main checkout fast-forwards to the landed merge, its
 `scripts/smoke.sh`, when there and executable, runs there under HARNESS_SMOKE_TIMEOUT seconds. Exit 0 lands as today;
 2 or the time limit lands with a `harness-pr: warning:` line and a ticket comment; 1 or any other exit reverts the
-merge on main as `harness-pr revert` does (the revert pushed, the incident bug, the ticket reopened as needs-input, a
+merge on main as `harness-pr revert` does (the revert pushed, the incident bug, the ticket reopened and parked, a
 notification) and the land exits 1 naming the revert. No executable scripts/smoke.sh lands as today.
 
 The fixtures are pr_support's (WorktreeTest: a bare origin, the main checkout `proj`, the ticket worktree), plus a
@@ -61,7 +61,7 @@ class LandCanary(WorktreeTest):
             "epic-check": {"stdout": EPIC_SAID},
             "task create": {"stdout": json.dumps({"number": BUG, "url": f"https://github.com/o/r/issues/{BUG}"}),
                             "read_stdin": self.bug_stdin},
-            "needs-input": {"stdout": "https://github.com/o/r/issues/12#issuecomment-9\n"}}})
+            "park": {"stdout": "#12 parked; follow-up #40\n"}}})
         write(self.state_path("tickets", "12.json"),
               json.dumps({"number": 12, "parent": {"number": 3, "title": "Widgets", "goal": ""}}))
 
@@ -205,8 +205,8 @@ class LandCanary(WorktreeTest):
     def without_paths(self, text):
         return text.replace(self.tmp, "<tmp>")
 
-    def asked(self):
-        return [a for a in self.board() if a[:2] == ["needs-input", "12"]]
+    def parked(self):
+        return [a for a in self.board() if a[:2] == ["park", "12"]]
 
     def revert_notes(self):
         return [n for n in self.notifications() if "revert" in " ".join(n).lower()]
@@ -214,7 +214,7 @@ class LandCanary(WorktreeTest):
     # ----------------------------------------------------------- assertions
     def assertNothingReverted(self, p, sha):
         """origin/main still at the merge with no revert made anywhere; the ticket closed, unlabelled and commented
-        as today; no bug, no needs-input, no reopen, no revert notification."""
+        as today; no bug, no park, no needs-input, no reopen, no revert notification."""
         self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(self.origin_head(), sha, "origin/main moved after the merge")
         self.assertEqual(self.reverts_on_origin(), [])
@@ -224,7 +224,7 @@ class LandCanary(WorktreeTest):
         self.assertIn(["close", "12", "--repo", self.main], board)
         self.assertIn(["comment", "12", "--body", f"Landed in {sha}", "--repo", self.main], board)
         self.assertIn(["issue", "edit", "12", "--remove-label", "status:in-review"], self.gh_argv())
-        self.assertFalse([a for a in board if a[:2] == ["task", "create"] or a[0] == "needs-input"], board)
+        self.assertFalse([a for a in board if a[:2] == ["task", "create"] or a[0] in ("park", "needs-input")], board)
         self.assertFalse([a for a in self.gh_argv() if a[:2] == ["issue", "reopen"]], self.gh_argv())
         self.assertEqual(self.revert_notes(), [])
 
@@ -290,7 +290,7 @@ class LandCanary(WorktreeTest):
     def assertReverted(self, p, sha, note, code):
         """Exit 1 naming the revert; origin/main's head a revert of the merge on top of it, the main checkout at it;
         one incident bug (`Merge commit: <sha>`, the canary's output as evidence) labelled incident; the ticket
-        asked once, naming the revert, scripts/smoke.sh and the exit `code`. The revert's sha."""
+        parked once, naming the revert, scripts/smoke.sh and the exit `code`. The revert's sha."""
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(self.smoke_runs(), [(self.main, note)])
@@ -306,6 +306,7 @@ class LandCanary(WorktreeTest):
         creates = [a for a in self.board() if a[:2] == ["task", "create"]]
         self.assertEqual(len(creates), 1, self.board())
         self.assertEqual(creates[0][creates[0].index("--type") + 1], "bug", creates[0])
+        self.assertIn("--proposed", creates[0])
         bodies = self.jsonl(self.bug_stdin)
         self.assertEqual(len(bodies), 1, bodies)
         body = bodies[0]
@@ -315,12 +316,14 @@ class LandCanary(WorktreeTest):
         self.assertIn(f"canary out: {note}", body)
         self.assertIn(f"canary err: {note}", body)
         self.assertIn(["issue", "edit", str(BUG), "--add-label", "incident"], self.gh_argv())
-        asks = self.asked()
-        self.assertEqual(len(asks), 1, self.board())
-        question = asks[0][asks[0].index("--question") + 1]
-        self.assertIn(revert[:7], question)
-        self.assertIn(SMOKE, question)
-        self.assertRegex(question.replace(revert[:7], ""), rf"\b{code}\b")
+        self.assertEqual([a for a in self.board() if a[0] == "needs-input"], [])
+        parks = self.parked()
+        self.assertEqual(len(parks), 1, self.board())
+        reason = parks[0][parks[0].index("--reason") + 1]
+        self.assertIn(revert[:7], reason)
+        self.assertIn(SMOKE, reason)
+        self.assertRegex(reason.replace(revert[:7], ""), rf"\b{code}\b")
+        self.assertEqual(parks[0][parks[0].index("--follow-up") + 1].lstrip("#"), str(BUG))
         self.assertTrue(any("reverted PR #34" in " ".join(n) for n in self.notifications()), self.notifications())
         return revert
 
@@ -343,13 +346,25 @@ class LandCanary(WorktreeTest):
         p = self.land(sha)
         self.assertReverted(p, sha, note, 1)
         self.assertIn(["issue", "reopen", "12"], self.gh_argv())
-        # the land's ticket steps first, then the canary's verdict: the ticket ends reopened and asked
+        # the land's ticket steps first, then the canary's verdict: the ticket ends reopened and parked
         steps = [self.position(f"git -C {self.main} pull --ff-only"),
                  self.position("harness-board close 12"),
                  self.position(f"harness-board comment 12 --body Landed in {sha}"),
                  self.position("gh issue reopen 12"),
-                 self.position("harness-board needs-input 12")]
+                 self.position("harness-board park 12")]
         self.assertEqual(steps, sorted(steps), "\n".join(self.order()))
+
+    def test_failed_canary_reports_ticket_parked(self):
+        note = "parked landing 9d2"
+        self.project()
+        sha = self.landed(1, note)
+        p = self.land(sha)
+        revert = self.reverts_on_origin()[0]
+        said = [line for line in p.stderr.splitlines() if "bug #" in line and revert[:7] in line]
+        self.assertTrue(said, p.stderr)
+        self.assertIn("parked", " ".join(said).lower())
+        self.assertNotIn("needs input", (p.stdout + p.stderr).lower())
+        self.assertReverted(p, sha, note, 1)
 
     def test_a_degraded_canary_lands_with_a_warning_and_a_ticket_comment(self):
         note = "degraded landing 7c4"
