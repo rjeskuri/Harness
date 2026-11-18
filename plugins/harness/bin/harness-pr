@@ -20,7 +20,7 @@ Usage:
 
 revert undoes a landed PR on main through the main checkout (on main, no tracked changes, no commit origin/main lacks
 but this revert; fetched and fast-forwarded first): `git revert --no-edit` of its merge commit and `git push origin main` (a rejected push gets one
-`git pull --rebase`), an incident bug under the ticket's epic, the ticket reopened as needs-input, a notification.
+`git pull --rebase`), an incident bug under the ticket's epic, the ticket reopened and parked, a notification.
 A step an earlier run did is skipped. autoland, and land after a failed canary, call revert_landed() in-process.
 
 land, once it has pulled the main checkout, runs that checkout's scripts/smoke.sh there when it is an executable
@@ -155,7 +155,7 @@ TITLE_SENTENCE = 60          # an out-of-scope ticket's title: at most this much
 AWAIT_FIELDS = "number,title,isDraft,createdAt,url,headRefName,closingIssuesReferences,statusCheckRollup"
 SHA_TEXT = re.compile(r"[0-9a-fA-F]{7,40}")
 INCIDENT = "incident"
-NEEDS_INPUT = "**Needs your input**"     # harness-board's needs-input comments start with it
+PARKED = "**Parked**"                    # the first line of the comment `harness-board park` posts
 DEFAULT_REASON = "no reason given"
 EVIDENCE_TAIL_LINES = 40
 SMOKE_TIMEOUT = 300.0        # seconds it may take (HARNESS_SMOKE_TIMEOUT)
@@ -1928,7 +1928,7 @@ def land_canary(repo, number, sha, tickets):
                 [f"{SMOKE} {said}, and reverting {sha[:7]} failed: {err}; harness-pr revert {number} once that is "
                  "fixed"])
     revert, ticket = result["revert"], result["ticket"]
-    asked = f", ticket #{ticket} needs input" if ticket else ""
+    asked = f", ticket #{ticket} parked" if ticket else ""
     return ([f"Canary: {SMOKE} {said}, so the land was reverted:"] + [f"  {line}" for line in result["summary"]],
             [f"{SMOKE} {said} in the main checkout, so the merge was reverted in {revert[:7]} "
              f"(bug #{result['bug']}{asked})"])
@@ -2257,8 +2257,8 @@ def bug_body(sha, revert, pr, ticket, reason, evidence):
 
 
 def file_bug(repo, title, body, epic):
-    """`harness-board task create` for the incident bug, then the `incident` label; its number."""
-    args = (["task", "create", "--type", "bug", "--risk", "high", "--size", "S"]
+    """`harness-board task create --proposed` for the incident bug, then the `incident` label; its number."""
+    args = (["task", "create", "--proposed", "--type", "bug", "--risk", "high", "--size", "S"]
             + (["--parent", str(epic)] if epic else []) + ["--title", title, "--body-file", "-", "--json"])
     done = board_run(repo, args, check=False, stdin=body)
     try:
@@ -2276,32 +2276,32 @@ def file_bug(repo, title, body, epic):
     return n
 
 
-def ask_ticket(repo, number, question, evidence):
-    """Reopen the ticket when it is closed and ask `question` there, unless it is already the newest needs-input
-    question; what was done."""
+def park_ticket(repo, number, reason, evidence, bug):
+    """Reopen the ticket when it is closed and park it on `reason` with the bug as its follow-up, unless its newest
+    Parked comment already holds that reason; what was done."""
     info = gh_json(["issue", "view", str(number), "--json", "state,comments"], repo.main)
     info = info if isinstance(info, dict) else {}
     done = []
     if str(info.get("state") or "").upper() != "OPEN":
         gh(["issue", "reopen", str(number)], repo.main)
         done.append("reopened")
-    asked = [b for b in ((c.get("body") or "").lstrip() for c in as_list(info.get("comments")))
-             if b.startswith(NEEDS_INPUT)]
-    if asked and question in asked[-1]:
-        return done + ["already asked"]
-    args = ["needs-input", str(number), "--question", question]
+    parked = [b for b in ((c.get("body") or "").lstrip() for c in as_list(info.get("comments")))
+              if b.startswith(PARKED)]
+    if parked and reason in parked[-1]:
+        return done + ["already parked"]
+    args = ["park", str(number), "--reason", reason, "--follow-up", str(bug)]
     with tempfile.TemporaryDirectory(prefix="harness-revert-") as folder:
         if evidence and evidence.strip():
             path = os.path.join(folder, "evidence.log")
             write_text(path, evidence, prefix=".harness-pr-")
             args += ["--evidence-file", path]
         board(repo, *args)
-    return done + ["asked"]
+    return done + ["parked"]
 
 
 def revert_landed(repo, sha, reason, evidence):
     """Revert the landed commit `sha` on main through the main checkout and push it, file the incident bug under the
-    ticket's epic, reopen the ticket as needs-input and notify; each step skipped when an earlier run did it.
+    ticket's epic, reopen the ticket and park it on the bug, notify; each step skipped when an earlier run did it.
     `evidence` is text (or None). Returns {pr, sha, revert, ticket, bug, summary}; Problem on a refusal."""
     main = repo.main
     os.environ["HARNESS_ALLOW_MAIN"] = "1"  # the revert commit and its push: the git hooks refuse main otherwise
@@ -2337,9 +2337,8 @@ def revert_landed(repo, sha, reason, evidence):
         summary.append(f"Bug: #{bug} filed" + (f" under #{epic}" if epic else "") + ", labelled incident.")
 
     if ticket:
-        question = f"Reverted in {revert[:7]}: {reason}. Bug #{bug} tracks the fix."
-        done = ask_ticket(repo, ticket, question, evidence)
-        acted = acted or done != ["already asked"]
+        done = park_ticket(repo, ticket, f"Reverted in {revert[:7]}: {reason}", evidence, bug)
+        acted = acted or done != ["already parked"]
         summary.append(f"Ticket: #{ticket} {', '.join(done)}.")
     else:
         summary.append("Ticket: none (no PR names one).")
