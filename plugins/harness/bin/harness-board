@@ -17,6 +17,7 @@ Usage:
     harness-board promote N    # a proposed epic and its open proposed tasks, or a proposed task, to ready
     harness-board comment N (--body TEXT | --body-file F)
     harness-board needs-input N --question TEXT [--evidence-file F]
+    harness-board park N --reason TEXT [--evidence-file F] [--follow-up M[,M]]   # blocked, with a follow-up task
     harness-board answers N [--since ISO]   # the owner's replies since the last needs-input question
     harness-board close N [--comment TEXT]
     harness-board epic-check N
@@ -108,6 +109,7 @@ SECTIONS = [("Request", "request"), ("Outline", "outline"), ("Definition of done
 ISSUE_FIELDS = "number,title,url,body,labels,state,parent,blockedBy,comments"
 PRESERVED = (("branch", None), ("worktree", None), ("started_at", None), ("attempts", []))
 NEEDS_INPUT = "**Needs your input**"
+PARKED = "**Parked**"           # the first line of the comment `park` posts
 RESOLUTION = "**Resolution**"   # the comment `harness-pr land` posts on a ticket it lands
 MARKER = "<!-- harness -->"     # the last line of every comment posted here
 BOT_LOGINS = ("github-actions[bot]", "github-actions")   # the deploy guard's author (REST, GraphQL), casefolded
@@ -117,7 +119,9 @@ EPIC_DONE = "All tasks landed."
 CONTEXT_LINES = 120     # the most lines `show --markdown` prints
 COMMENTS_SHOWN = 10     # the newest comments in the context
 COMMENT_LINES = 20      # lines shown of each
-EVIDENCE_LINES = 60     # lines of evidence in a needs-input comment
+EVIDENCE_LINES = 60     # lines of evidence in a needs-input or park comment
+FOLLOW_UP_EVIDENCE = 40  # lines of evidence in the context of park's follow-up task
+FOLLOW_UP_TITLE = 60    # characters of the reason's first line in the follow-up's title
 LIST_LIMIT = "200"
 GH_TIMEOUT = 60         # seconds per gh call
 LINK_RETRY_DELAY = 1.0  # seconds before the one retry of a sub-issue link
@@ -651,7 +655,7 @@ def cmd_epic_create(repo, args):
     emit(args.json, {"number": number, "url": url}, f"#{number} {url}")
 
 
-def blocker_numbers(values):
+def blocker_numbers(values, option="--blocked-by"):
     out = []
     for value in values or []:
         for part in value.split(","):
@@ -659,7 +663,7 @@ def blocker_numbers(values):
             if not part:
                 continue
             if not part.isdigit() or int(part) <= 0:
-                raise Problem(f"--blocked-by: not an issue number: {part!r}")
+                raise Problem(f"{option}: not an issue number: {part!r}")
             if int(part) not in out:
                 out.append(int(part))
     return out
@@ -685,6 +689,14 @@ def link_sub_issue(repo, parent, number):
     return error, issue_id
 
 
+def create_issue(repo, title, path, stdin, labels, priority=False, proposed=False):
+    """`gh issue create` with the body from `path` (`-`: `stdin`), then the Projects board item; (number, url)."""
+    out = gh(repo, ["issue", "create", "--title", title, "--body-file", path] + label_args(labels), stdin)
+    number, url = created_issue(out)
+    mirror_created(repo, url, priority, proposed)
+    return number, url
+
+
 def cmd_task_create(repo, args):
     path, stdin = body_file(args.body_file)
     blockers = blocker_numbers(args.blocked_by)
@@ -693,9 +705,7 @@ def cmd_task_create(repo, args):
     labels = [args.type, initial_status(args)] + ([f"size:{args.size}"] if args.size else []) \
         + ([f"risk:{args.risk}"] if args.risk else []) + (["no-tests"] if args.no_tests else []) \
         + (["needs-local"] if args.needs_local else []) + (["priority:high"] if args.priority else [])
-    out = gh(repo, ["issue", "create", "--title", args.title, "--body-file", path] + label_args(labels), stdin)
-    number, url = created_issue(out)
-    mirror_created(repo, url, args.priority, args.proposed)
+    number, url = create_issue(repo, args.title, path, stdin, labels, args.priority, args.proposed)
     result = {"number": number, "url": url, "parent": args.parent, "linked": None, "blocked_by": []}
 
     def fail(message):
@@ -835,16 +845,25 @@ def cmd_comment(repo, args):
     emit(args.json, {"number": args.number, "url": url}, url or f"commented on #{args.number}")
 
 
+def fenced_tail(evidence, limit):
+    """The evidence's last lines in a code fence longer than any backtick run inside, at most `limit` lines (an
+    omission line first when cut); "" when it has no text."""
+    lines = (evidence or "").strip("\n").splitlines()
+    if not any(line.strip() for line in lines):
+        return ""
+    if len(lines) > limit:
+        keep = limit - 1
+        lines = [f"[... {len(lines) - keep} earlier lines omitted]"] + lines[-keep:]
+    longest = max((len(run) for run in re.findall(r"`{3,}", "\n".join(lines))), default=0)
+    fence = "`" * max(3, longest + 1)
+    return "\n".join([fence] + lines + [fence])
+
+
 def needs_input_body(number, question, evidence):
     parts = [NEEDS_INPUT, question.strip()]
-    lines = (evidence or "").strip("\n").splitlines()
-    if any(line.strip() for line in lines):
-        if len(lines) > EVIDENCE_LINES:
-            keep = EVIDENCE_LINES - 1
-            lines = [f"[... {len(lines) - keep} earlier lines omitted]"] + lines[-keep:]
-        longest = max((len(run) for run in re.findall(r"`{3,}", "\n".join(lines))), default=0)
-        fence = "`" * max(3, longest + 1)
-        parts.append("\n".join([fence] + lines + [fence]))
+    block = fenced_tail(evidence, EVIDENCE_LINES)
+    if block:
+        parts.append(block)
     parts.append(f"Reply in a comment; /harness:work {number} picks it up.")
     return marked("\n\n".join(parts))
 
@@ -859,6 +878,81 @@ def cmd_needs_input(repo, args):
     url = first_line(out.strip().splitlines()[-1] if out.strip() else "")
     notified = notify(f"{repo.name} #{args.number} needs input", f"harness-{repo.key}-{args.number}")
     emit(args.json, {"number": args.number, "url": url, "notified": notified}, url or f"#{args.number} needs input")
+
+
+def follow_up_body(number, reason, evidence):
+    """The follow-up task `park` files for #number, in the task template's headings."""
+    context = f"- #{number}"
+    block = fenced_tail(evidence, FOLLOW_UP_EVIDENCE)
+    if block:
+        context += f", parked with this evidence (at most its last {FOLLOW_UP_EVIDENCE} lines):\n\n{block}"
+    return (f"## Request\n{reason.strip()}\n\nFound when #{number} was parked.\n\n"
+            f"## Outline\n1. Read the evidence on #{number}.\n2. Fix the cause, or split it into tickets.\n"
+            f"3. `harness-board status {number} ready`.\n\n"
+            f"## Definition of done\n- [ ] What stopped #{number} no longer does.\n\n"
+            f"## Tests that must pass\n- #{number}'s own tests, and CI green.\n\n"
+            f"## Context\n{context}\n")
+
+
+def park_body(number, reason, evidence, follow_ups, created):
+    """The Parked comment: the reason, the evidence (fenced), the follow-ups and how to retry."""
+    refs = ", ".join(f"#{m}" for m in follow_ups)
+    if created:
+        refs += f" (proposed; `harness-board promote {follow_ups[0]}` runs it)"
+    parts = [PARKED, reason.strip()]
+    block = fenced_tail(evidence, EVIDENCE_LINES)
+    if block:
+        parts.append(block)
+    parts.append(f"Follow-up: {refs}\nRetry #{number}: `harness-board status {number} ready`")
+    return marked("\n\n".join(parts))
+
+
+def park(repo, number, reason, evidence=None, follow_ups=None):
+    """Park #number: refuse an empty reason, a closed issue or an epic with nothing changed; else status blocked,
+    one status:proposed follow-up task under N's epic (none when `follow_ups` names them), one Parked comment and
+    one notification. Returns {"number", "follow_up", "url", "notified"}."""
+    reason_first = first_line(reason)
+    if not reason_first:
+        raise Problem(f"--reason is empty; #{number} not parked")
+    follow_ups = list(follow_ups or [])
+    data = gh_json(repo, ["issue", "view", str(number), "--json", "number,title,url,labels,state,parent"])
+    data = data if isinstance(data, dict) else {}
+    names = label_names(data.get("labels"))
+    if str(data.get("state", "")).upper() == "CLOSED":
+        raise Problem(f"#{number} is closed; only an open ticket can be parked")
+    if "epic" in names:
+        raise Problem(f"#{number} is an epic; park one of its tasks")
+    parent = data.get("parent") if isinstance(data.get("parent"), dict) else {}
+    epic = int(parent["number"]) if parent.get("number") else None
+    if epic and not follow_ups:
+        repo.slug()                    # fails before anything changes when gh cannot see the repository
+    set_status(repo, number, "blocked")
+    created = not follow_ups
+    if created:
+        risk = "risk:high" if "risk:high" in names else "risk:low"
+        title = f"Unstick #{number}: {reason_first[:FOLLOW_UP_TITLE].rstrip()}"
+        m, _url = create_issue(repo, title, "-", follow_up_body(number, reason, evidence),
+                               ["task", "status:proposed", "size:S", risk], proposed=True)
+        follow_ups = [m]
+        if epic:
+            error, issue_id = link_sub_issue(repo, epic, m)
+            if error is not None:
+                slug = repo.slug()
+                id_hint = issue_id or f"$(gh api repos/{slug}/issues/{m} --jq .id)"
+                warn("harness-board", f"#{m} was not linked under #{epic}: {error}; link it with: "
+                     f"gh api -X POST repos/{slug}/issues/{epic}/sub_issues -F sub_issue_id={id_hint}")
+    out = gh(repo, ["issue", "comment", str(number), "--body",
+                    park_body(number, reason, evidence, follow_ups, created)])
+    url = first_line(out.strip().splitlines()[-1] if out.strip() else "")
+    notified = notify(f"{repo.name} #{number} parked: {reason_first}", f"harness-{repo.key}-{number}")
+    return {"number": number, "follow_up": follow_ups, "url": url, "notified": notified}
+
+
+def cmd_park(repo, args):
+    follow_ups = blocker_numbers(args.follow_up, "--follow-up")
+    evidence = read_text(args.evidence_file, "evidence file") if args.evidence_file else None
+    result = park(repo, args.number, args.reason, evidence, follow_ups)
+    emit(args.json, result, f"#{args.number} parked; follow-up {', '.join(f'#{m}' for m in result['follow_up'])}")
 
 
 def cmd_answers(repo, args):
@@ -1152,7 +1246,7 @@ def parser():
     ap.add_argument("--repo", metavar="PATH", help=repo_help)
     ap.add_argument("--json", action="store_true", help="print JSON")
     sub = ap.add_subparsers(dest="cmd", metavar="{labels,epic,task,show,ready,status,promote,comment,needs-input,"
-                                               "answers,close,epic-check,board,tier,project}")
+                                               "park,answers,close,epic-check,board,tier,project}")
     sub.required = True
 
     labels = sub.add_parser("labels", help="the board's label set")
@@ -1213,6 +1307,15 @@ def parser():
     ni.add_argument("--question", required=True, metavar="TEXT")
     ni.add_argument("--evidence-file", metavar="F", help=f"shown fenced, at most {EVIDENCE_LINES} lines (the tail)")
 
+    park_ap = sub.add_parser("park", parents=[common],
+                             help="mark a stuck ticket blocked, file a proposed follow-up task, comment and notify")
+    park_ap.add_argument("number", type=issue_number, metavar="N")
+    park_ap.add_argument("--reason", required=True, metavar="TEXT", help="why it is stuck")
+    park_ap.add_argument("--evidence-file", metavar="F",
+                         help=f"shown fenced, at most {EVIDENCE_LINES} lines (the tail)")
+    park_ap.add_argument("--follow-up", action="append", metavar="M[,M]",
+                         help="the tickets that unstick it, named in place of creating a follow-up task")
+
     answers = sub.add_parser("answers", parents=[common],
                              help="your replies on a ticket since its last needs-input question (JSON)")
     answers.add_argument("number", type=issue_number, metavar="N")
@@ -1252,7 +1355,7 @@ def parser():
 COMMANDS = {"labels ensure": cmd_labels_ensure, "epic create": cmd_epic_create, "task create": cmd_task_create,
             "show": cmd_show, "ready": cmd_ready, "status": cmd_status, "promote": cmd_promote,
             "comment": cmd_comment,
-            "needs-input": cmd_needs_input, "answers": cmd_answers, "close": cmd_close,
+            "needs-input": cmd_needs_input, "park": cmd_park, "answers": cmd_answers, "close": cmd_close,
             "epic-check": cmd_epic_check, "board": cmd_board, "tier": cmd_tier}
 PROJECT_COMMANDS = {"project check": cmd_project_check, "project sync": cmd_project_sync}   # open their own repos
 
