@@ -2,9 +2,9 @@
 `harness-work attempt` does (same store, same answer, same options) and names the next step of the work loop.
 
 - line 1 of the text output is attempt's answer, line 2 is `next: <step>`; --json is attempt's object plus "next";
-- retry and escalate repeat the stage; needs-input names needs-input;
+- retry and escalate repeat the stage; park names park;
 - a breaker failure answers done, every time and at any tier, and goes to code (#375: one breaker round, its gaps
-  go to the coder as requirements); it never answers needs-input;
+  go to the coder as requirements); it never answers park;
 - done: tests -> breaker (risk:high) or code; breaker (pass or fail) -> code; code -> review; review and fix -> fix while the
   latest review round (harness_lib.reviews.latest_round) has blocking findings, else ci; ci -> `ultra, then ready`
   (risk:high) or ready;
@@ -189,7 +189,7 @@ class Stage(tw.WorkTest):
                 n = self.put_ticket(risk)
                 self.save_round(n, 2)
                 self.assertEqual(self.stage(n, "fix", "fail"), ("retry", "fix"))
-                self.assertEqual(self.stage(n, "fix", "fail"), ("needs-input", "needs-input"))
+                self.assertEqual(self.stage(n, "fix", "fail"), ("park", "park"))
 
             with self.subTest(risk=risk, row="fix pass"):
                 n = self.put_ticket(risk)
@@ -210,11 +210,11 @@ class Stage(tw.WorkTest):
     def test_failures_repeat_the_stage_and_a_breaker_failure_goes_to_code(self):
         specs = [("task", "S", "low"), ("task", "M", "low"), ("bug", "S", "low"), ("task", "M", "high")]
         known = {   # line 1 of three failures in a row, from the escalation rule (#239, #252)
-            (("task", "S", "low"), "code"): ["retry", "escalate opus", "needs-input"],
-            (("task", "M", "low"), "code"): ["retry", "escalate opus xhigh", "needs-input"],
-            (("task", "M", "high"), "code"): ["retry", "needs-input", "needs-input"],
-            (("task", "S", "low"), "fix"): ["retry", "needs-input", "needs-input"],
-            (("task", "M", "high"), "breaker"): ["done", "done", "done"],     # #375: never needs-input
+            (("task", "S", "low"), "code"): ["retry", "escalate opus", "park"],
+            (("task", "M", "low"), "code"): ["retry", "escalate opus xhigh", "park"],
+            (("task", "M", "high"), "code"): ["retry", "park", "park"],
+            (("task", "S", "low"), "fix"): ["retry", "park", "park"],
+            (("task", "M", "high"), "breaker"): ["done", "done", "done"],     # #375: never park
         }
         seen = set()
         for kind, size, risk in specs:
@@ -231,8 +231,8 @@ class Stage(tw.WorkTest):
                         self.assertEqual(answer, self.attempt(other, stage, "fail"))
                         if stage == "breaker":
                             self.assertEqual((answer, step), ("done", "code"))
-                        elif answer == "needs-input":
-                            self.assertEqual(step, "needs-input")
+                        elif answer == "park":
+                            self.assertEqual(step, "park")
                         else:
                             self.assertTrue(answer == "retry" or answer.startswith("escalate "), answer)
                             self.assertEqual(step, stage)
@@ -248,7 +248,7 @@ class Stage(tw.WorkTest):
                         self.save_round(n, 1)
                     self.assertEqual(self.stage(n, stage, "fail"),
                                      ("done", "code") if stage == "breaker" else ("retry", stage))
-        self.assertEqual(seen, {"retry", "escalate", "needs-input", "done"})
+        self.assertEqual(seen, {"retry", "escalate", "park", "done"})
 
         # an explicit tier escalates as attempt does, and the stage still repeats
         n = self.put_ticket("high", size="L")
@@ -260,6 +260,51 @@ class Stage(tw.WorkTest):
         # a breaker failure at any tier goes to code, and never asks for input however often it repeats
         for tier in ("sonnet", "opus", "fable", "sonnet"):
             self.assertEqual(self.stage(n, "breaker", "fail", "--tier", tier), ("done", "code"))
+
+    def test_stage_names_park_after_final_failure(self):
+        """#387: the failure that parks the ticket (fix's second; another stage's second with nothing above its tier,
+        else its third) prints `park` and `next: park`, and --json carries action and next "park"; every failure
+        before it repeats the stage. The first call is a real process, the rest in process."""
+        first = [True]
+
+        def call(n, *argv):
+            args = ["stage", str(n), *argv]
+            if first[0]:
+                first[0] = False
+                p = self.work(*args)
+            else:
+                p = tw.gitrepo_support.run_in_process(tw.TOOL, args, cwd=self.repo, env=self.env())
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            return p.stdout
+
+        # (risk, size): S/low routes code to sonnet and review to opus, both below the top: the third failure parks;
+        # M/high routes both to opus xhigh, the top: the second parks. fix parks on its second whatever the route.
+        for (risk, size), final in ((("low", "S"), 3), (("high", "M"), 2)):
+            for stage in ("tests", "code", "review", "fix", "ci"):
+                last = 2 if stage == "fix" else final
+                for output in ("text", "json"):
+                    with self.subTest(risk=risk, size=size, stage=stage, output=output):
+                        n = self.put_ticket(risk, size=size)
+                        if stage in ("review", "fix"):
+                            self.save_round(n, 1)
+                        for failures in range(1, last + 1):
+                            final_one = failures == last
+                            if output == "text":
+                                lines = call(n, stage, "fail").strip("\n").split("\n")
+                                self.assertEqual(len(lines), 2, lines)
+                                if final_one:
+                                    self.assertEqual(lines, ["park", NEXT + "park"])
+                                else:
+                                    self.assertEqual(lines[1], NEXT + stage)
+                            else:
+                                data = json.loads(call(n, stage, "fail", "--json"))
+                                self.assertEqual(data["failures"], failures)
+                                if final_one:
+                                    self.assertEqual((data["action"], data["next"], data["next_tier"],
+                                                      data["next_effort"]), ("park", "park", None, None))
+                                else:
+                                    self.assertEqual(data["next"], stage)
+                                    self.assertIn(data["action"], ("retry", "escalate"))
 
     def test_records_the_same_attempt_as_attempt(self):
         # (argv, blocking count of a review round saved just before the call, or None)
@@ -330,7 +375,7 @@ class Stage(tw.WorkTest):
         self.assertEqual(self.stage(n, "review", "pass"), ("done", "fix"))
         self.assertEqual(self.stage(n, "fix", "fail"), ("retry", "fix"))
         self.save_round(n, 1)
-        self.assertEqual(self.stage(n, "fix", "fail"), ("needs-input", "needs-input"))
+        self.assertEqual(self.stage(n, "fix", "fail"), ("park", "park"))
         self.save_round(n, 0)
         self.assertEqual(self.stage(n, "fix", "pass"), ("done", "ci"))
         self.assertEqual(self.stage(n, "ci", "pass"), ("done", "ultra, then ready"))
@@ -454,7 +499,7 @@ class Stage(tw.WorkTest):
             (["tests", "pass"], None, "code"),
             (["code", "fail"], None, "code"),
             (["code", "fail"], None, "code"),
-            (["code", "fail"], None, "needs-input"),
+            (["code", "fail"], None, "park"),
             (["review", "pass"], 0, "ci"),
             (["ci", "pass"], None, "ready"),
         ]
@@ -477,7 +522,7 @@ class Stage(tw.WorkTest):
                     self.assertEqual({k: v for k, v in data.items() if k not in ("next", "number")},
                                      {k: v for k, v in theirs.items() if k != "number"})
                     actions.add(data["action"])
-        self.assertEqual(actions, {"done", "retry", "escalate", "needs-input"})
+        self.assertEqual(actions, {"done", "retry", "escalate", "park"})
 
 
 if __name__ == "__main__":

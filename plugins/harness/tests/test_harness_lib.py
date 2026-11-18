@@ -2068,7 +2068,7 @@ class ToolsFollowTheLibTests(ToolTestCase):
         self.assertNotIn("Traceback", r.stderr)
         self.assertIn(adopt, r.stderr)  # the missing cache is the lib's
         self.assertNotIn(old, r.stdout + r.stderr)
-        for word in ("retry", "escalate", "needs-input", self.token + " "):
+        for word in ("retry", "escalate", "needs-input", "park", self.token + " "):
             self.assertNotIn(word, r.stdout)
         self.assertFalse(lib_cache.exists())
 
