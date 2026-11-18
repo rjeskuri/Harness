@@ -27,6 +27,9 @@ land, once it has pulled the main checkout, runs that checkout's scripts/smoke.s
 file, under HARNESS_SMOKE_TIMEOUT seconds (the environment, else the main checkout's .claude/settings.json `env`, else
 300), its whole process group killed at the limit. Exit 0 lands as before; 2 or the limit is one warning and a
 comment on each ticket; any other exit reverts the merge (revert_landed) and the land exits 1 naming the revert.
+Last, unless the canary failed, land runs `harness-work dispatch --after N --repo <main>` (cwd the main checkout) for
+each ticket it closed and prints a `Dispatch:` line with that stdout indented under it (nothing when it prints
+nothing); a failed run is one `harness-pr: warning: dispatch after #N: ...` line and the exit is unchanged.
 
 land --catch-up, before the preconditions: while the head is behind main and --rounds allow, the head branch's
 worktree (clean and at the head, else refuse) runs `git fetch origin`, `git merge-tree --write-tree` of the head and
@@ -63,7 +66,7 @@ ultra runs nothing (one line, exit 0) when the project's HARNESS_ULTRAREVIEW is 
 
 The repository is the cwd's (open: --worktree, else the cwd), else CLAUDE_PROJECT_DIR. gh is HARNESS_GH when
 set, else `gh`; claude is HARNESS_CLAUDE, else `claude`; harness-board, harness-red and harness-work (land's Cost
-block on each Resolution; a failed cost run is a warning) are found on PATH, else
+block on each Resolution and its dispatch; a failed run of either is a warning) are found on PATH, else
 next to this script. A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through
 to stderr, in order; its other stderr stays hidden. HARNESS_POLL_SECONDS replaces the 20 s poll interval (tests).
 
@@ -1895,14 +1898,15 @@ def smoke_limit(main):
 def land_canary(repo, number, sha, tickets):
     """The canary after a land that pulled the main checkout (harness_lib.canary's run_canary): healthy changes
     nothing; degraded is one warning and a comment on each ticket, nothing reverted; failed reverts the merge `sha`
-    on main as `revert` does (revert_landed, the canary's output as the evidence). (summary lines, problems): a
-    revert is a problem, so the land exits 1 naming it."""
+    on main as `revert` does (revert_landed, the canary's output as the evidence). (summary lines, problems, stands):
+    a revert is a problem, so the land exits 1 naming it; `stands` is False for a failed canary, whether or not
+    the revert worked, and the land then dispatches nothing."""
     ran = run_canary(repo.main, smoke_limit(repo.main))
     if ran is None:
-        return [], []
+        return [], [], True
     verdict, said, output = ran
     if verdict == "healthy":
-        return [f"Canary: {SMOKE} {said}."], []
+        return [f"Canary: {SMOKE} {said}."], [], True
     if verdict == "degraded":
         warn("harness-pr", f"{SMOKE} {said} after PR #{number} landed: degraded, nothing reverted")
         landed = f"landed in {sha[:7]}" if sha else "landed"
@@ -1916,22 +1920,37 @@ def land_canary(repo, number, sha, tickets):
                 board(repo, "comment", str(n), "--body", body)
             except Problem as err:
                 problems.append(f"ticket #{n}: the canary comment failed: {err}")
-        return [f"Canary: {SMOKE} {said}: degraded, nothing reverted."], problems
+        return [f"Canary: {SMOKE} {said}: degraded, nothing reverted."], problems, True
     if not sha:
         return ([f"Canary: {SMOKE} {said}; nothing reverted."],
                 [f"{SMOKE} {said}, but the merge commit is unknown, so nothing was reverted; "
-                 f"harness-pr revert {number}"])
+                 f"harness-pr revert {number}"], False)
     try:
         result = revert_landed(repo, sha, f"{SMOKE} {said} in the main checkout after the land", output or None)
     except Problem as err:
         return ([f"Canary: {SMOKE} {said}; the revert failed."],
                 [f"{SMOKE} {said}, and reverting {sha[:7]} failed: {err}; harness-pr revert {number} once that is "
-                 "fixed"])
+                 "fixed"], False)
     revert, ticket = result["revert"], result["ticket"]
     asked = f", ticket #{ticket} needs input" if ticket else ""
     return ([f"Canary: {SMOKE} {said}, so the land was reverted:"] + [f"  {line}" for line in result["summary"]],
             [f"{SMOKE} {said} in the main checkout, so the merge was reverted in {revert[:7]} "
-             f"(bug #{result['bug']}{asked})"])
+             f"(bug #{result['bug']}{asked})"], False)
+
+
+def dispatch_after(repo, number):
+    """`harness-work dispatch --after N --repo <main>` for a ticket the land closed (#390), no stdin, cwd the main
+    checkout; its stdout lines. A run that fails, times out or cannot start is one warning line and no lines."""
+    try:
+        done = tool("harness-work", ["dispatch", "--after", str(number), "--repo", repo.main], repo.main,
+                    check=False)
+    except Problem as err:
+        warn("harness-pr", f"dispatch after #{number}: {err}")
+        return []
+    if done.returncode != 0:
+        warn("harness-pr", f"dispatch after #{number}: {first_line(done.stderr) or f'exit {done.returncode}'}")
+        return []
+    return (done.stdout or "").splitlines()
 
 
 def cmd_land(args):
@@ -2074,16 +2093,24 @@ def cmd_land(args):
         return made["text"]
 
     ticket_lines = []
+    closed = []
     for n in tickets:
         line, error = land_ticket(repo, n, sha, number, resolution, view.get("url"))
         ticket_lines.append(line)
         if error:
             problems.append(f"ticket #{n}: {error}")
+        else:
+            closed.append(n)
     summary.append("Ticket: " + ("; ".join(ticket_lines) if ticket_lines else "none linked") + ".")
+    stands = True                             # False when the canary failed: the merge is (being) reverted
     if pulled_main:                           # after the ticket steps: a revert reopens the ticket they closed
-        lines, trouble = land_canary(repo, number, sha, tickets)
+        lines, trouble, stands = land_canary(repo, number, sha, tickets)
         summary.extend(lines)
         problems.extend(trouble)
+    if stands:                                # last: what each closed ticket unblocks (#390)
+        said = [line for n in closed for line in dispatch_after(repo, n) if line.strip()]
+        if said:
+            summary.extend(["Dispatch:"] + [f"  {line}" for line in said])
     print("\n".join(summary))
     if problems:
         sys.stdout.flush()

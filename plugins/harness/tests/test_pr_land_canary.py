@@ -228,6 +228,12 @@ class LandCanary(WorktreeTest):
         self.assertFalse([a for a in self.gh_argv() if a[:2] == ["issue", "reopen"]], self.gh_argv())
         self.assertEqual(self.revert_notes(), [])
 
+    def assertDispatchedFromMain(self, ticket):
+        calls = self.dispatches()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0]["argv"][:3], ["dispatch", "--after", str(ticket)])
+        self.assertEqual(os.path.realpath(calls[0]["cwd"]), self.main)
+
     def assertLandedAsToday(self, p, sha):
         """Exit 0, the main checkout fast-forwarded to the merge, and nothing reverted."""
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
@@ -328,6 +334,7 @@ class LandCanary(WorktreeTest):
         self.assertEqual(self.smoke_runs(), [(self.main, note)])
         self.assertEqual(self.canary_comments(), [])
         self.assertEqual(self.smoke_warnings(p), [])
+        self.assertDispatchedFromMain(12)
 
     def test_a_failing_canary_reverts_the_merge_files_the_bug_and_reopens_the_ticket(self):
         note = "broken landing 3b8"
@@ -350,6 +357,15 @@ class LandCanary(WorktreeTest):
         sha = self.landed(2, note)
         p = self.land(sha)
         self.assertDegraded(p, sha, note, timed_out=False)
+        self.assertDispatchedFromMain(12)           # a degraded land still stands: it dispatches (#390)
+
+    def test_reverted_land_dispatches_nothing(self):
+        note = "broken landing 9d2"
+        self.project()
+        sha = self.landed(1, note)
+        p = self.land(sha)
+        self.assertReverted(p, sha, note, 1)
+        self.assertEqual(self.dispatches(), [], "the revert undid the merge: no ticket is unblocked")
 
     def test_without_a_smoke_script_the_land_is_as_today(self):
         self.project(smoke=None)

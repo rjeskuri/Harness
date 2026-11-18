@@ -266,6 +266,10 @@ class PrTest(unittest.TestCase):
     def stub_calls(self, tool):
         return [c["argv"] for c in self.jsonl(self.stub_log) if c["tool"] == tool]
 
+    def dispatches(self):
+        """The `harness-work dispatch ...` calls a land made (#390), each {"tool", "argv", "cwd"} as the stub logged it."""
+        return [c for c in self.jsonl(self.stub_log) if c["tool"] == "harness-work" and c["argv"][:1] == ["dispatch"]]
+
     def order(self):
         if not os.path.exists(self.order_log):
             return []
