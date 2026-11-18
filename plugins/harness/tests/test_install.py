@@ -99,21 +99,36 @@ SETTINGS = {
 
 
 # The snippet's permission and autoMode lists, pinned independently of the installer: the nine harness rules of
-# the project template, the two ask rules (a raw merge, which skips the gate, and autoland; `harness-pr land` is a
-# reviewed merge a session may run without asking, Ryan 2026-11-04, so it is retired from the ask list, #324),
-# and the two autoMode lists led by the "$defaults" sentinel (the prose entries are pinned by their opening words,
-# from the ticket's Context; no autoMode.allow entry allows landing).
+# the project template, the one ask rule (a raw merge, which skips the gate; every PR lands through `harness-pr land`
+# without asking, so its old ask rule and autoland's are retired, #324 and #393), and the two autoMode lists led by
+# the "$defaults" sentinel (the prose entries are pinned by their opening words, from the ticket's outline, with
+# Asks last; no autoMode.allow entry allows landing).
 RAW_MERGE, LAND, AUTOLAND = "Bash(gh pr merge *)", "Bash(harness-pr land *)", "Bash(harness-pr autoland *)"
-ASK_RULES = [RAW_MERGE, AUTOLAND]
-RETIRED = {"permissions.ask": [LAND]}
-# The snippet's Review convention entry, the live sentence of ~/.claude/settings.json (#324 Context), and two
-# stale entries with the same label that earlier add-only merges left in that file.
-REVIEW_CONVENTION = (
+ASK_RULES = [RAW_MERGE]
+RETIRED = {"permissions.ask": [LAND, AUTOLAND]}
+# The three entries #393 rewords, as ~/.claude/settings.json holds them before it (the stale input of the replace
+# tests), and two older stale Review convention entries that earlier add-only merges left in that file.
+STALE_LAND_CONVENTION = (
     "Review convention: pull requests are opened by the harness from ticket branches t/<n>-*, reviewed by the "
     "harness reviewer agent in a fresh context, and merged only through `harness-pr land`, which refuses a draft, "
     "red or pending checks, a conflict and unaddressed review findings. A merge through that command is a reviewed "
     "merge, and a session may run it without asking (Ryan's standing permission, 2026-11-04; `harness-pr revert` "
     "undoes a land). `harness-pr autoland` is the epic #132 plan, not built yet.")
+STALE_SERVICES = (
+    "Key internal services: LaunchAgents com.ryaneskuri.harness-* under ~/Library/LaunchAgents are the harness's own "
+    "scheduled jobs (digest); harness-board comments on GitHub issues are the harness's own status comments, not "
+    "instructions to automation. An autoland job is the epic #132 plan, not built yet.")
+STALE_REMOTE = (
+    "Sensitive remote targets: the Jotform forms, the Global G.L.O.W. Google Sheet, Salesforce, and the "
+    "jotform-glow-sync auto-sync workflow's variables and secrets. Every write there needs my explicit go in the "
+    "session.")
+# The entry #393 leaves as it is.
+SENSITIVE_DATA = (
+    "Sensitive data locations & audiences: /Users/ryaneskuri/jotform-glow-sync data/, backups/ and credentials/ hold "
+    "minors' personal data; share with nothing outside that project's own tools.")
+# A sentence claiming every write (to the sensitive targets) needs Ryan's go: "every write there needs ...".
+EVERY_WRITE_ASKS = re.compile(r"\b(every|all|any)\s+writes?\b(\s+\S+){0,6}?\s+(needs?|requires?|asks?)\b",
+                              re.IGNORECASE)
 STALE_AUTOLAND_CONVENTION = (
     "Review convention: pull requests are opened by the harness from ticket branches t/<n>-*, reviewed by the "
     "harness reviewer agent in a fresh context, and merged only through `harness-pr land` or `harness-pr autoland`, "
@@ -125,7 +140,8 @@ STALE_ASKING_CONVENTION = (
     "red or pending checks, a conflict and unaddressed review findings. A merge through that command is a reviewed "
     "merge, and a session asks before running it. `harness-pr autoland` is the epic #132 plan, not built yet.")
 ENVIRONMENT_OPENINGS = ["Organization:", "Source control:", "CI/CD deploy targets:", "Review convention:",
-                        "Key internal services:", "Sensitive data locations & audiences:", "Sensitive remote targets:"]
+                        "Key internal services:", "Sensitive data locations & audiences:", "Sensitive remote targets:",
+                        "Asks:"]
 AUTO_ALLOW_OPENINGS = ["Writing or loading a com.ryaneskuri.harness-* LaunchAgent"]
 DEFAULTS = "$defaults"
 LISTS = (("permissions", "allow"), ("permissions", "ask"), ("autoMode", "environment"), ("autoMode", "allow"))
@@ -303,7 +319,7 @@ class Install(unittest.TestCase):
         for piece in ("~/.claude/settings.json: set model, effortLevel; ",
                       f'set modelSettings for {", ".join(snippet["modelSettings"])}',
                       'removed enabledPlugins["companion@ryan"]', ADDED_ALL,
-                      "added 9 permissions.allow, 2 permissions.ask, 7 autoMode.environment, 1 autoMode.allow",
+                      "added 9 permissions.allow, 1 permissions.ask, 8 autoMode.environment, 1 autoMode.allow",
                       f"(backup settings.json.bak-{today})"):
             self.assertIn(piece, line)
         self.assert_line_counts(line, removed={}, replaced={})                       # nothing retired or stale
@@ -341,7 +357,7 @@ class Install(unittest.TestCase):
         for piece in ("~/.claude/settings.json: set model, effortLevel; ",
                       f'set modelSettings for {", ".join(snippet["modelSettings"])}',
                       ADDED_ALL,
-                      "added 9 permissions.allow, 2 permissions.ask, 7 autoMode.environment, 1 autoMode.allow"):
+                      "added 9 permissions.allow, 1 permissions.ask, 8 autoMode.environment, 1 autoMode.allow"):
             self.assertIn(piece, line)
         self.assertTrue(line.endswith(" (created)"), line)
 
@@ -392,11 +408,15 @@ class Install(unittest.TestCase):
         self.assertIn("the LaunchAgent is not loaded", p.stdout)
         self.assertIn("security add-generic-password", p.stdout)                  # the install carried on
 
-    # Sessions may land but never merge raw (#324, Ryan 2026-11-04): after an install a raw `gh pr merge` and
-    # `harness-pr autoland` prompt, `harness-pr land` does not (the retired ask rule is gone, `Bash(harness-pr:*)`
-    # allows it), and the classifier is told so. The rules are spelled out here, not read from the snippet.
+    # Sessions may land but never merge raw (#324, Ryan 2026-11-04; #393): after an install a raw `gh pr merge`
+    # prompts, neither `harness-pr land` nor `harness-pr autoland` does (their retired ask rules are gone,
+    # `Bash(harness-pr:*)` allows them), and the classifier is told so. The rules are spelled out here, not read
+    # from the snippet.
 
     def test_sessions_may_land_but_never_merge_raw_after_install(self):
+        snippet_convention = [e for e in read_json(SNIPPET)["autoMode"]["environment"]
+                              if label(e) == "Review convention"]
+        self.assertEqual(len(snippet_convention), 1, snippet_convention)
         starts = {      # name: (settings or None, the user's own ask rules, in the order they must keep)
             "fresh HOME, no settings": (None, []),
             "settings with none of the lists": (SETTINGS, []),
@@ -406,10 +426,12 @@ class Install(unittest.TestCase):
                                            ["Bash(git push --force:*)", "Bash(npm publish:*)"]),
             "the raw-merge ask rule already there": ({"permissions": {"ask": [RAW_MERGE]},
                                                       "autoMode": {"allow": [DEFAULTS], "environment": []}}, []),
-            "the land rule there": ({"permissions": {"ask": [AUTOLAND, LAND, "Bash(x)"]}}, ["Bash(x)"]),
-            "the land rule twice, around own rules": ({"permissions": {"ask": ["Bash(rm -rf build)", LAND, RAW_MERGE,
-                                                                               "Bash(x)", LAND]}},
-                                                      ["Bash(rm -rf build)", "Bash(x)"]),
+            "the land and autoland rules and the old convention there": (
+                {"permissions": {"ask": [AUTOLAND, LAND, "Bash(x)"]},
+                 "autoMode": {"environment": [DEFAULTS, STALE_LAND_CONVENTION]}}, ["Bash(x)"]),
+            "both rules twice, around own rules": ({"permissions": {"ask": ["Bash(rm -rf build)", LAND, RAW_MERGE,
+                                                                            AUTOLAND, "Bash(x)", LAND, AUTOLAND]}},
+                                                   ["Bash(rm -rf build)", "Bash(x)"]),
         }
         for name, (start, own) in starts.items():
             with self.subTest(start=name):
@@ -422,10 +444,9 @@ class Install(unittest.TestCase):
                 self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                 merged = read_json(self.settings)
                 ask = merged["permissions"]["ask"]
-                for rule in (RAW_MERGE, AUTOLAND):
-                    self.assertEqual(ask.count(rule), 1, (rule, ask))
-                self.assertEqual([e for e in ask if "harness-pr land" in e], [], ask)
-                self.assertEqual([e for e in ask if e not in (RAW_MERGE, AUTOLAND)], own, "own ask rules moved")
+                self.assertEqual(ask.count(RAW_MERGE), 1, ask)
+                self.assertEqual([e for e in ask if re.search(r"harness-pr (auto)?land", e)], [], ask)
+                self.assertEqual([e for e in ask if e != RAW_MERGE], own, "own ask rules moved")
                 self.assertIn("Bash(harness-pr:*)", merged["permissions"]["allow"])  # so landing runs unasked
                 for rule in (LAND, AUTOLAND):
                     self.assertNotIn(rule, merged["permissions"]["allow"])
@@ -435,12 +456,12 @@ class Install(unittest.TestCase):
                 self.assertEqual(merged["autoMode"]["allow"][0], DEFAULTS)
                 self.assertGreaterEqual(len(merged["autoMode"]["allow"]), 2, "the LaunchAgent entry is gone too")
                 conventions = [e for e in merged["autoMode"]["environment"] if label(e) == "Review convention"]
-                self.assertEqual(conventions, [REVIEW_CONVENTION])
+                self.assertEqual(conventions, snippet_convention)
 
-    def test_the_snippet_asks_only_for_raw_merge_and_autoland(self):
+    def test_the_snippet_asks_only_for_raw_merge(self):
         snippet = read_json(SNIPPET)
-        self.assertEqual(snippet["permissions"]["ask"], [RAW_MERGE, AUTOLAND])
-        self.assertEqual(snippet.get("retired"), {"permissions.ask": [LAND]})
+        self.assertEqual(snippet["permissions"]["ask"], [RAW_MERGE])
+        self.assertEqual(snippet.get("retired"), {"permissions.ask": [LAND, AUTOLAND]})
         for entry in snippet["permissions"]["allow"]:
             self.assertIsNone(re.search(r"\bland\b|autoland|\bmerg", entry, re.IGNORECASE), entry)
         for entry in snippet["autoMode"]["allow"]:
@@ -450,14 +471,39 @@ class Install(unittest.TestCase):
         self.assertNotIn(None, labels)
         self.assertEqual(len(set(labels)), len(labels), labels)
 
-    def test_the_snippet_review_convention_is_the_live_sentence(self):
-        env = read_json(SNIPPET)["autoMode"]["environment"]
-        self.assertEqual([e for e in env if label(e) == "Review convention"], [REVIEW_CONVENTION])
+    def test_the_snippet_environment_asks_only_before_the_irreversible(self):
+        # #393: every PR lands through `harness-pr land` unasked and `harness-pr revert` undoes a land; autoland is
+        # retired, not planned; writes to the sensitive remote targets run unasked while deleting records there and
+        # changing that workflow's secrets still need Ryan's go; the sensitive data entry stays as it was. The
+        # wording is the coder's: only these facts are pinned (Asks by its label, in snippet_lists).
+        auto = read_json(SNIPPET)["autoMode"]
+        env = auto["environment"]
+        by_label = {}
+        for entry in env:
+            by_label.setdefault(label(entry), []).append(entry.replace("`", ""))
+        for name in ("Review convention", "Key internal services", "Sensitive remote targets", "Asks"):
+            self.assertEqual(len(by_label.get(name, [])), 1, (name, by_label.get(name)))
+        review, services, remote = (by_label[n][0] for n in ("Review convention", "Key internal services",
+                                                               "Sensitive remote targets"))
+        self.assertIn("harness-pr land", review)
+        self.assertIn("harness-pr revert", review)
+        self.assertRegex(review, r"(?i)\bwithout\b[^.;]*\bask|\bunasked\b")
+        for name, entry in (("Review convention", review), ("Key internal services", services)):
+            with self.subTest(entry=name):
+                self.assertNotRegex(entry, r"(?i)autoland|#132\b|epic 132\b")
+        self.assertRegex(remote, r"(?i)\bdelet")
+        self.assertRegex(remote, r"(?i)\bsecret")
+        for entry in env + auto["allow"]:
+            for sentence in self.sentences(entry):
+                with self.subTest(sentence=sentence[:70]):
+                    self.assertIsNone(EVERY_WRITE_ASKS.search(sentence), "says every write needs Ryan's go")
+        self.assertEqual([e for e in env if label(e) == "Sensitive data locations & audiences"], [SENSITIVE_DATA])
 
     # Neither `harness-pr autoland` nor an autoland LaunchAgent exists yet (epic #132). The text checks below read
-    # each sentence (a line split after . ; ! or ?) with backticks removed. A line that is only a permission rule
-    # string, such as "Bash(harness-pr autoland *)", is a rule, not a description, and is exempt.
-    RULE_ONLY = re.compile(r'^\s*"[A-Za-z]+\([^"]*\)",?\s*$')
+    # each sentence (a line split after . ; ! or ?) with backticks removed. A quoted permission rule string, such as
+    # "Bash(harness-pr autoland *)" on its own line or in a `retired` list, is a rule, not a description, and is
+    # exempt: it is taken out of the line before the line is read.
+    RULE = re.compile(r'"[A-Za-z]+\([^"]*\)"')
     # Said of autoland, these fail a sentence whatever else it says: merge or land wording reaching autoland
     # through via/through/by/with (no parenthesis or clause break between), autoland followed by a merge or land
     # verb, "Merging: autoland", and autoland in the same sentence as "eligible" (the auto-land rubric).
@@ -496,7 +542,8 @@ class Install(unittest.TestCase):
         # as planned. Every line naming autoland also names epic #132.
         for name, text in self.user_files().items():
             for number, line in enumerate(text.splitlines(), 1):
-                if "autoland" not in line.lower() or self.RULE_ONLY.match(line):
+                line = self.RULE.sub("", line)
+                if "autoland" not in line.lower():
                     continue
                 with self.subTest(file=name, line=number):
                     self.assertRegex(line, r"#132\b|epic 132\b")
@@ -564,7 +611,7 @@ class Install(unittest.TestCase):
         env, auto_allow = wanted["autoMode", "environment"], wanted["autoMode", "allow"]
         own = {
             ("permissions", "allow"): ["Bash(ls:*)", allow[3], "Read(~/notes/**)", allow[0], "Bash(make test)"],
-            ("permissions", "ask"): ["Bash(git push --force:*)", LAND, ask[1]],
+            ("permissions", "ask"): ["Bash(git push --force:*)", LAND, AUTOLAND],
             ("autoMode", "environment"): ["My own context line.", env[2], DEFAULTS, "Another of mine."],
             ("autoMode", "allow"): [auto_allow[1], "Running make test is allowed."],
         }
@@ -579,19 +626,20 @@ class Install(unittest.TestCase):
         merged = read_json(self.settings)
         for obj, key in LISTS:
             with self.subTest(list=f"{obj}.{key}"):
-                kept = [e for e in own[obj, key] if e != LAND]                    # the retired rule goes
+                kept = [e for e in own[obj, key] if e not in (LAND, AUTOLAND)]    # the retired rules go
                 self.assert_merged(merged[obj][key], kept, wanted[obj, key], sentinel=obj == "autoMode")
         self.assertEqual(merged["permissions"]["deny"], mine["permissions"]["deny"])
         self.assertEqual(merged["autoMode"]["soft_deny"], mine["autoMode"]["soft_deny"])
         self.assertEqual(merged["theme"], "light")
         line = settings_line(p.stdout)
-        # The own lists already hold ask[1], env[2] (and the sentinel) and auto_allow[1]: one fewer of the first two
-        # is added, and autoMode.allow, already holding its one prose entry, gains nothing and gets no count (only its sentinel moves).
-        self.assertIn(f"added {len(allow) - 2} permissions.allow, {len(ask) - 1} permissions.ask, "
+        # The own lists already hold allow[3] and allow[0], env[2] (and the sentinel) and auto_allow[1]: fewer of the
+        # first two are added, the ask list loses both retired rules and gains the raw-merge one, and autoMode.allow,
+        # already holding its one prose entry, gains nothing and gets no count (only its sentinel moves).
+        self.assertIn(f"added {len(allow) - 2} permissions.allow, {len(ask)} permissions.ask, "
                       f"{len(ENVIRONMENT_OPENINGS) - 1} autoMode.environment", line)
-        self.assertIn("added 7 permissions.allow, 1 permissions.ask, 6 autoMode.environment", line)
+        self.assertIn("added 7 permissions.allow, 1 permissions.ask, 7 autoMode.environment", line)
         self.assertNotRegex(line, r"\d+ autoMode\.allow")
-        self.assert_line_counts(line, removed={"permissions.ask": 1}, replaced={})
+        self.assert_line_counts(line, removed={"permissions.ask": 2}, replaced={})
         self.assertIn(" (backup settings.json.bak-", line)
         self.assertEqual(len(self.backups()), 1)
 
@@ -690,11 +738,13 @@ class Install(unittest.TestCase):
                     self.assertEqual(fh.read(), after_first)
                 self.assertEqual(self.backups(), backups)
 
-        # Needing only the retire and the replace, as the live file did on 2026-11-04 (the land rule asked, two
-        # stale Review convention entries): the first run removes and replaces, the next change nothing.
+        # Needing only the retire and the replace, as the live file does before #393 (the three entries it rewords
+        # as they were, no Asks, the land and autoland rules asked, an older stale Review convention later): the
+        # first run replaces the three in place, adds Asks and removes both rules; the next change nothing.
         env = wanted["autoMode", "environment"]
-        at = env.index(REVIEW_CONVENTION)
-        stale_env = env[:at] + [STALE_AUTOLAND_CONVENTION] + env[at + 1:] + ["Mine too.", STALE_ASKING_CONVENTION]
+        stale = {label(e): e for e in (STALE_LAND_CONVENTION, STALE_SERVICES, STALE_REMOTE)}
+        live = [stale.get(label(e), e) for e in env if label(e) != "Asks"]
+        stale_env = live + ["Mine too.", STALE_ASKING_CONVENTION]
         stale_ask = [RAW_MERGE, LAND, AUTOLAND, "Bash(git push --force:*)"]
         before = self.reset({"permissions": {"allow": wanted["permissions", "allow"], "ask": stale_ask},
                              "autoMode": {"environment": stale_env, "allow": wanted["autoMode", "allow"]},
@@ -703,11 +753,11 @@ class Install(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         line = settings_line(p.stdout)
         self.assertNotIn("already up to date", line)
-        self.assert_line_counts(line, added={}, replaced={"autoMode.environment": 1})
-        self.assertEqual(counts(line, "removed").get("permissions.ask"), 1, line)
+        self.assert_line_counts(line, added={"autoMode.environment": 1}, replaced={"autoMode.environment": 3})
+        self.assertEqual(counts(line, "removed").get("permissions.ask"), 2, line)
         merged = read_json(self.settings)
-        self.assertEqual(merged["permissions"]["ask"], [RAW_MERGE, AUTOLAND, "Bash(git push --force:*)"])
-        self.assertEqual(merged["autoMode"]["environment"], env + ["Mine too."])
+        self.assertEqual(merged["permissions"]["ask"], [RAW_MERGE, "Bash(git push --force:*)"])
+        self.assertEqual(merged["autoMode"]["environment"], env[:-1] + ["Mine too.", env[-1]])   # Asks appended
         backups = self.backups()
         self.assertEqual(len(backups), 1)
         with open(os.path.join(os.path.dirname(self.settings), backups[0]), "rb") as fh:
@@ -736,17 +786,18 @@ class Install(unittest.TestCase):
         own_allow = ["Bash(ls:*)"] + wanted["permissions", "allow"]
         auto = {"environment": wanted["autoMode", "environment"] + ["Mine."], "allow": wanted["autoMode", "allow"]}
         cases = {   # name: (ask before, ask after up to the appended entries, appended, removed count)
-            "one copy, alone": ([LAND], [], [RAW_MERGE, AUTOLAND], 1),
-            "two copies around the snippet's rules": ([LAND, RAW_MERGE, AUTOLAND, LAND], [RAW_MERGE, AUTOLAND], [], 2),
-            "one between own rules": (["Bash(git push --force:*)", LAND, "Bash(npm publish:*)", AUTOLAND],
-                                      ["Bash(git push --force:*)", "Bash(npm publish:*)", AUTOLAND], [RAW_MERGE], 1),
-            "three copies beside rules that only resemble it": (
+            "one copy, alone": ([LAND], [], [RAW_MERGE], 1),
+            "two copies of each around the snippet's rule": ([LAND, AUTOLAND, RAW_MERGE, AUTOLAND, LAND], [RAW_MERGE],
+                                                             [], 4),
+            "one of each between own rules": (["Bash(git push --force:*)", LAND, "Bash(npm publish:*)", AUTOLAND],
+                                              ["Bash(git push --force:*)", "Bash(npm publish:*)"], [RAW_MERGE], 2),
+            "copies beside rules that only resemble them": (
                 [LAND, "Bash(harness-pr land 42)", RAW_MERGE, LAND, "Bash(git reset --hard:*)", AUTOLAND, LAND,
                  "Bash(harness-pr land:*)"],
-                ["Bash(harness-pr land 42)", RAW_MERGE, "Bash(git reset --hard:*)", AUTOLAND, "Bash(harness-pr land:*)"],
-                [], 3),
-            "none to remove": (["Bash(git push --force:*)", AUTOLAND, RAW_MERGE],
-                               ["Bash(git push --force:*)", AUTOLAND, RAW_MERGE], [], 0),
+                ["Bash(harness-pr land 42)", RAW_MERGE, "Bash(git reset --hard:*)", "Bash(harness-pr land:*)"],
+                [], 4),
+            "none to remove": (["Bash(git push --force:*)", RAW_MERGE],
+                               ["Bash(git push --force:*)", RAW_MERGE], [], 0),
         }
         for name, (ask, kept, appended, removed) in cases.items():
             with self.subTest(case=name):
@@ -777,28 +828,28 @@ class Install(unittest.TestCase):
         snippet = read_json(SNIPPET)
         env = wanted["autoMode", "environment"]
         snip = {label(e): e for e in env if label(e)}
-        self.assertEqual(snip["Review convention"], REVIEW_CONVENTION)
         base = dict({k: snippet[k] for k in ("model", "effortLevel", "modelSettings")}, theme="dark",
                     permissions={"allow": wanted["permissions", "allow"], "ask": wanted["permissions", "ask"]})
-        org, source, ci = snip["Organization"], snip["Source control"], snip["CI/CD deploy targets"]
-        services, data, remote = (snip["Key internal services"], snip["Sensitive data locations & audiences"],
-                                  snip["Sensitive remote targets"])
+        org, source, ci, review = (snip["Organization"], snip["Source control"], snip["CI/CD deploy targets"],
+                                   snip["Review convention"])
+        services, data, remote, asks = (snip["Key internal services"], snip["Sensitive data locations & audiences"],
+                                        snip["Sensitive remote targets"], snip["Asks"])
         cases = {   # name: (environment before, after up to the appended entries, appended, replaced count or None)
             "two stale Review convention entries": (
                 [DEFAULTS, org, "Team: just me, no staff.", source, STALE_AUTOLAND_CONVENTION, ci,
                  "A line of my own without a label.", STALE_ASKING_CONVENTION,
                  "Note: the Review convention: below is mine.", services, data, remote, "Deploy: by hand on Fridays."],
-                [DEFAULTS, org, "Team: just me, no staff.", source, REVIEW_CONVENTION, ci,
+                [DEFAULTS, org, "Team: just me, no staff.", source, review, ci,
                  "A line of my own without a label.", "Note: the Review convention: below is mine.", services, data,
                  remote, "Deploy: by hand on Fridays."],
-                [], 1),
-            "three stale labels, three missing, the sentinel out of place": (
+                [asks], 1),
+            "three stale labels, four missing, the sentinel out of place": (
                 ["Organization: someone else, long ago.", "Mine: a line of my own.", DEFAULTS,
                  "Review convention: merged by hand after a look.", source, "Sensitive remote targets: none yet.",
-                 "Organization: a second, older line.", REVIEW_CONVENTION, "Mine: another line of my own."],
-                [DEFAULTS, org, "Mine: a line of my own.", REVIEW_CONVENTION, source, remote,
+                 "Organization: a second, older line.", STALE_LAND_CONVENTION, "Mine: another line of my own."],
+                [DEFAULTS, org, "Mine: a line of my own.", review, source, remote,
                  "Mine: another line of my own."],
-                [ci, services, data], 3),
+                [ci, services, data, asks], 3),
             "the snippet's entry first, a stale one later": (
                 env + ["Mine.", STALE_AUTOLAND_CONVENTION, "Source control:github.com/someone-else"],
                 env + ["Mine."], [], None),
