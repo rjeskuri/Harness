@@ -158,12 +158,13 @@ Choices #328 leaves open, fixed here:
   that rewrites a .gitignore gets no decision and no snapshot or ref. Any .gitignore counts (the root one, a
   nested one, one deleted from disk, a new one only staged) when what is on disk differs from what the form writes
   there: HEAD for a reset (with no target or HEAD), the index for checkout or restore of paths without a tree-ish,
-  the tree-ish for `checkout HEAD -- p`. Pinned forms: `reset --hard [HEAD]`, `checkout -- .`, `checkout -- <its
-  folder or itself>`, `restore .`, `restore <it>`, `checkout HEAD -- <it>`. A path form whose pathspec leaves out
-  every differing .gitignore (`checkout -- src`, `restore src/app.py` with only the root one edited), a clean before
-  the form, the clean alone, and these forms when no .gitignore differs are backed up as before.
-- Ruling (fix round 2, low): the overwrite check reads the target in every spelling: `restore -s X`, `-WsX`,
-  `--so X`, `checkout X p` without `--`, `checkout -f X -- .`, `switch --detach -f X`, `reset --merge X`.
+  the tree-ish for `checkout HEAD -- p`; `restore --staged --worktree` writes HEAD's, so a change only staged
+  counts for it. Pinned here: `reset --hard && clean -fd` with the root .gitignore edited on disk, and
+  `restore --staged --worktree . && clean -fd` with it edited and staged, get nothing; `checkout -- src && clean -fd`
+  (its pathspec leaves the edited .gitignore out), and both pairs when no .gitignore differs, are backed up as before.
+- Ruling (fix round 2, low): the overwrite check reads the target in every spelling (`restore -s X`, `-WsX`,
+  `--so X`, `checkout X p` without `--`, `switch --detach -f X`, `reset --merge X` among them). Pinned here:
+  `reset --hard X`, `checkout -f X`, `checkout X -- p` and `restore --source=X p`.
 - Ruling (finding 2): a branch name that is not a plain branch of refs/heads/ (`@{-1}`, `@{-2}`, quoted or not) or
   names none (a missing branch) gets no decision and no ref, for every branch of the part: `git branch -D <real>
   @{-1}` and `git branch -D <real> <missing>` keep nothing either (git deletes the real one before it fails).

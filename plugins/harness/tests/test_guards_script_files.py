@@ -64,6 +64,7 @@ class ScriptFileTests(GuardTestCase):
         self.state = self.repo_state(self.repo)
         # tracked at the ticket branch's HEAD, not on main
         self.write(self.wt / "scripts/tool.py", PROGRAMS["py"])
+        self.write(self.wt / "scripts/tool.sh", PROGRAMS["sh"])
         self.git(self.wt, "add", "-A")
         self.git(self.wt, "commit", "-q", "-m", "Add the project's scripts")
         # untracked: outside any repository and in the worktree; one only staged
@@ -158,19 +159,26 @@ class ScriptFileTests(GuardTestCase):
             ("python3 -m tools.gen", self.wt, ROLES),  # a module resolved to an untracked file
             (f"python3 -m pytest -q {o}/w.py", self.wt, ROLES),  # a test runner given one
             (f"python3 {o}/w.py", self.scratch(), (BREAKER,)),  # the breaker's scratch worktree
+            # judged where the part runs: outside any worktree, against the hook's
+            (f"cd {o} && python3 w.py", self.wt, ROLES),
         )
+        quoted = {f"cd {o} && python3 w.py": "python3 w.py"}  # the part the reason names
         for command, cwd, agents in rows:
             for agent in agents:
                 with self.subTest(command=command, agent=agent, cwd=cwd.name):
-                    self.assertRefused(self.bash(command, agent, cwd=cwd), command)
+                    self.assertRefused(self.bash(command, agent, cwd=cwd), quoted.get(command, command))
 
     def test_tracked_programs_runners_and_other_sessions_still_run(self):
-        o = self.outside
+        o, scratch = self.outside, self.scratch()
         tests_first = ("tests_first.py",)
         rows = (
             # (command, where it runs, the agents, the hooks that let it through)
             ("python3 scripts/tool.py", self.wt, ROLES, tests_first),  # tracked at HEAD
-            ("python3 scripts/tool.py", self.scratch(), (BREAKER,), tests_first),
+            ("sh scripts/tool.sh", self.wt, ROLES, tests_first),
+            ("cd scripts && python3 tool.py", self.wt, ROLES, tests_first),  # found from the part's directory
+            ("python3 scripts/tool.py", scratch, (BREAKER,), tests_first),
+            # from the ticket worktree into the scratch: judged against the scratch it runs in
+            (f"cd {scratch} && python3 scripts/tool.py", self.wt, (BREAKER,), tests_first),
             ("python3 -m unittest tests/test_new.py", self.wt, ROLES, tests_first),  # the new test
             ("python3 -m pytest -q", self.wt, ROLES, tests_first),  # no target: collects the worktree
             (f"harness-red run --worktree {self.wt}", self.wt, ROLES, tests_first),
