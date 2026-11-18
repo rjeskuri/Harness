@@ -345,6 +345,59 @@ class Land(LandBase):
         self.assertEqual(lines[3], "Ticket: #12 closed, status labels removed, commented, "
                                    "epic check: #3: 1 of 2 tasks closed; left open.")
 
+    # ------------------------------------------------------------- dispatching what the land unblocks (#390)
+    def assertDispatchedOnce(self, ticket):
+        """One `harness-work dispatch --after <ticket> --repo <main>`, run with the main checkout as cwd."""
+        calls = self.dispatches()
+        self.assertEqual(len(calls), 1, calls)
+        argv = calls[0]["argv"]
+        self.assertEqual(argv[:3], ["dispatch", "--after", str(ticket)], argv)
+        self.assertEqual(argv[argv.index("--repo") + 1], self.main, argv)
+        self.assertEqual(os.path.realpath(calls[0]["cwd"]), self.main)
+
+    def test_land_dispatches_after_closing(self):
+        said = "dispatched #15 (ready)\ndispatched #16 (ready)\nskipped #17: blocked by #18\n"
+        self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}},
+                        "harness-work": {"dispatch --after": {"stdout": said}}})
+        self.scenario(self.land_calls())
+        p = self.ok("land", "34", "--yes", cwd=self.wt)       # from the worktree the land removes
+        self.assertFalse(os.path.exists(self.wt))
+        self.assertDispatchedOnce(12)
+        # after the ticket steps, the last thing the land runs
+        self.assertGreater(self.position("harness-work dispatch"), self.position("harness-board epic-check 3"))
+        self.assertEqual(self.order()[-1].split()[:2], ["harness-work", "dispatch"], self.order())
+        lines = p.stdout.splitlines()
+        at = lines.index("Dispatch:")
+        self.assertGreater(at, [i for i, line in enumerate(lines) if line.startswith("Ticket:")][0])
+        self.assertEqual(lines[at + 1:], ["  " + line for line in said.splitlines()], p.stdout)
+        self.assertEqual([line for line in p.stderr.splitlines() if "warning" in line], [], p.stderr)
+
+    def test_land_that_dispatches_nothing_prints_no_dispatch_line(self):
+        self.scenario(self.land_calls())
+        p = self.ok("land", "34", "--yes", cwd=self.main)
+        self.assertDispatchedOnce(12)
+        self.assertNotIn("Dispatch:", p.stdout)
+
+    def test_dispatch_failure_is_a_warning(self):
+        self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}},
+                        "harness-work": {"dispatch --after": {"exit": 3, "stdout": "half done\n",
+                                                              "stderr": "no capacity left\nsecond line\n"}}})
+        self.scenario(self.land_calls())
+        p = self.ok("land", "34", "--yes", cwd=self.wt)
+        self.assertDispatchedOnce(12)
+        said = [line for line in p.stderr.splitlines() if "dispatch after" in line]
+        self.assertEqual(said, ["harness-pr: warning: dispatch after #12: no capacity left"], p.stderr)
+        self.assertIn("Ticket: #12 closed", p.stdout)          # the land itself finished
+        self.assertFalse(os.path.exists(self.wt))
+
+    def test_dispatch_failure_without_stderr_names_the_exit(self):
+        self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}},
+                        "harness-work": {"dispatch --after": {"exit": 7}}})
+        self.scenario(self.land_calls())
+        p = self.ok("land", "34", "--yes", cwd=self.main)
+        self.assertEqual([line for line in p.stderr.splitlines() if "dispatch after" in line],
+                         ["harness-pr: warning: dispatch after #12: exit 7"], p.stderr)
+
     def test_land_stops_after_the_merge_on_a_dirty_worktree(self):
         self.scenario(self.land_calls())
         write(os.path.join(self.wt, "notes.txt"), "unsaved\n")
@@ -382,6 +435,7 @@ class Land(LandBase):
         self.assertFalse(any(a[:2] == ["issue", "view"] for a in self.gh_argv()))
         self.assertEqual(self.stub_calls("harness-board"), [])
         self.assertEqual(p.stdout.splitlines()[-1], "Ticket: none linked.")
+        self.assertEqual(self.dispatches(), [])          # no ticket closed, nothing to dispatch after (#390)
 
     def test_land_resumes_after_a_dirty_stop_without_a_second_merge(self):
         self.scenario(self.land_calls())
@@ -1374,6 +1428,7 @@ class LandRefusals(RowsInProcess, CopiedWorktree, WorktreeTest):
                                  {"match": ["pr", "merge"], "stdout": ""}])
                 self.assertOneLineError(self.pr("land", "34"), needle)
                 self.assertFalse(any(a[:2] == ["pr", "merge"] for a in self.gh_argv()))
+                self.assertEqual(self.dispatches(), [])          # a refusal before the merge dispatches nothing (#390)
 
 
 class LandGate(GateAsserts, RowsInProcess, CopiedWorktree, WorktreeTest):

@@ -399,6 +399,14 @@ class LandCost(WorktreeTest):
     def no_cost_warnings(self, stderr):
         return [line for line in stderr.splitlines() if "no cost block" in line]
 
+    def cost_runs(self):
+        """The harness-work calls that are cost runs: a land also runs `dispatch --after N` (#390), not pinned here."""
+        return [a for a in self.stub_calls("harness-work") if a[:1] == ["cost"]]
+
+    def without_dispatch_warnings(self, lines):
+        """The stderr lines but the `dispatch after #N` warnings of #390, which a missing harness-work adds."""
+        return [line for line in lines if not line.startswith("harness-pr: warning: dispatch after #")]
+
     def isolated_land(self, fx, tickets, work_next_to_tool):
         """A land by a copy of harness-pr in a plugin of its own (its lib and templates linked to the real ones),
         with no harness-work on PATH: the fakes but harness-work, the stubs and the system. With
@@ -461,7 +469,7 @@ class LandCost(WorktreeTest):
                 p = self.land(fx, tickets, cwd=cwd)
                 self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                 pr = str(fx["pr"])
-                self.assertEqual(self.stub_calls("harness-work"),
+                self.assertEqual(self.cost_runs(),
                                  [["cost", str(n), "--pr", pr, "--markdown", "--repo", self.main] for n in tickets],
                                  "one cost run per ticket, with the PR and the main checkout")
                 merge = self.position(f"gh pr merge {pr}")
@@ -479,7 +487,7 @@ class LandCost(WorktreeTest):
             p = self.isolated_land(fx, tickets, work_next_to_tool=True)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertEqual(self.no_cost_warnings(p.stderr), [], p.stderr)
-            self.assertEqual(self.stub_calls("harness-work"),
+            self.assertEqual(self.cost_runs(),
                              [["cost", str(n), "--pr", pr, "--markdown", "--repo", self.main] for n in tickets])
             for n in tickets:
                 self.assertTrue(self.resolution_of(n).endswith("\n\n" + blocks[n]), self.resolution_of(n))
@@ -561,7 +569,7 @@ class LandCost(WorktreeTest):
             p = self.isolated_land(fx, tickets, work_next_to_tool=False)
             self.assertEqual(p.returncode, before.returncode, p.stdout + p.stderr)
             self.assertEqual(p.stdout, before.stdout)
-            self.assertEqual(self.stub_calls("harness-work"), [], "no harness-work was run")
+            self.assertEqual(self.cost_runs(), [], "no cost run happened")
             warned = self.no_cost_warnings(p.stderr)
             for n in tickets:
                 mine = [line for line in warned if line.startswith(f"harness-pr: warning: no cost block for #{n}: ")]
@@ -570,8 +578,9 @@ class LandCost(WorktreeTest):
                 self.assertEqual(self.resolution_of(n), base)
                 self.assertLandedFollows(n, fx["sha"])
             self.assertEqual(len(warned), len(tickets), p.stderr)
-            self.assertEqual([line for line in p.stderr.splitlines() if line not in warned],
-                             before.stderr.splitlines(), "no other stderr than a land without cost")
+            others = [line for line in p.stderr.splitlines() if line not in warned]
+            self.assertEqual(self.without_dispatch_warnings(others), before.stderr.splitlines(),
+                             "no other stderr than a land without cost")
 
     def test_empty_cost_output_adds_nothing(self):
         for fx, tickets in self.CASES:
@@ -581,7 +590,7 @@ class LandCost(WorktreeTest):
                     self.costs({n: {"stdout": stdout} for n in tickets})
                     p = self.land(fx, tickets)
                     self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                    self.assertEqual([a[:2] for a in self.stub_calls("harness-work")],
+                    self.assertEqual([a[:2] for a in self.cost_runs()],
                                      [["cost", str(n)] for n in tickets], "the cost ran for each ticket")
                     for n in tickets:
                         self.assertEqual(self.resolution_of(n), base, f"#{n}: no block, not even a blank line")
@@ -616,7 +625,7 @@ class LandCost(WorktreeTest):
                     p = self.land(fx, tickets, state="MERGED", comments=comments)
                     self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                     self.assertFalse(any(a[:2] == ["pr", "merge"] for a in self.gh_argv()), "no second merge")
-                    self.assertEqual(self.stub_calls("harness-work"),
+                    self.assertEqual(self.cost_runs(),
                                      [["cost", str(n), "--pr", pr, "--markdown", "--repo", self.main] for n in ran],
                                      "the cost runs only for a ticket whose Resolution is posted")
                     for n in tickets:
