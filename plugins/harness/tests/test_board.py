@@ -3484,9 +3484,11 @@ class TierRouting(BoardTest):
         self.assertEqual(p.stderr, "")
         self.assertEqual(json.loads(p.stdout), [
             {"number": 4, "title": "T4", "type": "task", "size": "L", "risk": "low", "tier": "opus",
-             "flags": ["priority:high"]},
-            {"number": 2, "title": "T2", "type": "task", "size": "S", "risk": "low", "tier": "sonnet", "flags": []},
-            {"number": 3, "title": "T3", "type": "bug", "size": "M", "risk": "low", "tier": "opus", "flags": []}])
+             "flags": ["priority:high"], "blocked_by": []},
+            {"number": 2, "title": "T2", "type": "task", "size": "S", "risk": "low", "tier": "sonnet", "flags": [],
+             "blocked_by": []},
+            {"number": 3, "title": "T3", "type": "bug", "size": "M", "risk": "low", "tier": "opus", "flags": [],
+             "blocked_by": []}])  # #389: every row carries blocked_by
         p = self.ok("ready")
         self.assertEqual(p.stderr, "")
         self.assertEqual([line.split() for line in p.stdout.splitlines()],
