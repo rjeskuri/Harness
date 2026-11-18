@@ -1810,15 +1810,20 @@ class VerifyOnStopTests(HookTestCase):
         self.assertEqual(hook.stdout.read(), b"")
         hook.stdout.close()
         hook.stderr.close()
+        # poll for the command's exit; the probe runs before the deadline check, so a
+        # process that dies as the deadline passes is not a failure
         deadline = time.monotonic() + 5
         while True:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
                 break
-            self.assertLess(
-                time.monotonic(), deadline, "the verify command outlived its hook"
-            )
+            if time.monotonic() >= deadline:
+                try:
+                    os.kill(pid, 0)  # one last probe: the race is lost by a hair, not the test
+                except ProcessLookupError:
+                    break
+                self.fail("the verify command outlived its hook")
             time.sleep(0.02)
 
     # ---- docs-and-config-only turns (#163)

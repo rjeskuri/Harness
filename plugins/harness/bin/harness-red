@@ -22,7 +22,8 @@ Usage:
     harness-red files [--base origin/main]   # the branch's own test files: its changed runnable tests, plus the
                                              # test modules each other changed path names or HARNESS_TEST_MAP adds
     harness-red run [--base origin/main]     # HARNESS_TEST_CMD on those files: exit 0 when it passes, else 1;
-                                             # no files runs nothing (exit 0); writes no record
+                                             # prints the elapsed seconds; no files runs nothing (exit 0);
+                                             # writes no record
     harness-red scratch create               # a detached worktree of HEAD for the test-breaker; prints its path
     harness-red scratch run                  # the record's tests in the scratch: cheat passed (0) or cheat failed (1)
     harness-red scratch remove
@@ -55,6 +56,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 if _LIB not in sys.path:
@@ -729,11 +731,15 @@ def cmd_run(repo, args):
     if not files:
         print(NOTHING_RUN)
         return 0
+    started = time.monotonic()
     cmd, code, output, timed_out = run_tests(repo, files, repo.top)
+    elapsed = f"elapsed: {time.monotonic() - started:.1f}s"
     if timed_out:
         print(f"own tests: {len(files)} files, {cmd} {output}")
+        print(elapsed)
         return 1
     print(f"own tests: {len(files)} files, exit {code}")
+    print(elapsed)
     print(tail(output))
     return 0 if code == 0 else 1
 

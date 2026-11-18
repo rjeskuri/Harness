@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -559,6 +560,23 @@ class OwnRun(Repos, unittest.TestCase):
         self.assertIn("AssertionError: 5 != 6", p.stdout)
         for _, dirs, _ in os.walk(wt):                                  # PYTHONDONTWRITEBYTECODE reached the tests
             self.assertNotIn("__pycache__", dirs)
+
+    def test_run_prints_the_elapsed_seconds_of_the_own_tests_run(self):
+        # a passing and a failing run each carry one seconds figure (a non-negative number) beside the
+        # "own tests: N files, exit C" line; the value is a real clock, so only its shape is pinned
+        seconds = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*(?:s|sec|secs|seconds)\b", re.IGNORECASE)
+        for name, changes, code in (
+            ("one file passing", {"src/app/models.py": "edit"}, 0),
+            ("three files failing", {"src/app/models.py": "edit", "lib/user_store.py": "edit"}, 1),
+        ):
+            with self.subTest(name):
+                _, wt = self.new_repo(APP)
+                self.change(wt, changes)
+                p = self.red(wt, "run", **self.recording(RUNNER_LINES="3", RUNNER_EXIT=str(code)))
+                self.assertEqual(p.returncode, code, p.stdout + p.stderr)
+                found = seconds.findall(p.stdout)
+                self.assertEqual(len(found), 1, p.stdout)
+                self.assertGreaterEqual(float(found[0]), 0)
 
     def test_run_with_no_own_files_runs_nothing_and_exits_zero(self):
         for name, changes in (
