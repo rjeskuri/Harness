@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ticket work: a branch and worktree per ticket, the failure policy (retry, escalate, needs-input), dispatch
+Ticket work: a branch and worktree per ticket, the failure policy (retry, escalate, park), dispatch
 of a headless or background session per ready ticket, a Claude cloud session on one ticket, the run records, the
 budgets and the worktree list.
 
@@ -37,12 +37,12 @@ opus (a cached fable is the pre-#239 rubric's and yields to the route; a cache w
 as `harness-board tier` does, a cached fable reading as opus xhigh). The
 effort is --effort, else the route's effort when the attempt ran at the route's tier, else none (null). The second
 failure in a row escalates: sonnet prints `escalate opus`, opus with no effort or below xhigh `escalate opus xhigh`;
-a stage already at opus xhigh or max, or on an explicitly named fable, gets needs-input instead. No escalation goes to
-fable. fix never escalates: retry, then needs-input. A breaker failure answers done at any tier, however often (one
+a stage already at opus xhigh or max, or on an explicitly named fable, gets park instead. No escalation goes to
+fable. fix never escalates: retry, then park. A breaker failure answers done at any tier, however often (one
 round; its gaps go to the coder as requirements). --json adds effort, next_tier and next_effort.
 
 stage: records as attempt does (the same code, store and answer), then prints `next: <step>` on a second line
-(--json: attempt's object plus "next"). retry and escalate repeat the stage; needs-input names needs-input; done
+(--json: attempt's object plus "next"). retry and escalate repeat the stage; park names park; done
 goes tests -> breaker (risk:high) or code, breaker (pass or fail) -> code, code -> review,
 review and fix -> fix while the latest review round (harness_lib.reviews) has blocking findings, else ci,
 ci -> `ultra, then ready` (risk:high) or ready. Risk and flags come from the ticket cache (risk,
@@ -257,7 +257,7 @@ LIVE_STATES = ("running", "working", "blocked", "idle", "busy", "waiting", "star
 ENDED_STATES = {"done": "ok", "failed": "error", "stopped": "stopped"}   # outcome; another ended state is kept as is
 # A ticket whose turn is over: its issue CLOSED, or OPEN with one of these. The bg supervisor marks a finished session
 # `blocked` when its summary of the final reply suggests a next step for the user (#123), so the ticket decides.
-FINISHED_STATUSES = ("status:in-review", "status:needs-input")
+FINISHED_STATUSES = ("status:in-review", "status:needs-input", "status:blocked")   # blocked: parked (#387)
 PID_SLACK = 120               # seconds: a process younger than its run record by more is a recycled pid
 # The dispatching session's own identity, which a detached run must not inherit.
 SESSION_ENV = ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION",
@@ -1106,8 +1106,8 @@ def record_repo(record, repos):
 
 
 def issue_finished(issue):
-    """Whether a ticket's turn is over: its issue CLOSED (whatever labels it kept), or OPEN with status:in-review or
-    status:needs-input. In progress, ready, blocked or without a status, it is not."""
+    """Whether a ticket's turn is over: its issue CLOSED (whatever labels it kept), or OPEN with status:in-review,
+    status:needs-input or status:blocked (parked, #387). In progress, ready or without a status, it is not."""
     if not isinstance(issue, dict):
         return False
     state = str(issue.get("state", "")).upper()
@@ -1581,14 +1581,14 @@ def record_attempt(repo, cache, args):
     action = cost.attempt_action(args.stage, args.result, failures)     # fix: two rounds, never escalate; breaker: done
     nxt = next_route(tier, effort) if action == "escalate" else None
     if action == "escalate" and nxt is None:
-        action = "needs-input"          # nothing above opus xhigh or an explicit fable
+        action = "park"                 # nothing above opus xhigh or an explicit fable
     next_tier, next_effort = nxt or (None, None)
     return {"number": n, "stage": args.stage, "result": args.result, "tier": tier, "effort": effort,
             "failures": failures, "action": action, "next_tier": next_tier, "next_effort": next_effort}
 
 
 def answer_text(data):
-    """attempt's text answer: `done`, `retry`, `escalate <tier> [<effort>]` or `needs-input`."""
+    """attempt's text answer: `done`, `retry`, `escalate <tier> [<effort>]` or `park`."""
     return " ".join(x for x in (data["action"], data["next_tier"], data["next_effort"]) if x)
 
 
@@ -1627,11 +1627,11 @@ def stage_refusal(n, stage, result, marks, found):
 
 
 def next_step(data, marks, found):
-    """The work loop's step after the attempt `data`: the same stage on retry or escalate, needs-input, or the
+    """The work loop's step after the attempt `data`: the same stage on retry or escalate, park, or the
     stage done leads to (a breaker failure is done: code, with the gaps as requirements)."""
     stage, action = data["stage"], data["action"]
-    if action == "needs-input":
-        return "needs-input"
+    if action == "park":
+        return "park"
     if action != "done":
         return stage
     if stage in ("review", "fix"):
@@ -2294,8 +2294,8 @@ def parser():
 
     attempt = sub.add_parser("attempt", parents=[with_repo, with_json],
                              help="record a stage's result; prints done, retry, escalate <tier> [<effort>] or "
-                                  "needs-input (escalate opus, then escalate opus xhigh, then needs-input; fix "
-                                  "retries, then needs-input; a breaker failure is done)")
+                                  "park (escalate opus, then escalate opus xhigh, then park; fix retries, then "
+                                  "park; a breaker failure is done)")
     attempt.add_argument("number", type=issue_number, metavar="N")
     attempt.add_argument("stage", choices=STAGES)
     attempt.add_argument("result", choices=("pass", "fail"))

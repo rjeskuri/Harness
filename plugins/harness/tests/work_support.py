@@ -423,7 +423,7 @@ def route_of(kind, size, risk):
 
 def escalation_of(tier, effort):
     """#239: where an escalation-worthy failure at (tier, effort) goes: sonnet to opus; opus below xhigh to opus at
-    xhigh; opus at xhigh or above, and an explicit fable, have nothing above them (None: needs-input)."""
+    xhigh; opus at xhigh or above, and an explicit fable, have nothing above them (None: park)."""
     if tier == "sonnet":
         return "opus", None
     if tier == "opus" and effort in (None, "low", "medium", "high"):
@@ -434,7 +434,7 @@ def escalation_of(tier, effort):
 def escalation_text(tier, effort):
     nxt = escalation_of(tier, effort)
     if nxt is None:
-        return "needs-input"
+        return "park"
     return " ".join(["escalate", nxt[0]] + ([nxt[1]] if nxt[1] else []))
 
 
@@ -485,9 +485,9 @@ def ready_pr(number):
 # =========================================================================== #123: stop the session of a finished ticket
 # The bg supervisor marks a finished session `blocked` (not `done`) when its summary of the final reply suggests a next
 # step for the user (`/harness:land 121`), so the `claude agents` state cannot tell a finished run from a live one. The
-# ticket decides: a session whose ticket is status:in-review, status:needs-input or closed has ended, whatever its
-# state; the sweep closes its record and runs `claude stop <id>`. A session whose ticket is status:in-progress is never
-# stopped, and a live-state one stays live.
+# ticket decides: a session whose ticket is status:in-review, status:needs-input, status:blocked (#387) or closed has
+# ended, whatever its state; the sweep closes its record and runs `claude stop <id>`. A session whose ticket is
+# status:in-progress is never stopped, and a live-state one stays live.
 IN_REVIEW = ("task", "status:in-review", "size:S", "risk:low")
 NEEDS_INPUT = ("task", "status:needs-input", "size:S", "risk:low")
 NO_STATUS = ("task", "size:S", "risk:low")
