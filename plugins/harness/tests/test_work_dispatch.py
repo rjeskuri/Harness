@@ -1871,12 +1871,15 @@ class DispatchResume(RowsInProcess, CopiedProject, WorkTest):
         self.needs_input(12, comment(ME, iso_ago(hours=1), "Use main."))   # an older "Started on" is not this launch's
         began = time.monotonic()
         p = self.work("dispatch", "--only", "12", env=self.env(FAKECLAUDE_NO_START="1", HARNESS_START_WAIT="2",
-                                                               **CREDENTIALS))
+                                                               FAKECLAUDE_BG_ID="never12", **CREDENTIALS))
         took = time.monotonic() - began
         self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertEqual(len(self.claude_calls()), 1)
+        launch, stop = self.claude_calls()                               # the launch, then the stop of that session
+        self.assertEqual(launch["argv"][0], "--bg")
+        self.assertEqual(stop["argv"], ["stop", "never12"])
         [record] = self.run_records()
         self.assertEqual((record["ticket"], record["outcome"]), (12, "error"))
+        self.assertEqual(record["bg_id"], "never12")
         self.assertTrue(record["ended_at"])
         self.assertTrue(record.get("error") and "\n" not in record["error"], record)
         self.assertIn("#12", p.stderr)
@@ -1890,7 +1893,50 @@ class DispatchResume(RowsInProcess, CopiedProject, WorkTest):
         self.assertEqual(len(records), 2)
         newest = max(records, key=lambda r: r["started_at"] + r["id"])
         self.assertEqual((newest["bg_id"], newest["ended_at"], newest["outcome"]), ("again12", None, None))
-        self.assertEqual(len(self.claude_calls()), 2)
+        calls = self.claude_calls()                                       # launch, stop, launch again: no second stop
+        self.assertEqual([c["argv"][0] for c in calls], ["--bg", "stop", "--bg"])
+
+    def test_every_launch_that_never_starts_is_stopped_after_one_shared_wait(self):
+        issues = [issue(n, labels=NEEDS_INPUT, title=f"Resumed {n}", comments=[
+            comment(ME, iso_ago(hours=5), self.STARTED_EARLIER.format(n=n)), comment(ME, iso_ago(hours=3), QUESTION),
+            comment(ME, iso_ago(hours=1), "Use main.")]) for n in (12, 13)]
+        self.scenario(issues=issues)
+        wait = 3
+        began = time.monotonic()
+        p = self.work("dispatch", "--only", "12,13", env=self.env(FAKECLAUDE_NO_START="1", FAKECLAUDE_BG_ID="never",
+                                                                  HARNESS_START_WAIT=str(wait), **CREDENTIALS))
+        took = time.monotonic() - began
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertGreaterEqual(took, wait - 0.5)
+        self.assertLess(took, 1.7 * wait)                                 # waits in turn would take about 2 * wait
+        records = self.run_records()
+        self.assertEqual(sorted((r["ticket"], r["outcome"]) for r in records), [(12, "error"), (13, "error")])
+        self.assertTrue(all(r["ended_at"] for r in records), records)
+        calls = self.claude_calls()
+        self.assertEqual(sorted(c["argv"][-1] for c in calls if c["argv"][0] == "--bg"),
+                         ["/harness:work 12", "/harness:work 13"])
+        self.assertEqual([c["argv"] for c in calls if c["argv"][0] == "stop"], [["stop", "never"]] * 2)
+        for n in (12, 13):
+            self.assertIn(f"#{n}", p.stderr)
+
+    def test_a_headless_run_that_exits_without_starting_is_left_for_the_sweep_to_classify(self):
+        self.scenario(issues=[issue(12)], ready=[ready_row(12)])
+        env = self.env(FAKECLAUDE_NO_START="1", FAKECLAUDE_MODE="billing", HARNESS_START_WAIT="20", **CREDENTIALS)
+        began = time.monotonic()
+        p = self.work("dispatch", "--venue", "headless", env=env)
+        self.assertLess(time.monotonic() - began, 15)                     # it saw the exit, it did not wait it out
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertRegex(p.stderr, r"#12 not launched: the session exited before it posted")
+        [record] = self.run_records()
+        self.assertEqual((record["ticket"], record["venue"], record["ended_at"], record["outcome"]),
+                         (12, "headless", None, None))                    # not ended by dispatch
+        self.assertEqual([c["argv"][0] for c in self.claude_calls()], ["-p"])   # nothing to stop
+        self.assertTrue(wait_for(lambda: pid_gone(record["pid"])))
+        [swept] = self.ok_json("runs", "--sweep", "--json")
+        self.assertTrue(swept["ended_at"])
+        self.assertNotEqual(swept["outcome"], "ok")
+        self.assertTrue(self.read_json(self.budgets_path())["api"]["exhausted_until"])   # billing marked the budget
+        self.assertIn("api: exhausted", self.ok("budget").stdout)
 
     def test_a_session_that_starts_is_never_failed_by_the_wait(self):
         self.scenario(issues=[issue(7, title="Seven")], ready=[ready_row(7, "Seven")])
