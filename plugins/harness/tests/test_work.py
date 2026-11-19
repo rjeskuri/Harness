@@ -43,8 +43,9 @@ class Start(WorkTest):
 
         data = self.ok_json("start", "12", "--json")
         self.assertEqual(set(data), {"number", "branch", "worktree", "tier", "previous_status", "waiting", "answers",
-                                     "context"})
+                                     "context", "resume", "pr"})
         self.assertEqual((data["previous_status"], data["waiting"], data["answers"]), ("ready", False, []))
+        self.assertEqual((data["resume"], data["pr"]), (False, None))     # a fresh start: no branch, no PR
         wt = self.worktree_path()
         self.assertEqual((data["number"], data["branch"], data["worktree"], data["tier"]), (12, BRANCH, wt, "sonnet"))
         self.assertTrue(data["context"].startswith("# #12 Add the board tool"), data["context"][:80])
@@ -92,6 +93,29 @@ class Start(WorkTest):
         self.assertEqual(self.git(wt, "rev-parse", "HEAD"), head)
         self.assertEqual(self.git(wt, "rev-parse", "--abbrev-ref", "@{u}"), "origin/t/12-older-title")
         self.assertFalse(os.path.exists(self.worktree_path()))
+
+    def push_branch_with_commit(self):
+        other = self.other_clone()
+        self.git(other, "switch", "-q", "-c", BRANCH)
+        write(os.path.join(other, "WIP.md"), "work in progress\n")
+        self.git(other, "add", "-A")
+        self.git(other, "commit", "-q", "-m", "WIP")
+        self.git(other, "push", "-q", "origin", BRANCH)
+
+    def test_start_of_a_ready_ticket_whose_branch_has_a_pr_is_a_resume_naming_the_pr(self):
+        # #407: an unparked ticket (status ready) with a branch and an open PR resumes; a draft PR counts too
+        self.push_branch_with_commit()
+        for number, rows in ((7, ready_pr(7)), (23, draft(23))):
+            with self.subTest(pr=number):
+                self.scenario(issues=[issue()], prs=rows)
+                data = self.ok_json("start", "12", "--json")
+                self.assertEqual((data["previous_status"], data["resume"], data["pr"]), ("ready", True, number))
+
+    def test_start_of_a_ready_ticket_whose_branch_has_commits_but_no_pr_is_a_resume_without_a_pr(self):
+        self.push_branch_with_commit()
+        self.scenario(issues=[issue()], prs=[])
+        data = self.ok_json("start", "12", "--json")
+        self.assertEqual((data["resume"], data["pr"]), (True, None))
 
     def test_start_copies_gitignored_files_listed_in_worktreeinclude(self):
         write(os.path.join(self.repo, ".env"), "KEY=1\n")              # ignored and included: copied
