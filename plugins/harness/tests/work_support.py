@@ -607,5 +607,334 @@ class CloudTest(WorkTest):
 WAVE_ID_RE = r"^w\d{14}(?:-\d+)?$"
 
 
+# =========================================================================== #164: dispatch --all-projects
+# gh calls name no repository (they run in the project's main checkout), so a test with several projects routes them
+# by their working directory: FAKEGH_PROJECTS maps each project's main checkout (a real path) to its own scenario and
+# gh log, and a gh or claude started in it, or under it (a ticket worktree), gets them as FAKEGH_SCENARIO and
+# FAKEGH_LOG. A launched session's "Started on" comment (FAKE_CLAUDE's post_started) so lands in its own project's
+# scenario. A call outside every project keeps the test's own FAKEGH_SCENARIO and FAKEGH_LOG.
+ROUTED = """#!{python} -IS
+import json, os, sys
+table = json.loads(os.environ.get("FAKEGH_PROJECTS") or "{{}}")
+here = os.path.realpath(os.getcwd())
+best = ""
+for root in table:
+    if (here == root or here.startswith(root + os.sep)) and len(root) > len(best):
+        best = root
+if best:
+    os.environ["FAKEGH_SCENARIO"] = table[best]["scenario"]
+    os.environ["FAKEGH_LOG"] = table[best]["log"]
+os.execv({python!r}, [{python!r}, "-I", "-S", {target!r}] + sys.argv[1:])
+"""
+# launchctl for --install-launchd and --uninstall-launchd (as test_digest's): each call one JSON line in LAUNCHCTL_LOG;
+# a subcommand named in LAUNCHCTL_FAIL fails with exit 5.
+LAUNCHCTL_RECORDER = """#!{python} -IS
+import json, os, sys
+args = sys.argv[1:]
+log = os.environ.get("LAUNCHCTL_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(["launchctl"] + args) + "\\n")
+if args and args[0] in os.environ.get("LAUNCHCTL_FAIL", "").split(","):
+    sys.stderr.write(args[0] + " failed: 5: Input/output error\\n")
+    sys.exit(5)
+"""
+AUTODISPATCH = "HARNESS_AUTODISPATCH"
+
+
+def routed_bins():
+    """routedbin, made once per module beside setUpModule's bins: gh and claude routed by cwd, and launchctl."""
+    folder = os.path.join(BINS["root"], "routedbin")
+    if not os.path.isdir(folder):
+        executable(os.path.join(folder, "gh"), ROUTED.format(python=sys.executable, target=FAKEGH))
+        executable(os.path.join(folder, "claude"),
+                   ROUTED.format(python=sys.executable, target=os.path.join(BINS["fakebin"], "claude")))
+        executable(os.path.join(folder, "launchctl"), LAUNCHCTL_RECORDER.format(python=sys.executable))
+    return folder
+
+
+class ProjectsTest(WorkTest):
+    """Several registered projects (~/.claude/harness/projects.json): each its own main checkout and bare origin,
+    with the .claude/settings.json of PROJECTS committed and pushed (None: none), built once per class and copied for
+    each setUp. Each project has its own gh scenario (`board`) and gh log; `self.repo` is the first project. A test's
+    first harness-work run is a process of its own, later ones run in this process (as test_work_dispatch's
+    RowsInProcess), except a dispatch that may launch a headless session."""
+
+    PROJECTS = {"alpha-app": {AUTODISPATCH: "1"},
+                "beta-app": {AUTODISPATCH: 1},
+                "gamma-app": {"CLAUDE_VERIFY_CMD": "make check"},
+                "delta-app": {AUTODISPATCH: "1"}}
+    ran_a_process = False
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        root = os.path.realpath(tempfile.mkdtemp(prefix="harness-work-projects-"))
+        cls.addClassCleanup(shutil.rmtree, root, True)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("CLAUDE", "HARNESS_", "GIT_", "FAKEGH_", "FAKECLAUDE_"))}
+        env.update(HOME=os.path.join(root, "home"), PATH=os.pathsep.join(["/usr/bin", "/bin"]),
+                   GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@localhost",
+                   GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@localhost")
+
+        def git(repo, *args, **extra):
+            p = subprocess.run([GIT, "-C", repo, "-c", "commit.gpgsign=false", "-c", "maintenance.auto=false",
+                                "-c", "gc.auto=0", *args], env=dict(env, **extra), capture_output=True, text=True)
+            if p.returncode != 0:
+                raise AssertionError(f"template: git {' '.join(args)}: {p.stderr}")
+
+        for name, settings in cls.PROJECTS.items():
+            origin, main = os.path.join(root, name + ".git"), os.path.join(root, name)
+            for repo, flags in ((origin, ("--bare",)), (main, ())):
+                os.makedirs(repo)
+                git(repo, "init", "-q", *flags, "-b", "main")
+                git(repo, "config", "gc.auto", "0")
+                git(repo, "config", "maintenance.auto", "false")
+            write(os.path.join(main, "README.md"), f"# {name}\n")
+            write(os.path.join(main, ".gitignore"), ".env\n*.log\n")
+            write(os.path.join(main, ".worktreeinclude"), "# copied into new worktrees\n.env\n.env.*\n")
+            if settings is not None:
+                write(os.path.join(main, ".claude", "settings.json"), json.dumps({"env": settings}))
+            git(main, "add", "-A")
+            git(main, "commit", "-q", "-m", "First", GIT_AUTHOR_DATE=TEN_DAYS_AGO, GIT_COMMITTER_DATE=TEN_DAYS_AGO)
+            git(main, "remote", "add", "origin", origin)
+            git(main, "push", "-q", "-u", "origin", "main")
+        cls.template_root = root
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="harness-work-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = self.mk("home")
+        self.scenario_path = os.path.join(self.tmp, "scenario.json")
+        self.gh_log = os.path.join(self.tmp, "gh.log")
+        self.claude_log = os.path.join(self.tmp, "claude.log")
+        self.launch_log = os.path.join(self.tmp, "launchctl.log")
+        self.elsewhere = self.mk("elsewhere")         # in no repository, as launchd's working directory
+        root = type(self).template_root
+        self.projects = {}
+        for name in self.PROJECTS:
+            gitrepo_support.copy_repo(os.path.join(root, name + ".git"), os.path.join(self.tmp, name + ".git"))
+            main = os.path.join(self.tmp, name)
+            gitrepo_support.copy_repo(os.path.join(root, name), main)
+            config = os.path.join(main, ".git", "config")
+            write(config, read_text(config).replace(os.path.join(root, name + ".git"),
+                                                    os.path.join(self.tmp, name + ".git")))
+            self.projects[name] = main
+        first = next(iter(self.PROJECTS))
+        self.repo, self.origin = self.projects[first], os.path.join(self.tmp, first + ".git")
+        self.key = sha12(os.path.realpath(self.repo))
+        self.scenario()
+        for name in self.PROJECTS:
+            self.board(name)
+        self.register(*self.PROJECTS)
+
+    # ----------------------------------------------------------- the projects
+    def register(self, *names):
+        """The registry: `names` in that order, each entry named after its folder; a name that is not one of the
+        projects is a path where nothing is (a project that was moved away)."""
+        paths = [self.projects.get(n) or os.path.join(self.tmp, n) for n in names]
+        write(os.path.join(self.home, ".claude", "harness", "projects.json"), json.dumps(
+            {"version": 1, "projects": [{"path": p, "name": os.path.basename(p)} for p in paths]}))
+
+    def scenario_of(self, name):
+        return os.path.join(self.tmp, name + ".scenario.json")
+
+    def gh_log_of(self, name):
+        return os.path.join(self.tmp, name + ".gh.log")
+
+    @staticmethod
+    def title(name, n):
+        return f"{name} ticket {n}"
+
+    def board(self, name, ready=(), live=(), incidents=(), failing=False):
+        """Project `name`'s gh: `ready` tickets status:ready, `live` ones status:in-progress, `incidents` the open
+        issues labelled incident; with `failing` every `gh issue list` fails."""
+        calls = []
+        if failing:
+            calls.append({"match": ["issue", "list"], "exit": 1,
+                          "stderr": "HTTP 502: Bad gateway (https://api.github.com/graphql)\n"})
+        found = [{"number": n, "title": f"Outage {n}", "labels": [{"name": "incident"}]} for n in incidents]
+        calls += [{"contains": ["issue", "list", "--label", "incident"], "stdout_json": found},
+                  {"contains": ["issue", "list", "--label=incident"], "stdout_json": found}]
+        calls += [{"match": ["issue", "view", str(n)], "stdout_json": issue(n, title=self.title(name, n))}
+                  for n in ready]
+        calls += [{"match": ["issue", "view", str(n)],
+                   "stdout_json": issue(n, labels=IN_PROGRESS, title=self.title(name, n))} for n in live]
+        calls += [
+            {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": f"o/{name}"}},
+            {"match": ["issue", "list"], "stdout_json": [ready_row(n, self.title(name, n)) for n in ready]},
+            {"match": ["issue", "edit"], "stdout": ""},
+            {"match": ["issue", "comment"], "stdout": f"https://github.com/o/{name}/issues/1#issuecomment-1\n"},
+            {"match": ["pr", "list"], "stdout_json": []},
+            {"match": ["api", "user"], "stdout": "rjeskuri\n"},
+            {"match": ["api"], "stdout_json": []},
+        ]
+        path = self.scenario_of(name)
+        write(path, json.dumps({"calls": calls}))
+        if os.path.exists(path + ".state.json"):
+            os.unlink(path + ".state.json")
+
+    def commit_settings(self, name, env):
+        """Project `name`'s .claude/settings.json with this env, committed and pushed to its origin."""
+        main = self.projects[name]
+        write(os.path.join(main, ".claude", "settings.json"), json.dumps({"env": env}))
+        self.git(main, "add", "-A")
+        self.git(main, "commit", "-q", "-m", "Settings")
+        self.git(main, "push", "-q", "origin", "main")
+
+    def live_run(self, name, ticket, bg_id, started_at=None):
+        """An unended bg run record of project `name`'s ticket (live while `claude agents` lists bg_id live)."""
+        main = os.path.realpath(self.projects[name])
+        rid = f"{sha12(main)}-{ticket}-20261019070000"
+        record = {"id": rid, "ticket": ticket, "repo": main,
+                  "worktree": os.path.join(main, ".claude", "worktrees", f"t-{ticket}-x"), "branch": f"t/{ticket}-x",
+                  "venue": "bg", "bg_id": bg_id, "log": os.path.join(self.runs_dir(), rid + ".log"),
+                  "started_at": started_at or iso_ago(hours=1), "ended_at": None, "exit": None, "outcome": None}
+        write(os.path.join(self.runs_dir(), rid + ".json"), json.dumps(record))
+        return record
+
+    @staticmethod
+    def agents(states):
+        """`claude agents --json` listing {bg_id: state}."""
+        return json.dumps([{"id": bg_id, "kind": "background", "state": state} for bg_id, state in states.items()])
+
+    def env(self, **extra):
+        bins = routed_bins()
+        env = super().env()
+        env.update(PATH=os.pathsep.join([bins, env["PATH"]]), HARNESS_GH=os.path.join(bins, "gh"),
+                   HARNESS_CLAUDE=os.path.join(bins, "claude"), HARNESS_LAUNCHCTL=os.path.join(bins, "launchctl"),
+                   LAUNCHCTL_LOG=self.launch_log,
+                   FAKEGH_PROJECTS=json.dumps({os.path.realpath(main): {"scenario": self.scenario_of(name),
+                                                                         "log": self.gh_log_of(name)}
+                                               for name, main in self.projects.items()}))
+        env.update(extra)
+        return env
+
+    def work(self, *args, env=None, cwd=None):
+        headless = (tuple(args[:1]) == ("dispatch",) and "--dry-run" not in args
+                    and any(a == "--api" or "headless" in a for a in args))
+        if not self.ran_a_process or headless:
+            self.ran_a_process = True
+            return super().work(*args, env=env, cwd=cwd)
+        p = gitrepo_support.run_in_process(TOOL, args=args, cwd=cwd or self.repo, env=env or self.env())
+        self.assertNotIn("Traceback", p.stderr)
+        return p
+
+    # ----------------------------------------------------------- what happened
+    def project_of(self, path):
+        real = os.path.realpath(path)
+        for name, main in self.projects.items():
+            main = os.path.realpath(main)
+            if real == main or real.startswith(main + os.sep):
+                return name
+        return None
+
+    def launches(self):
+        """(project, ticket) of every session launched (`claude --bg` or `claude -p`), in order."""
+        out = []
+        for call in self.claude_calls():
+            if "--bg" in call["argv"] or "-p" in call["argv"]:
+                found = re.search(r"/harness:work (\d+)", " ".join(call["argv"]))
+                out.append((self.project_of(call["cwd"]), int(found.group(1)) if found else None))
+        return out
+
+    def project_gh_calls(self, name):
+        path = self.gh_log_of(name)
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as fh:
+            return [json.loads(line)["argv"] for line in fh if line.strip()]
+
+    def started_in(self, name):
+        """What starting a ticket leaves in project `name`: a ticket worktree, or a gh issue edit or comment."""
+        worktrees = os.path.join(self.projects[name], ".claude", "worktrees")
+        found = [f"worktree {w}" for w in (os.listdir(worktrees) if os.path.isdir(worktrees) else [])]
+        found += [" ".join(a[:3]) for a in self.project_gh_calls(name) if a[:2] in (["issue", "edit"],
+                                                                                   ["issue", "comment"])]
+        return found
+
+    def runs_snapshot(self):
+        """{file name: bytes} of the runs directory."""
+        folder = self.runs_dir()
+        out = {}
+        for name in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+            with open(os.path.join(folder, name), "rb") as fh:
+                out[name] = fh.read()
+        return out
+
+
+# --------------------------------------------------------------- #164: a bg session's transcript at the usage limit
+# The refusal Claude Code 2.1.310 wrote on 2026-10-24 when a bg session hit the plan's limit (verbatim, trimmed):
+# one synthetic assistant line on the main thread; 1 to 8 non-assistant lines always followed it.
+USAGE_LIMIT_SESSION = "106605e7-7ead-4edf-bd57-8a9e15b9a29d"
+SESSION_LIMIT_TEXT = "You've hit your session limit \u00b7 resets 8:40pm (Asia/Tokyo)"
+
+
+def usage_limit_refusal(timestamp="2026-10-24T10:11:06.486Z", resets_at=1792842000, quota_resets_at=None,
+                        text=SESSION_LIMIT_TEXT, sidechain=False):
+    """The refusal entry. `resets_at` goes to apiErrorParams.rate_limit_info.resetsAt, `quota_resets_at` (default:
+    the same) to quotaLimits.resetsAt; None leaves that block out."""
+    entry = {"type": "assistant", "isSidechain": sidechain, "timestamp": timestamp,
+             "message": {"model": "<synthetic>", "content": [{"type": "text", "text": text}]},
+             "apiError": "usage_limit_reached"}
+    quota = resets_at if quota_resets_at is None else quota_resets_at
+    if resets_at is not None:
+        entry["apiErrorParams"] = {"rate_limit_info": {
+            "status": "rejected", "resetsAt": resets_at, "rateLimitType": "five_hour", "overageStatus": "rejected",
+            "overageDisabledReason": "org_level_disabled", "isUsingOverage": False}}
+    if quota is not None:
+        entry["quotaLimits"] = {"status": "rejected", "resetsAt": quota, "rateLimitType": "five_hour"}
+    entry.update({"error": "rate_limit", "isApiErrorMessage": True, "apiErrorStatus": 429, "sessionKind": "bg",
+                  "version": "2.1.310"})
+    return entry
+
+
+def said(text, when, sidechain=False):
+    """An ordinary assistant reply."""
+    return {"type": "assistant", "isSidechain": sidechain, "timestamp": when,
+            "message": {"model": "claude-opus-5-5", "content": [{"type": "text", "text": text}]}}
+
+
+def prompted(text, when, **fields):
+    return dict({"type": "user", "isSidechain": False, "timestamp": when,
+                 "message": {"role": "user", "content": text}}, **fields)
+
+
+def after_turn(session, when):
+    """The non-assistant lines that follow a turn's end in a real transcript."""
+    return [{"type": "system", "subtype": "turn_duration", "durationMs": 48211, "isSidechain": False,
+             "timestamp": when},
+            {"type": "last-prompt", "lastPrompt": "/harness:work 40", "sessionId": session},
+            {"type": "custom-title", "customTitle": "alpha-app #40 alpha-app ticket 40", "sessionId": session}]
+
+
+def stamp(text, **delta):
+    """A transcript timestamp (`...T10:11:06.486Z`) moved by `delta`, in the same form."""
+    when = dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ") + dt.timedelta(**delta)
+    return when.strftime("%Y-%m-%dT%H:%M:%S.") + f"{when.microsecond // 1000:03d}Z"
+
+
+def limited_transcript(session, refusal):
+    """A bg session's main transcript that ends on `refusal`: the prompt, a reply and a subagent's line before it,
+    then the lines that follow a turn; every time taken from the refusal's."""
+    at = refusal["timestamp"]
+    return ([prompted("/harness:work 40", stamp(at, minutes=-13)),
+             said("Starting ticket #40: reading the ticket.", stamp(at, minutes=-12)),
+             said("Tests written.", stamp(at, minutes=-6), sidechain=True),
+             refusal] + after_turn(session, stamp(at, milliseconds=120)))
+
+
+def transcript_start(lines):
+    """A run's start a minute before its transcript's first line."""
+    first = min(e["timestamp"] for e in lines if e.get("timestamp"))
+    return (dt.datetime.strptime(first[:19], "%Y-%m-%dT%H:%M:%S") - dt.timedelta(minutes=1)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def epoch_iso(seconds):
+    """A Unix time as the budgets' UTC stamp, from first principles."""
+    return dt.datetime.fromtimestamp(seconds, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 # Everything above, underscored names included, for `from work_support import *`.
 __all__ = [_n for _n in list(globals()) if not _n.startswith("__")]
