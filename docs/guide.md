@@ -11,9 +11,9 @@ The harness turns each project's GitHub issues into the context for every sessio
 | Personal instructions, `~/.claude/CLAUDE.md` | A short file Claude reads at the start of every session | Carries your preferences and the loop's rules: read the ticket first, never work on main, tests first, route by tier |
 | The board | GitHub Issues in each project's private repo: epics, task sub-issues, labels for status, size and risk | The single record of what is asked, what is in progress and what needs you. Agents read it before working and write status back |
 | The `harness` plugin | Seven agents, eight skills and seven hooks, installed once for your user | Agents do the work, skills are the procedures you start with `/harness:<name>`, hooks enforce the rules whatever the model thinks |
-| The `harness-*` tools | Nine command-line tools, on the Bash PATH in every session | The deterministic parts: board edits, worktrees, the red proof, PRs, budgets. Outside a session they live in `~/portfolio_projects/Harness/plugins/harness/bin/` |
+| The `harness-*` tools | Nine command-line tools, on the Bash PATH in every session | The deterministic parts: board edits, worktrees, the red proof, PRs, budgets. Outside a session they live in `~/Projects/Harness/plugins/harness/bin/` |
 | The digest | A launchd job that runs `harness-digest` daily at 08:30 | One notification with PRs to review, tickets that need input and stale work, across every project |
-| The Harness repo, `~/portfolio_projects/Harness` | The source of all of the above, under git | Edit a skill, an agent or a hook there, run `/reload-plugins`, and every project picks it up |
+| The Harness repo, `~/Projects/Harness` | The source of all of the above, under git | Edit a skill, an agent or a hook there, run `/reload-plugins`, and every project picks it up |
 
 Each project keeps its own `CLAUDE.md`, hooks, rules and skills. The harness adds the board, the guards and the loop beside them, in every project including jotform-glow-sync.
 
@@ -21,10 +21,10 @@ Each project keeps its own `CLAUDE.md`, hooks, rules and skills. The harness add
 
 In a terminal, in this order.
 
-1. **Install.** `sh ~/portfolio_projects/Harness/scripts/install.sh`. It installs the plugin, your `CLAUDE.md`, the model settings and the daily digest, and backs up what it replaces. `claude --version` should print 2.1.296 or newer.
+1. **Install.** `sh ~/Projects/Harness/scripts/install.sh`. It installs the plugin, your `CLAUDE.md`, the model settings and the daily digest, and backs up what it replaces. `claude --version` should print 2.1.296 or newer.
 2. **Store the API key.** `security add-generic-password -a "$USER" -s harness-anthropic -w` prompts for the key and keeps it in the keychain. Only `/harness:work --api` (or `--venue headless`) runs read it, from there, so it never appears on a command line or in the environment.
 3. **Check GitHub.** `gh auth status` should show your account. The board needs it.
-4. **Register your projects.** `harness-projects discover` lists repos with Claude Code sessions. Add each with `harness-projects add <path>`. Mark client work billable: `harness-projects add ~/jotform-glow-sync --billable --client "Global G.L.O.W."`.
+4. **Register your projects.** `harness-projects discover` lists repos with Claude Code sessions. Add each with `harness-projects add <path>`. Mark client work billable: `harness-projects add ~/Projects/jotform-glow-sync --billable --client "Global G.L.O.W."`.
 5. **Put the first repo on the board.** `cd` into it, start `claude`, and trust the folder when asked. Run `/harness:new-project`. It interviews you, shows the scaffold plan, and asks before it creates the private GitHub repository and pushes. A repo that already has commits gets the scaffold through a chore ticket and a PR: the first PR to land.
 6. **Plan once.** `/harness:plan <a small, real request>`. Answer the interview, read the proposed table of tasks, approve it. The epic and tasks appear on GitHub.
 7. **Work one ticket here.** `/harness:work <n>` runs the whole loop in this session, so you see each stage. Later, `/harness:work` with no number dispatches every ready ticket in the background.
@@ -139,7 +139,7 @@ A project that sets `HARNESS_ULTRAREVIEW=off` gets no ultrareview: `harness-pr u
 | Budget exhausted | `harness-work budget status`. Top up, then `harness-work budget reset api`. Until then `--api` and `--venue headless` are refused; dispatch runs on the subscription, its default, either way |
 | Old worktrees pile up | `harness-work worktrees` lists them and flags stale ones; `harness-work worktree remove <branch>` removes one |
 | Standup says the fleet could not be read | The `claude` binary was not found. The tool looks on PATH, then in `~/.local/bin` |
-| `/hooks` lists nothing from the harness | Trust the folder, then `/reload-plugins`. `claude plugin validate ~/portfolio_projects/Harness` checks the plugin. `claude --debug` logs every hook run with its exit code to `~/.claude/debug/<session-id>.txt` |
+| `/hooks` lists nothing from the harness | Trust the folder, then `/reload-plugins`. `claude plugin validate ~/Projects/Harness` checks the plugin. `claude --debug` logs every hook run with its exit code to `~/.claude/debug/<session-id>.txt` |
 | An edit was flagged for a secret | Move the value to the environment, the keychain or a gitignored file. A fixtures file with fake tokens can carry the line `harness: allow-secrets` |
 | No notifications | `brew list terminal-notifier`; allow it under System Settings, Notifications; check that a Focus mode is not hiding banners |
 | Everything misbehaves | `"disableAllHooks": true` in the project's `.claude/settings.local.json` pauses its hooks. `claude doctor` checks the install |
