@@ -46,13 +46,28 @@ the chain), restored after a subshell or a child shell, and moved for git by -C,
   - in every repo, on every branch: a force push (--force, -f, --force-with-lease or a
     +refspec), and a push that names main or master as the destination (main,
     HEAD:main, refs/heads/main, :main), --mirror, --all, or a matching (:) or wildcard
-    refspec that reaches main.
+    refspec that reaches main;
+  - (d, #268) when the repo git runs in is a linked worktree, or a main working tree on
+    another branch with a commit, or the command starts in one sharing that repo's common
+    git dir (git -C <main checkout> from a ticket worktree): what moves main, master or
+    origin's remote-tracking refs, shadows them, or retargets origin (harness-red's proof
+    trusts a merge of main):
+    update-ref of such a ref (refs/heads/main, main, refs/tags/main, refs/remotes/origin/*,
+    origin/*, refs/tags/origin/*), fetch or pull with --update-head-ok or a refspec or
+    --refmap writing one (main:main, x:refs/remotes/origin/main, a pattern reaching one),
+    branch -f|-m|-C onto main or -D main, checkout -B, switch -C or worktree add -B main,
+    a tag named main or origin/<x>, remote add, set-url or rename of origin, and config
+    writes to remote.origin.* (a value, --add, --replace-all, --unset, set, unset, a
+    section renamed to or from it); and a write (as above) under refs/ or logs/ of that
+    repo's common git dir, or to its packed-refs. Reads, git fetch origin, pull and merge
+    of origin/main, and main or origin/main as a start point run.
 Reading, mkdir, git fetch, pull, switch, checkout <branch>, worktree, gh, harness-* and
 the project's CLAUDE_VERIFY_CMD run.
 
-Allowed always: a linked worktree, a detached HEAD, a repo with no commits, a path outside
-any repo, and any repo whose HARNESS_ALLOW_MAIN is 1 (environment first, then `env` in the
-repo's .claude/settings.json, then .claude/settings.local.json).
+Allowed always, but for rules (c) and (d): a linked worktree, a detached HEAD, a repo with
+no commits, a path outside any repo. Allowed always: any repo whose HARNESS_ALLOW_MAIN is 1
+(environment first, then `env` in the repo's .claude/settings.json, then
+.claude/settings.local.json).
 
 The shell walker (Part, split_command, command_words, stdin_program and their tables) comes
 from harness_lib.shellwalk, shared with readonly_bash.py. tests_first.py imports this
@@ -118,6 +133,33 @@ PUSH_ADVICE = (
     "main and master change only through a pull request: push the ticket branch and "
     "open one (harness-pr open <issue#>)."
 )
+MAIN_REFS_ADVICE = (
+    "From a ticket branch or a linked worktree, leave main, origin and origin/main as they "
+    "are: git fetch origin updates origin/main, and main changes only through a pull request."
+)
+# Rule (d): the refs whose files and reflogs a Bash write must not touch, under the common
+# git dir; refs a fetch pattern must not reach.
+REF_STORES = ("refs", "logs")
+WATCHED_REFS = tuple(
+    f"refs/{kind}/{b}" for kind in ("heads", "remotes/origin") for b in sorted(PROTECTED)
+)
+FETCH_SHORT_VALUES = "josX"  # pull's -s and -X too: it hands its refspecs to fetch
+FETCH_LONG_VALUES = set(
+    "--depth --deepen --shallow-since --shallow-exclude --jobs --refmap --server-option "
+    "--upload-pack --negotiation-tip --filter --recurse-submodules-default "
+    "--submodule-prefix --strategy --strategy-option".split()
+)
+TAG_LONG_VALUES = set("--message --file --local-user --trailer --cleanup --sort --format".split())
+# git tag options under which it lists, deletes or verifies tags instead of creating one
+TAG_NOT_CREATING = set(
+    "-l --list -d --delete -v --verify -n --contains --no-contains --merged --no-merged "
+    "--points-at".split()
+)
+CONFIG_LONG_VALUES = set("--file --blob --type --default --comment --value --url".split())
+CONFIG_READS = set(
+    "--get --get-all --get-regexp --get-urlmatch --get-color --get-colorbool -l --list".split()
+)
+CONFIG_WRITES = {"--add", "--replace-all", "--unset", "--unset-all"}
 
 NODES = {"node", "nodejs", "bun"}
 NODE_VALUE_OPTIONS = set(
@@ -241,10 +283,10 @@ def toplevel(directory: str | None) -> Path | None:
     return Path(top) if out.returncode == 0 and top else None
 
 
-def protected_repo(directory: str) -> tuple[Path, str] | None:
-    """(top-level, branch) when `directory` is in the main working tree of a repo that is
-    on main or master and has a commit; None otherwise (not a repo, a linked worktree,
-    detached, another branch, no commits yet)."""
+def git_dirs(directory: str) -> tuple[str, str, bool] | None:
+    """(top-level, common git dir, linked) of the working tree holding `directory`, from one
+    rev-parse: the common dir canonical, linked True in a linked worktree. None outside a
+    working tree."""
     out = git(
         directory,
         "rev-parse",
@@ -256,17 +298,54 @@ def protected_repo(directory: str) -> tuple[Path, str] | None:
     if out.returncode != 0 or len(lines) < 3 or not all(lines[:3]):
         return None
     top, git_dir, common = lines[:3]
-    common_dir = os.path.join(directory, common)  # unchanged when already absolute
-    # git_dir comes in the on-disk spelling, common_dir in the spelling of `directory`
-    if canonical_path(git_dir) != canonical_path(common_dir):
-        return None  # a linked worktree: its branch is never main
+    # git_dir comes in the on-disk spelling, the common dir in the spelling of `directory`
+    common = canonical_path(os.path.join(directory, common))  # unchanged when absolute
+    return top, common, canonical_path(git_dir) != common
+
+
+def current_branch(directory: str) -> str | None:
+    """The branch checked out in `directory`'s working tree; None when detached."""
     head = git(directory, "symbolic-ref", "--short", "-q", "HEAD")
     branch = head.stdout.strip()
-    if head.returncode != 0 or branch not in PROTECTED:
+    return branch if head.returncode == 0 and branch else None
+
+
+def has_commit(directory: str) -> bool:
+    return git(directory, "rev-parse", "--verify", "-q", "HEAD").returncode == 0
+
+
+def direct(what, directory: str):
+    return what(directory)
+
+
+def protected_repo(directory: str, ask=direct) -> tuple[Path, str] | None:
+    """(top-level, branch) when `directory` is in the main working tree of a repo that is
+    on main or master and has a commit; None otherwise (not a repo, a linked worktree,
+    detached, another branch, no commits yet). `ask(what, directory)` asks git_dirs,
+    current_branch and has_commit (Bash caches the answers per command)."""
+    dirs = ask(git_dirs, directory)
+    if dirs is None or dirs[2]:
+        return None  # not a repo, or a linked worktree: its branch is never main
+    branch = ask(current_branch, directory)
+    if branch not in PROTECTED:
         return None  # detached, or another branch
-    if git(directory, "rev-parse", "--verify", "-q", "HEAD").returncode != 0:
+    if not ask(has_commit, directory):
         return None  # no commits yet: the first commit has to land somewhere
-    return Path(top), branch
+    return Path(dirs[0]), branch
+
+
+def guarded_tree(directory: str, ask=direct) -> Path | None:
+    """The top-level when `directory` is in a linked worktree, or in a main working tree on
+    a branch other than main or master with a commit: where main and origin must not be
+    moved (rule (d)). None otherwise (not a repo, on main or master, detached, no commits)."""
+    dirs = ask(git_dirs, directory)
+    if dirs is None:
+        return None
+    if not dirs[2]:
+        branch = ask(current_branch, directory)
+        if branch is None or branch in PROTECTED or not ask(has_commit, directory):
+            return None
+    return Path(dirs[0])
 
 
 # ---------- Edit, Write, NotebookEdit ----------
@@ -701,6 +780,155 @@ def git_refusal(
     return None
 
 
+# ---------- main and origin, from a ticket branch (rule (d), #268) ----------
+
+
+def git_words(
+    args: list[str], short_values: str = "", long_values: frozenset | set = frozenset()
+) -> tuple[list[str], set]:
+    """(operands, options) of a git subcommand's `args` as parse-options reads them: options
+    anywhere before --, a short option in `short_values` taking the rest of its cluster or
+    else the next word, a long one in `long_values` the next word unless given with =.
+    options holds each short option seen ("-f") and each long option's name ("--force")."""
+    operands: list[str] = []
+    options: set = set()
+    k = 0
+    while k < len(args):
+        a = args[k]
+        k += 1
+        if a == "--":
+            operands.extend(args[k:])
+            break
+        if a.startswith("--"):
+            name, eq, _ = a.partition("=")
+            options.add(name)
+            if name in long_values and not eq:
+                k += 1
+        elif a.startswith("-") and a != "-":
+            for j, ch in enumerate(a[1:], 2):
+                options.add("-" + ch)
+                if ch in short_values:
+                    if j == len(a):
+                        k += 1  # the value is the next word
+                    break
+        else:
+            operands.append(a)
+    return operands, options
+
+
+def ref_moved(ref: str) -> str | None:
+    """What writing the ref `ref` moves or shadows, in any spelling git resolves before the
+    real one: main or master (refs/heads/<b>, <b>, refs/<b>, refs/tags/<b>) or a ref of
+    origin's (refs/remotes/origin/*, origin/*, refs/tags/origin/*, refs/heads/origin/*). A
+    pattern counts when it can reach main, master, origin/main or origin/master. None for
+    any other ref."""
+    if "*" in ref:
+        hits = [r for r in WATCHED_REFS if fnmatch.fnmatchcase(r, ref)]
+        if hits:
+            return hits[0].replace("refs/heads/", "").replace("refs/remotes/", "")
+    name = ref[len("refs/") :] if ref.startswith("refs/") else ref
+    for prefix in ("heads/", "tags/", "remotes/"):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+            break
+    if name in PROTECTED or name.startswith("origin/"):
+        return name
+    return None
+
+
+def fetch_refusal(sub: str, rest: list[str]) -> str | None:
+    """Why git fetch (or pull) `rest` would write main or one of origin's refs itself: a
+    refspec or --refmap with such a destination, or --update-head-ok."""
+    words, options = git_words(rest, FETCH_SHORT_VALUES, FETCH_LONG_VALUES)
+    if "--update-head-ok" in options:
+        return f"git {sub} --update-head-ok can move the branch checked out"
+    specs = [] if options & {"--all", "--multiple"} else words[1:]  # the first: the remote
+    specs += [rest[k + 1] for k, a in enumerate(rest[:-1]) if a == "--refmap"]
+    specs += [a[len("--refmap=") :] for a in rest if a.startswith("--refmap=")]
+    for spec in specs:
+        _, colon, dst = spec.lstrip("+").partition(":")
+        moved = ref_moved(dst) if colon and dst else None
+        if moved:
+            return f"git {sub} {spec} writes {moved}"
+    return None
+
+
+def tag_refusal(rest: list[str]) -> str | None:
+    """Why git tag `rest` would create a tag named main, master or origin/<x>, which git
+    resolves before the branch or remote-tracking ref of that name."""
+    words, options = git_words(rest, "mFu", TAG_LONG_VALUES)
+    if options & TAG_NOT_CREATING or not words:
+        return None
+    moved = ref_moved("refs/tags/" + words[0])
+    return f"git tag {words[0]} shadows {moved}" if moved else None
+
+
+def remote_refusal(rest: list[str]) -> str | None:
+    """Why git remote `rest` would point origin elsewhere: add, set-url or rename of it."""
+    words, _ = git_words(rest)
+    if not words or words[0] not in ("add", "set-url", "rename"):
+        return None
+    action = words[0]
+    names, _ = git_words(rest[rest.index(action) + 1 :], "tm", {"--track", "--master"})
+    if "origin" in names[: 2 if action == "rename" else 1]:
+        return f"git remote {action} retargets origin"
+    return None
+
+
+def names_origin(name: str) -> bool:
+    """True for a config key or section in remote.origin (the section name is
+    case-insensitive, the subsection is not)."""
+    section, _, rest = name.partition(".")
+    return section.lower() == "remote" and "origin" in (rest, rest.rpartition(".")[0])
+
+
+def config_refusal(rest: list[str]) -> str | None:
+    """Why git config `rest` would change a remote.origin.* setting: a key given a value,
+    --add, --replace-all, --unset or --unset-all of one, `set` or `unset` (git 2.46's
+    subcommands), or a section renamed to or from remote.origin. Reads pass."""
+    words, options = git_words(rest, "f", CONFIG_LONG_VALUES)
+    if not words or options & CONFIG_READS:
+        return None
+    action = words[0]
+    if action in ("set", "unset"):
+        keys = words[1:2]
+    elif action == "rename-section" or "--rename-section" in options:
+        keys = words[1:3] if action == "rename-section" else words[:2]
+    elif len(words) >= 2 or options & CONFIG_WRITES:
+        keys = words[:1]
+    else:
+        return None  # a read: one key, no value
+    hit = [k for k in keys if names_origin(k)]
+    return f"git config {hit[0]} retargets origin" if hit else None
+
+
+def main_ref_refusal(sub: str, rest: list[str]) -> str | None:
+    """Why git `sub` `rest` would move main or one of origin's refs, shadow one with a name git
+    resolves first, or retarget origin; rule (d), which holds on a ticket branch or in a
+    linked worktree (guarded_tree). Fetching from origin and merging origin/main pass."""
+    if sub == "update-ref":
+        refs, _ = git_words(rest, "m")
+        moved = ref_moved(refs[0]) if refs else None
+        return f"git update-ref {refs[0]} moves {moved}" if moved else None
+    if sub in ("fetch", "pull"):
+        return fetch_refusal(sub, rest)
+    if sub == "branch":
+        return branch_refusal(rest)
+    if sub in ("checkout", "switch", "worktree"):
+        options = ("-C", "--force-create") if sub == "switch" else ("-B",)
+        reset = option_value(rest, options)
+        if reset is not None and branch_name(reset) in PROTECTED:
+            return f"git {sub} {options[0]} {reset} resets {reset}"
+        return None
+    if sub == "tag":
+        return tag_refusal(rest)
+    if sub == "remote":
+        return remote_refusal(rest)
+    if sub == "config":
+        return config_refusal(rest)
+    return None
+
+
 # ---------- files a part writes ----------
 
 
@@ -1117,14 +1345,77 @@ def code_writes(name: str, args: list[str], part: Part) -> str | None:
 # ---------- Bash ----------
 
 
+def cached(state: dict):
+    """An `ask` for protected_repo and guarded_tree that asks git each question once per
+    command and directory (state["repos"])."""
+    repos = state["repos"]
+
+    def ask(what, directory: str):
+        key = (what, directory)
+        if key not in repos:
+            repos[key] = what(directory)
+        return repos[key]
+
+    return ask
+
+
 def repo_at(state: dict, directory: str | None) -> tuple[Path, str] | None:
     """protected_repo(directory), cached per command; None for an unknown directory."""
     if directory is None or not os.path.isdir(directory):
         return None
-    repos = state["repos"]
-    if directory not in repos:
-        repos[directory] = protected_repo(directory)
-    return repos[directory]
+    return protected_repo(directory, cached(state))
+
+
+def guarded_at(state: dict, directory: str | None) -> Path | None:
+    """guarded_tree(directory), cached per command; None for an unknown directory."""
+    if directory is None or not os.path.isdir(directory):
+        return None
+    return guarded_tree(directory, cached(state))
+
+
+def main_refs_tree(state: dict, directory: str | None) -> Path | None:
+    """Where rule (d) holds for git run in `directory`: its own guarded tree, or else the one
+    the command started in (state["start"]) when both share a common git dir, so a ticket
+    worktree's `git -C <main checkout on main>` is judged as the ticket worktree's own."""
+    tree = guarded_at(state, directory)
+    if tree is not None or directory is None or not os.path.isdir(directory):
+        return tree
+    home = guarded_at(state, state.get("start"))
+    if home is None:
+        return None
+    ask = cached(state)
+    here = ask(git_dirs, directory)
+    return home if here is not None and here[1] == ask(git_dirs, state["start"])[1] else None
+
+
+def tree_dir(path: str) -> str:
+    """The directory whose working tree the absolute `path` belongs to: its nearest existing
+    directory, or for git's own files (under .git) the working tree around them."""
+    directory = path if os.path.isdir(path) else existing_dir(os.path.dirname(path))
+    names = resolved(path).split(os.sep)
+    if ".git" in names:
+        directory = os.sep.join(names[: names.index(".git")]) or os.sep
+    return directory
+
+
+def ref_file_tree(state: dict, path: str | None) -> Path | None:
+    """The guarded working tree (guarded_tree) whose common git dir holds the absolute
+    `path` under refs/ or logs/, or as packed-refs: the files and reflogs of main and
+    origin/main. None otherwise. Reuses the rev-parse holder() already asked."""
+    real = resolved(path) if path is not None else ""
+    names = real.split(os.sep)
+    if ".git" not in names:  # as holder() reads it: git's files are under a .git
+        return None
+    directory = os.sep.join(names[: names.index(".git")]) or os.sep
+    if not os.path.isdir(directory):
+        return None
+    dirs = cached(state)(git_dirs, directory)
+    if dirs is None:
+        return None
+    rel = os.path.relpath(real, dirs[1])
+    if rel != "packed-refs" and rel.split(os.sep)[0] not in REF_STORES:
+        return None
+    return guarded_at(state, directory)
 
 
 def holder(state: dict, path: str | None) -> tuple[Path, str] | None:
@@ -1133,10 +1424,7 @@ def holder(state: dict, path: str | None) -> tuple[Path, str] | None:
     <top>/.claude/worktrees/ (ticket worktrees, judged by their own branch)."""
     if path is None or path == "/dev" or path.startswith("/dev/"):
         return None
-    directory = path if os.path.isdir(path) else existing_dir(os.path.dirname(path))
-    names = resolved(path).split(os.sep)
-    if ".git" in names:  # git's own files belong to the working tree around them
-        directory = os.sep.join(names[: names.index(".git")]) or os.sep
+    directory = tree_dir(path)  # git's own files belong to the working tree around them
     found = repo_at(state, directory)
     if found is None:
         return None
@@ -1202,6 +1490,9 @@ def part_refusal(state: dict, part: Part, name: str, args: list[str]) -> tuple |
                 found = None
         if found is not None:
             return part.text, why, found[0], found[1], ADVICE
+        tree = ref_file_tree(state, path)
+        if tree is not None:
+            return part.text, why, tree, None, MAIN_REFS_ADVICE
     if name == "git":
         there = repo_at(state, where)
         if there is not None:
@@ -1212,6 +1503,10 @@ def part_refusal(state: dict, part: Part, name: str, args: list[str]) -> tuple |
             why = push_target_refusal(rest)
             if why:
                 return part.text, why, toplevel(where), None, PUSH_ADVICE
+        why = main_ref_refusal(sub, rest)
+        tree = main_refs_tree(state, where) if why else None
+        if tree is not None:
+            return part.text, why, tree, None, MAIN_REFS_ADVICE
     return None
 
 
@@ -1234,7 +1529,7 @@ def bash_refusal(command: str, cwd: str) -> str | None:
     (HARNESS_ALLOW_MAIN read as main() and allow_main read it). backup_gate.py asks it too."""
     if os.environ.get("HARNESS_ALLOW_MAIN", "").strip() == "1" or not command.strip():
         return None
-    found = refusal({"cwd": cwd, "repos": {}}, command)
+    found = refusal({"cwd": cwd, "start": cwd, "repos": {}}, command)
     if found is None:
         return None
     text, why, top, branch, advice = found
