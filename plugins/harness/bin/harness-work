@@ -168,6 +168,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -1141,16 +1142,21 @@ def ticket_finished(record, repos):
         return None
 
 
-def stop_session(record, as_json):
-    """`claude stop <id>` for the bg session of a finished ticket (its conversation is kept): `stopped session <id>`
-    on stdout (stderr under --json, which keeps stdout whole), or one warning when it fails."""
-    bg_id = str(record.get("bg_id"))
+def stop_bg(record):
+    """`claude stop <id>` for the bg session of a record: None when it stopped, else why it did not."""
     try:
-        done = run([claude_exe(), "stop", bg_id], env=child_env(), timeout=STOP_TIMEOUT)
-        why = None if done.returncode == 0 else (last_line(done.stderr) or last_line(done.stdout)
-                                                 or f"exit {done.returncode}")
+        done = run([claude_exe(), "stop", str(record.get("bg_id"))], env=child_env(), timeout=STOP_TIMEOUT)
+        return None if done.returncode == 0 else (last_line(done.stderr) or last_line(done.stdout)
+                                                  or f"exit {done.returncode}")
     except Problem as err:
-        why = str(err)
+        return str(err)
+
+
+def stop_session(record, as_json):
+    """Stop the bg session of a finished ticket (its conversation is kept): `stopped session <id>` on stdout (stderr
+    under --json, which keeps stdout whole), or one warning when it fails."""
+    bg_id = str(record.get("bg_id"))
+    why = stop_bg(record)
     if why is not None:
         warn(f"#{record.get('ticket')}: cannot stop session {bg_id}: {why}")
         return
@@ -1256,30 +1262,71 @@ def start_wait():
         return START_WAIT
 
 
-def confirm_started(repo, record, before):
-    """Wait up to HARNESS_START_WAIT seconds (default 60) for the launched session's own `harness-work start` to
-    comment "Started on" (more such comments than `before`, counted ahead of the launch). A session that never does
-    ends its record in error, so the next dispatch retries the ticket (#367). `before` None: nothing to compare."""
-    if before is None:
-        return
-    n, wait = record["ticket"], start_wait()
-    deadline = time.monotonic() + wait
-    while True:
-        try:
-            if started_comments(repo, n) > before:
-                return
-        except Problem:
-            pass                                    # a failed read is "not yet"; the deadline decides
+def stop_launched(record):
+    """Stop the session of a launch that never started (a bg session by `claude stop`, a headless run by a signal to
+    its process group, started with start_new_session); a clause for the error line saying what happened."""
+    if is_bg(record):
+        bg_id = str(record.get("bg_id"))
+        why = stop_bg(record)
+        return f"stopped session {bg_id}" if why is None else f"could not stop session {bg_id}: {why}"
+    pid = record.get("pid")
+    if not pid_alive(pid, parse_iso(record.get("started_at"))):
+        return "it had exited"
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "it had exited"
+    except OSError as err:
+        return f"could not stop pid {pid}: {err.strerror or err}"
+    return f"stopped pid {pid}"
+
+
+def confirm_started(repo, pending):
+    """Wait together, up to HARNESS_START_WAIT seconds (default 60) in all, for each launched session's own
+    `harness-work start` to comment "Started on" (more such comments than `before`, counted ahead of its launch).
+    `pending` is a list of (record, before); `before` None: nothing to compare. Returns {ticket: why} for those that
+    did not start (#367). A session still running that never posts is stopped and its record ends in error, so the
+    next dispatch retries the ticket. A headless run that exited without one is left unended: the sweep classifies
+    its log (a billing or auth failure marks the api budget and does not count toward the redispatch cap)."""
+    wait = start_wait()
+    waiting = [(record, before) for record, before in pending if before is not None]
+    bad, deadline = {}, time.monotonic() + wait
+    while waiting:
+        for item in list(waiting):
+            record, before = item
+            n = record["ticket"]
+            gone = not is_bg(record) and not pid_alive(record.get("pid"), parse_iso(record.get("started_at")))
+            try:
+                seen = started_comments(repo, n) > before   # read after `gone`: a comment just before exit counts
+            except Problem:
+                seen = False                                # a failed read is "not yet"; the deadline decides
+            if seen:
+                waiting.remove(item)
+            elif gone:
+                waiting.remove(item)
+                bad[n] = (f"the session exited before it posted \"Started on\" on #{n}; its run record is left "
+                          f"for the sweep to classify")
         left = deadline - time.monotonic()
-        if left <= 0:
-            failed(record, f"the session did not start within {wait:g} s (no \"Started on\" comment on #{n})")
+        if not waiting or left <= 0:
+            break
         time.sleep(min(1.0, left))
+    for record, _ in waiting:
+        n = record["ticket"]
+        why = (f"the session did not start within {wait:g} s (no \"Started on\" comment on #{n}); "
+               f"{stop_launched(record)}")
+        end_failed(record, why)
+        bad[n] = one_line(why)
+    return bad
+
+
+def end_failed(record, why):
+    record.update(ended_at=iso(now()), outcome="error", error=one_line(why))
+    save_run(record)
 
 
 def failed(record, why):
     """A launch that never ran: recorded as ended in error, so the next dispatch picks the ticket up again."""
-    record.update(ended_at=iso(now()), outcome="error", error=one_line(why))
-    save_run(record)
+    end_failed(record, why)
     raise Problem(why)
 
 
@@ -1904,9 +1951,11 @@ def cmd_dispatch(repo, args):
         return
     if shutil.which(claude_exe()) is None:
         raise Problem(f"claude not found ({claude_exe()}); nothing started")
-    launched, failures = [], []
+    # launch every planned session first, then wait for all of them together (#367): the wait stays near
+    # HARNESS_START_WAIT instead of that long for each launch in turn
+    outcomes, pending = [], []
     for row in plan:
-        if len(launched) >= slots:
+        if sum(1 for _, rec, _ in outcomes if rec is not None) >= slots:
             break
         n = row["number"]
         try:
@@ -1919,11 +1968,19 @@ def cmd_dispatch(repo, args):
             except Problem:
                 before = None
             record = launch(repo, ticket, venue, route["effort"])
-            confirm_started(repo, record, before)
         except Problem as err:
-            failures.append({"number": n, "error": one_line(err)})
+            outcomes.append((n, None, one_line(err)))
+            continue
+        outcomes.append((n, record, None))
+        pending.append((record, before))
+    not_started = confirm_started(repo, pending)
+    launched, failures = [], []
+    for n, record, why in outcomes:
+        why = why or not_started.get(n)
+        if why:
+            failures.append({"number": n, "error": why})
             if not args.json:
-                print(f"#{n} not launched: {one_line(err)}", file=sys.stderr, flush=True)
+                print(f"#{n} not launched: {why}", file=sys.stderr, flush=True)
             continue
         launched.append(record)
         if not args.json:
