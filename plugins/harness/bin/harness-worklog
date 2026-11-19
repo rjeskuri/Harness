@@ -32,7 +32,7 @@ session). `describe` writes the description of a day's auto row.
 
 Each block's time also goes to the ticket its session ran for: a session in a ticket worktree
 (<repo>/.claude/worktrees/t-N-<slug>), on a ticket branch (t/N-...), or one that ran
-`/harness:work N`; anything else is unattributed. A block across several tickets is split by message
+`/harness:work N` (that turn only); anything else is unattributed. A block across several tickets is split by message
 time, and a day's logged hours are apportioned to its tickets to the quarter hour so the parts add up
 to the day. `update` writes each ticket's hours by day into one comment on the issue in the origin's
 GitHub repository (marked <!-- harness-hours -->, edited in place; rows for days outside the window
@@ -404,7 +404,8 @@ def ticket_events(paths, repo=None):
     transcripts. A session id found in several files (a copy, or a resumed session) counts each entry once: per
     entry, the most times any one file holds it. An entry without a session id belongs to its file alone.
     An entry's ticket is its folder's (a ticket worktree, folder_ticket), else its own (entry_ticket), else the
-    one the last `/harness:work N` its session ran before it in that file named; else None (unattributed)."""
+    one of the `/harness:work N` turn it is in (from that message to the session's next message the user typed
+    in that file); else None (unattributed)."""
     held, tickets = {}, {}    # (session id, entry) -> the most times one file holds it; -> its ticket
     for path in paths:
         seen, work, folder = {}, {}, folder_ticket(path, repo)
@@ -419,10 +420,12 @@ def ticket_events(paths, repo=None):
                     continue
                 when = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(UTC)
                 sid, human = entry.get("sessionId") or path, is_human_message(entry)
-                if human:
+                if human:                       # `/harness:work N` is one turn: the next typed message ends it
                     m = WORK_COMMAND.search(message_text(entry))
                     if m:
                         work[sid] = int(m.group(1))
+                    else:
+                        work.pop(sid, None)
                 key = (sid, when, human, entry["type"])
                 seen[key] = seen.get(key, 0) + 1
                 if tickets.get(key) is None:
@@ -515,11 +518,12 @@ def apportion(hours, shares):
 
 def ticket_hours(computed, shares):
     """{ticket: {'yyyy-mm-dd': hours}} for the computed days: each day's logged hours apportioned to its tickets
-    and its unattributed time (apportion), the tickets' parts kept when above zero."""
+    and its unattributed time (apportion). Every ticket with an event on a computed day is present, a part that
+    rounds to nothing as 0.0, so record_hours clears the row an earlier count gave it."""
     out = {}
     for day, (hours, *_) in computed.items():
         for ticket, h in apportion(hours, shares.get(day) or {None: 0.0}).items():
-            if ticket is not None and h > 0:
+            if ticket is not None:
                 out.setdefault(ticket, {})[day] = h
     return out
 
@@ -800,14 +804,15 @@ def issue_comments(slug, number):
 
 def record_hours(slug, number, hours, window, login):
     """Bring ticket `number`'s hours comment to `hours` ({day: h}) for the `window` days, keeping its rows for
-    other days: 'created', 'updated' or 'unchanged'. The comment is the login's own one with the marker."""
+    other days: 'created', 'updated' or 'unchanged'. A day at 0 hours has no row, and a ticket with no comment
+    and no hours gets none ('unchanged'). The comment is the login's own one with the marker."""
     mine = [c for c in issue_comments(slug, number)
             if HOURS_MARKER in (c.get("body") or "") and author_login(c) == login]
     old = hours_of(mine[0].get("body")) if mine else {}
     days = {d: h for d, h in old.items() if d not in window}
-    days.update(hours)
+    days.update((d, h) for d, h in hours.items() if h > 0)
     body = hours_body(days)
-    if mine and (mine[0].get("body") or "") == body:
+    if (mine and (mine[0].get("body") or "") == body) or (not mine and not days):
         return "unchanged"
     if mine:
         gh_json(["api", "-X", "PATCH", f"repos/{slug}/issues/comments/{mine[0]['id']}", "-f", f"body={body}"], REPO)
@@ -823,7 +828,9 @@ def record_tickets(tickets, window):
         return
     slug = github_slug()
     if not slug:
-        print(f"{len(tickets)} ticket(s) worked on, not recorded: the origin is not on GitHub")
+        worked = [n for n, days in tickets.items() if any(days.values())]
+        if worked:
+            print(f"{len(worked)} ticket(s) worked on, not recorded: the origin is not on GitHub")
         return
     try:
         login = gh_login()
