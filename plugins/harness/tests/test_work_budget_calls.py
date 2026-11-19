@@ -582,9 +582,10 @@ class Args(CallsTest):
         with open(self.budgets_path(), encoding="utf-8") as fh:
             self.assertEqual(fh.read(), text)
         self.assertEqual(self.ok("budget").stdout.splitlines(),
-                         [f"api: exhausted until {until} (billing)", "cloud: available"])
+                         [f"api: exhausted until {until} (billing)", "cloud: available",
+                          "subscription: available"])
         status = json.loads(self.ok("budget", "status", "--json").stdout)
-        self.assertEqual(set(status), {"api", "cloud"})
+        self.assertEqual(set(status), {"api", "cloud", "subscription"})
 
 
 if __name__ == "__main__":
