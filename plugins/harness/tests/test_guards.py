@@ -731,5 +731,42 @@ class ReadonlyPlannerTests(GuardTestCase):
                 self.assertIsNone(self.guard("git log --oneline -5", agent))
 
 
+class OpsBeforeValuesTests(GuardTestCase):
+    """#72: an ops run sits in the main checkout on main and saves the before-values of the records it is about to
+    change into the folder `harness-work start` gave it, ~/.claude/harness/ops/<repo key>/<N>/, outside every
+    repository. Neither guard refuses that write, by Write, Edit or a Bash redirect."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = self.make_repo()
+        key = hashlib.sha1(str(self.repo.resolve()).encode()).hexdigest()[:12]
+        state = self.home / ".claude/harness"
+        self.before = state / "ops" / key / "72"
+        self.before.mkdir(parents=True)
+        ticket = {"number": 72, "title": "Fill in the blank regions", "type": "ops", "status": "in-progress",
+                  "flags": ["needs-local"], "labels": ["ops", "status:in-progress", "needs-local"], "tier": "opus",
+                  "branch": None, "worktree": None}
+        self.write(state / "repos" / key / "tickets/72.json", json.dumps(ticket))
+
+    def decide(self, hook: str, tool: str, tool_input: dict) -> str | None:
+        return self.decision(self.run_hook(hook, self.payload(tool, tool_input, self.repo)))
+
+    def test_the_before_values_write_is_allowed_on_main(self):
+        target = self.before / "before.json"
+        calls = (
+            ("Write", {"file_path": str(target), "content": '[{"Id": "003A", "Region__c": null}]\n'}),
+            ("Edit", {"file_path": str(target), "old_string": "null", "new_string": '""'}),
+            ("Bash", {"command": f"echo '[]' > {target}", "description": "Save the before-values"}),
+            ("Bash", {"command": f"cat records.json | tee {self.before}/before-2.json", "description": "Save"}),
+        )
+        for hook in ("branch_guard.py", "tests_first.py"):
+            for tool, tool_input in calls:
+                with self.subTest(hook=hook, tool=tool, input=tool_input):
+                    self.assertIsNone(self.decide(hook, tool, tool_input))
+        # the same write into the main checkout is still refused: the guard did judge this session's repo
+        inside = {"file_path": str(self.repo / "before.json"), "content": "[]\n"}
+        self.assertEqual(self.decide("branch_guard.py", "Write", inside), f"On main in proj. {ADVICE}")
+
+
 if __name__ == "__main__":
     unittest.main()
