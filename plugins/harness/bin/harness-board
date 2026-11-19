@@ -8,10 +8,11 @@ labels. `show` keeps a local cache of each ticket at
 Usage:
     harness-board labels ensure
     harness-board epic create --title T --body-file F [--size S|M|L] [--risk low|high] [--proposed]
-    harness-board task create --title T --body-file F [--parent N] [--type task|bug|chore|refactor]
+    harness-board task create --title T --body-file F [--parent N] [--type task|bug|chore|refactor|ops]
                               [--size S|M|L] [--risk low|high] [--blocked-by N[,N]]
                               [--no-tests] [--needs-local] [--priority] [--proposed]
     harness-board show N [--markdown]
+    harness-board retype N --type task|bug|chore|refactor --reason TEXT   # an ops ticket that needs code after all
     harness-board ready
     harness-board status N ready|in-progress|in-review|blocked|needs-input|proposed [--comment TEXT]
     harness-board promote N    # a proposed epic and its open proposed tasks, or a proposed task, to ready
@@ -30,6 +31,11 @@ Usage:
 
 Every comment posted here ends with the line `<!-- harness -->` (hidden on GitHub), so `answers` can tell the
 harness's own comments, posted under the owner's account, from the owner's replies.
+
+An `ops` ticket is a record update with no code change (Salesforce, Jotform, a project script): `task create --type
+ops` labels it `ops` and `needs-local` (once), and `show` parses its sections (Request, Change, Source of truth,
+Apply, Verify, Rollback, Context) in place of a task's. `retype` swaps the type label for --type, keeps every other
+label and comments the reason; --reason is required.
 
 With HARNESS_PROJECT=OWNER/NUMBER (the environment first, where an empty value means off; else `env` in
 ~/.claude/settings.json), `epic create` and `task create` add the issue to that GitHub Projects board with
@@ -77,6 +83,7 @@ LABELS = [
     ("bug", "D73A4A", "Something is broken"),
     ("chore", "BFD4F2", "Upkeep: tooling, config, docs, lessons"),
     ("refactor", "C2E0C6", "Restructure without changing behavior"),
+    ("ops", "006B75", "A record update with no code change"),
     ("status:ready", "0052CC", "Ready to work on"),
     ("status:in-progress", "FBCA04", "An agent is working on it"),
     ("status:in-review", "D4C5F9", "A pull request awaits your review"),
@@ -96,8 +103,9 @@ LABELS = [
     ("degraded", "FBCA04", "A live check is degraded; nothing was reverted"),
     ("deploy-frozen", "000000", "Deploys are stopped until you clear this"),
 ]
-TYPES = ("epic", "bug", "refactor", "chore", "task")          # the first present wins
-TASK_TYPES = ("task", "bug", "chore", "refactor")
+TYPES = ("epic", "ops", "bug", "refactor", "chore", "task")   # the first present wins
+TASK_TYPES = ("task", "bug", "chore", "refactor")              # the types that change code: retype's targets
+CREATE_TYPES = TASK_TYPES + ("ops",)
 STATUSES = ("ready", "in-progress", "in-review", "blocked", "needs-input", "proposed")
 STATUS_TITLES = {"ready": "Ready", "in-progress": "In progress", "in-review": "In review", "blocked": "Blocked",
                  "needs-input": "Needs input", "proposed": "Proposed"}
@@ -106,6 +114,8 @@ FLAGS = ("no-tests", "needs-local", "priority:high")
 TIERS = ("sonnet", "opus", "fable")
 SECTIONS = [("Request", "request"), ("Outline", "outline"), ("Definition of done", "definition_of_done"),
             ("Tests that must pass", "tests"), ("Context", "context")]
+OPS_SECTIONS = [("Request", "request"), ("Change", "change"), ("Source of truth", "source_of_truth"),
+                ("Apply", "apply"), ("Verify", "verify"), ("Rollback", "rollback"), ("Context", "context")]
 ISSUE_FIELDS = "number,title,url,body,labels,state,parent,blockedBy,comments"
 PRESERVED = (("branch", None), ("worktree", None), ("started_at", None), ("attempts", []))
 NEEDS_INPUT = "**Needs your input**"
@@ -379,8 +389,11 @@ def first_paragraph(text):
     return " ".join(lines)
 
 
-def parse_sections(body):
+def parse_sections(body, kind=None):
+    """The body's sections by key; an ops ticket's (`kind` "ops") are OPS_SECTIONS, each its stripped text."""
     raw = split_sections(body)
+    if kind == "ops":
+        return {key: raw.get(heading.lower(), "").strip() for heading, key in OPS_SECTIONS}
     dod = raw.get("definition of done", "")
     tests = raw.get("tests that must pass", "")
     items = [m.group(1) for m in (BULLET.match(line) for line in tests.splitlines()) if m]
@@ -445,7 +458,8 @@ def fetch_record(repo, number):
               "url": data.get("url") or "", "type": kind["type"], "status": kind["status"],
               "size": kind["size"], "risk": kind["risk"], "flags": kind["flags"], "labels": names,
               "tier": kind["tier"], "parent": None, "blocked_by": [], "body": data.get("body") or "",
-              "sections": parse_sections(data.get("body")), "comments": [], "fetched_at": now_iso()}
+              "sections": parse_sections(data.get("body"), kind["type"]), "comments": [],
+              "fetched_at": now_iso()}
     parent = data.get("parent")
     if isinstance(parent, dict) and parent.get("number"):
         if parent.get("body") is None:          # gh's parent field carries no body: the goal needs it
@@ -583,7 +597,7 @@ def context_markdown(record, resolutions=None, tier_from=None):
     entries = [(t["number"], [f"### #{t['number']} {t['title']}: Resolution"] + (resolutions or {})[t["number"]])
                for t in tasks or [] if t["state"] == "CLOSED" and (resolutions or {}).get(t["number"])]
     at = len(lines)                                    # an epic's Resolutions go under its task list
-    for heading, _ in SECTIONS:
+    for heading, _ in OPS_SECTIONS if record.get("type") == "ops" else SECTIONS:
         text = raw.get(heading.lower(), "").strip("\n")
         if text.strip():
             lines += ["", f"## {heading}"] + text.splitlines()
@@ -702,9 +716,10 @@ def cmd_task_create(repo, args):
     blockers = blocker_numbers(args.blocked_by)
     if args.parent:
         repo.slug()                    # fails before anything is created when gh cannot see the repository
+    needs_local = args.needs_local or args.type == "ops"     # an ops ticket needs this Mac's connectors
     labels = [args.type, initial_status(args)] + ([f"size:{args.size}"] if args.size else []) \
         + ([f"risk:{args.risk}"] if args.risk else []) + (["no-tests"] if args.no_tests else []) \
-        + (["needs-local"] if args.needs_local else []) + (["priority:high"] if args.priority else [])
+        + (["needs-local"] if needs_local else []) + (["priority:high"] if args.priority else [])
     number, url = create_issue(repo, args.title, path, stdin, labels, args.priority, args.proposed)
     result = {"number": number, "url": url, "parent": args.parent, "linked": None, "blocked_by": []}
 
@@ -741,6 +756,28 @@ def cmd_show(repo, args):
         print(context_markdown(record, task_resolutions(repo, record.get("tasks") or [], owner), tier_from))
     else:
         emit(True, record, "")
+
+
+def cmd_retype(repo, args):
+    """Swap the ticket's type label for --type (any other of TYPES but epic goes), keep every other label and
+    comment the reason: an ops ticket that turns out to need a code change goes back to a normal ticket."""
+    reason = (args.reason or "").strip()
+    if not reason:
+        raise Problem(f"--reason is required: say why #{args.number} changes type; nothing changed")
+    data = gh_json(repo, ["issue", "view", str(args.number), "--json", "labels"])
+    names = label_names(data.get("labels") if isinstance(data, dict) else None)
+    if "epic" in names:
+        raise Problem(f"#{args.number} is an epic; only a task can be retyped")
+    removed = [name for name in names if name in TYPES and name != args.type]
+    cmd = ["issue", "edit", str(args.number), "--add-label", args.type]
+    for name in removed:
+        cmd += ["--remove-label", name]
+    gh(repo, cmd)
+    old = ", ".join(removed) or "no type"
+    gh(repo, ["issue", "comment", str(args.number), "--body", marked(f"Retyped from {old} to {args.type}: {reason}")])
+    labels = [name for name in names if name not in removed] + ([args.type] if args.type not in names else [])
+    refresh_cache(repo, args.number, labels=labels)
+    emit(args.json, {"number": args.number, "type": args.type, "removed": removed}, f"#{args.number} type {args.type}")
 
 
 def cmd_ready(repo, args):
@@ -1245,8 +1282,8 @@ def parser():
     ap = Parser(prog="harness-board", description="The board: GitHub Issues as tickets (epics, tasks, status labels).")
     ap.add_argument("--repo", metavar="PATH", help=repo_help)
     ap.add_argument("--json", action="store_true", help="print JSON")
-    sub = ap.add_subparsers(dest="cmd", metavar="{labels,epic,task,show,ready,status,promote,comment,needs-input,"
-                                               "park,answers,close,epic-check,board,tier,project}")
+    sub = ap.add_subparsers(dest="cmd", metavar="{labels,epic,task,show,retype,ready,status,promote,comment,"
+                                               "needs-input,park,answers,close,epic-check,board,tier,project}")
     sub.required = True
 
     labels = sub.add_parser("labels", help="the board's label set")
@@ -1272,7 +1309,8 @@ def parser():
     tc.add_argument("--title", required=True)
     tc.add_argument("--body-file", required=True, metavar="F", help="the body (- for stdin)")
     tc.add_argument("--parent", type=issue_number, metavar="N", help="the epic to link it under")
-    tc.add_argument("--type", choices=TASK_TYPES, default="task")
+    tc.add_argument("--type", choices=CREATE_TYPES, default="task",
+                    help="ops: a record update with no code change (labels needs-local too)")
     tc.add_argument("--size", choices=("S", "M", "L"))
     tc.add_argument("--risk", choices=("low", "high"))
     tc.add_argument("--blocked-by", action="append", metavar="N[,N]", help="issues that must close first")
@@ -1284,6 +1322,12 @@ def parser():
     show = sub.add_parser("show", parents=[common], help="fetch a ticket, write its cache, print it")
     show.add_argument("number", type=issue_number, metavar="N")
     show.add_argument("--markdown", action="store_true", help=f"the ticket context (at most {CONTEXT_LINES} lines)")
+
+    retype = sub.add_parser("retype", parents=[common],
+                            help="swap a ticket's type label (an ops ticket that needs code) and comment the reason")
+    retype.add_argument("number", type=issue_number, metavar="N")
+    retype.add_argument("--type", required=True, choices=TASK_TYPES)
+    retype.add_argument("--reason", required=True, metavar="TEXT", help="why; posted on the ticket")
 
     sub.add_parser("ready", parents=[common], help="open, unblocked status:ready tickets in dispatch order")
 
@@ -1353,7 +1397,7 @@ def parser():
 
 
 COMMANDS = {"labels ensure": cmd_labels_ensure, "epic create": cmd_epic_create, "task create": cmd_task_create,
-            "show": cmd_show, "ready": cmd_ready, "status": cmd_status, "promote": cmd_promote,
+            "show": cmd_show, "retype": cmd_retype, "ready": cmd_ready, "status": cmd_status, "promote": cmd_promote,
             "comment": cmd_comment,
             "needs-input": cmd_needs_input, "park": cmd_park, "answers": cmd_answers, "close": cmd_close,
             "epic-check": cmd_epic_check, "board": cmd_board, "tier": cmd_tier}

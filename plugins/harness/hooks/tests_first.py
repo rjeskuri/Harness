@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """PreToolUse hook (matcher: Edit|Write|NotebookEdit|Bash): tests first, proven.
 
+First, for the main session and every agent, on any branch (#267): the harness's own state is
+written only by its tools. An edit of, or a Bash write (as below) to, a path in red/, red-files/
+or tickets/ of any ~/.claude/harness/repos/<key>/, or of a key directory or repos/ itself, is
+refused, judged on the real path (symlinks resolved, compared without case). harness-red,
+harness-board and harness-work write that state from their own process, unseen here, so they
+run; a redirection of their output is judged like any write. reviews/, cost/ and scratch/ are
+not guarded.
+
 On a ticket branch (t/<N>-<slug>) every edited file is classified by its repo-relative
 path: a test (HARNESS_TEST_PATTERNS), exempt (HARNESS_SOURCE_EXEMPT), or source. For the
 role rules the files that decide which tests run and how (.claude/settings.json,
@@ -82,6 +90,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
@@ -157,6 +166,15 @@ PROGRAM_UNKNOWN = "{name} runs {file}, a program file whose path cannot be known
 PROGRAM_UNVERIFIED = (
     "git did not say in time whether the worktree tracks {file}, so this run of {name} is "
     "refused, not judged; retry it"
+)
+# The harness's own state (#267): the directories of ~/.claude/harness/repos/<key>/ whose files
+# decide what these rules allow (red records, their side files, ticket caches).
+STATE_DIRS = {"red", "red-files", "tickets"}
+STATE = (
+    "red/, red-files/ and tickets/ under ~/.claude/harness/repos/<key>/ hold the red records, "
+    "their side files and the ticket caches the tests-first rules read; only harness-red, "
+    "harness-board and harness-work write them. Run the tool instead (harness-red check, "
+    "harness-board show <N>)."
 )
 
 
@@ -262,6 +280,25 @@ def in_scratch(top: Path) -> bool:
     except ValueError:
         return False
     return len(rel) >= 3 and rel[1] == "scratch"
+
+
+def folded(path: str) -> str:
+    """The real path of `path` as the file system compares it: NFC, case folded."""
+    return unicodedata.normalize("NFC", os.path.realpath(path)).casefold()
+
+
+def state_write(path: str) -> bool:
+    """True when writing the absolute `path` writes the harness's own state: red/, red-files/
+    or tickets/ of any ~/.claude/harness/repos/<key>/ or a path in one, or a key directory or
+    repos/ itself (removing, moving or filling those reaches all three). Decided on the real
+    path, symlinks and .. resolved, compared without case as macOS's file system does."""
+    rel = os.path.relpath(folded(path), folded(str(harness_home() / "repos")))
+    if rel == ".":
+        return True
+    parts = rel.split(os.sep)
+    if parts[0] == os.pardir:
+        return False
+    return len(parts) == 1 or parts[1] in STATE_DIRS
 
 
 def relative_path(path: str, top: Path) -> str | None:
@@ -623,13 +660,20 @@ def check_bash(command: str, cwd: str, role: str) -> None:
     for part, name, args in guard.walk(state, command):
         here = state["cwd"]
         note_exports(part.words, name, args, exports)
-        paths = [p for _, p, _, exact in guard.writes(part, name, args, here) if exact]
+        written = guard.writes(part, name, args, here)
+        paths = [p for _, p, _, exact in written if exact]
         bulk, where = False, here
         if name == "git":
             where, sub, rest = guard.git_split(args, here)
             for p in guard.git_paths(sub, rest, where):
                 paths.append(guard.absolute(p, where))
             bulk = bulk_form(guard, sub, rest, where)
+        # the harness's own state, for every role and the main session; a patch or xargs by the
+        # directory it writes in. The tools that own it write it themselves, unseen here.
+        for path in paths + [p for _, p, _, exact in written if not exact]:
+            if path is not None and state_write(path):
+                deny(f'Refused "{guard.shown(part.text)}": it writes {path}. {STATE}')
+                return
         for path in paths:
             if path is None:
                 continue
@@ -676,6 +720,9 @@ def check(data: dict) -> None:
     if not isinstance(raw, str) or not raw.strip():
         return
     path = os.path.join(cwd, os.path.expanduser(raw))
+    if state_write(path):
+        deny(f"{path} is the harness's own state. {STATE}")
+        return
     why = path_refusal(path, role, {})
     if why:
         deny(why)
