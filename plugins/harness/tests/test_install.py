@@ -122,9 +122,18 @@ STALE_REMOTE = (
     "Sensitive remote targets: the Jotform forms, the Global G.L.O.W. Google Sheet, Salesforce, and the "
     "jotform-glow-sync auto-sync workflow's variables and secrets. Every write there needs my explicit go in the "
     "session.")
-# The entry #393 leaves as it is.
+# The two entries #410 moves to ~/Projects, as ~/.claude/settings.json held them before the move (the stale input),
+# and the snippet's text for the second (the Organization entry is read from the snippet by its label).
+OLD_HARNESS, NEW_HARNESS = "/Users/ryaneskuri/portfolio_projects/Harness", "/Users/ryaneskuri/Projects/Harness"
+OLD_JOTFORM, NEW_JOTFORM = "/Users/ryaneskuri/jotform-glow-sync", "/Users/ryaneskuri/Projects/jotform-glow-sync"
+STALE_ORGANIZATION = (
+    "Organization: Ryan Eskuri, solo developer. Primary use: software development with the personal 'harness' Claude "
+    f"Code plugin loaded in place from {OLD_HARNESS}.")
+STALE_SENSITIVE_DATA = (
+    f"Sensitive data locations & audiences: {OLD_JOTFORM} data/, backups/ and credentials/ hold "
+    "minors' personal data; share with nothing outside that project's own tools.")
 SENSITIVE_DATA = (
-    "Sensitive data locations & audiences: /Users/ryaneskuri/jotform-glow-sync data/, backups/ and credentials/ hold "
+    f"Sensitive data locations & audiences: {NEW_JOTFORM} data/, backups/ and credentials/ hold "
     "minors' personal data; share with nothing outside that project's own tools.")
 # A sentence claiming every write (to the sensitive targets) needs Ryan's go: "every write there needs ...".
 EVERY_WRITE_ASKS = re.compile(r"\b(every|all|any)\s+writes?\b(\s+\S+){0,6}?\s+(needs?|requires?|asks?)\b",
@@ -870,6 +879,90 @@ class Install(unittest.TestCase):
                 self.assert_line_counts(line, added={"autoMode.environment": len(appended)} if appended else {})
                 if replaced is not None:
                     self.assert_line_counts(line, replaced={"autoMode.environment": replaced})
+
+    def test_the_snippet_and_the_install_files_name_only_the_new_checkout_paths(self):
+        # #410: Harness and jotform-glow-sync moved under ~/Projects. No file that tells where a checkout lives
+        # (user/, scripts/, docs/guide.md) names the old place, in either spelling.
+        env = read_json(SNIPPET)["autoMode"]["environment"]
+        org = [e for e in env if label(e) == "Organization"]
+        data = [e for e in env if label(e) == "Sensitive data locations & audiences"]
+        self.assertEqual(len(org), 1)
+        self.assertEqual(len(data), 1)
+        self.assertIn(f"loaded in place from {NEW_HARNESS}", org[0])
+        self.assertIn(NEW_JOTFORM, data[0])
+        files = [os.path.join(REPO, "docs", "guide.md")]
+        for folder in ("user", "scripts"):
+            for name in sorted(os.listdir(os.path.join(REPO, folder))):
+                if os.path.isfile(os.path.join(REPO, folder, name)):
+                    files.append(os.path.join(REPO, folder, name))
+        for path in files:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            with self.subTest(file=os.path.relpath(path, REPO)):
+                for old in ("portfolio_projects", "ryaneskuri/jotform-glow-sync", "~/jotform-glow-sync"):
+                    self.assertNotIn(old, text)
+
+    def test_entries_naming_the_old_checkout_paths_are_replaced_and_a_second_install_changes_nothing(self):
+        wanted = snippet_lists(self)
+        snippet = read_json(SNIPPET)
+        env = wanted["autoMode", "environment"]
+        snip = {label(e): e for e in env if label(e)}
+        org, data = snip["Organization"], snip["Sensitive data locations & audiences"]
+        self.assertNotEqual(org, STALE_ORGANIZATION)
+        self.assertNotEqual(data, STALE_SENSITIVE_DATA)
+        base = dict({k: snippet[k] for k in ("model", "effortLevel", "modelSettings")}, theme="dark",
+                    permissions={"allow": wanted["permissions", "allow"], "ask": wanted["permissions", "ask"]})
+        moved = ("Organization", "Sensitive data locations & audiences")
+        rest = [e for e in env if label(e) not in moved][1:]   # the others, without "$defaults"
+
+        def swapped(old):   # the snippet's list with the given labels' entries as the stale text
+            return [old.get(label(e), e) for e in env]
+
+        cases = {   # name: (environment before, environment after, replaced count or None)
+            "both old, as the file held them before the move": (
+                swapped({"Organization": STALE_ORGANIZATION,
+                         "Sensitive data locations & audiences": STALE_SENSITIVE_DATA}), env, 2),
+            "both old, beside lines of the file's own": (
+                [DEFAULTS, "Mine first.", STALE_ORGANIZATION, "Mine: second.", STALE_SENSITIVE_DATA] + rest
+                + ["Mine last."],
+                [DEFAULTS, "Mine first.", org, "Mine: second.", data] + rest + ["Mine last."], 2),
+            "only the Organization entry old": (swapped({"Organization": STALE_ORGANIZATION}), env, 1),
+            "only the Sensitive data entry old": (
+                swapped({"Sensitive data locations & audiences": STALE_SENSITIVE_DATA}), env, 1),
+            "old entries added beside the new ones": (
+                env + [STALE_ORGANIZATION, "Mine.", STALE_SENSITIVE_DATA], env + ["Mine."], None),
+        }
+        for name, (before, after, replaced) in cases.items():
+            with self.subTest(case=name):
+                self.reset(dict(base, autoMode={"environment": before, "allow": wanted["autoMode", "allow"]}))
+                p = self.install()
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                merged = read_json(self.settings)
+                got = merged["autoMode"]["environment"]
+                self.assertEqual(got, after)
+                self.assertEqual([e for e in got if label(e) == "Organization"], [org])
+                self.assertEqual([e for e in got if label(e) == "Sensitive data locations & audiences"], [data])
+                with open(self.settings, encoding="utf-8") as fh:
+                    raw = fh.read()
+                for old in (OLD_HARNESS, OLD_JOTFORM):
+                    self.assertNotIn(old, raw)
+                self.assertEqual(merged["autoMode"]["allow"], wanted["autoMode", "allow"])
+                self.assertEqual(merged["permissions"], base["permissions"])
+                line = settings_line(p.stdout)
+                self.assertNotIn("already up to date", line)
+                if replaced is not None:
+                    self.assert_line_counts(line, replaced={"autoMode.environment": replaced}, added={})
+                backups = self.backups()
+                self.assertEqual(len(backups), 1)
+                with open(self.settings, "rb") as fh:
+                    after_first = fh.read()
+                for again in (2, 3):
+                    p = self.install()
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn("~/.claude/settings.json: already up to date", p.stdout)
+                    with open(self.settings, "rb") as fh:
+                        self.assertEqual(fh.read(), after_first, f"install {again} changed the file")
+                    self.assertEqual(self.backups(), backups)
 
     def test_retire_and_replace_follow_the_snippet_list_by_list(self):
         # A snippet of the test's own: a retired string goes from the list the snippet retires it under, every
