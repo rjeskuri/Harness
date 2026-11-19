@@ -13,6 +13,7 @@ The harness turns each project's GitHub issues into the context for every sessio
 | The `harness` plugin | Seven agents, eight skills and seven hooks, installed once for your user | Agents do the work, skills are the procedures you start with `/harness:<name>`, hooks enforce the rules whatever the model thinks |
 | The `harness-*` tools | Nine command-line tools, on the Bash PATH in every session | The deterministic parts: board edits, worktrees, the red proof, PRs, budgets. Outside a session they live in `~/portfolio_projects/Harness/plugins/harness/bin/` |
 | The digest | A launchd job that runs `harness-digest` daily at 08:30 | One notification with PRs to review, tickets that need input and stale work, across every project |
+| Hourly dispatch (opt-in) | A launchd job you install yourself, `harness-work dispatch --install-launchd` | Every hour, the ready tickets of the projects you opted in start in the background, up to 8 live runs across all projects (Hourly dispatch, below) |
 | The Harness repo, `~/portfolio_projects/Harness` | The source of all of the above, under git | Edit a skill, an agent or a hook there, run `/reload-plugins`, and every project picks it up |
 
 Each project keeps its own `CLAUDE.md`, hooks, rules and skills. The harness adds the board, the guards and the loop beside them, in every project including jotform-glow-sync.
@@ -119,11 +120,22 @@ Turn it off by removing `HARNESS_PROJECT` from `~/.claude/settings.json`, or for
 | Work | Bills to | When it runs out |
 | --- | --- | --- |
 | Your interactive sessions, including `/harness:work N` | The Max subscription | Wait for the window; `/usage` shows the five-hour and seven-day limits |
-| `/harness:work` dispatch (the default) | The Max subscription: one background session per ticket | Wait for the window, as for interactive sessions |
+| `/harness:work` dispatch (the default), and the hourly dispatch | The Max subscription: one background session per ticket | A background session that hits the usage limit marks the `subscription` budget exhausted until the reset its refusal names (else 5 hours after it), found by the next sweep. Until then background dispatch, the hourly one included, starts nothing and says until when; `--api` still runs |
 | `/harness:work --api` (or `--venue headless`) dispatch | The API key in the keychain | A billing or auth failure marks the `api` budget exhausted for 24 hours. Until then `--api` and `--venue headless` are refused; dispatch without them still runs on the subscription |
 | Ultrareview on `risk:high` PRs | claude.ai usage credits, about 5 to 25 dollars a run | A credits failure marks the `cloud` budget exhausted for 24 hours |
 
-`harness-work budget status` shows both budgets. After a top-up, `harness-work budget reset api` clears the mark. `harness-work budget exhaust api --reason <text>` marks it exhausted by hand, which stops `--api` runs. The session brief and the standup name an exhausted budget.
+`harness-work budget status` shows the three budgets. After a top-up, `harness-work budget reset api` clears the mark; `harness-work budget reset subscription` clears the usage-limit hold early (the same refusal never marks it again; a new one does). `harness-work budget exhaust api --reason <text>` marks it exhausted by hand, which stops `--api` runs. The session brief and the standup name an exhausted budget.
+
+## Hourly dispatch
+
+Off until you opt a project in and install the job. Once both are done, minute 0 of every hour runs `harness-work dispatch --all-projects --max 8`: each registered project that opted in and has no open issue labelled `incident` gets the same dispatch as `/harness:work`, in the background on the subscription, topped up to 8 live runs across all projects (runs you started count too). A project with an open incident, or not opted in, is skipped with one line in the log.
+
+1. **Opt a project in.** In that project's `.claude/settings.json` (not `settings.local.json`), under `env`, set `"HARNESS_AUTODISPATCH": "1"`, then commit and push it to main. Only the file committed at `origin/main` counts, so a setting in your shell or a working tree opts nothing in. Opt out by committing `"0"` or removing the line.
+2. **Install the job, once.** `harness-work dispatch --install-launchd` writes `~/Library/LaunchAgents/com.ryaneskuri.harness-dispatch.plist` and loads it; it dispatches nothing itself. The install script does not install it. `harness-work dispatch --all-projects --dry-run` shows what the next hour would start.
+3. **Read the log.** `~/.claude/harness/dispatch/launchd.log` holds each tick's output: the projects skipped and why, the sessions launched, and a project that failed (one line; the others still run).
+4. **Uninstall.** `harness-work dispatch --uninstall-launchd` unloads the job and removes the file.
+
+The Mac must be awake for a tick to run: lid open on power, or closed with an external display attached. Hours missed while it slept run once when it wakes (the job uses `StartCalendarInterval`), not once per missed hour. While the `subscription` budget is exhausted each tick starts nothing, until the reset.
 
 A project that sets `HARNESS_ULTRAREVIEW=off` gets no ultrareview: `harness-pr ultra` prints one line and runs nothing, so its pull requests spend no usage credits.
 
@@ -136,7 +148,7 @@ A project that sets `HARNESS_ULTRAREVIEW=off` gets no ultrareview: `harness-pr u
 | `harness-red check` says the tests pass | They do not test the change. Back to the test-author; only a `refactor` ticket proceeds on green |
 | `no checks registered` from `harness-pr checks` | The repo has no CI on pull requests. The scaffold's `.github/workflows/ci.yml` is missing, or `--no-ci` skipped it and the project's own CI does not run on PRs |
 | A headless run died | `harness-work runs --sweep` shows each run's exit and outcome: `ok`, `billing`, `auth` or `error`. The log is in `~/.claude/harness/runs/`. The next `/harness:work` re-dispatches a ticket still in progress without a PR |
-| Budget exhausted | `harness-work budget status`. Top up, then `harness-work budget reset api`. Until then `--api` and `--venue headless` are refused; dispatch runs on the subscription, its default, either way |
+| Budget exhausted | `harness-work budget status`. Top up, then `harness-work budget reset api`. Until then `--api` and `--venue headless` are refused; dispatch runs on the subscription, its default, either way. `subscription` exhausted: the usage limit; background dispatch waits for the reset time it names, or `harness-work budget reset subscription` |
 | Old worktrees pile up | `harness-work worktrees` lists them and flags stale ones; `harness-work worktree remove <branch>` removes one |
 | Standup says the fleet could not be read | The `claude` binary was not found. The tool looks on PATH, then in `~/.local/bin` |
 | `/hooks` lists nothing from the harness | Trust the folder, then `/reload-plugins`. `claude plugin validate ~/portfolio_projects/Harness` checks the plugin. `claude --debug` logs every hook run with its exit code to `~/.claude/debug/<session-id>.txt` |
