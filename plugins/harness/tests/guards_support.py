@@ -1,4 +1,4 @@
-"""Shared by test_guards, test_guards_exemptions, test_guards_tests_first, test_guards_main_merge: the fixtures, helpers and base classes of the
+"""Shared by test_guards, test_guards_exemptions, test_guards_tests_first, test_guards_main_merge, test_guards_main_refs: the fixtures, helpers and base classes of the
 test_guards suite, split by test class so no one module bounds the parallel suite. Not a test
 module (no `test_` prefix): discovery and scripts/run_suite.py skip it. Each test module
 imports everything here, `setUpModule` and `tearDownModule` included, so each still builds its
@@ -343,6 +343,57 @@ class GuardTestCase(unittest.TestCase):
             [d["hookEventName"], d["permissionDecision"]], ["PreToolUse", "deny"]
         )
         return d["permissionDecisionReason"]
+
+
+class ClassFixtureGuardCase(GuardTestCase):
+    """A GuardTestCase whose tests share one fixture built once per class (epic #374): setUpClass
+    gives the class one folder and environment (cls.tmp, cls.home, cls.env, made as
+    GuardTestCase.setUp makes a test's) and cls.builder, a GuardTestCase working in them whose
+    git, write, make_repo and worktree build the fixture; the folder goes when the class ends.
+    Each test gets its own copy of cls.env, and its first hook run is still a real process."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        builder = GuardTestCase()
+        builder.setUp()
+        cls.addClassCleanup(builder.doCleanups)
+        cls.builder = builder
+        cls.tmp, cls.home, cls.env = builder.tmp, builder.home, builder.env
+
+    def setUp(self) -> None:  # the class's folder, not one per test
+        self.env = dict(type(self).env)
+
+
+# #268: the branches and worktrees test_guards_main_refs judges ref moves in.
+MAIN_REFS_BRANCH = "t/268-main-refs"
+MAIN_REFS_OTHER = "t/270-other"
+
+
+def main_refs_fixture(b: GuardTestCase) -> dict:
+    """Built with `b` (a ClassFixtureGuardCase's builder): a bare origin.git holding main; proj, a
+    clone of it by remote add and push, its main working tree switched to MAIN_REFS_BRANCH, with
+    a linked worktree on MAIN_REFS_OTHER under proj/.claude/worktrees/; and parked, a clone of
+    origin whose main working tree stays on main, as the harness keeps it, with a linked worktree
+    on MAIN_REFS_BRANCH. Returns {"ticket": proj, "linked": proj's linked worktree, "parked":
+    parked's linked worktree, "common": proj's git dir, which its linked worktree shares}."""
+    origin = b.tmp / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+        check=True, capture_output=True, env=b.env,
+    )
+    proj = b.make_repo("proj")
+    b.git(proj, "remote", "add", "origin", str(origin))
+    b.git(proj, "push", "-q", "origin", "main")  # also sets refs/remotes/origin/main
+    b.git(proj, "switch", "-q", "-c", MAIN_REFS_BRANCH)
+    linked = b.worktree(proj, MAIN_REFS_OTHER, "proj/.claude/worktrees/t-270")
+    parked = b.tmp / "parked"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(parked)],
+        check=True, capture_output=True, env=b.env,
+    )
+    parked_wt = b.worktree(parked, MAIN_REFS_BRANCH, "parked/.claude/worktrees/t-268")
+    return {"ticket": proj, "linked": linked, "parked": parked_wt, "common": proj / ".git"}
 
 
 # Ignore rules committed in BranchGuardBashExemptions' repo.
