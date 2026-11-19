@@ -1398,6 +1398,25 @@ def without_pr(repo, n, branch):
     return found
 
 
+def branch_prs(repo, branch):
+    """The pull requests of `branch` in any state, newest first (a failing gh call raises Problem)."""
+    prs = gh_json(repo, ["pr", "list", "--head", str(branch), "--state", "all", "--json", "number,state,isDraft",
+                         "--limit", str(PR_ROWS)]) if branch else []
+    return [pr for pr in prs if isinstance(pr, dict)] if isinstance(prs, list) else []
+
+
+def resume_state(repo, branch, worktree):
+    """(resume, pr) of a started ticket: `pr` is the newest open pull request of the branch (a draft counts), else
+    None; `resume` is true when there is such a PR or the branch carries commits beyond origin/main (main without an
+    origin), false on a fresh start."""
+    opened = [pr.get("number") for pr in branch_prs(repo, branch) if str(pr.get("state", "")).upper() == "OPEN"]
+    pr = opened[0] if opened else None
+    base = next((ref for ref in ("origin/main", "main") if ref_exists(repo, ref)), None)
+    ahead = git(worktree, "rev-list", "--count", f"{base}..HEAD") if base else None
+    commits = ahead is not None and ahead.returncode == 0 and ahead.stdout.strip() not in ("", "0")
+    return pr is not None or commits, pr
+
+
 def ask_without_pr(repo, n, branch):
     issue = ticket_issue(repo, n)
     if not isinstance(issue, dict) or str(issue.get("state", "")).upper() != "OPEN":
@@ -1405,9 +1424,7 @@ def ask_without_pr(repo, n, branch):
     labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
     if "status:in-progress" not in labels:
         return None
-    prs = gh_json(repo, ["pr", "list", "--head", str(branch), "--state", "all", "--json", "number,state,isDraft",
-                         "--limit", str(PR_ROWS)]) if branch else []
-    rows = [pr for pr in prs if isinstance(pr, dict)] if isinstance(prs, list) else []
+    rows = branch_prs(repo, branch)
     if any(pr.get("isDraft") is not True for pr in rows):    # a ready one, merged or closed too: a normal end
         return None
     drafts = [pr.get("number") for pr in rows if str(pr.get("state", "")).upper() == "OPEN"]   # newest first
@@ -1477,7 +1494,11 @@ def cmd_start(repo, args):
     data = {"number": ticket["number"], "branch": ticket["branch"], "worktree": ticket["worktree"],
             "tier": ticket["tier"], "previous_status": ticket["previous_status"], "waiting": ticket["waiting"],
             "answers": ticket["answers"], "context": context}
+    data["resume"], data["pr"] = resume_state(repo, ticket["branch"], ticket["worktree"])
     text = f"{ticket['worktree']}\n\n{context}"
+    if data["resume"]:
+        where = f"open PR #{data['pr']}" if data["pr"] else "commits and no open PR"
+        text += f"\n\nResume: {ticket['branch']} already has {where}; pick up where it stopped, not at the tests."
     if ticket["waiting"]:
         text += f"\n\n#{ticket['number']} is status:needs-input with no answer yet; its status is unchanged."
     elif ticket["answers"]:
