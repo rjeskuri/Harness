@@ -48,8 +48,10 @@ the chain), restored after a subshell or a child shell, and moved for git by -C,
     HEAD:main, refs/heads/main, :main), --mirror, --all, or a matching (:) or wildcard
     refspec that reaches main;
   - (d, #268) when the repo git runs in is a linked worktree, or a main working tree on
-    another branch with a commit: what moves main, master or origin's remote-tracking refs,
-    shadows them, or retargets origin (harness-red's proof trusts a merge of main):
+    another branch with a commit, or the command starts in one sharing that repo's common
+    git dir (git -C <main checkout> from a ticket worktree): what moves main, master or
+    origin's remote-tracking refs, shadows them, or retargets origin (harness-red's proof
+    trusts a merge of main):
     update-ref of such a ref (refs/heads/main, main, refs/tags/main, refs/remotes/origin/*,
     origin/*, refs/tags/origin/*), fetch or pull with --update-head-ok or a refspec or
     --refmap writing one (main:main, x:refs/remotes/origin/main, a pattern reaching one),
@@ -1371,6 +1373,21 @@ def guarded_at(state: dict, directory: str | None) -> Path | None:
     return guarded_tree(directory, cached(state))
 
 
+def main_refs_tree(state: dict, directory: str | None) -> Path | None:
+    """Where rule (d) holds for git run in `directory`: its own guarded tree, or else the one
+    the command started in (state["start"]) when both share a common git dir, so a ticket
+    worktree's `git -C <main checkout on main>` is judged as the ticket worktree's own."""
+    tree = guarded_at(state, directory)
+    if tree is not None or directory is None or not os.path.isdir(directory):
+        return tree
+    home = guarded_at(state, state.get("start"))
+    if home is None:
+        return None
+    ask = cached(state)
+    here = ask(git_dirs, directory)
+    return home if here is not None and here[1] == ask(git_dirs, state["start"])[1] else None
+
+
 def tree_dir(path: str) -> str:
     """The directory whose working tree the absolute `path` belongs to: its nearest existing
     directory, or for git's own files (under .git) the working tree around them."""
@@ -1486,11 +1503,10 @@ def part_refusal(state: dict, part: Part, name: str, args: list[str]) -> tuple |
             why = push_target_refusal(rest)
             if why:
                 return part.text, why, toplevel(where), None, PUSH_ADVICE
-        else:
-            why = main_ref_refusal(sub, rest)
-            tree = guarded_at(state, where) if why else None
-            if tree is not None:
-                return part.text, why, tree, None, MAIN_REFS_ADVICE
+        why = main_ref_refusal(sub, rest)
+        tree = main_refs_tree(state, where) if why else None
+        if tree is not None:
+            return part.text, why, tree, None, MAIN_REFS_ADVICE
     return None
 
 
@@ -1513,7 +1529,7 @@ def bash_refusal(command: str, cwd: str) -> str | None:
     (HARNESS_ALLOW_MAIN read as main() and allow_main read it). backup_gate.py asks it too."""
     if os.environ.get("HARNESS_ALLOW_MAIN", "").strip() == "1" or not command.strip():
         return None
-    found = refusal({"cwd": cwd, "repos": {}}, command)
+    found = refusal({"cwd": cwd, "start": cwd, "repos": {}}, command)
     if found is None:
         return None
     text, why, top, branch, advice = found
