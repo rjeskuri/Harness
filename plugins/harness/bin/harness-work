@@ -217,7 +217,7 @@ try:
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
     from harness_lib import backups, cost, reviews, waves
     from harness_lib.text import age_text as ago_text
-    from harness_lib.text import first_line, harness_home, home, last_line, one_line, parse_iso, parse_iso_seconds
+    from harness_lib.text import first_line, harness_home, last_line, one_line, parse_iso, parse_iso_seconds
     from harness_lib.text import read_json
     from harness_lib.text import write_json as _write_json
     from harness_lib import gh as ghlib
@@ -916,11 +916,13 @@ def session_transcript(bg_id):
     ~/.claude/projects/*/<bg_id>*.jsonl (a subagent's file sits deeper and never matches); None when there is none."""
     if not SAFE_ID_RE.match(bg_id):
         return None
-    job = read_json(home(".claude", "jobs", bg_id, "state.json"))
+    claude_dir = os.path.join(os.path.expanduser("~"), ".claude")
+    job = read_json(os.path.join(claude_dir, "jobs", bg_id, "state.json"))
     link = job.get("linkScanPath") if isinstance(job, dict) else None
     if isinstance(link, str) and os.path.isfile(link):
         return link
-    found = glob.glob(os.path.join(glob.escape(home(".claude", "projects")), "*", glob.escape(bg_id) + "*.jsonl"))
+    found = glob.glob(os.path.join(glob.escape(os.path.join(claude_dir, "projects")), "*",
+                                   glob.escape(bg_id) + "*.jsonl"))
     found = [path for path in found if os.path.isfile(path)]
     return max(found, key=os.path.getmtime) if found else None
 
@@ -2663,7 +2665,7 @@ def cmd_worktree_remove(repo, args):
 
 # --------------------------------------------------------------- launchd (#164; harness-digest's are the model)
 def plist_path():
-    return home("Library", "LaunchAgents", f"{LAUNCHD_LABEL}.plist")
+    return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", f"{LAUNCHD_LABEL}.plist")
 
 
 def launchctl(args):
@@ -2682,7 +2684,8 @@ def install_launchd():
     StartCalendarInterval, not StartInterval: launchd runs a calendar job missed while the Mac slept once on wake."""
     path = plist_path()
     script = os.path.realpath(os.path.abspath(__file__))
-    job_path = ":".join(["/opt/homebrew/bin", "/usr/local/bin", home(".local", "bin"), "/usr/bin", "/bin"])
+    job_path = ":".join(["/opt/homebrew/bin", "/usr/local/bin", os.path.join(os.path.expanduser("~"), ".local", "bin"),
+                         "/usr/bin", "/bin"])
     python = shutil.which("python3", path=job_path) or sys.executable    # the python3 the job's own PATH finds
     log = harness_home("dispatch", "launchd.log")
     job = {"Label": LAUNCHD_LABEL,
