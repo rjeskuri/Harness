@@ -116,10 +116,35 @@ if argv[:1] == ["stop"]:
         sys.exit(1)
     print("Stopped " + named[0])
     sys.exit(0)
+def post_started():
+    # A session that starts (#367): its `harness-work start` leaves a "Started on" comment on the ticket. Here the
+    # comment is added to the scenario's `issue view N` answer, stamped two seconds ahead so a launch time kept in
+    # whole seconds never ties with it. FAKECLAUDE_NO_START=1: a session that exits before it starts.
+    import datetime, re
+    path = os.environ.get("FAKEGH_SCENARIO")
+    found = re.search(r"/harness:work (\\d+)", " ".join(argv))
+    if os.environ.get("FAKECLAUDE_NO_START") or not path or not found or not os.path.exists(path):
+        return
+    number = found.group(1)
+    branch = os.path.basename(os.getcwd()).replace("-", "/", 1)
+    when = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
+    with open(path, encoding="utf-8") as fh:
+        scenario = json.load(fh)
+    for call in scenario.get("calls", []):
+        if call.get("match") == ["issue", "view", number] and isinstance(call.get("stdout_json"), dict):
+            call["stdout_json"].setdefault("comments", []).append({{
+                "author": {{"login": "rjeskuri"}}, "createdAt": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "url": "https://github.com/o/r/issues/" + number + "#issuecomment-started",
+                "body": "Started on " + branch + " (fakehost, session)\\n\\n<!-- harness -->"}})
+    with open(path + ".claude", "w", encoding="utf-8") as fh:
+        json.dump(scenario, fh)
+    os.replace(path + ".claude", path)
 if "--bg" in argv:
+    post_started()
     print("backgrounded \\u00b7 " + os.environ.get("FAKECLAUDE_BG_ID", "abc123") + " \\u00b7 " + argv[argv.index("-n") + 1])
     sys.exit(0)
 if "-p" in argv:
+    post_started()
     time.sleep(float(os.environ.get("FAKECLAUDE_SLEEP", "0.2")))
     if os.environ.get("FAKECLAUDE_MODE") == "billing":
         print(json.dumps({{"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
@@ -300,7 +325,8 @@ class WorkTest(unittest.TestCase):
                    GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@localhost",
                    HARNESS_GH=os.path.join(BINS["fakebin"], "gh"),
                    HARNESS_CLAUDE=os.path.join(BINS["fakebin"], "claude"),
-                   FAKEGH_SCENARIO=self.scenario_path, FAKEGH_LOG=self.gh_log, FAKECLAUDE_LOG=self.claude_log)
+                   FAKEGH_SCENARIO=self.scenario_path, FAKEGH_LOG=self.gh_log, FAKECLAUDE_LOG=self.claude_log,
+                   HARNESS_START_WAIT="10")     # #367: seconds a launch waits for its session's "Started on"
         env.update(extra)
         return env
 

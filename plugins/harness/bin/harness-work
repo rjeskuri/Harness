@@ -217,7 +217,8 @@ DIRTY_SHOWN = 10
 GIT_TIMEOUT = 120
 TOOL_TIMEOUT = 300            # a harness-board call
 SETUP_TIMEOUT = 1500          # uv sync, npm ci
-LAUNCH_TIMEOUT = 120          # claude --bg returns once the session is handed to the supervisor
+START_WAIT = 60.0             # seconds dispatch waits after a launch for the session's "Started on" comment (#367)
+LAUNCH_TIMEOUT = 120         # claude --bg returns once the session is handed to the supervisor
 AGENTS_TIMEOUT = 30
 STOP_TIMEOUT = 30             # claude stop <id> of a finished ticket's session
 GH_TIMEOUT = 60
@@ -637,12 +638,14 @@ def issue_labels(repo, number):
     return [lb.get("name") for lb in labels or [] if isinstance(lb, dict)]
 
 
-def start_ticket(repo, number, venue, draft_pr=None):
+def start_ticket(repo, number, venue, draft_pr=None, announce=False):
     """Everything `start` does except printing; the ticket record, the branch and the worktree.
 
     A needs-input ticket's answers are read before `show` refreshes the ticket cache. The status goes to
     in-progress except from in-review (a revision pass) and from needs-input without an answer (waiting).
-    `draft_pr`: dispatch's redispatch of a run that left only that open draft PR; a start comment names it."""
+    `draft_pr`: dispatch's redispatch of a run that left only that open draft PR; a start comment names it.
+    `announce`: a session's own start (`harness-work start`) comments "Started on" on a ticket already in-progress too
+    (dispatch moved it there before the launch), so dispatch can see the session came up."""
     answers = []
     if "status:needs-input" in issue_labels(repo, number):
         found = board_json(repo, "answers", number, "--json")
@@ -669,6 +672,8 @@ def start_ticket(repo, number, venue, draft_pr=None):
     waiting = previous == "needs-input" and not answers
     if previous not in ("in-progress", "in-review") and not waiting:
         board(repo, "status", number, "in-progress", "--comment", f"Started on {branch} ({hostname()}, {venue})")
+    elif announce and previous == "in-progress":
+        board(repo, "comment", number, "--body", f"Started on {branch} ({hostname()}, {venue})")
     if draft_pr:
         board(repo, "comment", number, "--body", f"Started again on {branch} ({hostname()}, {venue}): draft PR "
                                                  f"#{draft_pr} is open and the worktree may hold uncommitted work "
@@ -1237,6 +1242,40 @@ def launch(repo, ticket, venue, effort=None):
     return record
 
 
+def started_comments(repo, n):
+    """How many "Started on" comments ticket n carries."""
+    issue = gh_json(repo, ["issue", "view", str(n), "--json", "comments"])
+    comments = issue.get("comments") if isinstance(issue, dict) else None
+    return sum(1 for c in comments or [] if isinstance(c, dict) and str(c.get("body") or "").startswith("Started on"))
+
+
+def start_wait():
+    try:
+        return max(0.0, float(os.environ.get("HARNESS_START_WAIT", START_WAIT)))
+    except ValueError:
+        return START_WAIT
+
+
+def confirm_started(repo, record, before):
+    """Wait up to HARNESS_START_WAIT seconds (default 60) for the launched session's own `harness-work start` to
+    comment "Started on" (more such comments than `before`, counted ahead of the launch). A session that never does
+    ends its record in error, so the next dispatch retries the ticket (#367). `before` None: nothing to compare."""
+    if before is None:
+        return
+    n, wait = record["ticket"], start_wait()
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            if started_comments(repo, n) > before:
+                return
+        except Problem:
+            pass                                    # a failed read is "not yet"; the deadline decides
+        left = deadline - time.monotonic()
+        if left <= 0:
+            failed(record, f"the session did not start within {wait:g} s (no \"Started on\" comment on #{n})")
+        time.sleep(min(1.0, left))
+
+
 def failed(record, why):
     """A launch that never ran: recorded as ended in error, so the next dispatch picks the ticket up again."""
     record.update(ended_at=iso(now()), outcome="error", error=one_line(why))
@@ -1472,7 +1511,7 @@ def live_runs(records, agents):
 
 # --------------------------------------------------------------- commands
 def cmd_start(repo, args):
-    ticket = start_ticket(repo, args.number, args.venue)
+    ticket = start_ticket(repo, args.number, args.venue, announce=True)
     context = board(repo, "show", args.number, "--markdown").rstrip("\n")
     data = {"number": ticket["number"], "branch": ticket["branch"], "worktree": ticket["worktree"],
             "tier": ticket["tier"], "previous_status": ticket["previous_status"], "waiting": ticket["waiting"],
@@ -1755,6 +1794,16 @@ def after_text(after):
     return f"after #{after['ticket']}: nothing ready"
 
 
+def answered_needs_input(repo, n):
+    """Ticket n is status:needs-input and the owner has answered since its question (harness-board answers)."""
+    try:
+        if "status:needs-input" not in issue_labels(repo, n):
+            return False
+        return bool(board_json(repo, "answers", n, "--json"))
+    except Problem:
+        return False
+
+
 def cmd_dispatch(repo, args):
     if args.max < 1:
         raise Problem("--max must be at least 1")
@@ -1793,6 +1842,9 @@ def cmd_dispatch(repo, args):
         if n in seen or any(s["number"] == n for s in skipped):
             continue
         seen.add(n)
+        if n not in live and answered_needs_input(repo, n):     # the owner's answer resumes it, as cloud does (#367)
+            candidates.append({"number": n, "title": "", "again": "an answer to its question"})
+            continue
         skipped.append({"number": n, "why": f"live run {live[n]['id']}" if n in live else
                         "not ready, and not in progress with an ended run to redispatch"})
     for row in candidates:
@@ -1862,7 +1914,12 @@ def cmd_dispatch(repo, args):
             if not ticket["title"]:
                 ticket["title"] = row.get("title") or ""
             route = code_route(ticket["type"], ticket["size"], ticket["risk"], routing)
+            try:
+                before = started_comments(repo, n)
+            except Problem:
+                before = None
             record = launch(repo, ticket, venue, route["effort"])
+            confirm_started(repo, record, before)
         except Problem as err:
             failures.append({"number": n, "error": one_line(err)})
             if not args.json:

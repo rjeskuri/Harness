@@ -1804,6 +1804,103 @@ class DispatchOnly(RowsInProcess, CopiedProject, WorkTest):
         self.assertEqual(self.claude_calls(), [])
 
 
+# =========================================================================== dispatch resumes an answered ticket (#367)
+class DispatchResume(RowsInProcess, CopiedProject, WorkTest):
+    """`dispatch --only N` plans a status:needs-input ticket the owner has answered (harness-board answers N), as
+    `cloud` does, and confirms each launch: the session's own `harness-work start` leaves a "Started on" comment, and
+    a launch that shows none within HARNESS_START_WAIT seconds (default 60) ends its run record in error. The fake
+    claude (work_support) posts that comment when it is launched, unless FAKECLAUDE_NO_START is set."""
+
+    SKIP = "not ready, and not in progress with an ended run to redispatch"
+    STARTED_EARLIER = "Started on t/{n}-first-run (host, bg)" + MARK
+
+    def needs_input(self, n, *replies, title="Resumed"):
+        comments = [comment(ME, iso_ago(hours=5), self.STARTED_EARLIER.format(n=n)),
+                    comment(ME, iso_ago(hours=3), QUESTION)] + list(replies)
+        self.scenario(issues=[issue(n, labels=NEEDS_INPUT, title=title, comments=comments)])
+
+    def edits(self, n):
+        return [a for a in self.gh_calls() if a[:3] == ["issue", "edit", str(n)]]
+
+    def test_only_launches_an_answered_needs_input_ticket_with_a_run_record(self):
+        cases = ((12, [comment(ME, iso_ago(hours=1), "Use main.")]),
+                 (40, [comment("drive-by-user", iso_ago(hours=2), "Me too"),
+                       comment(ME.upper(), iso_ago(minutes=5), "The --fast one."),
+                       comment(ME, iso_ago(minutes=4), "Note to self." + MARK)]))
+        for n, replies in cases:
+            with self.subTest(ticket=n):
+                shutil.rmtree(self.runs_dir(), True)
+                for path in (self.gh_log, self.claude_log):
+                    if os.path.exists(path):
+                        os.unlink(path)
+                self.needs_input(n, *replies, title=f"Resumed {n}")
+                bg_id = f"resume{n}"
+                p = self.ok("dispatch", "--only", str(n), env=self.env(FAKECLAUDE_BG_ID=bg_id, **CREDENTIALS))
+                self.assertRegex(p.stdout, rf"(?m)^#{n} bg on t/{n}-\S+ \(id {bg_id}\)$")
+                self.assertNotIn(self.SKIP, p.stdout + p.stderr)
+                [call] = self.claude_calls()
+                self.assertEqual(call["argv"], ["--bg", "-n", f"proj #{n} Resumed {n}", "--permission-mode", "auto",
+                                                f"/harness:work {n}"])
+                [record] = self.run_records()
+                self.assertEqual((record["ticket"], record["venue"], record["bg_id"], record["ended_at"],
+                                  record["outcome"]), (n, "bg", bg_id, None, None))
+                self.assertTrue(record["id"].startswith(f"{self.key}-{n}-"), record["id"])
+                self.assertEqual(os.path.realpath(call["cwd"]), os.path.realpath(record["worktree"]))
+                moved = [a for a in self.edits(n) if "status:in-progress" in a and "status:needs-input" in a]
+                self.assertTrue(moved, self.edits(n))
+                self.assertTrue([a for a in self.gh_calls() if a[:3] == ["issue", "comment", str(n)]
+                                 and "Started on" in " ".join(a)])
+
+    def test_only_still_skips_a_needs_input_ticket_without_an_answer_since_its_question(self):
+        question = comment(ME, iso_ago(hours=3), QUESTION)
+        shapes = {"no reply at all": [question],
+                  "only the harness's own note": [question, comment(ME, iso_ago(hours=1), "Reminder." + MARK)],
+                  "a reply before the question": [comment(ME, iso_ago(hours=4), "Use main."), question],
+                  "a reply by someone else": [question, comment("drive-by-user", iso_ago(hours=1), "Use main.")]}
+        for shape, comments in shapes.items():
+            with self.subTest(shape):
+                self.scenario(issues=[issue(12, labels=NEEDS_INPUT, comments=comments)])
+                p = self.ok("dispatch", "--only", "12", env=self.env(**CREDENTIALS))
+                self.assertIn(f"skip #12: {self.SKIP}", p.stdout + p.stderr)
+                self.assertEqual(self.claude_calls(), [])
+                self.assertEqual(self.run_records(), [])
+                self.assertFalse([a for a in self.gh_calls() if a[:2] in (["issue", "edit"], ["issue", "comment"])])
+                self.assertFalse(os.path.exists(os.path.join(self.repo, ".claude", "worktrees")))
+
+    def test_a_launch_whose_session_never_starts_ends_its_record_in_error_and_the_next_dispatch_retries(self):
+        self.needs_input(12, comment(ME, iso_ago(hours=1), "Use main."))   # an older "Started on" is not this launch's
+        began = time.monotonic()
+        p = self.work("dispatch", "--only", "12", env=self.env(FAKECLAUDE_NO_START="1", HARNESS_START_WAIT="2",
+                                                               **CREDENTIALS))
+        took = time.monotonic() - began
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(len(self.claude_calls()), 1)
+        [record] = self.run_records()
+        self.assertEqual((record["ticket"], record["outcome"]), (12, "error"))
+        self.assertTrue(record["ended_at"])
+        self.assertTrue(record.get("error") and "\n" not in record["error"], record)
+        self.assertIn("#12", p.stderr)
+        self.assertIn(record["error"], p.stderr)                         # it says so
+        self.assertGreaterEqual(took, 1.5)                                # it waited for the session before giving up
+        self.assertLess(took, 30)
+        # the ended record is what the next dispatch retries: a healthy session now starts and the run goes on
+        self.ok("dispatch", "--only", "12", env=self.env(HARNESS_START_WAIT="10", FAKECLAUDE_BG_ID="again12",
+                                                         **CREDENTIALS))
+        records = self.run_records()
+        self.assertEqual(len(records), 2)
+        newest = max(records, key=lambda r: r["started_at"] + r["id"])
+        self.assertEqual((newest["bg_id"], newest["ended_at"], newest["outcome"]), ("again12", None, None))
+        self.assertEqual(len(self.claude_calls()), 2)
+
+    def test_a_session_that_starts_is_never_failed_by_the_wait(self):
+        self.scenario(issues=[issue(7, title="Seven")], ready=[ready_row(7, "Seven")])
+        began = time.monotonic()
+        self.ok("dispatch", "--only", "7", env=self.env(HARNESS_START_WAIT="30", **CREDENTIALS))
+        self.assertLess(time.monotonic() - began, 20)                     # a seen "Started on" ends the wait at once
+        [record] = self.run_records()
+        self.assertEqual((record["ticket"], record["ended_at"], record["outcome"]), (7, None, None))
+
+
 # =========================================================================== dispatch --after N (#389)
 def blocked_row(number, title, blockers=(), labels=READY):
     """A ready row as `gh issue list` gives it, its blockers all closed (harness-board ready drops any other)."""
