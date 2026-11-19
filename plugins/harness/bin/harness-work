@@ -18,11 +18,12 @@ Usage:
     harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
     harness-work budget calls [--hours 24] [--json]
     harness-work worktrees [--stale DAYS]
+    harness-work branches [--prune]
     harness-work worktree remove BRANCH [--discard]
     harness-work backup list [--all]
     harness-work backup restore ID [--path P] [--to DIR] [--force]
-    start, attempt, stage, cost, dispatch, cloud, waves, wave, worktrees, worktree and backup take --repo PATH (default:
-    CLAUDE_PROJECT_DIR, else the cwd's repository); every subcommand except worktree remove takes --json.
+    start, attempt, stage, cost, dispatch, cloud, waves, wave, worktrees, branches, worktree and backup take --repo PATH
+    (default: CLAUDE_PROJECT_DIR, else the cwd's repository); every subcommand except worktree remove takes --json.
 
 State, under ~/.claude/harness: repos/<repo-key>/tickets/<N>.json (the ticket cache that `harness-board show`
 writes; start adds branch, worktree and started_at, attempt adds to attempts), repos/<repo-key>/cost/<N>.json (the
@@ -143,6 +144,23 @@ from its claude.ai/code URL. The run record gets venue cloud, cloud_id and url, 
 ticket. A failed launch, or one without a session id, ends the record in error with claude's last line; billing
 wording there marks the cloud budget exhausted for 24 h.
 
+branches (#416): origin's ticket branches (t/N-<slug>, read from origin with `git ls-remote`, never from
+refs/remotes/origin) that no worktree has checked out, each with its ticket, its issue's state, its newest PR (`gh pr
+list --head <branch> --state all`) and a stale flag. Stale only when the issue is CLOSED, none of its PRs is OPEN, no
+live run record (run_live, every venue) names the branch, and its tip is the head of one of its PRs (refs/pull/N/head
+on origin) or, with no PR, the issue was closed as completed. A failed or unreadable gh answer keeps the branch and is
+one of its reasons. --json: [{branch, ticket, tip, issue ({state, state_reason}, null when unread), pr ({number, state}
+of the newest, or null), stale, reason}]. --prune deletes each stale branch with `gh api
+repos/{owner}/{repo}/git/refs/heads/<branch> -X DELETE` in the main checkout, never with git push (the pre-push hook
+and branch_guard go on refusing a raw delete), and prints one line per branch: `deleted origin/<branch>: <why>`,
+`kept origin/<branch>: <reasons>` or `not deleted origin/<branch>: <gh's error>`; a failed DELETE lets the rest run and
+exits 1. --prune --json adds deleted (and error) to each row.
+
+worktree remove: after the worktree and the local branch, a ticket branch's origin branch goes too when the branches
+judge calls it stale, its tip read from origin (`deleted origin/<branch>: <why>`); else one warning `kept
+origin/<branch>: <reasons>`, a failed read of origin or gh included, and the local removal stands. Nothing when origin
+has no such branch. A failed DELETE is one line, exit 1.
+
 backup list: this repository's snapshots (harness_lib/backups.py: its project store, <git common dir>/harness-backups/,
 and its own in ~/.claude/harness/backups/), newest first, as ID, AGE, ITEMS (paths and git refs), SIZE and COMMAND; --all adds every
 snapshot in ~/.claude/harness/backups/, and outside a repository list acts as --all; --json prints the manifests;
@@ -181,6 +199,7 @@ import subprocess
 import sys
 import termios
 import time
+from urllib.parse import quote
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 if _LIB not in sys.path:
@@ -1493,12 +1512,13 @@ PR_ROWS = 100       # pull requests of a branch read by ask_without_pr
 
 
 def ticket_issue(repo, n):
-    """Ticket n's issue (number, title, state, labels); a failing gh call raises Problem. One command reads each issue
-    once: the sweep's finished and early checks and dispatch's redispatch share it, a failure included."""
+    """Ticket n's issue (number, title, state, stateReason, labels); a failing gh call raises Problem. One command reads
+    each issue once: the sweep's finished and early checks, dispatch's redispatch and the branch judge share it, a
+    failure included."""
     key = (repo.main, n)
     if key not in ISSUES:
         try:
-            ISSUES[key] = gh_json(repo, ["issue", "view", str(n), "--json", "number,title,state,labels"])
+            ISSUES[key] = gh_json(repo, ["issue", "view", str(n), "--json", "number,title,state,stateReason,labels"])
         except Problem as err:
             ISSUES[key] = err
     found = ISSUES[key]
@@ -1524,10 +1544,13 @@ def without_pr(repo, n, branch):
     return found
 
 
-def branch_prs(repo, branch):
-    """The pull requests of `branch` in any state, newest first (a failing gh call raises Problem)."""
+def branch_prs(repo, branch, strict=False):
+    """The pull requests of `branch` in any state, newest first (a failing gh call raises Problem; with `strict` so
+    does an answer that is not a list, which otherwise reads as none)."""
     prs = gh_json(repo, ["pr", "list", "--head", str(branch), "--state", "all", "--json", "number,state,isDraft",
                          "--limit", str(PR_ROWS)]) if branch else []
+    if strict and not isinstance(prs, list):
+        raise Problem(f"gh pr list --head {branch} printed no list of pull requests")
     return [pr for pr in prs if isinstance(pr, dict)] if isinstance(prs, list) else []
 
 
@@ -2384,6 +2407,161 @@ def cmd_worktrees(repo, args):
     print(table(lines))
 
 
+# --------------------------------------------------------------- origin's ticket branches (#416)
+TICKET_BRANCH_RE = re.compile(r"t/([0-9]+)-[^/]+")      # t/N-<slug>, the form start creates
+
+
+def branch_ticket(branch):
+    """N of a ticket branch t/N-<slug>, else None."""
+    found = TICKET_BRANCH_RE.fullmatch(branch or "")
+    return int(found.group(1)) if found and int(found.group(1)) > 0 else None
+
+
+def origin_refs(repo, *patterns):
+    """{ref: sha} of origin's refs matching `patterns`, read from origin now (`git ls-remote`), never from the local
+    refs/remotes/origin/*, which lack what a cloud session or a CI fix pushed since the last fetch. Problem when
+    origin cannot be read."""
+    refs = {}
+    for line in git_ok(repo.main, "ls-remote", "origin", *patterns).splitlines():
+        sha, _, ref = line.partition("\t")
+        if ref.strip():
+            refs[ref.strip()] = sha.strip()
+    return refs
+
+
+def live_run_branches(repo):
+    """{branch: run id} of this repository's live runs, by run_live (every venue)."""
+    agents = Agents()
+    return {r["branch"]: r.get("id") for r in load_runs()
+            if of_repo(r, repo) and isinstance(r.get("branch"), str) and r["branch"] and run_live(r, agents)}
+
+
+def judge_branch(repo, branch, tip, refs, live):
+    """Origin's ticket branch `branch` at `tip`: {branch, ticket, tip, issue {state, state_reason} or None, pr (the
+    newest, {number, state}) or None, stale, reason}. Stale only when its issue is CLOSED, none of its PRs is OPEN, no
+    live run names it (`live`, live_run_branches) and `tip` is the head of one of its PRs (refs/pull/N/head in
+    `refs`, read from origin) or, with no PR, its issue was closed as completed: the commits stay reachable or have
+    landed. A failed or unreadable gh answer keeps it and is one of its reasons, never read as an answer. `reason`
+    says why it is stale, or every reason it is kept."""
+    n = branch_ticket(branch)
+    kept, issue, prs = [], None, None
+    if branch in live:
+        kept.append(f"a live run names it ({live[branch]})")
+    try:
+        found = ticket_issue(repo, n)
+        if not isinstance(found, dict) or not found.get("state"):
+            raise Problem(f"gh issue view {n} printed no issue state")
+        issue = {"state": str(found["state"]).upper(), "state_reason": str(found.get("stateReason") or "").upper()
+                 or None}
+    except Problem as err:
+        kept.append(f"cannot read issue #{n}: {err}")
+    try:
+        prs = branch_prs(repo, branch, strict=True)
+    except Problem as err:
+        kept.append(f"cannot list its PRs: {err}")
+    if issue is not None and issue["state"] != "CLOSED":
+        kept.append(f"issue #{n} is {issue['state'].lower()}")
+    held = None
+    if prs:
+        opened = [pr for pr in prs if str(pr.get("state", "")).upper() == "OPEN"]
+        held = next((pr for pr in prs if refs.get(f"refs/pull/{pr.get('number')}/head") == tip), None)
+        if opened:
+            kept.append(f"PR #{opened[0].get('number')} is open")
+        elif held is None:
+            numbers = ", ".join(f"#{pr.get('number')}" for pr in prs)
+            kept.append(f"its tip {tip[:7]} is the head of none of its PRs ({numbers}), so its later commits would "
+                        f"be lost")
+    elif prs == [] and issue is not None and issue["state"] == "CLOSED" and issue["state_reason"] != "COMPLETED":
+        how = (issue["state_reason"] or "no reason").lower().replace("_", " ")
+        kept.append(f"no PR holds its commits and #{n} was closed as {how}, not as completed")
+    if kept:
+        reason = "; ".join(kept)
+    elif held is not None:
+        reason = f"#{n} closed, PR #{held.get('number')} holds its tip"
+    else:
+        reason = f"#{n} closed as completed, no PR"
+    newest = prs[0] if prs else None
+    return {"branch": branch, "ticket": n, "tip": tip, "issue": issue,
+            "pr": {"number": newest.get("number"), "state": str(newest.get("state") or "").upper()} if newest else None,
+            "stale": not kept, "reason": reason}
+
+
+def delete_origin_branch(repo, branch):
+    """Delete origin's `branch` through the GitHub API, in the main checkout (whose repository `{owner}/{repo}`
+    names, as for the tool's other gh calls); never through git push, so the pre-push hook and branch_guard go on
+    refusing a raw delete. Problem with gh's error."""
+    gh_json(repo, ["api", f"repos/{{owner}}/{{repo}}/git/refs/heads/{quote(branch)}", "-X", "DELETE"])
+
+
+def cmd_branches(repo, args):
+    trees = {e.branch for e in worktree_entries(repo.main, git_ok) if e.branch and os.path.isdir(e.path)}
+    refs = origin_refs(repo, "refs/heads/t/*", "refs/pull/*/head")
+    found = [(ref[len("refs/heads/"):], tip) for ref, tip in refs.items() if ref.startswith("refs/heads/")]
+    branches = sorted(((branch_ticket(branch), branch, tip) for branch, tip in found
+                       if branch_ticket(branch) is not None and branch not in trees))
+    branches = [(branch, tip) for _, branch, tip in branches]
+    live = live_run_branches(repo) if branches else {}
+    rows = [judge_branch(repo, branch, tip, refs, live) for branch, tip in branches]
+    if not args.prune:
+        if wants_json(args):
+            emit(True, rows, "")
+        elif not rows:
+            print("No ticket branches on origin without a worktree.")
+        else:
+            lines = [("BRANCH", "ISSUE", "PR", "VERDICT")]
+            for r in rows:
+                state = f"#{r['ticket']} {r['issue']['state'].lower()}" if r["issue"] else f"#{r['ticket']} ?"
+                pr = f"#{r['pr']['number']} {r['pr']['state'].lower()}" if r["pr"] else "-"
+                lines.append((r["branch"], state, pr, ("stale: " if r["stale"] else "keep: ") + r["reason"]))
+            print(table(lines))
+        return
+    failed = 0
+    for r in rows:
+        r["deleted"] = False
+        if not r["stale"]:
+            line = f"kept origin/{r['branch']}: {r['reason']}"
+        else:
+            try:
+                delete_origin_branch(repo, r["branch"])
+                r["deleted"] = True
+                line = f"deleted origin/{r['branch']}: {r['reason']}"
+            except Problem as err:
+                failed += 1
+                r["error"] = str(err)
+                line = f"not deleted origin/{r['branch']}: {err}"
+        if not wants_json(args):
+            print(one_line(line), flush=True)
+    if wants_json(args):
+        emit(True, rows, "")
+    if failed:
+        raise Problem(f"{failed} of {sum(1 for r in rows if r['stale'])} stale branches could not be deleted")
+
+
+def prune_after_remove(repo, branch):
+    """worktree remove's remote step, by judge_branch as `branches --prune`: origin's ticket branch deleted when stale
+    (`deleted origin/<branch>: <why>` on stdout), else kept with its reasons (one warning); nothing for a branch that
+    is no ticket branch or that origin does not have. A failed DELETE is Problem."""
+    if branch_ticket(branch) is None:
+        return
+    try:
+        refs = origin_refs(repo, f"refs/heads/{branch}", "refs/pull/*/head")
+    except Problem as err:
+        warn(f"kept origin/{branch}: cannot read origin: {err}")
+        return
+    tip = refs.get(f"refs/heads/{branch}")
+    if tip is None:
+        return
+    row = judge_branch(repo, branch, tip, refs, live_run_branches(repo))
+    if not row["stale"]:
+        warn(f"kept origin/{branch}: {row['reason']}")
+        return
+    try:
+        delete_origin_branch(repo, branch)
+    except Problem as err:
+        raise Problem(f"origin/{branch} not deleted: {err}") from None
+    print(one_line(f"deleted origin/{branch}: {row['reason']}"), flush=True)
+
+
 # --------------------------------------------------------------- backups
 def backup_main(args):
     """The main checkout backup acts for: --repo (which must be in a repository), else CLAUDE_PROJECT_DIR, else the
@@ -2480,7 +2658,8 @@ def cmd_worktree_remove(repo, args):
     if has_branch:
         git_ok(repo.main, "branch", "-D", branch)
         done.append(f"deleted branch {branch}")
-    print("\n".join(done))
+    print("\n".join(done), flush=True)
+    prune_after_remove(repo, branch)
 
 
 # --------------------------------------------------------------- arguments
@@ -2505,7 +2684,7 @@ def parser():
     ap = Parser(prog="harness-work", description="Ticket worktrees, attempts, dispatch, runs and budgets.")
     sub = ap.add_subparsers(dest="cmd",
                             metavar="{start,attempt,stage,cost,dispatch,cloud,runs,waves,wave,budget,worktrees,"
-                                    "worktree,backup}")
+                                    "branches,worktree,backup}")
     sub.required = True
 
     start = sub.add_parser("start", parents=[with_repo, with_json],
@@ -2602,10 +2781,16 @@ def parser():
                          help="the ticket worktrees with age, PR state and the stale flag")
     wts.add_argument("--stale", type=float, default=7, metavar="DAYS", help="default 7")
 
+    brs = sub.add_parser("branches", parents=[with_repo, with_json],
+                         help="origin's t/* branches without a worktree, with issue, newest PR and the stale flag")
+    brs.add_argument("--prune", action="store_true",
+                     help="delete each stale branch through the GitHub API; print deleted or kept with the reason")
+
     wt = sub.add_parser("worktree", help="one ticket worktree")
     wt_sub = wt.add_subparsers(dest="action", metavar="{remove}")
     wt_sub.required = True
-    rm = wt_sub.add_parser("remove", parents=[with_repo], help="remove a worktree and delete its branch")
+    rm = wt_sub.add_parser("remove", parents=[with_repo],
+                           help="remove a worktree and delete its branch, and origin's when it is stale")
     rm.add_argument("branch")
     rm.add_argument("--discard", action="store_true", help="remove it even with uncommitted changes")
 
@@ -2643,7 +2828,7 @@ def main():
         else:
             command = {"start": cmd_start, "attempt": cmd_attempt, "stage": cmd_stage, "cost": cmd_cost, "dispatch": cmd_dispatch,
                        "cloud": cmd_cloud, "waves": cmd_waves, "wave": cmd_wave_drop, "worktrees": cmd_worktrees,
-                       "worktree": cmd_worktree_remove}[args.cmd]
+                       "branches": cmd_branches, "worktree": cmd_worktree_remove}[args.cmd]
             command(open_repo(args.repo), args)
     except Problem as err:
         sys.exit(f"harness-work: {one_line(err)}")
