@@ -1901,14 +1901,14 @@ class DispatchResume(RowsInProcess, CopiedProject, WorkTest):
             comment(ME, iso_ago(hours=5), self.STARTED_EARLIER.format(n=n)), comment(ME, iso_ago(hours=3), QUESTION),
             comment(ME, iso_ago(hours=1), "Use main.")]) for n in (12, 13)]
         self.scenario(issues=issues)
-        wait = 3
+        wait = 8                                                          # big enough that the fixed overhead is small beside it
         began = time.monotonic()
         p = self.work("dispatch", "--only", "12,13", env=self.env(FAKECLAUDE_NO_START="1", FAKECLAUDE_BG_ID="never",
                                                                   HARNESS_START_WAIT=str(wait), **CREDENTIALS))
         took = time.monotonic() - began
         self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertGreaterEqual(took, wait - 0.5)
-        self.assertLess(took, 1.7 * wait)                                 # waits in turn would take about 2 * wait
+        self.assertLess(took, 2 * wait - 1)                               # waits in turn take at least 2 * wait plus the overhead
         records = self.run_records()
         self.assertEqual(sorted((r["ticket"], r["outcome"]) for r in records), [(12, "error"), (13, "error")])
         self.assertTrue(all(r["ended_at"] for r in records), records)
