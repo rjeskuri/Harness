@@ -30,6 +30,14 @@ day whose transcripts may have expired (Claude Code deletes a session about
 30 days after its last activity - run `update` at the end of every working
 session). `describe` writes the description of a day's auto row.
 
+Each block's time also goes to the ticket its session ran for: a session in a ticket worktree
+(<repo>/.claude/worktrees/t-N-<slug>), on a ticket branch (t/N-...), or one that ran
+`/harness:work N`; anything else is unattributed. A block across several tickets is split by message
+time, and a day's logged hours are apportioned to its tickets to the quarter hour so the parts add up
+to the day. `update` writes each ticket's hours by day into one comment on the issue in the origin's
+GitHub repository (marked <!-- harness-hours -->, edited in place; rows for days outside the window
+are kept). `invoice` exports a month by ticket and epic, as CSV and markdown, reconciled with the log.
+
 Usage:
     harness-worklog init                        # the Mac's zone from the 1st of last month
     harness-worklog init --since 2026-09-01
@@ -41,6 +49,7 @@ Usage:
     harness-worklog add --date 2026-09-29 --hours 1.5 --description "Call with the program team"
     harness-worklog export --month 2026-09                    # invoice rows to the screen
     harness-worklog export --month 2026-09 --rate 60 --out invoice-2026-09.csv
+    harness-worklog invoice --month 2026-09 --out-dir ~/invoices   # by ticket and epic, CSV and markdown
     harness-worklog --repo ~/code/other update               # a repo other than the current one
 """
 from __future__ import annotations
@@ -61,7 +70,8 @@ _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
-    from harness_lib.cli import Parser, run_main
+    from harness_lib.cli import Parser, Problem, run_main, warn
+    from harness_lib.gh import gh_json, repo_slug
     from harness_lib.repo import main_checkout
     from harness_lib.text import session_folder
 except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
@@ -79,6 +89,16 @@ KEEP_DAYS = 29       # a day this recent still has all its transcripts; older ro
 UTC = dt.timezone.utc
 LOCALTIME = "/etc/localtime"
 GITHUB = "GitHub"     # the committer of merges made on github.com: UTC, not evidence of the Mac's zone
+HOURS_MARKER = "<!-- harness-hours -->"     # the one comment per ticket that carries its hours by day
+RESOLUTION = "**Resolution**"              # the comment `harness-pr land` posts on a ticket it lands
+BOARD_MARKER = "<!-- harness -->"
+HOURS_ROW = re.compile(r"^\|\s*(\d{4}-\d{2}-\d{2})\s*\|\s*(\d+(?:\.\d+)?)\s*\|", re.MULTILINE)
+TICKET_DIR = re.compile(r"t-(\d+)(?:-|$)")                                # a ticket worktree: t-N-<slug>
+TICKET_CWD = re.compile(r"/\.claude/worktrees/t-(\d+)(?:-[^/]*)?(?:/|$)")
+TICKET_BRANCH = re.compile(r"t/(\d+)(?:-|$)")                             # a ticket branch: t/N-<slug>
+WORK_COMMAND = re.compile(r"<command-name>\s*/harness:work\s*</command-name>.*?<command-args>\s*#?(\d+)\b", re.DOTALL)
+INVOICE_COLS = ["date", "epic", "ticket", "title", "hours", "resolution"]
+UNATTRIBUTED = "unattributed"             # the invoice's ticket cell for time outside any ticket
 
 
 def git_facts(path, *flags):
@@ -269,7 +289,7 @@ def suggest_since(evts, after, end, changed=None, gap_minutes=GAP_MINUTES):
     time: that time when nobody was working near it, else the idle stretch just before the session
     that holds or follows it; without it, the longest idle stretch. A suggestion to check, not a fact."""
     gap = dt.timedelta(minutes=gap_minutes)
-    times = [t for t, _ in evts if after < t < end]
+    times = [e[0] for e in evts if after < e[0] < end]
     if changed and after < changed < end:
         if changed - after > gap and end - changed > gap and all(abs(t - changed) > gap for t in times):
             return changed.replace(second=0, microsecond=0)
@@ -352,13 +372,42 @@ def is_human_message(entry):
     return False
 
 
-def events(paths):
-    """(UTC datetime, is the user's message) for every user/assistant entry in the transcripts.
-    A session id found in several files (a copy, or a resumed session) counts each entry once: per entry,
-    the most times any one file holds it. An entry without a session id belongs to its file alone."""
-    held = {}    # (session id, entry) -> the most times one file holds it
+def message_text(entry):
+    """The text of an entry's message: its string content, or its text parts joined."""
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(c.get("text", "") for c in content
+                         if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str))
+    return ""
+
+
+def folder_ticket(path, repo=None):
+    """The ticket of a transcript's folder: N for the folder of a worktree <repo>/.claude/worktrees/t-N-<slug>."""
+    prefix = session_folder(os.path.join(repo or REPO, ".claude", "worktrees")) + "-"
+    name = os.path.basename(os.path.dirname(os.path.abspath(path)))
+    m = TICKET_DIR.match(name[len(prefix):]) if name.startswith(prefix) else None
+    return int(m.group(1)) if m else None
+
+
+def entry_ticket(entry):
+    """The ticket an entry names itself: its cwd inside a ticket worktree, else its gitBranch t/N-...; or None."""
+    m = TICKET_CWD.search(entry.get("cwd") or "") if isinstance(entry.get("cwd"), str) else None
+    if not m and isinstance(entry.get("gitBranch"), str):
+        m = TICKET_BRANCH.match(entry["gitBranch"])
+    return int(m.group(1)) if m else None
+
+
+def ticket_events(paths, repo=None):
+    """(UTC datetime, is the user's message, ticket number or None) for every user/assistant entry in the
+    transcripts. A session id found in several files (a copy, or a resumed session) counts each entry once: per
+    entry, the most times any one file holds it. An entry without a session id belongs to its file alone.
+    An entry's ticket is its folder's (a ticket worktree, folder_ticket), else its own (entry_ticket), else the
+    one the last `/harness:work N` its session ran before it in that file named; else None (unattributed)."""
+    held, tickets = {}, {}    # (session id, entry) -> the most times one file holds it; -> its ticket
     for path in paths:
-        seen = {}
+        seen, work, folder = {}, {}, folder_ticket(path, repo)
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 try:
@@ -369,17 +418,28 @@ def events(paths):
                 if entry.get("type") not in ("user", "assistant") or not stamp:
                     continue
                 when = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(UTC)
-                key = (entry.get("sessionId") or path, when, is_human_message(entry), entry["type"])
+                sid, human = entry.get("sessionId") or path, is_human_message(entry)
+                if human:
+                    m = WORK_COMMAND.search(message_text(entry))
+                    if m:
+                        work[sid] = int(m.group(1))
+                key = (sid, when, human, entry["type"])
                 seen[key] = seen.get(key, 0) + 1
+                if tickets.get(key) is None:
+                    tickets[key] = folder or entry_ticket(entry) or work.get(sid)
         for key, n in seen.items():
             held[key] = max(held.get(key, 0), n)
-    out = [(when, human) for (_, when, human, _), n in held.items() for _ in range(n)]
+    out = [(key[1], key[2], tickets.get(key)) for key, n in held.items() for _ in range(n)]
     return sorted(out, key=lambda e: e[0])
 
 
-def activity_blocks(evts, gap_minutes=GAP_MINUTES):
-    """[(start, end), ...]: runs of events with no pause over gap_minutes, whatever the clock says,
-    kept only when they hold one of the user's messages."""
+def events(paths):
+    """(UTC datetime, is the user's message) for every user/assistant entry, counted as ticket_events counts."""
+    return [(when, human) for when, human, _ in ticket_events(paths)]
+
+
+def event_runs(evts, gap_minutes=GAP_MINUTES):
+    """The events cut wherever nothing happened for more than gap_minutes, whatever the clock says."""
     gap = dt.timedelta(minutes=gap_minutes)
     runs, cur = [], []
     for e in sorted(evts, key=lambda e: e[0]):
@@ -389,7 +449,13 @@ def activity_blocks(evts, gap_minutes=GAP_MINUTES):
         cur.append(e)
     if cur:
         runs.append(cur)
-    return [(r[0][0], r[-1][0]) for r in runs if any(h for _, h in r)]
+    return runs
+
+
+def activity_blocks(evts, gap_minutes=GAP_MINUTES):
+    """[(start, end), ...]: runs of events with no pause over gap_minutes, whatever the clock says,
+    kept only when they hold one of the user's messages."""
+    return [(r[0][0], r[-1][0]) for r in event_runs(evts, gap_minutes) if any(e[1] for e in r)]
 
 
 def day_blocks(evts, zones, gap_minutes=GAP_MINUTES):
@@ -409,6 +475,53 @@ def day_hours(blocks):
     """Sum of the blocks, to the nearest quarter hour; at least 0.25 for a day with work."""
     minutes = sum((end - start).total_seconds() for start, end in blocks) / 60
     return max(0.25, math.floor(minutes / 15 + 0.5) * 0.25)
+
+
+def day_tickets(evts, zones, gap_minutes=GAP_MINUTES):
+    """{'yyyy-mm-dd': {ticket or None: seconds}} over the blocks day_blocks counts (ticket_events' triples): each
+    stretch between two events of a block goes to the later event's ticket, so a block spanning several tickets
+    is split by message time. A ticket with events but no stretch is present with 0 seconds."""
+    out = {}
+    for run in event_runs(evts, gap_minutes):
+        if not any(e[1] for e in run):
+            continue
+        tz = zone_at(zones, run[0][0])
+        if tz is None:
+            continue
+        shares = out.setdefault(run[0][0].astimezone(tz).date().isoformat(), {})
+        shares.setdefault(run[0][2], 0.0)
+        for a, b in zip(run, run[1:]):
+            shares[b[2]] = shares.get(b[2], 0.0) + (b[0] - a[0]).total_seconds()
+    return out
+
+
+def apportion(hours, shares):
+    """`hours` (whole quarter hours) split across the keys of `shares` (ticket or None: seconds) in proportion,
+    each to the quarter hour by largest remainder, so the parts always add up to `hours`; a tie goes to a ticket
+    before the unattributed time, then the lower number. Equal parts when no key has any seconds."""
+    quarters = round(hours * 4)
+    total = sum(shares.values())
+    weights = shares if total > 0 else {k: 1.0 for k in shares}
+    total = total if total > 0 else float(len(weights))
+    if not weights:
+        return {}
+    quota = {k: quarters * w / total for k, w in weights.items()}
+    out = {k: math.floor(q) for k, q in quota.items()}
+    order = sorted(weights, key=lambda k: (-(quota[k] - out[k]), k is None, k or 0))
+    for k in order[:quarters - sum(out.values())]:
+        out[k] += 1
+    return {k: q / 4 for k, q in out.items()}
+
+
+def ticket_hours(computed, shares):
+    """{ticket: {'yyyy-mm-dd': hours}} for the computed days: each day's logged hours apportioned to its tickets
+    and its unattributed time (apportion), the tickets' parts kept when above zero."""
+    out = {}
+    for day, (hours, *_) in computed.items():
+        for ticket, h in apportion(hours, shares.get(day) or {None: 0.0}).items():
+            if ticket is not None and h > 0:
+                out.setdefault(ticket, {})[day] = h
+    return out
 
 
 def zones_text(blocks):
@@ -492,7 +605,7 @@ def since_problems(since, new_tz, zones, evts, commits, now, gap_minutes=GAP_MIN
         out.append(f"commit {first_new[2]} at {first_new[0]:%Y-%m-%d %H:%M}Z was made on the new clock: "
                    "the switch came before it")
     gap = dt.timedelta(minutes=gap_minutes)
-    near = [t for t, _ in evts if abs(t - since) <= gap]
+    near = [e[0] for e in evts if abs(e[0] - since) <= gap]
     between = last_old and first_new and last_old[0] < since < first_new[0]
     if near and not between:
         out.append(f"{since:%Y-%m-%d %H:%M}Z falls inside a session (activity {near[0]:%H:%M}Z-"
@@ -636,6 +749,226 @@ def invoice_rows(rows, month, rate=None):
     return out + [tail]
 
 
+# --------------------------------------------------------- tickets on GitHub
+def github_slug(repo=None):
+    """OWNER/REPO of the repo's origin when it is on github.com (the board's tickets live there), else None."""
+    try:
+        out = subprocess.run(["git", "-C", repo or REPO, "remote", "get-url", "origin"], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    slug =repo_slug(out.stdout) if out.returncode == 0 and out.stdout.strip() else None
+    return slug if slug and slug.count("/") == 1 else None
+
+
+def gh_login():
+    """The gh account's login, casefolded: the hours comments are its own, and only its own are read."""
+    data = gh_json(["api", "user"], REPO)
+    login = data.get("login") if isinstance(data, dict) else None
+    if not login:
+        raise Problem("gh api user printed no login")
+    return login.casefold()
+
+
+def author_login(comment):
+    """A comment's author login, casefolded: REST's user.login or `gh issue` JSON's author.login."""
+    who = comment.get("user") or comment.get("author") or {}
+    return (who.get("login") or "").casefold() if isinstance(who, dict) else ""
+
+
+def hours_of(body):
+    """{'yyyy-mm-dd': hours} from an hours comment's table rows."""
+    return {d: float(h) for d, h in HOURS_ROW.findall(body or "")}
+
+
+def hours_body(days):
+    """The hours comment: one table row per day, oldest first, a Total row, then the marker."""
+    lines = [("**Hours** on this ticket by day, from the work log (`harness-worklog update` keeps this comment "
+              "current; edit the log, not this comment)"), "", "| Date | Hours |", "| --- | ---: |"]
+    lines += [f"| {d} | {days[d]:.2f} |" for d in sorted(days)]
+    lines += [f"| **Total** | **{sum(days.values()):.2f}** |", "", HOURS_MARKER]
+    return "\n".join(lines) + "\n"
+
+
+def issue_comments(slug, number):
+    """Every comment on issue `number`, oldest first (REST, all pages)."""
+    data = gh_json(["api", f"repos/{slug}/issues/{number}/comments?per_page=100", "--paginate", "--slurp"], REPO)
+    if isinstance(data, list) and all(isinstance(page, list) for page in data):
+        data = [c for page in data for c in page]
+    return [c for c in data if isinstance(c, dict)] if isinstance(data, list) else []
+
+
+def record_hours(slug, number, hours, window, login):
+    """Bring ticket `number`'s hours comment to `hours` ({day: h}) for the `window` days, keeping its rows for
+    other days: 'created', 'updated' or 'unchanged'. The comment is the login's own one with the marker."""
+    mine = [c for c in issue_comments(slug, number)
+            if HOURS_MARKER in (c.get("body") or "") and author_login(c) == login]
+    old = hours_of(mine[0].get("body")) if mine else {}
+    days = {d: h for d, h in old.items() if d not in window}
+    days.update(hours)
+    body = hours_body(days)
+    if mine and (mine[0].get("body") or "") == body:
+        return "unchanged"
+    if mine:
+        gh_json(["api", "-X", "PATCH", f"repos/{slug}/issues/comments/{mine[0]['id']}", "-f", f"body={body}"], REPO)
+        return "updated"
+    gh_json(["api", "-X", "POST", f"repos/{slug}/issues/{number}/comments", "-f", f"body={body}"], REPO)
+    return "created"
+
+
+def record_tickets(tickets, window):
+    """`update`'s ticket step: each ticket's hours ({ticket: {day: h}}) on its comment in the origin's repository.
+    A repo without a GitHub origin skips it; a ticket gh fails on is a warning, never the exit status."""
+    if not tickets:
+        return
+    slug = github_slug()
+    if not slug:
+        print(f"{len(tickets)} ticket(s) worked on, not recorded: the origin is not on GitHub")
+        return
+    try:
+        login = gh_login()
+    except Problem as err:
+        warn("harness-worklog", f"ticket hours not recorded on {slug}: {err}")
+        return
+    for number in sorted(tickets):
+        try:
+            outcome = record_hours(slug, number, tickets[number], window, login)
+        except Problem as err:
+            warn("harness-worklog", f"#{number}: hours comment not updated: {err}")
+            continue
+        total = sum(tickets[number].values())
+        print(f"  #{number}  {total:5.2f} h in this window   (hours comment {outcome})")
+
+
+def resolution_summary(comments, login):
+    """The first paragraph of the newest `**Resolution**` comment by `login`, on one line; '' when none."""
+    for c in reversed(comments):
+        body = (c.get("body") or "").strip()
+        if author_login(c) == login and body.startswith(RESOLUTION):
+            para = []
+            for line in body[len(RESOLUTION):].splitlines():
+                line = line.strip()
+                if line == BOARD_MARKER or (not line and not para):
+                    continue
+                if not line:
+                    break
+                para.append(line)
+            return " ".join(para)
+    return ""
+
+
+def ticket_records(slug):
+    """{ticket: {'title', 'epic', 'epic_title', 'resolution', 'hours': {day: h}}} for every issue of `slug`
+    carrying the login's hours comment; Problem when gh fails (an invoice is never written half-read)."""
+    login = gh_login()
+    issues = gh_json(["issue", "list", "-R", slug, "--state", "all", "--limit", "5000", "--json",
+                      "number,title,parent,comments"], REPO)
+    out = {}
+    for issue in issues if isinstance(issues, list) else []:
+        comments = [c for c in issue.get("comments") or [] if isinstance(c, dict)]
+        mine = [c for c in comments if HOURS_MARKER in (c.get("body") or "") and author_login(c) == login]
+        if not mine or not issue.get("number"):
+            continue
+        parent = issue.get("parent") if isinstance(issue.get("parent"), dict) else {}
+        out[int(issue["number"])] = {"title": issue.get("title") or "", "epic": parent.get("number"),
+                                     "epic_title": parent.get("title") or "",
+                                     "resolution": resolution_summary(comments, login),
+                                     "hours": hours_of(mine[0].get("body"))}
+    return out
+
+
+def invoice_lines(rows, month, records):
+    """(the invoice's rows as dicts in INVOICE_COLS, its total, warnings): one row per ticket and day of `month`,
+    then one per day for the time outside any ticket (the day's logged hours, manual rows included, less its
+    tickets' hours; the day's descriptions as its resolution), and the Total row. The rows add up to the log."""
+    billed, descs = {}, {}
+    for r in rows:
+        if r["date"].startswith(month + "-"):
+            billed[r["date"]] = billed.get(r["date"], 0.0) + float(r["hours"] or 0)
+            if (r.get("description") or "").strip():
+                descs.setdefault(r["date"], []).append(r["description"].strip())
+    by_day = {}
+    for number, rec in records.items():
+        for day, h in rec["hours"].items():
+            if day.startswith(month + "-") and h:
+                by_day.setdefault(day, []).append((number, h))
+    out, warnings = [], []
+    for day in sorted(set(billed) | set(by_day)):
+        for number, h in sorted(by_day.get(day, [])):
+            rec = records[number]
+            out.append({"date": day, "epic": str(rec["epic"] or ""), "ticket": str(number), "title": rec["title"],
+                        "hours": f"{h:.2f}", "resolution": rec["resolution"]})
+        rest = round(billed.get(day, 0.0) - sum(h for _, h in by_day.get(day, [])), 2)
+        if rest < 0:
+            warnings.append(f"{day}: the tickets carry {rest:+.2f} h more than {rel(LOG)} logs; run update "
+                            f"--since {day} if its transcripts still exist")
+        if rest:
+            out.append({"date": day, "epic": "", "ticket": UNATTRIBUTED, "title": "Time outside a ticket",
+                        "hours": f"{rest:.2f}", "resolution": " / ".join(descs.get(day, []))})
+    total = round(sum(float(r["hours"]) for r in out), 2)
+    return out, total, warnings
+
+
+def md_cell(text):
+    return " ".join(str(text).split()).replace("|", "\\|")
+
+
+def invoice_markdown(title, month, lines, total, records):
+    """The month's invoice as markdown: totals by epic, by ticket, then by day."""
+    epics, tickets = {}, {}
+    for r in lines:
+        h = float(r["hours"])
+        if r["ticket"] == UNATTRIBUTED:
+            key = ("~", "Time outside a ticket")
+        elif r["epic"]:
+            key = (r["epic"], f"#{r['epic']} {records[int(r['ticket'])]['epic_title']}".strip())
+        else:
+            key = ("", "No epic")
+        epics[key] = epics.get(key, 0.0) + h
+        if r["ticket"] != UNATTRIBUTED:
+            tickets[int(r["ticket"])] = tickets.get(int(r["ticket"]), 0.0) + h
+    out = [f"# Invoice {month}: {title}", "", f"Total: **{total:.2f} h**, the month's hours in {rel(LOG)}.", "",
+           "## By epic", "", "| Epic | Hours |", "| --- | ---: |"]
+    for key in sorted(epics, key=lambda k: (k[0] == "~", k[0] == "", int(k[0]) if k[0].isdigit() else 0)):
+        out.append(f"| {md_cell(key[1])} | {epics[key]:.2f} |")
+    out += [f"| **Total** | **{total:.2f}** |", "", "## By ticket", "",
+            "| Ticket | Title | Epic | Hours | Resolution |", "| --- | --- | --- | ---: | --- |"]
+    for n in sorted(tickets):
+        rec = records[n]
+        epic = f"#{rec['epic']}" if rec["epic"] else ""
+        out.append(f"| #{n} | {md_cell(rec['title'])} | {epic} | {tickets[n]:.2f} | {md_cell(rec['resolution'])} |")
+    out += ["", "## By day", "", "| Date | Ticket | Title | Hours |", "| --- | --- | --- | ---: |"]
+    for r in lines:
+        ticket = f"#{r['ticket']}" if r["ticket"] != UNATTRIBUTED else ""
+        what = r["title"] if r["ticket"] != UNATTRIBUTED else " ".join(
+            x for x in (r["title"], f"({r['resolution']})" if r["resolution"] else "") if x)
+        out.append(f"| {r['date']} | {ticket} | {md_cell(what)} | {r['hours']} |")
+    out.append(f"| **Total** | | | **{total:.2f}** |")
+    return "\n".join(out) + "\n"
+
+
+def write_invoice(month, out_dir):
+    """`invoice`: DIR/invoice-<month>.csv and .md from the log and the tickets' hours comments; (csv path, md
+    path, total, rows, warnings)."""
+    slug = github_slug()
+    records = ticket_records(slug) if slug else {}
+    lines, total, warnings = invoice_lines(read_log(), month, records)
+    if not slug:
+        warnings.append("the origin is not on GitHub: every hour is time outside a ticket")
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, f"invoice-{month}.csv")
+    md_path = os.path.join(out_dir, f"invoice-{month}.md")
+    with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=INVOICE_COLS, lineterminator="\n")
+        w.writeheader()
+        w.writerows(lines)
+        w.writerow({"date": "Total", "epic": "", "ticket": "", "title": "", "hours": f"{total:.2f}",
+                    "resolution": ""})
+    with open(md_path, "w", encoding="utf-8") as fh:
+        fh.write(invoice_markdown(slug or os.path.basename(REPO), month, lines, total, records))
+    return csv_path, md_path, total, lines, warnings
+
+
 def read_log(path=None):
     path = path or LOG
     if not os.path.exists(path):
@@ -696,7 +1029,7 @@ def transcript_events(folders):
     paths = sorted(p for folder in folders for p in glob.glob(os.path.join(folder, "*.jsonl")))
     if not paths:
         sys.exit(f"no session transcripts in {folders[0]}")
-    return events(paths)
+    return ticket_events(paths)
 
 
 def first_of_previous_month(today):
@@ -790,6 +1123,10 @@ def main():
     ex.add_argument("--month", required=True, help="yyyy-mm")
     ex.add_argument("--rate", type=float, help="hourly rate: adds an Amount column")
     ex.add_argument("--out", help="write a CSV here (default: print)")
+    iv = sub.add_parser("invoice", parents=[where], help="one month by ticket and epic, as CSV and markdown")
+    iv.add_argument("--month", required=True, help="yyyy-mm")
+    iv.add_argument("--out-dir", metavar="DIR", help="where invoice-<month>.csv and .md go "
+                                                     "(default: the repo's worklog/invoices)")
     args = ap.parse_args()
     use_repo(find_repo(args.repo))
     if args.repo:
@@ -832,6 +1169,8 @@ def main():
         if not args.since and since < today - dt.timedelta(days=WINDOW_DAYS):
             print(f"(the log was behind: the window reached back to {since})")
         print(f"{len(computed)} day(s) since {since} updated in {rel(LOG)}")
+        record_tickets(ticket_hours(computed, day_tickets(evts, zones, args.gap_minutes)),
+                       set(computed) | set(dropped))
     elif args.cmd == "zone":
         if not args.since and not args.zone:
             mac = now.astimezone(sys_tz)
@@ -913,6 +1252,18 @@ def main():
                               "description": args.description.strip(), "source": "manual", "zone": ""}]
         write_log(sorted(rows, key=lambda r: (r["date"], r.get("source") != "auto")))
         print(f"added {args.hours:.2f} h on {args.date} (manual)")
+    elif args.cmd == "invoice":
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", args.month):
+            sys.exit("--month: give yyyy-mm, e.g. 2026-09")
+        out_dir = os.path.abspath(os.path.expanduser(args.out_dir or os.path.join(REPO, "worklog", "invoices")))
+        csv_path, md_path, total, lines, warnings = write_invoice(args.month, out_dir)
+        for w in warnings:
+            warn("harness-worklog", w)
+        tickets = len({r["ticket"] for r in lines if r["ticket"] != UNATTRIBUTED})
+        outside = sum(float(r["hours"]) for r in lines if r["ticket"] == UNATTRIBUTED)
+        print(f"{args.month}: {total:.2f} h, {tickets} ticket(s), {outside:.2f} h outside a ticket")
+        print(f"wrote {csv_path}")
+        print(f"wrote {md_path}")
     else:
         if not re.fullmatch(r"\d{4}-\d{2}", args.month):
             sys.exit("--month: give yyyy-mm, e.g. 2026-09")

@@ -69,7 +69,8 @@ The main session runs Opus 5.5 at high effort. `harness-board tier N` picks the 
 | `/harness:standup` | Every project: git state, board counts, PRs, needs-input tickets, stale worktrees, budgets |
 | `/harness:learn` | Lessons from the session become `chore` tickets, not edits |
 | `/harness:handoff` | Writes `docs/agent/handoff.md` before `/clear` |
-| `/harness:worklog` | Hours and a client note on a billable project |
+| `/harness:worklog` | Hours and a client note on a billable project; each ticket's hours on its issue |
+| `/harness:invoice [--month yyyy-mm]` | A month's hours by ticket and epic, as CSV and markdown, for the invoice |
 
 ## Hooks
 
