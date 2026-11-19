@@ -11,11 +11,14 @@ Usage:
                          [--effort low|medium|high|xhigh|max]
     harness-work stage N <stage> pass|fail [--tier T] [--effort E]
     harness-work cost N [--pr P] [--json | --markdown]
-    harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run] [--only N[,N...]]
+    harness-work dispatch [--max 10] [--venue headless|bg | --api] [--dry-run] [--only N[,N...] | --after N]
+    harness-work dispatch --all-projects [--max 8] [--dry-run]
+    harness-work dispatch --install-launchd | --uninstall-launchd
     harness-work runs [--sweep] [--all]
     harness-work waves [--all] [--refresh]
     harness-work wave drop ID N
-    harness-work budget [status | exhaust api|cloud --reason TEXT [--hours 24] | reset api|cloud]
+    harness-work budget [status | exhaust api|cloud|subscription --reason TEXT [--hours 24]
+                         | reset api|cloud|subscription]
     harness-work budget calls [--hours 24] [--json]
     harness-work worktrees [--stale DAYS]
     harness-work worktree remove BRANCH [--discard]
@@ -28,7 +31,8 @@ State, under ~/.claude/harness: repos/<repo-key>/tickets/<N>.json (the ticket ca
 writes; start adds branch, worktree and started_at, attempt adds to attempts), repos/<repo-key>/cost/<N>.json (the
 record `cost` writes), repos/<repo-key>/waves/<id>.json (a wave, harness_lib/waves.py), runs/<repo-key>-<N>-<stamp>.json
 and .log (one dispatched run), budgets.json
-({"api"|"cloud": {"exhausted_until", "reason"}}), backups/<id>/ (a snapshot, read by backup list and restore).
+({"api"|"cloud"|"subscription": {"exhausted_until", "reason"}}), backups/<id>/ (a snapshot, read by backup list and
+restore), dispatch/launchd.log (the LaunchAgent's output).
 
 attempt: appends {stage, tier, effort, result, at} to the ticket cache's attempts and prints the failure policy's
 answer. The tier is --tier, else the stage's route (harness_lib.routing: review_route for review, code_route for the
@@ -90,9 +94,26 @@ headless, only with --venue headless or its alias --api (--api with --venue bg i
 "/harness:work N"` billed to the API key through {"apiKeyHelper": HARNESS_API_KEY_CMD} (the key itself never
 reaches a command line or the environment). headless while the api budget is exhausted (judged after the sweep,
 which can be what exhausts it) is refused, --dry-run too: nothing starts, the exit is non-zero and the message
-names the time and `harness-work budget reset api`.
+names the time and `harness-work budget reset api`. bg while the subscription budget is exhausted (also judged after
+the sweep) is held the same way, --only, --after and --dry-run too: one line naming the subscription budget and its
+reset time, exit 1; headless is not held by it.
 An ops ticket never runs headless (it needs this Mac's connectors and credentials): a headless dispatch skips it with
 a reason naming ops (printed as `skip #N: ...`, and in "skipped"); bg launches it in the main checkout (no worktree).
+--all-projects (#164): one sweep of every run and the subscription hold, then each project of the registry
+(harness_lib/registry.py) in its order: one whose .claude/settings.json committed at origin/main sets
+HARNESS_AUTODISPATCH to 1 (a string or a number; never the working tree, settings.local.json or this environment)
+and that has no open issue labelled incident gets this dispatch in the bg venue; any other is one
+`<name>: skipped, <why>` line. --max (default 8) counts every live run record of every project (registered or not,
+opted in or not) plus what this call launched, so each tick only tops up to the cap. A project that cannot be read
+(its folder gone, not a repository, gh or harness-board failing) is one `harness-work: <name>: <why>` line on stderr;
+the rest still run and the exit is 1 at the end. --json prints one document {all_projects, venue, max, dry_run,
+live, projects: [{name, path, status dispatched|skipped|failed, why, result}]}. Needs no repository in the cwd.
+--api, --venue headless, --only, --after and --repo with it are argument errors.
+--install-launchd writes ~/Library/LaunchAgents/com.ryaneskuri.harness-dispatch.plist (dispatch --all-projects --max 8
+at minute 0 of every hour, StartCalendarInterval so an hour missed asleep runs once on wake; PATH as harness-digest's;
+log ~/.claude/harness/dispatch/launchd.log) and loads it (bootout, then bootstrap gui/<uid>, else load -w);
+--uninstall-launchd boots it out and removes the file, exit 0 when neither is there. Neither dispatches anything;
+launchctl is HARNESS_LAUNCHCTL when set.
 Effort: dispatch reads the routing settings once per command through harness_lib.routing.load_routing (environment,
 else the main checkout's .claude/settings.json) and launches each session, redispatched ones too, at its ticket's
 code route effort: HARNESS_CODE_EFFORT when set, else xhigh for a size:L or risk:high ticket (unless HARNESS_CODE_TIER
@@ -124,6 +145,11 @@ with no ready pull request of its branch in any state (none, or only drafts) end
 `ended early (draft PR #N)` naming the open draft, else `ended early (no PR)`, even when the run has an exit code.
 A bg failed or stopped run is never early. When gh cannot tell, or the record names no repository, it stays `ok`
 with a warning. One command asks gh once per ticket and branch.
+Every unended bg run's session transcript (~/.claude/jobs/<bg_id>/state.json's linkScanPath, else
+~/.claude/projects/*/<bg_id>*.jsonl) is read for a usage-limit refusal: its last main-thread assistant entry with
+isApiErrorMessage and apiError usage_limit_reached, no later user entry with usageLimitNote "release". It marks the
+subscription budget exhausted until rate_limit_info.resetsAt, else quotaLimits.resetsAt, else its timestamp plus 5 h,
+when that is still ahead; the record keeps it as usage_limit, so one refusal marks the budget once.
 A cloud run ends on the latest marker comment (first line `<!-- harness-cloud: done -->` or `<!-- harness-cloud:
 blocked -->`) by the gh user after the run's start, at that comment's time: done is `ok` (never early), blocked is
 `blocked` and asks the owner (`harness-board needs-input` with the comment's other lines); else, when its ticket is
@@ -168,7 +194,9 @@ import argparse
 import datetime as dt
 import json
 import fcntl
+import glob
 import os
+import plistlib
 import pty
 import re
 import select
@@ -190,11 +218,13 @@ try:
     from harness_lib.repo import NotARepository, RepoError, repo_facts, worktree_entries
     from harness_lib.routing import EFFORTS, cached_code_route, code_route, load_routing, next_route, review_route
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT, DEFAULT_TEST_PATTERNS, patterns, setting, settings_env
-    from harness_lib.settings import other_project, project_setting, setting_from
+    from harness_lib.settings import committed_env, other_project, project_setting, setting_from
+    from harness_lib.registry import load_registry
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
     from harness_lib import backups, cost, reviews, waves
     from harness_lib.text import age_text as ago_text
-    from harness_lib.text import harness_home, last_line, one_line, parse_iso, parse_iso_seconds, read_json
+    from harness_lib.text import first_line, harness_home, last_line, one_line, parse_iso, parse_iso_seconds
+    from harness_lib.text import read_json
     from harness_lib.text import write_json as _write_json
     from harness_lib import gh as ghlib
     from harness_lib import ghlimit
@@ -206,12 +236,19 @@ STAGES = ("tests", "breaker", "code", "review", "fix", "ci")
 TIERS = ("sonnet", "opus", "fable")
 DEFAULT_TIER = "opus"
 VENUES = ("headless", "bg")
-BUDGETS = ("api", "cloud")
+BUDGETS = ("api", "cloud", "subscription")
+DISPATCH_MAX = 10             # dispatch --max: live runs of this repository
+ALL_PROJECTS_MAX = 8          # dispatch --all-projects --max: live runs across every project (#164)
+AUTODISPATCH = "HARNESS_AUTODISPATCH"   # "1" in a project's committed settings opts it into --all-projects
+LAUNCHD_LABEL = "com.ryaneskuri.harness-dispatch"
 DEFAULT_KEY_CMD = "security find-generic-password -s harness-anthropic -w"
 EXCLUDE_LINE = ".claude/worktrees/"
 SLUG_MAX = 30
 LOG_TAIL = 60                 # lines of a run's log read by the sweep
-TAIL_BYTES = 256 * 1024
+TAIL_BYTES = 256 * 1024       # of a run's log, and of a bg session's transcript (the usage-limit check)
+USAGE_LIMIT_ERROR = "usage_limit_reached"   # a transcript entry's apiError when the subscription refused (#164)
+USAGE_LIMIT_HOURS = 5.0       # a refusal that names no reset time: its timestamp plus this
+SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")   # a bg_id that can name a file
 RECENT = dt.timedelta(hours=24)
 REDISPATCH_WINDOW = dt.timedelta(days=7)   # an ended run older than this is not picked up again
 REDISPATCH_MAX = 3            # ended runs of a ticket within the window after which dispatch skips it
@@ -758,6 +795,18 @@ def budget_line(name, entry):
     return f"{name}: exhausted until {iso(until)}" + (f" ({reason})" if reason else "")
 
 
+def subscription_hold():
+    """A Problem while the subscription budget is exhausted (#164): bg dispatch starts and launches nothing until the
+    reset, a dry run included."""
+    entry = load_budgets()["subscription"]
+    until = exhausted_until(entry)
+    if until is not None:
+        reason = one_line(entry.get("reason") or "")
+        raise Problem(f"the subscription budget is exhausted until {iso(until)}" + (f" ({reason})" if reason else "")
+                      + "; nothing started. bg dispatch waits for that time, or `harness-work budget reset "
+                        "subscription` once the limit has reset")
+
+
 # --------------------------------------------------------------- runs
 def runs_dir():
     return harness_home("runs")
@@ -883,7 +932,8 @@ def run_live(record, agents):
     return pid_alive(record.get("pid"), parse_iso(record.get("started_at")))
 
 
-def log_tail(path):
+def tail_lines(path):
+    """The lines of the last TAIL_BYTES of a file ([] when it cannot be read); the first may be cut."""
     try:
         with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
@@ -892,7 +942,107 @@ def log_tail(path):
             data = fh.read()
     except (OSError, TypeError):
         return []
-    return data.decode("utf-8", errors="replace").splitlines()[-LOG_TAIL:]
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def log_tail(path):
+    return tail_lines(path)[-LOG_TAIL:]
+
+
+def session_transcript(bg_id):
+    """The main transcript of bg session `bg_id` (docs/research/usage-limit.md): the `linkScanPath` of
+    ~/.claude/jobs/<bg_id>/state.json when that file names one that exists, else the newest
+    ~/.claude/projects/*/<bg_id>*.jsonl (a subagent's file sits deeper and never matches); None when there is none."""
+    if not SAFE_ID_RE.match(bg_id):
+        return None
+    claude_dir = os.path.join(os.path.expanduser("~"), ".claude")
+    job = read_json(os.path.join(claude_dir, "jobs", bg_id, "state.json"))
+    link = job.get("linkScanPath") if isinstance(job, dict) else None
+    if isinstance(link, str) and os.path.isfile(link):
+        return link
+    found = glob.glob(os.path.join(glob.escape(os.path.join(claude_dir, "projects")), "*",
+                                   glob.escape(bg_id) + "*.jsonl"))
+    found = [path for path in found if os.path.isfile(path)]
+    return max(found, key=os.path.getmtime) if found else None
+
+
+def usage_limit_refusal(lines):
+    """The usage-limit refusal a transcript ends on: its last main-thread assistant entry when that is an API error
+    with apiError usage_limit_reached and no later user entry released it (usageLimitNote "release"); else None.
+    The fields decide, never the words: the text changes between versions and is quoted elsewhere."""
+    released = False
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") == "user" and entry.get("usageLimitNote") == "release":
+            released = True
+        elif entry.get("type") == "assistant" and not entry.get("isSidechain"):
+            limited = entry.get("isApiErrorMessage") is True and entry.get("apiError") == USAGE_LIMIT_ERROR
+            return entry if limited and not released else None
+    return None
+
+
+def epoch_time(value):
+    """A datetime from Unix seconds (a number, never a bool), or None."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(value, dt.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def refusal_reset(entry):
+    """When a refusal's limit resets: apiErrorParams.rate_limit_info.resetsAt, else quotaLimits.resetsAt (Unix
+    seconds), else its timestamp plus USAGE_LIMIT_HOURS; None when it gives none of them. The reset text is not
+    read."""
+    params = entry.get("apiErrorParams") if isinstance(entry.get("apiErrorParams"), dict) else {}
+    info = params.get("rate_limit_info") if isinstance(params.get("rate_limit_info"), dict) else {}
+    quota = entry.get("quotaLimits") if isinstance(entry.get("quotaLimits"), dict) else {}
+    for value in (info.get("resetsAt"), quota.get("resetsAt")):
+        when = epoch_time(value)
+        if when is not None:
+            return when
+    at = parse_iso(entry.get("timestamp"))
+    return at + dt.timedelta(hours=USAGE_LIMIT_HOURS) if at is not None else None
+
+
+def refusal_text(entry):
+    message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
+    parts = message.get("content") if isinstance(message.get("content"), list) else []
+    texts = [p.get("text") for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str)]
+    return one_line(" ".join(texts)) or USAGE_LIMIT_ERROR
+
+
+def note_usage_limit(record):
+    """Mark the subscription budget exhausted until the reset of the usage-limit refusal that the transcript of a bg
+    record's session ends on, when that reset is still ahead and this refusal has not marked it before; an exhaustion
+    already running later is kept. The record keeps the refusal as `usage_limit` {"at", "until"} (budgets.json's
+    entry is overwritten by `budget reset`), so after a reset only a new refusal marks it again. True when the record
+    changed."""
+    path = session_transcript(str(record.get("bg_id") or ""))
+    entry = usage_limit_refusal(tail_lines(path)) if path else None
+    if entry is None:
+        return False
+    until = refusal_reset(entry)
+    seen = entry.get("timestamp") or str(until)
+    marked = record.get("usage_limit") if isinstance(record.get("usage_limit"), dict) else {}
+    if until is None or until <= now() or marked.get("at") == seen:
+        return False
+    budgets = load_budgets()
+    current = exhausted_until(budgets["subscription"])
+    if current is None or current < until:
+        reason = f"usage limit: {refusal_text(entry)} (#{record.get('ticket')}, session {record.get('bg_id')})"
+        budgets["subscription"] = {"exhausted_until": iso(until), "reason": reason[:REASON_MAX]}
+        write_json(budgets_path(), budgets)
+        warn(f"#{record.get('ticket')}: session {record.get('bg_id')} hit the subscription usage limit; the "
+             f"subscription budget is exhausted until {iso(until)}")
+    record["usage_limit"] = {"at": seen, "until": iso(until)}
+    return True
 
 
 def last_result(lines):
@@ -973,7 +1123,9 @@ def sweep(records, agents, as_json=False, dry_run=False):
     """Close the records whose run has ended; a billing or auth failure marks the api budget. A listed bg session
     whose ticket is finished has ended whatever its state says: it is stopped and its record closed. Saves. Under
     `dry_run` (dispatch --dry-run, #335) such a session is not stopped and its record is closed in memory only, with
-    a `would stop session <id> (#N <state>)` line, so the plan still counts its slot free."""
+    a `would stop session <id> (#N <state>)` line, so the plan still counts its slot free. Every unended bg record's
+    transcript is read for a usage-limit refusal, which marks the subscription budget (note_usage_limit): a limited
+    session stays `blocked`, a live state."""
     repos, logins = {}, {}
     for record in records:
         if record.get("ended_at"):
@@ -983,6 +1135,8 @@ def sweep(records, agents, as_json=False, dry_run=False):
             continue
         finished = False                    # None: the ticket could not be read, warned once
         if is_bg(record):
+            if note_usage_limit(record):
+                save_run(record)
             listing = agents.get(include_done=True)
             if listing is None:
                 continue
@@ -1924,25 +2078,51 @@ def answered_needs_input(repo, n):
         return False
 
 
-def cmd_dispatch(repo, args):
-    if args.max < 1:
-        raise Problem("--max must be at least 1")
-    routing = load_routing(repo.main)       # once per dispatch, whatever the run does next
+def routing_of(repo):
+    """load_routing for the main checkout, each problem warned once and remembered in REPORTED."""
+    routing = load_routing(repo.main)
     for problem in routing["problems"]:
         warn(problem)
         REPORTED.add(one_line(problem))
-    effort = routing["code_effort"]
+    return routing
+
+
+def cmd_dispatch(repo, args):
+    if args.max < 1:
+        raise Problem("--max must be at least 1")
+    routing = routing_of(repo)       # once per dispatch, whatever the run does next
     agents = Agents()
     records = load_runs()
     sweep(records, agents, wants_json(args), dry_run=args.dry_run)
-    mine = [r for r in records if of_repo(r, repo)]
     api_until = exhausted_until(load_budgets()["api"])    # after the sweep, which can be what exhausts it
     if args.venue == "headless" and api_until:
         raise Problem(f"the api budget is exhausted until {iso(api_until)}; nothing started. Dispatch "
                       f"without --api or --venue headless to run on the subscription, or `harness-work budget reset "
                       f"api` once the api key works again")
+    if args.venue != "headless":
+        subscription_hold()         # after the sweep too, which can be what exhausts it
+    data, failed_any = dispatch_repo(repo, args, routing, records, agents)
+    if args.json:
+        emit(True, data, "")
+    if failed_any:
+        sys.exit(1)
+
+
+def dispatch_repo(repo, args, routing, records, agents, shared=None):
+    """One repository's dispatch after the sweep and the budget checks: plan, start and launch, printing its text
+    lines (none under --json). (the --json result, whether a launch failed). `shared` is --all-projects' (live runs
+    across every project, slots left) in place of this repository's live runs and --max minus them."""
+    effort = routing["code_effort"]
+    mine = [r for r in records if of_repo(r, repo)]
     venue = args.venue or "bg"
     live = live_runs(mine, agents)
+    live_count, slots = (len(live), args.max - len(live)) if shared is None else shared
+
+    def done(data, text):
+        if not args.json:
+            print(text)
+        return data, False
+
     ready = board_json(repo, "ready", "--json")
     ready = [r for r in ready if isinstance(r, dict)] if isinstance(ready, list) else []
     named, after = args.only, None
@@ -1956,7 +2136,6 @@ def cmd_dispatch(repo, args):
         if isinstance(n, int) and n not in seen and (only is None or n in only):
             seen.add(n)
             candidates.append(row)
-    slots = args.max - len(live)
     plan, skipped = [], list(capped)
     for n in named or []:           # a named ticket that is no candidate: say why, launch nothing for it
         if n in seen or any(s["number"] == n for s in skipped):
@@ -1993,7 +2172,7 @@ def cmd_dispatch(repo, args):
         extra["after"] = after
     if args.dry_run:
         shown = f"effort {effort}, " if effort else ""
-        lines = [f"Dry run: venue {venue}, {shown}{len(live)} live, {max(0, slots)} of {args.max} slots free."]
+        lines = [f"Dry run: venue {venue}, {shown}{live_count} live, {max(0, slots)} of {args.max} slots free."]
         lines += [after_text(after)] if after is not None else []
         lines += [f"would start {describe(row)} and launch {venue}" for row in plan]
         group = [row["number"] for row in plan if open_wave(repo, row["number"]) is None] if wave_tier else []
@@ -2003,32 +2182,27 @@ def cmd_dispatch(repo, args):
         lines += [f"skip #{s['number']}: {s['why']}" for s in skipped]
         if not candidates:
             lines.append("None of the named tickets can be planned." if args.only else "No ready tickets.")
-        emit(wants_json(args), dict({"venue": venue, "effort": effort, "dry_run": True,
-                                     "live": [r["id"] for r in live.values()], "plan": plan, "skipped": skipped},
-                                    **extra), "\n".join(lines))
-        return
+        return done(dict({"venue": venue, "effort": effort, "dry_run": True, "live": [r["id"] for r in live.values()],
+                          "plan": plan, "skipped": skipped}, **extra), "\n".join(lines))
     if not args.json:
         if after is not None:
             print(after_text(after), flush=True)
         for s in (skipped if only is not None else capped + kept_local):
             print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
-        emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
-                                     "skipped": skipped}, **extra),
-             "None of the named tickets can be launched." if args.only else "No ready tickets.")
-        return
+        return done(dict({"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped},
+                         **extra),
+                    "None of the named tickets can be launched." if args.only else "No ready tickets.")
     if slots <= 0:
-        emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
-                                     "skipped": skipped}, **extra),
-             f"{len(live)} live runs; --max {args.max} reached, nothing launched.")
-        return
+        return done(dict({"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped},
+                         **extra),
+                    f"{live_count} live runs; --max {args.max} reached, nothing launched.")
     if not plan:
-        emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
-                                     "skipped": skipped}, **extra),
-             "Nothing to launch: " + "; ".join([f"#{s['number']} has a {s['why']}" for s in skipped
-                                                if s not in capped and s["why"].startswith("live run")]
-                                               + [f"#{s['number']} is {s['why']}" for s in kept_local]) + ".")
-        return
+        return done(dict({"venue": venue, "effort": effort, "launched": [], "failed": [], "skipped": skipped},
+                         **extra),
+                    "Nothing to launch: " + "; ".join([f"#{s['number']} has a {s['why']}" for s in skipped
+                                                       if s not in capped and s["why"].startswith("live run")]
+                                                      + [f"#{s['number']} is {s['why']}" for s in kept_local]) + ".")
     if shutil.which(claude_exe()) is None:
         raise Problem(f"claude not found ({claude_exe()}); nothing started")
     # launch every planned session first, then wait for all of them together (#367): the wait stays near
@@ -2055,12 +2229,13 @@ def cmd_dispatch(repo, args):
         pending.append((record, before))
     not_started = confirm_started(repo, pending)
     launched, failures = [], []
+    named = f"{repo.name} " if shared is not None else ""     # --all-projects: the stderr line names the project
     for n, record, why in outcomes:
         why = why or not_started.get(n)
         if why:
             failures.append({"number": n, "error": why})
             if not args.json:
-                print(f"#{n} not launched: {why}", file=sys.stderr, flush=True)
+                print(f"{named}#{n} not launched: {why}", file=sys.stderr, flush=True)
             continue
         launched.append(record)
         if not args.json:
@@ -2068,10 +2243,74 @@ def cmd_dispatch(repo, args):
             print(f"#{n} {venue} on {record['branch'] or 'the main checkout (ops)'} ({where})", flush=True)
     if wave_tier and launched:
         extra["wave"] = group_wave(repo, launched, wave_tier, routing["wave_effort"], args.json)
-    if args.json:
-        emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": launched, "failed": failures,
-                                     "skipped": skipped}, **extra), "")
-    if failures:
+    return (dict({"venue": venue, "effort": effort, "launched": launched, "failed": failures, "skipped": skipped},
+                 **extra), bool(failures))
+
+
+def autodispatch_repo(project):
+    """(the Repo, None) for a registered project that opted in and has no open incident; (None, why) for one that is
+    skipped. Opted in: HARNESS_AUTODISPATCH is 1 (a string or a number) in the .claude/settings.json committed at
+    origin/main (settings.committed_env), never the working tree, settings.local.json or this environment. A Problem
+    when the project cannot be read: its folder gone, not a repository, gh failing."""
+    if not os.path.isdir(project.path):
+        raise Problem(f"{project.path} is not a folder (moved or removed? harness-projects lists the registry)")
+    repo = Repo(project.path)
+    if setting_from(AUTODISPATCH, committed_env(repo.main)) != "1":
+        return None, f"not opted in ({AUTODISPATCH} is not 1 in .claude/settings.json at origin/main)"
+    found = gh_json(repo, ["issue", "list", "--label", "incident", "--state", "open", "--json", "number,title"])
+    incidents = [f"#{i.get('number')}" for i in found if isinstance(i, dict)] if isinstance(found, list) else []
+    if incidents:
+        return None, f"incident {', '.join(incidents)} open"
+    return repo, None
+
+
+def cmd_dispatch_all(args):
+    """dispatch --all-projects (#164): one sweep of every run, the subscription hold, then each registered project in
+    registry order that autodispatch_repo admits gets this repository's dispatch in the bg venue, its slots --max
+    minus the live runs of every project (each live record counts) and minus what earlier projects launched. A
+    skipped project is one line; a failing one is one stderr line, the rest still run, and the exit is 1 at the end.
+    Needs no repository in the cwd (launchd's job has none)."""
+    if args.max < 1:
+        raise Problem("--max must be at least 1")
+    as_json = wants_json(args)
+    agents = Agents()
+    records = load_runs()
+    sweep(records, agents, as_json, dry_run=args.dry_run)
+    subscription_hold()
+    projects = load_registry()
+    live = sum(1 for r in records if run_live(r, agents))
+    taken, results, failed_any = 0, [], False
+    if not as_json:
+        print(f"All projects: {live} live, --max {args.max}" + (", dry run." if args.dry_run else "."), flush=True)
+    for project in projects:
+        entry = {"name": project.name, "path": project.path, "status": "dispatched", "why": None, "result": None}
+        results.append(entry)
+        try:
+            repo, why = autodispatch_repo(project)
+            if repo is None:
+                entry.update(status="skipped", why=why)
+                if not as_json:
+                    print(f"{project.name}: skipped, {why}", flush=True)
+                continue
+            routing = routing_of(repo)
+            if not as_json:
+                print(f"{project.name} ({repo.main}):", flush=True)
+            data, failed = dispatch_repo(repo, args, routing, records, agents,
+                                         shared=(live + taken, args.max - live - taken))
+        except Problem as err:
+            entry.update(status="failed", why=one_line(err))
+            print(f"harness-work: {project.name}: {one_line(err)}", file=sys.stderr, flush=True)
+            failed_any = True
+            continue
+        entry["result"] = data
+        taken += len(data.get("plan") or []) if args.dry_run else len(data.get("launched") or [])
+        failed_any = failed_any or failed
+    if as_json:
+        emit(True, {"all_projects": True, "venue": "bg", "max": args.max, "dry_run": args.dry_run, "live": live,
+                    "projects": results}, "")
+    elif not projects:
+        print("No registered projects (harness-projects add registers one).")
+    if failed_any:
         sys.exit(1)
 
 
@@ -2483,6 +2722,71 @@ def cmd_worktree_remove(repo, args):
     print("\n".join(done))
 
 
+# --------------------------------------------------------------- launchd (#164; harness-digest's are the model)
+def plist_path():
+    return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", f"{LAUNCHD_LABEL}.plist")
+
+
+def launchctl(args):
+    """(exit code, first line of output) of a launchctl call (HARNESS_LAUNCHCTL when set); never raises."""
+    exe = os.environ.get("HARNESS_LAUNCHCTL") or "launchctl"
+    try:
+        done = subprocess.run([exe] + args, capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as err:
+        return 1, str(getattr(err, "strerror", None) or err)
+    return done.returncode, first_line(done.stderr) or first_line(done.stdout) or f"exit {done.returncode}"
+
+
+def install_launchd():
+    """Write the LaunchAgent that runs `dispatch --all-projects --max 8` at minute 0 of every hour and load it.
+    StartCalendarInterval, not StartInterval: launchd runs a calendar job missed while the Mac slept once on wake."""
+    path = plist_path()
+    script = os.path.realpath(os.path.abspath(__file__))
+    job_path = ":".join(["/opt/homebrew/bin", "/usr/local/bin", os.path.join(os.path.expanduser("~"), ".local", "bin"),
+                         "/usr/bin", "/bin"])
+    python = shutil.which("python3", path=job_path) or sys.executable    # the python3 the job's own PATH finds
+    log = harness_home("dispatch", "launchd.log")
+    job = {"Label": LAUNCHD_LABEL,
+           "ProgramArguments": [python, script, "dispatch", "--all-projects", "--max", str(ALL_PROJECTS_MAX)],
+           "StartCalendarInterval": {"Minute": 0}, "EnvironmentVariables": {"PATH": job_path},
+           "StandardOutPath": log, "StandardErrorPath": log, "RunAtLoad": False}
+    try:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            plistlib.dump(job, fh)
+    except OSError as err:
+        raise Problem(f"cannot write {path}: {err.strerror or err}") from None
+    domain = f"gui/{os.getuid()}"
+    launchctl(["bootout", f"{domain}/{LAUNCHD_LABEL}"])      # an older copy; failing means none was loaded
+    code, why = launchctl(["bootstrap", domain, path])
+    if code == 0:
+        print(f"harness-work: wrote {path} and loaded it (launchctl bootstrap {domain}); it dispatches every "
+              f"opted-in project hourly at minute 0, log {log}")
+        return
+    code2, why2 = launchctl(["load", "-w", path])
+    if code2 == 0:
+        print(f"harness-work: wrote {path}; launchctl bootstrap failed ({why}), loaded it with launchctl load -w "
+              f"instead; it dispatches every opted-in project hourly at minute 0, log {log}")
+        return
+    raise Problem(f"wrote {path} but could not load it: launchctl bootstrap: {why}; launchctl load -w: {why2}")
+
+
+def uninstall_launchd():
+    path = plist_path()
+    code, why = launchctl(["bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"])
+    unloaded = "unloaded it (launchctl bootout)" if code == 0 else f"it was not loaded ({why})"
+    try:
+        os.remove(path)
+        removed = f"removed {path}"
+    except FileNotFoundError:
+        removed = f"no {path} to remove"
+    except OSError as err:
+        raise Problem(f"{unloaded}; cannot remove {path}: {err.strerror or err}") from None
+    print(f"harness-work: {unloaded}; {removed}")
+
+
 # --------------------------------------------------------------- arguments
 def ticket_list(text):
     """An argparse `type=`: issue numbers separated by commas, in the order given, once each."""
@@ -2547,13 +2851,24 @@ def parser():
 
     dispatch = sub.add_parser("dispatch", parents=[with_repo, with_json],
                               help="start and launch a session per ready ticket")
-    dispatch.add_argument("--max", type=int, default=10, help="live runs at most (default 10)")
+    dispatch.add_argument("--max", type=int, default=None,
+                          help=f"live runs at most (default {DISPATCH_MAX}; with --all-projects {ALL_PROJECTS_MAX}, "
+                               f"counted across every project)")
     dispatch.add_argument("--venue", choices=VENUES,
-                          help="default: bg (the subscription); headless bills the API key and is refused while the "
-                               "api budget is exhausted")
+                          help="default: bg (the subscription; held while the subscription budget is exhausted); "
+                               "headless bills the API key and is refused while the api budget is exhausted")
     dispatch.add_argument("--api", action="store_true",
                           help="alias for --venue headless: runs headless, billed to the API key")
     dispatch.add_argument("--dry-run", action="store_true", help="print the plan; start and launch nothing")
+    dispatch.add_argument("--all-projects", action="store_true",
+                          help=f"every registered project whose .claude/settings.json at origin/main sets "
+                               f"{AUTODISPATCH} to 1 and that has no open incident issue, in bg; not with --api, "
+                               f"--venue headless, --only, --after or --repo")
+    job = dispatch.add_mutually_exclusive_group()
+    job.add_argument("--install-launchd", action="store_true",
+                     help=f"run dispatch --all-projects --max {ALL_PROJECTS_MAX} hourly (a LaunchAgent); "
+                          f"dispatches nothing now")
+    job.add_argument("--uninstall-launchd", action="store_true", help="remove that LaunchAgent")
     pick = dispatch.add_mutually_exclusive_group()
     pick.add_argument("--only", type=ticket_list, metavar="N[,N...]",
                       help="consider only these tickets (each ready, or in progress with an ended run); "
@@ -2584,7 +2899,7 @@ def parser():
     drop.add_argument("id", metavar="ID")
     drop.add_argument("number", type=issue_number, metavar="N")
 
-    budget = sub.add_parser("budget", parents=[with_json], help="the api and cloud budgets")
+    budget = sub.add_parser("budget", parents=[with_json], help="the api, cloud and subscription budgets")
     budget_sub = budget.add_subparsers(dest="action", metavar="{status,exhaust,reset,calls}")
     budget_sub.add_parser("status", parents=[nested_json], help="each budget's state (the default)")
     ex = budget_sub.add_parser("exhaust", parents=[nested_json], help="mark a budget exhausted")
@@ -2628,10 +2943,26 @@ def parser():
 def main():
     ap = parser()
     args = ap.parse_args()
-    if args.cmd == "dispatch" and args.api:
-        if args.venue == "bg":
-            ap.error("dispatch: --api is --venue headless and cannot go with --venue bg")
-        args.venue = "headless"
+    if args.cmd == "dispatch":
+        given = [flag for flag, on in (("--all-projects", args.all_projects), ("--max", args.max is not None),
+                                       ("--venue", args.venue), ("--api", args.api), ("--dry-run", args.dry_run),
+                                       ("--only", args.only is not None), ("--after", args.after is not None),
+                                       ("--repo", args.repo)) if on]
+        if (args.install_launchd or args.uninstall_launchd) and given:
+            ap.error(f"dispatch: --install-launchd and --uninstall-launchd take no {given[0]}")
+        if args.api:
+            if args.venue == "bg":
+                ap.error("dispatch: --api is --venue headless and cannot go with --venue bg")
+            args.venue = "headless"
+        if args.all_projects:
+            if args.venue == "headless":
+                ap.error("dispatch: --all-projects launches bg sessions on the subscription and cannot go with "
+                         + ("--api" if args.api else "--venue headless"))
+            other = next((flag for flag in ("--only", "--after", "--repo") if flag in given), None)
+            if other:
+                ap.error(f"dispatch: --all-projects cannot go with {other}")
+        if args.max is None:
+            args.max = ALL_PROJECTS_MAX if args.all_projects else DISPATCH_MAX
     try:
         now()  # an unreadable HARNESS_NOW stops here, before any command has written anything
         if args.cmd == "runs":
@@ -2640,6 +2971,12 @@ def main():
             cmd_budget(args)
         elif args.cmd == "backup":
             cmd_backup(args)
+        elif args.cmd == "dispatch" and args.install_launchd:
+            install_launchd()
+        elif args.cmd == "dispatch" and args.uninstall_launchd:
+            uninstall_launchd()
+        elif args.cmd == "dispatch" and args.all_projects:
+            cmd_dispatch_all(args)
         else:
             command = {"start": cmd_start, "attempt": cmd_attempt, "stage": cmd_stage, "cost": cmd_cost, "dispatch": cmd_dispatch,
                        "cloud": cmd_cloud, "waves": cmd_waves, "wave": cmd_wave_drop, "worktrees": cmd_worktrees,

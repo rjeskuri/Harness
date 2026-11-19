@@ -909,7 +909,8 @@ class AttemptEffort(WorkTest):
 
 class Budget(WorkTest):
     def test_status_exhaust_and_reset(self):
-        self.assertEqual(self.ok("budget").stdout.splitlines(), ["api: available", "cloud: available"])
+        self.assertEqual(self.ok("budget").stdout.splitlines(),
+                         ["api: available", "cloud: available", "subscription: available"])
         p = self.ok("budget", "exhaust", "cloud", "--reason", "ultrareview: out of credits", "--hours", "2")
         self.assertRegex(p.stdout.strip(), r"^cloud: exhausted until \S+Z \(ultrareview: out of credits\)$")
         saved = self.read_json(self.budgets_path())
