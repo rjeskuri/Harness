@@ -47,6 +47,7 @@ ROUTING_KEYS = ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER
 # The label table from docs/design.md, the source of truth for `labels ensure`.
 SPEC_COLORS = {
     "epic": "5319E7", "task": "0E8A16", "bug": "D73A4A", "chore": "BFD4F2", "refactor": "C2E0C6",
+    "ops": "006B75",                                                 # #72: a record update with no code change
     "status:ready": "0052CC", "status:in-progress": "FBCA04", "status:in-review": "D4C5F9",
     "status:blocked": "B60205", "status:needs-input": "E99695", "status:proposed": "BFE5BF",
     "size:S": "C5DEF5", "size:M": "BFDADC", "size:L": "F9D0C4",
@@ -329,9 +330,9 @@ class Labels(BoardTest):
             seen[argv[2]] = argv[4]
             descriptions[argv[2]] = argv[6]
         self.assertEqual(seen, SPEC_COLORS)
-        self.assertEqual(len(SPEC_COLORS), 23)                      # 22 before #159, plus status:proposed
+        self.assertEqual(len(SPEC_COLORS), 24)                      # 22 before #159, status:proposed, ops (#72)
         self.assertIn(f"{len(SPEC_COLORS)} labels created or updated", p.stdout)
-        self.assertIn("23 labels created or updated", p.stdout)
+        self.assertIn("24 labels created or updated", p.stdout)
         for name, text in AUTOLAND_DESCRIPTIONS.items():
             self.assertEqual(descriptions.get(name), text, name)
 

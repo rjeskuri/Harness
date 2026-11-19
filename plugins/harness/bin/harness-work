@@ -69,6 +69,10 @@ branch or a dirty worktree behind it gets one warning and is left alone; the tic
 except from status:in-review (a revision pass keeps its label) and from status:needs-input while the owner has not answered. For a needs-input ticket, `harness-board answers N`
 runs first, before anything refreshes the ticket cache. --json prints previous_status (the status before start),
 answers (the owner's replies; [] unless the ticket was needs-input) and waiting (needs-input with no answer).
+An ops ticket (type ops, #72: a record update with no code change) gets no fetch, branch or worktree: branch and
+worktree are null, the status moves as above, and --json adds ops (true) and before_dir,
+~/.claude/harness/ops/<repo-key>/<N>/ (created), where the run saves the before-values before any write. A non-ops
+start prints no ops key.
 
 dispatch: sweeps the runs, then starts and launches each ready ticket (and each in-progress ticket whose last
 run ended without a ready pull request, a draft counting as none, until 3 runs of it ended in the last 7 days,
@@ -87,6 +91,8 @@ headless, only with --venue headless or its alias --api (--api with --venue bg i
 reaches a command line or the environment). headless while the api budget is exhausted (judged after the sweep,
 which can be what exhausts it) is refused, --dry-run too: nothing starts, the exit is non-zero and the message
 names the time and `harness-work budget reset api`.
+An ops ticket never runs headless (it needs this Mac's connectors and credentials): a headless dispatch skips it with
+a reason naming ops (printed as `skip #N: ...`, and in "skipped"); bg launches it in the main checkout (no worktree).
 Effort: dispatch reads the routing settings once per command through harness_lib.routing.load_routing (environment,
 else the main checkout's .claude/settings.json) and launches each session, redispatched ones too, at its ticket's
 code route effort: HARNESS_CODE_EFFORT when set, else xhigh for a size:L or risk:high ticket (unless HARNESS_CODE_TIER
@@ -124,8 +130,8 @@ blocked -->`) by the gh user after the run's start, at that comment's time: done
 closed or a pull request of its branch merged, `ok`; else, 24 h after its start, `unknown`. Its status label never
 ends it. A failing gh call is one warning and leaves it open. An unended cloud run is live.
 
-cloud: refuses, before anything starts, a needs-local ticket (run it here with /harness:work N), an exhausted cloud
-budget, an unended cloud run of the ticket, a needs-input ticket with no answer since its question, and what start
+cloud: refuses, before anything starts, a needs-local or ops ticket (run it here with /harness:work N), an exhausted
+cloud budget, an unended cloud run of the ticket, a needs-input ticket with no answer since its question, and what start
 refuses; then starts the ticket (venue cloud), pushes its branch with upstream (a failed push launches nothing) and
 runs `claude --cloud <prompt> --on-branch <branch>` in the worktree with its stdout on a pseudo-terminal (claude
 starts a new cloud session only from a terminal), without the credentials above. The prompt is self-contained:
@@ -657,6 +663,8 @@ def start_ticket(repo, number, venue, draft_pr=None, announce=False):
     why = refusal(record)
     if why:
         raise Problem(why)
+    if record.get("type") == "ops":
+        return start_ops(repo, number, venue, record, answers, announce)
     fetch_origin(repo)
     ensure_exclude(repo)
     branch, worktree, created = make_worktree(repo, number, record.get("title"))
@@ -684,6 +692,37 @@ def start_ticket(repo, number, venue, draft_pr=None, announce=False):
             "title": record.get("title") or "", "previous_status": previous, "answers": answers,
             "waiting": waiting, "draft_pr": draft_pr,
             "type": record.get("type"), "size": record.get("size"), "risk": record.get("risk")}
+
+
+def ops_dir(repo, number):
+    """Where an ops run saves the before-values of ticket `number`, outside every repository."""
+    return harness_home("ops", repo.key, str(number))
+
+
+def start_ops(repo, number, venue, record, answers, announce):
+    """start_ticket for an ops ticket (a record update, no code): no branch and no worktree; the before-values
+    folder is created and named; the status moves as start_ticket's does."""
+    before_dir = ops_dir(repo, number)
+    try:
+        os.makedirs(before_dir, exist_ok=True)
+    except OSError as err:
+        raise Problem(f"cannot create {before_dir}: {err.strerror or err}") from None
+    cache = read_cache(repo, number) or dict(record)
+    if not cache.get("started_at"):
+        cache["started_at"] = iso(now())
+    cache.update(branch=None, worktree=None, before_dir=before_dir)
+    write_json(repo.ticket_path(number), cache)
+    previous = record.get("status")
+    waiting = previous == "needs-input" and not answers
+    where = f"Started on the main checkout, ops: no branch ({hostname()}, {venue})"
+    if previous not in ("in-progress", "in-review") and not waiting:
+        board(repo, "status", number, "in-progress", "--comment", where)
+    elif announce and previous == "in-progress":
+        board(repo, "comment", number, "--body", where)
+    tier = record.get("tier") if record.get("tier") in TIERS else DEFAULT_TIER
+    return {"number": number, "branch": None, "worktree": None, "tier": tier, "title": record.get("title") or "",
+            "previous_status": previous, "answers": answers, "waiting": waiting, "draft_pr": None,
+            "type": "ops", "size": record.get("size"), "risk": record.get("risk"), "before_dir": before_dir}
 
 
 # --------------------------------------------------------------- budgets
@@ -1206,6 +1245,7 @@ def launch(repo, ticket, venue, effort=None):
     if effort:
         record["effort"] = effort
     prompt = f"/harness:work {n}"
+    cwd = ticket["worktree"] or repo.main      # an ops ticket has no worktree: its session runs in the main checkout
     if ticket.get("draft_pr"):
         prompt += (f"\n\nThe previous run ended early: draft PR #{ticket['draft_pr']} is open and the worktree may "
                    f"hold uncommitted work from that run. Read `git status` and the PR's review comments before "
@@ -1218,7 +1258,7 @@ def launch(repo, ticket, venue, effort=None):
             argv += ["--effort", effort]
         try:
             with open(log, "ab") as out:
-                proc = subprocess.Popen(argv, cwd=ticket["worktree"], start_new_session=True, stdout=out,
+                proc = subprocess.Popen(argv, cwd=cwd, start_new_session=True, stdout=out,
                                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=child_env(repo))
         except OSError as err:
             return failed(record, f"cannot launch {argv[0]}: {err.strerror or err}")
@@ -1230,7 +1270,7 @@ def launch(repo, ticket, venue, effort=None):
             argv += ["--effort", effort]
         argv.append(prompt)
         try:
-            done = subprocess.run(argv, cwd=ticket["worktree"], capture_output=True, text=True, errors="replace",
+            done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, errors="replace",
                                   stdin=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT, env=child_env(repo))
         except (OSError, subprocess.SubprocessError) as err:
             return failed(record, f"cannot launch {argv[0]} --bg: {err}")
@@ -1580,8 +1620,13 @@ def cmd_start(repo, args):
     data = {"number": ticket["number"], "branch": ticket["branch"], "worktree": ticket["worktree"],
             "tier": ticket["tier"], "previous_status": ticket["previous_status"], "waiting": ticket["waiting"],
             "answers": ticket["answers"], "context": context}
-    data["resume"], data["pr"] = resume_state(repo, ticket["branch"], ticket["worktree"])
-    text = f"{ticket['worktree']}\n\n{context}"
+    if ticket["type"] == "ops":
+        data.update(ops=True, before_dir=ticket["before_dir"], resume=False, pr=None)
+        text = (f"Ops ticket: no branch or worktree; save the before-values in {ticket['before_dir']} before any "
+                f"write.\n\n{context}")
+    else:
+        data["resume"], data["pr"] = resume_state(repo, ticket["branch"], ticket["worktree"])
+        text = f"{ticket['worktree']}\n\n{context}"
     if data["resume"]:
         where = f"open PR #{data['pr']}" if data["pr"] else "commits and no open PR"
         text += f"\n\nResume: {ticket['branch']} already has {where}; pick up where it stopped, not at the tests."
@@ -1605,8 +1650,9 @@ def cmd_cloud(repo, args):
         raise Problem(f"#{n} already has a cloud run that has not ended: {unended[0].get('id')} "
                       f"({unended[0].get('url')}); follow it with harness-work runs --sweep")
     labels = issue_labels(repo, n)
-    if "needs-local" in labels:
-        raise Problem(f"#{n} is labelled needs-local: it needs this machine; run it here with /harness:work {n}")
+    if "needs-local" in labels or "ops" in labels:
+        what = "an ops ticket" if "ops" in labels else "labelled needs-local"
+        raise Problem(f"#{n} is {what}: it needs this machine; run it here with /harness:work {n}")
     if "status:needs-input" in labels and not board_json(repo, "answers", n, "--json"):
         raise Problem(f"#{n} is status:needs-input with no answer since its question; nothing started. Answer it "
                       f"on the ticket, then run harness-work cloud {n} again")
@@ -1862,6 +1908,12 @@ def after_text(after):
     return f"after #{after['ticket']}: nothing ready"
 
 
+def is_ops(repo, row):
+    """Whether a dispatch candidate is an ops ticket: its ready row's type, else its ticket cache's."""
+    kind = row.get("type") or (read_cache(repo, row["number"]) or {}).get("type")
+    return kind == "ops"
+
+
 def answered_needs_input(repo, n):
     """Ticket n is status:needs-input and the owner has answered since its question (harness-board answers)."""
     try:
@@ -1915,9 +1967,15 @@ def cmd_dispatch(repo, args):
             continue
         skipped.append({"number": n, "why": f"live run {live[n]['id']}" if n in live else
                         "not ready, and not in progress with an ended run to redispatch"})
+    kept_local = []                 # ops tickets a headless dispatch leaves out: they need this Mac's connectors
     for row in candidates:
         if row["number"] in live:
             skipped.append({"number": row["number"], "why": f"live run {live[row['number']]['id']}"})
+        elif venue == "headless" and is_ops(repo, row):
+            kept_local.append({"number": row["number"], "why": f"an ops ticket needs this Mac's connectors and "
+                                                               f"credentials, never headless; dispatch it bg or run "
+                                                               f"/harness:work {row['number']} here"})
+            skipped.append(kept_local[-1])
         elif len(plan) < slots or not args.dry_run:
             plan.append(row)
         else:
@@ -1952,7 +2010,7 @@ def cmd_dispatch(repo, args):
     if not args.json:
         if after is not None:
             print(after_text(after), flush=True)
-        for s in (skipped if only is not None else capped):
+        for s in (skipped if only is not None else capped + kept_local):
             print(f"skip #{s['number']}: {s['why']}", flush=True)
     if not candidates:
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
@@ -1967,8 +2025,9 @@ def cmd_dispatch(repo, args):
     if not plan:
         emit(wants_json(args), dict({"venue": venue, "effort": effort, "launched": [], "failed": [],
                                      "skipped": skipped}, **extra),
-             "Nothing to launch: " + "; ".join(f"#{s['number']} has a {s['why']}" for s in skipped
-                                               if s not in capped and s["why"].startswith("live run")) + ".")
+             "Nothing to launch: " + "; ".join([f"#{s['number']} has a {s['why']}" for s in skipped
+                                                if s not in capped and s["why"].startswith("live run")]
+                                               + [f"#{s['number']} is {s['why']}" for s in kept_local]) + ".")
         return
     if shutil.which(claude_exe()) is None:
         raise Problem(f"claude not found ({claude_exe()}); nothing started")
@@ -2006,7 +2065,7 @@ def cmd_dispatch(repo, args):
         launched.append(record)
         if not args.json:
             where = f"pid {record['pid']}, log {record['log']}" if venue == "headless" else f"id {record['bg_id']}"
-            print(f"#{n} {venue} on {record['branch']} ({where})", flush=True)
+            print(f"#{n} {venue} on {record['branch'] or 'the main checkout (ops)'} ({where})", flush=True)
     if wave_tier and launched:
         extra["wave"] = group_wave(repo, launched, wave_tier, routing["wave_effort"], args.json)
     if args.json:
