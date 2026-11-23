@@ -6,6 +6,7 @@ Ryan's Claude Code harness: one plugin (agents, skills, hooks, command-line tool
 - Verify, the whole suite, one process per test module in parallel (CI runs the same): `python3 scripts/run_suite.py`
 - One module: `python3 -m unittest discover -s plugins/harness/tests -p test_work.py`
 - Canary, is the plugin every project loads still working: `sh scripts/smoke.sh`
+- Loop smoke, one ticket through `/harness:work` in the sandbox repo (about 20 minutes): `python3 scripts/loop_smoke.py run --sandbox <path> [--plugin <worktree>/plugins/harness]`
 
 ## Where things live
 - `plugins/harness/tests/`: the suite; `fakegh.py` is the scripted fake `gh` every tool test uses, and fake executables are written once per module.
@@ -17,3 +18,4 @@ Ryan's Claude Code harness: one plugin (agents, skills, hooks, command-line tool
 ## Conventions
 - python3 standard library only, 3.9-compatible (`from __future__ import annotations`); tests are unittest modules that drive the tools as subprocesses (each test's first run a real process, its further table rows in process through `gitrepo_support.run_in_process`), and a suite split across several `test_<x>*.py` modules keeps its fixtures in `<x>_support.py` beside them (not collected). Tests pin behavior, never the wording of a document, skill or agent.
 - A change to a hook or tool updates its contract in `docs/design.md` in the same pull request.
+- A change to `plugins/harness/skills/work/SKILL.md` or `plugins/harness/agents/*.md` gets a loop smoke run against its branch before it lands.

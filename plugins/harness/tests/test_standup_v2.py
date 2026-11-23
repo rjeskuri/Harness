@@ -177,7 +177,9 @@ class StandupV2(unittest.TestCase):
             "api": {"exhausted_until": self.until, "reason": "credit balance too low"},
             "cloud": {"exhausted_until": z(60), "reason": "expired a minute ago"}}))
         k = key(W["alpha"])
-        log16 = write(os.path.join(self.tmp, "logs", "16.log"), "partial output\n", mtime=time.time() - 20 * 60)
+        for name in ("alpha", "beta"):                    # a learn run a day ago: no learn line (#424)
+            self.learn(name, z(DAY))
+        log16 =write(os.path.join(self.tmp, "logs", "16.log"), "partial output\n", mtime=time.time() - 20 * 60)
         runs = {
             "14": {"venue": "headless", "pid": os.getpid(), "started_at": z(2 * 3600), "ended_at": None,
                    "outcome": None, "exit": None},                                         # alive
@@ -195,6 +197,29 @@ class StandupV2(unittest.TestCase):
             write(os.path.join(self.state, "runs", f"{k}-{ticket}-20261013070000.json"),
                   json.dumps(dict(record, id=f"{k}-{ticket}", ticket=int(ticket), repo=W["alpha"],
                                   worktree=None, branch=f"t/{ticket}-x")))
+
+    def learn(self, name, last_run):
+        """Record the project's last learn run (None: no record at all)."""
+        path = os.path.join(self.state, "repos", key(W[name]), "learn.json")
+        if last_run is None:
+            if os.path.exists(path):
+                os.unlink(path)
+        else:
+            write(path, json.dumps({"last_run": last_run}))
+
+    def run_rows(self, *args):
+        """The first call a real process, later ones in this process (gitrepo_support.run_in_process)."""
+        if not getattr(self, "ran_a_process", False):
+            self.ran_a_process = True
+            return self.run_tool(*args)
+        sys.path.insert(0, HERE)
+        try:
+            from gitrepo_support import run_in_process
+        finally:
+            sys.path.remove(HERE)
+        env = base_env(self.home)
+        env.update(FAKEGH_SCENARIO=self.scenario, FAKEGH_LOG=self.ghlog)
+        return run_in_process(TOOL, args, cwd=self.tmp, env=env)
 
     def run_tool(self, *args, **extra):
         env = base_env(self.home)
@@ -281,6 +306,32 @@ class StandupV2(unittest.TestCase):
         s = self.sections(p.stdout)
         self.assertEqual(list(s), [f"## alpha `{W['alpha']}`", "## Fleet", "## Budgets", "## Runs"])
         self.assertIn(ALPHA_V2[0], s[f"## alpha `{W['alpha']}`"])
+
+    def test_learn_line_only_when_due(self):
+        alpha, gamma = (f"## {n} `{W[n]}`" for n in ("alpha", "gamma"))
+        nine = z(9 * DAY + 2 * 3600)
+        rows = [  # (alpha's last learn run, the learn lines in alpha's section, alpha's JSON `learn`)
+            (z(3 * DAY), [], False),
+            (nine, ["- learn: last run 9d ago; run /harness:learn"], True),
+            (z(7 * DAY + 3600), ["- learn: last run 7d ago; run /harness:learn"], True),
+            (None, ["- learn: never run; run /harness:learn"], True),
+        ]
+        for last_run, lines, due in rows:
+            with self.subTest(last_run=last_run):
+                self.learn("alpha", last_run)
+                self.learn("gamma", None)                   # no GitHub origin: never a learn line
+                p = self.run_rows()
+                self.assertEqual(p.returncode, 0, p.stderr)
+                s = self.sections(p.stdout)
+                self.assertEqual([x for x in s[alpha] if x.startswith("- learn:")], lines)
+                self.assertEqual([x for x in s[alpha] if not x.startswith("- learn:")][1:],
+                                 ["- last session: none recorded", "- next: none recorded"] + ALPHA_V2
+                                 + ["- sessions: none"])            # nothing else changes
+                self.assertFalse([x for x in s[gamma] if "learn" in x], s[gamma])
+                p = self.run_rows("--json")
+                self.assertEqual(p.returncode, 0, p.stderr)
+                projects = {x["name"]: x for x in json.loads(p.stdout)["projects"]}
+                self.assertEqual(projects["alpha"]["learn"], {"last_run": last_run, "due": due})
 
 
 if __name__ == "__main__":

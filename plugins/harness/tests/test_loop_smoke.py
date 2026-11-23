@@ -9,6 +9,10 @@ FAKEGH_LOG holds every gh call. The clone has a pre-push hook that records to $P
 repository's refs are compared before and after, so a push shows either way. The script runs from a directory that is
 not a git repository. Each test's first run is a process of its own; its further rows go through
 gitrepo_support.run_in_process.
+
+#427, `run`: the real harness-board creates the ticket (its `gh issue create` reaches fakegh), and `claude` is the
+fake below, named by HARNESS_CLAUDE, which records its argv, cwd, PATH, standard input, the `--settings` it got and
+its pid (and, told to hang, a child's pid) to $FAKECLAUDE_LOG. HOME is a temporary folder per row.
 """
 from __future__ import annotations
 
@@ -19,7 +23,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import types
 import unittest
+from datetime import datetime, timezone
 
 sys.dont_write_bytecode = True
 
@@ -33,6 +40,37 @@ COMMENT = "Closed by loop smoke reset"
 IDENTITY = dict(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
                 GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
 PRE_PUSH = '#!/bin/sh\necho "pre-push $*" >> "$PUSH_LOG"\nexit 1\n'
+BOARD = os.path.join(REPO, "plugins", "harness", "bin", "harness-board")
+DEFAULT_BIN = os.path.join(REPO, "plugins", "harness", "bin")
+RESULT_MARK = "fakeclaude-result-7c1e"
+FAKE_CLAUDE = r'''
+import json, os, select, subprocess, sys, time
+argv = sys.argv[1:]
+try:
+    ready, _, _ = select.select([0], [], [], 0.3)
+    stdin = ("eof" if os.read(0, 1) == b"" else "data") if ready else "open"
+except (OSError, ValueError):
+    stdin = "closed"
+settings = None
+if "--settings" in argv and argv.index("--settings") + 1 < len(argv):
+    value = argv[argv.index("--settings") + 1]
+    if os.path.isfile(value):
+        with open(value, encoding="utf-8") as fh:
+            value = fh.read()
+    settings = value
+record = {"argv": argv, "cwd": os.getcwd(), "path": os.environ.get("PATH", ""), "stdin": stdin,
+          "settings": settings, "pid": os.getpid()}
+hang = os.environ.get("FAKECLAUDE_MODE") == "hang"
+if hang:
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    record["child"] = child.pid
+with open(os.environ["FAKECLAUDE_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(record) + "\n")
+if hang:
+    time.sleep(30)
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "MARK"}), flush=True)
+'''.replace("MARK", RESULT_MARK)
 
 MOD = {}
 
@@ -86,6 +124,11 @@ def setUpModule():
     git(env, "-C", seed, "commit", "-q", "-m", "Next")
     git(env, "-C", seed, "push", "-q", bare, "main")
     MOD["tpl"] = tpl
+    # #427: the fake claude, and a plugin folder whose bin/ has a harness-board that runs the real one
+    MOD["claude"] = executable(os.path.join(root, "fakeclaude", "claude"), f"#!{sys.executable}\n" + FAKE_CLAUDE)
+    MOD["plugin"] = os.path.join(root, "plugin")
+    executable(os.path.join(MOD["plugin"], "bin", "harness-board"),
+               f'#!/bin/sh\nexec "{sys.executable}" "{BOARD}" "$@"\n')
 
 
 def tearDownModule():
@@ -420,6 +463,231 @@ class Guard(SandboxTest):
         p = self.run_script("reset", "--sandbox", clone)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertTrue(self.calls())
+
+
+# ---------------------------------------------------------------------------------------------- run (#427)
+
+def after(argv, flag):
+    """The token after `flag` in argv, else None."""
+    return argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else None
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    p = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
+    state = p.stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+class Run(SandboxTest):
+    def setUp(self):
+        super().setUp()
+        self.claude_log = os.path.join(self.tmp, "claude.log")
+        self.claude = MOD["claude"]
+        self.mode = ""
+        self.homes = 0
+
+    def env(self):
+        env = super().env()
+        env.update(HARNESS_CLAUDE=self.claude, FAKECLAUDE_LOG=self.claude_log, FAKECLAUDE_MODE=self.mode)
+        return env
+
+    def fresh_home(self):
+        self.homes += 1
+        self.home = os.path.join(self.tmp, f"home{self.homes}")
+        os.makedirs(self.home)
+
+    def run_scenario(self, n, issue_state="CLOSED"):
+        """gh for one run: reset finds an earlier open Loop smoke issue #5, `issue create` makes #n, and check sees
+        #n as issue_state with a merged PR from t/n-loop-smoke."""
+        self.scenario([
+            {"match": ["issue", "create"], "stdout": f"https://github.com/rjeskuri/harness-sandbox/issues/{n}\n"},
+            {"match": ["issue", "list"], "stdout_json": [{"number": 5, "title": "Loop smoke 2026-11-01"}]},
+            {"match": ["issue", "view", str(n)], "stdout_json": {"state": issue_state, "number": n}},
+            {"match": ["pr", "list"], "stdout_json": [{"number": n + 100, "state": "MERGED",
+                                                       "headRefName": f"t/{n}-loop-smoke"}]},
+        ], default={"stdout": "", "exit": 0})
+        if os.path.exists(self.claude_log):
+            os.unlink(self.claude_log)
+
+    def run_real(self, *args):
+        """The script as its own process, its standard input a pipe held open for the whole run (so a launched
+        session that inherits it, rather than getting a closed one, is seen to)."""
+        self.ran_a_process = True
+        out_path, err_path = os.path.join(self.tmp, "run.out"), os.path.join(self.tmp, "run.err")
+        with open(out_path, "w") as out, open(err_path, "w") as err:
+            p = subprocess.Popen([sys.executable, SCRIPT, *args], cwd=self.cwd, env=self.env(),
+                                 stdin=subprocess.PIPE, stdout=out, stderr=err)
+            try:
+                code = p.wait(timeout=120)
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+                p.stdin.close()
+        with open(out_path) as fh_out, open(err_path) as fh_err:
+            return types.SimpleNamespace(returncode=code, stdout=fh_out.read(), stderr=fh_err.read())
+
+    def launches(self):
+        if not os.path.exists(self.claude_log):
+            return []
+        with open(self.claude_log, encoding="utf-8") as fh:
+            found = [json.loads(line) for line in fh if line.strip()]
+        for rec in found:
+            for pid in (rec.get("pid"), rec.get("child")):
+                if pid:
+                    self.addCleanup(self.kill_quietly, pid)
+        return found
+
+    @staticmethod
+    def kill_quietly(pid):
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+    def creates(self):
+        return [c["argv"] for c in self.calls() if c["argv"][:2] == ["issue", "create"]]
+
+    def lines(self, p):
+        return [line for line in (p.stdout + p.stderr).splitlines() if line.strip()]
+
+    def assert_one_ticket_and_launch(self, p, n, clone):
+        """One `Loop smoke <UTC stamp>` task created (S, low, ready) and one claude -p "/harness:work n" launched
+        from the sandbox; the launch record."""
+        creates = self.creates()
+        self.assertEqual(len(creates), 1, (self.calls(), p.stdout, p.stderr))
+        title = after(creates[0], "--title")
+        self.assertTrue(title and title.startswith("Loop smoke "), title)
+        self.assertIn(str(datetime.now(timezone.utc).year), title)
+        labels = {creates[0][i + 1] for i, tok in enumerate(creates[0][:-1]) if tok == "--label"}
+        self.assertTrue({"task", "status:ready", "size:S", "risk:low"} <= labels, creates[0])
+        launches = self.launches()
+        self.assertEqual(len(launches), 1, (launches, p.stdout, p.stderr))
+        argv = launches[0]["argv"]
+        self.assertIn("-p", argv)
+        self.assertIn(f"/harness:work {n}", argv)
+        self.assertEqual(after(argv, "--permission-mode"), "auto", argv)
+        self.assertEqual(after(argv, "--output-format"), "json", argv)
+        self.assertEqual(os.path.realpath(launches[0]["cwd"]), os.path.realpath(clone))
+        return launches[0]
+
+    def test_run_creates_a_ticket_launches_work_and_reports_the_check(self):
+        # (ticket number, the issue's state at check, run's expected exit code)
+        for n, state, code in ((41, "CLOSED", 0), (7, "OPEN", 1), (263, "CLOSED", 0)):
+            with self.subTest(ticket=n, state=state):
+                self.fresh_home()
+                clone, bare = self.sandbox()
+                remote_main = self.git("-C", bare, "rev-parse", "main")
+                bare_refs = self.refs(bare)
+                self.run_scenario(n, state)
+                first = not self.ran_a_process
+                if first:
+                    p = self.run_real("run", "--sandbox", clone)
+                else:
+                    p = self.run_script("run", "--sandbox", clone)
+                self.assertEqual(p.returncode, code, p.stdout + p.stderr)
+
+                launch = self.assert_one_ticket_and_launch(p, n, clone)
+                self.assertNotIn("--plugin-dir", launch["argv"])
+                self.assertEqual(os.path.realpath(launch["path"].split(os.pathsep)[0]), os.path.realpath(DEFAULT_BIN))
+                if first:
+                    self.assertIn(launch["stdin"], ("eof", "closed"), "the session's standard input is not closed")
+
+                # reset ran first: the earlier Loop smoke issue is closed, never the new one, and main fast-forwarded
+                closed = set()
+                for argv in (c["argv"] for c in self.calls() if c["argv"][:2] == ["issue", "close"]):
+                    closed |= numbers(argv)
+                self.assertEqual(closed, {5}, self.calls())
+                self.assertEqual(self.git("-C", clone, "rev-parse", "HEAD"), remote_main)
+                # nothing pushed, and the sandbox is not registered
+                self.assertEqual(self.pushes(), "")
+                self.assertEqual(self.refs(bare), bare_refs)
+                registry = os.path.join(self.home, ".claude", "harness", "projects.json")
+                if os.path.exists(registry):
+                    with open(registry, encoding="utf-8") as fh:
+                        self.assertNotIn("harness-sandbox", fh.read())
+
+                # the session's output is in ~/.claude/harness/smoke/<stamp>.log, and run names that file
+                smoke = os.path.join(self.home, ".claude", "harness", "smoke")
+                logs = sorted(os.listdir(smoke)) if os.path.isdir(smoke) else []
+                self.assertEqual(len(logs), 1, logs)
+                self.assertTrue(logs[0].endswith(".log"), logs)
+                log = os.path.join(smoke, logs[0])
+                with open(log, encoding="utf-8") as fh:
+                    self.assertIn(RESULT_MARK, fh.read())
+                self.assertIn(logs[0], p.stdout)
+
+                # check's own three lines for ticket n, in order, in run's output
+                self.ran_a_process = True
+                expected = self.run_script("check", "--sandbox", clone, "--ticket", str(n))
+                want = [line for line in expected.stdout.splitlines() if line.strip()]
+                self.assertEqual(len(want), 3, expected.stdout)
+                self.assertEqual([line.startswith("ok ") for line in want], [state == "CLOSED", True, True], want)
+                got = [line.strip() for line in p.stdout.splitlines()]
+                starts = [i for i in range(len(got) - 2) if got[i:i + 3] == want]
+                self.assertTrue(starts, (want, p.stdout))
+
+    def test_plugin_dir_and_its_bin_reach_the_launched_session(self):
+        plugin = MOD["plugin"]
+        for n in (58, 9):
+            with self.subTest(ticket=n):
+                self.fresh_home()
+                clone, bare = self.sandbox()
+                bare_refs = self.refs(bare)
+                self.run_scenario(n)
+                p = self.run_script("run", "--sandbox", clone, "--plugin", plugin)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                launch = self.assert_one_ticket_and_launch(p, n, clone)
+                argv = launch["argv"]
+                self.assertEqual(os.path.realpath(after(argv, "--plugin-dir") or ""), os.path.realpath(plugin), argv)
+                self.assertIsNotNone(launch["settings"], argv)
+                settings = json.loads(launch["settings"])
+                self.assertIs(settings["enabledPlugins"]["harness@ryan"], False, settings)
+                first = launch["path"].split(os.pathsep)[0]
+                self.assertEqual(os.path.realpath(first), os.path.realpath(os.path.join(plugin, "bin")))
+                self.assertEqual(self.pushes(), "")
+                self.assertEqual(self.refs(bare), bare_refs)
+
+    def test_a_session_past_the_timeout_is_killed_and_fails(self):
+        # a session that outlives --timeout 0.02 (1.2 s); check itself would pass, so the one FAIL is the timeout
+        self.fresh_home()
+        clone, _ = self.sandbox()
+        self.run_scenario(31)
+        self.mode = "hang"
+        started = time.monotonic()
+        p = self.run_real("run", "--sandbox", clone, "--timeout", "0.02")
+        elapsed = time.monotonic() - started
+        launches = self.launches()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertLess(elapsed, 25, "run waited for the session instead of its timeout")
+        fails = [line for line in self.lines(p) if line.startswith("FAIL")]
+        self.assertEqual(len(fails), 1, p.stdout + p.stderr)
+        self.assertIn("time", fails[0].lower())
+        self.assertEqual(len(launches), 1, launches)
+        pids = [launches[0]["pid"], launches[0]["child"]]
+        deadline = time.monotonic() + 5
+        while any(alive(pid) for pid in pids) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual([pid for pid in pids if alive(pid)], [], "the session or its child outlived the timeout")
+
+        # a launch that fails (no such claude) exits 1 with one FAIL line naming the launch
+        self.mode = ""
+        self.fresh_home()
+        clone, _ = self.sandbox()
+        self.run_scenario(32)
+        self.claude = os.path.join(self.tmp, "no-such-claude")
+        p = self.run_script("run", "--sandbox", clone)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        fails = [line for line in self.lines(p) if line.startswith("FAIL")]
+        self.assertEqual(len(fails), 1, p.stdout + p.stderr)
+        self.assertTrue("launch" in fails[0].lower() or "no-such-claude" in fails[0], fails[0])
+        self.assertEqual(self.launches(), [])
 
 
 if __name__ == "__main__":

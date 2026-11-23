@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""The loop smoke run's deterministic half, against the permanent sandbox repository `harness-sandbox`.
+"""The loop smoke run, against the permanent sandbox repository `harness-sandbox`: `run` drives one ticket through
+a headless `/harness:work`, and `check` and `reset` are its deterministic half.
 
 Usage:
+    python3 scripts/loop_smoke.py run --sandbox PATH [--plugin DIR] [--timeout MINUTES]
     python3 scripts/loop_smoke.py check --sandbox PATH --ticket N [--json]
     python3 scripts/loop_smoke.py reset --sandbox PATH [--json]
 
-Guard, both commands: PATH must be a git clone whose `origin` URL's last path part, without `.git`, is
+Guard, every command: PATH must be a git clone whose `origin` URL's last path part, without `.git`, is
 `harness-sandbox`. Anything else prints one line and exits 2, calling no gh and changing nothing.
 gh is HARNESS_GH, else `gh`, run with PATH as its working directory, with `-R OWNER/REPO` when origin is a
 github.com URL (gh then works on the repository the guard checked; a local origin gets no -R).
@@ -21,6 +23,17 @@ and close the issue with the comment `Closed by loop smoke reset`; then `git pul
 action; exit 0, or 1 when any action failed (the remaining actions still run). It never pushes and never
 touches an issue whose title does not start `Loop smoke`. --json prints {"ok": bool, "actions": [...]}.
 
+run: (a) reset, its lines printed (a failed reset stops here, exit 1); (b) `DIR/bin/harness-board task create
+--repo PATH --title "Loop smoke <UTC stamp>" --body-file - --size S --risk low` (status:ready), the body asking that
+`stamp()` in src/harness_sandbox/stamp.py return the stamp; (c) `claude -p "/harness:work N" --permission-mode auto
+--output-format json` (HARNESS_CLAUDE, else claude), plus with --plugin `--plugin-dir DIR --settings
+'{"enabledPlugins": {"harness@ryan": false}}'`, in PATH, standard input closed, in a session of its own, with DIR/bin
+first on PATH (DIR defaults to this checkout's plugins/harness) and its output in ~/.claude/harness/smoke/<stamp>.log;
+(d) wait up to --timeout minutes (decimals allowed, default 45), then kill the session's process group; (e) check N,
+its lines printed, then the log path and the elapsed time. Exit: check's. A failed ticket create, a failed launch
+or a timeout prints one `FAIL ...` line naming it and exits 1 (a timeout runs no check). It never pushes and never
+registers the sandbox in projects.json; it runs on the claude login (no apiKeyHelper), the subscription.
+
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
 from __future__ import annotations
@@ -29,14 +42,20 @@ import argparse
 import glob
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 
 SANDBOX = "harness-sandbox"
 TITLE = "Loop smoke"
 COMMENT = "Closed by loop smoke reset"
 TIMEOUT = 120
 REFUSED = 2
+DEFAULT_PLUGIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugins", "harness")
+DISABLE_INSTALLED = json.dumps({"enabledPlugins": {"harness@ryan": False}})
+KILL_GRACE = 10
 
 
 class Refused(Exception):
@@ -255,6 +274,133 @@ def reset(path: str, repo: str | None, as_json: bool) -> int:
     return 0 if acts.ok else 1
 
 
+# ---------------------------------------------------------------------------------------------- run
+
+def ticket_body(stamp: str) -> str:
+    return f"""## Request
+Loop smoke run {stamp}: make `stamp()` in `src/harness_sandbox/stamp.py` return exactly the string `{stamp}`.
+
+## Outline
+1. Change `stamp()` in `src/harness_sandbox/stamp.py` to return `"{stamp}"`.
+2. Pin that value in `tests/test_stamp.py`.
+
+## Definition of done
+- [ ] `stamp()` returns exactly `"{stamp}"`.
+- [ ] `tests/test_stamp.py` asserts that value.
+
+## Tests that must pass
+- `tests/test_stamp.py`: `stamp()` returns exactly `"{stamp}"`.
+The existing suite (`scripts/verify.sh`) stays green.
+
+## Context
+- `src/harness_sandbox/stamp.py`: the one function this ticket changes.
+- A loop smoke ticket, created by Harness's `scripts/loop_smoke.py run`; `reset` closes it if it is left open.
+- Must not change: anything else.
+"""
+
+
+def session_env(plugin: str) -> dict:
+    """This process's environment with the plugin's bin/ first on PATH."""
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join(p for p in (os.path.join(plugin, "bin"), env.get("PATH", "")) if p)
+    return env
+
+
+def create_ticket(path: str, plugin: str, stamp: str) -> tuple[int | None, str]:
+    """(the new issue's number, its URL), or (None, why not)."""
+    argv = [os.path.join(plugin, "bin", "harness-board"), "task", "create", "--repo", path,
+            "--title", f"{TITLE} {stamp}", "--body-file", "-", "--size", "S", "--risk", "low", "--json"]
+    try:
+        p = subprocess.run(argv, cwd=path, env=session_env(plugin), input=ticket_body(stamp),
+                           capture_output=True, text=True, timeout=TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, str(exc)
+    if p.returncode != 0:
+        return None, one_line(p.stderr or p.stdout) or f"harness-board exited {p.returncode}"
+    try:
+        found = json.loads(p.stdout)
+        return int(found["number"]), str(found.get("url") or "")
+    except (ValueError, KeyError, TypeError) as exc:
+        return None, f"no issue number in harness-board's output: {exc}"
+
+
+def kill_group(proc: subprocess.Popen) -> None:
+    """SIGTERM the session's process group, then, after a grace period, SIGKILL whatever is left of it."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    proc.wait()
+
+
+def since(start: float) -> str:
+    seconds = int(time.monotonic() - start)
+    return f"{seconds // 60}m{seconds % 60:02d}s"
+
+
+def run_smoke(path: str, repo: str | None, plugin: str, plugin_dir: bool, minutes: float) -> int:
+    start = time.monotonic()
+    if reset(path, repo, False) != 0:
+        print("loop_smoke: reset failed, so no ticket was created", file=sys.stderr)
+        return 1
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    n, detail = create_ticket(path, plugin, stamp)
+    if n is None:
+        print(f"FAIL could not create the {TITLE} ticket: {detail}")
+        return 1
+    print(f"ok created #{n} {detail}".rstrip(), flush=True)
+
+    folder = os.path.join(os.path.expanduser("~"), ".claude", "harness", "smoke")
+    os.makedirs(folder, exist_ok=True)
+    log = os.path.join(folder, f"{stamp}.log")
+    claude = os.environ.get("HARNESS_CLAUDE") or "claude"
+    argv = [claude, "-p", f"/harness:work {n}", "--permission-mode", "auto", "--output-format", "json"]
+    if plugin_dir:
+        argv += ["--plugin-dir", plugin, "--settings", DISABLE_INSTALLED]
+    failed = None
+    with open(log, "w", encoding="utf-8") as out:
+        try:
+            # a session of its own, so a timeout kills its whole process group and never this process
+            proc = subprocess.Popen(argv, cwd=path, env=session_env(plugin), stdin=subprocess.DEVNULL,
+                                    stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as exc:
+            failed = f"FAIL could not launch {claude}: {exc}"
+        else:
+            print(f"launched /harness:work {n} (pid {proc.pid}), up to {minutes:g} min", flush=True)
+            try:
+                code = proc.wait(timeout=minutes * 60)
+            except subprocess.TimeoutExpired:
+                kill_group(proc)
+                failed = f"FAIL session timed out after {minutes:g} min; killed its process group"
+    if failed:
+        print(failed)
+        result = 1
+    else:
+        print(f"session exited {code}", flush=True)
+        result = check(path, repo, n, False)
+    print(f"log {log}")
+    print(f"elapsed {since(start)}")
+    return result
+
+
+def minutes_arg(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of minutes: {text!r}") from None
+    if not value > 0:
+        raise argparse.ArgumentTypeError(f"not more than 0 minutes: {text!r}")
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="loop_smoke.py", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -265,6 +411,12 @@ def main() -> int:
     p_reset = sub.add_parser("reset", help="close the open Loop smoke issues, their PRs and worktrees")
     p_reset.add_argument("--sandbox", required=True, help="the local harness-sandbox clone")
     p_reset.add_argument("--json", action="store_true")
+    p_run = sub.add_parser("run", help="reset, create a Loop smoke ticket, run /harness:work on it headless, check")
+    p_run.add_argument("--sandbox", required=True, help="the local harness-sandbox clone")
+    p_run.add_argument("--plugin", metavar="DIR", help="load this plugin folder (a branch's plugins/harness) in "
+                       "place of the installed harness")
+    p_run.add_argument("--timeout", type=minutes_arg, default=45.0, metavar="MINUTES",
+                       help="kill the session after this many minutes (decimals allowed, default 45)")
     args = parser.parse_args()
     try:
         path, repo = guard(args.sandbox)
@@ -273,6 +425,9 @@ def main() -> int:
         return REFUSED
     if args.command == "check":
         return check(path, repo, args.ticket, args.json)
+    if args.command == "run":
+        plugin = os.path.abspath(os.path.expanduser(args.plugin)) if args.plugin else DEFAULT_PLUGIN
+        return run_smoke(path, repo, plugin, bool(args.plugin), args.timeout)
     return reset(path, repo, args.json)
 
 
