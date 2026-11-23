@@ -314,8 +314,9 @@ class UltraSettingFromWorktree(UltraSettingBase, WorktreeTest):
 
 
 class LandCost(WorktreeTest):
-    """`land` runs `harness-work cost N --pr P --markdown --repo <main>` for each ticket whose Resolution it posts and
-    adds the stdout, stripped, to that ticket's Resolution after a blank line. The harness-work stub answers per
+    """`land` runs `harness-work cost N --pr P --markdown --landed-by loop|hand --repo <main>` for each ticket whose
+    Resolution it posts (loop under `land --loop`, else hand, #426) and adds the stdout, stripped, to that ticket's
+    Resolution after a blank line. The harness-work stub answers per
     ticket (`cost N`), and the harness-board stub logs each comment's body, so a test reads the Resolution posted
     for every ticket. Two PRs, each closing two tickets, so neither a PR number nor a ticket can be hard-coded."""
 
@@ -363,10 +364,10 @@ class LandCost(WorktreeTest):
             self.git(self.wt, "add", "-A")
             self.git(self.wt, "commit", "-q", "-m", "Add the widget")
 
-    def land(self, fx, tickets, cwd=None, **scenario):
+    def land(self, fx, tickets, cwd=None, flags=(), **scenario):
         self.fresh_worktree()
         self.scenario(self.cost_calls(fx, tickets, **scenario))
-        p = self.pr("land", str(fx["pr"]), "--yes", cwd=cwd or self.main)
+        p = self.pr("land", str(fx["pr"]), "--yes", *flags, cwd=cwd or self.main)
         self.assertNotIn("Traceback", p.stderr)
         return p
 
@@ -470,11 +471,13 @@ class LandCost(WorktreeTest):
                 self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                 pr = str(fx["pr"])
                 self.assertEqual(self.cost_runs(),
-                                 [["cost", str(n), "--pr", pr, "--markdown", "--repo", self.main] for n in tickets],
+                                 [["cost", str(n), "--pr", pr, "--markdown", "--landed-by", "hand", "--repo",
+                                   self.main] for n in tickets],
                                  "one cost run per ticket, with the PR and the main checkout")
                 merge = self.position(f"gh pr merge {pr}")
                 for n in tickets:
-                    cost = self.position(f"harness-work cost {n} --pr {pr} --markdown --repo {self.main}")
+                    cost = self.position(f"harness-work cost {n} --pr {pr} --markdown --landed-by hand --repo "
+                                         f"{self.main}")
                     posted = self.position(f"harness-board comment {n} --body {RESOLUTION}")
                     self.assertLess(merge, cost, f"the cost of #{n} runs after the merge")
                     self.assertLess(cost, posted, f"and before #{n}'s Resolution is posted")
@@ -488,7 +491,8 @@ class LandCost(WorktreeTest):
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertEqual(self.no_cost_warnings(p.stderr), [], p.stderr)
             self.assertEqual(self.cost_runs(),
-                             [["cost", str(n), "--pr", pr, "--markdown", "--repo", self.main] for n in tickets])
+                             [["cost", str(n), "--pr", pr, "--markdown", "--landed-by", "hand", "--repo", self.main]
+                              for n in tickets])
             for n in tickets:
                 self.assertTrue(self.resolution_of(n).endswith("\n\n" + blocks[n]), self.resolution_of(n))
 
@@ -502,6 +506,28 @@ class LandCost(WorktreeTest):
             self.assertNotIn("Traceback", p.stderr)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertEqual(self.jsonl(seen), ["" for _ in tickets], "each cost run reads an empty stdin")
+
+    def test_land_tells_cost_whether_the_loop_landed_it(self):
+        """`land P --loop` asks for `--landed-by loop`, a land without it for `--landed-by hand` (a missing flag is a
+        person's land); the Resolution carries the block the cost run printed, its `Landed by` line included."""
+        for fx, tickets in self.CASES:
+            pr = str(fx["pr"])
+            _, base = self.baseline(fx, tickets)
+            for flags, who in ((("--loop",), "loop"), ((), "hand")):
+                with self.subTest(pr=fx["pr"], tickets=tickets, flags=flags):
+                    blocks = {n: cost_block(n, fx["pr"]) + f"\n\nLanded by: {who}" for n in tickets}
+                    self.costs({n: {"stdout": b + "\n"} for n, b in blocks.items()})
+                    p = self.land(fx, tickets, flags=flags)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertEqual(self.cost_runs(),
+                                     [["cost", str(n), "--pr", pr, "--markdown", "--landed-by", who, "--repo",
+                                       self.main] for n in tickets])
+                    for n in tickets:
+                        body = self.resolution_of(n)
+                        self.assertEqual(body, base + "\n\n" + blocks[n])
+                        self.assertIn(f"Landed by: {who}", body.splitlines())
+                        self.assertLandedFollows(n, fx["sha"])
+                    self.assertEqual(self.no_cost_warnings(p.stderr), [])
 
     # ------------------------------------------------------------------ specific
     def test_a_failing_cost_run_warns_and_lands_without_a_block(self):
@@ -626,7 +652,8 @@ class LandCost(WorktreeTest):
                     self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                     self.assertFalse(any(a[:2] == ["pr", "merge"] for a in self.gh_argv()), "no second merge")
                     self.assertEqual(self.cost_runs(),
-                                     [["cost", str(n), "--pr", pr, "--markdown", "--repo", self.main] for n in ran],
+                                     [["cost", str(n), "--pr", pr, "--markdown", "--landed-by", "hand", "--repo",
+                                       self.main] for n in ran],
                                      "the cost runs only for a ticket whose Resolution is posted")
                     for n in tickets:
                         self.assertEqual(self.comments_on(n), posted.get(n, []), f"what the resume posts on #{n}")

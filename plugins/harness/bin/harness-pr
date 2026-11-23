@@ -1719,12 +1719,13 @@ def resolution_here(body, url):
         and any(line.strip() == f"PR: {url}" for line in body.splitlines())
 
 
-def cost_block(repo, number, pr):
-    """`harness-work cost N --pr P --markdown` for the ticket, stripped; "" when it prints nothing. A run that
-    fails, times out or cannot start is one warning line and "": the land goes on without the block."""
+def cost_block(repo, number, pr, landed_by):
+    """`harness-work cost N --pr P --markdown --landed-by loop|hand` for the ticket, stripped; "" when it prints
+    nothing. A run that fails, times out or cannot start is one warning line and "": the land goes on without
+    the block."""
     try:
-        done = tool("harness-work", ["cost", str(number), "--pr", str(pr), "--markdown", "--repo", repo.main],
-                    repo.main, check=False)
+        done = tool("harness-work", ["cost", str(number), "--pr", str(pr), "--markdown", "--landed-by", landed_by,
+                                     "--repo", repo.main], repo.main, check=False)
     except Problem as err:
         warn("harness-pr", f"no cost block for #{number}: {err}")
         return ""
@@ -1734,8 +1735,9 @@ def cost_block(repo, number, pr):
     return (done.stdout or "").strip()
 
 
-def land_ticket(repo, number, sha, pr, resolution, url=None):
-    """Close the ticket when GitHub has not, drop its status labels, comment the Resolution (`resolution()`) and
+def land_ticket(repo, number, sha, pr, resolution, url=None, landed_by="hand"):
+    """Close the ticket when GitHub has not, drop its status labels, comment the Resolution (`resolution()`, with
+    the Cost block recording `landed_by`) and
     then `Landed in <sha>` unless the ticket already has this landing's own (a resumed land; this landing's
     `Landed in` there means both are), check its epic. Only this landing's comments count: `Landed in` this sha
     or this PR (with no sha, the Squash commit of this PR's Resolution), and a Resolution naming this PR's
@@ -1769,7 +1771,7 @@ def land_ticket(repo, number, sha, pr, resolution, url=None):
             # the Resolution goes first: a land that stops between the two still finds `Landed in` missing
             if not mine:
                 text = resolution()                # the PR's, shared by its tickets; the Cost block is this one's
-                block = cost_block(repo, number, pr)
+                block = cost_block(repo, number, pr, landed_by)
                 board(repo, "comment", str(number), "--body", f"{text}\n\n{block}" if block else text)
             board(repo, "comment", str(number), "--body", f"{LANDED} {sha}" if sha else f"{LANDED} PR #{pr}")
             done.append("commented")
@@ -1931,7 +1933,8 @@ def catch_up_command(args):
     if args.timeout != CATCH_UP_TIMEOUT:
         words += ["--timeout", f"{args.timeout:g}"]
     return " ".join(words + [f for f, on in (("--discard", args.discard),
-                                             ("--accept-findings", args.accept_findings)) if on])
+                                             ("--accept-findings", args.accept_findings),
+                                             ("--loop", args.loop)) if on])
 
 
 def catch_up(repo, number, view, args):
@@ -2209,7 +2212,8 @@ def cmd_land(args):
     ticket_lines = []
     closed = []
     for n in tickets:
-        line, error = land_ticket(repo, n, sha, number, resolution, view.get("url"))
+        line, error = land_ticket(repo, n, sha, number, resolution, view.get("url"),
+                                  "loop" if args.loop else "hand")
         ticket_lines.append(line)
         if error:
             problems.append(f"ticket #{n}: {error}")
@@ -2619,6 +2623,8 @@ def parser():
                     help=f"with --catch-up: merges of main at most ({CATCH_UP_ROUNDS})")
     ld.add_argument("--timeout", type=seconds_arg, default=CATCH_UP_TIMEOUT, metavar="SECONDS",
                     help=f"with --catch-up: for all its check waits together, then exit 8 ({CATCH_UP_TIMEOUT:g})")
+    ld.add_argument("--loop", action="store_true",
+                    help="the /harness:work loop is landing it: the Cost block records `Landed by: loop`, else hand")
 
     gt = sub.add_parser("gate", help="the auto-land verdict: land, wait, fix or manual, and why")
     gt.add_argument("number", type=number_arg, metavar="P")

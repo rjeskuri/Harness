@@ -252,6 +252,7 @@ COVERAGE = ("A lower bound: only the transcripts on this Mac are read, and the o
 HEADER = "**Cost** (tokens and model time from the transcripts, a lower bound)"
 TABLE_HEAD = ("Stage", "Model", "Rounds", "Tokens", "Output", "Model time", "Agent time")
 ROUND_KEYS = {"retry": "retry", "escalate": "escalate", "park": "park"}
+LANDED_BY = ("loop", "hand")     # who landed the PR: the loop's `harness-pr land --loop`, else a person
 
 
 def attempt_action(stage, result, failures):
@@ -296,10 +297,10 @@ def rounds(attempts):
 
 
 def build_record(number: int, main: str, usage: dict, cache: dict | None, pr: int | None,
-                 computed_at: str) -> dict:
+                 computed_at: str, landed_by: str | None = None) -> dict:
     """The cost/<N>.json record: ticket_usage's `usage`, the ticket cache's title, labels, tier and rounds
-    (all None without a cache), `pr` and the coverage note. needs_input, lines, elapsed, ci and landed_at
-    stay None here."""
+    (all None without a cache), `pr`, `landed_by` (loop, hand or None) and the coverage note. needs_input,
+    lines, elapsed, ci and landed_at stay None here."""
     cache = cache if isinstance(cache, dict) else None
     field = (lambda key: cache.get(key)) if cache else (lambda key: None)
     attempts = cache.get("attempts") if cache and isinstance(cache.get("attempts"), list) else []
@@ -309,7 +310,7 @@ def build_record(number: int, main: str, usage: dict, cache: dict | None, pr: in
             "session_totals": usage["session_totals"], "sessions": usage["sessions"],
             "rounds": rounds(attempts) if cache else None,
             "needs_input": None, "lines": None, "elapsed": None, "ci": None, "landed_at": None,
-            "coverage": COVERAGE}
+            "landed_by": landed_by, "coverage": COVERAGE}
 
 
 # --------------------------------------------------------------- the gh-backed parts (pure; harness-work asks gh)
@@ -463,8 +464,8 @@ def total_row(record):
 
 
 def notes(record):
-    """The lines under the table that have data: the session total, the rounds, the extras (lines, elapsed, CI,
-    needs input), the shared sessions left out."""
+    """The lines under the table that have data: the session total, the rounds, who landed it, the extras (lines,
+    elapsed, CI, needs input), the shared sessions left out."""
     lines = []
     st = record["session_totals"]
     if st:
@@ -480,6 +481,8 @@ def notes(record):
         lines.append(f"Rounds: breaker re-rounds {r['breaker_rerounds']}, fix rounds {r['fix_rounds']}; "
                      f"retries {tally['retry']}, escalations {tally['escalate']}, "
                      f"parked {tally['park']}")
+    if record.get("landed_by"):
+        lines.append(f"Landed by: {record['landed_by']}")
     lines += extras(record)
     shared = [s["id"][:8] for s in record["sessions"] if not s["own"]]
     if shared:

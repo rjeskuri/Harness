@@ -2109,11 +2109,18 @@ def cmd_cost(repo, args):
     """Ticket N's tokens and model time per stage and model, from the transcripts and the ticket cache:
     saved as cost/<N>.json (replacing an earlier record), printed as text, --json or --markdown."""
     n = args.number
+    if args.landed_by not in (None,) + cost.LANDED_BY:
+        raise Problem(f"--landed-by must be {' or '.join(cost.LANDED_BY)}, not {args.landed_by!r}")
+    path = repo.cost_path(n)
+    landed_by = args.landed_by
+    if landed_by is None:       # a run without the flag keeps who landed it, as the saved record says
+        saved = read_json(path)
+        landed_by = saved.get("landed_by") if isinstance(saved, dict) else None
+        landed_by = landed_by if landed_by in cost.LANDED_BY else None
     usage = cost.ticket_usage(repo.main, n)
     cache = read_cache(repo, n)
-    record = cost.build_record(n, repo.main, usage, cache, args.pr, iso(now()))
+    record = cost.build_record(n, repo.main, usage, cache, args.pr, iso(now()), landed_by)
     cost_extras(repo, record, cache)
-    path = repo.cost_path(n)
     write_json(path, record)
     if args.markdown:
         print(cost.render_markdown(record))
@@ -3086,6 +3093,8 @@ def parser():
     output = cost_.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", help="print the record")
     output.add_argument("--markdown", action="store_true", help="print the Cost block of the Resolution")
+    cost_.add_argument("--landed-by", metavar="loop|hand",
+                       help="who landed the PR, kept in the record (default: the saved record's)")
 
     dispatch = sub.add_parser("dispatch", parents=[with_repo, with_json],
                               help="start and launch a session per ready ticket")
