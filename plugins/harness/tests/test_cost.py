@@ -5,7 +5,8 @@ ticket_usage) and its attempts (the ticket cache), printed and saved as
 
 The contract under test (the ticket's Context):
 - The record: ticket, title, repo, computed_at, type, size, risk, tier, pr, rows, totals, by_model,
-  session_totals, sessions, rounds, needs_input, lines, elapsed, ci, landed_at, coverage. rows to sessions are
+  session_totals, sessions, rounds, needs_input, lines, elapsed, ci, landed_at, landed_by, coverage. rows to
+  sessions are
   ticket_usage's; pr is --pr or null; title to tier and rounds are null without a ticket cache. With every gh
   call failing (CostCommand's default scenario), lines, ci, needs_input and landed_at are null and elapsed holds
   no PR or ready time, so the Cost block gains no line.
@@ -15,6 +16,9 @@ The contract under test (the ticket's Context):
   fix_rounds = fix attempts.
 - Number formats: tokens below 1,000 as the integer, below 1,000,000 as 12.3k, else 12.3M; durations 45s, 12m,
   1h05m; model names without a leading `claude-`.
+- landed_by (#426): `--landed-by loop|hand` sets it; without the flag the saved record's value is kept (null when
+  there is none). When set, `Landed by: loop|hand` is the line right after the Rounds line (or stands where that
+  line would be) in the text and the Cost block.
 - --markdown: the Cost block, rows aggregated by stage and model (rounds counted, times summed), stages in
   ticket_usage's order, lines without data left out. The text output shows the same rows.
 
@@ -66,7 +70,7 @@ FABLE = "claude-fable-5"
 STAGES = ("tests", "breaker", "code", "review", "fix", "other", "orchestrator")
 RECORD_KEYS = {"ticket", "title", "repo", "computed_at", "type", "size", "risk", "tier", "pr", "rows", "totals",
                "by_model", "session_totals", "sessions", "rounds", "needs_input", "lines", "elapsed", "ci",
-               "landed_at", "coverage"}
+               "landed_at", "landed_by", "coverage"}
 CACHE_KEYS = ("title", "type", "size", "risk", "tier")
 TOTAL_KEYS = ("input", "output", "cache_write", "cache_read", "total", "messages", "model_ms")
 
@@ -452,6 +456,7 @@ class CostBase(unittest.TestCase):
         self.assertEqual(sorted(record["sessions"], key=lambda s: s["id"]),
                          sorted(expected["sessions"], key=lambda s: s["id"]))
         self.assertEqual(record["rounds"], expected.get("rounds"))
+        self.assertIsNone(record["landed_by"], "no --landed-by and no saved value")
         # every gh call fails in CostCommand: no PR, no comments, no runs
         for key in ("needs_input", "lines", "ci", "landed_at"):
             self.assertIsNone(record[key], key)
@@ -588,6 +593,100 @@ class CostCommand(CostBase):
                 out = self.cost(n, "--markdown")
                 self.assertEqual(out.strip("\n"), block(
                     [("code", model_shown, "1", total_s, output_s, model_s, wall_s)], (total_s, output_s, model_s)))
+
+    # ----------------------------------------------------------- landed by (#426)
+    def landed(self, text):
+        return [line for line in text.splitlines() if line.startswith("Landed by")]
+
+    def assertLandedAfterRounds(self, text, rounds_line, who):
+        """`Landed by: <who>` is the line right after `rounds_line`; with `who` None there is no such line."""
+        lines = text.splitlines()
+        if who is None:
+            self.assertEqual(self.landed(text), [], text)
+            return
+        self.assertEqual(self.landed(text), [f"Landed by: {who}"], text)
+        self.assertIn(rounds_line, lines, text)
+        self.assertEqual(lines[lines.index(rounds_line) + 1], f"Landed by: {who}", text)
+
+    def test_landed_by_is_recorded_and_shown(self):
+        for i, who in enumerate(("loop", "hand", None)):
+            n = 61 + i
+            flag = ["--landed-by", who] if who else []
+            with self.subTest(who=who):
+                shutil.rmtree(self.projects, True)
+                self.widget_fixture(n)
+                self.write_cache(n, attempts=WIDGET_ATTEMPTS)
+                landed = [f"Landed by: {who}"] if who else []
+                md = self.cost(n, "--markdown", *flag)
+                self.assertEqual(md.strip("\n"), block(WIDGET_ROWS, WIDGET_TOTAL, WIDGET_SESSION, WIDGET_ROUNDS,
+                                                       *landed, WIDGET_NOT_COUNTED),
+                                 "the line follows the Rounds line in the Cost block")
+                record = self.read_record(n)
+                self.assertIn("landed_by", record)
+                self.assertEqual(record["landed_by"], who)
+                printed = json.loads(self.cost(n, "--json", *flag))
+                self.assertEqual(printed["landed_by"], who)
+                self.assertEqual(printed, self.read_record(n))
+                self.assertLandedAfterRounds(self.cost(n, *flag), WIDGET_ROUNDS, who)
+                self.assertEqual(self.read_record(n)["landed_by"], who)
+
+        with self.subTest("no Rounds line: the line stands where it would be"):
+            shutil.rmtree(self.projects, True)
+            tests = [Msg("msg_64_t", T("09:00:00.000"), T("09:12:00.000"), (4, 1200, 0, 10796))]
+            self.own_session(64, "nocache", agents=[("harness:test-author", "#64 tests", tests)])
+            md = self.cost(64, "--markdown", "--landed-by", "hand")
+            self.assertEqual(md.strip("\n"), block([("tests", "opus-5-5", "1", "12.0k", "1.2k", "12m", "12m")],
+                                                   ("12.0k", "1.2k", "12m"), "Landed by: hand"))
+            self.assertEqual(self.read_record(64)["landed_by"], "hand")
+
+        with self.subTest("only loop or hand"):
+            done = self.work("cost", 65, "--markdown", "--landed-by", "robot", "--repo", self.repo)
+            self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+            self.assertEqual(done.stdout, "")
+            lines = [x for x in done.stderr.splitlines() if x.strip()]
+            self.assertEqual(len(lines), 1, done.stderr)
+            self.assertIn("--landed-by", lines[0])
+            self.assertFalse(os.path.exists(self.record_path(65)), "a bad invocation saves nothing")
+
+    def test_a_later_run_without_landed_by_keeps_the_saved_value(self):
+        n, slug = 71, "keep"
+        first = [Msg("msg_71_1", T("09:00:00.000"), T("09:00:45.000"), (1, 98, 0, 900))]
+        self.own_session(n, slug, agents=[("harness:coder", f"#{n} code", first)])
+        self.write_cache(n, attempts=[("tests", "pass"), ("code", "pass")])
+        rounds_line = "Rounds: breaker re-rounds 0, fix rounds 0; retries 0, escalations 0, parked 0"
+
+        self.assertLandedAfterRounds(self.cost(n, "--markdown", "--landed-by", "loop"), rounds_line, "loop")
+        self.assertEqual(self.read_record(n)["landed_by"], "loop")
+        self.assertEqual(self.read_record(n)["totals"]["total"], 999)
+
+        # more work since: the record is computed again, its landed_by kept
+        more = [Msg("msg_71_2", T("10:00:00.000"), T("10:00:10.000"), (1, 9, 0, 90), SONNET)]
+        write_session(self.worktree_folder(f"t-{n}-{slug}"), "0a1b2c3d-7171-4000-8000-000000000071",
+                      [user_entry(T("09:59:00.000"), f"t/{n}-{slug}")],
+                      agents=[(aid(n, 60), meta("harness:reviewer", f"#{n} review"), turns(more, f"t/{n}-{slug}"))])
+        self.assertLandedAfterRounds(self.cost(n), rounds_line, "loop")
+        record = self.read_record(n)
+        self.assertEqual((record["landed_by"], record["totals"]["total"]), ("loop", 1099))
+        self.assertEqual(json.loads(self.cost(n, "--json"))["landed_by"], "loop")
+        self.assertLandedAfterRounds(self.cost(n, "--markdown"), rounds_line, "loop")
+
+        # a later flag replaces it, and that value is kept in turn
+        self.assertLandedAfterRounds(self.cost(n, "--landed-by", "hand"), rounds_line, "hand")
+        self.assertLandedAfterRounds(self.cost(n, "--markdown"), rounds_line, "hand")
+        self.assertEqual(json.loads(self.cost(n, "--json"))["landed_by"], "hand")
+        self.assertLandedAfterRounds(self.cost(n, "--markdown", "--landed-by", "loop"), rounds_line, "loop")
+        self.assertEqual(self.read_record(n)["landed_by"], "loop")
+
+        # another ticket has only its own: none saved, or an older record without the key, is null
+        self.own_session(72, "other", agents=[("harness:coder", "#72 code", [
+            Msg("msg_72_1", T("11:00:00.000"), T("11:00:05.000"), (1, 2, 3, 4))])])
+        self.assertEqual(self.landed(self.cost(72, "--markdown")), [])
+        self.assertIsNone(self.read_record(72)["landed_by"])
+        write(self.record_path(73), json.dumps({"ticket": 73, "rows": [], "landed_at": None}))
+        printed = json.loads(self.cost(73, "--json"))
+        self.assertIn("landed_by", printed)
+        self.assertIsNone(printed["landed_by"])
+        self.assertEqual(self.read_record(n)["landed_by"], "loop", "the other runs leave #71's alone")
 
     # ----------------------------------------------------------- rounds
     def test_rounds_replay_the_attempt_store(self):
