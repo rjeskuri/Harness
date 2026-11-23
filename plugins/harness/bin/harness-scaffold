@@ -8,11 +8,17 @@ optionally creates the GitHub repository and registers the project.
 
 Usage:
     harness-scaffold init [PATH] --name NAME [--stack python|node|none] [--verify CMD] [--test-cmd CMD]
-                          [--github] [--register [--billable] [--client C]] [--no-ci] [--force] [--dry-run]
+                          [--github] [--public] [--register [--billable] [--client C]] [--no-ci] [--force]
+                          [--dry-run]
     harness-scaffold labels [PATH]          # harness-board labels ensure, for an existing repo
 
+The repository is private unless --public is given: --github creates it with --private (--public), and ci.yml
+runs on the Mac's self-hosted runner, `runs-on: [self-hosted, linux, harness-mac]` (harness-runner), or on
+`ubuntu-latest` for a public one, whose fork pull requests must never run on the Mac.
+
 Templates live in ../templates next to this script and are rendered by plain substitution of
-{{name}}, {{pkg}}, {{stack}}, {{verify_cmd}}, {{test_cmd}}, {{tests_dirs}}, {{python_version}}, {{year}}:
+{{name}}, {{pkg}}, {{stack}}, {{verify_cmd}}, {{test_cmd}}, {{tests_dirs}}, {{python_version}}, {{year}},
+{{runs_on}}:
 - Only those known keys are replaced, and never right after a `$`, so GitHub Actions expressions
   such as ${{ github.ref }} and unknown tokens such as {{number}} pass through untouched.
 - In a text template, a line that holds a placeholder whose value is empty is left out (the none
@@ -88,6 +94,7 @@ EXCLUDE_LINE = ".claude/worktrees/"
 ADOPT_TITLE = "Adopt the harness scaffold"
 NO_RULESET = ("Branch protection is unavailable on this plan for a private repo; "
               "the local branch guard is the only block.")
+RUNS_ON = {"private": "[self-hosted, linux, harness-mac]", "public": "ubuntu-latest"}   # ci.yml's runs-on
 TOOL_TIMEOUT = 1800          # harness-work start runs the worktree setup (uv sync, npm ci)
 
 # Test runners each stack's settings.json allows on top of the template's list.
@@ -1011,12 +1018,13 @@ def first_commit(root, name, dry):
     say(f"committed {sha} on main: {subject}")
 
 
-def github(root, name, create, push, dry):
-    """The private repository (`create`), main pushed to it (`push`), the labels,
+def github(root, name, create, push, dry, public=False):
+    """The repository (`create`; private unless `public`), main pushed to it (`push`), the labels,
     delete-branch-on-merge and the ruleset."""
     gh = gh_cmd()
     if create:
-        cmd = [gh, "repo", "create", name, "--private", "--source", ".", "--remote", "origin"]
+        cmd = [gh, "repo", "create", name, "--public" if public else "--private", "--source", ".", "--remote",
+               "origin"]
         if dry:
             say(f"would run: {quoted(cmd)}")
         else:
@@ -1205,6 +1213,7 @@ def cmd_init(args):
         "tests_dirs": ", ".join(f"`{d}/`" for d in tests_dirs(root, stack, args.verify, layout)),
         "python_version": PYTHON_VERSION,
         "year": str(dt.date.today().year),
+        "runs_on": RUNS_ON["public" if args.public else "private"],
     }
     files = plan(root, stack, values, ci=not args.no_ci, verify=args.verify, layout=layout)
     if layout:
@@ -1219,7 +1228,7 @@ def cmd_init(args):
         first_commit(root, name, dry)
         configure_repo(root, args.force, dry)          # after the commit: the scaffold lands as it is
         if args.github:
-            github(root, name, create=not has_origin(root), push=True, dry=dry)
+            github(root, name, create=not has_origin(root), push=True, dry=dry, public=args.public)
     else:
         statuses = preview(root, files, args.force)
         origin = has_origin(root)
@@ -1228,7 +1237,7 @@ def cmd_init(args):
                 say(f"{'would keep' if dry else 'kept'} {dest}")
             configure_repo(root, args.force, dry)
             if args.github:
-                github(root, name, create=not origin, push=not origin, dry=dry)
+                github(root, name, create=not origin, push=not origin, dry=dry, public=args.public)
             say("nothing to adopt: every scaffold file is already here")
         else:
             if not origin and not args.github:
@@ -1236,7 +1245,7 @@ def cmd_init(args):
                               "ticket and a pull request, so pass --github to create the repository first")
             configure_repo(root, args.force, dry)
             if args.github:
-                github(root, name, create=not origin, push=not origin, dry=dry)
+                github(root, name, create=not origin, push=not origin, dry=dry, public=args.public)
             if dry:
                 for dest, status in statuses:
                     report(dest, status, args.force, True)
@@ -1263,7 +1272,10 @@ def parser():
     init.add_argument("--stack", choices=STACKS, help="default: detected (pyproject.toml or *.py, package.json)")
     init.add_argument("--verify", metavar="CMD", help="the verify command, written into scripts/verify.sh (default: the stack's checks)")
     init.add_argument("--test-cmd", metavar="CMD", help="HARNESS_TEST_CMD, with {files} (default: per stack)")
-    init.add_argument("--github", action="store_true", help="create the private GitHub repository and push main")
+    init.add_argument("--github", action="store_true", help="create the GitHub repository (private unless "
+                                                            "--public) and push main")
+    init.add_argument("--public", action="store_true", help="the repository is public: --github creates it public "
+                                                            "and ci.yml runs on ubuntu-latest, never on the Mac")
     init.add_argument("--register", action="store_true", help="add the project to the harness-projects registry")
     init.add_argument("--billable", action="store_true", help="with --register: hours count toward an invoice")
     init.add_argument("--client", help="with --register: who is billed")

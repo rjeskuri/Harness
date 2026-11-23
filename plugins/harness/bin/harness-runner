@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""
+Self-hosted CI runners on this Mac for the private registered projects: one Linux container per GitHub
+repository, `runner-<repo>`, built from templates/runner, registered as `harness-mac-<repo>` with the label
+harness-mac (a private project's ci.yml runs on [self-hosted, linux, harness-mac]). The registration lives in
+the named volume `runner-<repo>`, so a re-created container keeps it. A public repository never gets one: its
+fork pull requests would run on the Mac. Contract and trust boundary: docs/design.md, harness-runner.
+
+Usage:
+    harness-runner add PROJECT [--memory 2g] [--cpus 2]   # build the image if missing, register, start
+    harness-runner list [--json]                           # every private registered project: container, GitHub
+    harness-runner upgrade                                 # rebuild the image, re-create the idle runners
+    harness-runner remove PROJECT                          # container, volume and GitHub registration
+
+PROJECT is a registered project's name or path (harness-projects); its origin names the repository.
+gh is HARNESS_GH when set, else `gh` on PATH; docker is `docker` on PATH.
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.cli import Parser, Problem, emit, run_main, table, warn
+    from harness_lib.gh import gh, gh_json
+    from harness_lib.registry import find_project, load_registry
+    from harness_lib.runners import (CONFIG_DIR, container_name, docker_binary, docker_containers, github_runner,
+                                     origin_slug, runner_name)
+    from harness_lib.text import first_line
+except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
+    sys.exit(f"harness-runner: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
+
+PROG = "harness-runner"
+TEMPLATES = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "templates",
+                                          "runner"))
+IMAGE = "harness-runner"
+DEFAULT_MEMORY = "2g"
+DEFAULT_CPUS = "2"
+LISTEN_SECONDS = 60      # how long add waits for the runner to say `Listening for Jobs`
+BUILD_TIMEOUT = 1800
+
+
+# --------------------------------------------------------------- docker
+def need_docker():
+    docker = docker_binary()
+    if docker is None:
+        raise Problem("docker not found on PATH; install Docker Desktop")
+    return docker
+
+
+def docker(args, check=True, timeout=120):
+    """docker with `args`; the CompletedProcess, a Problem naming the call when it fails and `check`."""
+    try:
+        done = subprocess.run([need_docker()] + list(args), capture_output=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise Problem(f"docker {args[0]} timed out after {timeout} s") from None
+    except OSError as err:
+        raise Problem(f"cannot run docker: {err.strerror or err}") from None
+    if check and done.returncode != 0:
+        raise Problem(f"docker {args[0]} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
+    return done
+
+
+def image_tag():
+    """harness-runner:<the runner version pinned in templates/runner/Dockerfile>."""
+    path = os.path.join(TEMPLATES, "Dockerfile")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as err:
+        raise Problem(f"cannot read {path}: {err.strerror or err}") from None
+    m = re.search(r"^FROM\s+\S*actions-runner:(\d+\.\d+\.\d+)\s*$", text, re.M)
+    if not m:
+        raise Problem(f"{path}: no `FROM ...actions-runner:x.y.z` line")
+    return f"{IMAGE}:{m.group(1)}"
+
+
+def image_id(tag):
+    done = docker(["image", "inspect", "--format", "{{.Id}}", tag], check=False)
+    return done.stdout.strip() if done.returncode == 0 and done.stdout.strip() else None
+
+
+def build_image(pull=False):
+    """Build templates/runner as image_tag(); the tag."""
+    tag = image_tag()
+    print(f"building {tag} from {TEMPLATES}", flush=True)
+    docker(["build"] + (["--pull"] if pull else []) + ["-t", tag, TEMPLATES], timeout=BUILD_TIMEOUT)
+    return tag
+
+
+def ensure_image():
+    tag = image_tag()
+    return tag if image_id(tag) else build_image()
+
+
+def inspect(name):
+    """`docker inspect` of the container, or None when there is none."""
+    done = docker(["container", "inspect", name], check=False)
+    if done.returncode != 0:
+        return None
+    try:
+        data = json.loads(done.stdout)
+    except ValueError:
+        raise Problem(f"docker inspect {name} printed something other than JSON") from None
+    return data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+
+
+def config_volume(info):
+    """The named volume mounted at CONFIG_DIR in an inspected container, or None."""
+    for m in info.get("Mounts") or []:
+        if isinstance(m, dict) and m.get("Type") == "volume" and m.get("Destination") == CONFIG_DIR and m.get("Name"):
+            return m["Name"]
+    return None
+
+
+def run_args(name, volume, memory, cpus, restart, tag, env_file=None, start=True):
+    args = ["run", "-d"] if start else ["create"]
+    args += ["--name", name, "--restart", restart]
+    if memory:
+        args += ["--memory", str(memory)]
+    if cpus:
+        args += ["--cpus", str(cpus)]
+    if env_file:
+        args += ["--env-file", env_file]
+    return args + ["--mount", f"type=volume,source={volume},target={CONFIG_DIR}", tag]
+
+
+def listening(name):
+    """Whether the container's log says `Listening for Jobs` within LISTEN_SECONDS."""
+    deadline = time.monotonic() + LISTEN_SECONDS
+    while True:
+        done = docker(["logs", "--tail", "50", name], check=False)
+        if "Listening for Jobs" in done.stdout + done.stderr:
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(2)
+
+
+# --------------------------------------------------------------- GitHub
+def project_repo(key):
+    """(project, OWNER/REPO) of a registered project whose origin is on github.com."""
+    project = find_project(load_registry(), key)
+    slug = origin_slug(project.path)
+    if not slug:
+        raise Problem(f"{project.name}: no origin remote on github.com at {project.path}")
+    return project, slug
+
+
+def is_private(slug):
+    data = gh_json(["api", f"repos/{slug}"], None)
+    if not isinstance(data, dict) or not isinstance(data.get("private"), bool):
+        visibility = str(data.get("visibility") or "").lower() if isinstance(data, dict) else ""
+        if visibility not in ("public", "private", "internal"):
+            raise Problem(f"gh api repos/{slug} gave no visibility")
+        return visibility != "public"
+    return data["private"]
+
+
+def registration_token(slug):
+    """A one-hour registration token: gh's stdout only, never an argument or an environment value."""
+    token = gh(["api", "-X", "POST", f"repos/{slug}/actions/runners/registration-token", "--jq", ".token"],
+               None).strip()
+    if not token or any(ch.isspace() for ch in token):
+        raise Problem(f"gh api repos/{slug}/actions/runners/registration-token gave no token")
+    return token
+
+
+# --------------------------------------------------------------- commands
+def cmd_add(args):
+    project, slug = project_repo(args.project)
+    if not is_private(slug):
+        raise Problem(f"{slug} is public: a self-hosted runner would run its fork pull requests on this Mac, "
+                      "so its CI stays on ubuntu-latest")
+    need_docker()
+    repo = slug.split("/")[1]
+    name = container_name(repo)
+    if inspect(name) is not None:
+        raise Problem(f"{name} already exists; `harness-runner upgrade` re-creates it, "
+                      f"`harness-runner remove {project.name}` deletes it")
+    tag = ensure_image()
+    token = registration_token(slug)
+    with tempfile.TemporaryDirectory(prefix="harness-runner-") as folder:     # mode 700, removed on the way out
+        env_file = os.path.join(folder, f"{repo}.env")
+        fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            os.fchmod(fh.fileno(), 0o600)
+            fh.write(f"RUNNER_TOKEN={token}\nRUNNER_URL=https://github.com/{slug}\n"
+                     f"RUNNER_NAME={runner_name(repo)}\n")
+        del token
+        try:
+            docker(run_args(name, name, args.memory, args.cpus, "unless-stopped", tag, env_file=env_file))
+        finally:
+            os.remove(env_file)       # docker read it before `run` returned
+    caps = f"{args.memory} memory, {args.cpus} CPUs"
+    if listening(name):
+        print(f"{name}: {runner_name(repo)} registered on {slug} and listening for jobs ({caps}, volume {name})")
+    else:
+        warn(PROG, f"{name} started ({caps}) but is not listening after {LISTEN_SECONDS} s; `docker logs {name}`")
+
+
+def private_projects():
+    """[(project, slug)] for every registered project with a github.com origin that GitHub says is private, in
+    registry order; a visibility that cannot be read is one warning, that project skipped."""
+    projects = [(p, origin_slug(p.path)) for p in load_registry()]
+    projects = [(p, s) for p, s in projects if s]
+
+    def visibility(pair):
+        try:
+            return is_private(pair[1])
+        except Problem as err:
+            warn(PROG, f"{pair[0].name}: {err}")
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(projects)))) as pool:
+        private = list(pool.map(visibility, projects))
+    return [pair for pair, keep in zip(projects, private) if keep]
+
+
+def cmd_list(args):
+    projects = private_projects()
+    containers, docker_error = {}, None
+    exe = docker_binary()
+    if exe is None:
+        docker_error = "docker not found on PATH"
+    else:
+        try:
+            containers = docker_containers(exe)
+        except Problem as err:
+            docker_error = str(err)
+    if docker_error:
+        warn(PROG, f"{docker_error}: container states unknown")
+
+    def github(slug):
+        try:
+            found = github_runner(slug)
+            return (str(found.get("status") or "unknown"), bool(found.get("busy"))) if found else ("missing", False)
+        except Problem as err:
+            warn(PROG, f"{slug}: {err}")
+            return "unknown", False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(projects)))) as pool:
+        states = list(pool.map(github, [s for _, s in projects]))
+    entries = []
+    for (project, slug), (status, busy) in zip(projects, states):
+        name = container_name(slug.split("/")[1])
+        entries.append({"name": project.name, "repo": slug, "container_name": name,
+                        "container": "unknown" if docker_error else containers.get(name, "missing"),
+                        "github": status, "busy": busy})
+    if args.json:
+        emit(True, entries, "")
+        return
+    if not entries:
+        print("No private registered project.")
+        return
+    rows = [("NAME", "REPO", "CONTAINER", "GITHUB", "")]
+    for e in entries:
+        note = "PRs queue for up to 24 h" if e["github"] == "offline" else ("busy" if e["busy"] else "")
+        rows.append((e["name"], e["repo"], e["container"], e["github"], note))
+    print(table(rows))
+
+
+def cmd_upgrade(args):
+    need_docker()
+    tag = build_image(pull=True)
+    new_id = image_id(tag)
+    for project, slug in [(p, origin_slug(p.path)) for p in load_registry()]:
+        if not slug:
+            continue
+        name = container_name(slug.split("/")[1])
+        info = inspect(name)
+        if info is None:
+            continue
+        volume = config_volume(info)
+        if volume is None:
+            warn(PROG, f"{name} has no volume at {CONFIG_DIR} (set up by hand); `harness-runner remove "
+                       f"{project.name}` and `harness-runner add {project.name}` move it")
+            continue
+        if new_id and info.get("Image") == new_id:
+            print(f"{name}: already on {tag}")
+            continue
+        try:
+            found = github_runner(slug)
+        except Problem as err:
+            warn(PROG, f"{name} left as it is: {err}")
+            continue
+        if found and found.get("busy"):
+            print(f"{name}: busy with a job, left on its image; run `harness-runner upgrade` again when it is idle")
+            continue
+        host = info.get("HostConfig") or {}
+        memory = host.get("Memory") or None
+        nano = host.get("NanoCpus") or 0
+        cpus = f"{nano / 1e9:g}" if nano else None
+        restart = (host.get("RestartPolicy") or {}).get("Name") or "unless-stopped"
+        running = bool((info.get("State") or {}).get("Running"))
+        docker(["rm", "-f", name])
+        docker(run_args(name, volume, memory, cpus, restart, tag, start=running))
+        print(f"{name}: re-created on {tag}" + ("" if running else " (stopped, as it was)"))
+
+
+def cmd_remove(args):
+    project, slug = project_repo(args.project)
+    need_docker()
+    name = container_name(slug.split("/")[1])
+    info = inspect(name)
+    volume = (config_volume(info) if info else None) or name
+    if info is not None:
+        docker(["rm", "-f", name])
+        print(f"removed container {name}")
+    if docker(["volume", "inspect", volume], check=False).returncode == 0:
+        docker(["volume", "rm", volume])
+        print(f"removed volume {volume}")
+    found = github_runner(slug)
+    if found and found.get("id") is not None:
+        gh(["api", "-X", "DELETE", f"repos/{slug}/actions/runners/{found['id']}"], None)
+        print(f"removed {runner_name(slug.split('/')[1])} from {slug}")
+    else:
+        print(f"no {runner_name(slug.split('/')[1])} registered on {slug}")
+
+
+def main():
+    ap = Parser(prog=PROG, description="Self-hosted CI runners on this Mac for the private registered projects.")
+    sub = ap.add_subparsers(dest="cmd", metavar="{add,list,upgrade,remove}")
+    add = sub.add_parser("add", help="build the image if missing, register the runner and start its container")
+    add.add_argument("project", help="a registered project's name or path")
+    add.add_argument("--memory", default=DEFAULT_MEMORY, help=f"the container's memory cap (default {DEFAULT_MEMORY})")
+    add.add_argument("--cpus", default=DEFAULT_CPUS, help=f"the container's CPU cap (default {DEFAULT_CPUS})")
+    lst = sub.add_parser("list", help="container state and GitHub's status of every private registered project")
+    lst.add_argument("--json", action="store_true")
+    sub.add_parser("upgrade", help="rebuild the image and re-create the idle runners on it")
+    rm = sub.add_parser("remove", help="delete the container, its volume and the GitHub registration")
+    rm.add_argument("project", help="a registered project's name or path")
+    args = ap.parse_args()
+    if not args.cmd:
+        ap.error("give a subcommand: add, list, upgrade or remove")
+    {"add": cmd_add, "list": cmd_list, "upgrade": cmd_upgrade, "remove": cmd_remove}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    run_main(PROG, main)
