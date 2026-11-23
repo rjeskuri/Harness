@@ -145,7 +145,7 @@ A project that sets `HARNESS_ULTRAREVIEW=off` gets no ultrareview: `harness-pr u
 
 A change to `plugins/harness/skills/work/SKILL.md` or `plugins/harness/agents/*.md` gets a loop smoke run against its branch before it lands. The run works on one public sandbox repository, `rjeskuri/harness-sandbox`, reused each time. It resets the sandbox (closing any `Loop smoke` issue left open, with its pull requests and worktrees), creates a `Loop smoke <stamp>` ticket asking `stamp()` to return that stamp, and runs `claude -p "/harness:work N"` headless in the sandbox. It then checks that the issue is closed, a pull request from `t/N-*` is merged and no worktree of it is left. It is a manual check, not a CI gate.
 
-- On main: `python3 scripts/loop_smoke.py run --sandbox ~/portfolio_projects/harness-sandbox`
+- On main: `python3 scripts/loop_smoke.py run --sandbox <sandbox>`, where `<sandbox>` is the local `harness-sandbox` clone beside your Harness checkout
 - Against a branch: add `--plugin <worktree>/plugins/harness`. That session loads the branch's plugin in place of the installed one, with the branch's `bin/` first on PATH.
 
 A run takes about 20 minutes and uses some subscription quota. `claude -p` with no `apiKeyHelper` runs on your login (`apiKeySource` is `none`), so it does not use the API key. The harness's own headless dispatch adds `apiKeyHelper`; this run does not. `--timeout` (minutes, default 45) kills a session that runs too long, and the session's output is in `~/.claude/harness/smoke/<stamp>.log`. The run never pushes to the sandbox and never adds it to `projects.json`.
@@ -153,9 +153,9 @@ A run takes about 20 minutes and uses some subscription quota. `claude -p` with 
 One-time setup, as done on 2026-11-23 after your OK:
 
 1. Create the folder with the package files first: `pyproject.toml`, `uv.lock`, `src/harness_sandbox/{__init__,stamp}.py` and `tests/{test_smoke,test_stamp}.py`. A simple way is to scaffold a throwaway folder and copy its `pyproject.toml`, `uv.lock`, `src` and `tests`. They must exist before the scaffold runs: the scaffold keeps a layout it finds, and once it has committed, the branch guard refuses edits on main.
-2. `harness-scaffold init <path> --name harness-sandbox --stack python`, with no `--github` and no `--register`.
-3. `HARNESS_ALLOW_MAIN=1 gh repo create harness-sandbox --public --source <path> --push`. Without the variable, the pre-push hook refuses this first push to main.
-4. `harness-board labels ensure --repo <path>`.
+2. `harness-scaffold init <sandbox> --name harness-sandbox --stack python`, with no `--github` and no `--register`.
+3. `HARNESS_ALLOW_MAIN=1 gh repo create harness-sandbox --public --source <sandbox> --push`. Without the variable, the pre-push hook refuses this first push to main.
+4. `harness-board labels ensure --repo <sandbox>`.
 5. `git config user.email <your GitHub noreply address>` in the clone, so smoke commits do not carry a personal address.
 6. Run `claude` in the folder once and accept the trust dialog. A `claude -p` session in a folder that was never trusted ignores the project's `permissions.allow` (`docs/research/plugin-dir-smoke.md`).
 
