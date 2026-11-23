@@ -1228,8 +1228,9 @@ class EndedEarly(WorkTest):
 
     def test_a_ready_pull_request_or_a_waiting_ticket_is_a_normal_end(self):
         # The same log for every run; only the board and the branch's PRs differ. A ready PR, a ticket the run moved
-        # to in-review or needs-input (draft or not), a merged PR and a closed issue are normal ends: `ok`, never
-        # dispatched again. #26 (in progress, draft only) is the control that does end early.
+        # to in-review with a draft or to needs-input (draft or not), a merged PR and a closed issue are normal ends:
+        # `ok`, never dispatched again. #26 (in progress, draft only) is the control that does end early, and #23 (in
+        # review with its ready PR open, #422) ended before the land: early, dispatched again.
         in_review = ("task", "status:in-review", "size:S", "risk:low")
         needs_input = ("task", "status:needs-input", "size:S", "risk:low")
         merged = [{"number": 74, "state": "MERGED", "isDraft": False}]
@@ -1237,7 +1238,7 @@ class EndedEarly(WorkTest):
             20: (IN_PROGRESS, ready_pr(70), ready_pr(70), "ok"),
             21: (in_review, draft(71), draft(71), "ok"),
             22: (needs_input, draft(72), draft(72), "ok"),
-            23: (in_review, ready_pr(73), ready_pr(73), "ok"),
+            23: (in_review, ready_pr(73), ready_pr(73), "early"),
             24: (IN_PROGRESS, [], merged, "ok"),
             25: (IN_PROGRESS, draft(75), draft(75), "ok"),             # the issue is CLOSED (below)
             27: (needs_input, [], [], "ok"),
@@ -1258,14 +1259,16 @@ class EndedEarly(WorkTest):
                     self.assertEqual(rows[n]["state"], "ended ok")
                     self.assertNotIn("early", lines[n])
         self.assertEqual(rows[26]["state"], "ended early (draft PR #76)")
+        self.assertEqual(rows[23]["state"], "ended before landing (PR #73)")
 
         p = self.ok("dispatch", "--dry-run")
-        started = [line for line in p.stdout.splitlines() if line.startswith("would start #")]
-        self.assertEqual(len(started), 1, p.stdout)
-        self.assertTrue(started[0].startswith("would start #26 "), p.stdout)
-        self.assertIn("#76", started[0])
+        started = {int(m.group(1)): line for line in p.stdout.splitlines()
+                   for m in [re.match(r"would start #(\d+) ", line)] if m}
+        self.assertEqual(sorted(started), [23, 26], p.stdout)
+        self.assertIn("#76", started[26])
+        self.assertIn("(again after early, PR #73 in review)", started[23])
         data = self.ok_json("dispatch", "--dry-run", "--json")
-        self.assertEqual([row["number"] for row in data["plan"]], [26])
+        self.assertEqual([row["number"] for row in data["plan"]], [23, 26])
         self.assertEqual(data["skipped"], [])
 
     def test_dispatch_asks_gh_about_a_freshly_ended_draft_run_once(self):
