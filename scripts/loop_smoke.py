@@ -7,16 +7,17 @@ Usage:
 
 Guard, both commands: PATH must be a git clone whose `origin` URL's last path part, without `.git`, is
 `harness-sandbox`. Anything else prints one line and exits 2, calling no gh and changing nothing.
-gh is HARNESS_GH, else `gh`, run with PATH as its working directory.
+gh is HARNESS_GH, else `gh`, run with PATH as its working directory, with `-R OWNER/REPO` when origin is a
+github.com URL (gh then works on the repository the guard checked; a local origin gets no -R).
 
 check: three assertions, one stdout line each, starting `ok ` or `FAIL `: issue N is CLOSED; a pull request
 whose head branch starts `t/N-` is MERGED; no worktree of `t/N-*` remains (none registered in
 `git worktree list`, no folder PATH/.claude/worktrees/t-N-*). Exit 0 when all three hold, else 1.
 --json prints {"ticket": N, "ok": bool, "checks": [{"name", "ok", "detail"}]} instead.
 
-reset: for each OPEN issue whose title starts `Loop smoke`, close its open pull requests from `t/<n>-*`
-(deleting their branches), remove its local worktrees (--force) and local branches, and close the issue
-with the comment `Closed by loop smoke reset`; then `git switch main` and `git pull --ff-only`. One line per
+reset: `git switch main`; then for each OPEN issue whose title starts `Loop smoke`, remove its local worktrees
+(--force), close its open pull requests from `t/<n>-*` (deleting their branches), delete its local branches
+and close the issue with the comment `Closed by loop smoke reset`; then `git pull --ff-only`. One line per
 action; exit 0, or 1 when any action failed (the remaining actions still run). It never pushes and never
 touches an issue whose title does not start `Loop smoke`. --json prints {"ok": bool, "actions": [...]}.
 
@@ -55,12 +56,13 @@ def git(path: str, *args: str) -> tuple[int, str, str]:
     return run(["git", *args], path)
 
 
-def gh(path: str, *args: str) -> tuple[int, str, str]:
-    return run([os.environ.get("HARNESS_GH", "gh"), *args], path)
+def gh(path: str, *args: str, repo: str | None = None) -> tuple[int, str, str]:
+    pin = ["-R", repo] if repo else []
+    return run([os.environ.get("HARNESS_GH", "gh"), *args, *pin], path)
 
 
-def gh_json(path: str, *args: str):
-    code, out, err = gh(path, *args)
+def gh_json(path: str, *args: str, repo: str | None = None):
+    code, out, err = gh(path, *args, repo=repo)
     if code != 0:
         raise RuntimeError(one_line(err or out) or f"gh exited {code}")
     try:
@@ -74,8 +76,17 @@ def one_line(text: str) -> str:
     return lines[-1] if lines else ""
 
 
-def guard(path: str) -> str:
-    """The sandbox clone's absolute path, or Refused with the reason."""
+def github_repo(url: str) -> str | None:
+    """OWNER/REPO of a github.com remote URL (https, ssh or scp form), else None."""
+    parts = url.rstrip("/").replace(":", "/").split("/")
+    if len(parts) < 3 or not any(p == "github.com" or p.endswith("@github.com") for p in parts[:-2]):
+        return None
+    name = parts[-1][: -len(".git")] if parts[-1].endswith(".git") else parts[-1]
+    return f"{parts[-2]}/{name}" if parts[-2] and name else None
+
+
+def guard(path: str) -> tuple[str, str | None]:
+    """The sandbox clone's absolute path and its github.com OWNER/REPO (None for another origin), or Refused."""
     if not os.path.isdir(path):
         raise Refused(f"{path} is not a folder")
     path = os.path.abspath(path)
@@ -88,7 +99,7 @@ def guard(path: str) -> str:
         last = last[: -len(".git")]
     if last != SANDBOX:
         raise Refused(f"refused: origin of {path} is {url}, not {SANDBOX}")
-    return path
+    return path, github_repo(url)
 
 
 def worktrees(path: str) -> list[tuple[str, str]]:
@@ -107,17 +118,18 @@ def worktrees(path: str) -> list[tuple[str, str]]:
 
 # ---------------------------------------------------------------------------------------------- check
 
-def check_issue(path: str, n: int) -> tuple[bool, str]:
+def check_issue(path: str, n: int, repo: str | None) -> tuple[bool, str]:
     try:
-        state = str(gh_json(path, "issue", "view", str(n), "--json", "state").get("state", ""))
+        state = str(gh_json(path, "issue", "view", str(n), "--json", "state", repo=repo).get("state", ""))
     except (RuntimeError, AttributeError) as exc:
         return False, f"issue #{n}: {exc}"
     return state == "CLOSED", f"issue #{n} is {state or 'of no state'}"
 
 
-def check_pr(path: str, n: int) -> tuple[bool, str]:
+def check_pr(path: str, n: int, repo: str | None) -> tuple[bool, str]:
     try:
-        prs = gh_json(path, "pr", "list", "--state", "all", "--json", "number,state,headRefName", "--limit", "100")
+        prs = gh_json(path, "pr", "list", "--state", "all", "--json", "number,state,headRefName", "--limit", "100",
+                      repo=repo)
         ours = [pr for pr in prs if str(pr.get("headRefName", "")).startswith(f"t/{n}-")]
     except (RuntimeError, AttributeError, TypeError) as exc:
         return False, f"pull requests: {exc}"
@@ -130,7 +142,7 @@ def check_pr(path: str, n: int) -> tuple[bool, str]:
     return False, f"no merged pull request from t/{n}-* ({seen})"
 
 
-def check_worktree(path: str, n: int) -> tuple[bool, str]:
+def check_worktree(path: str, n: int, repo: str | None) -> tuple[bool, str]:
     try:
         trees = [(folder, branch) for folder, branch in worktrees(path) if branch.startswith(f"t/{n}-")]
     except RuntimeError as exc:
@@ -144,10 +156,10 @@ def check_worktree(path: str, n: int) -> tuple[bool, str]:
     return True, f"no worktree of t/{n}-* left"
 
 
-def check(path: str, n: int, as_json: bool) -> int:
+def check(path: str, repo: str | None, n: int, as_json: bool) -> int:
     checks = []
     for name, fn in (("issue", check_issue), ("pr", check_pr), ("worktree", check_worktree)):
-        ok, detail = fn(path, n)
+        ok, detail = fn(path, n, repo)
         checks.append({"name": name, "ok": ok, "detail": detail})
     all_ok = all(c["ok"] for c in checks)
     if as_json:
@@ -182,12 +194,14 @@ class Actions:
         return all(a["ok"] for a in self.done)
 
 
-def reset(path: str, as_json: bool) -> int:
+def reset(path: str, repo: str | None, as_json: bool) -> int:
     acts = Actions(as_json)
+    # first, so the clone itself has no t/<n>-* branch checked out when those branches are deleted
+    on_main = acts.command("switch main", git(path, "switch", "main"), "switched to main")
     issues, prs = [], []
     try:
         found = gh_json(path, "issue", "list", "--state", "open", "--search", f"{TITLE} in:title",
-                        "--json", "number,title", "--limit", "100")
+                        "--json", "number,title", "--limit", "100", repo=repo)
         issues = [i for i in found if str(i.get("title", "")).startswith(TITLE)]
         acts.record("list issues", True, f"{len(issues)} open {TITLE} issue(s)"
                     + (": " + ", ".join(f"#{i['number']}" for i in issues) if issues else ""))
@@ -196,7 +210,7 @@ def reset(path: str, as_json: bool) -> int:
     if issues:
         try:
             prs = gh_json(path, "pr", "list", "--state", "open", "--json", "number,state,headRefName",
-                          "--limit", "100")
+                          "--limit", "100", repo=repo)
             prs = [pr for pr in prs if pr.get("state", "OPEN") == "OPEN"]
         except (RuntimeError, AttributeError, TypeError) as exc:
             acts.record("list prs", False, f"list open pull requests: {exc}")
@@ -205,12 +219,6 @@ def reset(path: str, as_json: bool) -> int:
     for issue in issues:
         n = issue["number"]
         prefix = f"t/{n}-"
-        for pr in prs:
-            head = str(pr.get("headRefName", ""))
-            if head.startswith(prefix):
-                p = str(pr["number"])
-                acts.command("close pr", gh(path, "pr", "close", p, "--delete-branch"),
-                             f"closed PR #{p} ({head}) and deleted its branch")
         try:
             trees = [(folder, branch) for folder, branch in worktrees(path) if branch.startswith(prefix)]
         except RuntimeError as exc:
@@ -218,19 +226,27 @@ def reset(path: str, as_json: bool) -> int:
             trees = []
         for folder, branch in trees:
             if os.path.realpath(folder) == os.path.realpath(path):
-                continue  # the clone itself is on that branch; `git switch main` below moves it
+                continue  # the clone itself is still on that branch: `git switch main` above failed
             acts.command("remove worktree", git(path, "worktree", "remove", "--force", folder),
                          f"removed worktree {folder} ({branch})")
+        # after the worktrees are gone: without -R, gh also deletes the local branch, which git refuses while a
+        # worktree has it checked out, and gh then stops before deleting the remote branch
+        for pr in prs:
+            head = str(pr.get("headRefName", ""))
+            if head.startswith(prefix):
+                p = str(pr["number"])
+                acts.command("close pr", gh(path, "pr", "close", p, "--delete-branch", repo=repo),
+                             f"closed PR #{p} ({head}) and deleted its branch")
         code, out, err = git(path, "for-each-ref", "--format=%(refname:short)", "refs/heads/")
         if code != 0:
             acts.record("delete branch", False, f"list local branches of {prefix}*: {one_line(err)}")
         for branch in out.split() if code == 0 else []:
             if branch.startswith(prefix):
                 acts.command("delete branch", git(path, "branch", "-D", branch), f"deleted local branch {branch}")
-        acts.command("close issue", gh(path, "issue", "close", str(n), "--comment", COMMENT),
+        acts.command("close issue", gh(path, "issue", "close", str(n), "--comment", COMMENT, repo=repo),
                      f"closed issue #{n} ({issue.get('title', '')})")
 
-    if acts.command("switch main", git(path, "switch", "main"), "switched to main"):
+    if on_main:
         acts.command("pull", git(path, "pull", "--ff-only"), "fast-forwarded main")
     else:
         acts.record("pull", False, "did not pull: not on main")
@@ -251,13 +267,13 @@ def main() -> int:
     p_reset.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
-        path = guard(args.sandbox)
+        path, repo = guard(args.sandbox)
     except Refused as exc:
         print(f"loop_smoke: {exc}", file=sys.stderr)
         return REFUSED
     if args.command == "check":
-        return check(path, args.ticket, args.json)
-    return reset(path, args.json)
+        return check(path, repo, args.ticket, args.json)
+    return reset(path, repo, args.json)
 
 
 if __name__ == "__main__":
