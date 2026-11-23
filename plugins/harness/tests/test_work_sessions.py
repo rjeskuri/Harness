@@ -12,11 +12,15 @@ import unittest
 from work_support import *  # noqa: F401,F403
 
 
-class StopFinishedSessions(WorkTest):
-    def board_scenario(self, tickets, ready=(), failing=()):
+class BgSessions:
+    """The helpers of the tests on bg sessions and the tickets that decide their end (StopFinishedSessions,
+    InReviewBeforeLanding)."""
+
+    def board_scenario(self, tickets, ready=(), failing=(), startable=False):
         """tickets: {n: (labels, issue state, PRs of its branch t/<n>-x)}; `ready` the rows of `harness-board ready`.
         For a ticket in `failing`, `gh issue view n` exits 1 with a message on stderr, as gh does when the network or
-        the token is gone."""
+        the token is gone. `startable`: gh also answers what starting a ticket asks (issue edit and comment, gh api),
+        for a dispatch that launches."""
         gone = {"stderr": "HTTP 502: Bad gateway (https://api.github.com/graphql)\n", "exit": 1}
         calls = [dict(gone, match=["issue", "view", str(n)]) if n in failing else
                  {"match": ["issue", "view", str(n)], "stdout_json": issue(n, labels=labels, state=state)}
@@ -31,6 +35,12 @@ class StopFinishedSessions(WorkTest):
             {"match": ["pr", "list"], "stdout_json": []},
             {"match": ["api", "user"], "stdout": "rjeskuri\n"},
         ]
+        if startable:
+            calls += [
+                {"match": ["issue", "edit"], "stdout": ""},
+                {"match": ["issue", "comment"], "stdout": "https://github.com/o/r/issues/12#issuecomment-1\n"},
+                {"match": ["api"], "stdout_json": []},
+            ]
         write(self.scenario_path, json.dumps({"calls": calls}))
         state = self.scenario_path + ".state.json"
         if os.path.exists(state):
@@ -43,6 +53,17 @@ class StopFinishedSessions(WorkTest):
             self.write_run(n, venue="bg", bg_id=bg_id, log=None)
         return json.dumps([{"id": bg_id, "kind": "background", "state": state, "cwd": self.repo,
                             "name": f"proj #{n} {TITLE}"} for n, (bg_id, state) in cases.items()])
+
+    def headless_run(self, n, result):
+        """An unended headless run record of ticket n whose process is gone, its log ending on `result`."""
+        record = self.write_run(n, pid=self.dead_pid())
+        write(record["log"], CONNECTORS_WARNING + "\n" + json.dumps(result) + "\n")
+        return record
+
+    def run_lines(self, env):
+        """{ticket: its line} of `harness-work runs --all` (no sweep)."""
+        return {int(m.group(1)): line for line in self.ok("runs", "--all", env=env).stdout.splitlines()
+                for m in [re.search(r"proj #(\d+)\b", line)] if m}
 
     def stops(self):
         """{session id: how many times `claude stop` was called with it}."""
@@ -73,13 +94,17 @@ class StopFinishedSessions(WorkTest):
         """The command's stderr lines other than a `stopped session <id>` report."""
         return [line for line in p.stderr.splitlines() if line.strip() and not re.search(STOPPED_RE, line)]
 
+
+class StopFinishedSessions(BgSessions, WorkTest):
     # ---- broad: the ticket's status decides, across agents states, statuses and PR states
     def test_sweep_stops_the_session_of_every_finished_ticket_and_of_no_in_progress_one(self):
         cases = {   # n: (bg id, agents state, labels, issue state, PRs, stopped, record closed, outcome)
-            70: ("s-a11", "blocked", IN_REVIEW, "OPEN", ready_pr(120), True, True, None),
+            # #422: in review with an open ready PR is before the land: a blocked session (its turn over) is stopped
+            # and ends early, a done one ends early without a stop
+            70: ("s-a11", "blocked", IN_REVIEW, "OPEN", ready_pr(120), True, True, "early"),
             71: ("s-b22", "blocked", NEEDS_INPUT, "OPEN", [], True, True, None),
             72: ("s-c33", "blocked", IN_REVIEW, "CLOSED", MERGED, True, True, None),
-            73: ("s-d44", "done", IN_REVIEW, "OPEN", ready_pr(121), True, True, "ok"),
+            73: ("s-d44", "done", IN_REVIEW, "OPEN", ready_pr(121), False, True, "early"),
             74: ("s-e55", "done", NEEDS_INPUT, "OPEN", draft(122), True, True, "ok"),
             75: ("s-f66", "done", NO_STATUS, "CLOSED", MERGED, True, True, "ok"),
             76: ("s-g77", "idle", NEEDS_INPUT, "OPEN", [], True, True, None),
@@ -137,10 +162,10 @@ class StopFinishedSessions(WorkTest):
                                  {n: s[3] for n, s in plan.items()})
 
     def test_only_in_review_needs_input_blocked_or_closed_end_a_session_and_an_unreadable_ticket_stays_live(self):
-        # The finished set is exactly status:in-review, status:needs-input, status:blocked (#387) or a CLOSED issue
-        # (closed wins over any leftover label, status:in-progress included). An OPEN ticket with status:ready or no
-        # status label is not finished: its live session is never stopped and holds a slot. Nor is a ticket gh cannot
-        # read.
+        # The finished set is exactly status:in-review (without an open ready PR, #422), status:needs-input,
+        # status:blocked (#387) or a CLOSED issue (closed wins over any leftover label, status:in-progress included).
+        # An OPEN ticket with status:ready or no status label is not finished: its live session is never stopped and
+        # holds a slot. Nor is a ticket gh cannot read.
         cases = {   # n: (bg id, agents state, labels, issue state, PRs, finished)
             120: ("s-rd0", "blocked", READY, "OPEN", [], False),
             121: ("s-bk1", "blocked", BLOCKED_STATUS, "OPEN", draft(190), True),
@@ -148,7 +173,7 @@ class StopFinishedSessions(WorkTest):
             123: ("s-ci3", "blocked", IN_PROGRESS, "CLOSED", MERGED, True),
             124: ("s-gf4", "blocked", IN_REVIEW, "OPEN", ready_pr(191), False),     # gh issue view fails (below)
             125: ("s-ci5", "done", IN_PROGRESS, "CLOSED", MERGED, True),
-            126: ("s-rv6", "blocked", IN_REVIEW, "OPEN", ready_pr(192), True),
+            126: ("s-rv6", "blocked", IN_REVIEW, "OPEN", draft(192), True),
             127: ("s-rd7", "idle", READY, "OPEN", [], False),
         }
         failing = {124}
@@ -251,9 +276,10 @@ class StopFinishedSessions(WorkTest):
 
     # ---- the four cases the ticket names
     def test_a_blocked_session_of_an_in_review_ticket_is_stopped_once_and_frees_its_dispatch_slot(self):
+        # The finished path: in review without an open ready PR (#422; with one, InReviewBeforeLanding).
         # runs --sweep alone: one `claude stop <id>`, reported, and the record closed.
         agents = self.bg_sessions({90: ("s-rev1", "blocked")})
-        self.board_scenario({90: (IN_REVIEW, "OPEN", ready_pr(160))})
+        self.board_scenario({90: (IN_REVIEW, "OPEN", draft(160))})
         p = self.work("runs", "--sweep", env=self.env(FAKECLAUDE_AGENTS=agents))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.stops(), {"s-rev1": 1})
@@ -263,12 +289,13 @@ class StopFinishedSessions(WorkTest):
         # dispatch: the session does not hold a slot, so --max N plans N launches, for each finished status. Whichever
         # command stops the session, it is stopped once in all.
         ready = [ready_row(n, f"Ready {n}") for n in (91, 92, 93, 94)]
-        for labels, state in ((IN_REVIEW, "OPEN"), (NEEDS_INPUT, "OPEN"), (IN_REVIEW, "CLOSED")):
+        for labels, state, prs in ((IN_REVIEW, "OPEN", draft(160)), (NEEDS_INPUT, "OPEN", ready_pr(160)),
+                                   (IN_REVIEW, "CLOSED", ready_pr(160))):
             for most in (1, 2, 3):
                 with self.subTest(labels=labels, state=state, max=most):
                     self.fresh()
                     agents = self.bg_sessions({90: ("s-rev1", "blocked")})
-                    self.board_scenario({90: (labels, state, ready_pr(160))}, ready=ready)
+                    self.board_scenario({90: (labels, state, prs)}, ready=ready)
                     env = self.env(FAKECLAUDE_AGENTS=agents)
                     data = self.ok_json("dispatch", "--dry-run", "--max", str(most), "--json", env=env)
                     self.assertEqual(data["live"], [])
@@ -282,7 +309,7 @@ class StopFinishedSessions(WorkTest):
         # The dry-run text says the same.
         self.fresh()
         agents = self.bg_sessions({90: ("s-rev1", "blocked")})
-        self.board_scenario({90: (IN_REVIEW, "OPEN", ready_pr(160))}, ready=ready)
+        self.board_scenario({90: (IN_REVIEW, "OPEN", [])}, ready=ready)
         p = self.ok("dispatch", "--dry-run", "--max", "2", env=self.env(FAKECLAUDE_AGENTS=agents))
         self.assertIn("Dry run: venue bg, 0 live, 2 of 2 slots free.", p.stdout)
         self.assertEqual(len(re.findall(r"^would start #", p.stdout, re.M)), 2, p.stdout)
@@ -371,6 +398,210 @@ class StopFinishedSessions(WorkTest):
         self.assertIn("s-bad0", warnings[0])
         self.assertEqual(self.stops(), {"s-bad0": 1})
         self.assertTrue(self.records()[110]["ended_at"])
+
+
+# =========================================================================== #422: in review, before the land
+class InReviewBeforeLanding(BgSessions, WorkTest):
+    """#422: `harness-pr ready` sets status:in-review before /harness:work lands (#383), so a ticket that is OPEN and
+    in review with an open, non-draft pull request of its run's branch is not finished: its run is on its way to the
+    land. A live session (any live state but `blocked`) is neither stopped nor closed and holds its dispatch slot. A
+    session that ended its turn (`done`; `blocked`, stopped once) and an exited headless `ok` run end `early` with
+    `ready_pr`, and dispatch runs the ticket again, still in review, under the cap of 3 counted runs in 7 days. In
+    review with no PR, only a draft, or a merged or closed one is finished as before.
+
+    A test's first harness-work run is a process of its own; its further runs run in this process (#378)."""
+
+    ran_a_process = False
+
+    def work(self, *args, env=None, cwd=None):
+        if not self.ran_a_process:
+            self.ran_a_process = True
+            return super().work(*args, env=env, cwd=cwd)
+        p = gitrepo_support.run_in_process(TOOL, args=args, cwd=cwd or self.repo, env=env or self.env())
+        self.assertNotIn("Traceback", p.stderr)
+        return p
+
+    def test_a_working_session_before_landing_is_not_stopped_and_holds_its_slot(self):
+        cases = {   # n: (bg id, a live `claude agents` state other than blocked, the ready PR of its branch)
+            90: ("s-wk90", "running", 160),
+            91: ("s-wk91", "idle", 261),
+            92: ("s-wk92", "working", 362),
+            93: ("s-wk93", "waiting", 463),
+        }
+        ready = [ready_row(n, f"Ready {n}") for n in range(140, 146)]
+        agents = self.bg_sessions({n: c[:2] for n, c in cases.items()})
+        ids = {n: r["id"] for n, r in self.records().items()}
+        self.board_scenario({n: (IN_REVIEW, "OPEN", ready_pr(c[2])) for n, c in cases.items()}, ready=ready)
+        env = self.env(FAKECLAUDE_AGENTS=agents)
+
+        p = self.work("runs", "--sweep", env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.stops(), {}, p.stdout + p.stderr)
+        self.assertEqual(self.reported(p), [])
+        saved = self.records()
+        for n, c in cases.items():
+            with self.subTest(ticket=n, state=c[1]):
+                self.assertIsNone(saved[n]["ended_at"], saved[n])
+                self.assertIsNone(saved[n]["outcome"], saved[n])
+        shown = {r["ticket"]: r["state"] for r in self.ok_json("runs", "--json", env=env)}
+        self.assertEqual(shown, {n: c[1] for n, c in cases.items()})
+
+        # dispatch: each session is a live run holding its slot, so --max N plans N minus the live runs, from the
+        # ready tickets only; a dry run would stop none of them, and a sweep after it still stops none.
+        for extra in (1, 2):
+            most = len(cases) + extra
+            with self.subTest(max=most):
+                p = self.ok("dispatch", "--dry-run", "--max", str(most), "--json", env=env)
+                data = json.loads(p.stdout)
+                self.assertEqual(sorted(data["live"]), sorted(ids.values()), data)
+                self.assertEqual(len(data["plan"]), extra, data)
+                self.assertTrue({row["number"] for row in data["plan"]} <= set(range(140, 146)), data)
+                self.assertNotIn("would stop session", p.stdout + p.stderr)
+        self.ok("runs", "--sweep", env=env)
+        self.assertEqual(self.stops(), {})
+        self.assertEqual({n: r["ended_at"] for n, r in self.records().items()}, {n: None for n in cases})
+
+    def test_a_done_or_blocked_session_before_landing_ends_early_with_its_pr(self):
+        # #90's bg session is `done`, #91's `blocked` (the supervisor's mark of a finished turn, #123), #92's headless
+        # run exited `ok`; each ticket in review with its own ready PR. #93's `failed` session is the control: failed
+        # keeps its outcome, never early.
+        prs = {90: 160, 91: 271, 92: 382, 93: 493}
+        agents = self.bg_sessions({90: ("s-dn90", "done"), 91: ("s-bl91", "blocked"), 93: ("s-fl93", "failed")})
+        self.headless_run(92, {"type": "result", "subtype": "success", "is_error": False, "num_turns": 9,
+                               "result": "PR #382 is ready; landing it next.", "stop_reason": "end_turn"})
+        self.board_scenario({n: (IN_REVIEW, "OPEN", ready_pr(pr)) for n, pr in prs.items()})
+        env = self.env(FAKECLAUDE_AGENTS=agents)
+        early = {n: f"ended before landing (PR #{prs[n]})" for n in (90, 91, 92)}
+
+        p = self.work("runs", "--sweep", "--json", env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rows = {r["ticket"]: r for r in json.loads(p.stdout)}
+        saved = self.records()
+        for n, state in early.items():
+            with self.subTest(ticket=n):
+                self.assertTrue(saved[n]["ended_at"], saved[n])
+                self.assertEqual((saved[n]["outcome"], saved[n].get("ready_pr")), ("early", prs[n]), saved[n])
+                self.assertEqual((rows[n]["outcome"], rows[n]["state"]), ("early", state), rows[n])
+        self.assertTrue(saved[93]["ended_at"], saved[93])
+        self.assertEqual((saved[93]["outcome"], rows[93]["state"]), ("error", "ended error"))
+        # only the blocked session is stopped, once (the failed control's stop is not this ticket's business)
+        self.assertEqual({k: v for k, v in self.stops().items() if k != "s-fl93"}, {"s-bl91": 1},
+                         p.stdout + p.stderr)
+        self.assertEqual([x for x in self.reported(p) if x != "s-fl93"], ["s-bl91"])
+
+        # Without a sweep, from the saved records alone: the same state in --json and in the table.
+        shown = {r["ticket"]: r["state"] for r in self.ok_json("runs", "--json", env=env)}
+        self.assertEqual({n: shown[n] for n in early}, early)
+        lines = self.run_lines(env)
+        for n, state in early.items():
+            self.assertIn(state, lines[n])
+        self.ok("runs", "--sweep", env=env)                     # a second sweep stops nothing more
+        self.assertEqual(self.stops().get("s-bl91"), 1)
+
+    def test_dispatch_relaunches_it_in_review_until_the_cap(self):
+        # #90's done session ends early in dispatch's own sweep; #93's run ended early (PR #263) at an earlier sweep.
+        # #95 is a ready ticket beside them.
+        prs = {90: 160, 93: 263}
+        agents = self.bg_sessions({90: ("s-dn90", "done")})
+        self.write_run(93, venue="bg", bg_id="s-old93", log=None, started_at=iso_ago(hours=3),
+                       ended_at=iso_ago(hours=1), outcome="early", ready_pr=263)
+        self.board_scenario({n: (IN_REVIEW, "OPEN", ready_pr(pr)) for n, pr in prs.items()},
+                            ready=[ready_row(95, "Ready 95")], startable=True)
+        env = self.env(FAKECLAUDE_AGENTS=agents, FAKECLAUDE_BG_ID="s-new90")
+
+        p = self.ok("dispatch", "--dry-run", "--max", "5", env=env)
+        lines = p.stdout.splitlines()
+        for n, pr in prs.items():
+            self.assertIn(f"would start #{n} {TITLE} (again after early, PR #{pr} in review) and launch bg", lines)
+        data = self.ok_json("dispatch", "--dry-run", "--max", "5", "--json", env=env)
+        plan = {row["number"]: row for row in data["plan"]}
+        self.assertEqual(sorted(plan), [90, 93, 95], data)
+        for n, pr in prs.items():
+            self.assertEqual((plan[n].get("again"), plan[n].get("ready_pr")), ("early", pr), plan[n])
+        self.assertEqual(data["skipped"], [])
+        for n, pr in prs.items():                               # --only goes through the same redispatch
+            with self.subTest(only=n):
+                data = self.ok_json("dispatch", "--dry-run", "--only", str(n), "--json", env=env)
+                self.assertEqual([(r["number"], r.get("again"), r.get("ready_pr")) for r in data["plan"]],
+                                 [(n, "early", pr)], data)
+                self.assertEqual(data["skipped"], [])
+
+        # For real: /harness:work 90 is launched and the ticket keeps status:in-review (no label edit).
+        p = self.work("dispatch", "--only", "90", env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        [launch] = [c for c in self.claude_calls() if "--bg" in c["argv"]]
+        self.assertRegex(launch["argv"][-1], r"^/harness:work 90\b")
+        self.assertEqual([a for a in self.gh_calls() if a[:3] == ["issue", "edit", "90"]], [])
+        [new] = [r for r in self.run_records() if r["ticket"] == 90 and not r.get("ended_at")]
+        self.assertEqual(new.get("bg_id"), "s-new90", new)
+
+        # The cap: three counted runs of #90 ended in the 7 days, so it is skipped with the cap's fields and its
+        # newest record is marked capped; #93's three include a billing run, which does not count, so it goes again.
+        self.fresh()
+        histories = {90: ("early", "early", "early"), 93: ("early", "billing", "early")}
+        last = {}
+        for n, outcomes in histories.items():
+            for i, outcome in enumerate(outcomes):
+                hours = 30 - 10 * i
+                extra = {"ready_pr": prs[n]} if outcome == "early" else {}
+                last[n] = self.write_run(n, id=f"{self.key}-{n}-2026100{i + 1}090000", venue="bg",
+                                         bg_id=f"s-h{n}{i}", log=None, started_at=iso_ago(hours=hours + 1),
+                                         ended_at=iso_ago(hours=hours), outcome=outcome, **extra)
+        self.board_scenario({n: (IN_REVIEW, "OPEN", ready_pr(pr)) for n, pr in prs.items()}, startable=True)
+        env = self.env()
+        data = self.ok_json("dispatch", "--dry-run", "--json", env=env)
+        self.assertEqual([(r["number"], r.get("again"), r.get("ready_pr")) for r in data["plan"]],
+                         [(93, "early", 263)], data)
+        [skip] = data["skipped"]
+        self.assertEqual(sorted(skip), ["advice", "number", "runs", "why", "window_days"])
+        self.assertEqual({k: skip[k] for k in ("number", "runs", "window_days", "advice")},
+                         {"number": 90, "runs": 3, "window_days": 7, "advice": "/harness:work 90"})
+        data = self.ok_json("dispatch", "--dry-run", "--only", "90", "--json", env=env)
+        self.assertEqual(data["plan"], [])
+        self.assertEqual([(s["number"], s.get("runs"), s.get("advice")) for s in data["skipped"]],
+                         [(90, 3, "/harness:work 90")])
+        table = self.ok("runs", "--all", env=env).stdout.splitlines()
+        capped = [line for line in table if "capped" in line]
+        self.assertEqual(len(capped), 1, table)
+        self.assertIn(last[90]["id"], capped[0])
+        self.assertIn("ended before landing (PR #160)", capped[0])
+        marked = [r["id"] for r in self.ok_json("runs", "--all", "--json", env=env) if r.get("capped")]
+        self.assertEqual(marked, [last[90]["id"]])
+        self.assertEqual([c for c in self.claude_calls() if "--bg" in c["argv"]], [])
+
+    def test_in_review_without_an_open_ready_pr_stays_finished(self):
+        cases = {   # n: (bg id, agents state, PRs of its branch t/<n>-x, finished)
+            100: ("s-np0", "blocked", [], True),                                    # no PR (an ops ticket)
+            101: ("s-dr1", "idle", draft(171), True),                               # only a draft
+            102: ("s-mg2", "done", [{"number": 172, "state": "MERGED", "isDraft": False}], True),
+            103: ("s-cl3", "running", [{"number": 173, "state": "CLOSED", "isDraft": False}], True),
+            104: ("s-rp4", "idle", ready_pr(174), False),       # the control: an open ready PR, before the land
+        }
+        ready = [ready_row(n, f"Ready {n}") for n in range(110, 116)]
+        agents = self.bg_sessions({n: c[:2] for n, c in cases.items()})
+        self.board_scenario({n: (IN_REVIEW, "OPEN", c[2]) for n, c in cases.items()}, ready=ready)
+        env = self.env(FAKECLAUDE_AGENTS=agents)
+
+        p = self.work("runs", "--sweep", env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        finished = sorted(c[0] for c in cases.values() if c[3])
+        self.assertEqual(self.stops(), {bg_id: 1 for bg_id in finished}, p.stdout + p.stderr)
+        self.assertEqual(self.reported(p), finished)
+        saved = self.records()
+        for n, c in cases.items():
+            with self.subTest(ticket=n, state=c[1], prs=c[2]):
+                if c[3]:
+                    self.assertTrue(saved[n]["ended_at"], saved[n])
+                    self.assertEqual(saved[n]["outcome"], "ok", saved[n])
+                    self.assertIsNone(saved[n].get("ready_pr"), saved[n])
+                else:
+                    self.assertIsNone(saved[n]["ended_at"], saved[n])
+
+        # Never dispatched again: the next dispatch plans only ready tickets, the control holding its slot.
+        data = self.ok_json("dispatch", "--dry-run", "--max", "4", "--json", env=env)
+        self.assertEqual(data["live"], [saved[104]["id"]], data)
+        self.assertEqual([row["number"] for row in data["plan"]], [110, 111, 112], data)
+        self.assertEqual(self.stops(), {bg_id: 1 for bg_id in finished})
 
 
 # =========================================================================== #42: redispatch of a draft-PR run
