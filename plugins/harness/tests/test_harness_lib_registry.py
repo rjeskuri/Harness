@@ -58,7 +58,7 @@ READ_ARGS = {
 # The keys of one project in `harness-standup --json`, today.
 STANDUP_KEYS = {
     "name", "path", "billable", "client", "error", "git", "last_session", "next", "latest_spec",
-    "hours_this_month", "sessions", "board", "prs_awaiting", "needs_input", "stale_worktrees", "board_error",
+    "hours_this_month", "sessions", "board", "prs_awaiting", "needs_input", "stale_worktrees", "board_error", "learn",
 }
 KNOWN = ("path", "name", "billable", "client", "notes")
 # Entries that are not a project with a path: skipped by board, standup and digest, refused by harness-projects.
