@@ -184,7 +184,7 @@ The sandbox stays out of `projects.json`.
 - Run unfamiliar or risky tickets with `/harness:work <n>` in a session you watch. Dispatch the rest.
 - Answer needs-input tickets and decide on parked ones the same day. Each waiting ticket holds a worktree.
 - One session per project. `/clear` between unrelated tasks, with `/harness:handoff` first when you stop mid-task.
-- Keep each project's `CLAUDE.md` under about 60 lines. `/harness:learn` turns a session's corrections into proposed chore tickets; promote the ones you agree with.
+- Keep each project's `CLAUDE.md` under about 60 lines. `/harness:learn` turns a session's corrections into proposed chore tickets; promote the ones you agree with. It also reads the PR review findings, PR comments and parks since its last run, and `/harness:standup` reminds you after 7 days.
 - Never loosen a test to get a PR through. A wrong test goes back to the test-author with the reason.
 - Keep secrets out of commands. The API key lives in the keychain for that reason.
 - End every billable session with `/harness:worklog`, and run it at least every two weeks: Claude Code deletes a transcript about 30 days after its last activity, and the hours come from transcripts.
