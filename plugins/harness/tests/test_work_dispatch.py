@@ -1471,7 +1471,8 @@ class DispatchDryRunStopsNothing(RowsInProcess, CopiedProject, WorkTest):
     # Each fixture: finished {n: (bg id, agents state, labels, issue state, PRs)}, live {n: (bg id, agents state,
     # PRs)} of status:in-progress tickets, the ready tickets in board order, and --max.
     FIXTURES = (
-        {"finished": {301: ("s-fin1", "blocked", IN_REVIEW, "OPEN", ready_pr(401)),
+        # in review without an open ready PR: a ready one is before the land, not finished (#422)
+        {"finished": {301: ("s-fin1", "blocked", IN_REVIEW, "OPEN", draft(401)),
                       302: ("s-fin2", "idle", NEEDS_INPUT, "OPEN", []),
                       303: ("s-fin3", "done", IN_REVIEW, "CLOSED", MERGED)},
          "live": {304: ("s-run4", "running", [])},
@@ -1480,7 +1481,8 @@ class DispatchDryRunStopsNothing(RowsInProcess, CopiedProject, WorkTest):
          "live": {58: ("s-b58", "blocked", []), 59: ("s-i59", "idle", draft(459))},
          "ready": [60, 61, 62, 63, 64], "max": 4},
         {"finished": {88: ("s-x88", "blocked", NEEDS_INPUT, "OPEN", draft(488)),
-                      89: ("s-y89", "blocked", IN_REVIEW, "OPEN", ready_pr(489))},
+                      89: ("s-y89", "blocked", IN_REVIEW, "OPEN",
+                           [{"number": 489, "state": "CLOSED", "isDraft": False}])},
          "live": {},
          "ready": [90, 91, 92], "max": 2},
     )

@@ -320,7 +320,8 @@ BG_ID_RE = re.compile(r"backgrounded\s+(?:·|-)\s+(\S+)")
 LIVE_STATES = ("running", "working", "blocked", "idle", "busy", "waiting", "starting")
 ENDED_STATES = {"done": "ok", "failed": "error", "stopped": "stopped"}   # outcome; another ended state is kept as is
 # A ticket whose turn is over: its issue CLOSED, or OPEN with one of these. The bg supervisor marks a finished session
-# `blocked` when its summary of the final reply suggests a next step for the user (#123), so the ticket decides.
+# `blocked` when its summary of the final reply suggests a next step for the user (#123), so the ticket decides. In
+# review with an open ready pull request of the run's branch is not over: the run is before its land (#422).
 FINISHED_STATUSES = ("status:in-review", "status:needs-input", "status:blocked")   # blocked: parked (#387)
 PID_SLACK = 120               # seconds: a process younger than its run record by more is a recycled pid
 # The dispatching session's own identity, which a detached run must not inherit.
@@ -1142,7 +1143,9 @@ def sweep(records, agents, as_json=False, dry_run=False):
     """Close the records whose run has ended; a billing or auth failure marks the api budget. A listed bg session
     whose ticket is finished has ended whatever its state says: it is stopped and its record closed. Saves. Under
     `dry_run` (dispatch --dry-run, #335) such a session is not stopped and its record is closed in memory only, with
-    a `would stop session <id> (#N <state>)` line, so the plan still counts its slot free. Every unended bg record's
+    a `would stop session <id> (#N <state>)` line, so the plan still counts its slot free. A session whose ticket is
+    before its land (before_landing, #422) is not finished: `blocked` (its turn over, #123) is stopped as above and
+    ends `early`, `done` ends `early`, any other live state keeps its record open. Every unended bg record's
     transcript is read for a usage-limit refusal, which marks the subscription budget (note_usage_limit): a limited
     session stays `blocked`, a live state."""
     repos, logins = {}, {}
@@ -1153,6 +1156,7 @@ def sweep(records, agents, as_json=False, dry_run=False):
             sweep_cloud(record, repos, logins)
             continue
         finished = False                    # None: the ticket could not be read, warned once
+        stop = False
         if is_bg(record):
             if note_usage_limit(record):
                 save_run(record)
@@ -1163,18 +1167,19 @@ def sweep(records, agents, as_json=False, dry_run=False):
             state = entry.get("state") if entry else None
             if entry is not None and state != "stopped":
                 finished = ticket_finished(record, repos)
-            if entry is not None and not state_ended(state) and not finished:
+            stop = bool(finished) or (finished is False and state == "blocked" and ticket_landing(record, repos))
+            if entry is not None and not state_ended(state) and not stop:
                 continue
-            if finished and dry_run:
+            if stop and dry_run:
                 n = record.get("ticket")
                 print(f"would stop session {record.get('bg_id')} (#{n} "
                       f"{finished_as(ticket_issue(record_repo(record, repos), n))})",
                       file=sys.stderr if as_json else sys.stdout, flush=True)
-            elif finished:
+            elif stop:
                 stop_session(record, as_json)
             record["ended_at"] = iso(now())
-            if finished and not state_ended(state):
-                outcome = "ok"              # a live state of a finished turn: the ticket says it is over
+            if stop and not state_ended(state):
+                outcome = "ok"              # a live state of a finished turn (before the land: early, below)
             else:
                 outcome = ENDED_STATES.get(state, str(state)) if entry is not None else "unknown"
             code = entry.get("exitCode", entry.get("exit")) if entry is not None else None
@@ -1186,17 +1191,19 @@ def sweep(records, agents, as_json=False, dry_run=False):
                 continue
             record["ended_at"] = mtime_iso(record.get("log"))
             outcome, reason = classify(log_tail(record.get("log")))
-        # a bg `done` is judged like a headless `ok`; failed, stopped and the rest never become early, nor does a run
-        # whose ticket is finished (never in progress) or could not be read (warned already)
+        # a bg `done` (or `blocked` stopped before the land) is judged like a headless `ok`; failed, stopped and the
+        # rest never become early, nor does a run whose ticket is finished or could not be read (warned already)
         early = ended_early(record, repos) if outcome == "ok" and finished is False else None
         if early is not None:
             outcome = "early"
             if early.get("draft_pr"):
                 record["draft_pr"] = early["draft_pr"]
+            if early.get("ready_pr"):
+                record["ready_pr"] = early["ready_pr"]
         record["outcome"] = outcome
         if outcome in ("billing", "auth") and not is_bg(record):
             exhaust(load_budgets(), "api", f"{outcome}: {reason}", EXHAUST_HOURS)
-        if not (dry_run and finished):
+        if not (dry_run and stop):
             save_run(record)
 
 
@@ -1299,14 +1306,16 @@ def sweep_cloud(record, repos, logins):
 
 
 def ended_early(record, repos):
-    """The issue (as without_pr gives it) when an `ok` run (headless, or bg `done`) left its ticket in progress with no
-    ready pull request: the session ended its turn before the work did. None, with a warning, when the repository or
-    gh cannot tell. `repos` caches Repo by path."""
+    """The issue when an `ok` run (headless, bg `done`, or bg `blocked` before the land) ended its turn before the work
+    did: as without_pr gives it (left in progress with no ready pull request), or as before_landing gives it (left in
+    review before the land of its ready pull request, #422). None, with a warning, when the repository or gh cannot
+    tell. `repos` caches Repo by path."""
     n = record.get("ticket")
     if not isinstance(n, int):
         return None
     try:
-        return without_pr(record_repo(record, repos), n, record.get("branch"))
+        repo = record_repo(record, repos)
+        return without_pr(repo, n, record.get("branch")) or before_landing(repo, n, record.get("branch"))
     except Problem as err:
         warn(f"#{n}: cannot check whether its run ended early: {err}")
         return None
@@ -1342,16 +1351,27 @@ def finished_as(issue):
 
 
 def ticket_finished(record, repos):
-    """Whether the ticket of a run is finished (issue_finished); None, with a warning, when the repository or gh
-    cannot tell, so the session is neither stopped nor counted ended."""
+    """Whether the ticket of a run is finished (issue_finished), never while it is before its land (before_landing,
+    #422); None, with a warning, when the repository or gh cannot tell (the issue, or the pull requests of an
+    in-review ticket's branch), so the session is neither stopped nor counted ended."""
     n = record.get("ticket")
     if not isinstance(n, int):
         return None
     try:
-        return issue_finished(ticket_issue(record_repo(record, repos), n))
+        repo = record_repo(record, repos)
+        return issue_finished(ticket_issue(repo, n)) and before_landing(repo, n, record.get("branch")) is None
     except Problem as err:
         warn(f"#{n}: cannot tell whether its ticket is finished: {err}")
         return None
+
+
+def ticket_landing(record, repos):
+    """Whether the ticket of a run is before its land (before_landing); False when the repository or gh cannot tell,
+    which ticket_finished, asking the same first, has warned about."""
+    try:
+        return before_landing(record_repo(record, repos), record.get("ticket"), record.get("branch")) is not None
+    except Problem:
+        return False
 
 
 def stop_bg(record):
@@ -1378,6 +1398,8 @@ def stop_session(record, as_json):
 def run_state(record, agents):
     if record.get("ended_at"):
         if record.get("outcome") == "early":           # wins over an exit code: the 0 of a done bg run says less
+            if record.get("ready_pr"):
+                return f"ended before landing (PR #{record['ready_pr']})"
             pr = record.get("draft_pr")
             return f"ended early (draft PR #{pr})" if pr else "ended early (no PR)"
         exit_code = record.get("exit")
@@ -1662,6 +1684,7 @@ def launch_cloud(repo, ticket, prompt):
 
 ISSUES = {}         # (main checkout, ticket): the issue or the Problem, read once per command
 WITHOUT_PR = {}     # (main checkout, ticket, branch): the issue, None or the Problem, asked once per command
+LANDING = {}        # the same for before_landing
 PR_ROWS = 100       # pull requests of a branch read by ask_without_pr
 
 
@@ -1734,12 +1757,42 @@ def ask_without_pr(repo, n, branch):
     return dict(issue, draft_pr=drafts[0] if drafts else None)
 
 
+def before_landing(repo, n, branch):
+    """The issue of ticket n when it is OPEN and status:in-review and `branch` has an open pull request that is not a
+    draft, else None; its `ready_pr` is the newest such PR's number. `harness-pr ready` sets in-review before
+    /harness:work lands (#383), so a run that ended there ended before its land (#422). A failing gh call, or a PR
+    answer that is not a list, raises Problem. One command asks gh once per ticket and branch, as without_pr does."""
+    key = (repo.main, n, branch)
+    if key not in LANDING:
+        try:
+            LANDING[key] = ask_before_landing(repo, n, branch)
+        except Problem as err:
+            LANDING[key] = err
+    found = LANDING[key]
+    if isinstance(found, Problem):
+        raise found
+    return found
+
+
+def ask_before_landing(repo, n, branch):
+    issue = ticket_issue(repo, n)
+    if not isinstance(issue, dict) or str(issue.get("state", "")).upper() != "OPEN":
+        return None
+    labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
+    if "status:in-review" not in labels:
+        return None
+    ready = [pr.get("number") for pr in branch_prs(repo, branch, strict=True)    # newest first
+             if str(pr.get("state", "")).upper() == "OPEN" and pr.get("isDraft") is not True]
+    return dict(issue, ready_pr=ready[0]) if ready else None
+
+
 def redispatch_candidates(repo, records, live, *, capped_only=False, only=None):
-    """In-progress tickets whose last run ended (within the window) without a ready pull request: dispatched again,
-    unless REDISPATCH_MAX runs of the ticket ended within the window, billing and auth runs not counting (the
-    budget's failure, not the ticket's). (candidates, skipped, the id of the record each skipped ticket's cap rests
-    on: its latest started). `capped_only` skips the gh check for tickets under the cap, whose answer the caller
-    would discard. `only` (a set of ticket numbers) considers just those tickets."""
+    """Tickets whose last run ended (within the window) before the work did: in progress without a ready pull request
+    (without_pr), or in review before the land of its ready one (before_landing, #422). Dispatched again, unless
+    REDISPATCH_MAX runs of the ticket ended within the window, billing and auth runs not counting (the budget's
+    failure, not the ticket's). (candidates, skipped, the id of the record each skipped ticket's cap rests on: its
+    latest started). `capped_only` skips the gh check for tickets under the cap, whose answer the caller would
+    discard. `only` (a set of ticket numbers) considers just those tickets."""
     cutoff = now() - REDISPATCH_WINDOW
     latest, ended_runs = {}, {}
     for record in records:
@@ -1761,7 +1814,8 @@ def redispatch_candidates(repo, records, live, *, capped_only=False, only=None):
         if capped_only and ended_runs.get(n, 0) < REDISPATCH_MAX:
             continue
         try:
-            issue = without_pr(repo, n, record.get("branch"))
+            issue = (without_pr(repo, n, record.get("branch"))
+                     or before_landing(repo, n, record.get("branch")))
         except Problem as err:
             warn(f"#{n}: cannot check whether its ended run needs another: {err}")
             continue
@@ -1770,14 +1824,16 @@ def redispatch_candidates(repo, records, live, *, capped_only=False, only=None):
         again = record.get("outcome") or "ended"
         if ended_runs.get(n, 0) >= REDISPATCH_MAX:
             days = REDISPATCH_WINDOW.days
-            skipped.append({"number": n, "why": f"{ended_runs[n]} runs ended without a ready pull request in {days} "
-                                                f"days (last: {again} at {record.get('ended_at')}); run it in this "
-                                                f"session with /harness:work {n}, or wait for the window",
+            how = (f"in {days} days with PR #{issue['ready_pr']} still not landed" if issue.get("ready_pr") else
+                   f"without a ready pull request in {days} days")
+            skipped.append({"number": n, "why": f"{ended_runs[n]} runs ended {how} (last: {again} at "
+                                                f"{record.get('ended_at')}); run it in this session with "
+                                                f"/harness:work {n}, or wait for the window",
                             "runs": ended_runs[n], "window_days": days, "advice": f"/harness:work {n}"})
             capped_ids[n] = record.get("id")
             continue
         out.append({"number": n, "title": issue.get("title") or "", "tier": None, "again": again,
-                    "draft_pr": issue.get("draft_pr")})
+                    "draft_pr": issue.get("draft_pr"), "ready_pr": issue.get("ready_pr")})
     return out, skipped, capped_ids
 
 
@@ -2168,7 +2224,8 @@ def dispatch_repo(repo, args, routing, records, agents, shared=None):
             candidates.append({"number": n, "title": "", "again": "an answer to its question"})
             continue
         skipped.append({"number": n, "why": f"live run {live[n]['id']}" if n in live else
-                        "not ready, and not in progress with an ended run to redispatch"})
+                        "not ready, and not in progress with an ended run to redispatch, nor in review with one that "
+                        "ended before the land"})
     kept_local = []                 # ops tickets a headless dispatch leaves out: they need this Mac's connectors
     for row in candidates:
         if row["number"] in live:
@@ -2187,6 +2244,8 @@ def dispatch_repo(repo, args, routing, records, agents, shared=None):
         detail = f"tier {row['tier']}" if row.get("tier") else f"again after {row.get('again')}"
         if row.get("draft_pr"):
             detail += f", draft PR #{row['draft_pr']}"
+        if row.get("ready_pr"):
+            detail += f", PR #{row['ready_pr']} in review"
         return f"#{row['number']} {row.get('title') or ''} ({detail})"
 
     wave_tier = routing["wave_tier"]
@@ -2240,8 +2299,8 @@ def dispatch_repo(repo, args, routing, records, agents, shared=None):
             if not ticket["title"]:
                 ticket["title"] = row.get("title") or ""
             route = code_route(ticket["type"], ticket["size"], ticket["risk"], routing)
-            try:
-                before = started_comments(repo, n)
+            try:            # start keeps an in-review ticket without a "Started on" comment: nothing to wait for (#422)
+                before = None if ticket["previous_status"] == "in-review" else started_comments(repo, n)
             except Problem:
                 before = None
             record = launch(repo, ticket, venue, route["effort"])
