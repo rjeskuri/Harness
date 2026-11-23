@@ -2792,6 +2792,59 @@ class GitHub(ScaffoldTest):
         self.assertEqual(self.git(worktree, "log", "-1", "--format=%s"), "Adopt the harness scaffold (#3)")
 
 
+SELF_HOSTED = ["self-hosted", "linux", "harness-mac"]
+
+
+def runs_on(ci_text):
+    """The labels of the verify job's `runs-on:` in a ci.yml, flow list or plain value, quotes dropped."""
+    lines = [ln.strip() for ln in ci_text.splitlines() if ln.strip().startswith("runs-on:")]
+    if len(lines) != 1:
+        raise AssertionError(f"expected one runs-on line, found {lines}")
+    value = lines[0][len("runs-on:"):].split(" #")[0].strip()
+    if value.startswith("[") and value.endswith("]"):
+        return [part.strip().strip("'\"") for part in value[1:-1].split(",") if part.strip()]
+    return [value.strip("'\"")]
+
+
+class RunsOnByVisibility(ScaffoldTest):
+    """Ticket #420: the CI template runs on the Mac's self-hosted runner, `runs-on: [self-hosted, linux,
+    harness-mac]`, when the repository is private, and on `ubuntu-latest` when it is public, since fork pull
+    requests of a public repository would run on the Mac. --github creates a private repository unless
+    --public is given, and --public alone (no repository created) says the repository is public."""
+
+    def test_the_ci_template_runs_on_by_visibility(self):
+        rows = [  # (stack, flags, gh repo create's visibility flag or None, expected runs-on)
+            ("python", ["--github"], "--private", SELF_HOSTED),
+            ("node", ["--github", "--public"], "--public", ["ubuntu-latest"]),
+            ("none", ["--github"], "--private", SELF_HOSTED),
+            ("python", ["--github", "--public"], "--public", ["ubuntu-latest"]),
+            ("node", ["--github"], "--private", SELF_HOSTED),
+            ("none", ["--public"], None, ["ubuntu-latest"]),
+        ]
+        self.stub("harness-board", {"labels": "ok\n"})
+
+        def gh_calls():
+            return [c for c in self.calls() if "tool" not in c]
+
+        for i, (stack, flags, visibility, expected) in enumerate(rows):
+            with self.subTest(stack=stack, flags=flags):
+                calls = len(gh_calls())
+                env = self.env(**self.fake_gh(GitHub.SCENARIO + [GitHub.FORBIDDEN], self.bare(f"origin{i}.git")))
+                root = os.path.join(self.tmp, f"demo{i}")
+                self.ok("init", root, "--name", f"demo-{i}", "--stack", stack, *flags, env=env)
+                ci = self.read(root, ".github/workflows/ci.yml")
+                self.assertEqual(runs_on(ci), expected, ci)
+                if expected != SELF_HOSTED:
+                    self.assertNotIn("self-hosted", ci)
+                creates = [c["argv"] for c in gh_calls()[calls:] if c["argv"][:2] == ["repo", "create"]]
+                if visibility is None:
+                    self.assertEqual(creates, [])
+                else:
+                    self.assertEqual(len(creates), 1, creates)
+                    self.assertIn(visibility, creates[0])
+                    self.assertNotIn({"--private": "--public", "--public": "--private"}[visibility], creates[0])
+
+
 class Register(ScaffoldTest):
     def test_register_adds_the_project_to_the_registry(self):
         root = os.path.join(self.tmp, "billed")

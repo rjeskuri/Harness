@@ -7,7 +7,9 @@ remote is on github.com, when gh is found (HARNESS_GH, else gh on PATH): the boa
 requests awaiting review, the tickets that need your input and the stale ticket worktrees; and, gh or not, a
 `- learn:` reminder when the last /harness:learn run (repos/<key>/learn.json) is older than 7 days or none. Then the
 fleet of every running Claude Code session, waiting ones first; the exhausted budgets; and the headless
-and background runs alive or ended in the last 24 hours. Markdown, or --json for the structure behind it.
+and background runs alive or ended in the last 24 hours. A project whose runner-<repo> container (harness-runner)
+GitHub does not report online gets a `- runner:` line; a `## Runners` section says when docker does not answer.
+Markdown, or --json for the structure behind it.
 
 Usage:
     harness-standup                  # every registered project
@@ -39,6 +41,7 @@ try:
     from harness_lib.paths import canonical_path, path_key, repo_key, same_entry
     from harness_lib.registry import find_project, load_registry
     from harness_lib.repo import worktree_entries
+    from harness_lib.runners import DOCKER_DOWN, runner_checks, runner_problem
     from harness_lib.text import (age_text, first_line, home, parse_iso_seconds, read_json, same_path,
                                   session_folder)
 except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
@@ -551,7 +554,7 @@ def git_text(g):
     return ", ".join(parts)
 
 
-def markdown(reports, fleet, fleet_error, registered, budgets=(), runs=(), now=None):
+def markdown(reports, fleet, fleet_error, registered, budgets=(), runs=(), now=None, runners_error=None):
     now = time.time() if now is None else now
     out = []
     if not registered:
@@ -579,9 +582,14 @@ def markdown(reports, fleet, fleet_error, registered, budgets=(), runs=(), now=N
             then = parse_iso_seconds(learn["last_run"])
             out.append(f"- learn: last run {age_text(then, now)}; run /harness:learn" if then is not None
                        else "- learn: never run; run /harness:learn")
+        problem = runner_problem(r.get("runner"))
+        if problem:
+            out.append(f"- runner: {problem}")
         if r["sessions"] is not None:
             out.append("- sessions: " + (", ".join(session_text(e) for e in r["sessions"]) or "none"))
         out.append("")
+    if runners_error:
+        out += ["## Runners", "- " + DOCKER_DOWN.format(why=runners_error), ""]
     out.append("## Fleet")
     if fleet_error:
         out.append(f"- could not read the fleet: {fleet_error}")
@@ -611,6 +619,8 @@ def main():
     reader = threading.Thread(target=read_fleet_into, args=(box,), daemon=True)
     reader.start()
     workers = max(1, min(8, len(projects)))
+    side = concurrent.futures.ThreadPoolExecutor(max_workers=1)        # the runner checks, beside the rest
+    runner_job = side.submit(runner_checks, [p.path for p in projects if os.path.isdir(p.path)])
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as gh_pool:
         boards = [gh_pool.submit(board_report, p, now) for p in projects]       # gh side by side with git
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -620,6 +630,11 @@ def main():
             if r["error"]:
                 r.update(board=None, prs_awaiting=None, needs_input=None, stale_worktrees=None, board_error=None,
                          learn=None)
+    runners, runners_error = runner_job.result()
+    side.shutdown()
+    for r in reports:                       # only a project with a runner container gets the key
+        if not r["error"] and r["path"] in runners:
+            r["runner"] = runners[r["path"]]
     budgets, runs = exhausted_budgets(now), recent_runs(registered, now)
     reader.join(FLEET_TIMEOUT + 1)
     fleet, fleet_error = box.get("fleet", (None, f"`claude agents --json` timed out after {FLEET_TIMEOUT} s"))
@@ -630,9 +645,9 @@ def main():
     if args.json:
         print(json.dumps({"generated": dt.datetime.fromtimestamp(now).astimezone().isoformat(timespec="seconds"),
                           "projects": reports, "fleet": fleet, "fleet_error": fleet_error, "budgets": budgets,
-                          "runs": runs}, indent=2, ensure_ascii=False))
+                          "runs": runs, "runners_error": runners_error}, indent=2, ensure_ascii=False))
     else:
-        print(markdown(reports, fleet, fleet_error, bool(registered), budgets, runs, now))
+        print(markdown(reports, fleet, fleet_error, bool(registered), budgets, runs, now, runners_error))
 
 
 if __name__ == "__main__":

@@ -4,7 +4,8 @@ The daily digest: what is waiting on you across the registered projects. For eac
 ~/.claude/harness/projects.json with an `origin` remote: your open pull requests awaiting review,
 tickets labeled status:needs-input (with the first line of the question), tickets in progress for more
 than 3 days without a pull request, and ticket worktrees (.claude/worktrees/) with no commit for 7 days
-and no open pull request. Then exhausted budgets and the runs that failed (billing, auth, error) or ended
+and no open pull request, and a runner-<repo> container (harness-runner) that GitHub does not report online,
+since its pull requests' CI queues instead of failing (`## Runners` when docker does not answer). Then exhausted budgets and the runs that failed (billing, auth, error) or ended
 early (no PR) since the previous digest. Writes ~/.claude/harness/digest/<yyyy-mm-dd>.md, prints it, and sends one
 notification `Harness digest: <p> PRs to review, <q> need input, <s> stale` (none when all three are 0).
 
@@ -40,6 +41,7 @@ try:
     from harness_lib.paths import canonical_path, path_key, repo_key, same_entry
     from harness_lib.registry import load_registry
     from harness_lib.repo import worktree_entries
+    from harness_lib.runners import DOCKER_DOWN, runner_checks, runner_problem
     from harness_lib.text import (age_text, first_line, harness_home, home, parse_iso_seconds, read_json,
                                   same_path)
 except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
@@ -291,6 +293,9 @@ def markdown(data):
             blocks.append(("Stale worktrees", [f"- {w['branch'] or 'detached'} at {w['relative']} "
                                                f"(last commit {w['last_commit']['age']}, no open PR)"
                                                for w in p["stale_worktrees"]]))
+        problem = runner_problem(p.get("runner"))
+        if problem:
+            blocks.append(("Runner", [f"- {problem}"]))
         if not blocks:
             continue
         said = True
@@ -298,6 +303,9 @@ def markdown(data):
         for title, lines in blocks:
             out += ["", f"### {title}"] + lines
         out.append("")
+    if data.get("runners_error"):
+        said = True
+        out += ["## Runners", "- " + DOCKER_DOWN.format(why=data["runners_error"]), ""]
     if data["budgets"]:
         said = True
         out += ["## Budgets"] + [f"- {b['name']} exhausted until {b['until']}" + (f" ({b['reason']})" if b["reason"] else "")
@@ -320,12 +328,18 @@ def digest(now):
     previous = previous_digest(folder, date)
     since = previous if previous is not None else now - RUNS_WINDOW
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(projects)))) as pool:
+        runner_job = pool.submit(runner_checks, [p["path"] for p in projects if os.path.isdir(p["path"])])
         read = list(pool.map(lambda p: project_digest(p, gh, now), projects))
+        runners, runners_error = runner_job.result()
+    for p in read:                          # only a project with a runner container gets the key
+        if not p["error"] and p["path"] in runners:
+            p["runner"] = runners[p["path"]]
     data = {"date": date, "generated": iso(now), "since": iso(since), "file": os.path.join(folder, f"{date}.md"),
             "registered": bool(projects),
             "projects": [{k: v for k, v in p.items() if k != "skipped"} for p in read if not p["skipped"]],
             "skipped": [{"name": p["name"], "path": p["path"], "why": p["skipped"]} for p in read if p["skipped"]],
-            "budgets": exhausted_budgets(now), "runs": failed_runs(projects, since, now)}
+            "budgets": exhausted_budgets(now), "runs": failed_runs(projects, since, now),
+            "runners_error": runners_error}
     readable = [p for p in data["projects"] if not p["error"]]
     data["counts"] = {"prs": sum(len(p["prs"]) for p in readable),
                       "needs_input": sum(len(p["needs_input"]) for p in readable),

@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: {{runs_on}}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7

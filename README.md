@@ -101,6 +101,7 @@ Hooks run outside the sandbox with your permissions. Point `CLAUDE_VERIFY_CMD` a
 | `harness-projects` | The project registry |
 | `harness-standup` | The cross-project standup behind `/harness:standup` |
 | `harness-worklog` | Hours from session transcripts for invoicing |
+| `harness-runner` | Self-hosted CI runners on the Mac for private projects: add, list, upgrade, remove |
 
 ## Per-project settings
 
