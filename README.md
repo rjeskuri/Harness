@@ -1,6 +1,6 @@
 # Harness
 
-Ryan's personal Claude Code harness, v2: one plugin installed once at user scope, applied to every project. The board is the context: every unit of work is a GitHub issue, an epic with task sub-issues, and agents read the ticket before they work and write status back to it. Tests come first and are proven to fail before any source changes. Nothing happens on main: each ticket gets its own branch and worktree, and work lands through a pull request. Your part is to plan, answer tickets that need input, and land the `risk:high` pull requests: `/harness:work` lands a `risk:low` ticket's pull request itself once it is green and reviewed.
+Ryan's personal Claude Code harness, v2: one plugin installed once at user scope, applied to every project. The board is the context: every unit of work is a GitHub issue, an epic with task sub-issues, and agents read the ticket before they work and write status back to it. Tests come first and are proven to fail before any source changes. Nothing happens on main: each ticket gets its own branch and worktree, and work lands through a pull request. Your part is to plan, answer tickets that need input, and read the pull requests after they land: `/harness:work` lands every ticket's pull request itself, at any risk, once it is green, current with main and free of high and medium findings.
 
 Built 2026-10-13 against Claude Code 2.1.296 and gh 2.99.0. New to the CLI? Start with the [first-run guide](docs/guide.md). The design and every contract live in [docs/design.md](docs/design.md).
 
@@ -10,7 +10,7 @@ Built 2026-10-13 against Claude Code 2.1.296 and gh 2.99.0. New to the CLI? Star
 |---|---|
 | `.claude-plugin/marketplace.json` | The marketplace `ryan`, with one plugin: `harness` |
 | `plugins/harness/agents/` | planner, test-author, test-breaker, coder, reviewer, researcher, quick |
-| `plugins/harness/skills/` | plan, work, land, new-project, learn, standup, handoff, worklog |
+| `plugins/harness/skills/` | cloud, handoff, invoice, land, learn, new-project, plan, standup, work, worklog |
 | `plugins/harness/hooks/` | The hook scripts and `hooks.json` |
 | `plugins/harness/bin/` | The nine `harness-*` tools, on the Bash PATH in every session |
 | `plugins/harness/templates/` | Ticket, PR body and project scaffold templates |
@@ -42,7 +42,7 @@ Then register your projects: `harness-projects discover`, and `harness-projects 
 2. `/harness:plan <request>` interviews you, has the planner propose an epic and tasks, and creates the issues once you approve.
 3. `/harness:work` dispatches one background session on the subscription per ready ticket (`/harness:work --api`: headless runs on the API key); `/harness:work N` runs ticket N in this session.
 4. A ticket that needs you gets a comment and a notification; reply in a comment, then `/harness:work N` picks up the answer.
-5. `/harness:land` lists PRs awaiting you; `/harness:land P` summarizes one, asks once, squash-merges, cleans up and closes the ticket.
+5. Every PR lands at the end of its own run. `/harness:land` is only for a parked ticket's PR you choose to land: it lists PRs awaiting you, and `/harness:land P` squash-merges one with no question, cleans up and closes the ticket.
 
 ## Agents and routing
 
@@ -64,8 +64,9 @@ The main session runs Opus 5.5 at high effort. `harness-board tier N` picks the 
 |---|---|
 | `/harness:new-project [path]` | Interview, scaffold, private GitHub repo, labels, registry entry |
 | `/harness:plan [request]` | Interview, planner proposal, issues on the board after approval |
-| `/harness:work [issue#]` | One ticket to a landed PR here (a `risk:high` one to a ready PR for you), or dispatch every ready ticket |
-| `/harness:land [PR#]` | PRs awaiting you, or one PR merged after one confirmation |
+| `/harness:work [issue#]` | One ticket to a landed PR here, at any risk, or dispatch every ready ticket |
+| `/harness:cloud N` | One ticket started in a Claude cloud session as a plain worker; review, the PR, CI and landing stay on this Mac |
+| `/harness:land [PR#]` | A parked ticket's PR: the PRs awaiting you, or one PR merged with no confirmation question |
 | `/harness:standup` | Every project: git state, board counts, PRs, needs-input tickets, stale worktrees, budgets |
 | `/harness:learn` | Lessons from the session become `chore` tickets, not edits |
 | `/harness:handoff` | Writes `docs/agent/handoff.md` before `/clear` |

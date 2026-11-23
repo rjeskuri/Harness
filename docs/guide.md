@@ -10,7 +10,7 @@ The harness turns each project's GitHub issues into the context for every sessio
 | --- | --- | --- |
 | Personal instructions, `~/.claude/CLAUDE.md` | A short file Claude reads at the start of every session | Carries your preferences and the loop's rules: read the ticket first, never work on main, tests first, route by tier |
 | The board | GitHub Issues in each project's private repo: epics, task sub-issues, labels for status, size and risk | The single record of what is asked, what is in progress and what needs you. Agents read it before working and write status back |
-| The `harness` plugin | Seven agents, eight skills and seven hooks, installed once for your user | Agents do the work, skills are the procedures you start with `/harness:<name>`, hooks enforce the rules whatever the model thinks |
+| The `harness` plugin | Seven agents, ten skills and seven hooks, installed once for your user | Agents do the work, skills are the procedures you start with `/harness:<name>`, hooks enforce the rules whatever the model thinks |
 | The `harness-*` tools | Nine command-line tools, on the Bash PATH in every session | The deterministic parts: board edits, worktrees, the red proof, PRs, budgets. Outside a session they live in `~/Projects/Harness/plugins/harness/bin/` |
 | The digest | A launchd job that runs `harness-digest` daily at 08:30 | One notification with PRs to review, tickets that need input and stale work, across every project |
 | Hourly dispatch (opt-in) | A launchd job you install yourself, `harness-work dispatch --install-launchd` | Every hour, the ready tickets of the projects you opted in start in the background, up to 8 live runs across all projects (Hourly dispatch, below) |
@@ -43,6 +43,8 @@ In a terminal, in this order.
 | Land | `/harness:land`, then `/harness:land <P>` | Only for a parked ticket's PR you choose to land: merged with no question, worktree and branch cleaned up, ticket closed. Every other PR lands at the end of its run, at any risk |
 | Handoff | `/harness:handoff`, then `/clear` | `docs/agent/handoff.md`, which the next session's brief reads |
 | Worklog | `/harness:worklog` | The day's hours and a client note on billable projects |
+| Invoice | `/harness:invoice [--month yyyy-mm]` | A month's hours by ticket and epic, as CSV and markdown, for the invoice |
+| Cloud | `/harness:cloud <n>` | One ticket started in a Claude cloud session; review, the PR, CI and landing stay on this Mac |
 
 One session per project. `claude agents` in a terminal lists every session, including the background ones dispatch starts.
 
