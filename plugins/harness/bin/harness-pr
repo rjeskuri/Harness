@@ -12,6 +12,7 @@ Usage:
     harness-pr checks P [--wait] [--timeout 1200] [--json]
     harness-pr ready P [--ticket N]
     harness-pr comments P [--since ISO] [--unresolved] [--json]
+    harness-pr learn [--since ISO] [--json] | learn --mark
     harness-pr awaiting [--all-projects] [--json]
     harness-pr ultra P [--post] [--force]
     harness-pr land P [--yes] [--discard] [--accept-findings] [--catch-up [--rounds 3] [--timeout 420]]
@@ -61,6 +62,10 @@ recorded; no open PR records the round with a warning and posts nothing. Then, w
 outside finding of any recorded round not ticketed yet (by path and body, kept in tickets.json) becomes a proposed
 bug ticket under the ticket's epic (`harness-board task create`, the body on stdin, naming this round's PR), its
 number on the notes line; a failed create is a warning, and the next round with a PR tries it again.
+
+learn lists the PRs merged since `since` (--since, else `last_run` in ~/.claude/harness/repos/<key>/learn.json, else
+7 days ago), each with its ticket (t/N- branch), its review rounds' findings and its conversation without the
+harness's own, then the `**Parked**` issue comments created since then; --mark records now as `last_run`, no gh call.
 
 ultra runs nothing (one line, exit 0) when the project's HARNESS_ULTRAREVIEW is off, unless --force; see cmd_ultra.
 
@@ -164,6 +169,7 @@ EVIDENCE_TAIL_LINES = 40
 SMOKE_TIMEOUT = 300.0        # seconds it may take (HARNESS_SMOKE_TIMEOUT)
 CATCH_UP_ROUNDS = 3          # land --catch-up: merges of main at most
 CATCH_UP_TIMEOUT = 420.0     # land --catch-up: seconds for all its check waits, one call under the Bash tool's 600 s
+LEARN_DAYS = 7               # learn: the window without --since or a recorded run
 
 
 def plural(n, word):
@@ -1266,6 +1272,114 @@ def cmd_comments(args):
         blocks.append("\n".join([f"## Comments ({len(found['comments'])})"] + [
             f"- **{c['author']}** ({c['created_at'][:10]}): {quoted_body(c['body'])}" for c in found["comments"]]))
     print("\n\n".join(blocks))
+    return 0
+
+
+# --------------------------------------------------------------- learn
+def utc_stamp(when):
+    return when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def at_or_after(text, since):
+    when = parse_iso(text)
+    return when is not None and when >= since
+
+
+def round_findings(key, ticket):
+    """Every finding of the ticket's review rounds, each {"round", "severity", "path", "line", "body"}."""
+    out = []
+    for index, rnd in enumerate(load_rounds(key, ticket), 1):
+        k = rnd.get("round") if isinstance(rnd.get("round"), int) else index
+        for group in ("blocking", "low", "outside"):
+            out += [{"round": k, "severity": f.get("severity"), "path": f.get("path"), "line": f.get("line"),
+                     "body": f.get("body") or ""} for f in as_list(rnd.get(group)) if isinstance(f, dict)]
+    return out
+
+
+def parked_since(repo, since):
+    """The `**Parked**` issue comments created at or after `since`, oldest first. The API's `since` filters by
+    the last update, so the creation time is checked here."""
+    endpoint = f"repos/{repo.slug()}/issues/comments?since={utc_stamp(since)}&per_page=100"
+    pages = gh_json(["api", endpoint, "--paginate", "--slurp"], repo.root)
+    if not isinstance(pages, list):
+        raise Problem(f"gh api {endpoint} printed no list of comments")
+    out = []
+    for page in pages:
+        for c in (page if isinstance(page, list) else [page]):
+            if not isinstance(c, dict) or not at_or_after(c.get("created_at"), since):
+                continue
+            lines = (c.get("body") or "").strip().splitlines()
+            if not lines or lines[0].strip() != PARKED:
+                continue
+            issue = re.search(r"/issues/(\d+)", c.get("issue_url") or c.get("html_url") or "")
+            out.append({"ticket": int(issue.group(1)) if issue else None, "url": c.get("html_url") or "",
+                        "created_at": c.get("created_at"), "reason": first_line("\n".join(lines[1:]))})
+    return sorted(out, key=lambda p: parse_iso(p["created_at"]))
+
+
+def merged_since(repo, since):
+    """The PRs merged at or after `since`, oldest first, each with its ticket, review-round findings and
+    conversation without the harness's own."""
+    data = gh_json(["pr", "list", "--state", "merged", "--search", f"merged:>={utc_stamp(since)[:10]}", "--json",
+                    "number,title,url,mergedAt,headRefName", "--limit", "100"], repo.root)
+    prs = [p for p in as_list(data) if isinstance(p, dict) and at_or_after(p.get("mergedAt"), since)]
+    out = []
+    for p in sorted(prs, key=lambda p: parse_iso(p["mergedAt"])):
+        ticket = TICKET_BRANCH.match(p.get("headRefName") or "")
+        ticket = int(ticket.group(1)) if ticket else None
+        out.append({"number": p.get("number"), "title": p.get("title") or "", "url": p.get("url") or "",
+                    "merged_at": p.get("mergedAt"), "ticket": ticket,
+                    "findings": round_findings(repo.key, ticket) if ticket is not None else [],
+                    "comments": conversation(conversation_of(repo, p.get("number")))})
+    return out
+
+
+def learn_text(data):
+    head = f"Since {data['since']}" + (f" (last learn run {data['last_run']})" if data["last_run"] else "")
+    blocks = [head]
+    for p in data["prs"]:
+        ticket = f"ticket #{p['ticket']}" if p["ticket"] is not None else "no ticket"
+        lines = [f"## PR #{p['number']} {p['title']} ({ticket}, merged {p['merged_at']})", p["url"]]
+        for f in p["findings"]:
+            spot = f"`{f['path']}:{f['line']}`" if f["line"] else f"`{f['path']}`" if f["path"] else "(no path)"
+            lines.append(f"- round {f['round']} [{f['severity']}] {spot} {one_line(f['body'])}")
+        talk = p["comments"]
+        for t in talk["threads"]:
+            spot = f"`{t['path']}:{t['line']}`" if t["line"] else f"`{t['path']}`" if t["path"] else "(general)"
+            lines += [f"- thread {spot} **{c['author']}**: {one_line(c['body'])}" for c in t["comments"]]
+        lines += [f"- review **{r['author']}** {r['state']}: {one_line(r['body'])}" for r in talk["reviews"]]
+        lines += [f"- comment **{c['author']}**: {one_line(c['body'])}" for c in talk["comments"]]
+        blocks.append("\n".join(lines))
+    if not data["prs"]:
+        blocks.append("No PRs merged.")
+    parked = [f"- #{x['ticket']} {x['created_at']}: {x['reason']} {x['url']}".rstrip() for x in data["parked"]]
+    blocks.append("\n".join(["Parked:"] + parked) if parked else "Parked: none")
+    return "\n\n".join(blocks)
+
+
+def cmd_learn(args):
+    repo = open_repo()
+    path = repo.state("learn.json")
+    if args.mark:
+        stamp = now_iso()
+        write_json(path, {"last_run": stamp}, prefix=".learn-")
+        emit(args.json, {"last_run": stamp}, f"learn run recorded at {stamp}")
+        return 0
+    record = read_json(path)
+    last_run = record.get("last_run") if isinstance(record, dict) else None
+    last_run = last_run if parse_iso(last_run) is not None else None
+    if args.since is not None:
+        since = parse_iso(args.since)
+        if since is None:
+            raise Problem(f"--since: not an ISO-8601 time: {args.since!r}")
+    elif last_run is not None:
+        since = parse_iso(last_run)
+    else:
+        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=LEARN_DAYS)
+    since = since.replace(microsecond=0)
+    data = {"since": utc_stamp(since), "last_run": last_run, "prs": merged_since(repo, since),
+            "parked": parked_since(repo, since)}
+    emit(args.json, data, learn_text(data))
     return 0
 
 
@@ -2433,9 +2547,9 @@ def rounds_arg(text):
 
 def parser():
     ap = Parser(prog="harness-pr", description="Pull requests for tickets: open, review, findings, checks, ready, "
-                                               "comments, awaiting, ultra, land, gate, revert.")
+                                               "comments, learn, awaiting, ultra, land, gate, revert.")
     sub = ap.add_subparsers(dest="cmd",
-                            metavar="{open,review,findings,checks,ready,comments,awaiting,ultra,land,gate,revert}")
+                            metavar="{open,review,findings,checks,ready,comments,learn,awaiting,ultra,land,gate,revert}")
     sub.required = True
 
     op = sub.add_parser("open", help="push the ticket branch and open (or update) its draft PR")
@@ -2477,6 +2591,12 @@ def parser():
     cm.add_argument("--unresolved", action="store_true", help="unresolved review threads only")
     cm.add_argument("--json", action="store_true")
 
+    lr = sub.add_parser("learn", help="the PRs merged and the tickets parked since the last learn run")
+    lr.add_argument("--since", metavar="ISO",
+                    help=f"the window's start (default: the last run, else {LEARN_DAYS} days ago)")
+    lr.add_argument("--mark", action="store_true", help="record now as the last learn run; list nothing")
+    lr.add_argument("--json", action="store_true")
+
     aw = sub.add_parser("awaiting", help="your open, non-draft PRs")
     aw.add_argument("--all-projects", action="store_true", help="every registered project with an origin remote")
     aw.add_argument("--json", action="store_true")
@@ -2514,7 +2634,8 @@ def parser():
 
 
 COMMANDS = {"open": cmd_open, "review": cmd_review, "findings": cmd_findings, "checks": cmd_checks, "ready": cmd_ready,
-            "comments": cmd_comments, "awaiting": cmd_awaiting, "ultra": cmd_ultra, "land": cmd_land,
+            "comments": cmd_comments, "learn": cmd_learn,
+            "awaiting": cmd_awaiting, "ultra": cmd_ultra, "land": cmd_land,
             "gate": cmd_gate, "revert": cmd_revert}
 
 
