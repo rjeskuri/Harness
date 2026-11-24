@@ -449,6 +449,8 @@ def tool_surface(code, prod, caller_lines, tests, design, add, no_caller):
     for path, options, dest, call in flags:
         name, marks = flag_name(path, options), [bounded(o) for o in options]
         if dest not in read:
+            if code.kept(call):
+                continue
             hits = [t.rel for t in tests if any(m.search(s) for s in t.strings for m in marks)]
             add(code, call.lineno, "flag", name, code.segment(call), set(range(call.lineno, call.end_lineno + 1)),
                 hits, any(m.search(section) for m in marks))

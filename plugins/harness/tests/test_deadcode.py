@@ -505,9 +505,30 @@ class KeepComment(ScanCase):
             if __name__ == "__main__":
                 sys.exit(main())
         ''')
+        flags = dedent('''
+            #!/usr/bin/env python3
+            import argparse
+
+
+            def main():
+                ap = argparse.ArgumentParser(prog="harness-keep")
+                sub = ap.add_subparsers(dest="cmd")
+                sub.required = True
+                ld = sub.add_parser("land")
+                ld.add_argument("--yes", action="store_true")  # deadcode: keep (old sessions still pass it)
+                # deadcode: keep (the owner's muscle memory)
+                ld.add_argument("--force", action="store_true")
+                ld.add_argument("--quiet", action="store_true")
+                args = ap.parse_args()
+                print(args.cmd)
+
+
+            main()
+        ''')
         files = {
             LIB + "keepers.py": keepers,
             BIN + "harness-alpha": "#!/usr/bin/env python3\nimport harness_lib.keepers\n",
+            BIN + "harness-keep": flags,
             HOOKS + "legacy.py": stub,
             HOOKS + "unkept.py": stub.replace("# deadcode: keep (a stub for sessions that started before it was unwired)\n", ""),
         }
@@ -515,6 +536,9 @@ class KeepComment(ScanCase):
         self.assertEqual(self.names_in(out, LIB + "keepers.py"), {"not_kept"})
         self.assertEqual([c for c in out["candidates"] if c["path"] == HOOKS + "legacy.py"], [])
         self.assertTrue(any(c["path"] == HOOKS + "unkept.py" for c in out["candidates"]), out["candidates"])
+        # An unread flag is a candidate unless its add_argument line, or the line above, keeps it.
+        self.assertEqual({last(c["name"]) for c in out["candidates"] if c["path"] == BIN + "harness-keep"},
+                         {"--quiet"})
 
 
 class RecordsAndProtocols(ScanCase):
