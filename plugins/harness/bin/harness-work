@@ -20,6 +20,7 @@ Usage:
     harness-work budget [status | exhaust api|cloud|subscription --reason TEXT [--hours 24]
                          | reset api|cloud|subscription]
     harness-work budget calls [--hours 24] [--json]
+    harness-work budget clear-gh-cache [--json]
     harness-work worktrees [--stale DAYS]
     harness-work branches [--prune]
     harness-work worktree remove BRANCH [--discard]
@@ -275,7 +276,8 @@ UNCOUNTED = ("billing", "auth")   # outcomes of runs that do not count toward RE
 EXHAUST_HOURS = 24.0
 CALLS_HOURS = 24.0            # budget calls: the default window
 CALLS_TOP = 15                # budget calls: rows of the text COMMAND table
-RATE_LIMIT_QUERY = "query=query{rateLimit{limit used remaining resetAt}}"   # budget calls: GitHub's own count
+GH_REFUSAL = re.compile(rb'"type"\s*:\s*"RATE_LIMIT"')   # budget status: a refusal gh cached for 24 h (cli/cli#12812)
+RATE_LIMIT_QUERY ="query=query{rateLimit{limit used remaining resetAt}}"   # budget calls: GitHub's own count
 REASON_MAX = 200
 DIRTY_SHOWN = 10
 GIT_TIMEOUT = 120
@@ -2701,9 +2703,41 @@ def cmd_budget_calls(args):
     print("\n\n".join(parts))
 
 
+def gh_cache_refusals():
+    """The files under gh's cache dir ($XDG_CACHE_HOME/gh, else ~/.cache/gh) whose reply is a cached RATE_LIMIT
+    refusal, sorted; gh replays such an entry for up to 24 h after the quota has reset."""
+    root = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"), "gh")
+    found = []
+    for folder, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(folder, name)
+            try:
+                if os.path.isfile(path) and not os.path.islink(path):
+                    with open(path, "rb") as fh:
+                        if GH_REFUSAL.search(fh.read(1 << 20)):
+                            found.append(path)
+            except OSError:
+                continue
+    return sorted(found)
+
+
+def cmd_budget_clear_gh_cache(args):
+    cleared = []
+    for path in gh_cache_refusals():
+        try:
+            os.remove(path)
+            cleared.append(path)
+        except OSError as err:
+            warn(f"could not remove {path}: {err.strerror or err}")
+    emit(wants_json(args), {"cleared": cleared}, "\n".join(f"cleared {path}" for path in cleared))
+
+
 def cmd_budget(args):
     if args.action == "calls":
         cmd_budget_calls(args)
+        return
+    if args.action == "clear-gh-cache":
+        cmd_budget_clear_gh_cache(args)
         return
     budgets = load_budgets()
     action = args.action or "status"
@@ -2723,7 +2757,14 @@ def cmd_budget(args):
     data = {name: {"exhausted_until": budgets[name].get("exhausted_until"),
                    "reason": budgets[name].get("reason") or "",
                    "exhausted": exhausted_until(budgets[name]) is not None} for name in names}
-    emit(wants_json(args), data, "\n".join(budget_line(name, budgets[name]) for name in names))
+    lines = [budget_line(name, budgets[name]) for name in names]
+    if action == "status":
+        cached = gh_cache_refusals()
+        if cached:
+            data["gh_cache"] = cached
+            lines += [f"gh cache: cached rate-limit refusal {path} (gh replays it for up to 24 h; "
+                      "`harness-work budget clear-gh-cache` removes it)" for path in cached]
+    emit(wants_json(args), data, "\n".join(lines))
 
 
 def cmd_worktrees(repo, args):
@@ -3213,7 +3254,7 @@ def parser():
     drop.add_argument("number", type=issue_number, metavar="N")
 
     budget = sub.add_parser("budget", parents=[with_json], help="the api, cloud and subscription budgets")
-    budget_sub = budget.add_subparsers(dest="action", metavar="{status,exhaust,reset,calls}")
+    budget_sub = budget.add_subparsers(dest="action", metavar="{status,exhaust,reset,calls,clear-gh-cache}")
     budget_sub.add_parser("status", parents=[nested_json], help="each budget's state (the default)")
     ex = budget_sub.add_parser("exhaust", parents=[nested_json], help="mark a budget exhausted")
     ex.add_argument("name", choices=BUDGETS)
@@ -3225,6 +3266,9 @@ def parser():
                                   help="the gh call log: totals by tool, command, ticket and hour, the busiest minute")
     calls.add_argument("--hours", default=str(CALLS_HOURS), metavar="H",
                        help="the window, default 24 (checked by the command: a bad value is one line, exit 1)")
+
+    budget_sub.add_parser("clear-gh-cache", parents=[nested_json],
+                          help="remove gh's cached RATE_LIMIT refusals (status names them)")
 
     wts = sub.add_parser("worktrees", parents=[with_repo, with_json],
                          help="the ticket worktrees with age, PR state and the stale flag")
