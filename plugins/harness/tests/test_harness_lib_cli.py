@@ -74,7 +74,7 @@ MOVED = (
 USED = {
     "harness-board": {
         "Problem": "cli", "Parser": "cli", "table": "cli", "emit": "cli", "issue_number": "cli", "warn": "cli",
-        "one_line": "text", "first_line": "text", "home": "text", "now_iso": "text",
+        "one_line": "text", "first_line": "text", "now_iso": "text",
         "parse_iso": "text", "as_list": "text", "read_text": "text", "write_json": "text",
         "read_json": "text", "harness_home": "text",
     },
@@ -1725,7 +1725,8 @@ class ToolsWarnAndReachStderrOnlyTheirOwnWay(unittest.TestCase):
             streams, printers = stderr_aliases(tree)
             writers = [fn for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
                        and any(isinstance(c, ast.Call) and writes_to_stderr(c, streams, printers) for c in ast.walk(fn))]
-            self.assertNotEqual(writers, [], f"{tool} writes no stderr line of its own: the plant has nowhere to go")
+            if tool == "harness-pr":  # harness-board has no hand-written stderr writer left; the plants above cover it
+                self.assertNotEqual(writers, [], f"{tool} writes no stderr line of its own: the plant has nowhere to go")
             for fn in writers:
                 with self.subTest(tool=tool, inside=fn.name):
                     fn.body.insert(0, ast.parse('sys.stderr.write("x: " + chr(87) + "ARNING: m\\n")').body[0])
@@ -2502,8 +2503,8 @@ class ToolsRunTheLib(unittest.TestCase):
     def test_board_finds_its_files_under_home_through_the_lib(self):
         """Repo.ticket_path: the path under HOME comes from the lib."""
         board = load_tool(BIN / "harness-board")
-        self.spy(board, self.text.home, "home")
-        self.spy(board, self.text.harness_home, "harness_home", required=False)
+        self.spy(board, self.text.home, "home", required=False)
+        self.spy(board, self.text.harness_home, "harness_home")
         for home in (os.path.join(self.tmp, "h1"), os.path.join(self.tmp, "Other Home")):
             with self.subTest(home=home), mock.patch.dict(os.environ, {"HOME": home}):
                 repo = object.__new__(board.Repo)
