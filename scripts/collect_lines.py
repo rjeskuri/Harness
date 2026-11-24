@@ -11,7 +11,8 @@ sys.settrace and threading.settrace, keeps the lines it runs of the checkout's p
 (plugins/harness/tests left out) and writes them at exit or SIGTERM to one JSON per process. The wrapped runner
 (scripts/run_suite.py, or scripts/loop_smoke.py run) runs on the venv's python3 with the venv's bin first on PATH.
 Afterwards the per-process files are merged, each line mapped to its statement with ast, into
-~/.claude/harness/deadcode/<repo-key>/<run>/lines.json: {"files": {path: {"executed_lines": [...]}}, "real_run"}.
+~/.claude/harness/deadcode/<repo-key>/<run>/lines.json: {"files": {path: {"executed_lines": [...]}}, "real_run",
+"returncode"}, returncode the wrapped command's exit (130 for a Ctrl-C), so only 0 is a complete run.
 The flag is removed whatever happens. Standard library only, 3.9-compatible.
 """
 from __future__ import annotations
@@ -202,8 +203,10 @@ def collect(argv: list[str], kind: str, real_run: bool) -> int:
             pass
     count = len([n for n in os.listdir(procs) if n.endswith(".json")])
     out = os.path.join(run, "lines.json")
+    data = merge(procs, real_run)
+    data["returncode"] = code  # a reader treats only 0 as a complete run
     with open(out, "w", encoding="utf-8") as fh:
-        json.dump(merge(procs, real_run), fh, indent=1, sort_keys=True)
+        json.dump(data, fh, indent=1, sort_keys=True)
     shutil.rmtree(procs, ignore_errors=True)
     print("collect_lines: %s exit %d, %.0f s, %d processes, %s" % (kind, code, time.monotonic() - started, count, out))
     return 0 if code == 0 else 1

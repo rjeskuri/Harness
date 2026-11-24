@@ -14,8 +14,9 @@ child's exit status and stdout to $FIXTURE_REPORT. HOME is a temporary folder pe
 (~/.claude/harness/deadcode/venv) and the state folder land under it.
 
 The merged line data is found by structure, not by path: a JSON file under ~/.claude/harness/deadcode (outside the
-venv) whose top level holds `files` and `real_run`. Its `files` maps a path relative to the checkout to
-{"executed_lines": [statement lines]}. Expected lines are read from `# @tag` markers in the fixture sources.
+venv) whose top level holds `files` and `real_run`; `returncode` is the wrapped command's exit code. Its `files`
+maps a path relative to the checkout to {"executed_lines": [statement lines]}. Expected lines are read from `# @tag`
+markers in the fixture sources.
 """
 from __future__ import annotations
 
@@ -368,6 +369,7 @@ class SuiteRunTest(unittest.TestCase):
 
     def test_writes_one_suite_json_not_marked_real(self):
         self.assertIs(self.data["real_run"], False)
+        self.assertEqual(self.data["returncode"], 0)
         self.assertIsInstance(self.data["files"], dict)
         for rel, entry in self.data["files"].items():
             self.assertFalse(os.path.isabs(rel), rel)
@@ -512,6 +514,7 @@ class RunsTest(unittest.TestCase):
         self.assertEqual(sorted(d["real_run"] for d in found.values()), [False, True])
         self.assertEqual(len(set(found)), 2)
         real, suite_data = newest(w, True), newest(w, False)
+        self.assertEqual((real["returncode"], suite_data["returncode"]), (0, 0))
         sample, tool = "plugins/harness/lib/sample.py", "plugins/harness/bin/harness-fake"
         self.assertLessEqual(marked(w, sample, "delta"), lines(real, sample))
         self.assertLessEqual(marked(w, tool, "tool-loop"), lines(real, tool))
@@ -531,9 +534,10 @@ class RunsTest(unittest.TestCase):
 
     def test_a_failing_suite_still_writes_its_data_and_turns_collection_off(self):
         w = self.world
-        proc = collect(w, "suite", mode="beta-only", exit_code=1)
+        proc = collect(w, "suite", mode="beta-only", exit_code=3)
         self.assertNotEqual(proc.returncode, 0)
         data = newest(w, False)
+        self.assertEqual(data["returncode"], 3, "lines.json does not record the wrapped command's exit code")
         rel = "plugins/harness/lib/sample.py"
         self.assertLessEqual(marked(w, rel, "beta"), lines(data, rel))
         before = state_files(w)
