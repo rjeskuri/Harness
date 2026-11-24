@@ -32,6 +32,9 @@ The `--json` shape these tests pin (stdout is that one JSON object):
 `line` is the 1-based line of the mutated node, `function` the plain name of the function holding it, `change`
 names the operator replaced and its replacement (e.g. "* -> /"; only the two tokens are pinned). Exit codes: 0 when
 nothing survived, 2 when the baseline fails (no mutant runs), 3 when a mutant survived.
+
+#502: `--changed REF` keeps only the sites on lines that are new or changed in `git diff REF` (a fixture with a
+second commit, run with `--changed HEAD~1`); with `--lines` as well, a site must be on both.
 """
 from __future__ import annotations
 
@@ -389,6 +392,53 @@ class MutateScriptTest(unittest.TestCase):
         self.assertEqual(set(sources), {CALC})
         self.assertEqual(snapshot(self.root), before)
         self.git_clean()
+
+    # ------------------------------------------------------------------------------- #502: --changed by line
+
+    def commit(self, files: dict) -> None:
+        for rel, text in files.items():
+            with open(os.path.join(self.root, rel), "w") as handle:
+                handle.write(text)
+        env = dict(os.environ, **IDENTITY)
+        for args in (("add", "-A"), ("commit", "-q", "-m", "change")):
+            subprocess.run([GIT, "-C", self.root, *args], check=True, capture_output=True, env=env)
+
+    def test_changed_ref_mutates_only_the_sites_on_changed_lines(self):
+        """`--changed REF` keeps a site only when its line is new or changed in `git diff REF`: a line that merely
+        moved (code inserted above it) or a file whose changes hold no site gives no mutant. With `--lines` too,
+        a site must be on both."""
+        added = CALC.replace("def untested(a, b):", "def added(a):\n    return a - 1\n\n\ndef untested(a, b):")
+        two = CALC.replace("return a + b", "return a + b  # two").replace("return a * 3", "return a * 3  # two")
+        rows = [
+            # name, new calc.py, extra args, expected exit, expected {(line, function)} survivors, killed
+            ("one changed line in scale", CALC.replace("return a * 3", "return a * 4"), (), 3,
+             {(line_of(CALC, "a * 3"), "scale")}, 0),
+            ("a function inserted above three others", added, (), 3,
+             {(line_of(added, "a - 1"), "added")}, 0),
+            ("the changed line's site is caught", CALC.replace("return x > 10", "return x > 10  # big"), (), 0,
+             set(), 1),
+            ("only the docstring changed", CALC.replace("are words here", "are only words here"), (), 0,
+             set(), 0),
+            ("two changed lines, --lines picks one", two, ("--lines", str(line_of(two, "a * 3"))), 3,
+             {(line_of(two, "a * 3"), "scale")}, 0),
+        ]
+        for i, (name, new, extra, code, survivors, killed) in enumerate(rows):
+            with self.subTest(name):
+                self.root = os.path.join(self.tmp, f"repo{i}")
+                self.calc_tree()
+                self.commit({f"{LIB}/calc.py": new})
+                proc = self.run_mutate(f"{LIB}/calc.py", "--changed", "HEAD~1", "--tests", "test_calc.py",
+                                       *extra, "--json")
+                self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
+                report = self.report(proc)
+                got = {(s["line"], s["function"]) for s in report["survivors"]}
+                self.assertEqual(got, survivors, report["survivors"])
+                self.assertEqual(report["killed"], killed, report)
+                if not survivors:
+                    self.assertEqual(report["survived"], 0, report)
+                if not survivors and not killed:  # no changed line holds a site: nothing was mutated
+                    self.assertEqual([f for f in report["files"] if f["killed"] or f["survived"]], [])
+                self.git_clean()
 
     # ---------------------------------------------------------------------------------------------- DoD 6
 
