@@ -124,7 +124,11 @@ VS Code had no GitHub session and spent none of the quota. There is no need to c
 
 ## 7. Hazard: a cached refusal replayed for up to 24 h
 
-**Verified:** `~/.cache/gh` holds a refusal written at 03:52:22Z (`RATE_LIMIT`, `X-Ratelimit-Used: 5000`). gh replays it for up to 24 h to any command that sends the same feature-detection request, whatever the quota is now. This is cli/cli#12812, open, reproduced on 2.105.0 on 2026-11-20: https://github.com/cli/cli/issues/12812. Clearing it (the entry, or `gh config clear-cache`) is the owner's call. A refusal while every live read shows points left should be checked against this cache first.
+**Verified:** `~/.cache/gh` holds a refusal written at 03:52:22Z (`RATE_LIMIT`, `X-Ratelimit-Used: 5000`). gh replays it for up to 24 h to any command that sends the same feature-detection request, whatever the quota is now. This is cli/cli#12812, open, reproduced on 2.105.0 on 2026-11-20: https://github.com/cli/cli/issues/12812. A refusal while every live read shows points left should be checked against this cache first.
+
+**Which commands (#470).** **Verified** only for `gh pr checks` (section 1: two of its four requests are feature-detection queries served from the 24 h cache, `X-Gh-Cache-Ttl: 24h0m0s`). **Not confirmed:** the full list of commands that send the cached query and a replayed refusal end to end; that needs `GH_DEBUG=api` runs, which spend quota, so it was not done. The detection is therefore by content, not by command: any file under gh's cache dir whose body holds `"type":"RATE_LIMIT"`.
+
+**Detect and clear (#470).** `harness-work budget status` names each such file (`$XDG_CACHE_HOME/gh`, else `~/.cache/gh`, any depth) and `harness-work budget clear-gh-cache` removes exactly those files and nothing else; a plain `gh config clear-cache` would also drop the valid entries. The entries are regenerable, so clearing costs a few points at most, but it is an explicit command, not run by status or dispatch.
 
 ## 8. How the shim and `budget calls` close the logging gap
 
@@ -146,4 +150,4 @@ VS Code had no GitHub session and spent none of the quota. There is no need to c
 - One real `gh project item-edit` with a dry-run cost of its item-by-URL query, to settle 75 against 101 + 3.
 - ~10 minutes of `gh api -i graphql` `rateLimit` samples with no harness activity, to see whether the two counters converge and which one refuses.
 - https://github.com/settings/applications (owner only): any other OAuth or GitHub App acting as rjeskuri.
-- Whether to delete the cached refusal entry or run `gh config clear-cache` (section 7).
+- Which gh commands send the cached feature-detection query, beyond `pr checks` (section 7, not confirmed).
