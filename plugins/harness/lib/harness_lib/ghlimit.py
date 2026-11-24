@@ -23,6 +23,10 @@ DAY_FILE = re.compile(r"^calls-(\d{4}-\d\d-\d\d)\.jsonl$")
 TICKET_DIR = re.compile(r"/\.claude/worktrees/t-(\d+)-")
 WORKTREES = "/.claude/worktrees/"
 HEX = re.compile(r"^[0-9a-fA-F]{7,40}$")
+# Estimated GraphQL points of one logged call by call_name, from the costs measured in
+# docs/research/github-quota.md; any other graphql call is 1 and a REST call 0. The item-edit entry drops once
+# the board mirror edits by ID (#447).
+POINTS = {"project item-edit": 104, "project item-list": 101}
 
 
 def gh_dir():
@@ -70,6 +74,13 @@ def call_name(args):
     parts = [":n" if p.isdigit() else ":sha" if HEX.match(p) else p for p in parts]
     words = ["api"] + ([method] if method and method.upper() != "GET" else []) + ["/".join(parts)]
     return " ".join(words)
+
+
+def call_points(line):
+    """Estimated GraphQL points of a logged line: 0 unless its kind is graphql, else POINTS[cmd], default 1."""
+    if line.get("kind") != "graphql":
+        return 0
+    return POINTS.get(line.get("cmd"), 1)
 
 
 def ticket_of(cwd):
