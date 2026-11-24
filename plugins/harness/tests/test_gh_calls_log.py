@@ -755,7 +755,7 @@ class Names(unittest.TestCase):
             (["api", "rate_limit"], "api rate_limit", "rest"),
             (["api", "repos/o/r/commits/0123abc4567/check-runs"],
              "api repos/:owner/:repo/commits/:sha/check-runs", "rest"),
-            (["project", "item-edit", "3", "--owner", "o", "--url", "u"], "project item-edit", "graphql"),
+            (["project", "view", "3", "--owner", "o"], "project view", "graphql"),
             (["run", "view", "987", "--log-failed"], "run view", "rest"),
             # more of the same rules, so no row is a special case
             (["pr", "view", "34", "--json", "statusCheckRollup"], "pr view", "graphql"),

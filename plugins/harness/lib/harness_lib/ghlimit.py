@@ -24,9 +24,8 @@ TICKET_DIR = re.compile(r"/\.claude/worktrees/t-(\d+)-")
 WORKTREES = "/.claude/worktrees/"
 HEX = re.compile(r"^[0-9a-fA-F]{7,40}$")
 # Estimated GraphQL points of one logged call by call_name, from the costs measured in
-# docs/research/github-quota.md; any other graphql call is 1 and a REST call 0. The item-edit entry drops once
-# the board mirror edits by ID (#447).
-POINTS = {"project item-edit": 104, "project item-list": 101}
+# docs/research/github-quota.md; any other graphql call is 1 and a REST call 0.
+POINTS = {"project item-list": 101}
 
 
 def gh_dir():

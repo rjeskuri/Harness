@@ -21,7 +21,7 @@ kept in <scenario>.state.json. Without a match and without "default" the fake pr
 `fakegh: no match for: gh ...` on stderr and exits 1.
 
 The REST layer (#447). After the "calls" entries and before "default", `gh api` calls on GitHub's issue and pull
-request REST routes are answered from the scenario's world, and `gh project` calls from its board:
+request REST routes are answered from the scenario's world:
 - "issues": {"12": {...}} and, in "calls", entries {"issue": 12, "data": {...}} (issue_entry): each issue in the
   shape `gh issue view --json` prints (number, title, body, state OPEN|CLOSED, stateReason, url, labels as
   [{"name"}] or names, comments as [{"author": {"login"}, "body", "createdAt", "url"}], parent as a number or
@@ -32,9 +32,6 @@ request REST routes are answered from the scenario's world, and `gh project` cal
 - "pulls" (or "calls" entries {"pulls": [...]}, pulls_entry): pull requests in `gh pr list --json` shape (number,
   state OPEN|CLOSED|MERGED, isDraft, mergedAt, url, body, title, headRefName, headRefOid, createdAt); a row without
   headRefName belongs to every branch.
-- "project": a board, or a list of them (board()): {"owner", "number", "id", "fields": [{"id", "name", "options":
-  [{"id", "name"}]}], "items": {url: id}}, for `gh project view|field-list|item-add|item-list N --owner O` and
-  `gh project item-edit` by IDs; "refuse": true refuses every item-edit.
 - "rest" entries in "calls" (rest_entry): {"rest": "issues/12/labels", "method": "POST"} answers any call on that
   route (or below it, unless "exact"; a `*` segment matches any one) with that method (any when absent), and for
   "branch" only a pulls list whose head names that branch, with the entry's response(s), before the world does.
@@ -50,16 +47,13 @@ issues/N/dependencies/blocked_by, issues?labels=a,b&state=open|closed|all, pulls
 leave the world as it was (each read answers the scenario): POST issues/N/labels, PUT issues/N/labels,
 DELETE issues/N/labels/NAME (404 when the issue lacks it), POST issues/N/comments (html_url
 <issue url>#issuecomment-1), PATCH issues/N, POST issues/N/sub_issues, POST issues/N/dependencies/blocked_by.
-gh project item-edit takes --id, --project-id, --field-id and --single-select-option-id; an ID the board does not
-hold is refused (`GraphQL: Could not resolve to a node with the global id of '<id>'`, exit 1); the value set is kept
-in <scenario>.state.json (project_values). By name (--field/--value) it is refused.
 
 Every invocation appends one JSON line {"argv": [...], "stdin": "..."} to the file named by
 FAKEGH_LOG (plus "exit" for a call the REST layer answered), so tests can assert on the exact calls made.
 gh_view(entries, scenario_path) reads them back with the REST issue writes as the gh commands they stand for (issue
 edit --add-label/--remove-label, issue comment --body, issue close [--comment] for a comment then a PATCH, issue
 reopen), so a test can compare what changed on GitHub whichever route made it; issue_gets, list_queries,
-pull_queries and board_writes read the reads, the list and pulls queries and the board's changes back.
+pull_queries read the reads, the list and pulls queries back.
 """
 from __future__ import annotations
 
@@ -200,23 +194,6 @@ def rest_entry(route, method=None, exact=False, **response):
     if exact:
         entry["exact"] = True
     return entry
-
-
-def board(project, fields, items=(), generation=1):
-    """A Projects board for the "project" key: OWNER/NUMBER, {field name: [option names]}, the issue URLs already
-    on it, and the generation of its field and option IDs (a field made again gets new ones; the board's own ID and
-    its items' stay)."""
-    owner, number = project.split("/")
-    tag = re.sub(r"\W", "_", project)
-
-    def ident(*parts):
-        return "_".join([tag] + [re.sub(r"\W", "_", p.lower()) for p in parts] + [f"g{generation}"])
-
-    return {"owner": owner, "number": int(number), "id": f"PVT_{tag}",
-            "fields": [{"id": "PVTSSF_" + ident(name), "name": name,
-                        "options": [{"id": "OPT_" + ident(name, o), "name": o} for o in opts]}
-                       for name, opts in fields.items()],
-            "items": {url: f"PVTI_PVT_{tag}_{url.rstrip('/').rsplit('/', 1)[-1]}" for url in items}}
 
 
 ISSUE_WRITES = {"edit": ("labels", None), "close": ("", "PATCH"), "reopen": ("", "PATCH"),
@@ -553,12 +530,10 @@ class World:
         for row in self.issue_list or []:           # a listed row is an issue too, under any entry of its own
             if isinstance(row, dict) and str(row.get("number", "")).isdigit():
                 self.merge(row["number"], row)
-        self.project = scenario.get("project") if isinstance(scenario.get("project"), (dict, list)) else None
         self.login = scenario.get("login") or DEFAULT_LOGIN
         self.active = bool(self.issues or self.any_issue or self.issue_list is not None or self.pulls is not None
-                           or self.rest
-                           or self.project or any(c.get("world") for c in scenario.get("calls", [])
-                                                  if isinstance(c, dict)))
+                           or self.rest or any(c.get("world") for c in scenario.get("calls", [])
+                                               if isinstance(c, dict)))
 
     def merge(self, key, data):
         n = int(key)
@@ -568,8 +543,6 @@ class World:
 
     # ---------------------------------------------------- dispatch
     def serve(self, argv, stdin, state, state_path):
-        if argv[:1] == ["project"]:
-            return self.serve_project(argv, state, state_path) if self.project else None
         req = parse_api(argv, stdin)
         if req is None:
             return None
@@ -796,70 +769,6 @@ class World:
             per_page, page = PER_PAGE, 1
         return {"stdout_json": rows[(page - 1) * per_page: page * per_page]}
 
-    # ---------------------------------------------------- the Projects board
-    def serve_project(self, argv, state, state_path):
-        verb = argv[1] if len(argv) > 1 else ""
-        opts, positional = options(argv[2:])
-        number = positional[0] if positional else None
-        wants_json = opts.get("--format") == "json"
-        added = state.setdefault("project", {}).setdefault("items", {})
-        values = state["project"].setdefault("values", {})
-        if verb == "item-edit":
-            if "--field" in opts or "--value" in opts or "--url" in opts:
-                return {"stderr": "fakegh: item-edit by name is not served by the board; pass --id, --project-id, "
-                                  "--field-id and --single-select-option-id\n", "exit": 1}
-            item, project_id = opts.get("--id"), opts.get("--project-id")
-            field_id, option_id = opts.get("--field-id"), opts.get("--single-select-option-id")
-            board = next((b for b in self.boards() if b.get("id") == project_id and not b.get("refuse")), None)
-            items = board_items(board, added) if board else {}
-            field = next((f for f in (board or {}).get("fields") or [] if f.get("id") == field_id), None)
-            option = next((o for o in (field or {}).get("options") or [] if o.get("id") == option_id), None)
-            for given, known in ((project_id, board is not None), (item, item in items.values()),
-                                 (field_id, field is not None), (option_id, option is not None)):
-                if not known:
-                    return {"stderr": f"GraphQL: Could not resolve to a node with the global id of '{given}'. "
-                                      "(updateProjectV2ItemFieldValue)\n", "exit": 1}
-            values.setdefault(item, {})[field["name"]] = option["name"]
-            save_state(state_path, state)
-            return {"stdout_json": {"id": item}} if wants_json else {"stdout": ""}
-        if verb not in ("view", "field-list", "item-add", "item-list"):
-            return None
-        board = next((b for b in self.boards() if number == str(b.get("number"))
-                      and opts.get("--owner") == b.get("owner")), None)
-        if board is None:
-            return {"stderr": f"Could not resolve to a ProjectV2 with the number {number}.\n", "exit": 1}
-        items = board_items(board, added)
-        if verb == "view":
-            return {"stdout_json": {"id": board.get("id"), "number": board.get("number"),
-                                    "title": board.get("title", "Board"), "owner": {"login": board.get("owner")}}}
-        if verb == "field-list":
-            fields = [dict(f, type=f.get("type") or ("ProjectV2SingleSelectField" if f.get("options") is not None
-                                                     else "ProjectV2Field")) for f in board.get("fields") or []]
-            return {"stdout_json": {"fields": fields, "totalCount": len(fields)}}
-        if verb == "item-add":
-            url = opts.get("--url")
-            if not url:
-                return {"stderr": "required flag(s) \"url\" not set\n", "exit": 1}
-            item = items.get(url)
-            if item is None:
-                m = re.search(r"/(\d+)$", url)
-                item = f"PVTI_{board.get('id')}_{m.group(1) if m else len(items) + 1}"
-                added.setdefault(str(board.get("id")), {})[url] = item
-                save_state(state_path, state)
-            return {"stdout_json": {"id": item, "type": "Issue", "url": url}} if wants_json else {"stdout": ""}
-        rows = [dict({"id": i, "content": {"url": u, "type": "Issue"}},
-                     **{k.lower(): v for k, v in values.get(i, {}).items()}) for u, i in items.items()]
-        return {"stdout_json": {"items": rows, "totalCount": len(rows)}}
-
-    def boards(self):
-        project = self.project
-        return [b for b in (project if isinstance(project, list) else [project]) if isinstance(b, dict)]
-
-
-def board_items(board, added):
-    """{url: item id} on `board`: its fixture's items and the ones item-add put there."""
-    return dict(board.get("items") or {}, **added.get(str(board.get("id")), {}))
-
 
 def route_matches(pattern, route, exact=False):
     """Whether `route` is `pattern` or (unless `exact`) below it; a `*` segment of the pattern matches any one."""
@@ -1032,48 +941,6 @@ def issue_gets(entries, number):
     return sum(1 for e in entries
                for req in [parse_api(e.get("argv") or [], e.get("stdin") or "")]
                if req is not None and req["method"] == "GET" and req["route"] == f"issues/{n}")
-
-
-def board_writes(entries, scenario_path):
-    """What the gh project calls the board answered changed, in order: ("item-add", "OWNER/NUMBER", url) for an
-    issue added that was not on the board, ("item-edit", "OWNER/NUMBER", url, field, option) for a value set, by
-    names, whether the call named IDs or (a "calls" answer aside) names. Reads, resolving an item already there
-    and refused calls change nothing."""
-    with open(scenario_path, encoding="utf-8") as fh:
-        world = World(json.load(fh))
-    on_board = {str(b.get("id")): dict(b.get("items") or {}) for b in world.boards()}
-    out = []
-    for entry in entries:
-        argv = entry.get("argv") or []
-        if argv[:1] != ["project"] or entry.get("exit", 0) != 0 or "exit" not in entry:
-            continue
-        opts, pos = options(argv[2:])
-        if "--project-id" in opts:
-            board = next((b for b in world.boards() if b.get("id") == opts["--project-id"]), None)
-        else:
-            board = next((b for b in world.boards() if pos[:1] == [str(b.get("number"))]
-                          and opts.get("--owner") == b.get("owner")), None)
-        if board is None:
-            continue
-        name, items = f"{board.get('owner')}/{board.get('number')}", on_board[str(board.get("id"))]
-        if argv[1] == "item-add" and opts.get("--url") and opts["--url"] not in items:
-            m = re.search(r"/(\d+)$", opts["--url"])
-            items[opts["--url"]] = f"PVTI_{board.get('id')}_{m.group(1) if m else len(items) + 1}"
-            out.append(("item-add", name, opts["--url"]))
-        elif argv[1] == "item-edit" and "--field-id" in opts:
-            url = next((u for u, i in items.items() if i == opts.get("--id")), None)
-            field = next((f for f in board.get("fields") or [] if f.get("id") == opts["--field-id"]), {})
-            option = next((o for o in field.get("options") or []
-                           if o.get("id") == opts.get("--single-select-option-id")), {})
-            out.append(("item-edit", name, url, field.get("name"), option.get("name")))
-    return out
-
-
-def project_values(scenario_path):
-    """{item id: {field name: option name}} the board holds after the item-edit calls, and {url: item id} added."""
-    state = load_state((scenario_path or "fakegh") + ".state.json")
-    project = state.get("project") or {}
-    return project.get("values") or {}
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 """Tests for harness_lib/registry.py (ticket #91, refactor 9 of docs/proposals/refactor.md): one reader
-and writer for ~/.claude/harness/projects.json, adopted by harness-projects (strict), harness-board,
+and writer for ~/.claude/harness/projects.json, adopted by harness-projects (strict),
 harness-standup and harness-digest; harness-pr keeps its own reader.
 
 - The tools, as they behave today and must keep behaving (broad, through the command line, each in a
   temporary HOME): the four messages for an unreadable registry (not valid JSON, cannot read, wrong
-  shape, wrong version) word for word from all four tools; harness-projects refuses an entry without
-  a path (`project N has no path`, N counted from 1) where board, standup and digest skip it; the
+  shape, wrong version) word for word from all three tools; harness-projects refuses an entry without
+  a path (`project N has no path`, N counted from 1) where standup and digest skip it; the
   standup's `--json` projects keep exactly today's keys and values (name, path, billable, client and
   the report fields; no notes, no unknown keys); `harness-standup <key>` picks by exact name, any
   case, or path; harness-projects keeps unknown entry keys through a write; harness-pr's reader still
@@ -29,7 +29,6 @@ import dataclasses
 import importlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -47,11 +46,10 @@ LIB = PLUGIN / "lib"
 REGISTRY_PY = LIB / "harness_lib" / "registry.py"
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 GIT = shutil.which("git")
-READERS = ("harness-projects", "harness-board", "harness-standup", "harness-digest")
+READERS = ("harness-projects", "harness-standup", "harness-digest")
 # The arguments that make each tool read the registry before anything else (no gh, no repository needed).
 READ_ARGS = {
     "harness-projects": ["list"],
-    "harness-board": ["project", "sync", "--all-projects"],
     "harness-standup": ["--json"],
     "harness-digest": ["--json"],
 }
@@ -61,7 +59,7 @@ STANDUP_KEYS = {
     "hours_this_month", "sessions", "board", "prs_awaiting", "needs_input", "stale_worktrees", "board_error", "learn",
 }
 KNOWN = ("path", "name", "billable", "client", "notes")
-# Entries that are not a project with a path: skipped by board, standup and digest, refused by harness-projects.
+# Entries that are not a project with a path: skipped by standup and digest, refused by harness-projects.
 PATHLESS = ({"name": "nopath"}, {"path": ""}, {"path": "   "}, {"path": 5, "name": "five"}, {"path": None},
             "just a string", ["a", "list"], 7, None)
 
@@ -143,7 +141,6 @@ def tool_env(home, **extra) -> dict:
         "PYTHONIOENCODING": "utf-8",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CEILING_DIRECTORIES": str(home),
-        "HARNESS_PROJECT": "o/7",          # harness-board project sync needs a board before it reads the registry
         "HARNESS_NOTIFY_SOUND": "",
     }
     env.update(extra)
@@ -163,14 +160,8 @@ def write_registry(home, data=None, text=None) -> str:
     return path
 
 
-def board_skipped(stderr: str) -> list:
-    return re.findall(r"the registered project (.+?) is skipped: ", stderr)
-
-
 def read_names(tool, proc) -> list:
     """The (name or None, path) pairs a reader reported, in the order it reported them."""
-    if tool == "harness-board":
-        return [(None, p) for p in board_skipped(proc.stderr)]
     data = json.loads(proc.stdout)
     if tool == "harness-standup":
         return [(p["name"], p["path"]) for p in data["projects"]]
@@ -246,7 +237,7 @@ class ToolsReadTheRegistry(TempHome):
             with open(path, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["projects"], projects)      # nothing was written
 
-    def test_board_standup_and_digest_skip_an_entry_without_a_path(self):
+    def test_standup_and_digest_skip_an_entry_without_a_path(self):
         names = ("alpha", "beta", "gamma", "delta")
         for shift in range(3):
             good = [{"path": os.path.join(self.home, f"{n}{shift}"), "name": f"{n.title()}{shift}"} for n in names]
@@ -258,16 +249,11 @@ class ToolsReadTheRegistry(TempHome):
                 projects.insert(0, PATHLESS[-2])
             write_registry(self.home, {"version": 1, "projects": projects})
             want = [(p["name"], p["path"]) for p in good]
-            for tool in ("harness-board", "harness-standup", "harness-digest"):
+            for tool in ("harness-standup", "harness-digest"):
                 with self.subTest(tool=tool, shift=shift):
                     proc = run(BIN, tool, READ_ARGS[tool], self.home)
-                    if tool == "harness-board":
-                        self.assertEqual(proc.returncode, 1, proc.stderr)
-                        self.assertEqual(board_skipped(proc.stderr), [p for _, p in want])
-                        self.assertIn("No registered projects to sync.", proc.stdout)
-                    else:
-                        self.assertEqual(proc.returncode, 0, proc.stderr)
-                        self.assertEqual(read_names(tool, proc), want)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(read_names(tool, proc), want)
 
     def test_standup_json_projects_shape(self):
         t = self.home
@@ -446,12 +432,11 @@ class ToolsUseTheLib(TempHome):
         good = [{"path": os.path.join(self.home, n), "name": n.upper()} for n in ("one", "two", "three", "four")]
         write_registry(self.home, {"version": 1, "projects": [good[0], {"name": "x"}, good[1], good[2], good[3]]})
         want = [(p["name"], p["path"]) for p in reversed(good)]
-        for tool in ("harness-board", "harness-standup", "harness-digest"):
+        for tool in ("harness-standup", "harness-digest"):
             with self.subTest(tool=tool):
                 proc = run(self.bin, tool, READ_ARGS[tool], self.home)
                 got = read_names(tool, proc)
-                self.assertEqual(got, [(None, p) for _, p in want] if tool == "harness-board" else want,
-                                 proc.stderr)
+                self.assertEqual(got, want, proc.stderr)
         write_registry(self.home, {"version": 1, "projects": good})
         proc = run(self.bin, "harness-projects", ["--json"], self.home)
         self.assertEqual(proc.returncode, 0, proc.stderr)

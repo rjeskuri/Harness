@@ -237,7 +237,7 @@ class DailyCase(unittest.TestCase):
                if not k.startswith(("HARNESS_", "FAKEGH_", "GIT_", "CLAUDE_", "LAUNCHCTL_", "BODY_"))}
         dirs = [W["fakebin"], os.path.dirname(GIT), os.path.dirname(sys.executable), "/usr/bin", "/bin"]
         env.update(HOME=home, PATH=os.pathsep.join(dict.fromkeys(dirs)), HARNESS_GH=os.path.join(W["fakebin"], "gh"),
-                   HARNESS_LAUNCHCTL=os.path.join(W["fakebin"], "launchctl"), HARNESS_PROJECT="",
+                   HARNESS_LAUNCHCTL=os.path.join(W["fakebin"], "launchctl"),
                    FAKEGH_SCENARIO=self.scenario, FAKEGH_LOG=self.ghlog, BODY_LOG=self.bodylog,
                    LAUNCHCTL_LOG=self.launchlog, GIT_CONFIG_NOSYSTEM="1")
         env.update(extra)

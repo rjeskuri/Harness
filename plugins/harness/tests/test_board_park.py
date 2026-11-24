@@ -35,7 +35,7 @@ REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
 OWNER = {"match": ["api", "user"], "stdout": "rjeskuri\n"}
 MARKER = "<!-- harness -->"
 DROPPED = ("CLAUDE_PROJECT_DIR", "HARNESS_GH", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "HARNESS_NOTIFY_APP",
-           "HARNESS_NOTIFY_SOUND", "HARNESS_PROJECT", "HARNESS_SESSION_PROJECT", "HARNESS_CODE_TIER",
+           "HARNESS_NOTIFY_SOUND", "HARNESS_SESSION_PROJECT", "HARNESS_CODE_TIER",
            "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER", "HARNESS_WAVE_REVIEW")
 
 TASK_BODY = """## Request
@@ -408,7 +408,7 @@ class ParkTest(unittest.TestCase):
                     self.assertIn(needle, p.stderr)
                 changed = [argv for argv in self.calls()
                            if argv[:2] in (["issue", "edit"], ["issue", "comment"], ["issue", "create"],
-                                           ["issue", "close"], ["project", "item-edit"], ["project", "item-add"])
+                                           ["issue", "close"], ["project"])
                            or (argv[:1] == ["api"] and ("POST" in argv or "PATCH" in argv))]
                 self.assertEqual(changed, [])
                 self.assertEqual(self.notifications(), [])

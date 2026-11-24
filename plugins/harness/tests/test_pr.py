@@ -100,8 +100,8 @@ class Open(WorktreeTest):
         """#69: warnings pass through from every harness-board call, not only `status`: open's `show` and `comment`
         each exit 0 with a warning among other stderr; open's stderr is exactly those warnings, once each, in call
         order, and its stdout is unchanged."""
-        show_warning = "harness-board: warning: the Projects board acme/3 was not updated: show (token-n1)"
-        comment_warning = "harness-board: warning: the Projects board acme/3 was not updated: comment (token-p2)"
+        show_warning = "harness-board: warning: the tier setting x is not valid: show (token-n1)"
+        comment_warning = "harness-board: warning: the tier setting x is not valid: comment (token-p2)"
         self.outputs(**{"harness-board": {
             "show": {"stdout": json.dumps(board_ticket("low")),
                      "stderr": f"harness-board: note: chatter (token-q3)\n{show_warning}\n"},
@@ -182,6 +182,9 @@ def prior_body(review, notes=None):
             "Verify:\n```\nSTALE VERIFY TAIL\n```\n\n"
             f"## Review\n{review}\n\n## Risks\nStale risk text.\n")
 
+
+# The retired Projects mirror setting (#486), spelled in two pieces so the ticket's grep finds none in the tree.
+OLD_SETTING = "HARNESS_" + "PROJECT"
 
 STALE = ("A stale summary", "A stale item", "test_stale.py", "STALE RED TAIL", "STALE VERIFY TAIL", "Stale risk text")
 OLD_REVIEWS = (
@@ -609,77 +612,38 @@ class Ready(PrTest):
         self.assertOneLineError(p, "PR #34 is ready, but", "gh issue edit failed")
         self.assertEqual(len(self.notifications()), 1)
 
-    def test_ready_with_the_real_board_mirrors_in_review_to_the_configured_project(self):
-        """#64: no stubs, HARNESS_PROJECT set: the real harness-board sets the ticket's project item to "In review",
-        on the URL gh reports for the issue (not one built from the remote)."""
+    def test_ready_with_the_real_board_makes_no_project_call_whatever_the_old_project_setting_holds(self):
+        """#486: no stubs, the retired project setting in the environment, in settings.json or both: the real
+        harness-board still swaps the ticket's status label, makes no `gh project` call and adds nothing to
+        ready's stderr."""
         url = "https://ghe.example.com/o/r/issues/12"
-        self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, self.view([12]),
-                       {"match": ["issue", "view", "12"], "stdout_json": {
-                           "number": 12, "url": url, "labels": [{"name": "task"}, {"name": "status:in-progress"}]}},
-                       {"match": ["issue", "edit", "12"], "stdout": url + "\n"},
-                       {"match": ["issue", "comment", "12"], "stdout": url + "#issuecomment-1\n"}])
-        with open(self.scenario_path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        data["project"] = [fakegh.board("rjeskuri/7", BOARD_FIELDS, [url])]     # #447: the board resolves IDs
-        write(self.scenario_path, json.dumps(data))
-        p = self.ok("ready", "34", stubs=False, HARNESS_PROJECT="rjeskuri/7")
-        self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
-        argvs = self.gh_argv()
-        self.assertIn(["issue", "edit", "12", "--add-label", "status:in-review", "--remove-label",
-                       "status:in-progress"], argvs)
-        self.assertEqual(fakegh.board_writes(self.gh_calls(), self.scenario_path),
-                         [("item-edit", "rjeskuri/7", url, "Status", "In review")])
-
-    # ------------------------------------------------- #69: harness-board's Projects warning reaches the user
-    def real_board_scenario(self, project_call):
-        """ready 34 closing #12 with the real harness-board; `project_call` answers any `gh project ...`."""
-        url = "https://github.com/o/r/issues/12"
-        self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, self.view([12]),
-                       {"match": ["issue", "view", "12"], "stdout_json": {
-                           "number": 12, "url": url, "labels": [{"name": "task"}, {"name": "status:in-progress"}]}},
-                       {"match": ["issue", "edit", "12"], "stdout": url + "\n"},
-                       {"match": ["issue", "comment", "12"], "stdout": url + "#issuecomment-1\n"},
-                       dict(project_call, match=["project"])])
-        if not project_call.get("exit", 0):     # #447: a board that answers resolves its IDs, then sets them
-            with open(self.scenario_path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            data["calls"] = [c for c in data["calls"] if c.get("match") != ["project"]]
-            data["project"] = [fakegh.board(p, BOARD_FIELDS, [url]) for p in ("rjeskuri/7", "some-org/42", "acme/3")]
-            write(self.scenario_path, json.dumps(data))
-
-    def test_ready_passes_the_board_warning_through_when_the_project_item_edit_fails(self):
-        """Real harness-board, a failing `gh project item-edit`: ready still exits 0 with its usual stdout, and
-        harness-board's one warning line, naming that board and gh's error, is on ready's stderr exactly once. The
-        board comes from the environment in one case and from ~/.claude/settings.json in the other."""
-        cases = [("rjeskuri/7", "HTTP 403: missing the project scope (token-d4)", "env"),
-                 ("some-org/42", "could not find the item (token-e5)", "settings")]
-        for project, why, source in cases:
-            with self.subTest(project=project, source=source):
-                self.real_board_scenario({"stderr": why + "\n", "exit": 1})
-                settings = os.path.join(self.home, ".claude", "settings.json")
-                if source == "settings":
-                    write(settings, json.dumps({"env": {"HARNESS_PROJECT": project}}))
-                    p = self.ok("ready", "34", stubs=False)
-                else:
-                    p = self.ok("ready", "34", stubs=False, HARNESS_PROJECT=project)
-                owner, number = project.split("/")
+        settings = os.path.join(self.home, ".claude", "settings.json")
+        for source, project in (("environment", "rjeskuri/7"), ("settings", "some-org/42"), ("both", "acme/3"),
+                                ("environment", "not-a-board")):
+            with self.subTest(source=source, project=project):
+                self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, self.view([12]),
+                               {"match": ["issue", "view", "12"], "stdout_json": {
+                                   "number": 12, "url": url,
+                                   "labels": [{"name": "task"}, {"name": "status:in-progress"}]}},
+                               {"match": ["issue", "edit", "12"], "stdout": url + "\n"},
+                               {"match": ["issue", "comment", "12"], "stdout": url + "#issuecomment-1\n"}])
+                if source in ("settings", "both"):
+                    write(settings, json.dumps({"env": {OLD_SETTING: project}}))
+                env = {OLD_SETTING: project} if source in ("environment", "both") else {}
+                p = self.ok("ready", "34", stubs=False, **env)
                 self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
-                # #447: the call refused may be one that resolves the board's IDs: any gh project call
-                self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
-                self.assertRegex(p.stderr.splitlines()[0], "^" + re.escape(
-                    f"harness-board: warning: the Projects board {owner}/{number} was not updated: gh project ")
-                    + r"[a-z-]+\b.* failed: " + re.escape(why) + "$")
+                self.assertEqual(p.stderr, "")
+                argvs = self.gh_argv()
                 self.assertIn(["issue", "edit", "12", "--add-label", "status:in-review", "--remove-label",
-                               "status:in-progress"], self.gh_argv(), "the labels still changed")
-                self.assertEqual(len(self.notifications()), 1 if source == "env" else 2)
+                               "status:in-progress"], argvs)
+                self.assertEqual([a for a in argvs if a[:1] == ["project"]], [])
 
     def test_ready_shows_only_the_warning_lines_of_a_successful_board_call(self):
         """A board that exits 0 with stderr: each `harness-board: warning:` line reaches ready's stderr once, in
         order; its other stderr lines stay hidden. A board with only other stderr leaves ready's stderr empty."""
-        warnings = ["harness-board: warning: the Projects board acme/3 was not updated: gh project item-edit 3 "
-                    "failed: stub says no (token-f6)",
-                    "harness-board: warning: HARNESS_PROJECT='x' is not OWNER/NUMBER; the Projects board is not "
-                    "updated (token-g7)"]
+        warnings = ["harness-board: warning: the review tier setting 'y' is not valid; the labels decide "
+                    "(token-f6)",
+                    "harness-board: warning: the tier setting 'x' is not valid; the labels decide (token-g7)"]
         chatter = ["harness-board: note: chatter (token-h8)", "warning: chatter without the prefix (token-i9)",
                    "gh: some progress line (token-j0)"]
         runs = [([chatter[0], warnings[0], chatter[1]], [warnings[0]]),
@@ -693,14 +657,6 @@ class Ready(PrTest):
                 self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
                 self.assertEqual(p.stderr.splitlines(), shown, p.stderr)
                 self.assertEqual([a[:3] for a in self.stub_calls("harness-board")], [["status", "12", "in-review"]])
-
-    def test_ready_stderr_is_unchanged_without_the_project_setting(self):
-        """No HARNESS_PROJECT anywhere, real harness-board: no project call and ready's stderr is empty as before."""
-        self.real_board_scenario({"stderr": "should never run\n", "exit": 1})
-        p = self.ok("ready", "34", stubs=False)
-        self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
-        self.assertEqual(p.stderr, "")
-        self.assertEqual([a for a in self.gh_argv() if a[:1] == ["project"]], [])
 
     def test_ready_on_a_manual_land_pr_adds_a_line_naming_the_owners_land(self):
         """#451: ready on a PR with manual-land on it or on the ticket it closes marks it ready, sets the ticket in

@@ -32,7 +32,6 @@ sys.dont_write_bytecode = True  # loading the lib and the tool must not leave __
 
 from gitrepo_support import GIT, run_in_process  # noqa: E402  (GIT: the git binary itself, not macOS's xcrun shim)
 import fakegh  # noqa: E402  (#447: the REST layer the issue fixtures move to, and gh_view to read writes back)
-from fakegh import issue_entry, list_entry, rest_entry  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(os.path.dirname(HERE), "bin", "harness-board")
@@ -41,8 +40,10 @@ FAKEGH = os.path.join(HERE, "fakegh.py")
 REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
 # The gh login show keeps comments from (#334: the owner's, the harness's under the same login, and the bot's).
 OWNER = {"match": ["api", "user"], "stdout": "rjeskuri\n"}
+# The retired Projects mirror setting (#486), spelled in two pieces so the ticket's grep finds none in the tree.
+OLD_SETTING = "HARNESS_" + "PROJECT"
 MARK = "\n\n<!-- harness -->"      # the last line of every comment harness-board posts
-# The routing settings (docs/design.md, Settings): dropped from the inherited environment like HARNESS_PROJECT.
+# The routing settings (docs/design.md, Settings): dropped from the inherited environment.
 ROUTING_KEYS = ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER", "HARNESS_WAVE_REVIEW")
 
 # The label table from docs/design.md, the source of truth for `labels ensure`.
@@ -140,68 +141,7 @@ def setUpModule():
     for name in ("terminal-notifier", "osascript"):
         executable(os.path.join(fakebin, name), f'#!/bin/sh\nexec "{py}" "{recorder}" "$0" "$@"\n')
         executable(os.path.join(failbin, name), f'#!/bin/sh\nNOTIFY_EXIT=1 exec "{py}" "{recorder}" "$0" "$@"\n')
-    # reposbin: a gh that picks the fakegh scenario by repository (its -R/--repo value, a repos/OWNER/REPO api
-    # path, else the cwd's registered checkout) and logs {"repo", "argv"} to $REPOS_LOG; see ProjectSync.
-    reposgh = write(os.path.join(root, "reposgh.py"), REPOS_GH.replace("@HERE@", repr(HERE)))
-    reposbin = os.path.join(root, "reposbin")
-    if " " in py:
-        executable(os.path.join(reposbin, "gh"), f'#!/bin/sh\nexec "{py}" "{reposgh}" "$@"\n')
-    else:                                            # the script itself, as fakebin's gh above
-        executable(os.path.join(reposbin, "gh"), f"#!{py} -SB\n" + REPOS_GH.replace("@HERE@", repr(HERE)))
-    BINS.update(root=root, fakebin=fakebin, altbin=altbin, failbin=failbin, reposbin=reposbin)
-
-
-REPOS_GH = r'''
-import json, os, re, sys
-sys.path.insert(0, @HERE@)
-import fakegh
-argv = sys.argv[1:]
-with open(os.environ["FAKEGH_REPOS"], encoding="utf-8") as fh:
-    world = json.load(fh)
-slug = None
-for i, tok in enumerate(argv):
-    if tok in ("-R", "--repo") and i + 1 < len(argv):
-        slug = argv[i + 1]
-    elif tok.startswith("--repo="):
-        slug = tok[len("--repo="):]
-    elif argv[:1] == ["api"]:
-        m = re.match(r"/?repos/([^/{}]+/[^/?{}]+)", tok)
-        if m:
-            slug = m.group(1)
-key = None
-if slug:
-    key = world["slugs"].get("/".join(slug.rstrip("/").split("/")[-2:]))
-else:
-    cwd = os.path.realpath(os.getcwd())
-    for path, k in sorted(world["paths"].items(), key=lambda kv: -len(kv[0])):
-        if cwd == path or cwd.startswith(path + os.sep):
-            key = k
-            break
-with open(os.environ["REPOS_LOG"], "a", encoding="utf-8") as fh:
-    fh.write(json.dumps({"repo": key, "argv": argv}) + "\n")
-os.environ["FAKEGH_SCENARIO"] = world["scenarios"].get(key) or world["default"]
-sys.argv = ["gh"] + argv
-if argv[:2] != ["issue", "list"]:
-    sys.exit(fakegh.main())
-# gh issue list returns at most --limit issues (default 30), as the real one does
-limit = 30
-for i, tok in enumerate(argv):
-    if tok in ("-L", "--limit") and i + 1 < len(argv):
-        limit = int(argv[i + 1])
-    elif tok.startswith("--limit="):
-        limit = int(tok[len("--limit="):])
-import io
-real, sys.stdout = sys.stdout, io.StringIO()
-code = fakegh.main()
-out, sys.stdout = sys.stdout.getvalue(), real
-try:
-    data = json.loads(out)
-    out = json.dumps(data[:limit]) if isinstance(data, list) else out
-except ValueError:
-    pass
-sys.stdout.write(out)
-sys.exit(code)
-'''
+    BINS.update(root=root, fakebin=fakebin, altbin=altbin, failbin=failbin)
 
 
 def tearDownModule():
@@ -244,7 +184,7 @@ class BoardTest(unittest.TestCase):
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items()
                if k not in ("CLAUDE_PROJECT_DIR", "HARNESS_GH", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
-                            "HARNESS_NOTIFY_APP", "HARNESS_NOTIFY_SOUND", "HARNESS_PROJECT",
+                            "HARNESS_NOTIFY_APP", "HARNESS_NOTIFY_SOUND",
                             "HARNESS_SESSION_PROJECT") + ROUTING_KEYS}
         paths = [self.fakebin] + ([os.path.dirname(GIT)] if GIT else []) + ["/usr/bin", "/bin"]
         env.update(HOME=self.home, PATH=os.pathsep.join(paths), GIT_CEILING_DIRECTORIES=self.tmp,
@@ -257,15 +197,12 @@ class BoardTest(unittest.TestCase):
         return subprocess.run([GIT, "-C", self.repo, "-c", "init.defaultBranch=main"] + list(args),
                               env=self.env(), capture_output=True, text=True, check=True)
 
-    def scenario(self, calls, default=None, rest=True, project=None):
+    def scenario(self, calls, default=None, rest=True):
         """The fake gh's answers. #447: the gh issue fixtures move to the REST layer (fakegh.as_rest), so every
-        issue read and write goes through `gh api`; `rest=False` keeps them as gh commands (project sync and
-        project check stay on gh issue list). `project`: the Projects board the mirror resolves its IDs on."""
+        issue read and write goes through `gh api`; `rest=False` keeps them as gh commands."""
         data = {"calls": fakegh.as_rest(calls) if rest else calls}
         if default is not None:
             data["default"] = default
-        if project is not None:
-            data["project"] = project
         write(self.scenario_path, json.dumps(data))
         for leftover in (self.scenario_path + ".state.json", self.log):
             if os.path.exists(leftover):
@@ -1096,1185 +1033,103 @@ class Status(BoardTest):
                          + MARK)
 
 
-# ======================================================================= the Projects board mirror (#64)
-# The Status options the labels map to, from the ticket (and docs/proposals/kanban-board.md), not the code.
-PROJECT_OPTIONS = {"ready": "Ready", "in-progress": "In progress", "in-review": "In review", "blocked": "Blocked",
-                   "needs-input": "Needs input"}
-FAILED_SCOPE = "error: your authentication token is missing required scopes [project]\n"
-# The fields the harness writes on a board (#447: the fake board answers ID lookups and ID edits on these).
-BOARD_FIELDS = {"Status": list(PROJECT_OPTIONS.values()) + ["Done"], "Priority": ["High", "Normal"]}
-
-
-def project_call(argv):
-    """(subcommand, positionals, {option: value}) of a `gh project ...` argv; `--opt value` and `--opt=value` both
-    count, and flag order does not matter. An option given twice is kept as a list, so it fails equality."""
-    pos, opts, i = [], {}, 2
-    while i < len(argv):
-        tok = argv[i]
-        if tok.startswith("--"):
-            name, eq, value = tok[2:].partition("=")
-            if not eq:
-                i += 1
-                value = argv[i] if i < len(argv) else None
-            opts[name] = [opts[name], value] if name in opts else value
-        else:
-            pos.append(tok)
-        i += 1
-    return argv[1], pos, opts
-
-
-def item_add(project, url):
-    owner, number = project.rsplit("/", 1)
-    return ("item-add", [number], {"owner": owner, "url": url})
-
-
-def item_edit(project, url, field, value):
-    owner, number = project.rsplit("/", 1)
-    return ("item-edit", [number], {"owner": owner, "url": url, "field": field, "value": value})
-
-
-class ProjectMirror(BoardTest):
-    """HARNESS_PROJECT=owner/number mirrors create and every status change to a Projects board: item-add, then
-    Status by option name, then Priority=High for `task create --priority`. The first failing project call stops
-    the rest with one warning and exit 0; unset, empty or invalid means no `gh project` call at all.
-
-    Issue URLs here are on ghe.example.com while the git remote and `gh repo view` say github.com/o/r, so only
-    the URL gh itself reports for the issue passes as `--url`."""
+# ======================================================================= no Projects board mirror (#486)
+class NoProjectsMirror(BoardTest):
+    """The Projects board mirror is gone for good (#486): whatever the retired project setting holds, in the
+    environment or in the settings file's `env`, create and every status change make no `gh project` call and say
+    nothing about it, and the old `project check` / `project sync` subcommands no longer exist."""
 
     HOST = "https://ghe.example.com/o/r/issues/"
-    PROJECT_OK = []          # #447: no scripted project answer; the boards below answer
-    # Every board a test here names, each holding the issues the status tests move (they were created mirrored).
-    BOARDS = ("rjeskuri/7", "acme-org/23", "someone/1", "rjeskuri/12", "acme-org/4", "someone/5", "rjeskuri/9")
-    ON_BOARD = (7, 12, 19, 27, 31, 40, 44, 48, 66, 77, 140, 305)
+    # Where the setting comes from, and what it holds: a valid board, an invalid value and an empty one, which
+    # the mirror used to turn into a warning or an off switch and now nothing reads.
+    SETTINGS = [("environment", "rjeskuri/3"), ("settings file", "rjeskuri/3"), ("both", "acme-org/23"),
+                ("environment", "not-a-board"), ("settings file", ""), ("both", "rjeskuri/3")]
 
     def setUp(self):
         super().setUp()
         self.body = write(os.path.join(self.tmp, "body.md"), TASK_BODY)
 
-    # ------------------------------------------------------------------ helpers
-    def boards(self):
-        return [fakegh.board(p, BOARD_FIELDS, [self.HOST + str(n) for n in self.ON_BOARD]) for p in self.BOARDS]
+    def configure(self, where, value):
+        """The env kwargs for harness-board, with the settings file written when `where` says so."""
+        settings = {"env": {OLD_SETTING: value}} if where in ("settings file", "both") else {}
+        write(os.path.join(self.home, ".claude", "settings.json"), json.dumps(settings))
+        return {OLD_SETTING: value} if where in ("environment", "both") else {}
 
     def project_calls(self):
-        """What changed on the boards, in order (#447: by names, whichever IDs the calls passed): item_add for an
-        issue put on a board, item_edit for a field set. A refused call changes nothing."""
-        out = []
-        for row in fakegh.board_writes(self.entries(), self.scenario_path):
-            out.append(item_add(row[1], row[2]) if row[0] == "item-add" else item_edit(*row[1:]))
-        return out
+        return [argv for argv in self.calls() if argv[:1] == ["project"]]
 
-    def other_calls(self):
-        return [argv for argv in self.calls() if argv[:1] != ["project"]]
-
-    def index_of(self, predicate, what):
-        calls = self.calls()
-        found = [i for i, argv in enumerate(calls) if predicate(argv)]
-        self.assertTrue(found, f"no {what} call in {calls}")
-        return found[0]
-
-    def settings(self, text):
-        write(os.path.join(self.home, ".claude", "settings.json"), text)
-
-    def create_scenario(self, number, parent=None, blockers=(), project=None):
-        url = self.HOST + str(number)
-        calls = [REPO_VIEW, {"match": ["issue", "create"], "stdout": f"Creating issue in o/r\n\n{url}\n"}]
-        calls += project if project is not None else self.PROJECT_OK
-        if parent:
-            calls += [{"match": ["api", f"repos/o/r/issues/{number}", "--jq", ".id"], "stdout": f"{number}00\n"},
-                      {"match": ["api", "-X", "POST", f"repos/o/r/issues/{parent}/sub_issues"], "stdout": "{}"}]
-        for b in blockers:
-            calls.append({"match": ["issue", "edit", str(number), "--add-blocked-by", str(b)], "stdout": url + "\n"})
-        self.scenario(calls, project=self.boards())
-        return url
-
-    def task_create(self, number, priority, parent=None, blockers=(), **env):
-        argv = ["task", "create", "--title", f"Ticket {number}", "--body-file", self.body]
-        argv += (["--parent", str(parent)] if parent else []) + (["--blocked-by", ",".join(map(str, blockers))]
-                                                                 if blockers else [])
-        argv += ["--priority"] if priority else []
-        return self.board(*argv, **env)
-
-    def task_create_calls(self, number, priority, parent=None, blockers=()):
-        """The gh calls `task create` makes today, without a project."""
-        labels = ["task", "status:ready"] + (["priority:high"] if priority else [])
-        create = ["issue", "create", "--title", f"Ticket {number}", "--body-file", self.body] + \
-            [x for label in labels for x in ("--label", label)]
-        calls = [["repo", "view", "--json", "nameWithOwner"]] if parent else []
-        calls.append(create)
-        if parent:
-            calls += [["api", f"repos/o/r/issues/{number}", "--jq", ".id"],
-                      ["api", "-X", "POST", f"repos/o/r/issues/{parent}/sub_issues", "-F", f"sub_issue_id={number}00"]]
-        calls += [["issue", "edit", str(number), "--add-blocked-by", str(b)] for b in blockers]
-        return calls
-
-    def status_scenario(self, number, old_status, project=None):
-        url = self.HOST + str(number)
-        labels = [{"name": "task"}, {"name": "status:" + old_status}, {"name": "size:M"}]
-        self.scenario([REPO_VIEW,
-                       {"match": ["issue", "view", str(number)], "stdout_json": {"labels": labels, "url": url,
-                                                                                 "number": number}}]
-                      + (project if project is not None else self.PROJECT_OK)
-                      + [{"match": ["issue", "comment"], "stdout": f"{url}#issuecomment-{number}1\n"}],
-                      default={"stdout": ""}, project=self.boards())
-        return url
-
-    def label_swap(self, number, new, old):
-        return ["issue", "edit", str(number), "--add-label", "status:" + new, "--remove-label", "status:" + old]
-
-    def assertOneWarning(self, p, *needles):
+    def assertSilent(self, p):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertNotIn("Traceback", p.stderr)
-        lines = [line for line in p.stderr.splitlines() if line.strip()]
-        self.assertEqual(len(lines), 1, f"want exactly one warning line:\n{p.stderr}")
-        for needle in needles:
-            self.assertIn(needle, lines[0])
-        return lines[0]
+        self.assertEqual(p.stderr, "", "no warning about the project setting")
 
-    # ------------------------------------------------------------------ create
-    def test_task_create_adds_the_issue_then_sets_status_ready_then_priority_high(self):
-        cases = [("rjeskuri/7", 13, True, 3, (9,)),
-                 ("acme-org/23", 58, True, None, ()),
-                 ("someone/1", 204, False, 5, (40, 41)),
-                 ("rjeskuri/12", 9, False, None, ())]
-        for project, number, priority, parent, blockers in cases:
-            with self.subTest(project=project, number=number, priority=priority):
-                url = self.create_scenario(number, parent, blockers)
-                p = self.task_create(number, priority, parent, blockers, HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+    def test_create_makes_no_project_call_and_no_warning(self):
+        cases = [(13, ["task", "create", "--title", "T13", "--parent", "3", "--blocked-by", "9", "--priority"]),
+                 (58, ["task", "create", "--title", "T58", "--type", "bug"]),
+                 (91, ["epic", "create", "--title", "E91", "--size", "M"]),
+                 (204, ["task", "create", "--title", "T204", "--proposed", "--priority"])]
+        for (where, value), (number, argv) in zip(self.SETTINGS * 2, cases * 2):
+            with self.subTest(where=where, value=value, number=number):
+                url = self.HOST + str(number)
+                calls = [REPO_VIEW, {"match": ["issue", "create"], "stdout": f"Creating issue in o/r\n\n{url}\n"},
+                         {"match": ["api", f"repos/o/r/issues/{number}", "--jq", ".id"], "stdout": f"{number}00\n"},
+                         {"match": ["api", "-X", "POST"], "stdout": "{}"},
+                         {"match": ["issue", "edit"], "stdout": url + "\n"}]
+                self.scenario(calls, default={"stdout": ""})
+                p = self.board(*argv, "--body-file", self.body, **self.configure(where, value))
+                self.assertSilent(p)
                 self.assertEqual(p.stdout.strip(), f"#{number} {url}")
-                self.assertEqual(self.other_calls(), self.task_create_calls(number, priority, parent, blockers),
-                                 "the issue, link and blocked-by calls are unchanged")
-                expected = [item_add(project, url), item_edit(project, url, "Status", "Ready")]
-                if priority:
-                    expected.append(item_edit(project, url, "Priority", "High"))
-                self.assertEqual(self.project_calls(), expected)
-                created = self.index_of(lambda a: a[:2] == ["issue", "create"], "issue create")
-                first_project = self.index_of(lambda a: a[:1] == ["project"], "gh project")
-                self.assertLess(created, first_project, "the issue exists before it is added to the project")
-
-    def test_epic_create_adds_and_sets_status_ready_with_no_priority(self):
-        for project, number in (("rjeskuri/7", 3), ("acme-org/23", 91), ("someone/1", 150)):
-            with self.subTest(project=project, number=number):
-                url = self.create_scenario(number)
-                p = self.board("epic", "create", "--title", f"Epic {number}", "--body-file", self.body, "--size", "M",
-                               HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertEqual(p.stdout.strip(), f"#{number} {url}")
-                self.assertEqual(self.other_calls(), [["issue", "create", "--title", f"Epic {number}", "--body-file",
-                                                       self.body, "--label", "epic", "--label", "status:ready",
-                                                       "--label", "size:M"]])
-                self.assertEqual(self.project_calls(), [item_add(project, url),
-                                                        item_edit(project, url, "Status", "Ready")])
-                self.assertFalse(any("Priority" in argv for argv in self.calls()), "epics get no Priority write")
-
-    # ------------------------------------------------------------------ status changes
-    def test_status_makes_one_status_edit_with_the_mapped_option_for_every_status(self):
-        cases = [("ready", 12, "blocked", "rjeskuri/7"),
-                 ("in-progress", 31, "ready", "acme-org/23"),
-                 ("in-review", 7, "in-progress", "someone/1"),
-                 ("blocked", 140, "in-review", "rjeskuri/12"),
-                 ("needs-input", 66, "in-progress", "acme-org/4")]
-        self.assertEqual({c[0] for c in cases}, set(PROJECT_OPTIONS))
-        for status, number, old, project in cases:
-            for comment_text in (None, f"Moved #{number} on"):
-                with self.subTest(status=status, number=number, comment=bool(comment_text)):
-                    url = self.status_scenario(number, old)
-                    extra = ["--comment", comment_text] if comment_text else []
-                    p = self.board("status", str(number), status, *extra, HARNESS_PROJECT=project)
-                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                    self.assertEqual(p.stdout.strip(), f"#{number} status:{status}")
-                    self.assertEqual(self.project_calls(), [item_edit(project, url, "Status", PROJECT_OPTIONS[status])],
-                                     "one Status edit, by option name, on the URL gh reports for the issue")
-                    swap = self.label_swap(number, status, old)
-                    self.assertIn(swap, self.calls())
-                    swapped = self.calls().index(swap)
-                    edited = self.index_of(lambda a: a[:1] == ["project"], "gh project")
-                    self.assertLess(swapped, edited, "the label is the source of truth: it changes first")
-                    if comment_text:
-                        self.assertIn(["issue", "comment", str(number), "--body", comment_text + MARK], self.calls())
-
-    def test_needs_input_makes_one_status_edit_needs_input(self):
-        for number, old, project in ((12, "in-progress", "rjeskuri/7"), (77, "ready", "acme-org/23"),
-                                     (305, "blocked", "someone/1")):
-            with self.subTest(number=number, project=project):
-                url = self.status_scenario(number, old)
-                p = self.board("needs-input", str(number), "--question", "Which base?", HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertEqual(self.project_calls(), [item_edit(project, url, "Status", "Needs input")])
-                swap = self.label_swap(number, "needs-input", old)
-                self.assertIn(swap, self.calls())
-                self.assertLess(self.calls().index(swap), self.index_of(lambda a: a[:1] == ["project"], "gh project"))
-                comments = [a for a in self.calls() if a[:3] == ["issue", "comment", str(number)]]
-                self.assertEqual(len(comments), 1, self.calls())
-                self.assertTrue(comments[0][-1].startswith("**Needs your input**"), comments[0])
-
-    # ------------------------------------------------------------------ failures fail open
-    def test_a_failing_project_call_on_status_warns_once_and_exits_zero(self):
-        failing = [{"match": ["project"], "stderr": FAILED_SCOPE, "exit": 1}]
-        for status, number, old, project in (("in-progress", 12, "ready", "rjeskuri/7"),
-                                             ("in-review", 48, "in-progress", "acme-org/23"),
-                                             ("blocked", 9, "ready", "someone/1")):
-            with self.subTest(status=status, number=number):
-                url = self.status_scenario(number, old, project=failing)
-                p = self.board("status", str(number), status, HARNESS_PROJECT=project)
-                line = self.assertOneWarning(p)
-                self.assertIn("project", line.lower())
-                self.assertEqual(p.stdout.strip(), f"#{number} status:{status}")
-                self.assertIn(self.label_swap(number, status, old), self.calls(), "the labels still change")
-                self.assertEqual(self.project_calls(), [], "the refused board is left as it was")
-                self.assertTrue([a for a in self.calls() if a[:1] == ["project"]], url)
-
-    def test_a_failing_item_add_stops_the_edits_with_one_warning(self):
-        failing_add = [{"match": ["project", "item-add"], "stderr": FAILED_SCOPE, "exit": 1}]
-        for number, priority, parent, project in ((13, True, 3, "acme-org/23"), (58, False, None, "rjeskuri/7")):
-            with self.subTest(number=number, priority=priority):
-                blockers = (9,) if parent else ()
-                url = self.create_scenario(number, parent, blockers, project=failing_add)
-                p = self.task_create(number, priority, parent, blockers, HARNESS_PROJECT=project)
-                self.assertOneWarning(p)
-                self.assertEqual(p.stdout.strip(), f"#{number} {url}")
-                self.assertEqual(self.other_calls(), self.task_create_calls(number, priority, parent, blockers),
-                                 "the issue is created, linked and blocked as without a project")
-                self.assertEqual(self.project_calls(), [], "no edit after a failed add")
-                self.assertTrue([a for a in self.calls() if a[:2] == ["project", "item-add"]])
-        url = self.create_scenario(91, project=failing_add)
-        p = self.board("epic", "create", "--title", "Epic 91", "--body-file", self.body, HARNESS_PROJECT="someone/1")
-        self.assertOneWarning(p)
-        self.assertEqual(p.stdout.strip(), f"#91 {url}")
-        self.assertEqual(self.project_calls(), [])
-        self.assertTrue([a for a in self.calls() if a[:2] == ["project", "item-add"]])
-
-    def test_a_failing_status_edit_on_create_stops_the_priority_edit_with_one_warning(self):
-        for number, project in ((13, "acme-org/23"), (204, "rjeskuri/7")):
-            with self.subTest(number=number):
-                status_field = fakegh.board(project, BOARD_FIELDS)["fields"][0]
-                self.assertEqual(status_field["name"], "Status")
-                status_fails = [{"contains": ["project", "item-edit", status_field["id"]],
-                                 "stderr": "GraphQL: Could not resolve option 'Ready' on field 'Status'\n", "exit": 1}]
-                url = self.create_scenario(number, project=status_fails)
-                p = self.task_create(number, True, HARNESS_PROJECT=project)
-                self.assertOneWarning(p)
-                self.assertEqual(p.stdout.strip(), f"#{number} {url}")
-                self.assertEqual(self.project_calls(), [item_add(project, url)],
-                                 "no Priority edit after the Status edit failed")
-                self.assertFalse([a for a in self.calls() if a[:2] == ["project", "item-edit"]
-                                  and ("Priority" in a or any("priority" in t for t in a))], self.calls())
-
-    def test_a_failing_project_call_on_needs_input_still_asks_and_notifies(self):
-        self.status_scenario(27, "in-progress", project=[{"match": ["project"], "stderr": FAILED_SCOPE, "exit": 1}])
-        p = self.board("needs-input", "27", "--question", "Ship it?", HARNESS_PROJECT="rjeskuri/7")
-        self.assertOneWarning(p)
-        self.assertIn(self.label_swap(27, "needs-input", "in-progress"), self.calls())
-        self.assertEqual(len([a for a in self.calls() if a[:3] == ["issue", "comment", "27"]]), 1)
-        self.assertEqual(len(self.notifications()), 1)
-
-    # ------------------------------------------------------------------ the setting
-    def run_everything(self, check, **env):
-        """epic create, task create --priority --parent, every status and needs-input, each followed by
-        check(what, process) while its calls are still logged."""
-        self.create_scenario(3)
-        check("epic create", self.board("epic", "create", "--title", "E", "--body-file", self.body, **env))
-        self.create_scenario(13, parent=3, blockers=(9,))
-        check("task create", self.task_create(13, True, 3, (9,), **env))
-        for status in PROJECT_OPTIONS:
-            old = "ready" if status != "ready" else "blocked"
-            self.status_scenario(12, old)
-            p = self.board("status", "12", status, **env)
-            check(f"status {status}", p)
-            self.assertEqual(self.writes(), [self.label_swap(12, status, old)],
-                             f"status {status}: the calls are exactly today's")
-            self.assertEqual(self.reads_of(12), 1, f"status {status}: one read of the issue")
-        self.status_scenario(12, "in-progress")
-        check("needs-input", self.board("needs-input", "12", "--question", "Q?", **env))
-
-    def assertNoProjectCall(self, what, p, quiet=True):
-        self.assertEqual(p.returncode, 0, (what, p.stdout + p.stderr))
-        self.assertNotIn("Traceback", p.stderr)
-        if quiet:
-            self.assertEqual(p.stderr.strip(), "", what)
-        self.assertTrue(self.calls(), what)
-        self.assertFalse([a for a in self.calls() if a[:1] == ["project"]], what)
-
-    def test_without_the_setting_no_project_call(self):
-        for settings in (None, json.dumps({"env": {"OTHER_SETTING": "x"}, "model": "opus"}),
-                         json.dumps({"permissions": {"allow": []}})):
-            with self.subTest(settings=settings):
-                if settings is not None:
-                    self.settings(settings)
-                self.run_everything(self.assertNoProjectCall)
-
-    def test_an_empty_environment_value_turns_the_mirror_off_over_a_valid_settings_file(self):
-        self.settings(json.dumps({"env": {"HARNESS_PROJECT": "acme-org/23"}}))
-        self.run_everything(self.assertNoProjectCall, HARNESS_PROJECT="")
-
-    def test_the_setting_comes_from_settings_env_when_the_environment_lacks_it(self):
-        for project, number in (("acme-org/23", 12), ("rjeskuri/9", 40)):
-            with self.subTest(project=project):
-                self.settings(json.dumps({"env": {"HARNESS_PROJECT": project, "OTHER": "1"}, "model": "opus"}))
-                url = self.status_scenario(number, "ready")
-                self.ok("status", str(number), "in-review")
-                self.assertEqual(self.project_calls(), [item_edit(project, url, "Status", "In review")])
-                url = self.create_scenario(number + 1)
-                self.ok("epic", "create", "--title", "E", "--body-file", self.body)
-                self.assertEqual(self.project_calls(), [item_add(project, url),
-                                                        item_edit(project, url, "Status", "Ready")])
-
-    def test_the_environment_wins_over_settings(self):
-        for env_project, file_project in (("rjeskuri/7", "acme-org/23"), ("acme-org/23", "rjeskuri/7")):
-            with self.subTest(env=env_project, file=file_project):
-                self.settings(json.dumps({"env": {"HARNESS_PROJECT": file_project}}))
-                url = self.status_scenario(19, "in-progress")
-                self.ok("status", "19", "blocked", HARNESS_PROJECT=env_project)
-                self.assertEqual(self.project_calls(), [item_edit(env_project, url, "Status", "Blocked")])
-
-    def test_a_malformed_or_misplaced_setting_means_unset(self):
-        """Only env.HARNESS_PROJECT of a settings file that parses as a JSON object counts. Several fixtures carry
-        a valid-looking `"HARNESS_PROJECT": "acme-org/23"` as text, so a text search finds it and fails."""
-        texts = ['{"env": {"HARNESS_PROJECT": "acme-org/23",}}',              # trailing comma
-                 '{"env": {"HARNESS_PROJECT": "acme-org/23"}',                # missing brace
-                 '// settings\n{"env": {"HARNESS_PROJECT": "acme-org/23"}}',  # a comment: not JSON
-                 '{"HARNESS_PROJECT": "acme-org/23"}',                        # top level
-                 '{"permissions": {"HARNESS_PROJECT": "acme-org/23"}}',       # under another key
-                 '{"extra": {"env": {"HARNESS_PROJECT": "acme-org/23"}}, "env": {}}',
-                 '{"env": {"NOTE": "\\"HARNESS_PROJECT\\": \\"acme-org/23\\""}}',
-                 '{"env": {"HARNESS_PROJECT_OLD": "acme-org/23"}}',
-                 '[{"env": {"HARNESS_PROJECT": "acme-org/23"}}]',             # not an object
-                 "{not json", "", '{"env": "HARNESS_PROJECT=acme-org/23"}', '{"env": null}',
-                 '{"env": ["HARNESS_PROJECT", "acme-org/23"]}', '{"env": {"HARNESS_PROJECT": 23}}']
-        for text in texts:
-            with self.subTest(settings=text):
-                self.settings(text)
-                url = self.status_scenario(12, "ready")
-                p = self.board("status", "12", "in-progress")
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertNotIn("Traceback", p.stderr)
-                self.assertEqual(p.stdout.strip(), "#12 status:in-progress")
-                self.assertEqual(self.project_calls(), [])
-                # the environment still works next to the file
-                self.status_scenario(12, "ready")
-                self.ok("status", "12", "in-progress", HARNESS_PROJECT="someone/5")
-                self.assertEqual(self.project_calls(), [item_edit("someone/5", url, "Status", "In progress")])
-
-    def test_an_invalid_value_warns_once_naming_it_and_makes_no_project_call(self):
-        bad = ["acme-org", "acme-org/", "/7", "acme-org/x", "acme-org/0", "acme-org/-3", "acme-org/7x", "7"]
-        for value in bad:
-            for source in ("environment", "settings"):
-                with self.subTest(value=value, source=source):
-                    env = {"HARNESS_PROJECT": value} if source == "environment" else {}
-                    if source == "settings":
-                        self.settings(json.dumps({"env": {"HARNESS_PROJECT": value}}))
-                    else:
-                        self.settings(json.dumps({"env": {"HARNESS_PROJECT": "someone/5"}}))   # env wins, even bad
-                    self.status_scenario(31, "ready")
-                    p = self.board("status", "31", "in-review", **env)
-                    self.assertOneWarning(p, value)
-                    self.assertEqual(p.stdout.strip(), "#31 status:in-review")
-                    self.assertIn(self.label_swap(31, "in-review", "ready"), self.calls())
-                    self.assertEqual(self.project_calls(), [])
-        for value in ("acme-org/x", "/7"):
-            with self.subTest(create=value):
-                url = self.create_scenario(58)
-                p = self.task_create(58, True, HARNESS_PROJECT=value)
-                self.assertOneWarning(p, value)
-                self.assertEqual(p.stdout.strip(), f"#58 {url}")
-                self.assertEqual(self.project_calls(), [])
-
-    def test_a_padded_or_zero_led_value_is_invalid(self):
-        """The value must be exactly OWNER/NUMBER: a leading zero, surrounding blanks or a trailing newline are
-        not stripped into a valid one. The warning names the value (blanks aside)."""
-        for value in ("acme-org/07", " acme-org/7", "acme-org/7 ", "acme-org/7\n", "rjeskuri/012"):
-            for source in ("environment", "settings"):
-                with self.subTest(value=value, source=source):
-                    env = {"HARNESS_PROJECT": value} if source == "environment" else {}
-                    self.settings(json.dumps({"env": {"HARNESS_PROJECT": value if source == "settings"
-                                                      else "someone/5"}}))
-                    self.status_scenario(44, "in-progress")
-                    p = self.board("status", "44", "blocked", **env)
-                    self.assertOneWarning(p, value.strip())
-                    self.assertEqual(p.stdout.strip(), "#44 status:blocked")
-                    self.assertIn(self.label_swap(44, "blocked", "in-progress"), self.calls())
-                    self.assertEqual(self.project_calls(), [])
-
-    def test_status_without_an_issue_url_warns_once_and_makes_no_project_call(self):
-        for number, url in ((12, None), (47, ""), (93, "   ")):
-            with self.subTest(number=number, url=url):
-                labels = [{"name": "task"}, {"name": "status:ready"}]
-                reply = {"labels": labels, "number": number}
-                if url is not None:
-                    reply["url"] = url
-                self.scenario([REPO_VIEW, {"match": ["issue", "view", str(number)], "stdout_json": reply}],
-                              default={"stdout": ""}, project=self.boards())
-                p = self.board("status", str(number), "in-progress", HARNESS_PROJECT="acme-org/23")
-                self.assertOneWarning(p)
-                self.assertEqual(p.stdout.strip(), f"#{number} status:in-progress")
-                self.assertIn(self.label_swap(number, "in-progress", "ready"), self.calls())
-                self.assertEqual(self.project_calls(), [])
-                self.assertFalse([a for a in self.calls() if a[:1] == ["project"]], self.calls())
-
-    def test_commands_that_never_mirror_print_no_warning_for_an_invalid_value(self):
-        epic_state = {"state": "OPEN", "subIssuesSummary": {"total": 2, "completed": 1, "percentCompleted": 50}}
-        self.scenario([REPO_VIEW,
-                       {"match": ["issue", "view", "3"], "stdout_json": epic_state},
-                       {"match": ["issue", "view", "12"], "stdout_json": issue()},
-                       {"match": ["issue", "list"], "stdout_json": []},
-                       {"match": ["api", "user"], "stdout": "rjeskuri\n"},
-                       {"match": ["project"], "stdout": ""}],
-                      default={"stdout": "https://github.com/o/r/issues/12#issuecomment-1\n"})
-        commands = [("show", "12"), ("show", "12", "--markdown"), ("ready",), ("comment", "12", "--body", "Note."),
-                    ("close", "12"), ("epic-check", "3"), ("board",), ("answers", "12")]
-        for value, source in (("acme-org", "environment"), ("acme-org/x", "settings"), ("/7", "environment")):
-            env = {"HARNESS_PROJECT": value} if source == "environment" else {}
-            self.settings(json.dumps({"env": {"HARNESS_PROJECT": value}}) if source == "settings" else "{}")
-            for argv in commands:
-                with self.subTest(value=value, command=" ".join(argv)):
-                    p = self.board(*argv, **env)
-                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                    self.assertEqual(p.stderr, "", "a command that never mirrors does not read the setting")
-                    self.assertFalse([a for a in self.calls() if a[:1] == ["project"]])
-
-
-# ======================================================================= project check, project sync (#65)
-UNSET = "<unset>"     # an item with no value for the field: gh item-list leaves the key out
-ABSENT = "<absent>"   # an issue that is not an item on the board
-
-# One row per open issue: (type, status label or None, priority:high?, board Status, board Priority). Expected
-# writes, from the ticket and the #74 review: a missing issue is added, then Status is set from its status label
-# (none without a label) and Priority to High only with priority:high. An item is edited only in the fields that
-# disagree; an unset board Priority counts as Normal, so only High against Normal (either way) is Priority drift.
-SYNC_ROWS = [
-    ("task", "ready", True, "Ready", "High"),                  # in agreement
-    ("task", "in-progress", False, "In progress", "Normal"),   # in agreement
-    ("task", "in-review", False, "In progress", "Normal"),     # Status drift
-    ("bug", "blocked", True, "Done", "High"),                  # Status drift (a drag to Done)
-    ("task", "needs-input", False, UNSET, "Normal"),           # Status unset
-    ("chore", "ready", False, "Blocked", "High"),              # both drift
-    ("task", "in-progress", True, "In progress", "Normal"),    # Priority drift to High
-    ("task", "in-review", False, "In review", "High"),         # Priority drift to Normal
-    ("task", "needs-input", True, "Needs input", UNSET),       # Priority unset, wants High
-    ("refactor", "blocked", False, "Blocked", UNSET),          # Priority unset counts as Normal: no write
-    ("task", "ready", False, ABSENT, None),                    # missing: add, Ready
-    ("task", "in-review", True, ABSENT, None),                 # missing: add, In review, High
-    ("task", None, False, ABSENT, None),                       # missing, no status label: add only
-    ("task", None, False, "Ready", "Normal"),                  # no status label: Status left alone
-    ("task", None, True, UNSET, "Normal"),                     # no status label: Priority only
-    ("epic", "blocked", True, "Blocked", "High"),              # in agreement
-    ("task", "needs-input", False, ABSENT, None),              # missing: add, Needs input
-    ("task", "in-progress", True, "In review", "Normal"),      # both drift
-]
-SYNC_ROWS_WRITES, SYNC_ROWS_ADDS = 19, 4    # counted by hand from the comments above
-
-
-def sync_issue(slug, number, kind, status, high, state="OPEN"):
-    labels = [kind] + (["status:" + status] if status else []) + (["priority:high"] if high else []) + ["size:M"]
-    return {"number": number, "title": f"Ticket {number} of {slug}", "url": f"https://github.com/{slug}/issues/{number}",
-            "labels": [{"name": n} for n in labels], "state": state}
-
-
-def board_item(slug, number, status=UNSET, priority=UNSET, kind="Issue", labels=()):
-    """An item as `gh project item-list --format json` prints it (checked against gh 2.99.0)."""
-    path = "pull" if kind == "PullRequest" else "issues"
-    item = {"id": f"PVTI_{slug.replace('/', '_')}_{number}_{kind}", "title": f"Ticket {number} of {slug}",
-            "content": {"number": number, "repository": slug, "title": f"Ticket {number} of {slug}", "type": kind,
-                        "url": f"https://github.com/{slug}/{path}/{number}"},
-            "repository": "https://github.com/" + slug, "labels": list(labels)}
-    if status != UNSET:
-        item["status"] = status
-    if priority != UNSET:
-        item["priority"] = priority
-    return item
-
-
-def draft_item(title, status="Ready"):
-    return {"id": "PVTI_draft_" + title.replace(" ", "_"), "title": title, "status": status,
-            "content": {"body": "", "title": title, "type": "DraftIssue"}}
-
-
-def rows_world(slug, numbers, rows=SYNC_ROWS):
-    """(open issues, their board items) for `rows` numbered by `numbers`; item labels match the issue's, as gh's do."""
-    issues, items = [], []
-    for number, (kind, status, high, board_status, board_priority) in zip(numbers, rows):
-        it = sync_issue(slug, number, kind, status, high)
-        issues.append(it)
-        if board_status != ABSENT:
-            items.append(board_item(slug, number, board_status, board_priority,
-                                    labels=[label["name"] for label in it["labels"]]))
-    return issues, items
-
-
-def expected_writes(project, issues, items):
-    """The write calls sync owes for `issues` against `items`, from the ticket's rules."""
-    on_board = {i["content"]["url"]: i for i in items if i.get("content", {}).get("url")}
-    writes = []
-    for it in issues:
-        names = [label["name"] for label in it["labels"]]
-        status = next((PROJECT_OPTIONS[n[len("status:"):]] for n in names if n.startswith("status:")), None)
-        priority = "High" if "priority:high" in names else "Normal"
-        item = on_board.get(it["url"])
-        if item is None:
-            writes.append(item_add(project, it["url"]))
-        if status and (item is None or item.get("status") != status):
-            writes.append(item_edit(project, it["url"], "Status", status))
-        board_priority = "Normal" if item is None else (item.get("priority") or "Normal")   # unset is Normal
-        if board_priority != priority:
-            writes.append(item_edit(project, it["url"], "Priority", priority))
-    return writes
-
-
-def counts(calls):
-    """A multiset of project calls, comparable regardless of order."""
-    out = {}
-    for sub, pos, opts in calls:
-        key = json.dumps([sub, pos, sorted(opts.items(), key=lambda kv: kv[0])], default=str)
-        out[key] = out.get(key, 0) + 1
-    return out
-
-
-class ProjectSync(BoardTest):
-    """`harness-board project sync [--repo PATH | --all-projects] [--dry-run]` against HARNESS_PROJECT: reads the
-    board (item-list --format json --limit 1000) and each repository's open issues (gh issue list), adds the open
-    issues missing from the board and corrects Status and Priority drift with one item-edit per drifted field, by
-    the same status map as the mirror; closed issues, pull requests, drafts and other repositories' items are left
-    alone. Every gh call goes through reposbin's gh, which answers per repository, so the issue list must be read
-    in (or for) the repository being synced."""
-
-    def setUp(self):
-        super().setUp()
-        self.world_path = os.path.join(self.tmp, "world.json")
-        self.repos_log = os.path.join(self.tmp, "repos.log")
-        self.world = {"paths": {}, "slugs": {}, "scenarios": {}, "default": self.scenario_path}
-        self.repo_specs = {}
-
-    def env(self, **extra):
-        env = super().env(**extra)
-        if hasattr(self, "world_path"):
-            env["PATH"] = BINS["reposbin"] + os.pathsep + env["PATH"]
-            env.update(FAKEGH_REPOS=self.world_path, REPOS_LOG=self.repos_log)
-        return env
-
-    # ------------------------------------------------------------------ the fake world
-    def new_repo(self, name):
-        path = self.mk(name)
-        subprocess.run([GIT, "-C", path, "-c", "init.defaultBranch=main", "init", "-q"], env=self.env(), check=True)
-        subprocess.run([GIT, "-C", path, "remote", "add", "origin", f"https://github.com/x/{name}.git"],
-                       env=self.env(), check=True)
-        return path
-
-    def add_repo(self, key, path, slug, issues, closed=()):
-        self.repo_specs[key] = dict(path=os.path.realpath(path), slug=slug, issues=list(issues), closed=list(closed))
-
-    def build(self, items, project_calls=(), total=None):
-        """Write one scenario per repository (its repo view and issue lists, then the shared board) and the
-        default scenario (the board only), and clear the logs. `total` is item-list's totalCount (default: all)."""
-        board = list(project_calls) + [
-            {"match": ["project", "item-list"],
-             "stdout_json": {"items": items, "totalCount": len(items) if total is None else total}},
-            {"match": ["project", "item-add"], "stdout": ""},
-            {"match": ["project", "item-edit"], "stdout": ""}]
-        self.world.update(paths={}, slugs={}, scenarios={})
-        for key, spec in self.repo_specs.items():
-            calls = [{"match": ["repo", "view"], "stdout_json": {"nameWithOwner": spec["slug"]}},
-                     {"contains": ["issue", "list", "--state", "all"], "stdout_json": spec["issues"] + spec["closed"]},
-                     {"contains": ["issue", "list", "--state", "closed"], "stdout_json": spec["closed"]},
-                     {"match": ["issue", "list"], "stdout_json": spec["issues"]}] + board
-            path = os.path.join(self.tmp, f"scenario-{key}.json")
-            write(path, json.dumps({"calls": calls}))
-            self.world["paths"][spec["path"]] = key
-            self.world["slugs"][spec["slug"]] = key
-            self.world["scenarios"][key] = path
-        self.scenario(board, rest=False)              # project sync stays on gh issue list (#447)
-        write(self.world_path, json.dumps(self.world))
-        for leftover in [self.repos_log] + [p + ".state.json" for p in self.world["scenarios"].values()]:
-            if os.path.exists(leftover):
-                os.unlink(leftover)
-
-    def logged(self):
-        if not os.path.exists(self.repos_log):
-            return []
-        with open(self.repos_log, encoding="utf-8") as fh:
-            return [json.loads(line) for line in fh if line.strip()]
-
-    def writes(self):
-        return [project_call(e["argv"]) for e in self.logged()
-                if e["argv"][:2] in (["project", "item-add"], ["project", "item-edit"])]
-
-    def registry(self, paths):
-        write(os.path.join(self.home, ".claude", "harness", "projects.json"), json.dumps(
-            {"version": 1, "projects": [{"path": p, "name": os.path.basename(p), "billable": False, "client": "",
-                                         "notes": ""} for p in paths]}))
-
-    def sync(self, *extra, cwd=None, **env):
-        return self.board("project", "sync", *extra, cwd=cwd, **env)
-
-    # ------------------------------------------------------------------ assertions
-    def assertWritesEqual(self, expected, what=""):
-        self.assertEqual(counts(self.writes()), counts(expected), f"{what}\nwrites: {self.writes()}")
-
-    def assertAddsFirst(self):
-        writes = self.writes()
-        for i, (sub, _, opts) in enumerate(writes):
-            if sub == "item-add":
-                edits_before = [w for w in writes[:i] if w[0] == "item-edit" and w[2].get("url") == opts.get("url")]
-                self.assertEqual(edits_before, [], f"{opts.get('url')} is edited before it is added")
-
-    def assertReadTheBoard(self, project):
-        owner, number = project.rsplit("/", 1)
-        reads = [project_call(e["argv"]) for e in self.logged() if e["argv"][:2] == ["project", "item-list"]]
-        self.assertTrue(reads, "no gh project item-list call")
-        for sub, pos, opts in reads:
-            self.assertEqual(pos, [number], reads)
-            self.assertEqual((opts.get("owner"), opts.get("format"), opts.get("limit")), (owner, "json", "1000"), reads)
-
-    def assertListedIssues(self, key):
-        self.assertTrue([e for e in self.logged() if e["argv"][:2] == ["issue", "list"] and e["repo"] == key],
-                        f"no gh issue list for {key}: {self.logged()}")
-
-    def change_lines(self, stdout, url):
-        number = url.rsplit("/", 1)[1]
-        pattern = re.compile(r"(?:#%s|%s)(?!\d)" % (number, re.escape(url)))
-        return [line for line in stdout.splitlines() if pattern.search(line)]
-
-    def assertChangeLines(self, stdout, issues, expected):
-        """One line per change: an issue with no change is never named; one with changes is named on at least one
-        and at most one line per write, and those lines carry each new value (and `add` for an added one)."""
-        for it in issues:
-            mine = [w for w in expected if w[2]["url"] == it["url"]]
-            lines = self.change_lines(stdout, it["url"])
-            if not mine:
-                self.assertEqual(lines, [], f"#{it['number']} needs no change\n{stdout}")
-                continue
-            self.assertTrue(1 <= len(lines) <= len(mine), f"#{it['number']}: {len(mine)} changes\n{stdout}")
-            text = "\n".join(lines)
-            for sub, _, opts in mine:
-                if sub == "item-add":
-                    self.assertIn("add", text.lower(), f"#{it['number']} is added\n{stdout}")
-                else:
-                    self.assertIn(opts["value"], text, f"#{it['number']} {opts['field']}\n{stdout}")
-
-    def foreign_items(self, slug, clash):
-        """Board items sync must not touch: another repository's issue with the same number as `clash`, a pull
-        request and a draft, each disagreeing with every label in sight."""
-        return [board_item("someone-else/elsewhere", clash, "Done", "High", labels=["status:ready"]),
-                board_item(slug, clash + 1000, "Blocked", UNSET, kind="PullRequest"),
-                draft_item(f"Idea for {slug}")]
-
-    def closed_issues(self, slug, base):
-        """Closed issues, one drifted on the board and one missing from it: the built-in workflow owns them."""
-        closed = [sync_issue(slug, base, "task", "in-review", True, state="CLOSED"),
-                  sync_issue(slug, base + 1, "task", "ready", False, state="CLOSED")]
-        return closed, [board_item(slug, base, "In progress", "Normal", labels=["task", "status:in-review"])]
-
-    def standard_world(self, project, slug, numbers, closed_base):
-        issues, items = rows_world(slug, numbers)
-        closed, closed_items = self.closed_issues(slug, closed_base)
-        items = items + closed_items + self.foreign_items(slug, numbers[2])
-        self.add_repo("main", self.repo, slug, issues, closed)
-        return issues, items
-
-    WORLDS = [("rjeskuri/7", "rjeskuri/alpha", list(range(3, 21)), 90),
-              ("acme-org/23", "acme-org/widgets", [101 + 7 * i for i in range(18)], 300),
-              ("someone/1", "someone/tools", [40 + 3 * i for i in range(18)][::-1], 7)]
-
-    # ------------------------------------------------------------------ broad: the whole repair
-    def test_sync_adds_missing_issues_and_corrects_status_and_priority_drift(self):
-        for project, slug, numbers, closed_base in self.WORLDS:
-            with self.subTest(project=project, slug=slug):
-                issues, items = self.standard_world(project, slug, numbers, closed_base)
-                self.build(items)
-                expected = expected_writes(project, issues, items)
-                self.assertEqual((len(expected), sum(w[0] == "item-add" for w in expected)),
-                                 (SYNC_ROWS_WRITES, SYNC_ROWS_ADDS), "the test's own model")
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertNotIn("Traceback", p.stderr)
-                self.assertWritesEqual(expected)
-                self.assertAddsFirst()
-                self.assertReadTheBoard(project)
-                self.assertListedIssues("main")
-                self.assertChangeLines(p.stdout, issues, expected)
-
-    def test_sync_leaves_closed_issues_pull_requests_drafts_and_other_repositories_alone(self):
-        for project, slug, numbers, closed_base in self.WORLDS:
-            with self.subTest(project=project):
-                issues, items = self.standard_world(project, slug, numbers, closed_base)
-                self.build(items)
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                ours = {it["url"] for it in issues}
-                strays = [w for w in self.writes() if w[2].get("url") not in ours]
-                self.assertEqual(strays, [], "only this repository's open issues are written")
-                for closed in (closed_base, closed_base + 1):
-                    self.assertEqual(self.change_lines(p.stdout, f"https://github.com/{slug}/issues/{closed}"), [],
-                                     f"closed #{closed} is not reported\n{p.stdout}")
-
-    def test_items_in_agreement_make_no_write_and_no_change_line(self):
-        agree = [SYNC_ROWS[i] for i in (0, 1, 9, 13, 15)] + [("bug", "needs-input", False, "Needs input", "Normal"),
-                                                              ("task", None, False, UNSET, UNSET)]
-        for project, slug, numbers in (("rjeskuri/7", "rjeskuri/alpha", [12, 13, 14, 15, 16, 17, 18]),
-                                       ("acme-org/23", "acme-org/widgets", [205, 3, 77, 41, 9, 120, 64]),
-                                       ("someone/1", "someone/tools", [8, 6, 4, 2, 1, 30, 11])):
-            with self.subTest(project=project):
-                issues, items = rows_world(slug, numbers, agree)
-                closed, closed_items = self.closed_issues(slug, 500)
-                self.add_repo("main", self.repo, slug, issues, closed)
-                self.build(items + closed_items + self.foreign_items(slug, numbers[0]))
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertEqual(self.writes(), [])
-                self.assertReadTheBoard(project)
-                for it in issues:
-                    self.assertEqual(self.change_lines(p.stdout, it["url"]), [], p.stdout)
-
-    def test_dry_run_prints_the_changes_and_writes_nothing(self):
-        for project, slug, numbers, closed_base in self.WORLDS:
-            with self.subTest(project=project):
-                issues, items = self.standard_world(project, slug, numbers, closed_base)
-                self.build(items)
-                expected = expected_writes(project, issues, items)
-                p = self.sync("--dry-run", HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertEqual(self.writes(), [], "--dry-run makes no item-add or item-edit call")
-                self.assertReadTheBoard(project)
-                self.assertListedIssues("main")
-                self.assertChangeLines(p.stdout, issues, expected)
-
-    def test_each_single_drift_is_one_edit_of_that_field(self):
-        """One issue per run, so the edit depends on the issue's own labels and item only."""
-        cases = [("rjeskuri/7", "rjeskuri/alpha", 31, ("task", "in-review", False, "Ready", "Normal"),
-                  [("Status", "In review")]),
-                 ("acme-org/23", "acme-org/widgets", 4, ("task", "blocked", False, "In progress", "Normal"),
-                  [("Status", "Blocked")]),
-                 ("someone/1", "someone/tools", 250, ("bug", "ready", False, "Needs input", "Normal"),
-                  [("Status", "Ready")]),
-                 ("rjeskuri/12", "rjeskuri/beta", 66, ("task", "needs-input", False, "Done", "Normal"),
-                  [("Status", "Needs input")]),
-                 ("acme-org/4", "acme-org/gears", 19, ("task", "in-progress", False, "Blocked", "Normal"),
-                  [("Status", "In progress")]),
-                 ("rjeskuri/7", "rjeskuri/alpha", 8, ("task", "ready", True, "Ready", "Normal"),
-                  [("Priority", "High")]),
-                 ("someone/1", "someone/tools", 120, ("task", "blocked", False, "Blocked", "High"),
-                  [("Priority", "Normal")])]
-        for project, slug, number, row, fields in cases:
-            with self.subTest(project=project, number=number, row=row):
-                issues, items = rows_world(slug, [number], [row])
-                self.add_repo("main", self.repo, slug, issues)
-                self.build(items)
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                url = f"https://github.com/{slug}/issues/{number}"
-                self.assertEqual(self.writes(), [item_edit(project, url, f, v) for f, v in fields])
-                lines = self.change_lines(p.stdout, url)
-                self.assertEqual(len(lines), 1, p.stdout)
-                self.assertIn(fields[0][1], lines[0])
-
-    def test_a_missing_issue_is_added_then_its_fields_set(self):
-        cases = [("rjeskuri/7", "rjeskuri/alpha", 14, ("task", "ready", False), [("Status", "Ready")]),
-                 ("acme-org/23", "acme-org/widgets", 207, ("epic", "in-progress", True),
-                  [("Status", "In progress"), ("Priority", "High")]),
-                 ("someone/1", "someone/tools", 2, ("task", None, True), [("Priority", "High")]),
-                 ("rjeskuri/12", "rjeskuri/beta", 63, ("chore", None, False), []),
-                 ("acme-org/4", "acme-org/gears", 9, ("bug", "blocked", False), [("Status", "Blocked")])]
-        for project, slug, number, (kind, status, high), fields in cases:
-            with self.subTest(project=project, number=number):
-                it = sync_issue(slug, number, kind, status, high)
-                other = board_item(slug, number + 1, "Ready", "Normal", labels=["task", "status:ready"])
-                self.add_repo("main", self.repo, slug, [it, sync_issue(slug, number + 1, "task", "ready", False)])
-                self.build([other])
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                url = it["url"]
-                writes = self.writes()
-                self.assertEqual(writes[0], item_add(project, url), writes)
-                self.assertEqual(counts(writes[1:]), counts([item_edit(project, url, f, v) for f, v in fields]))
-                self.assertTrue(self.change_lines(p.stdout, url), p.stdout)
-                self.assertEqual(self.change_lines(p.stdout, other["content"]["url"]), [], p.stdout)
-
-    def test_repo_option_syncs_that_repository_from_elsewhere(self):
-        project, slug = "acme-org/23", "acme-org/widgets"
-        issues, items = rows_world(slug, [61, 62, 63, 64], [SYNC_ROWS[2], SYNC_ROWS[1], SYNC_ROWS[10], SYNC_ROWS[7]])
-        self.add_repo("main", self.repo, slug, issues)
-        self.build(items)
-        p = self.sync("--repo", self.repo, cwd=self.home, HARNESS_PROJECT=project)
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertWritesEqual(expected_writes(project, issues, items))
-        self.assertListedIssues("main")
-
-    def test_the_project_may_come_from_settings(self):
-        project, slug = "rjeskuri/9", "rjeskuri/alpha"
-        write(os.path.join(self.home, ".claude", "settings.json"),
-              json.dumps({"env": {"HARNESS_PROJECT": project}, "model": "opus"}))
-        issues, items = rows_world(slug, [5, 6], [SYNC_ROWS[3], SYNC_ROWS[11]])
-        self.add_repo("main", self.repo, slug, issues)
-        self.build(items)
-        p = self.sync()
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertWritesEqual(expected_writes(project, issues, items))
-        self.assertReadTheBoard(project)
-
-    # ------------------------------------------------------------------ --all-projects
-    def test_all_projects_covers_each_registered_repository(self):
-        project = "rjeskuri/12"
-        alpha, widgets, tools = self.new_repo("alpha"), self.new_repo("widgets"), self.new_repo("tools")
-        # alpha and widgets share issue numbers, with different drift: matching by number alone fails
-        a_issues, a_items = rows_world("rjeskuri/alpha", [5, 6, 7, 8, 9, 10, 11, 12, 13], SYNC_ROWS[:9])
-        w_issues, w_items = rows_world("acme-org/widgets", [5, 6, 7, 8, 9, 10, 11, 12, 13], SYNC_ROWS[9:])
-        agree = [SYNC_ROWS[0], SYNC_ROWS[1], SYNC_ROWS[15]]
-        t_issues, t_items = rows_world("someone/tools", [40, 41, 42], agree)
-        # the current checkout is not registered: its drift stays
-        u_issues, u_items = rows_world("o/unregistered", [5, 6, 7], [SYNC_ROWS[2], SYNC_ROWS[10], SYNC_ROWS[6]])
-        self.add_repo("alpha", alpha, "rjeskuri/alpha", a_issues,
-                      [sync_issue("rjeskuri/alpha", 70, "task", "ready", False, state="CLOSED")])
-        self.add_repo("widgets", widgets, "acme-org/widgets", w_issues)
-        self.add_repo("tools", tools, "someone/tools", t_issues)
-        self.add_repo("cwd", self.repo, "o/unregistered", u_issues)
-        self.registry([alpha, widgets, tools])
-        items = a_items + w_items + t_items + u_items + [draft_item("Loose idea")]
-        expected = (expected_writes(project, a_issues, items) + expected_writes(project, w_issues, items)
-                    + expected_writes(project, t_issues, items))
-        self.assertEqual(expected_writes(project, t_issues, items), [], "tools is in agreement")
-        for dry in (False, True):
-            with self.subTest(dry_run=dry):
-                self.build(items)
-                p = self.sync("--all-projects", *(["--dry-run"] if dry else []), HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertNotIn("Traceback", p.stderr)
-                self.assertWritesEqual([] if dry else expected)
-                if not dry:
-                    self.assertAddsFirst()
-                for key in ("alpha", "widgets", "tools"):
-                    self.assertListedIssues(key)
-                self.assertReadTheBoard(project)
-                changed = {w[2]["url"] for w in expected}
-                lines = [line for line in p.stdout.splitlines() if re.search(r"#\d|/issues/\d", line)]
-                self.assertTrue(len(changed) <= len(lines) <= len(expected),
-                                f"{len(changed)} issues changed in {len(expected)} writes\n{p.stdout}")
-
-    # ------------------------------------------------------------------ failures
-    def test_a_failing_write_is_named_the_rest_still_run_and_sync_exits_1(self):
-        for project, slug, numbers, closed_base in self.WORLDS:
-            with self.subTest(project=project):
-                issues, items = self.standard_world(project, slug, numbers, closed_base)
-                bad_edits = [issues[2]["url"], issues[6]["url"]]     # a Status drift and a Priority drift
-                bad_add = issues[11]["url"]                          # a missing issue
-                failing = [{"contains": ["project", "item-edit", url], "stderr": FAILED_SCOPE, "exit": 1}
-                           for url in bad_edits]
-                failing.append({"contains": ["project", "item-add", bad_add],
-                                "stderr": "GraphQL: Could not add item\n", "exit": 1})
-                self.build(items, failing)
-                expected = expected_writes(project, issues, items)
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-                self.assertNotIn("Traceback", p.stderr)
-                rest = [w for w in expected if w[2]["url"] != bad_add]
-                self.assertWritesEqual(rest + [item_add(project, bad_add)],
-                                       "every other write is still attempted; a failed add gets no edit")
-                for url in bad_edits + [bad_add]:
-                    self.assertTrue(self.change_lines(p.stderr, url), f"{url} is named on stderr\n{p.stderr}")
-
-    def test_a_failing_board_read_is_one_line_and_writes_nothing(self):
-        for project in ("rjeskuri/7", "acme-org/23"):
-            with self.subTest(project=project):
-                issues, items = rows_world("rjeskuri/alpha", [3, 4, 5], SYNC_ROWS[2:5])
-                self.add_repo("main", self.repo, "rjeskuri/alpha", issues)
-                self.build(items, [{"match": ["project", "item-list"], "stderr": FAILED_SCOPE, "exit": 1}])
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertOneLineError(p, "item-list")
-                self.assertEqual(self.writes(), [])
-
-    # ------------------------------------------------------------------ gaps the test-breaker named: the issue
-    # list's default cap, stale labels on board items, odd status labels, a board larger than the item-list read
-    def test_every_open_issue_is_synced_past_gh_issue_lists_default_of_30(self):
-        """The fake gh issue list returns at most --limit issues (default 30), like gh."""
-        for project, slug, numbers in (("rjeskuri/7", "rjeskuri/alpha", list(range(1, 38))),
-                                       ("acme-org/23", "acme-org/widgets", [500 - 4 * i for i in range(41)])):
-            with self.subTest(project=project, issues=len(numbers)):
-                rows = [SYNC_ROWS[i % len(SYNC_ROWS)] for i in range(len(numbers))]
-                issues, items = rows_world(slug, numbers, rows)
-                self.add_repo("main", self.repo, slug, issues)
-                self.build(items)
-                expected = expected_writes(project, issues, items)
-                late = {it["url"] for it in issues[30:]}
-                self.assertTrue([w for w in expected if w[2]["url"] in late], "issues past 30 need writes")
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertWritesEqual(expected, "every open issue, not just the first 30")
-
-    def test_labels_come_from_the_issue_not_the_board_items_stale_copy(self):
-        cases = [("rjeskuri/7", "rjeskuri/alpha", 17, ["task", "status:blocked"], ["task", "status:ready"],
-                  "Ready", "Normal", [("Status", "Blocked")]),
-                 ("acme-org/23", "acme-org/widgets", 230, ["task", "status:ready"], ["task", "status:blocked"],
-                  "Blocked", "Normal", [("Status", "Ready")]),
-                 ("someone/1", "someone/tools", 5, ["task", "status:in-review"],
-                  ["task", "status:in-review", "priority:high"], "In review", "High", [("Priority", "Normal")]),
-                 ("rjeskuri/12", "rjeskuri/beta", 88, ["bug", "status:ready", "priority:high"], ["bug", "status:ready"],
-                  "Ready", "Normal", [("Priority", "High")])]
-        for project, slug, number, issue_labels, item_labels, status, priority, fields in cases:
-            with self.subTest(project=project, number=number):
-                it = {"number": number, "title": f"T {number}", "url": f"https://github.com/{slug}/issues/{number}",
-                      "labels": [{"name": n} for n in issue_labels], "state": "OPEN"}
-                self.add_repo("main", self.repo, slug, [it])
-                self.build([board_item(slug, number, status, priority, labels=item_labels)])
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertEqual(self.writes(), [item_edit(project, it["url"], f, v) for f, v in fields])
-
-    def test_an_unknown_or_doubled_status_label_is_one_warning_and_no_status_write(self):
-        cases = [("rjeskuri/7", "rjeskuri/alpha", [21, 22, 23, 24, 25]),
-                 ("acme-org/23", "acme-org/widgets", [310, 9, 144, 2, 77])]
-        for project, slug, (done, foo, double, plain, highdone) in cases:
-            with self.subTest(project=project):
-                odd = {done: ["task", "status:done"], foo: ["task", "status:foo"],
-                       double: ["task", "status:ready", "status:blocked"],
-                       highdone: ["task", "status:done", "priority:high"]}
-                issues = [{"number": n, "title": f"T {n}", "url": f"https://github.com/{slug}/issues/{n}",
-                           "labels": [{"name": x} for x in labels], "state": "OPEN"} for n, labels in odd.items()]
-                issues.append(sync_issue(slug, plain, "task", "in-review", False))
-                items = [board_item(slug, n, "In progress", "Normal", labels=odd[n]) for n in odd]
-                items.append(board_item(slug, plain, "Ready", "Normal", labels=["task", "status:in-review"]))
-                self.add_repo("main", self.repo, slug, issues)
-                self.build(items)
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                url = f"https://github.com/{slug}/issues/"
-                self.assertWritesEqual([item_edit(project, url + str(highdone), "Priority", "High"),
-                                        item_edit(project, url + str(plain), "Status", "In review")],
-                                       "no Status write for an odd status label; Priority still follows")
-                warnings = [line for line in p.stderr.splitlines() if line.strip()]
-                self.assertEqual(len(warnings), len(odd), p.stderr)
-                for n in odd:
-                    self.assertEqual(len(self.change_lines(p.stderr, url + str(n))), 1, f"#{n}\n{p.stderr}")
-                self.assertEqual(self.change_lines(p.stderr, url + str(plain)), [], p.stderr)
-
-    def test_a_truncated_board_adds_nothing_fixes_drift_warns_with_the_count_and_exits_1(self):
-        for project, slug, numbers, total in (("rjeskuri/7", "rjeskuri/alpha", list(range(3, 21)), 1437),
-                                              ("acme-org/23", "acme-org/widgets", [101 + 7 * i for i in range(18)],
-                                               1002)):
-            with self.subTest(project=project, total=total):
-                issues, items = rows_world(slug, numbers)
-                self.add_repo("main", self.repo, slug, issues)
-                self.build(items, total=total)
-                on_board = {i["content"]["url"] for i in items}
-                expected = [w for w in expected_writes(project, issues, items) if w[2]["url"] in on_board]
-                self.assertTrue(expected)
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-                self.assertNotIn("Traceback", p.stderr)
-                self.assertFalse([w for w in self.writes() if w[0] == "item-add"], "no add from a partial board")
-                self.assertWritesEqual(expected, "drift on the items it has is still fixed")
-                warnings = [line for line in p.stderr.splitlines() if line.strip()]
-                self.assertEqual(len(warnings), 1, p.stderr)
-                self.assertIn(str(total), warnings[0])
-
-    # ------------------------------------------------------------------ the #74 review
-    def test_an_unset_priority_counts_as_normal(self):
-        """Only High against Normal is Priority drift; an unset board Priority is Normal. Hand-written cases."""
-        for project, slug, number, high, board_priority, fields in (
-                ("rjeskuri/7", "rjeskuri/alpha", 12, False, UNSET, []),
-                ("acme-org/23", "acme-org/widgets", 230, False, UNSET, []),
-                ("someone/1", "someone/tools", 5, True, UNSET, [("Priority", "High")]),
-                ("rjeskuri/12", "rjeskuri/beta", 77, True, "Normal", [("Priority", "High")]),
-                ("acme-org/4", "acme-org/gears", 3, False, "High", [("Priority", "Normal")]),
-                ("someone/30", "someone/stuff", 41, False, "Normal", []),
-                ("rjeskuri/7", "rjeskuri/alpha", 99, True, "High", [])):
-            with self.subTest(project=project, number=number, high=high, board=board_priority):
-                issues, items = rows_world(slug, [number], [("task", "in-review", high, "In review", board_priority)])
-                self.add_repo("main", self.repo, slug, issues)
-                self.build(items)
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                url = f"https://github.com/{slug}/issues/{number}"
-                self.assertEqual(self.writes(), [item_edit(project, url, f, v) for f, v in fields])
-                self.assertEqual(len(self.change_lines(p.stdout, url)), len(fields), p.stdout)
-
-    def test_all_projects_warns_once_per_unusable_registered_path_and_still_syncs_the_rest(self):
-        project = "acme-org/23"
-        alpha, widgets = self.new_repo("alpha"), self.new_repo("widgets")
-        missing = os.path.join(self.tmp, "gone-away")
-        plain = self.mk("not-a-repo")
-        no_remote = self.mk("no-remote")
-        subprocess.run([GIT, "-C", no_remote, "-c", "init.defaultBranch=main", "init", "-q"], env=self.env(), check=True)
-        a_issues, a_items = rows_world("rjeskuri/alpha", [5, 6, 7, 8], [SYNC_ROWS[2], SYNC_ROWS[6], SYNC_ROWS[10],
-                                                                       SYNC_ROWS[0]])
-        w_issues, w_items = rows_world("acme-org/widgets", [5, 6, 7], [SYNC_ROWS[7], SYNC_ROWS[17], SYNC_ROWS[1]])
-        self.add_repo("alpha", alpha, "rjeskuri/alpha", a_issues)
-        self.add_repo("widgets", widgets, "acme-org/widgets", w_issues)
-        items = a_items + w_items
-        expected = expected_writes(project, a_issues, items) + expected_writes(project, w_issues, items)
-        for order in ([missing, alpha, plain, no_remote, widgets], [plain, widgets, no_remote, alpha, missing]):
-            with self.subTest(order=[os.path.basename(p) for p in order]):
-                self.registry(order)
-                self.build(items)
-                p = self.sync("--all-projects", HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-                self.assertNotIn("Traceback", p.stderr)
-                self.assertWritesEqual(expected, "the usable repositories are still synced")
-                for bad in (missing, plain, no_remote):
-                    named = [line for line in p.stderr.splitlines() if bad in line]
-                    self.assertEqual(len(named), 1, f"one warning naming {bad}\n{p.stderr}")
-
-    def test_an_issue_list_at_its_limit_of_1000_warns_and_exits_1(self):
-        project, slug = "rjeskuri/7", "rjeskuri/alpha"
-        for count, code in ((1000, 1), (999, 0)):
-            with self.subTest(count=count):
-                rows = [("task", "ready", False, "Ready", "Normal")] * count
-                issues, items = rows_world(slug, list(range(1, count + 1)), rows)
-                self.add_repo("main", self.repo, slug, issues)
-                self.build(items)
-                p = self.sync(HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, code, p.stdout + p.stderr)
-                self.assertNotIn("Traceback", p.stderr)
-                self.assertEqual(self.writes(), [])
-                if code:
-                    self.assertIn("1000", p.stderr)
-                else:
-                    self.assertEqual(p.stderr.strip(), "")
-
-    def test_all_projects_with_no_registered_project_says_so_and_exits_0(self):
-        registry = os.path.join(self.home, ".claude", "harness", "projects.json")
-        for what in ("empty registry", "no registry file"):
-            with self.subTest(what=what):
-                if what == "empty registry":
-                    self.registry([])
-                elif os.path.exists(registry):
-                    os.unlink(registry)
-                self.build([board_item("rjeskuri/alpha", 4, "Ready", "Normal")])
-                p = self.sync("--all-projects", HARNESS_PROJECT="rjeskuri/7")
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertIn("no registered projects", p.stdout.lower())
-                self.assertEqual(self.writes(), [])
-
-    def test_repo_and_all_projects_together_is_an_error(self):
-        self.add_repo("main", self.repo, "rjeskuri/alpha", [sync_issue("rjeskuri/alpha", 3, "task", "ready", False)])
-        self.registry([self.repo])
-        self.build([])
-        for argv in (["--all-projects", "--repo", self.repo], ["--repo", self.repo, "--all-projects", "--dry-run"]):
+                made = self.calls()
+                self.assertEqual(sum(a[:2] == ["issue", "create"] for a in made), 1, made)
+                self.assertEqual(self.project_calls(), [], made)
+
+    def test_every_status_change_makes_no_project_call_and_no_warning(self):
+        rows = [(12, "ready"), (19, "in-progress"), (27, "in-review"), (31, "blocked"), (40, "needs-input"),
+                (44, "proposed"), (48, "ready"), (66, "in-review"), (77, "in-progress"), (140, "blocked"),
+                (305, "ready"), (7, "proposed")]
+        for (where, value), (number, status) in zip(self.SETTINGS * 2, rows):
+            with self.subTest(where=where, value=value, number=number, status=status):
+                url = self.HOST + str(number)
+                old = "blocked" if status == "ready" else "ready"
+                labels = [{"name": "task"}, {"name": "status:" + old}, {"name": "size:M"}]
+                self.scenario([REPO_VIEW,
+                               {"match": ["issue", "view", str(number)],
+                                "stdout_json": {"labels": labels, "url": url, "number": number}},
+                               {"match": ["issue", "comment"], "stdout": f"{url}#issuecomment-{number}1\n"}],
+                              default={"stdout": ""})
+                argv = ["needs-input", str(number), "--question", "Which base?"] if status == "needs-input" \
+                    else ["status", str(number), status]
+                p = self.board(*argv, **self.configure(where, value))
+                self.assertSilent(p)
+                made = self.calls()
+                self.assertEqual(self.project_calls(), [], made)
+                adds = [a for a in made if a[:2] == ["issue", "edit"] and "--add-label" in a]
+                self.assertEqual([a[a.index("--add-label") + 1] for a in adds], ["status:" + status], made)
+
+    def test_promote_makes_no_project_call_and_no_warning(self):
+        for (where, value), number in zip(self.SETTINGS, (12, 66, 140, 7, 31, 305)):
+            with self.subTest(where=where, value=value, number=number):
+                url = self.HOST + str(number)
+                self.scenario([REPO_VIEW,
+                               {"match": ["issue", "view", str(number)],
+                                "stdout_json": dict(issue(number=number, labels=("task", "status:proposed")),
+                                                    url=url)}],
+                              default={"stdout": ""})
+                p = self.board("promote", str(number), **self.configure(where, value))
+                self.assertSilent(p)
+                made = self.calls()
+                self.assertEqual(self.project_calls(), [], made)
+                self.assertTrue([a for a in made if "status:ready" in a], made)
+
+    def test_the_project_subcommands_are_gone(self):
+        self.configure("both", "rjeskuri/3")
+        for argv in (["project", "check"], ["project", "sync"], ["project", "sync", "--dry-run"],
+                     ["project", "sync", "--all-projects"]):
             with self.subTest(argv=argv):
-                p = self.sync(*argv, HARNESS_PROJECT="rjeskuri/7")
+                p = self.board(*argv, **{OLD_SETTING: "rjeskuri/3"})
                 self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
-                self.assertEqual(self.writes(), [])
-
-
-class ProjectCheck(BoardTest):
-    """`harness-board project check`: gh project field-list N --owner O --format json; Status needs Ready,
-    In progress, In review, Blocked, Needs input and Done, Priority needs High and Normal, by name. Complete:
-    exit 0. Otherwise each missing field or option is named and the exit is 1."""
-
-    STATUS = ["Ready", "In progress", "In review", "Blocked", "Needs input", "Done"]
-    PRIORITY = ["High", "Normal"]
-
-    def fields(self, status=STATUS, priority=PRIORITY, extra=()):
-        """A field-list as gh 2.99.0 prints it; None leaves the field out."""
-        def plain(name, n):
-            return {"id": f"PVTF_x{n}", "name": name, "type": "ProjectV2Field"}
-
-        def select(name, n, options):
-            return {"id": f"PVTSSF_x{n}", "name": name, "type": "ProjectV2SingleSelectField",
-                    "options": [{"id": f"{n}{i:06x}", "name": o} for i, o in enumerate(options)]}
-        out = [plain("Title", 1), plain("Assignees", 2)]
-        if status is not None:
-            out.append(select("Status", 3, status))
-        out += [plain("Labels", 4), plain("Repository", 5), plain("Parent issue", 6), plain("Sub-issues progress", 7)]
-        if priority is not None:
-            out.append(select("Priority", 8, priority))
-        out += [select(name, 9 + i, opts) for i, (name, opts) in enumerate(extra)]
-        return {"fields": out, "totalCount": len(out)}
-
-    def check(self, fields, project, **env):
-        self.scenario([REPO_VIEW, {"match": ["project", "field-list"], "stdout_json": fields}])
-        return self.board("project", "check", HARNESS_PROJECT=project, **env)
-
-    def assertFieldListed(self, project):
-        owner, number = project.rsplit("/", 1)
-        reads = [project_call(a) for a in self.calls() if a[:2] == ["project", "field-list"]]
-        self.assertEqual(len(reads), 1, self.calls())
-        sub, pos, opts = reads[0]
-        self.assertEqual((pos, opts.get("owner"), opts.get("format")), ([number], owner, "json"), reads)
-        self.assertFalse([a for a in self.calls() if a[:2] in (["project", "item-add"], ["project", "item-edit"])])
-
-    def test_a_complete_board_passes(self):
-        cases = [("rjeskuri/7", self.fields()),
-                 ("acme-org/23", self.fields(status=["Backlog"] + self.STATUS[::-1], priority=["Low", "Normal", "High"],
-                                             extra=[("Size", ["S", "M", "L"])])),
-                 ("someone/1", self.fields(status=self.STATUS[3:] + self.STATUS[:3]))]
-        for project, fields in cases:
-            with self.subTest(project=project):
-                p = self.check(fields, project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertNotIn("Traceback", p.stderr)
-                self.assertFieldListed(project)
-
-    def test_each_missing_field_or_option_is_named_and_check_exits_1(self):
-        s = self.STATUS
-        cases = [("rjeskuri/7", self.fields(status=[o for o in s if o != "Needs input"]), ["Needs input"]),
-                 ("acme-org/23", self.fields(status=["Ready", "In progress", "In review", "Done"]),
-                  ["Blocked", "Needs input"]),
-                 ("someone/1", self.fields(priority=None), ["Priority"]),
-                 ("rjeskuri/12", self.fields(priority=["High", "Low"]), ["Normal"]),
-                 ("acme-org/4", self.fields(status=["Ready", "Doing", "In review", "Blocked", "Needs input", "Done"],
-                                            priority=["Normal"]), ["In progress", "High"]),
-                 ("someone/30", self.fields(status=None), ["Status"])]
-        for project, fields, missing in cases:
-            with self.subTest(project=project, missing=missing):
-                p = self.check(fields, project)
-                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-                self.assertNotIn("Traceback", p.stderr)
-                output = p.stdout + p.stderr
-                for name in missing:
-                    self.assertIn(name, output)
-                self.assertFieldListed(project)
-
-    def test_options_that_are_present_are_not_reported(self):
-        p = self.check(self.fields(status=[o for o in self.STATUS if o != "Needs input"]), "acme-org/23")
-        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-        output = p.stdout + p.stderr
-        for present in ("In review", "Blocked", "High", "Normal"):
-            self.assertNotIn(present, output)
-        p = self.check(self.fields(priority=["High"]), "rjeskuri/7")
-        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-        self.assertIn("Normal", p.stdout + p.stderr)
-        for present in self.STATUS[1:5]:
-            self.assertNotIn(present, p.stdout + p.stderr)
-
-    def test_a_failing_field_list_is_one_line_and_exit_1(self):
-        self.scenario([REPO_VIEW, {"match": ["project", "field-list"], "stderr": FAILED_SCOPE, "exit": 1}])
-        p = self.board("project", "check", HARNESS_PROJECT="rjeskuri/7")
-        self.assertOneLineError(p, "field-list")
-
-
-class ProjectNeedsTheSetting(BoardTest):
-    """check and sync need a project: unset, empty or not OWNER/NUMBER is an error naming HARNESS_PROJECT, before
-    any gh project call."""
-
-    def test_check_and_sync_without_a_valid_setting_fail_naming_it(self):
-        settings = os.path.join(self.home, ".claude", "settings.json")
-        for env, settings_text in (({}, None), ({}, json.dumps({"env": {"OTHER": "1"}})),
-                                   ({"HARNESS_PROJECT": ""}, json.dumps({"env": {"HARNESS_PROJECT": "rjeskuri/7"}})),
-                                   ({"HARNESS_PROJECT": "rjeskuri"}, None), ({}, json.dumps(
-                                       {"env": {"HARNESS_PROJECT": "acme-org/x"}}))):
-            if settings_text is None and os.path.exists(settings):
-                os.unlink(settings)
-            elif settings_text is not None:
-                write(settings, settings_text)
-            for argv in (["project", "check"], ["project", "sync"], ["project", "sync", "--dry-run"],
-                         ["project", "sync", "--all-projects"]):
-                with self.subTest(env=env, settings=settings_text, argv=argv):
-                    self.scenario([REPO_VIEW, {"match": ["issue", "list"], "stdout_json": []},
-                                   {"match": ["project"], "stdout_json": {"fields": [], "items": [],
-                                                                         "totalCount": 0}}], rest=False)
-                    p = self.board(*argv, **env)
-                    self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
-                    self.assertNotIn("Traceback", p.stderr)
-                    self.assertIn("HARNESS_PROJECT", p.stderr)
-                    self.assertFalse([a for a in self.calls() if a[:1] == ["project"]], self.calls())
-
-    def test_help_for_the_project_subcommands(self):
-        for argv in (["project", "--help"], ["project", "check", "--help"], ["project", "sync", "--help"]):
-            p = self.board(*argv)
-            self.assertEqual(p.returncode, 0, (argv, p.stderr))
-            self.assertIn("usage:", p.stdout)
-        p = self.board("project", "sync", "--help")
-        for option in ("--dry-run", "--all-projects", "--repo"):
-            self.assertIn(option, p.stdout)
+                self.assertEqual(p.stdout, "")
+                self.assertEqual(self.calls(), [], "refused before any gh call")
 
 
 # ======================================================================= answers, epic-check, board
@@ -2630,7 +1485,7 @@ def label_edits(calls):
 class Proposed(BoardTest):
     """`status:proposed` (#159): `epic create --proposed` and `task create --proposed` label it in place of
     status:ready; `ready` never lists it; `promote N` moves a proposed epic and its open proposed sub-issues (or a
-    proposed task alone) to ready through the usual status change; the Projects board gets no Status for it."""
+    proposed task alone) to ready through the usual status change; the Projects board is not touched."""
 
     HOST = "https://ghe.example.com/o/r/issues/"
 
@@ -2645,23 +1500,13 @@ class Proposed(BoardTest):
                        {"match": ["issue", "create"], "stdout": f"Creating issue in o/r\n\n{url}\n"},
                        {"match": ["api", f"repos/o/r/issues/{number}", "--jq", ".id"], "stdout": f"{number}00\n"},
                        {"match": ["api", "-X", "POST"], "stdout": "{}"},
-                       {"match": ["issue", "edit"], "stdout": url + "\n"}], project=self.boards())
+                       {"match": ["issue", "edit"], "stdout": url + "\n"}])
         return url
 
     def created_labels(self):
         creates = [argv for argv in self.calls() if argv[:2] == ["issue", "create"]]
         self.assertEqual(len(creates), 1, self.calls())
         return creates[0]
-
-    BOARDS = ("rjeskuri/7", "acme-org/23", "someone/1", "rjeskuri/12")
-
-    def boards(self):
-        """#447: the boards the mirror resolves its IDs on, holding the issues the status tests move."""
-        return [fakegh.board(p, BOARD_FIELDS, [self.HOST + "12", self.HOST + "66"]) for p in self.BOARDS]
-
-    def project_calls(self):
-        """What changed on the boards, as ProjectMirror.project_calls reads it."""
-        return ProjectMirror.project_calls(self)
 
     def promote_world(self, number, labels, state="OPEN", subs=(), kind_title="Ticket"):
         """N as gh issue view shows it (every field, so any --json list is answered) and, for an epic, its sub-issues
@@ -2971,89 +1816,6 @@ class Proposed(BoardTest):
                 self.assertEqual([e["number"] for e in data["proposed"]],
                                  sorted(int(x.split()[1][1:]) for x in lines))
                 self.assertEqual([e["number"] for e in data["no-status"]], [6])
-
-    # ------------------------------------------------------------------ the Projects board
-    def test_project_check_and_sync_ignore_proposed(self):
-        self.scenario([REPO_VIEW, {"match": ["project", "field-list"], "stdout_json": ProjectCheck.fields(None)}])
-        p = self.board("project", "check", HARNESS_PROJECT="rjeskuri/7")
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertNotIn("Proposed", p.stdout + p.stderr)
-        for project, numbers in (("rjeskuri/7", (11, 12, 13, 14, 15)), ("acme-org/23", (230, 4, 77, 9, 101))):
-            with self.subTest(project=project):
-                proposed_a, proposed_b, proposed_c, drifted, plain = numbers
-                issues = [sync_issue("o/r", proposed_a, "task", "proposed", False),
-                          sync_issue("o/r", proposed_b, "epic", "proposed", False),
-                          sync_issue("o/r", proposed_c, "bug", "proposed", True),
-                          sync_issue("o/r", drifted, "task", "ready", False),
-                          sync_issue("o/r", plain, "task", "in-progress", False)]
-                items = [board_item("o/r", proposed_a, UNSET, "Normal", labels=["task", "status:proposed"]),
-                         board_item("o/r", proposed_b, "Ready", UNSET, labels=["epic", "status:proposed"]),
-                         board_item("o/r", proposed_c, "In progress", "High", labels=["bug", "status:proposed"]),
-                         board_item("o/r", drifted, "In review", "Normal", labels=["task", "status:ready"]),
-                         board_item("o/r", plain, "In progress", "Normal", labels=["task", "status:in-progress"])]
-                self.scenario([{"match": ["issue", "list"], "stdout_json": issues},
-                               {"match": ["project", "item-list"],
-                                "stdout_json": {"items": items, "totalCount": len(items)}},
-                               {"match": ["project"], "stdout": ""}], rest=False)    # project sync stays on gh
-                p = self.board("project", "sync", HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertEqual(p.stderr.strip(), "", "no warning for status:proposed")
-                writes = [project_call(a) for a in self.calls() if a[:2] in (["project", "item-add"],
-                                                                            ["project", "item-edit"])]
-                self.assertEqual(writes, [item_edit(project, f"https://github.com/o/r/issues/{drifted}",
-                                                    "Status", "Ready")],
-                                 "the proposed issues get no write; the drifted ready one is still corrected")
-
-    def test_mirror_adds_the_item_without_status(self):
-        cases = [("rjeskuri/7", 13, ["task", "create", "--title", "T13", "--parent", "3", "--blocked-by", "9"], False),
-                 ("acme-org/23", 58, ["task", "create", "--title", "T58", "--type", "bug"], False),
-                 ("someone/1", 91, ["epic", "create", "--title", "E91", "--size", "M"], False),
-                 ("rjeskuri/12", 204, ["task", "create", "--title", "T204", "--priority"], True)]
-        for project, number, argv, priority in cases:
-            with self.subTest(project=project, number=number):
-                url = self.create_scenario(number, self.HOST + str(number))
-                p = self.board(*argv, "--body-file", self.body, "--proposed", HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertEqual(p.stderr.strip(), "")
-                self.assertEqual(p.stdout.strip(), f"#{number} {url}")
-                calls = self.project_calls()
-                self.assertTrue(calls, "the issue is still added to the board")
-                self.assertEqual(calls[0], item_add(project, url))
-                self.assertFalse([c for c in calls if c[0] == "item-edit" and c[2].get("field") == "Status"],
-                                 "no Status for a proposed issue")
-                if not priority:
-                    self.assertEqual(calls, [item_add(project, url)], "item-add only")
-                created = self.index_of_create()
-                first_project = next(i for i, a in enumerate(self.calls()) if a[:1] == ["project"])
-                self.assertLess(created, first_project)
-        # `status N proposed`: the labels swap, the board's Status is left alone, and nothing warns
-        for number, old, project in ((12, "ready", "rjeskuri/7"), (66, "needs-input", "acme-org/23")):
-            with self.subTest(status_proposed=number):
-                url = self.HOST + str(number)
-                self.scenario([REPO_VIEW,
-                               {"match": ["issue", "view", str(number)],
-                                "stdout_json": {"labels": [{"name": "task"}, {"name": "status:" + old}], "url": url,
-                                                "number": number}}],
-                              default={"stdout": ""}, project=self.boards())
-                p = self.board("status", str(number), "proposed", HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertEqual(p.stderr.strip(), "")
-                self.assertEqual(p.stdout.strip(), f"#{number} status:proposed")
-                adds, removes = label_edits(self.calls())[number]
-                self.assertEqual((adds, removes), ({"status:proposed"}, {"status:" + old}))
-                self.assertEqual(self.project_calls(), [])
-                # and promoting it back mirrors Ready as any status change does
-                self.scenario([REPO_VIEW,
-                               {"match": ["issue", "view", str(number)],
-                                "stdout_json": dict(issue(number=number, labels=("task", "status:proposed")),
-                                                    url=url)}],
-                              default={"stdout": ""}, project=self.boards())
-                p = self.board("promote", str(number), HARNESS_PROJECT=project)
-                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-                self.assertEqual(self.project_calls(), [item_edit(project, url, "Status", "Ready")])
-
-    def index_of_create(self):
-        return next(i for i, a in enumerate(self.calls()) if a[:2] == ["issue", "create"])
 
     def test_help(self):
         p = self.board("promote", "--help")

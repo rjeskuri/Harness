@@ -664,8 +664,8 @@ class GitHubCount(CallsTest):
 
 # =========================================================================== GraphQL points (#469)
 class Points(CallsTest):
-    """The log counts calls, GitHub counts points (docs/research/github-quota.md): a logged `project item-edit`
-    is about 104 points, a `project item-list` line 101, any other graphql line 1, a rest line none. The estimate is
+    """The log counts calls, GitHub counts points (docs/research/github-quota.md): a logged `project item-list` line
+    is about 101 points, any other graphql line 1, a rest line none. The estimate is
     applied when the log is read, from the line's `cmd`; X-RateLimit-Used is not involved.
 
     Contract: --json gains `points` (total, beside graphql and rest), `points` in every by_tool and by_command row,
@@ -674,7 +674,7 @@ class Points(CallsTest):
     Text: the TOOL and COMMAND tables gain a last column POINTS, and the github line names used, logged_points and
     gap_points; the summary line is unchanged."""
 
-    EDIT, LIST = "project item-edit", "project item-list"
+    LIST = "project item-list"
 
     def seed_n(self, base, tool, cmd, kind, n, ticket=None):
         self.seed([call(base + dt.timedelta(seconds=i), tool, cmd, kind, ticket=ticket) for i in range(n)])
@@ -682,21 +682,18 @@ class Points(CallsTest):
     def test_points_by_total_tool_and_command(self):
         scenarios = [
             # (label, [(tool, cmd, kind, n)], total, {tool: points}, {cmd: points})
-            ("one item-edit", [("harness-board", self.EDIT, "graphql", 1)], 104,
-             {"harness-board": 104}, {self.EDIT: 104}),
             ("one item-list is one line of 101", [("harness-board", self.LIST, "graphql", 1)], 101,
              {"harness-board": 101}, {self.LIST: 101}),
-            ("the 2026-11-24 gap: 60 item-edits among 580 graphql calls",
-             [("harness-board", self.EDIT, "graphql", 60), ("agent", "issue view", "graphql", 520),
-              ("agent", "run list", "rest", 5)], 6760,
-             {"harness-board": 6240, "agent": 520}, {self.EDIT: 6240, "issue view": 520, "run list": 0}),
+            ("the 2026-11-24 gap: 60 item-lists among 580 graphql calls",
+             [("harness-board", self.LIST, "graphql", 60), ("agent", "issue view", "graphql", 520),
+              ("agent", "run list", "rest", 5)], 6580,
+             {"harness-board": 6060, "agent": 520}, {self.LIST: 6060, "issue view": 520, "run list": 0}),
             ("a mix: other project commands and api graphql cost 1, rest nothing",
-             [("harness-board", self.EDIT, "graphql", 2), ("harness-board", self.LIST, "graphql", 3),
-              ("harness-board", "project item-add", "graphql", 1), ("harness-pr", "pr view", "graphql", 4),
-              ("harness-pr", "api POST graphql", "graphql", 1), ("harness-pr", ACTIONS, "rest", 2)], 517,
-             {"harness-board": 512, "harness-pr": 5},
-             {self.EDIT: 208, self.LIST: 303, "project item-add": 1, "pr view": 4, "api POST graphql": 1,
-              ACTIONS: 0}),
+             [("harness-board", self.LIST, "graphql", 3), ("harness-board", "project view", "graphql", 1),
+              ("harness-pr", "pr view", "graphql", 4), ("harness-pr", "api POST graphql", "graphql", 1),
+              ("harness-pr", ACTIONS, "rest", 2)], 309,
+             {"harness-board": 304, "harness-pr": 5},
+             {self.LIST: 303, "project view": 1, "pr view": 4, "api POST graphql": 1, ACTIONS: 0}),
         ]
         for i, (label, groups, total, by_tool, by_cmd) in enumerate(scenarios):
             with self.subTest(label):
@@ -722,13 +719,13 @@ class Points(CallsTest):
 
     def test_points_follow_the_window(self):
         h = self.this_hour()
-        self.seed([call(h - dt.timedelta(hours=30), "harness-board", self.EDIT, "graphql"),    # outside 24 h
-                   call(h - dt.timedelta(hours=5), "harness-board", self.EDIT, "graphql"),
+        self.seed([call(h - dt.timedelta(hours=30), "harness-board", self.LIST, "graphql"),    # outside 24 h
+                   call(h - dt.timedelta(hours=5), "harness-board", self.LIST, "graphql"),
                    call(h - dt.timedelta(hours=2), "harness-board", self.LIST, "graphql"),
                    call(h - dt.timedelta(hours=2), "harness-pr", "pr view", "graphql")])
-        self.assertEqual(self.report()["points"], 104 + 101 + 1)
+        self.assertEqual(self.report()["points"], 101 + 101 + 1)
         self.assertEqual(self.report("--hours", "3")["points"], 101 + 1)
-        self.assertEqual(self.report("--hours", "40")["points"], 104 * 2 + 101 + 1)
+        self.assertEqual(self.report("--hours", "40")["points"], 101 * 3 + 1)
 
     def test_empty_window_has_zero_points(self):
         self.assertEqual(self.report()["points"], 0)
@@ -741,34 +738,34 @@ class Points(CallsTest):
             "default": {"stdout": "", "exit": 0}}))
 
     def seed_quota_window(self):
-        """Clock 12:17:43, reset 12:40:00 so window_start is 11:40:00. In the window: 21 item-edits (one at
+        """Clock 12:17:43, reset 12:40:00 so window_start is 11:40:00. In the window: 21 item-lists (one at
         11:40:00 itself, nine before the 0.5 h mark 11:47:43, eleven after), 100 issue views, one item-list, a rest
-        call. Outside it: an item-edit at 11:39:59."""
+        call. Outside it: an item-list at 11:39:59."""
         self.clock = at_utc("2026-03-10T12:17:43Z")
         self.answer(5000, at_utc("2026-03-10T12:40:00Z"))
-        self.seed([call(at_utc("2026-03-10T11:39:59Z"), "harness-board", self.EDIT, "graphql"),
-                   call(at_utc("2026-03-10T11:40:00Z"), "harness-board", self.EDIT, "graphql")])
-        self.seed_n(at_utc("2026-03-10T11:45:00Z"), "harness-board", self.EDIT, "graphql", 9)
-        self.seed_n(at_utc("2026-03-10T12:00:00Z"), "harness-board", self.EDIT, "graphql", 11)
+        self.seed([call(at_utc("2026-03-10T11:39:59Z"), "harness-board", self.LIST, "graphql"),
+                   call(at_utc("2026-03-10T11:40:00Z"), "harness-board", self.LIST, "graphql")])
+        self.seed_n(at_utc("2026-03-10T11:45:00Z"), "harness-board", self.LIST, "graphql", 9)
+        self.seed_n(at_utc("2026-03-10T12:00:00Z"), "harness-board", self.LIST, "graphql", 11)
         self.seed_n(at_utc("2026-03-10T12:01:00Z"), "agent", "issue view", "graphql", 100)
         self.seed([call(at_utc("2026-03-10T12:10:00Z"), "agent", self.LIST, "graphql"),
                    call(at_utc("2026-03-10T12:11:00Z"), "agent", "run list", "rest")])
 
     def test_github_block_has_logged_points_and_gap_points(self):
         self.seed_quota_window()
-        # logged_points over [window_start, now]: 21 * 104 + 100 + 101 = 2385; whatever --hours says
+        # logged_points over [window_start, now]: (21 + 1) * 101 + 100 = 2322; whatever --hours says
         for hours in ("0.5", "24"):
             with self.subTest(hours=hours):
                 data = self.report("--hours", hours)
                 gh = data["github"]
-                self.assertEqual(gh["logged_points"], 2385, gh)
-                self.assertEqual(gh["gap_points"], 5000 - 2385, gh)
+                self.assertEqual(gh["logged_points"], 2322, gh)
+                self.assertEqual(gh["gap_points"], 5000 - 2322, gh)
                 # the older fields stay as they were: 21 + 100 + 1 logged graphql lines
                 self.assertEqual((gh["used"], gh["logged_graphql"], gh["gap"]), (5000, 122, 5000 - 122), gh)
                 self.assertEqual(set(gh), {"used", "limit", "remaining", "reset", "window_start", "rate_limit_used",
                                            "logged_graphql", "gap", "logged_points", "gap_points"})
         # the total is the report window's, not GitHub's: 11 edits + 100 views + 1 list inside the last 0.5 h
-        self.assertEqual(self.report("--hours", "0.5")["points"], 1144 + 100 + 101)
+        self.assertEqual(self.report("--hours", "0.5")["points"], 11 * 101 + 100 + 101)
 
     def test_the_gap_in_points_is_what_the_log_did_not_see(self):
         # Used rises by 7 points that no line explains: gap_points rises by 7, logged_points does not move.
@@ -778,16 +775,16 @@ class Points(CallsTest):
         after = self.report("--hours", "0.5")["github"]
         self.assertEqual(after["logged_points"], before["logged_points"])
         self.assertEqual(after["gap_points"], before["gap_points"] + 7)
-        # one more logged item-edit in the window lowers gap_points by 104 and the plain gap by 1
-        self.seed([call(at_utc("2026-03-10T12:16:00Z"), "harness-board", self.EDIT, "graphql")])
+        # one more logged item-list in the window lowers gap_points by 101 and the plain gap by 1
+        self.seed([call(at_utc("2026-03-10T12:16:00Z"), "harness-board", self.LIST, "graphql")])
         more = self.report("--hours", "0.5")["github"]
-        self.assertEqual((more["gap_points"], more["gap"]), (after["gap_points"] - 104, after["gap"] - 1))
+        self.assertEqual((more["gap_points"], more["gap"]), (after["gap_points"] - 101, after["gap"] - 1))
 
     def test_text_shows_points_and_the_point_gap(self):
         self.seed_quota_window()
         out = self.ok("budget", "calls", "--hours", "0.5").stdout
         self.assertTrue(out.startswith("gh calls in the last 0.5 h: 113 (graphql 112, rest 1), 0 refused"), out)
-        numbers = [r"\b5000\b", r"\b2385\b", r"\b2615\b"]
+        numbers = [r"\b5000\b", r"\b2322\b", r"\b2678\b"]
         self.assertTrue(any(all(re.search(n, line) for n in numbers) for line in out.splitlines()), out)
 
         def row(first):
@@ -799,10 +796,9 @@ class Points(CallsTest):
 
         self.assertIn("POINTS", re.split(r"\s{2,}", next(l for l in out.splitlines() if l.startswith("TOOL")).strip()))
         self.assertEqual(row("agent"), ["agent", "102", "101", "1", "0", "201"])
-        self.assertEqual(row("harness-board"), ["harness-board", "11", "11", "0", "0", "1144"])
+        self.assertEqual(row("harness-board"), ["harness-board", "11", "11", "0", "0", "1111"])
         self.assertEqual(row("issue view"), ["issue view", "graphql", "100", "100"])
-        self.assertEqual(row(self.EDIT), [self.EDIT, "graphql", "11", "1144"])
-        self.assertEqual(row(self.LIST), [self.LIST, "graphql", "1", "101"])
+        self.assertEqual(row(self.LIST), [self.LIST, "graphql", "12", "1212"])
         self.assertEqual(row("run list"), ["run list", "rest", "1", "0"])
 
 

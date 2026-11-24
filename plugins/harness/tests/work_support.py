@@ -37,9 +37,6 @@ SECRET = "fake-key-value-7f3a9c"   # what the key command prints; must never rea
 DEFAULT_KEY_CMD = "security find-generic-password -s harness-anthropic -w"
 TEN_DAYS_AGO = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%S+0000")
 MARK = "\n\n<!-- harness -->"      # the last line of every comment harness-board posts
-# A Projects board's fields as the harness writes them (#447: fakegh.board answers ID lookups and ID edits on them).
-BOARD_FIELDS = {"Status": ["Ready", "In progress", "In review", "Blocked", "Needs input", "Done"],
-                "Priority": ["High", "Normal"]}
 QUESTION = "**Needs your input**\n\nWhich base?\n\nReply in a comment; /harness:work 12 picks it up." + MARK
 CREDENTIALS = {"ANTHROPIC_API_KEY": "sk-ant-fake", "ANTHROPIC_AUTH_TOKEN": "fake-token",
                "CLAUDE_CODE_OAUTH_TOKEN": "fake-oauth"}
@@ -189,22 +186,6 @@ def write(path, text):
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
     return path
-
-
-def project_argv(argv):
-    """(subcommand, positionals, {option: value}) of a `gh project ...` argv, whatever the flag order."""
-    pos, opts, i = [], {}, 2
-    while i < len(argv):
-        name, eq, value = argv[i][2:].partition("=")
-        if not argv[i].startswith("--"):
-            pos.append(argv[i])
-        else:
-            if not eq:
-                i += 1
-                value = argv[i] if i < len(argv) else None
-            opts[name] = [opts[name], value] if name in opts else value
-        i += 1
-    return argv[1], pos, opts
 
 
 def executable(path, text):
