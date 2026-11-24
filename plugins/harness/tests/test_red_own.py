@@ -441,6 +441,26 @@ class OwnFiles(Repos, unittest.TestCase):
         self.assertEqual(self.red(wt, "files").stdout, "")
         self.assertEqual(self.own_json(wt)["files"], [])
 
+    def test_scaffold_templates_are_never_own_files(self):
+        # #433: `scripts/loop_smoke.py` has the name key `smoke`, the subject of the scaffold's smoke-test
+        # templates; those are files to copy into other projects, not tests of this repo.
+        layout = ["scripts/loop_smoke.py", "scripts/other_tool.py", "tests/test_loop_smoke.py", "tests/test_other.py"]
+        templates = {"plugins/harness/templates/test_smoke.py": "import {{pkg}}\n",
+                     "plugins/harness/templates/smoke.test.js": 'assert.equal(pkg.name, "{{pkg}}");\n'}
+        _, wt = self.new_repo(layout, templates)
+        self.change(wt, {"scripts/loop_smoke.py": "edit"})
+        self.assertEqual(self.own(wt), ["tests/test_loop_smoke.py"])
+        got = self.own_json(wt)
+        self.assertEqual(got["files"], ["tests/test_loop_smoke.py"])
+        self.assertEqual(got["mapped"], {"scripts/loop_smoke.py": ["tests/test_loop_smoke.py"]})
+        self.assertEqual(got["unmapped"], [])
+
+        # only a template matches: the source is unmapped and nothing is listed
+        _, wt = self.new_repo(["scripts/loop_smoke.py", "tests/test_other.py"], templates)
+        self.change(wt, {"scripts/loop_smoke.py": "edit"})
+        self.assertEqual(self.own(wt), [])
+        self.assertEqual(self.own_json(wt)["unmapped"], ["scripts/loop_smoke.py"])
+
     def test_no_tests_ticket_is_answered_like_any_branch(self):
         changes = {"src/app/models.py": "edit", "tests/test_views.py": "edit", "docs/notes.md": "edit"}
         expected = ["tests/test_models.py", "tests/test_views.py"]
@@ -577,6 +597,30 @@ class OwnRun(Repos, unittest.TestCase):
                 found = seconds.findall(p.stdout)
                 self.assertEqual(len(found), 1, p.stdout)
                 self.assertGreaterEqual(float(found[0]), 0)
+
+    def test_run_ignores_the_scaffold_templates_next_to_a_matching_real_module(self):
+        # #433: the unparseable template once failed `run` (`own tests: 15 files, exit 1`) though the real
+        # module passed alone. The default command parses every file it is given.
+        _, wt = self.new_repo(["scripts/loop_smoke.py"],
+                              {"tests/test_loop_smoke.py": PASSING_TEST,
+                               "plugins/harness/templates/test_smoke.py": "import {{pkg}}\n",
+                               "plugins/harness/templates/smoke.test.js": "test({{pkg}});\n"})
+        self.change(wt, {"scripts/loop_smoke.py": "edit"})
+        # messages carry only the summary line: the child's traceback would echo a `SyntaxError:` line, which
+        # harness-red's own check reads as "tests failed to load" instead of an assertion failure
+        p = self.red(wt, "run")
+        summary = (p.stdout.splitlines() or [""])[0]
+        self.assertEqual(p.returncode, 0, summary)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(summary, "own tests: 1 files, exit 0")
+
+        # the real module failing still fails the run
+        write(os.path.join(wt, "tests", "test_loop_smoke.py"), FAILING_TEST)
+        p = self.red(wt, "run")
+        summary = (p.stdout.splitlines() or [""])[0]
+        self.assertEqual(p.returncode, 1, summary)
+        self.assertEqual(summary, "own tests: 1 files, exit 1")
+        self.assertIn("AssertionError: 5 != 6", p.stdout)
 
     def test_run_with_no_own_files_runs_nothing_and_exits_zero(self):
         for name, changes in (

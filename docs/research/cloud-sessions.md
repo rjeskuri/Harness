@@ -14,6 +14,8 @@ Gathered 2026-10-14 and re-checked 2026-10-26 (Claude Code 2.1.296, then 2.1.310
 - **Tracking:** `claude agents --json` does not list cloud sessions; there is no public status API for scripts. The run's outcome comes back as marker comments on the ticket.
 - **Seed bundle (seen 2026-10-26 on six hand-launched runs):** a session created before the Claude GitHub integration was connected for the repository is "Cloned from seed bundle": it has no `origin`, and the git proxy answers 403 "not in this session's authorized repository set" to a push, so it can never push. Connecting the integration later does not fix a session that is already running. Check the session page for "Cloned from seed bundle" before trusting a run; the launch prompt makes the session check `git remote get-url origin` and `git push --dry-run` first.
 
+- **Changed 2026-11-24 (Claude Code 2.1.331):** plugins can now reach a cloud session through the claude.ai account ("add it to your claude.ai account at claude.ai/customize/plugins", plugins/install docs); plugins from user settings and marketplaces in the repository's settings still do not load. GraphQL is still blocked and a new session still needs an interactive terminal. See `docs/research/off-mac-loop.md`.
+
 ## Not verified
 
 - The exact launch output after `Created cloud session:`. `harness-work cloud` takes the session id from the first `https://claude.ai/code/<id>` URL in it (the form of the session pages and of the `url` a follow-up returns) and treats output without one as a failed launch.
