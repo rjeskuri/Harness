@@ -567,7 +567,8 @@ def listed(body):
 def add_rejections(root, rejected):
     """Add the fingerprints listed by the ticket of each closed, unmerged dead-code PR not seen before to
     `rejected` ({"fingerprints", "prs"}); whether anything changed."""
-    prs = gh_json(["pr", "list", "--state", "closed", "--label", GATE, "--limit", "100",
+    # Unlabelled: the loop opens the PR bare and only the ticket carries GATE; DEAD_BRANCH picks the PRs out.
+    prs = gh_json(["pr", "list", "--state", "closed", "--limit", "100",
                    "--json", "number,headRefName,state,mergedAt"], root)
     have = {fp_key(f) for f in rejected["fingerprints"]}
     changed = False
@@ -747,7 +748,8 @@ def ticket_body(root, chosen, total, lines_file):
             "- Filed by `harness-deadcode daily` from `harness-deadcode scan --json`"
             + (f" with the line data in `{lines_file}`" if lines_file else " without line data") + ".",
             f"- `{GATE}`: the owner lands it with /harness:land. Closing its PR unmerged rejects these candidates "
-            "until their source changes; `# deadcode: keep (<reason>)` keeps one for good.", "",
+            "until their source changes; close this ticket as not planned with it, or no later batch is filed. "
+            "`# deadcode: keep (<reason>)` keeps one for good.", "",
             "<!-- harness-deadcode fingerprints",
             json.dumps([c["fingerprint"] for c in chosen], indent=1),
             "-->", ""]
@@ -779,7 +781,7 @@ def file_ticket(root, folder, body, epic, size):
 def daily(args):
     root = os.path.realpath(checkout(args.repo))
     if args.install_launchd:
-        return install_launchd(root)
+        return install_launchd(os.path.realpath(main_checkout(root) or root))   # not a ticket worktree
     folder = harness_home("deadcode", repo_key(main_checkout(root) or root))
     today = time.strftime("%Y-%m-%d")
     head = "harness-deadcode: dry run: " if args.dry_run else "harness-deadcode: "
