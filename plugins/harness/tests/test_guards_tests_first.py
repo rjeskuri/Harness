@@ -222,6 +222,33 @@ class TestsFirstTests(GuardTestCase):
         self.write(self.wt / "tests/test_app.py", "changed\n")
         self.assertIsNone(self.edit("src/app.py"))  # any record will do
 
+    def test_a_removed_record_allows_a_refactor_source_edit_and_not_a_task_one(self):
+        # #454: the test-author deletes the whole test file pinning dead code; harness-red check
+        # itself writes the `removed` record.
+        self.cache(type="refactor")
+        self.git(self.wt, "rm", "-q", "tests/test_app.py")
+        self.git(self.wt, "commit", "-q", "-m", "drop the tests of the dead code")
+        r = subprocess.run(
+            [sys.executable, str(RED_TOOL), "check"],
+            cwd=str(self.wt),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=120,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        record = json.loads((self.state / "red/t-12-fix-login.json").read_text())
+        self.assertEqual(record["kind"], "removed")
+        self.assertIsNone(self.edit("src/app.py", "harness:coder"))
+        self.assertIsNone(self.edit("src/app.py"))
+        # The same record proves nothing for any other ticket: refused for its kind, not for
+        # want of a record.
+        for ticket_type in ("task", "bug", "chore"):
+            with self.subTest(type=ticket_type):
+                self.cache(type=ticket_type, labels=[ticket_type, "status:in-progress"])
+                self.assertNotIn(self.edit("src/app.py", "harness:coder"), (None, NO_RED))
+                self.assertNotIn(self.edit("src/app.py"), (None, NO_RED))
+
     def test_test_and_exempt_paths_pass_without_a_red_record(self):
         for rel in (
             "tests/test_app.py",
