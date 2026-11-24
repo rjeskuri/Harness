@@ -668,9 +668,11 @@ class Revert(GuardTest):
             {"author": {"login": "rjeskuri"}, "createdAt": "2026-10-22T09:30:00Z", "body": body},
             {"author": {"login": "rjeskuri"}, "createdAt": "2026-10-22T11:00:00Z", "body": "Retry with a smaller batch."},
         ]
-        write(w.scenario_path, json.dumps({"calls": [
+        sys.path.insert(0, HERE)
+        import fakegh   # #447: harness-board reads the ticket's comments through REST (fakegh's REST world)
+        write(w.scenario_path, json.dumps({"calls": fakegh.as_rest([
             {"match": ["api", "user"], "stdout": "rjeskuri\n"},
-            {"match": ["issue", "view", "58", "--json", "comments"], "stdout_json": {"comments": thread}}]}))
+            {"match": ["issue", "view", "58", "--json", "comments"], "stdout_json": {"comments": thread}}])}))
         env = self.guard_env(w)
         q = subprocess.run([sys.executable, BOARD, "answers", "58"], cwd=board_repo, env=env, capture_output=True,
                            text=True, timeout=60)
