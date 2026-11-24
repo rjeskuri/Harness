@@ -131,6 +131,15 @@ def setUpModule():
         executable(os.path.join(M["pybin"], "python3"), PYTHON3.format(python=sys.executable))
         M["githome"] = os.path.join(root, "githome")
         os.makedirs(M["githome"])
+        # a second checkout's shim folder (a copy with the lib beside it, as a checkout has it) and a third one
+        # (the shim alone): different real paths from the shim under test, the same script
+        for key, name, with_lib in (("shim2", "checkout2", True), ("shim3", "checkout3", False)):
+            plugin = os.path.join(root, name, "plugins", "harness")
+            os.makedirs(os.path.join(plugin, "shim"))
+            shutil.copy2(SHIM, os.path.join(plugin, "shim", "gh"))
+            if with_lib:
+                shutil.copytree(LIB, os.path.join(plugin, "lib"), ignore=shutil.ignore_patterns("__pycache__"))
+            M[key] = os.path.join(plugin, "shim")
         # path-only checkouts for the shim's repo and ticket (no git needed: both come from the path)
         M["wt12"] = os.path.join(root, "acme-widget", ".claude", "worktrees", "t-12-add-the-widget")
         M["beta"] = os.path.join(root, "beta-tool")
@@ -196,13 +205,13 @@ class Case(unittest.TestCase):
         env.update(extra)
         return env
 
-    def shim(self, args, stdin=b"", cwd=None, exe=SHIM, **env):
+    def shim(self, args, stdin=b"", cwd=None, exe=SHIM, timeout=60, **env):
         """Run the shim as a program (its shebang, its folder's real path) with `stdin` bytes."""
         self.assertTrue(os.path.isfile(exe) and os.access(exe, os.X_OK), f"no executable shim at {exe}")
         cwd = cwd or M["beta"]
         env.setdefault("PWD", cwd)
         return subprocess.run([exe] + list(args), input=stdin, capture_output=True, cwd=cwd,
-                              env=self.env(**env), timeout=60)
+                              env=self.env(**env), timeout=timeout)
 
     def records(self):
         if not os.path.exists(self.record):
@@ -381,6 +390,83 @@ class Logged(Case):
                 self.assertEqual([r["argv"] for r in self.records()], [args])
 
 
+# ==================================================================== two checkouts' shims on PATH
+class TwoShims(Case):
+    """A session of one checkout can start a session that loads another checkout's plugin, so PATH holds two shim
+    folders (different real paths) ahead of the real gh. One gh call must reach the real gh once, whichever shim is
+    started and whichever folder comes first, instead of one shim running the other without end."""
+
+    def run_through(self, entry_dir, dirs, args, code, *, home=None):
+        try:
+            return self.shim(args, exe=os.path.join(entry_dir, "gh"), timeout=15, home=home,
+                             path=[M["pybin"]] + dirs + [M["realbin"], "/usr/bin", "/bin"],
+                             SHIMTEST_EXIT=str(code), SHIMTEST_ERR="e" + str(code))
+        except subprocess.TimeoutExpired:
+            self.fail(f"the shim in {entry_dir} did not finish with {dirs} on PATH (shims calling each other?)")
+
+    def test_two_shims_run_the_real_gh_once_and_log_once(self):
+        """Either shim started, either folder first: the real gh ran once with the argv unchanged, its stdout,
+        stderr and exit come through, and the log holds one agent line for the one call."""
+        orders = [("A then B", SHIM_DIR, M["shim2"]), ("B then A", M["shim2"], SHIM_DIR)]
+        cases = [(["issue", "view", "489", "--json", "title"], 0, "issue view"),
+                 (["pr", "checks", "7"], 8, "pr checks"),
+                 (["api", "user"], 3, "api user")]
+        for label, first, second in orders:
+            for entry in (SHIM_DIR, M["shim2"]):
+                for args, code, cmd in cases:
+                    with self.subTest(order=label, started=entry, args=args):
+                        if os.path.exists(self.record):
+                            os.unlink(self.record)
+                        home = self.new_home()
+                        p = self.run_through(entry, [first, second], args, code, home=home)
+                        self.assertEqual(p.stdout, b"out:" + json.dumps(args).encode("utf-8") + b"|", p.stderr)
+                        self.assertEqual(p.stderr, b"err:e" + str(code).encode("utf-8"))
+                        self.assertEqual(p.returncode, code)
+                        self.assertEqual([r["argv"] for r in self.records()], [args])
+                        lines = self.logged(home)
+                        self.assertEqual(len(lines), 1, lines)
+                        self.assertAgentLine(lines[0], cmd=cmd, exit=code)
+
+    def test_two_shims_pass_stdin_through(self):
+        """The one real gh gets the caller's stdin whole (a nested shim must not eat or duplicate it)."""
+        try:
+            p = self.shim(["pr", "create", "--body-file", "-"], stdin=b"body line\n", exe=SHIM, timeout=15,
+                          path=[M["pybin"], SHIM_DIR, M["shim2"], M["realbin"], "/usr/bin", "/bin"])
+        except subprocess.TimeoutExpired:
+            self.fail("the shim did not finish with two shim folders on PATH")
+        self.assertEqual((p.stdout, p.returncode), (b'out:["pr", "create", "--body-file", "-"]|body line\n', 0))
+        self.assertEqual(len(self.records()), 1)
+
+    def test_three_shims_and_a_shim_without_lib_still_run_the_real_gh_once(self):
+        """Three shim folders (one with no lib beside it) ahead of the real gh, in every rotation: one real call,
+        its exit, and at most one agent line."""
+        folders = [SHIM_DIR, M["shim2"], M["shim3"]]
+        for i in range(3):
+            order = folders[i:] + folders[:i]
+            for entry in folders:
+                with self.subTest(order=[os.path.basename(os.path.dirname(os.path.dirname(d))) for d in order],
+                                  started=entry):
+                    if os.path.exists(self.record):
+                        os.unlink(self.record)
+                    home = self.new_home()
+                    p = self.run_through(entry, order, ["run", "list"], 4, home=home)
+                    self.assertEqual((p.stdout, p.returncode), (b'out:["run", "list"]|', 4), p.stderr)
+                    self.assertEqual([r["argv"] for r in self.records()], [["run", "list"]])
+                    self.assertLessEqual(len(self.logged(home)), 1, self.logged(home))
+
+    def test_only_shims_are_skipped_the_first_real_gh_runs(self):
+        """With two shims first, the first real gh on PATH runs, not a later one."""
+        later = os.path.join(self.tmp, "later")
+        executable(os.path.join(later, "gh"), "#!/bin/sh\necho later-gh\nexit 9\n")
+        try:
+            p = self.shim(["auth", "status"], exe=os.path.join(M["shim2"], "gh"), timeout=15,
+                          path=[M["pybin"], M["shim2"], SHIM_DIR, M["realbin"], later, "/usr/bin", "/bin"])
+        except subprocess.TimeoutExpired:
+            self.fail("the shim did not finish with two shim folders on PATH")
+        self.assertEqual((p.stdout, p.returncode), (b'out:["auth", "status"]|', 0), p.stderr)
+        self.assertEqual(len(self.records()), 1)
+
+
 # ==================================================================== no double logging
 class HarnessCalls(Case):
     def test_the_harness_runners_mark_their_gh_children(self):
@@ -412,13 +498,17 @@ class HarnessCalls(Case):
         """HARNESS_GH unset, the shim first on PATH: `harness-board show 12 --json` reaches fakegh through the
         shim and the log holds only the board's own lines; an agent's `gh` in a shell with the same PATH adds one
         agent line."""
-        scenario = write(os.path.join(self.tmp, "scenario.json"), json.dumps({"calls": [
-            {"match": ["issue", "view", "12"], "stdout_json": {
-                "number": 12, "title": "Ticket 12", "url": "https://github.com/acme/shop-front/issues/12",
-                "body": "## Request\nAdd it.\n\n## Definition of done\n- [ ] It works\n",
-                "labels": [{"name": "task"}, {"name": "status:ready"}], "state": "OPEN", "parent": None,
-                "blockedBy": [], "comments": []}},
-            {"match": ["api", "user"], "stdout": "rjeskuri\n"}]}))
+        sys.path.insert(0, TESTS)
+        import fakegh
+        ticket = {"match": ["issue", "view", "12"], "stdout_json": {
+            "number": 12, "title": "Ticket 12", "url": "https://github.com/acme/shop-front/issues/12",
+            "body": "## Request\nAdd it.\n\n## Definition of done\n- [ ] It works\n",
+            "labels": [{"name": "task"}, {"name": "status:ready"}], "state": "OPEN", "parent": None,
+            "blockedBy": [], "comments": []}}
+        # #447: the board reads the ticket through REST (fakegh's REST world); the agent's own `gh issue view` below
+        # is a gh issue command, answered as before
+        scenario = write(os.path.join(self.tmp, "scenario.json"), json.dumps({"calls": [ticket] + fakegh.as_rest([
+            ticket, {"match": ["api", "user"], "stdout": "rjeskuri\n"}])}))
         dirs = [M["pybin"], SHIM_DIR, M["fakebin"]]
         if os.path.dirname(GIT) not in ("/usr/bin", "/bin"):
             dirs.append(os.path.dirname(GIT))
@@ -430,11 +520,16 @@ class HarnessCalls(Case):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(json.loads(p.stdout)["number"], 12)
         calls = self.records()
-        self.assertEqual([c["argv"][:2] for c in calls], [["issue", "view"], ["api", "user"]])
-        self.assertEqual([c["logged"] for c in calls], ["1", "1"], calls)
+        # #447: the record's REST reads (the issue itself first), then the one `gh api user`
+        self.assertEqual([c["argv"][:1] for c in calls], [["api"]] * len(calls), calls)
+        self.assertEqual(fakegh.parse_api(calls[0]["argv"])["route"], "issues/12", calls)
+        self.assertEqual(calls[-1]["argv"][:2], ["api", "user"], calls)
+        self.assertEqual([c["logged"] for c in calls], ["1"] * len(calls), calls)
         lines = self.logged()
-        self.assertEqual(sorted((x["tool"], x["cmd"]) for x in lines),
-                         [("harness-board", "api user"), ("harness-board", "issue view")])
+        self.assertEqual(len(lines), len(calls), lines)                      # each call logged once
+        self.assertEqual({x["tool"] for x in lines}, {"harness-board"}, lines)
+        self.assertEqual(sorted(x["cmd"] for x in lines if x["cmd"] in ("api user", "api repos/:owner/:repo/issues/:n")),
+                         ["api repos/:owner/:repo/issues/:n", "api user"], lines)
 
         # an agent's own gh in a later Bash call, same PATH: one agent line more
         s = subprocess.run(["/bin/sh", "-c", 'gh issue view 12 --json title'], cwd=M["main"],
@@ -444,7 +539,7 @@ class HarnessCalls(Case):
         agent = [x for x in self.logged() if x["tool"] == "agent"]
         self.assertEqual(len(agent), 1, self.logged())
         self.assertAgentLine(agent[0], cmd="issue view", kind="graphql", exit=0, repo="shop-front", ticket=None)
-        self.assertEqual(len(self.logged()), 3)
+        self.assertEqual(len(self.logged()), len(lines) + 1)
 
 
 # ==================================================================== the session puts the shim on PATH

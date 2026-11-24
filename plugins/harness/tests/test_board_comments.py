@@ -12,7 +12,8 @@ two owners, where what is kept and what is hidden trade places. The deploy guard
 harness's marker or without it. When the owner login cannot be read, show fails closed: only the deploy guard's
 comments are kept (never the origin remote's or the repository slug's owner's), the rest are hidden and counted.
 
-Self-contained (no sibling import): each test has its own temporary HOME and git repository with an `origin` remote
+Self-contained (no sibling import but fakegh, whose REST layer the gh issue fixtures move to, #447): each test has
+its own temporary HOME and git repository with an `origin` remote
 (never contacted); `gh` is the scripted fake (fakegh.py) behind a wrapper written once for the module, since macOS
 checks a new executable on its first run.
 """
@@ -28,6 +29,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fakegh  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(os.path.dirname(HERE), "bin", "harness-board")
@@ -259,7 +263,7 @@ class Case(unittest.TestCase):
                               capture_output=True, text=True, check=True)
 
     def scenario(self, calls):
-        write(self.scenario_path, json.dumps({"calls": calls}))
+        write(self.scenario_path, json.dumps({"calls": fakegh.as_rest(calls)}))    # #447: issues through REST
         for leftover in (self.scenario_path + ".state.json", self.log):
             if os.path.exists(leftover):
                 os.unlink(leftover)

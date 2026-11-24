@@ -262,6 +262,111 @@ PATH_CONTROLS = (
 )
 
 
+# Pinned by mutation triage (#477, epic #439): each row is a command a mutant of readonly_allow.py allowed while the
+# hook gives no decision. (Rows that depend on the environment or a special fixture are the tests below the class.)
+TRIAGE_NO_DECISION = (
+    # a word with a glob or a leading = names no known file, wherever a reader or git takes one
+    ("cat src/*.py", "main"),
+    ("ls *.md", "wt"),
+    ("cat =ls", "main"),
+    ("wc --lines src/*.py", "wt"),
+    ("grep -n hello src/*.py", "wt"),
+    ("sed -n 2p src/*.py", "main"),
+    ("cat < src/*.py", "main"),
+    ("cd * && pwd", "main"),
+    ("grep -f .en* README.md", "main"),
+    # a glob operand next to -e / -f / --regexp= is a file operand with a glob, not the pattern, in a clean folder too
+    ("cd src && grep -n -e login *.py", "main"),
+    ("cd src && grep -e login *.py", "main"),
+    ("cd src && grep --regexp=login *.py", "main"),
+    ("cd src && grep -n -f ../README.md *.py", "main"),
+    ("git grep -f '.en*' login", "main"),
+    ("git ls-files '*.py'", "main"),
+    ("git log -- 'src/*.py'", "main"),
+    ("git -C '*' status", "main"),
+    ("git grep -e login -- 'src/*.py'", "main"),
+    ("git grep --regexp=login -- 'src/*.py'", "main"),
+    ("git grep --file=README.md -- 'src/*.py'", "main"),
+    ("cat ~+/README.md", "main"),
+    # options that write, run a program or list what git would not
+    ("sort --out=sorted.txt README.md", "wt"),
+    ("tail --fol README.md", "wt"),
+    ("git grep --open-files=sh login", "main"),
+    ("git grep --untracked login", "main"),
+    ("git grep --no-exclude-standard login", "main"),
+    ("git ls-files -o", "main"),
+    ("git", "main"),
+    ("git worktree prune", "main"),
+    ("git -C /etc status", "main"),
+    ("cat README.md | uniq - out.txt", "wt"),
+    ("sed 2p README.md", "main"),
+    ("sed -n -e 1p -e 3p README.md", "main"),
+    ("sed -n 2p $HOME/.ssh/id_rsa", "main"),
+    # cd that does not move the shell where the walker puts it
+    ("cd src | cat app.py", "main"),
+    ("cat README.md | cd src", "main"),
+    ("cd src data && cat app.py", "main"),
+    ("cd nosuchdir && cat README.md", "main"),
+    # a program by path, nothing to run, a bare grep (it searches its own folder) and grep -r under a pipe
+    ("/bin/cat README.md", "main"),
+    ("./cat README.md", "main"),
+    ("# only a note", "main"),
+    ("grep TOKEN", "main"),
+    ("cat README.md | grep -rn hello", "main"),
+    ("cat README.md | grep --recursive hello", "main"),
+    ("cat README.md | grep --dereference-recursive hello", "main"),
+    ("cat README.md | grep -d recurse hello", "main"),
+    ("cat README.md | grep --directories=recurse hello", "main"),
+    ("cat README.md | grep --directories recurse hello", "main"),
+    # a redirection that only redirects, which split_command leaves out
+    ("pwd; < README.md", "main"),
+    ("(cat) < README.md", "main"),
+)
+
+# The same refusals on secret-shaped, sensitive or outside paths: the file an option or an operand names is judged.
+TRIAGE_SECRET = (
+    ("head --lines=2 .env", "main"),
+    ("head -n5 .env", "main"),
+    ("cut -d: -f1 .env", "main"),
+    ("grep -f .env README.md", "main"),
+    ("grep --file=.env README.md", "main"),
+    ("grep --exclude-from=.env pat README.md", "main"),
+    ("grep --include-from=.env pat README.md", "main"),
+    ("git diff .env", "main"),
+    ("git blame .env", "main"),
+    ("git show HEAD:.env", "main"),
+    ("git show HEAD:{vault}/notes.txt", "main"),
+    ("git blame --contents=.env README.md", "main"),
+    ("git log -L1,5:.env", "main"),
+    ("pwd; < .env", "main"),
+    ("(cat) < .env", "main"),
+    ("cd {vault} && ls", "main"),
+)
+
+# What the rows above are not: the same commands with nothing wrong in them.
+TRIAGE_CONTROLS = (
+    ("cat README.md | grep hello", "main"),
+    ("grep -n hello src/app.py", "wt"),
+    ("grep -f README.md src/app.py", "main"),
+    ("head --lines=2 README.md", "main"),
+    ("head -n5 README.md", "wt"),
+    ("cut -d: -f1 README.md", "wt"),
+    ("sed -n 2p README.md", "wt"),
+    ("sed -n -e 2p README.md", "main"),
+    ("git diff README.md", "main"),
+    ("git ls-files -- src", "main"),
+    ("git show HEAD:src/app.py", "main"),
+    ("git log -L1,5:src/app.py", "main"),
+    ("git blame --contents=README.md README.md", "main"),
+    ("git worktree list --porcelain", "main"),
+    ("git grep -e login -- src", "main"),
+    ("git -C {wt} status", "main"),
+    ("cd src && ls", "main"),
+    ("cd src && grep -n -e login app.py", "main"),
+    ("cd src && grep --regexp=login app.py", "main"),
+)
+
+
 class ReadonlyAllowTests(GuardTestCase):
     maxDiff = None
 
@@ -394,6 +499,53 @@ class ReadonlyAllowTests(GuardTestCase):
         self.write(self.home / ".claude/harness/backups" / f"20261118T101500Z-{self.tok[:6]}" / "files" / "0",
                    f"TOKEN={self.tok}\n")
         self.check([("grep -rn TOKEN ~/.claude/harness", "main")], allow=False, env={"HOME": str(self.home)})
+
+    def test_no_decision_for_spellings_a_mutant_would_allow(self):
+        self.check(TRIAGE_NO_DECISION, allow=False)
+        self.check(TRIAGE_SECRET, allow=False)
+        self.check(TRIAGE_CONTROLS, allow=True)
+
+    def test_git_rev_path_from_git_folder_is_judged_in_that_folder(self):
+        """`git -C data show HEAD:./cache.txt` reads data/cache.txt: a folder-scoped sensitive pattern names it,
+        although the whole word (`HEAD:./cache.txt`) and the file from the top (`./cache.txt`) match nothing."""
+        self.write_settings(self.main, {"HARNESS_SENSITIVE_PATHS": "data/*.txt"})
+        self.check([
+            ("git -C data show HEAD:./cache.txt", "main"),
+            ("cd data && git show HEAD:./cache.txt", "main"),
+            ("git -C data/ show HEAD:../data/cache.txt", "main"),
+        ], allow=False)
+        self.check([
+            ("git -C data show HEAD:./cache.{ext}", "main"),
+            ("git -C src show HEAD:./app.py", "main"),
+            ("git show HEAD:data/cache.{ext}", "main"),
+        ], allow=True)
+
+    def test_cdpath_makes_a_relative_cd_unplaceable(self):
+        # With CDPATH set, `cd src` may land in a folder of CDPATH: the walker could not follow it.
+        env = {"CDPATH": str(self.tmp)}
+        self.check([("cd src && cat app.py", "main"), ("cd src; ls", "wt")], allow=False, env=env)
+        self.check([("cd ./src && cat app.py", "main"), (f"cd {self.wt} && pwd", "main")], allow=True, env=env)
+        self.check([("cd src && cat app.py", "main")], allow=True)
+
+    def test_no_decision_outside_a_repository(self):
+        # No main checkout to judge paths against (the event's cwd is no repository, CLAUDE_PROJECT_DIR unset).
+        bare = self.tmp / f"bare-{self.tok}"
+        self.write(bare / "notes.txt", "hi\n")
+        self.places["bare"] = bare
+        rows = [("cat notes.txt", "bare"), ("pwd", "bare"), ("cat /etc/hosts", "bare")]
+        self.check(rows, allow=False, project=None)
+
+    def test_folder_grep_refuses_symlinks_and_huge_folders(self):
+        self.write(self.main / "links" / "real.txt", "x\n")
+        os.symlink("../README.md", self.main / "links" / "pointer")
+        many = self.main / "many"
+        for k in range(21):
+            (many / f"d{k}").mkdir(parents=True)
+            for n in range(1000):
+                (many / f"d{k}" / f"f{n}").touch()
+        # 21,000 entries: past the 20,000 a folder grep walks; a symlink anywhere in the folder.
+        self.check([("grep -rn x links", "main"), ("grep -rn x many", "main"), ("grep x many", "main")], allow=False)
+        self.check([("grep -rn login src", "main"), ("grep -n x links/real.txt", "main")], allow=True)
 
     def test_off_plan_mode_and_fail_open(self):
         shapes = [(c, "wt") for c in OUTAGE_SHAPES]
