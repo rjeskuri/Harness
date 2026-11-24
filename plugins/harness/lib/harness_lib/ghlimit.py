@@ -91,12 +91,14 @@ def repo_of(cwd):
     return os.path.basename(path.rstrip("/"))
 
 
-def log_call(args, *, cwd, exit, ms, waited_ms=0, refused=False):
+def log_call(args, *, cwd, exit, ms, waited_ms=0, refused=False, tool=None):
     """Append the call's line to today's file; the first line of a day drops the files over KEEP_DAYS days
-    old. Any OSError is skipped silently."""
+    old. `tool` names the caller (None: the basename of sys.argv[0]). Any OSError is skipped silently."""
     try:
         at = now_iso()
-        line = {"at": at, "tool": os.path.basename(sys.argv[0]) if sys.argv else "", "cmd": call_name(args),
+        if tool is None:
+            tool = os.path.basename(sys.argv[0]) if sys.argv else ""
+        line = {"at": at, "tool": tool, "cmd": call_name(args),
                 "kind": call_kind(args), "repo": repo_of(cwd), "ticket": ticket_of(cwd), "exit": exit,
                 "ms": int(ms), "waited_ms": int(waited_ms), "refused": bool(refused)}
         folder = gh_dir()

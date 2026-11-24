@@ -17,7 +17,15 @@ The contract these tests fix:
   (harness_lib.cli.table: left-aligned, two spaces apart, the last column unpadded). The ticket's example (12.5 s
   waited) prints `12 s waiting`. With no line in the window: `No gh calls logged in the last <H> h.`, exit 0.
 - --hours 0, a negative value or a non-number (nan included): one line on stderr naming --hours, exit 1.
-- No gh call (FAKEGH_LOG stays empty, no line is added to the call log); budgets.json is not touched.
+- One gh call (#448), `gh api -i graphql -f query=<a query reading rateLimit>`, made after the log is read (so the
+  report's own call counts in none of its totals); --hours that is not valid makes none. budgets.json is not touched.
+- --json also has the key github (#448): from the answer's headers X-RateLimit-Limit, -Used, -Remaining and -Reset
+  (epoch seconds; header names in any case) and the body's data.rateLimit.used: {"used", "limit", "remaining",
+  "reset", "window_start", "rate_limit_used", "logged_graphql", "gap"}; reset and window_start (reset - 3600 s)
+  `%Y-%m-%dT%H:%M:%SZ`; rate_limit_used null without the body field; logged_graphql the logged lines of kind graphql
+  (any tool, the shim's agent lines included) with `at` at or after window_start, whatever --hours says; gap = used -
+  logged_graphql. A failed call or an answer without the headers: github null, the rest unchanged, exit 0. The text
+  gains one line with used, rate_limit_used, logged_graphql and gap (the numbers are pinned, not the wording).
 - The harness-work usage text and design.md's harness-work section name `budget calls`.
 
 Every test pins the tool's clock through HARNESS_NOW (self.clock, a fixed instant) and seeds the log relative to
@@ -52,7 +60,7 @@ DESIGN = os.path.join(os.path.dirname(os.path.dirname(PLUGIN)), "docs", "design.
 UTC = dt.timezone.utc
 STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 KEYS = {"since", "until", "hours", "total", "graphql", "rest", "refused", "failed", "waited_seconds",
-        "peak_minute", "by_tool", "by_command", "by_ticket", "by_hour"}
+        "peak_minute", "by_tool", "by_command", "by_ticket", "by_hour", "github"}
 ACTIONS = "api repos/:owner/:repo/actions/runs"
 
 BINS: dict = {}
@@ -538,6 +546,118 @@ class Text(CallsTest):
             self.assertEqual(data[key], [], key)
 
 
+# =========================================================================== GitHub's own count beside the log
+def rate_answer(prefix, eol, used, limit, remaining, reset, body):
+    """What `gh api -i graphql` prints: the status line, the headers (X-RateLimit-* spelled with `prefix`), a blank
+    line, the JSON body."""
+    headers = [("Content-Type", "application/json; charset=utf-8"), (prefix + "Limit", limit),
+               (prefix + "Remaining", remaining), (prefix + "Reset", int(reset.timestamp())),
+               (prefix + "Resource", "graphql"), (prefix + "Used", used), ("X-Github-Request-Id", "C0DE:1234:5678")]
+    return "HTTP/2.0 200 OK" + eol + "".join(f"{k}: {v}{eol}" for k, v in headers) + eol + json.dumps(body)
+
+
+def rate_body(used, limit, reset):
+    return {"data": {"rateLimit": {"limit": limit, "used": used, "remaining": limit - used, "resetAt": stamp(reset)}}}
+
+
+class GitHubCount(CallsTest):
+    def answer(self, response):
+        """The fake gh's answer to `api -i graphql` (a response dict); anything else answers empty."""
+        write(self.scenario_path, json.dumps({"calls": [dict(response, match=["api", "-i", "graphql"])],
+                                              "default": {"stdout": "", "exit": 0}}))
+
+    CASES = [
+        # (label, clock, reset, header prefix, line end, used, limit, remaining, body rateLimit.used or None,
+        #  --hours, [(at, tool, kind)], logged_graphql, (total, graphql, rest) of the report)
+        ("the ticket's numbers", "2026-03-10T12:17:43Z", "2026-03-10T12:40:00Z", "X-RateLimit-", "\r\n",
+         5000, 5000, 0, 2032, None,
+         [("2026-03-10T11:40:00Z", "harness-pr", "graphql"),        # window_start itself: in
+          ("2026-03-10T11:52:10Z", "agent", "graphql"),
+          ("2026-03-10T12:05:00Z", "agent", "graphql"),
+          ("2026-03-10T12:15:30Z", "harness-board", "graphql"),
+          ("2026-03-10T12:00:00Z", "agent", "rest"),                # rest: not counted
+          ("2026-03-10T11:39:59Z", "harness-pr", "graphql"),        # a second before the window
+          ("2026-03-10T09:00:00Z", "session_brief.py", "graphql")],
+         4, (7, 6, 1)),
+        ("across midnight, gh's own header case, a window wider than --hours", "2026-11-16T00:30:00Z",
+         "2026-11-16T00:50:00Z", "X-Ratelimit-", "\n", 1234, 5000, 3766, 1240, "0.5",
+         [("2026-11-15T23:50:00Z", "agent", "graphql"),
+          ("2026-11-15T23:59:59Z", "harness-pr", "graphql"),
+          ("2026-11-16T00:10:00Z", "agent", "graphql"),
+          ("2026-11-16T00:29:00Z", "harness-board", "graphql"),
+          ("2026-11-16T00:29:30Z", "agent", "graphql"),
+          ("2026-11-16T00:05:00Z", "harness-work", "rest"),
+          ("2026-11-15T23:49:59Z", "agent", "graphql")],
+         5, (4, 3, 1)),
+        ("no rateLimit in the body", "2026-07-04T09:00:00Z", "2026-07-04T09:59:59Z", "x-ratelimit-", "\r\n",
+         42, 5000, 4958, None, None,
+         [("2026-07-04T08:59:59Z", "agent", "rest"),
+          ("2026-07-04T08:59:58Z", "harness-pr", "graphql")],
+         0, (2, 1, 1)),
+    ]
+
+    def setup_case(self, i, case):
+        (label, clock, reset, prefix, eol, used, limit, remaining, body_used, hours, lines, logged, totals) = case
+        self.fresh_home(f"home-{i}")
+        self.clock = at_utc(clock)
+        reset_at = at_utc(reset)
+        body = rate_body(body_used, limit, reset_at) if body_used is not None else {"data": {}}
+        self.answer({"stdout": rate_answer(prefix, eol, used, limit, remaining, reset_at, body)})
+        self.seed([call(at_utc(at), tool, "issue view" if kind == "graphql" else "run list", kind)
+                   for at, tool, kind in lines])
+        return ["--hours", hours] if hours else []
+
+    def test_json_has_githubs_count_the_logged_count_and_the_gap(self):
+        for i, case in enumerate(self.CASES):
+            label, _, reset, _, _, used, limit, remaining, body_used, _, _, logged, totals = case
+            with self.subTest(label):
+                args = self.setup_case(i, case)
+                data = self.report(*args)
+                window_start = stamp(at_utc(reset) - dt.timedelta(hours=1))
+                self.assertEqual(data["github"], {
+                    "used": used, "limit": limit, "remaining": remaining, "reset": reset,
+                    "window_start": window_start, "rate_limit_used": body_used, "logged_graphql": logged,
+                    "gap": used - logged}, data)
+                self.assertEqual((data["total"], data["graphql"], data["rest"]), totals, data)
+                argv = [json.loads(line)["argv"] for line in self.gh_calls()]
+                self.assertEqual([a[:3] for a in argv], [["api", "-i", "graphql"]])
+                os.unlink(self.gh_log)
+
+    def test_text_names_the_counted_and_logged_totals_and_the_gap(self):
+        # the second case: GitHub counted 1234 (its rateLimit field 1240), the log holds 5, a gap of 1229
+        args = self.setup_case(1, self.CASES[1])
+        out = self.ok("budget", "calls", *args).stdout
+        self.assertTrue(out.startswith("gh calls in the last 0.5 h: 4 (graphql 3, rest 1)"), out)
+        numbers = [r"\b1234\b", r"\b1240\b", r"\b5\b", r"\b1229\b"]
+        self.assertTrue(any(all(re.search(n, line) for n in numbers) for line in out.splitlines()), out)
+
+    def test_no_count_when_the_call_fails_or_has_no_headers(self):
+        # github null, every other figure as it was, exit 0; the text is what it is when gh answers nothing
+        reset = self.clock + dt.timedelta(minutes=20)
+        body = rate_body(2032, 5000, reset)
+        b0 = self.this_hour() - dt.timedelta(hours=2)
+        self.seed([call(b0 + dt.timedelta(minutes=5), "agent", "pr view", "graphql", ticket=130),
+                   call(b0 + dt.timedelta(minutes=6), "harness-work", "run list", "rest")])
+        self.answer({"stdout": ""})
+        plain = self.ok("budget", "calls").stdout
+        for label, response in (
+            ("gh failed", {"stderr": "HTTP 502: Bad Gateway (https://api.github.com/graphql)\n", "exit": 1}),
+            ("body only", {"stdout": json.dumps(body)}),
+            ("no rate-limit headers", {"stdout": "HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n"
+                                                 + json.dumps(body)}),
+        ):
+            with self.subTest(label):
+                self.answer(response)
+                data = self.report()
+                self.assertIsNone(data["github"], data)
+                self.assertEqual((data["total"], data["graphql"], data["rest"]), (2, 1, 1))
+                self.assertEqual(data["by_tool"], [
+                    {"tool": "agent", "calls": 1, "graphql": 1, "rest": 0, "refused": 0},
+                    {"tool": "harness-work", "calls": 1, "graphql": 0, "rest": 1, "refused": 0},
+                ])
+                self.assertEqual(self.ok("budget", "calls").stdout, plain)
+
+
 # =========================================================================== arguments and side effects
 class Args(CallsTest):
     def test_hours_must_be_a_positive_number(self):
@@ -555,21 +675,29 @@ class Args(CallsTest):
                 self.assertEqual(self.ok("budget", "calls", "--hours", value).stdout,
                                  f"No gh calls logged in the last {value} h.\n")
 
-    def test_makes_no_gh_call(self):
+    def test_makes_one_rate_limit_call(self):
+        # One `gh api -i graphql` reading rateLimit per valid run (#448); an invalid --hours makes none. The seeded
+        # day files keep what they held (the call's own line, if any, is only appended).
         b0 = self.this_hour() - dt.timedelta(hours=2)
         self.seed([call(b0 + dt.timedelta(minutes=5), "harness-pr", "pr view", "graphql", ticket=130),
                    call(b0 + dt.timedelta(minutes=6), "harness-work", "run list", "rest")])
         files = self.day_file_texts()
-        for args, code in ((["budget", "calls"], 0), (["budget", "calls", "--json"], 0),
-                           (["budget", "--json", "calls"], 0), (["budget", "calls", "--hours", "1"], 0),
-                           (["budget", "calls", "--hours", "0"], 1)):
+        for args, code, calls in ((["budget", "calls"], 0, 1), (["budget", "calls", "--json"], 0, 1),
+                                  (["budget", "--json", "calls"], 0, 1), (["budget", "calls", "--hours", "1"], 0, 1),
+                                  (["budget", "calls", "--hours", "0"], 1, 0)):
             with self.subTest(args=args):
+                if os.path.exists(self.gh_log):
+                    os.unlink(self.gh_log)
                 p = self.work(*args)
                 self.assertEqual(p.returncode, code, p.stdout + p.stderr)
-                self.assertEqual(self.gh_calls(), [])
-                self.assertFalse(os.path.exists(self.gh_log))
+                argv = [json.loads(line)["argv"] for line in self.gh_calls()]
+                self.assertEqual(len(argv), calls, argv)
+                for one in argv:
+                    self.assertEqual(one[:3], ["api", "-i", "graphql"], one)
+                    self.assertTrue(any("rateLimit" in a for a in one), one)
         after = self.day_file_texts()
-        self.assertEqual(after, files)            # no call of ours was logged either
+        for name, text in files.items():
+            self.assertTrue(after[name].startswith(text), name)
         self.assertFalse(os.path.exists(self.budgets_path()))
 
     def test_budgets_are_left_alone(self):
