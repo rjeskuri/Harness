@@ -634,5 +634,136 @@ class DispatchAfter(RowsInProcess, CopiedProject, WorkTest):
                     self.assertNothingStarted()
 
 
+# =========================================================================== #491: the landing session's own sweep
+LANDED = ("task", "size:S", "risk:low")          # a ticket the land closed: its status labels removed
+
+
+def session_uuid(short):
+    """A full session id whose short id (a bg run record's bg_id) is `short`."""
+    return f"{short}-4e1f-4a2b-9c3d-5e6f7a8b9c0d"
+
+
+class DispatchAfterFromTheLandingSession(RowsInProcess, CopiedProject, WorkTest):
+    """#491: `harness-pr land N --loop` runs `dispatch --after N` inside ticket N's own bg session, whose run record
+    names that session. Dispatch's sweep must not `claude stop` the session it runs in (that killed the land and its
+    dispatch before anything launched): it leaves that record open for a later sweep and starts the ready ticket N
+    unblocked. The session is known from CLAUDE_CODE_SESSION_ID (the full id) or CLAUDE_JOB_DIR
+    (~/.claude/jobs/<short id>), either one alone. Another finished ticket's session is still stopped and closed."""
+
+    # (landed N, its session's short id, ready M blocked only by N, another finished ticket K, K's session)
+    CASES = ((12, "95171f6f", 13, 30, "a0b1c2d3"),
+             (475, "c103ebd9", 477, 451, "5e6f7a8b"),
+             (447, "0d9e8f7a", 468, 452, "b4c5d6e7"))
+    # which of the two variables name the current session
+    IDENTITIES = ("both", "session id", "job dir")
+
+    stops = DispatchDryRunStopsNothing.stops
+    started_tickets = DispatchOnly.started_tickets
+
+    def bg_launched(self):
+        """The tickets a `claude --bg` was run for, from the fake claude's argv log."""
+        out = []
+        for call in self.claude_calls():
+            if "--bg" in call["argv"]:
+                found = re.search(r"/harness:work (\d+)", " ".join(call["argv"]))
+                out.append(int(found.group(1)) if found else None)
+        return sorted(out)
+
+    def record_of(self, n):
+        return next(r for r in self.run_records() if r["ticket"] == n)
+
+    def landed_board(self, n, short, m, k, k_short):
+        """N closed by its land, its bg session `running` (the land); K closed earlier, its session `blocked`; M
+        ready, blocked only by N. Returns the environment of no session."""
+        self.write_run(n, venue="bg", bg_id=short, log=None, branch=f"t/{n}-x",
+                       id=f"{self.key}-{n}-20261124100000")
+        self.write_run(k, venue="bg", bg_id=k_short, log=None, branch=f"t/{k}-x",
+                       id=f"{self.key}-{k}-20261124090000")
+        listing = [{"id": short, "kind": "background", "state": "running", "cwd": self.repo,
+                    "name": f"proj #{n} {TITLE}"},
+                   {"id": k_short, "kind": "background", "state": "blocked", "cwd": self.repo,
+                    "name": f"proj #{k} {TITLE}"}]
+        calls = [{"match": ["issue", "view", str(n)], "stdout_json": issue(n, labels=LANDED, state="CLOSED")},
+                 {"match": ["issue", "view", str(k)], "stdout_json": issue(k, labels=LANDED, state="CLOSED")},
+                 {"match": ["issue", "view", str(m)],
+                  "stdout_json": issue(m, title=f"Ready {m}", blocked_by=[{"number": n, "state": "CLOSED"}])}]
+        for t in (n, k):
+            calls.append({"contains": ["pr", "list", "--head", f"t/{t}-x", "--state", "all"],
+                          "stdout_json": [{"number": t + 1000, "state": "MERGED", "isDraft": False}]})
+            calls.append({"contains": ["pr", "list", "--head", f"t/{t}-x"], "stdout_json": []})
+        calls += [
+            {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}},
+            {"match": ["issue", "list"], "stdout_json": [blocked_row(m, f"Ready {m}", (n,))]},
+            {"match": ["issue", "edit"], "stdout": ""},
+            {"match": ["issue", "comment"], "stdout": "https://github.com/o/r/issues/1#issuecomment-1\n"},
+            {"match": ["pr", "list"], "stdout_json": []},
+            {"match": ["api", "user"], "stdout": "rjeskuri\n"},
+            {"match": ["api"], "stdout_json": []},
+        ]
+        self.put_scenario({"calls": calls})
+        return self.env(FAKECLAUDE_AGENTS=json.dumps(listing), **CREDENTIALS)
+
+    def inside(self, env, short, identity="both"):
+        """`env` as a bg session with short id `short` has it: its full id, its job folder, or both."""
+        job_dir = os.path.join(self.home, ".claude", "jobs", short)
+        os.makedirs(job_dir, exist_ok=True)
+        extra = {}
+        if identity in ("both", "session id"):
+            extra["CLAUDE_CODE_SESSION_ID"] = session_uuid(short)
+        if identity in ("both", "job dir"):
+            extra["CLAUDE_JOB_DIR"] = job_dir
+        return dict(env, **extra)
+
+    # ---- DoD 1: a ready ticket whose only blocker is N is started by N's land (its dispatch --after N)
+    def test_dispatch_after_from_the_landed_tickets_session_starts_what_it_unblocked(self):
+        for n, short, m, k, k_short in self.CASES:
+            for identity in self.IDENTITIES:
+                with self.subTest(landed=n, ready=m, identity=identity):
+                    self.setUp()
+                    env = self.inside(self.landed_board(n, short, m, k, k_short), short, identity)
+                    p = self.work("dispatch", "--after", str(n), "--repo", self.repo, env=env)
+                    out = p.stdout + p.stderr
+                    self.assertEqual(p.returncode, 0, out)
+                    self.assertNotIn(short, self.stops(), out)              # its own session is never stopped
+                    self.assertIsNone(self.record_of(n)["ended_at"], out)   # left for a later sweep
+                    self.assertEqual(self.stops(), {k_short: 1}, out)       # the control: K's session still is
+                    self.assertTrue(self.record_of(k)["ended_at"], out)
+                    self.assertIn(f"after #{n}: #{m} unblocked", p.stdout.splitlines(), out)
+                    self.assertEqual(self.bg_launched(), [m], out)
+                    self.assertEqual(self.started_tickets(), {m}, out)
+                    self.assertIsNone(self.record_of(m)["ended_at"], out)
+
+    def test_a_sweep_inside_the_session_leaves_it_for_a_later_sweep_outside(self):
+        for n, short, m, k, k_short in self.CASES:
+            with self.subTest(landed=n):
+                self.setUp()
+                env = self.landed_board(n, short, m, k, k_short)
+                p = self.work("runs", "--sweep", env=self.inside(env, short))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(self.stops(), {k_short: 1}, p.stdout + p.stderr)
+                self.assertIsNone(self.record_of(n)["ended_at"])
+                # a later sweep from another session stops and closes it as before
+                p = self.work("runs", "--sweep", env=self.inside(env, "ffee0011"))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(self.stops(), {k_short: 1, short: 1}, p.stdout + p.stderr)
+                self.assertTrue(self.record_of(n)["ended_at"])
+
+    def test_another_sessions_dispatch_still_stops_the_landed_tickets_session(self):
+        # the control: the environment names a session that is not N's (or none): N's session is stopped as today
+        for n, short, m, k, k_short in self.CASES:
+            for other in ("ffee0011", k_short, None):
+                with self.subTest(landed=n, session=other):
+                    self.setUp()
+                    env = self.landed_board(n, short, m, k, k_short)
+                    if other is not None:
+                        env = self.inside(env, other)
+                    p = self.work("dispatch", "--after", str(n), "--repo", self.repo, env=env)
+                    out = p.stdout + p.stderr
+                    self.assertEqual(p.returncode, 0, out)
+                    self.assertEqual(self.stops().get(short), 1, out)
+                    self.assertTrue(self.record_of(n)["ended_at"], out)
+                    self.assertEqual(self.bg_launched(), [m], out)
+
+
 if __name__ == "__main__":
     unittest.main()
