@@ -275,6 +275,11 @@ TRIAGE_NO_DECISION = (
     ("cat < src/*.py", "main"),
     ("cd * && pwd", "main"),
     ("grep -f .en* README.md", "main"),
+    # a glob operand next to -e / -f / --regexp= is a file operand with a glob, not the pattern, in a clean folder too
+    ("cd src && grep -n -e login *.py", "main"),
+    ("cd src && grep -e login *.py", "main"),
+    ("cd src && grep --regexp=login *.py", "main"),
+    ("cd src && grep -n -f ../README.md *.py", "main"),
     ("git grep -f '.en*' login", "main"),
     ("git ls-files '*.py'", "main"),
     ("git log -- 'src/*.py'", "main"),
@@ -357,6 +362,8 @@ TRIAGE_CONTROLS = (
     ("git grep -e login -- src", "main"),
     ("git -C {wt} status", "main"),
     ("cd src && ls", "main"),
+    ("cd src && grep -n -e login app.py", "main"),
+    ("cd src && grep --regexp=login app.py", "main"),
 )
 
 
@@ -497,6 +504,21 @@ class ReadonlyAllowTests(GuardTestCase):
         self.check(TRIAGE_NO_DECISION, allow=False)
         self.check(TRIAGE_SECRET, allow=False)
         self.check(TRIAGE_CONTROLS, allow=True)
+
+    def test_git_rev_path_from_git_folder_is_judged_in_that_folder(self):
+        """`git -C data show HEAD:./cache.txt` reads data/cache.txt: a folder-scoped sensitive pattern names it,
+        although the whole word (`HEAD:./cache.txt`) and the file from the top (`./cache.txt`) match nothing."""
+        self.write_settings(self.main, {"HARNESS_SENSITIVE_PATHS": "data/*.txt"})
+        self.check([
+            ("git -C data show HEAD:./cache.txt", "main"),
+            ("cd data && git show HEAD:./cache.txt", "main"),
+            ("git -C data/ show HEAD:../data/cache.txt", "main"),
+        ], allow=False)
+        self.check([
+            ("git -C data show HEAD:./cache.{ext}", "main"),
+            ("git -C src show HEAD:./app.py", "main"),
+            ("git show HEAD:data/cache.{ext}", "main"),
+        ], allow=True)
 
     def test_cdpath_makes_a_relative_cd_unplaceable(self):
         # With CDPATH set, `cd src` may land in a folder of CDPATH: the walker could not follow it.
