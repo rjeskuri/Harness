@@ -20,6 +20,7 @@ Usage:
     harness-work budget [status | exhaust api|cloud|subscription --reason TEXT [--hours 24]
                          | reset api|cloud|subscription]
     harness-work budget calls [--hours 24] [--json]
+    harness-work budget clear-gh-cache [--json]
     harness-work worktrees [--stale DAYS]
     harness-work branches [--prune]
     harness-work worktree remove BRANCH [--discard]
@@ -275,7 +276,8 @@ UNCOUNTED = ("billing", "auth")   # outcomes of runs that do not count toward RE
 EXHAUST_HOURS = 24.0
 CALLS_HOURS = 24.0            # budget calls: the default window
 CALLS_TOP = 15                # budget calls: rows of the text COMMAND table
-RATE_LIMIT_QUERY = "query=query{rateLimit{limit used remaining resetAt}}"   # budget calls: GitHub's own count
+GH_REFUSAL = re.compile(rb'"type"\s*:\s*"RATE_LIMIT"')   # budget status: a refusal gh cached for 24 h (cli/cli#12812)
+RATE_LIMIT_QUERY ="query=query{rateLimit{limit used remaining resetAt}}"   # budget calls: GitHub's own count
 REASON_MAX = 200
 DIRTY_SHOWN = 10
 GIT_TIMEOUT = 120
@@ -2563,10 +2565,11 @@ def cmd_runs(args):
         print(table(rows))
 
 
-def count(groups, key, item, kind):
-    """Add one call of `kind` to the row of `groups` under `key`, made from `item` on its first call."""
-    row = groups.setdefault(key, dict(item, calls=0, graphql=0, rest=0, refused=0))
+def count(groups, key, item, kind, points=0):
+    """Add one call of `kind` and `points` to the row of `groups` under `key`, made from `item` on its first call."""
+    row = groups.setdefault(key, dict(item, calls=0, graphql=0, rest=0, refused=0, points=0))
     row["calls"] += 1
+    row["points"] += points
     if kind in ("graphql", "rest"):
         row[kind] += 1
     return row
@@ -2635,12 +2638,15 @@ def cmd_budget_calls(args):
         window_start = github["reset"] - dt.timedelta(hours=1)
         if window_start < read_from:   # a reset more than an hour ahead: the part of its window not read yet
             read += [line for line in ghlimit.read_calls(window_start) if parse_iso(line["at"]) < read_from]
-        logged = sum(1 for line in read if line.get("kind") == "graphql" and parse_iso(line["at"]) >= window_start)
+        in_window = [line for line in read if line.get("kind") == "graphql" and parse_iso(line["at"]) >= window_start]
+        logged = len(in_window)
+        logged_points = sum(ghlimit.call_points(line) for line in in_window)
         github = {"used": github["used"], "limit": github["limit"], "remaining": github["remaining"],
                   "reset": iso(github["reset"]), "window_start": iso(window_start),
                   "rate_limit_used": github["rate_limit_used"], "logged_graphql": logged,
-                  "gap": github["used"] - logged}
-    totals = {"graphql": 0, "rest": 0, "refused": 0, "failed": 0}
+                  "gap": github["used"] - logged, "logged_points": logged_points,
+                  "gap_points": github["used"] - logged_points}
+    totals = {"graphql": 0, "rest": 0, "points": 0, "refused": 0, "failed": 0}
     waited_ms = 0
     tools, commands, tickets, by_hour, minutes = {}, {}, {}, {}, {}
     for line in lines:
@@ -2649,15 +2655,17 @@ def cmd_budget_calls(args):
         refused = line.get("refused") is True
         if kind in ("graphql", "rest"):
             totals[kind] += 1
+        points = ghlimit.call_points(line)
+        totals["points"] += points
         totals["refused"] += refused
         totals["failed"] += line.get("exit") != 0 and not refused
         waited = line.get("waited_ms")
         if isinstance(waited, (int, float)) and not isinstance(waited, bool) and abs(waited) < float("inf"):
             waited_ms += waited
         tool = str(line.get("tool") or "")
-        count(tools, tool, {"tool": tool}, kind)["refused"] += refused
+        count(tools, tool, {"tool": tool}, kind, points)["refused"] += refused
         cmd = str(line.get("cmd") or "")
-        count(commands, (cmd, str(kind)), {"cmd": cmd, "kind": kind}, kind)
+        count(commands, (cmd, str(kind)), {"cmd": cmd, "kind": kind}, kind, points)
         ticket = line.get("ticket")
         if isinstance(ticket, int) and not isinstance(ticket, bool):
             repo = str(line.get("repo") or "")
@@ -2668,11 +2676,12 @@ def cmd_budget_calls(args):
         minutes[minute] = minutes.get(minute, 0) + 1
     peak = min(minutes.items(), key=lambda kv: (-kv[1], kv[0])) if minutes else None
     data = {"since": iso(since), "until": iso(until), "hours": hours, "total": len(lines),
-            "graphql": totals["graphql"], "rest": totals["rest"], "refused": totals["refused"],
+            "graphql": totals["graphql"], "rest": totals["rest"], "points": totals["points"],
+            "refused": totals["refused"],
             "failed": totals["failed"], "waited_seconds": waited_ms / 1000,
             "peak_minute": {"minute": peak[0], "calls": peak[1]} if peak else None,
-            "by_tool": ranked(tools, ("tool", "calls", "graphql", "rest", "refused")),
-            "by_command": ranked(commands, ("cmd", "kind", "calls")),
+            "by_tool": ranked(tools, ("tool", "calls", "graphql", "rest", "refused", "points")),
+            "by_command": ranked(commands, ("cmd", "kind", "calls", "points")),
             "by_ticket": ranked(tickets, ("repo", "ticket", "calls", "graphql")),
             "by_hour": [{k: row[k] for k in ("hour", "calls", "graphql", "rest")}
                         for _, row in sorted(by_hour.items())]}
@@ -2686,18 +2695,21 @@ def cmd_budget_calls(args):
         body = github["rate_limit_used"] if github["rate_limit_used"] is not None else "n/a"
         github_line = (f"\nGitHub graphql since {github['window_start'][11:16]}Z (resets {github['reset'][11:16]}Z): "
                        f"{github['used']} of {github['limit']} counted (rateLimit.used {body}), "
-                       f"{github['logged_graphql']} logged, gap {github['gap']}")
+                       f"{github['logged_graphql']} logged, gap {github['gap']}; "
+                       f"points: {github['used']} counted, {github['logged_points']} logged, "
+                       f"gap {github['gap_points']}")
     if not lines:
         print(f"No gh calls logged in the last {window} h.{github_line}")
         return
     parts = [f"gh calls in the last {window} h: {data['total']} (graphql {data['graphql']}, rest {data['rest']}), "
              f"{data['refused']} refused, {data['failed']} failed, {int(data['waited_seconds'])} s waiting; "
              f"peak {peak[1]} in one minute ({peak[0][:16]}Z){github_line}",
-             table([("TOOL", "CALLS", "GRAPHQL", "REST", "REFUSED")]
-                   + [(r["tool"], str(r["calls"]), str(r["graphql"]), str(r["rest"]), str(r["refused"]))
-                      for r in data["by_tool"]]),
-             table([("COMMAND", "KIND", "CALLS")]
-                   + [(r["cmd"], str(r["kind"]), str(r["calls"])) for r in data["by_command"][:CALLS_TOP]])]
+             table([("TOOL", "CALLS", "GRAPHQL", "REST", "REFUSED", "POINTS")]
+                   + [(r["tool"], str(r["calls"]), str(r["graphql"]), str(r["rest"]), str(r["refused"]),
+                       str(r["points"])) for r in data["by_tool"]]),
+             table([("COMMAND", "KIND", "CALLS", "POINTS")]
+                   + [(r["cmd"], str(r["kind"]), str(r["calls"]), str(r["points"]))
+                      for r in data["by_command"][:CALLS_TOP]])]
     if data["by_ticket"]:
         parts.append(table([("TICKET", "CALLS", "GRAPHQL")]
                            + [(f"{r['repo']} #{r['ticket']}", str(r["calls"]), str(r["graphql"]))
@@ -2705,9 +2717,41 @@ def cmd_budget_calls(args):
     print("\n\n".join(parts))
 
 
+def gh_cache_refusals():
+    """The files under gh's cache dir ($XDG_CACHE_HOME/gh, else ~/.cache/gh) whose reply is a cached RATE_LIMIT
+    refusal, sorted; gh replays such an entry for up to 24 h after the quota has reset."""
+    root = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"), "gh")
+    found = []
+    for folder, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(folder, name)
+            try:
+                if os.path.isfile(path) and not os.path.islink(path):
+                    with open(path, "rb") as fh:
+                        if GH_REFUSAL.search(fh.read(1 << 20)):
+                            found.append(path)
+            except OSError:
+                continue
+    return sorted(found)
+
+
+def cmd_budget_clear_gh_cache(args):
+    cleared = []
+    for path in gh_cache_refusals():
+        try:
+            os.remove(path)
+            cleared.append(path)
+        except OSError as err:
+            warn(f"could not remove {path}: {err.strerror or err}")
+    emit(wants_json(args), {"cleared": cleared}, "\n".join(f"cleared {path}" for path in cleared))
+
+
 def cmd_budget(args):
     if args.action == "calls":
         cmd_budget_calls(args)
+        return
+    if args.action == "clear-gh-cache":
+        cmd_budget_clear_gh_cache(args)
         return
     budgets = load_budgets()
     action = args.action or "status"
@@ -2727,7 +2771,14 @@ def cmd_budget(args):
     data = {name: {"exhausted_until": budgets[name].get("exhausted_until"),
                    "reason": budgets[name].get("reason") or "",
                    "exhausted": exhausted_until(budgets[name]) is not None} for name in names}
-    emit(wants_json(args), data, "\n".join(budget_line(name, budgets[name]) for name in names))
+    lines = [budget_line(name, budgets[name]) for name in names]
+    if action == "status":
+        cached = gh_cache_refusals()
+        if cached:
+            data["gh_cache"] = cached
+            lines += [f"gh cache: cached rate-limit refusal {path} (gh replays it for up to 24 h; "
+                      "`harness-work budget clear-gh-cache` removes it)" for path in cached]
+    emit(wants_json(args), data, "\n".join(lines))
 
 
 def cmd_worktrees(repo, args):
@@ -3217,7 +3268,7 @@ def parser():
     drop.add_argument("number", type=issue_number, metavar="N")
 
     budget = sub.add_parser("budget", parents=[with_json], help="the api, cloud and subscription budgets")
-    budget_sub = budget.add_subparsers(dest="action", metavar="{status,exhaust,reset,calls}")
+    budget_sub = budget.add_subparsers(dest="action", metavar="{status,exhaust,reset,calls,clear-gh-cache}")
     budget_sub.add_parser("status", parents=[nested_json], help="each budget's state (the default)")
     ex = budget_sub.add_parser("exhaust", parents=[nested_json], help="mark a budget exhausted")
     ex.add_argument("name", choices=BUDGETS)
@@ -3229,6 +3280,9 @@ def parser():
                                   help="the gh call log: totals by tool, command, ticket and hour, the busiest minute")
     calls.add_argument("--hours", default=str(CALLS_HOURS), metavar="H",
                        help="the window, default 24 (checked by the command: a bad value is one line, exit 1)")
+
+    budget_sub.add_parser("clear-gh-cache", parents=[nested_json],
+                          help="remove gh's cached RATE_LIMIT refusals (status names them)")
 
     wts = sub.add_parser("worktrees", parents=[with_repo, with_json],
                          help="the ticket worktrees with age, PR state and the stale flag")

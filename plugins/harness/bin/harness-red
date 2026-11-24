@@ -13,7 +13,9 @@ change of the branch's own makes it stale.
 
 Usage:
     harness-red check [--base origin/main]   # run the branch's changed tests; red exits 0, anything else 1
-                                             # (no tests ran, or they failed to load: refused, nothing recorded)
+                                             # (no tests ran, or they failed to load: refused, nothing recorded);
+                                             # a refactor ticket whose only test changes delete test files
+                                             # gets a `removed` record listing them, with nothing run (#454)
     harness-red reprove [--base origin/main] # check for a branch that has source: its test files as they are now,
                                              # run against main's code at the merge base in a temporary worktree;
                                              # only red writes the record, with or without an earlier one
@@ -470,21 +472,24 @@ def own_files(repo, base):
 
 
 # --------------------------------------------------------------- commands
+def ticket_cache(repo):
+    """(N, ticket N's cache) for this t/<N>- branch (tickets/<N>.json beside red/), or (None, None) for another
+    branch name; the cache is None when it is missing, corrupt or not an object."""
+    m = re.match(r"t/(\d+)-", repo.branch)
+    if not m:
+        return None, None
+    ticket = read_json(os.path.join(os.path.dirname(os.path.dirname(repo.record_path)), "tickets",
+                                    m.group(1) + ".json"))
+    return int(m.group(1)), ticket if isinstance(ticket, dict) else None
+
+
 def no_tests_message(repo):
     """`(N, "ticket N is no-tests: no red run needed")` when the ticket cache of this t/<n>- branch carries the
     flag, else None (a missing or corrupt cache, no flags, another branch name: the normal path)."""
-    m = re.match(r"t/(\d+)-", repo.branch)
-    if not m:
-        return None
-    path = os.path.join(os.path.dirname(os.path.dirname(repo.record_path)), "tickets", m.group(1) + ".json")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            ticket = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    flags = ticket.get("flags") if isinstance(ticket, dict) else None
+    number, ticket = ticket_cache(repo)
+    flags = ticket.get("flags") if ticket else None
     if isinstance(flags, list) and "no-tests" in flags:
-        return int(m.group(1)), f"ticket {m.group(1)} is no-tests: no red run needed"
+        return number, f"ticket {number} is no-tests: no red run needed"
     return None
 
 
@@ -504,13 +509,19 @@ def merge_base_of(repo, base):
     return merge_base
 
 
+def deleted_tests(repo, changed):
+    """The changed test paths the worktree no longer has: test files the branch deleted."""
+    return [p for p in changed if repo.classify(p) == "test" and not os.path.lexists(os.path.join(repo.top, p))]
+
+
 def test_changes(repo, base):
     """(merge base, changed paths, test files): the branch's changes against `base` (resolved as check does) and
-    the test files among them that exist; none is refused."""
+    the test files among them that exist. None is refused, except on a refactor ticket whose only test changes
+    delete test files (#454): then the test files come back empty and the caller records the deletions as removed."""
     merge_base = merge_base_of(repo, repo.resolve_base(base))
     changed = repo.changed_paths(merge_base)
     tests = [p for p in changed if repo.classify(p) == "test" and os.path.isfile(os.path.join(repo.top, p))]
-    if not tests:
+    if not tests and not (deleted_tests(repo, changed) and (ticket_cache(repo)[1] or {}).get("type") == "refactor"):
         raise Problem("No test changes on this branch; write the tests first.")
     return merge_base, changed, tests
 
@@ -572,9 +583,9 @@ def run_red(repo, args, tests, run_files, cwd, again):
     return cmd, code, output
 
 
-def save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output):
+def save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output, kind=None):
     """Write the side file, then the record, of this run; print it. Returns its kind."""
-    kind = kind_of(code, output)
+    kind = kind or kind_of(code, output)
     record = {"branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
               "test_hash": tests_hash(contents), "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),
               "at": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
@@ -582,6 +593,8 @@ def save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, o
     write_json(repo.record_path, record, prefix=".red-")
     if args.json:
         print(json.dumps(record, indent=2, ensure_ascii=False))
+    elif kind == "removed":
+        print(f"removed: {len(tests)} test files")
     elif kind == "green":
         print(f"green: {len(tests)} test files, exit {code}")
         print(record["tail"])
@@ -589,6 +602,13 @@ def save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, o
         print(f"red ({kind}): {len(tests)} test files, exit {code}")
         print(record["tail"])
     return kind
+
+
+def save_removed(repo, args, merge_base, changed):
+    """The record of a refactor branch whose only test changes delete test files (#454): kind `removed`, its
+    test_files the deleted paths, nothing run. Exit 0."""
+    save_record(repo, args, merge_base, deleted_tests(repo, changed), [], {}, None, None, "", kind="removed")
+    return 0
 
 
 def module_parts(python, node):
@@ -647,6 +667,8 @@ def cmd_check(repo, args):
     if sources:
         raise Problem(f"Source already changed before the red run: {', '.join(sources)}. "
                       "Revert them or move them to the coder step.")
+    if not tests:                                  # a refactor ticket that only deletes test files
+        return save_removed(repo, args, merge_base, changed)
     run_files = runnable(tests)
     contents = read_files(repo.top, tests)         # the bytes the run proves, hashed and kept beside the record
     cmd, code, output = run_red(repo, args, tests, run_files, repo.top, "check")
@@ -664,9 +686,11 @@ def cmd_reprove(repo, args):
         print_no_tests(note, args.json)
         return 0
     merge_base, changed, tests = test_changes(repo, args.base)
+    if not tests:                                  # a refactor ticket that only deletes test files
+        return save_removed(repo, args, merge_base, changed)
     run_files = runnable(tests)
     contents = read_files(repo.top, tests)
-    gone = [p for p in changed if repo.classify(p) == "test" and not os.path.lexists(os.path.join(repo.top, p))]
+    gone = deleted_tests(repo, changed)
     tmp = tempfile.mkdtemp(prefix="harness-red-reprove-")
     path = os.path.join(tmp, repo.slug)
     try:
