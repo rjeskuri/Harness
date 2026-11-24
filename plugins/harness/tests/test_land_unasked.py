@@ -2,7 +2,8 @@
 
 A pull request lands on its own once it is green and current with main; nothing prompts Ryan for it. The contract
 these tests read from the ticket:
-  - hooks.json wires no land_ask.py, and every other hook keeps its event, matcher, place, command and timeout;
+  - hooks.json wires no land_ask.py, and every other hook keeps its event, matcher, place, command and timeout
+    (land_owner.py, added by #452 and pinned by test_land_owner.py, left out of that comparison);
   - no hook hooks.json wires for Bash (the list read from hooks.json itself) answers ask or deny for
     `harness-pr land 57`, `cd <worktree> && harness-pr land 57` or `harness-pr land 57 --accept-findings`, whatever
     risk label the ticket PR 57 closes carries (risk:high, risk:low, none), from a ticket worktree or from the main
@@ -126,6 +127,20 @@ def wiring(data: dict) -> dict:
     }
 
 
+def without(wired_hooks: dict, name: str) -> dict:
+    """`wired_hooks` (as wiring() gives it) with every hook running hooks/`name` taken out, and an entry left with no
+    hook dropped."""
+    out = {}
+    for event, entries in wired_hooks.items():
+        kept = []
+        for matcher, hooks in entries:
+            rest = [h for h in hooks if not any(str(a).endswith("/hooks/" + name) for a in [h[1], *h[2]])]
+            if rest:
+                kept.append((matcher, rest))
+        out[event] = kept
+    return out
+
+
 def bash_hooks() -> list:
     """The hook scripts hooks.json runs before a Bash call, in order, as paths in this checkout."""
     found = []
@@ -142,7 +157,7 @@ def bash_hooks() -> list:
 
 
 def pr_answer(pr: int, ticket: int, head: str) -> dict:
-    """gh pr view `pr` closing `ticket`, in gh's own shape."""
+    """gh pr view `pr` closing `ticket`, in gh's own shape; the PR carries no label (land_owner.py, #452, reads them)."""
     ref = {
         "id": f"I_kwDO{ticket:04d}",
         "number": ticket,
@@ -150,7 +165,7 @@ def pr_answer(pr: int, ticket: int, head: str) -> dict:
         "repository": {"id": "R_kgDO1", "name": "proj", "owner": {"id": "U_1", "login": "o"}},
     }
     return {"contains": ["pr", "view", str(pr)],
-            "stdout_json": {"closingIssuesReferences": [ref], "headRefName": head}}
+            "stdout_json": {"closingIssuesReferences": [ref], "headRefName": head, "labels": []}}
 
 
 def issue_answer(ticket: int, labels) -> dict:
@@ -260,8 +275,9 @@ class LandUnaskedTests(GuardTestCase):
             if any("land_ask" in str(w) for w in [hook.get("command", "")] + list(hook.get("args", [])))
         ]
         self.assertEqual(land_ask, [], "hooks.json still runs land_ask.py")
-        # Every other hook keeps its event, matcher, place in its list, command and timeout.
-        self.assertEqual(wiring(data), EXPECTED_WIRING)
+        # Every other hook keeps its event, matcher, place in its list, command and timeout. land_owner.py (#452)
+        # is new and test_land_owner.py pins its wiring, so its line is left out here.
+        self.assertEqual(without(wiring(data), "land_owner.py"), EXPECTED_WIRING)
 
     # ---- the stub left for sessions that started before the change
 
