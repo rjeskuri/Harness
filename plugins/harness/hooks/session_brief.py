@@ -7,7 +7,9 @@ CLAUDE_PROJECT_DIR are both set and not blank, it appends one line
 its own, never truncating it), so the session's Bash calls, which Claude Code gives no
 CLAUDE_PROJECT_DIR, know the session's project (harness_lib.settings.other_project); a file
 that cannot be written is skipped silently, and the export happens even where the brief does
-not. Then, when its own HARNESS_SESSION_PROJECT (which a hook process only has when it came with
+not. Next, when CLAUDE_ENV_FILE is set, it appends one line that puts the plugin's shim/
+folder first on PATH unless PATH already holds it, so a Bash call's `gh` reaches the gh shim
+(shim/gh), which logs the call. Then, when its own HARNESS_SESSION_PROJECT (which a hook process only has when it came with
 the process, from a spare another project's session started: #345) names another project than
 CLAUDE_PROJECT_DIR, it appends `unset <KEY>` for each harness key (HARNESS_* but
 HARNESS_SESSION_PROJECT, CLAUDE_VERIFY_CMD, CLAUDE_VERIFY_TIMEOUT) in its environment that no
@@ -535,8 +537,9 @@ def run_side_by_side(
 ) -> list[str] | None:
     """stdout of each command, run at the same time; None when one fails or the time runs
     out (then every one still running is stopped). With the lib, each command is logged
-    once as a gh call (ghlimit), with exit null when it was stopped."""
-    env = dict(os.environ, **GH_ENV)
+    once as a gh call (ghlimit), with exit null when it was stopped. Each child gets
+    HARNESS_GH_LOGGED=1, so the gh shim does not log the call a second time."""
+    env = {**os.environ, **GH_ENV, "HARNESS_GH_LOGGED": "1"}
     procs, started = [], []
     try:
         for cmd in cmds:
@@ -709,6 +712,17 @@ def export_session_project() -> None:
         append_to_env_file([f"export HARNESS_SESSION_PROJECT={shlex.quote(project)}"])
 
 
+def put_shim_on_path() -> None:
+    """Append a line to CLAUDE_ENV_FILE that puts the plugin's shim folder (the gh shim, which logs
+    an agent's own gh calls) first on PATH unless PATH already holds it; sh, bash and zsh alike.
+    Nothing when the folder is missing, CLAUDE_ENV_FILE is unset or the file cannot be written."""
+    shim = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "shim"))
+    if not os.path.isdir(shim):
+        return
+    q = shlex.quote(shim)
+    append_to_env_file([f'case ":$PATH:" in *:{q}:*) ;; *) export PATH={q}:"$PATH" ;; esac'])
+
+
 def is_harness_key(name: str) -> bool:
     return SHELL_NAME_RE.match(name) is not None and (
         (name.startswith("HARNESS_") and name != "HARNESS_SESSION_PROJECT")
@@ -790,6 +804,10 @@ def sweep_backups(git_root: Path | None, started: float) -> None:
 def main() -> int:
     started = time.monotonic()
     export_session_project()
+    try:
+        put_shim_on_path()
+    except Exception:  # fail open: the session's gh calls go unlogged, the brief goes on
+        pass
     try:
         dropped = drop_strays()
     except Exception:  # fail open: the brief goes on without the notice

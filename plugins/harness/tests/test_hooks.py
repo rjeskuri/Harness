@@ -35,6 +35,13 @@ from unittest import mock
 from gitrepo_support import copy_repo, make_template
 
 HOOKS = Path(__file__).resolve().parent.parent / "hooks"
+SHIM_DIR = HOOKS.parent / "shim"
+
+
+def without_shim_path(text: str) -> str:
+    """The env file's text without the line session_brief adds to put the gh shim's folder on PATH (#448)."""
+    return "".join(ln for ln in text.splitlines(keepends=True) if str(SHIM_DIR) not in ln)
+
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Secret-shaped samples, split so that no line of this file matches a pattern.
@@ -526,7 +533,7 @@ class SessionProjectExportTests(HookTestCase):
     def assertOneExportAppended(self, env_file: Path, before: str, project: Path) -> None:
         after = env_file.read_text(encoding="utf-8")
         self.assertTrue(after.startswith(before), f"earlier content was not kept: {after!r}")
-        added = after[len(before):]
+        added = without_shim_path(after[len(before):])
         self.assertEqual(added.count("\n"), 1, f"not exactly one line appended: {added!r}")
         self.assertTrue(added.endswith("\n"), added)
         self.assertTrue(added.startswith("export HARNESS_SESSION_PROJECT="), added)
@@ -638,7 +645,8 @@ class SessionProjectExportTests(HookTestCase):
         readonly = self.env_file()
         readonly.chmod(0o444)
         self.addCleanup(readonly.chmod, 0o644)
-        # With nothing to export (CLAUDE_PROJECT_DIR unset or blank), a writable env file is left as it was.
+        # With nothing to export (CLAUDE_PROJECT_DIR unset or blank), a writable env file gains no export (the
+        # shim's PATH line aside, #448).
         writable = self.env_file()
         cases = [("unset", None, str(project)), ("blank", "", str(project)),
                  ("missing directory", missing_dir, str(project)), ("a directory", a_dir, str(project)),
@@ -657,7 +665,7 @@ class SessionProjectExportTests(HookTestCase):
                 self.assertFalse(missing_dir.parent.exists(), "a folder was created for the env file")
                 self.assertEqual(list(a_dir.iterdir()), [])
                 self.assertEqual(readonly.read_text(encoding="utf-8"), self.EARLIER)
-                self.assertEqual(writable.read_text(encoding="utf-8"), self.EARLIER)
+                self.assertEqual(without_shim_path(writable.read_text(encoding="utf-8")), self.EARLIER)
 
     # ---- the registration: every source a Bash call can follow gets the export
 
