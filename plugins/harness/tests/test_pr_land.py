@@ -205,7 +205,7 @@ class Land(LandBase):
         self.assertEqual(sum(1 for a in self.gh_argv() if a == ["pr", "view", "34", "--json", LAND_FIELDS]), 2)
         self.assertFalse(os.path.exists(self.wt))
         self.assertFalse(self.branch_exists())
-        lines = p.stdout.splitlines()
+        lines = self.report_through_ticket(p.stdout)
         self.assertEqual(len(lines), 4, p.stdout)
         self.assertEqual(lines[0], f'Merged PR #34 "Add the widget (#12)" into main as {SHA[:12]}.')
         self.assertIn(f"removed {self.wt}", lines[1])
@@ -240,11 +240,48 @@ class Land(LandBase):
         self.assertEqual(lines[at + 1:], ["  " + line for line in said.splitlines()], p.stdout)
         self.assertEqual([line for line in p.stderr.splitlines() if "warning" in line], [], p.stderr)
 
-    def test_land_that_dispatches_nothing_prints_no_dispatch_line(self):
-        self.scenario(self.land_calls())
-        p = self.ok("land", "34", "--yes", cwd=self.main)
-        self.assertDispatchedOnce(12)
-        self.assertNotIn("Dispatch:", p.stdout)
+    def report_through_ticket(self, stdout):
+        """The land's stdout lines through its Ticket line. Every line after it must be the follow-on dispatch's
+        report (#390, #491), which the dispatch tests pin, so a test of the land itself counts only these."""
+        lines = stdout.splitlines()
+        ticket = [i for i, line in enumerate(lines) if line.startswith("Ticket:")]
+        self.assertEqual(len(ticket), 1, stdout)
+        self.assertEqual("\n".join(lines[ticket[0] + 1:]), self.dispatch_tail(stdout),
+                         f"nothing but the dispatch report after the Ticket line:\n{stdout}")
+        return lines[:ticket[0] + 1]
+
+    def dispatch_tail(self, stdout):
+        """The land's stdout from its first line about the dispatch after the Ticket line, joined: '' if none."""
+        lines = stdout.splitlines()
+        ticket = [i for i, line in enumerate(lines) if line.startswith("Ticket:")]
+        self.assertTrue(ticket, stdout)
+        rest = lines[ticket[0] + 1:]
+        first = next((i for i, line in enumerate(rest) if re.search(r"(?i)dispatch", line)), None)
+        return "" if first is None else "\n".join(rest[first:])
+
+    def test_land_says_why_its_dispatch_started_nothing(self):
+        """#491: a follow-on dispatch that printed nothing, or failed, is a stdout line of the land that names the
+        landed ticket and says nothing was started, with the failure's reason; not only a stderr warning."""
+        rows = (("printed nothing", {"stdout": ""}, None),
+                ("printed blank lines", {"stdout": "\n   \n"}, None),
+                ("failed with a reason", {"exit": 3, "stdout": "half done\n",
+                                          "stderr": "no capacity left\nsecond line\n"}, "no capacity left"),
+                ("failed with another reason", {"exit": 1, "stderr": "gh: GraphQL: refused (rate limit)\n"},
+                 "GraphQL: refused (rate limit)"),
+                ("failed without a reason", {"exit": 7}, "exit 7"))
+        for name, answer, reason in rows:
+            with self.subTest(name):
+                self.setUp()
+                self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}},
+                                "harness-work": {"dispatch --after": answer}})
+                self.scenario(self.land_calls())
+                p = self.ok("land", "34", "--yes", cwd=self.main)
+                self.assertDispatchedOnce(12)
+                tail = self.dispatch_tail(p.stdout)
+                self.assertRegex(tail, r"#12\b", p.stdout)
+                self.assertRegex(tail, r"(?i)\b(nothing|none|no tickets?)\b", p.stdout)
+                if reason:
+                    self.assertIn(reason, tail, p.stdout)
 
     def test_dispatch_failure_is_a_warning(self):
         self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}},
@@ -337,7 +374,7 @@ class Land(LandBase):
         self.scenario(self.land_calls(views=[merged]))
         p = self.ok("land", "34", "--discard", cwd=self.main)
         self.assertFalse(any(a[:2] == ["pr", "merge"] for a in self.gh_argv()))
-        lines = p.stdout.splitlines()
+        lines = self.report_through_ticket(p.stdout)
         self.assertEqual(lines[0], "already merged, finishing cleanup")
         self.assertEqual(lines[1], f'PR #34 "Add the widget (#12)" was already merged into main as {SHA[:12]}.')
         self.assertEqual(len(lines), 5, p.stdout)

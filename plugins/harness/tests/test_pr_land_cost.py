@@ -108,6 +108,12 @@ class LandCost(WorktreeTest):
         """The stderr lines but the `dispatch after #N` warnings of #390, which a missing harness-work adds."""
         return [line for line in lines if not line.startswith("harness-pr: warning: dispatch after #")]
 
+    def without_dispatch_block(self, stdout):
+        """The stdout lines before its `Dispatch:` block (#390), the land's last, where a harness-work that cannot
+        run is the reason nothing was started (#491)."""
+        lines = stdout.splitlines()
+        return lines[:lines.index("Dispatch:")] if "Dispatch:" in lines else lines
+
     def isolated_land(self, fx, tickets, work_next_to_tool):
         """A land by a copy of harness-pr in a plugin of its own (its lib and templates linked to the real ones),
         with no harness-work on PATH: the fakes but harness-work, the stubs and the system. With
@@ -281,7 +287,7 @@ class LandCost(WorktreeTest):
             p = self.pr("land", str(fx["pr"]), "--yes", cwd=self.main, PATH=path)
             self.assertNotIn("Traceback", p.stderr)
             self.assertEqual(p.returncode, before.returncode, p.stdout + p.stderr)
-            self.assertEqual(p.stdout, before.stdout)
+            self.assertEqual(self.without_dispatch_block(p.stdout), self.without_dispatch_block(before.stdout))
             warned = self.no_cost_warnings(p.stderr)
             for n in tickets:
                 mine = [line for line in warned if line.startswith(f"harness-pr: warning: no cost block for #{n}: ")]
@@ -294,7 +300,7 @@ class LandCost(WorktreeTest):
         with self.subTest("no harness-work on PATH or next to harness-pr"):
             p = self.isolated_land(fx, tickets, work_next_to_tool=False)
             self.assertEqual(p.returncode, before.returncode, p.stdout + p.stderr)
-            self.assertEqual(p.stdout, before.stdout)
+            self.assertEqual(self.without_dispatch_block(p.stdout), self.without_dispatch_block(before.stdout))
             self.assertEqual(self.cost_runs(), [], "no cost run happened")
             warned = self.no_cost_warnings(p.stderr)
             for n in tickets:

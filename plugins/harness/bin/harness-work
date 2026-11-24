@@ -1162,6 +1162,19 @@ def mtime_iso(path):
         return iso(now())
 
 
+def own_session_ids():
+    """The short ids (a bg run record's bg_id) of the session this process runs in (#491): the first 8 characters of
+    CLAUDE_CODE_SESSION_ID and the basename of CLAUDE_JOB_DIR (~/.claude/jobs/<short id>), either one alone."""
+    ids = set()
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if session:
+        ids.add(session[:8])
+    job = os.environ.get("CLAUDE_JOB_DIR", "").strip().rstrip("/")
+    if job:
+        ids.add(os.path.basename(job))
+    return ids
+
+
 def sweep(records, agents, as_json=False, dry_run=False):
     """Close the records whose run has ended; a billing or auth failure marks the api budget. A listed bg session
     whose ticket is finished has ended whatever its state says: it is stopped and its record closed. Saves. Under
@@ -1170,8 +1183,9 @@ def sweep(records, agents, as_json=False, dry_run=False):
     before its land (before_landing, #422) is not finished: `blocked` (its turn over, #123) is stopped as above and
     ends `early`, `done` ends `early`, any other live state keeps its record open. A manual-land ticket in review
     (#451) is never before its land: its session is finished once `blocked`, `idle` or ended (ticket_finished), and
-    a working one keeps its record open. Every unended bg record's
-    transcript is read for a usage-limit refusal, which marks the subscription budget (note_usage_limit): a limited
+    a working one keeps its record open. The session this sweep runs in (own_session_ids, #491: the land's
+    `dispatch --after N` runs inside ticket N's session) is never stopped: its record stays open for a later sweep.
+    Every unended bg record's transcript is read for a usage-limit refusal, which marks the subscription budget (note_usage_limit): a limited
     session stays `blocked`, a live state."""
     repos, logins = {}, {}
     for record in records:
@@ -1193,6 +1207,8 @@ def sweep(records, agents, as_json=False, dry_run=False):
             if entry is not None and state != "stopped":
                 finished = ticket_finished(record, repos, state)
             stop = bool(finished) or (finished is False and state == "blocked" and ticket_landing(record, repos))
+            if stop and str(record.get("bg_id")) in own_session_ids():
+                continue                    # the session this sweep runs in (#491): a later sweep stops it
             if entry is not None and not state_ended(state) and not stop:
                 continue
             if stop and dry_run:

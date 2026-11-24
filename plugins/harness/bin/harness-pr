@@ -28,8 +28,9 @@ file, under HARNESS_SMOKE_TIMEOUT seconds (the environment, else the main checko
 300), its whole process group killed at the limit. Exit 0 lands as before; 2 or the limit is one warning and a
 comment on each ticket; any other exit reverts the merge (revert_landed) and the land exits 1 naming the revert.
 Last, unless the canary failed, land runs `harness-work dispatch --after N --repo <main>` (cwd the main checkout) for
-each ticket it closed and prints a `Dispatch:` line with that stdout indented under it (nothing when it prints
-nothing); a failed run is one `harness-pr: warning: dispatch after #N: ...` line and the exit is unchanged.
+each ticket it closed and prints a `Dispatch:` line with that stdout indented under it (`after #N: nothing started`
+when it prints nothing, #491); a failed run is one `harness-pr: warning: dispatch after #N: ...` line and
+`after #N: nothing started (<reason>)` under `Dispatch:`, and the exit is unchanged.
 
 land --catch-up, before the preconditions: while the head is behind main and --rounds allow, the head branch's
 worktree (clean and at the head, else refuse) runs `git fetch origin`, `git merge-tree --write-tree` of the head and
@@ -1991,17 +1992,22 @@ def land_canary(repo, number, sha, tickets):
 
 def dispatch_after(repo, number):
     """`harness-work dispatch --after N --repo <main>` for a ticket the land closed (#390), no stdin, cwd the main
-    checkout; its stdout lines. A run that fails, times out or cannot start is one warning line and no lines."""
+    checkout; its non-blank stdout lines, or else one `after #N: nothing started` line (#491). A run that fails,
+    times out or cannot start is one warning line and that line with the reason in parentheses."""
+    why = None
     try:
         done = tool("harness-work", ["dispatch", "--after", str(number), "--repo", repo.main], repo.main,
                     check=False)
     except Problem as err:
-        warn("harness-pr", f"dispatch after #{number}: {err}")
-        return []
-    if done.returncode != 0:
-        warn("harness-pr", f"dispatch after #{number}: {first_line(done.stderr) or f'exit {done.returncode}'}")
-        return []
-    return (done.stdout or "").splitlines()
+        why = str(err)
+    else:
+        if done.returncode != 0:
+            why = first_line(done.stderr) or f"exit {done.returncode}"
+    if why is not None:
+        warn("harness-pr", f"dispatch after #{number}: {why}")
+        return [f"after #{number}: nothing started ({why})"]
+    said = [line for line in (done.stdout or "").splitlines() if line.strip()]
+    return said or [f"after #{number}: nothing started"]
 
 
 def cmd_land(args):
@@ -2169,7 +2175,7 @@ def cmd_land(args):
         summary.extend(lines)
         problems.extend(trouble)
     if stands:                                # last: what each closed ticket unblocks (#390)
-        said = [line for n in closed for line in dispatch_after(repo, n) if line.strip()]
+        said = [line for n in closed for line in dispatch_after(repo, n)]
         if said:
             summary.extend(["Dispatch:"] + [f"  {line}" for line in said])
     print("\n".join(summary))
