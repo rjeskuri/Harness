@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Pull requests for tickets: open a draft PR from a ticket worktree, post the reviewer's findings inline, wait on
-the checks, mark it ready, read the comments, list the PRs awaiting the user, run ultrareview, and land it
-(squash merge, then the worktree, the branch, the main checkout, the ticket and the project's canary).
+the checks, mark it ready, read the comments, list the PRs awaiting the user, and land it (squash
+merge, then the worktree, the branch, the main checkout, the ticket and the project's canary).
 
 Usage:
     harness-pr open N [--worktree PATH] [--verify-log F] [--review F] [--notes F] [--json]
@@ -14,7 +14,6 @@ Usage:
     harness-pr comments P [--since ISO] [--unresolved] [--json]
     harness-pr learn [--since ISO] [--json] | learn --mark
     harness-pr awaiting [--all-projects] [--json]
-    harness-pr ultra P [--post] [--force]
     harness-pr land P [--yes] [--discard] [--accept-findings] [--catch-up [--rounds 3] [--timeout 420]]
     harness-pr gate P [--json]
     harness-pr revert P|SHA [--reason TEXT] [--evidence-file F] [--json]
@@ -67,10 +66,8 @@ learn lists the PRs merged since `since` (--since, else `last_run` in ~/.claude/
 7 days ago), each with its ticket (t/N- branch), its review rounds' findings and its conversation without the
 harness's own, then the `**Parked**` issue comments created since then; --mark records now as `last_run`, no gh call.
 
-ultra runs nothing (one line, exit 0) when the project's HARNESS_ULTRAREVIEW is off, unless --force; see cmd_ultra.
-
 The repository is the cwd's (open: --worktree, else the cwd), else CLAUDE_PROJECT_DIR. gh is HARNESS_GH when
-set, else `gh`; claude is HARNESS_CLAUDE, else `claude`; harness-board, harness-red and harness-work (land's Cost
+set, else `gh`; harness-board, harness-red and harness-work (land's Cost
 block on each Resolution and its dispatch; a failed run of either is a warning) are found on PATH, else
 next to this script. A harness-board call that succeeds passes its `harness-board: warning:` stderr lines through
 to stderr, in order; its other stderr stays hidden. HARNESS_POLL_SECONDS replaces the 20 s poll interval (tests).
@@ -110,7 +107,6 @@ try:
     from harness_lib.canary import SMOKE, run_canary
     from harness_lib.autoland import (CONVERSATION, at_head, behind_main, check_entries as lib_check_entries,
                                       evaluate, fetch_origin, gate_settings, gather_facts, overall, review_counts)
-    from harness_lib.routing import load_routing
     from harness_lib.reviews import (add_rulings, add_ticket, finding_key, latest_round, load_rounds, load_tickets,
                                      reviews_dir, save_round)
     from harness_lib.settings import setting, settings_env
@@ -131,8 +127,6 @@ NO_RISK = "None noted."
 SEVERITIES = ("high", "medium", "low")
 SEVERITY_ALIASES = {"critical": "high", "blocker": "high", "major": "medium", "minor": "low", "nit": "low",
                     "info": "low"}
-SEVERITY_RANK = ("critical", "high", "medium", "low", "info")
-BILLING = re.compile(r"credit|billing|balance", re.I)
 RUN_URL = re.compile(r"/actions/runs/(\d+)")
 PR_URL = re.compile(r"https?://\S+/pull/(\d+)")
 HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -152,8 +146,6 @@ MERGEABLE_SLEEP = 3.0        # seconds, at most the poll interval
 GH_TIMEOUT = 60
 PUSH_TIMEOUT = 180
 TOOL_TIMEOUT = 180
-ULTRA_MINUTES = 30
-EXHAUSTED_HOURS = 24
 DEFAULT_CHECKED = "the diff against the ticket's definition of done"
 LAND_FIELDS = "isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state"
 RULING_LINE = re.compile(r"^[ \t]*(?:- )?(Ruling:.*\S)[ \t]*$", re.M)
@@ -1463,107 +1455,6 @@ def cmd_awaiting(args):
     return 0
 
 
-# --------------------------------------------------------------- ultra
-def find_findings(data):
-    """The findings in ultrareview's JSON, whatever its shape: a top-level list, a `findings` list (at any
-    depth), else every object that has a `severity`."""
-    if isinstance(data, list):
-        return [d for d in data if isinstance(d, dict)]
-    stack = [data]
-    while stack:
-        node = stack.pop(0)
-        if isinstance(node, dict):
-            if isinstance(node.get("findings"), list):
-                return [d for d in node["findings"] if isinstance(d, dict)]
-            stack.extend(node.values())
-        elif isinstance(node, list):
-            stack.extend(node)
-    found, stack = [], [data]
-    while stack:
-        node = stack.pop(0)
-        if isinstance(node, dict):
-            if "severity" in node:
-                found.append(node)
-            else:
-                stack.extend(node.values())
-        elif isinstance(node, list):
-            stack.extend(node)
-    return found
-
-
-def severity_line(findings):
-    counts = {}
-    for f in findings:
-        sev = str(f.get("severity") or "unrated").strip().lower() or "unrated"
-        counts[sev] = counts.get(sev, 0) + 1
-    rank = {s: i for i, s in enumerate(SEVERITY_RANK)}
-    order = sorted(counts, key=lambda s: (rank.get(s, len(rank)), s))
-    return ", ".join(f"{counts[s]} {s}" for s in order)
-
-
-def mark_cloud_exhausted(reason):
-    path = harness_home("budgets.json")
-    data = read_json(path)
-    data = data if isinstance(data, dict) else {}
-    until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=EXHAUSTED_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    data["cloud"] = {"exhausted_until": until, "reason": reason}
-    write_json(path, data, prefix=".harness-pr-")
-    return until
-
-
-def cmd_ultra(args):
-    """Run `claude ultrareview`, unless the project's HARNESS_ULTRAREVIEW is off (the environment, else the main
-    checkout's settings.json): then one line saying so and nothing run, unless --force. Each problem load_routing
-    finds is one `harness-pr: warning:` line, with --force too; an invalid HARNESS_ULTRAREVIEW is ignored."""
-    repo = open_repo()
-    number = args.number
-    routing = load_routing(repo.main)
-    for problem in routing["problems"]:
-        warn("harness-pr", problem)
-    if not routing["ultrareview"] and not args.force:
-        print(f"ultrareview PR #{number}: off for this project (HARNESS_ULTRAREVIEW=off); nothing run")
-        return 0
-    exe = os.environ.get("HARNESS_CLAUDE", "claude")
-    cmd = [exe, "ultrareview", str(number), "--json", "--timeout", str(ULTRA_MINUTES)]
-    cmd += ["--post"] if args.post else []
-    try:
-        done = subprocess.run(cmd, cwd=repo.root, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              stdin=subprocess.DEVNULL, timeout=(ULTRA_MINUTES + 10) * 60)
-    except FileNotFoundError:
-        raise Problem(f"claude not found ({exe})") from None
-    except OSError as err:
-        raise Problem(f"cannot run claude ({exe}): {err.strerror or err}") from None
-    except subprocess.TimeoutExpired:
-        raise Problem(f"claude ultrareview {number} did not finish in {ULTRA_MINUTES + 10} minutes") from None
-    path = repo.state("ultra", f"{number}.json")
-    if done.stdout.strip():
-        write_text(path, done.stdout, prefix=".harness-pr-")
-    if done.returncode != 0:
-        output = (done.stdout or "") + "\n" + (done.stderr or "")
-        hit = next((line for line in output.splitlines() if BILLING.search(line)), None)
-        if hit:
-            reason = one_line(hit)[:200]
-            until = mark_cloud_exhausted(reason)
-            raise Problem(f"ultrareview PR #{number} failed (exit {done.returncode}): {reason}; "
-                          f"the cloud budget is marked exhausted until {until}")
-        why = last_line(done.stderr) or last_line(done.stdout) or "no output"
-        raise Problem(f"ultrareview PR #{number} failed (exit {done.returncode}): {why}")
-    saved = f"saved {short_home(path)}" if done.stdout.strip() else "no output to save"
-    try:
-        data = json.loads(done.stdout)
-    except ValueError:
-        print(f"ultrareview PR #{number}: done, the output is not JSON so findings were not counted; {saved}")
-        return 0
-    findings = find_findings(data)
-    posted = "; posted to the PR" if args.post else ""
-    if findings:
-        print(f"ultrareview PR #{number}: {plural(len(findings), 'finding')} ({severity_line(findings)}){posted}; "
-              f"{saved}")
-    else:
-        print(f"ultrareview PR #{number}: no findings{posted}; {saved}")
-    return 0
-
-
 # --------------------------------------------------------------- land
 def worktree_for(main, branch):
     """The path of the worktree that has `branch` checked out, or None."""
@@ -2551,9 +2442,9 @@ def rounds_arg(text):
 
 def parser():
     ap = Parser(prog="harness-pr", description="Pull requests for tickets: open, review, findings, checks, ready, "
-                                               "comments, learn, awaiting, ultra, land, gate, revert.")
+                                               "comments, learn, awaiting, land, gate, revert.")
     sub = ap.add_subparsers(dest="cmd",
-                            metavar="{open,review,findings,checks,ready,comments,learn,awaiting,ultra,land,gate,revert}")
+                            metavar="{open,review,findings,checks,ready,comments,learn,awaiting,land,gate,revert}")
     sub.required = True
 
     op = sub.add_parser("open", help="push the ticket branch and open (or update) its draft PR")
@@ -2605,11 +2496,6 @@ def parser():
     aw.add_argument("--all-projects", action="store_true", help="every registered project with an origin remote")
     aw.add_argument("--json", action="store_true")
 
-    ul = sub.add_parser("ultra", help="claude ultrareview (bills usage credits)")
-    ul.add_argument("number", type=number_arg, metavar="P")
-    ul.add_argument("--post", action="store_true", help="post the findings to the PR")
-    ul.add_argument("--force", action="store_true", help="run even when the project's HARNESS_ULTRAREVIEW is off")
-
     ld = sub.add_parser("land", help="squash-merge, remove the worktree and branch, update main, close the ticket")
     ld.add_argument("number", type=number_arg, metavar="P")
     ld.add_argument("--yes", action="store_true", help="accepted and ignored (the land skill confirms)")
@@ -2641,7 +2527,7 @@ def parser():
 
 COMMANDS = {"open": cmd_open, "review": cmd_review, "findings": cmd_findings, "checks": cmd_checks, "ready": cmd_ready,
             "comments": cmd_comments, "learn": cmd_learn,
-            "awaiting": cmd_awaiting, "ultra": cmd_ultra, "land": cmd_land,
+            "awaiting": cmd_awaiting, "land": cmd_land,
             "gate": cmd_gate, "revert": cmd_revert}
 
 

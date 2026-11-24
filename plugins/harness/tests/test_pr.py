@@ -890,5 +890,41 @@ class Awaiting(PrTest):
         self.assertEqual(sum(1 for a in self.gh_argv() if a[:2] == ["pr", "list"]), 1)
 
 
+# =========================================================================== no ultra (#443)
+class NoUltra(PrTest):
+    """#443 removed ultrareview: `ultra` is no subcommand, so harness-pr refuses it exactly as it refuses any
+    unknown subcommand (the argparse invalid-choice error), runs nothing and saves nothing."""
+
+    # the subcommands that stay, each still listed in --help
+    KEPT = ("open", "review", "findings", "checks", "ready", "comments", "learn", "awaiting", "land", "gate",
+            "revert")
+
+    def test_ultra_is_refused_like_any_unknown_subcommand(self):
+        for args in (("1",), ("34", "--post"), ("7", "--force"), ("12", "--post", "--force")):
+            for word in ("ultra", "ultrareview"):
+                with self.subTest(word=word, args=args):
+                    self.scenario([])
+                    unknown = self.pr("nosuch", *args)       # what an unknown subcommand gets, for comparison
+                    p = self.pr(word, *args)
+                    self.assertNotIn("Traceback", p.stderr)
+                    self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertEqual(p.returncode, unknown.returncode, "refused as an unknown subcommand is")
+                    self.assertIn("invalid choice", p.stderr)
+                    self.assertEqual(p.stderr, unknown.stderr.replace("'nosuch'", repr(word)),
+                                     "the same argparse error as any unknown subcommand")
+                    self.assertNotIn("ultra", unknown.stderr.lower(), "the choices offered do not include ultra")
+                    self.assertEqual(p.stdout, "")
+                    self.assertEqual(self.stub_calls("claude"), [], "claude ultrareview never runs")
+                    self.assertEqual(self.gh_argv(), [])
+                    self.assertFalse(os.path.exists(self.state_path("ultra")), "no ultra state is saved")
+
+    def test_help_does_not_list_ultra(self):
+        p = self.ok("--help")
+        self.assertNotIn("ultra", p.stdout.lower())
+        listed = {line.split()[0] for line in p.stdout.splitlines() if line.startswith("    ") and line.split()}
+        for name in self.KEPT:
+            self.assertIn(name, listed, f"--help still lists {name}")
+
+
 if __name__ == "__main__":
     unittest.main()

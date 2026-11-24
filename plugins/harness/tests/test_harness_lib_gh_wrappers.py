@@ -999,8 +999,8 @@ class StaticNoOwnGhTests(unittest.TestCase):
         allowed = [
             'import subprocess\ndef git(p, *a):\n    return subprocess.run(["git", "-C", p] + list(a))\n',
             'import subprocess\ndef tool(name, args):\n    return subprocess.run([sibling(name)] + list(args))\n',
-            'import os, subprocess\ndef ultra(n):\n    exe = os.environ.get("HARNESS_CLAUDE", "claude")\n'
-            '    cmd = [exe, "ultrareview", str(n)]\n    cmd += ["--post"]\n    return subprocess.run(cmd)\n',
+            'import os, subprocess\ndef agents(n):\n    exe = os.environ.get("HARNESS_CLAUDE", "claude")\n'
+            '    cmd = [exe, "agents", str(n)]\n    cmd += ["--json"]\n    return subprocess.run(cmd)\n',
         ]
         flagged = [
             'import os, subprocess\ndef old(args):\n    exe = os.environ.get("HARNESS_GH", "gh")\n'
