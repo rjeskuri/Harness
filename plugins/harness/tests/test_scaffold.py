@@ -287,17 +287,15 @@ class Render(ScaffoldTest):
     def test_harness_own_settings_allow_the_nine_not_the_wildcard(self):
         """Harness's own .claude/settings.json follows the template: the nine rules, no wildcard.
 
-        Its env holds exactly the verify command, the test map (#264), ultrareview off (#283) and the red-run
-        timeout (#378: the own-tests run of a wide ticket outlasts the 300 s default); any other key fails."""
+        Its env holds exactly the verify command, the test map (#264) and the red-run timeout (#378: the own-tests
+        run of a wide ticket outlasts the 300 s default); any other key fails, HARNESS_ULTRAREVIEW too (#443)."""
         data = json.loads(self.read(REPO, ".claude", "settings.json"))
         allow = data["permissions"]["allow"]
         self.assertNotIn(WILDCARD, allow)
         self.assertEqual(allow, BASE_ALLOW + HARNESS_NINE)
         env = data["env"]
-        self.assertEqual(set(env), {"CLAUDE_VERIFY_CMD", "HARNESS_TEST_MAP", "HARNESS_ULTRAREVIEW",
-                                    "HARNESS_TEST_TIMEOUT"})
+        self.assertEqual(set(env), {"CLAUDE_VERIFY_CMD", "HARNESS_TEST_MAP", "HARNESS_TEST_TIMEOUT"})
         self.assertEqual(float(env["HARNESS_TEST_TIMEOUT"]), 900)
-        self.assertEqual(env["HARNESS_ULTRAREVIEW"], "off")
         self.assertEqual(env["CLAUDE_VERIFY_CMD"], "python3 scripts/run_suite.py")
         pairs = env["HARNESS_TEST_MAP"].split(",")
         for pair in ("plugins/harness/hooks/branch_guard.py=plugins/harness/tests/test_guards.py",
