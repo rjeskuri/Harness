@@ -38,6 +38,12 @@ at the head, once GitHub shows the pushed merge as headRefOid, are polled as che
 meanwhile taking another round. Red checks refuse naming them, behind with no round left refuses naming the rounds,
 and --timeout seconds (one deadline for every wait) used up exits 8 saying to run the same command again.
 
+land --loop (the work loop's land) of a PR with `manual-land` on it or on a ticket it closes (each read from gh; a
+failed read refuses, exit 1) prints `PR #P is manual-land: the owner lands it with /harness:land P` and exits 9 before
+anything else, catch-up included, nothing merged; without --loop it lands as any PR. ready on such a PR (the
+labels of --ticket's ticket when given; a failed read is one warning) prints `manual-land: waiting for /harness:land
+P` after its line and adds it to the notification.
+
 ready refuses a PR whose latest harness review (the newest review carrying the harness marker) has high or
 medium findings and no commit newer than it, naming those findings, and refuses when gh cannot tell. land judges
 at the head (headRefOid) instead: it refuses a head behind main, a latest harness review that is not of the head
@@ -76,7 +82,8 @@ gate prints the auto-land verdict (harness_lib/autoland.py) and exits 0 whatever
 fails gives `wait: <call> failed: <first stderr line>`.
 
 Exit status: 0 done; 1 a bad invocation, a failed precondition or call (one line on stderr), failed checks, or
-a land whose cleanup stopped; 8 checks still pending (as gh pr checks; land --catch-up at its --timeout).
+a land whose cleanup stopped; 8 checks still pending (as gh pr checks; land --catch-up at its --timeout); 9 land
+--loop of a manual-land PR.
 """
 from __future__ import annotations
 
@@ -147,7 +154,11 @@ GH_TIMEOUT = 60
 PUSH_TIMEOUT = 180
 TOOL_TIMEOUT = 180
 DEFAULT_CHECKED = "the diff against the ticket's definition of done"
-LAND_FIELDS = "isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state"
+LAND_FIELDS = ("isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state,"
+               "labels")
+TICKET_FIELDS = "state,labels,comments"   # what land reads of each ticket the PR closes
+MANUAL_LAND = "manual-land"               # the owner lands it, with /harness:land (#451)
+OWNER_LANDS = 9                           # land --loop's exit on a manual-land PR
 RULING_LINE = re.compile(r"^[ \t]*(?:- )?(Ruling:.*\S)[ \t]*$", re.M)
 OUTSIDE_NOTE = "(outside the files this ticket changed)"
 SENTENCE_END = re.compile(r"[.!?](?= |$)")
@@ -400,6 +411,24 @@ def closing_numbers(view):
         if isinstance(n, int) and n not in out:
             out.append(n)
     return out
+
+
+def manual_land(view, tickets, cwd, fields="labels"):
+    """Whether `manual-land` (#451) is on the PR (its view's labels) or on one of `tickets`, each read with `gh issue
+    view N --json <fields>` until one has it. A failed read raises Problem naming the ticket."""
+    def labelled(labels):
+        return any(label.get("name") == MANUAL_LAND for label in as_list(labels))
+
+    if labelled(view.get("labels")):
+        return True
+    for n in tickets:
+        try:
+            issue = gh_json(["issue", "view", str(n), "--json", fields], cwd)
+        except Problem as err:
+            raise Problem(f"ticket #{n}: {err}") from None
+        if isinstance(issue, dict) and labelled(issue.get("labels")):
+            return True
+    return False
 
 
 # --------------------------------------------------------------- findings
@@ -1162,17 +1191,26 @@ def cmd_ready(args):
         raise Problem(unaddressed(number, review, blocking, unlisted)
                       + f"; fix them, push, then harness-pr ready {number}")
     gh(["pr", "ready", str(number)], repo.root)
-    view = pr_view(repo, number, "url,title,closingIssuesReferences")
+    view = pr_view(repo, number, "url,title,closingIssuesReferences,labels")
     url, title = view.get("url") or "", view.get("title") or ""
     tickets = [args.ticket] if args.ticket else closing_numbers(view)
+    try:
+        gated = manual_land(view, tickets, repo.root)
+    except Problem as err:
+        gated = False
+        warn("harness-pr", f"cannot tell whether PR #{number} is manual-land ({err}); no manual-land line")
+    waits = f"manual-land: waiting for /harness:land {number}" if gated else ""
     error = None
     for n in tickets:
         try:
             board(repo, "status", str(n), "in-review", "--comment", f"PR #{number} ready for review: {url}")
         except Problem as err:
             error = error or err
-    notify(f"{repo.name} PR #{number} ready for review: {title}", f"harness-{repo.key}-pr-{number}")
+    notify(f"{repo.name} PR #{number} ready for review: {title}" + (f"\n{waits}" if waits else ""),
+           f"harness-{repo.key}-pr-{number}")
     print(f"PR #{number} ready for review: {url}")
+    if waits:
+        print(waits)
     if lows:
         warn("harness-pr", f"PR #{number}: {plural(len(lows), 'low finding')} left for the owner: " + "; ".join(lows))
     if not tickets:
@@ -1636,7 +1674,7 @@ def land_ticket(repo, number, sha, pr, resolution, url=None, landed_by="hand"):
     do not, so its second landing gets a Resolution and `Landed in` of its own. (summary, error)."""
     done = []
     try:
-        info = gh_json(["issue", "view", str(number), "--json", "state,labels,comments"], repo.main)
+        info = gh_json(["issue", "view", str(number), "--json", TICKET_FIELDS], repo.main)
         info = info if isinstance(info, dict) else {}
         if str(info.get("state", "")).upper() != "CLOSED":
             board(repo, "close", str(number))
@@ -1968,6 +2006,15 @@ def cmd_land(args):
     main = repo.main
     number = args.number
     view = pr_view(repo, number, LAND_FIELDS, main)
+    if args.loop:                             # only the owner lands a manual-land PR (#451): before anything merges
+        try:
+            gated = manual_land(view, closing_numbers(view), main, TICKET_FIELDS)
+        except Problem as err:
+            raise Problem(f"cannot tell whether PR #{number} is manual-land: {err}; nothing landed") from None
+        if gated:
+            print(f"harness-pr: PR #{number} is manual-land: the owner lands it with /harness:land {number}",
+                  file=sys.stderr)
+            return OWNER_LANDS
     state = str(view.get("state") or "OPEN").upper()
     if args.catch_up and state == "OPEN":
         view = catch_up(repo, number, view, args)
@@ -2510,7 +2557,8 @@ def parser():
     ld.add_argument("--timeout", type=seconds_arg, default=CATCH_UP_TIMEOUT, metavar="SECONDS",
                     help=f"with --catch-up: for all its check waits together, then exit 8 ({CATCH_UP_TIMEOUT:g})")
     ld.add_argument("--loop", action="store_true",
-                    help="the /harness:work loop is landing it: the Cost block records `Landed by: loop`, else hand")
+                    help="the /harness:work loop is landing it: the Cost block records `Landed by: loop`, else hand; "
+                         "a manual-land PR exits 9, nothing merged")
 
     gt = sub.add_parser("gate", help="the auto-land verdict: land, wait, fix or manual, and why")
     gt.add_argument("number", type=number_arg, metavar="P")

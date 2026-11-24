@@ -565,21 +565,31 @@ class Checks(PrTest):
 
 # =========================================================================== ready
 class Ready(PrTest):
-    def view(self, closing):
-        return {"match": ["pr", "view", "34", "--json", "url,title,closingIssuesReferences"],
-                "stdout_json": {"url": PR_URL, "title": "Add the widget (#12)",
+    # Any ticket's issue, whatever fields are asked: open and in progress, no manual-land (#451: ready may read the
+    # labels of the tickets it sets in review).
+    TICKET_VIEW = {"match": ["issue", "view"],
+                   "stdout_json": {"state": "OPEN", "labels": [{"name": "task"}, {"name": "status:in-progress"}]}}
+
+    def view(self, closing, number=34, labels=()):
+        """`gh pr view P --json <fields>` of the PR closing `closing`, whatever fields ready asks for (#451: its
+        labels too)."""
+        return {"match": ["pr", "view", str(number), "--json"],
+                "stdout_json": {"url": f"https://github.com/o/r/pull/{number}", "title": "Add the widget (#12)",
                                 "closingIssuesReferences": [{"number": n, "url": f"https://github.com/o/r/issues/{n}"}
-                                                            for n in closing]}}
+                                                            for n in closing],
+                                "labels": [{"name": n} for n in labels]}}
 
     def scenario(self, calls, default=None):
-        super().scenario(calls + [REPO_VIEW] + gate_calls(commits=[pr_commit("a", at(9))]), default)
+        super().scenario(calls + [REPO_VIEW] + gate_calls(commits=[pr_commit("a", at(9))]) + [self.TICKET_VIEW],
+                         default)
 
     def test_ready_marks_the_pr_and_the_closing_ticket_and_notifies(self):
         self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, self.view([12])])
         p = self.ok("ready", "34")
         self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
-        self.assertEqual([a for a in self.gh_argv() if a[0] not in ("api", "repo")],     # the gate's reads aside
-                         [["pr", "ready", "34"], ["pr", "view", "34", "--json", "url,title,closingIssuesReferences"]])
+        made = [a for a in self.gh_argv() if a[0] not in ("api", "repo")]               # the gate's reads aside
+        self.assertEqual([a for a in made if a[1:2] != ["view"]], [["pr", "ready", "34"]])     # its one change
+        self.assertIn(["pr", "view", "34"], [a[:3] for a in made])
         self.assertEqual(self.stub_calls("harness-board"), [
             ["status", "12", "in-review", "--comment", f"PR #34 ready for review: {PR_URL}", "--repo", self.main]])
         sent = self.notifications()
@@ -683,13 +693,46 @@ class Ready(PrTest):
         self.assertEqual(p.stderr, "")
         self.assertEqual([a for a in self.gh_argv() if a[:1] == ["project"]], [])
 
+    def test_ready_on_a_manual_land_pr_adds_a_line_naming_the_owners_land(self):
+        """#451: ready on a PR with manual-land on it or on the ticket it closes marks it ready, sets the ticket in
+        review and notifies as usual, and adds one line naming `/harness:land P` to its output and its notification;
+        the same ready without the label has neither."""
+        rows = [  # (PR, the PR's labels, ticket #12's labels, waits for the owner's land)
+            (34, ["manual-land"], ["task", "status:in-progress"], True),
+            (61, [], ["task", "status:in-progress", "manual-land"], True),
+            (57, [], ["task", "status:in-progress"], False),
+        ]
+        for pr, pr_labels, ticket_labels, gated in rows:
+            with self.subTest(pr=pr, pr_labels=pr_labels, ticket_labels=ticket_labels):
+                if os.path.exists(self.notify_log):
+                    os.unlink(self.notify_log)
+                ticket = {"number": 12, "state": "OPEN", "labels": [{"name": n} for n in ticket_labels]}
+                self.scenario([{"match": ["pr", "ready", str(pr)], "stdout": ""},
+                               self.view([12], number=pr, labels=pr_labels),
+                               {"match": ["issue", "view", "12"], "stdout_json": ticket},
+                               *gate_calls(commits=[pr_commit("a", at(9))], pull=f"repos/o/r/pulls/{pr}")])
+                p = self.ok("ready", str(pr))
+                lines = p.stdout.splitlines()
+                self.assertEqual(lines[0], f"PR #{pr} ready for review: https://github.com/o/r/pull/{pr}")
+                self.assertIn(["pr", "ready", str(pr)], self.gh_argv())
+                self.assertEqual([a[:3] for a in self.stub_calls("harness-board")], [["status", "12", "in-review"]])
+                sent = self.notifications()
+                self.assertEqual(len(sent), 1, sent)
+                if gated:
+                    self.assertEqual(len(lines), 2, p.stdout)
+                    self.assertIn(f"/harness:land {pr}", lines[1])
+                    self.assertTrue(any(f"/harness:land {pr}" in arg for arg in sent[0]), sent[0])
+                else:
+                    self.assertEqual(len(lines), 1, p.stdout)
+                    self.assertNotIn("/harness:land", " ".join(sent[0]))
+
 
 class ReadyGate(GateAsserts, PrTest):
     """`harness-pr ready P` refuses a PR whose latest harness review has findings and no commit after it."""
 
     def run_case(self, reviews, commits, *flags):
         self.scenario([{"match": ["pr", "ready", "34"], "stdout": ""}, Ready.view(self, [12]), REPO_VIEW]
-                      + gate_calls(reviews, commits))
+                      + gate_calls(reviews, commits) + [Ready.TICKET_VIEW])
         if os.path.exists(self.notify_log):
             os.unlink(self.notify_log)
         return self.pr("ready", "34", *flags)
@@ -792,7 +835,7 @@ class ReadyGate(GateAsserts, PrTest):
         for what, failing in GATE_READ_FAILURES.items():
             with self.subTest(what):
                 self.scenario([failing, {"match": ["pr", "ready", "34"], "stdout": ""}, Ready.view(self, [12]),
-                               REPO_VIEW] + gate_calls(reviews, commits))
+                               REPO_VIEW] + gate_calls(reviews, commits) + [Ready.TICKET_VIEW])
                 if os.path.exists(self.notify_log):
                     os.unlink(self.notify_log)
                 p = self.pr("ready", "34")
