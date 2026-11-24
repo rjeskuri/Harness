@@ -39,8 +39,10 @@ REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
 BOARD_FIELDS = {"Status": ["Ready", "In progress", "In review", "Blocked", "Needs input", "Done"],
                 "Priority": ["High", "Normal"]}
 HIGH_RISK = "High risk: review the data and live-system paths before merging."
-# What `land` reads of the PR before merging; headRefOid is the head the checks judge (#337).
-LAND_FIELDS = "isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state"
+# What `land` reads of the PR before merging; headRefOid is the head the checks judge (#337), labels whether the PR
+# is manual-land (#451).
+LAND_FIELDS = ("isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state,"
+               "labels")
 
 STUB = """import json, os, sys
 name, argv = os.path.basename(sys.argv[1]), sys.argv[2:]
@@ -693,10 +695,11 @@ HEAD_SHA = harness_review(1, at(1))[0]["commit_id"]
 
 
 def land_view(**over):
-    """What `gh pr view --json LAND_FIELDS` answers: the head's sha is HEAD_SHA unless `over` names another."""
+    """What `gh pr view --json LAND_FIELDS` answers: the head's sha is HEAD_SHA unless `over` names another; no labels
+    unless `over` gives some."""
     view = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": BRANCH, "headRefOid": HEAD_SHA,
             "closingIssuesReferences": [{"number": 12}], "statusCheckRollup": GREEN, "title": "Add the widget (#12)",
-            "url": PR_URL, "state": "OPEN"}
+            "url": PR_URL, "state": "OPEN", "labels": []}
     view.update(over)
     return view
 
@@ -974,25 +977,31 @@ class LandBase(RowsInProcess, CopiedWorktree, WorktreeTest):
     their own tests on it (LandResolution once inherited Land's and ran each of them a second time, unchanged)."""
 
     def land_calls(self, views=None, issue_state="OPEN", comments=(), reviews=(), commits=None, head=None,
-                   behind=0):
+                   behind=0, fx=None, pr_labels=(), ticket_labels=()):
         """The land conversation: the review gate's reads first (no harness review by default, so the gate
         passes; `head` (HEAD_SHA unless given) and `behind` the compare of main with the head), then the land; the
         last entries answer the PR's body and files, the ticket's other fields and a comment posted straight through
-        gh, so the land may read and post the Resolution either way."""
+        gh, so the land may read and post the Resolution either way. `fx` (FIXTURE_A unless given) is the PR landed,
+        its number and its files; `pr_labels` are the labels of the PR's land view and `ticket_labels` are added to
+        ticket #12's, in every answer gh gives about it (#451). The gh issue entries reach the land through
+        scenario()'s REST layer (#447)."""
+        fx = FIXTURE_A if fx is None else fx
+        pr = str(fx["pr"])
         head = HEAD_SHA if head is None else head
-        views = views or [land_view(headRefOid=head)]
+        views = views or [land_view(headRefOid=head, url=f"https://github.com/o/r/pull/{pr}",
+                                    labels=[{"name": n} for n in pr_labels])]
         commits = [pr_commit("a", at(9))] if commits is None else commits
-        issue = {"state": issue_state, "labels": [{"name": "task"}, {"name": "status:in-review"}],
-                 "comments": list(comments)}
-        return land_gate_calls(reviews, commits, head=head, behind=behind) + [
-                {"match": ["pr", "view", "34", "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": SHA}}},
-                {"match": ["pr", "view", "34", "--json", LAND_FIELDS],
+        issue = {"state": issue_state, "comments": list(comments),
+                 "labels": [{"name": n} for n in ("task", "status:in-review", *ticket_labels)]}
+        return land_gate_calls(reviews, commits, pull=f"repos/o/r/pulls/{pr}", head=head, behind=behind) + [
+                {"match": ["pr", "view", pr, "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": SHA}}},
+                {"match": ["pr", "view", pr, "--json", LAND_FIELDS],
                  "responses": [{"stdout_json": v} for v in views]},
-                REPO_VIEW, {"match": ["pr", "merge", "34"], "stdout": ""},
+                REPO_VIEW, {"match": ["pr", "merge", pr], "stdout": ""},
                 {"match": ["issue", "view", "12", "--json", "state,labels,comments"], "stdout_json": issue},
                 {"match": ["issue", "edit", "12"], "stdout": ""},
-                {"match": ["pr", "view", "34"], "stdout_json": pr_data(FIXTURE_A)},
-                *files_calls(34, FIXTURE_A["files"]),
+                {"match": ["pr", "view", pr], "stdout_json": pr_data(fx)},
+                *files_calls(fx["pr"], fx["files"]),
                 {"match": ["issue", "view", "12"],
                  "stdout_json": dict(issue, number=12, title="Add the widget", body=TICKET_12_BODY,
                                      url="https://github.com/o/r/issues/12")},

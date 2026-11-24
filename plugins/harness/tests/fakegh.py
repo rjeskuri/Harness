@@ -176,8 +176,9 @@ def respond(response: dict) -> int:
 
 # --------------------------------------------------------------- scenario helpers for the tests
 def issue_entry(number, data=None, **fields):
-    """A "calls" entry that puts issue `number` in the world: `data` (gh issue view --json's shape) plus `fields`."""
-    return {"issue": int(number), "data": dict(data or {}, **fields)}
+    """A "calls" entry that puts issue `number` in the world: `data` (gh issue view --json's shape) plus `fields`.
+    `number` "*" is any issue the world names no other entry for, under the number asked."""
+    return {"issue": "*" if number == "*" else int(number), "data": dict(data or {}, **fields)}
 
 
 def list_entry(rows):
@@ -299,8 +300,8 @@ def rest_form(call, pulls):
         return None
     verb = head[1]
     if verb == "view":
-        if not failing and isinstance(call.get("stdout_json"), dict) and number is not None:
-            return issue_entry(number, call["stdout_json"])
+        if not failing and isinstance(call.get("stdout_json"), dict):     # no number: any issue asked
+            return issue_entry(number if number is not None else "*", call["stdout_json"])
         if failing:
             return rest_entry(f"issues/{number}" if number else "issues/*", "GET", **response)
         return None
@@ -512,10 +513,14 @@ class World:
         self.pulls = None
         self.rest = []
         self.fallback = []
+        self.any_issue = {}          # issue_entry("*", ...): every issue no entry of its own names
         for key, data in (scenario.get("issues") or {}).items():
             self.merge(key, data)
         for index, call in enumerate(scenario.get("calls", [])):
-            if "issue" in call and isinstance(call.get("data"), dict):
+            if call.get("issue") == "*" and isinstance(call.get("data"), dict):
+                for field, value in call["data"].items():
+                    self.any_issue.setdefault(field, value)
+            elif "issue" in call and isinstance(call.get("data"), dict):
                 self.merge(call["issue"], call["data"])
             if isinstance(call.get("issue_list"), list):
                 self.issue_list = (self.issue_list or []) + call["issue_list"]
@@ -550,7 +555,8 @@ class World:
                 self.merge(row["number"], row)
         self.project = scenario.get("project") if isinstance(scenario.get("project"), (dict, list)) else None
         self.login = scenario.get("login") or DEFAULT_LOGIN
-        self.active = bool(self.issues or self.issue_list is not None or self.pulls is not None or self.rest
+        self.active = bool(self.issues or self.any_issue or self.issue_list is not None or self.pulls is not None
+                           or self.rest
                            or self.project or any(c.get("world") for c in scenario.get("calls", [])
                                                   if isinstance(c, dict)))
 
@@ -604,7 +610,7 @@ class World:
         if parts[0] != "issues" or len(parts) < 2 or not parts[1].isdigit():
             return None
         n, rest = int(parts[1]), parts[2:]
-        issue = self.issues.get(n)
+        issue = self.issue(n)
         if method == "GET":
             if issue is None:
                 return not_found()
@@ -665,14 +671,21 @@ class World:
         return None
 
     # ---------------------------------------------------- shapes
+    def issue(self, n):
+        """Issue n's entry, else the any-issue entry under number n, else None."""
+        found = self.issues.get(int(n))
+        if found is None and self.any_issue:
+            found = dict(self.any_issue, number=int(n))
+        return found
+
     def row(self, ref):
         """An issue from a reference: a number (its world entry), or a row merged over its world entry."""
         if isinstance(ref, dict):
             n = ref.get("number")
-            base = self.issues.get(int(n)) if isinstance(n, int) or (isinstance(n, str) and n.isdigit()) else None
+            base = self.issue(n) if isinstance(n, int) or (isinstance(n, str) and n.isdigit()) else None
             return dict(base or {}, **ref)
         if isinstance(ref, int) or (isinstance(ref, str) and ref.isdigit()):
-            return self.issues.get(int(ref)) or {"number": int(ref)}
+            return self.issue(ref) or {"number": int(ref)}
         return {}
 
     def slug_of(self, issue, slug):
@@ -894,7 +907,7 @@ def scenario_labels(scenario_path, number):
         return []
     with open(scenario_path, encoding="utf-8") as fh:
         world = World(json.load(fh))
-    return label_names(world.issues.get(int(number), {}).get("labels"))
+    return label_names((world.issue(number) or {}).get("labels"))
 
 
 def issue_write(req):

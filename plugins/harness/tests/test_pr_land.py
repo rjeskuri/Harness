@@ -709,6 +709,85 @@ class LandRefusals(RowsInProcess, CopiedWorktree, WorktreeTest):
                 self.assertEqual(self.dispatches(), [])          # a refusal before the merge dispatches nothing (#390)
 
 
+# ------------------------------------------------------------------ manual-land: the owner lands it (#451)
+class LandManual(LandBase):
+    """#451: a PR with `manual-land` on it or on the ticket it closes is landed only by the owner, through
+    /harness:land. The work loop's land (`--loop`, with or without `--catch-up`, which would merge main into the
+    branch and push it) refuses it before anything merges: exit 9, naming `/harness:land P`, the worktree, the
+    branch and the ticket as they were (still in review, nothing closed, commented, relabelled or parked) and
+    nothing dispatched. Without `--loop` the land goes on as today. Two PRs, 34 and 57, so P is not hard-coded; the
+    ticket's labels are only in gh's answers about #12 (its cache has none)."""
+
+    FIXTURES = {34: FIXTURE_A, 57: FIXTURE_B}
+    LABELLED = {"pr": {"pr_labels": ["manual-land"]}, "ticket": {"ticket_labels": ["manual-land"]}, None: {}}
+
+    def land(self, pr, where, flags, behind=0):
+        """`harness-pr land P <flags>` from the main checkout, `manual-land` on the PR, on ticket #12 or nowhere."""
+        self.scenario(self.land_calls(fx=self.FIXTURES[pr], behind=behind, **self.LABELLED[where]))
+        return self.pr("land", str(pr), *flags, cwd=self.main)
+
+    def fresh_repos(self):
+        """The template's origin, main checkout and ticket worktree again, as before any land."""
+        for name in ("origin.git", "proj"):
+            shutil.rmtree(os.path.join(self.tmp, name))
+        self.make_repos()
+
+    def assertLanded(self, p, pr):
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn(["pr", "merge", str(pr), "-R", "o/r", "--squash", "--delete-branch"], self.gh_argv())
+        self.assertFalse(os.path.exists(self.wt))
+        self.assertFalse(self.branch_exists())
+        self.assertIn(["close", "12", "--repo", self.main], self.stub_calls("harness-board"))
+
+    def test_the_loops_land_of_a_manual_land_pr_exits_9_and_merges_nothing(self):
+        rows = [  # (PR, where manual-land is, the land's flags, how far the head is behind main)
+            (34, "pr", ("--loop",), 0),
+            (57, "ticket", ("--loop",), 0),
+            (57, "pr", ("--catch-up", "--loop"), 2),
+            (34, "ticket", ("--catch-up", "--loop"), 2),
+        ]
+        for pr, where, flags, behind in rows:
+            with self.subTest(pr=pr, label_on=where, flags=flags, behind=behind):
+                head = self.git(self.wt, "rev-parse", "HEAD")
+                p = self.land(pr, where, flags, behind)
+                said = p.stdout + p.stderr
+                self.assertEqual(p.returncode, 9, said)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertIn(f"/harness:land {pr}", said)
+                self.assertNotIn(f"/harness:land {({34: 57, 57: 34})[pr]}", said)
+                # nothing merged or pushed: not the PR, and not main into the branch either
+                self.assertEqual([a for a in self.gh_argv() if a[:2] == ["pr", "merge"]], [])
+                self.assertEqual([line for line in self.order() if line.split()[:1] == ["git"]
+                                  and {"merge", "push"} & set(line.split())], [])
+                self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), head)
+                self.assertTrue(os.path.isdir(self.wt))
+                self.assertTrue(self.branch_exists())
+                # the ticket stays in review: nothing closes, comments on, relabels or parks it
+                self.assertEqual([a for a in self.stub_calls("harness-board") if a[:1] != ["show"]], [])
+                self.assertEqual([a for a in self.gh_argv() if a[:2] in (["issue", "edit"], ["issue", "close"],
+                                                                         ["issue", "comment"])], [])
+                self.assertEqual(self.dispatches(), [])
+
+    def test_a_land_without_loop_lands_a_manual_land_pr_as_before(self):
+        """The owner's land of the labelled PR (no --loop) merges and cleans up and prints what the land of the
+        same PR without the label prints; the loop's land of an unlabelled PR still lands."""
+        for pr, where in ((57, "pr"), (34, "ticket")):
+            with self.subTest(pr=pr, label_on=where):
+                self.fresh_repos()
+                before = self.land(pr, None, ())
+                self.assertLanded(before, pr)
+                self.fresh_repos()
+                p = self.land(pr, where, ())
+                self.assertLanded(p, pr)
+                self.assertEqual(p.stdout, before.stdout)
+                self.assertNotIn("/harness:land", p.stdout + p.stderr)
+        for pr, flags in ((34, ("--loop",)), (57, ("--catch-up", "--loop"))):
+            with self.subTest(pr=pr, label_on=None, flags=flags):
+                self.fresh_repos()
+                self.assertLanded(self.land(pr, None, flags), pr)
+
+
 class LandGate(GateAsserts, RowsInProcess, CopiedWorktree, WorktreeTest):
     """`harness-pr land P` refuses a PR whose latest harness review, at the head (HEAD_SHA here), has high or medium
     findings, unless --accept-findings; it lands the PR when that review is clean or has only low findings, or there

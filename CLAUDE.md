@@ -7,6 +7,7 @@ Ryan's Claude Code harness: one plugin (agents, skills, hooks, command-line tool
 - One module: `python3 -m unittest discover -s plugins/harness/tests -p test_work.py`
 - Canary, is the plugin every project loads still working: `sh scripts/smoke.sh`
 - Loop smoke, one ticket through `/harness:work` in the sandbox repo (about 20 minutes): `python3 scripts/loop_smoke.py run --sandbox <path> [--plugin <worktree>/plugins/harness]`
+- Line data for the dead-code scanner: `python3 scripts/collect_lines.py suite` (or `loop-smoke <sandbox>`, which lands a PR there)
 
 ## Where things live
 - `plugins/harness/tests/`: the suite; `fakegh.py` is the scripted fake `gh` every tool test uses, and fake executables are written once per module.
