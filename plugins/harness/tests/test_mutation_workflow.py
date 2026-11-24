@@ -1,20 +1,32 @@
-"""Tests for #476: .github/workflows/mutation.yml, the monthly report-only mutation run on Harness's main.
+"""Tests for #476 and #502: .github/workflows/mutation.yml, the monthly mutation run on Harness's main.
 
     python3 -m unittest discover -s plugins/harness/tests -p test_mutation_workflow.py
 
 The standard library has no YAML parser, so these tests read the small block-style subset a workflow uses: comments
 and blank lines dropped, nesting by indentation, a step list as `- ` items under `steps:`. They pin what the
-definition of done says and nothing about wording: the triggers (a monthly cron and a manual dispatch with a `shard`
-input, never a pull request or a push), read-only permissions and no secret, a hosted ubuntu job under the six-hour
-limit, a step that runs `scripts/mutate.py run`, and a step that uploads the report as an artifact.
+definitions of done say and nothing about wording: the triggers (a monthly cron and a manual dispatch with `full`
+and `file` inputs, never a pull request or a push), read-only permissions and no secret, hosted ubuntu jobs under
+the six-hour limit, a step that runs `scripts/mutate.py run`, and a step that uploads the report as an artifact.
+
+#502: one static matrix (`strategy.matrix`) whose entries name exactly the scoped files by their path under
+`plugins/harness/` (with or without that prefix), each once, no glob, no shard and no month rotation; the checkout
+has the whole history (`fetch-depth: 0`); the runner passes `--changed` (the base is main's commit of 35 days ago)
+and its handling depends on the `full` input; the `file` input is read by the matrix job; the job summary
+(`$GITHUB_STEP_SUMMARY`) is written at or after the run. Which lines `--changed` keeps is test_mutate_script.py's.
 """
 from __future__ import annotations
 
+import collections
 import re
 import unittest
 from pathlib import Path
 
-WORKFLOW = Path(__file__).resolve().parents[3] / ".github" / "workflows" / "mutation.yml"
+REPO = Path(__file__).resolve().parents[3]
+WORKFLOW = REPO / ".github" / "workflows" / "mutation.yml"
+PLUGIN = REPO / "plugins" / "harness"
+SCOPE = {"hooks/branch_guard.py", "hooks/backup_gate.py", "hooks/tests_first.py", "hooks/readonly_allow.py",
+         "hooks/readonly_bash.py", "hooks/land_ask.py", "lib/harness_lib/backups.py", "lib/harness_lib/shellwalk.py"}
+PLUGIN_PATH = re.compile(r"(?:plugins/harness/)?((?:hooks|lib|bin)/[\w./*?\[\]-]+)")
 
 Lines = list  # list of (indent, text) pairs
 
@@ -122,7 +134,7 @@ class MutationWorkflowTest(unittest.TestCase):
         self.assertTrue(self.jobs(), "no job under `jobs:`")
         self.assertNotIn("\t", self.text, "YAML forbids tabs")
 
-    def test_triggers_are_a_monthly_schedule_and_a_manual_dispatch_with_a_shard_input(self) -> None:
+    def test_triggers_are_a_monthly_schedule_and_a_manual_dispatch_with_full_and_file_inputs(self) -> None:
         triggers = self.triggers()
         self.assertEqual({"schedule", "workflow_dispatch"}, set(triggers), "only a schedule and a manual dispatch")
         crons = re.findall(r"cron:\s*[\"']?([^\"'\n]+?)[\"']?\s*$", joined(triggers["schedule"]), re.M)
@@ -136,11 +148,81 @@ class MutationWorkflowTest(unittest.TestCase):
                 self.assertRegex(field, r"^\d+(,\d+)*$", "not a monthly cron: %s" % cron)
         inputs = get(triggers["workflow_dispatch"], "inputs")
         self.assertIsNotNone(inputs, "workflow_dispatch has no inputs")
-        self.assertIn("shard", keys(inputs[1]))
+        names = set(keys(inputs[1]))
+        self.assertLessEqual({"full", "file"}, names, "workflow_dispatch needs a `full` and a `file` input")
+        self.assertNotIn("shard", names, "the shard rotation is gone")
 
-    def test_the_shard_input_is_used_by_a_step(self) -> None:
-        used = [s for s in self.all_steps() if "shard" in joined(s)]
-        self.assertTrue(used, "no step refers to the shard")
+    # ---------------------------------------------------------------------------------------- #502 matrix
+
+    def matrix_job(self) -> tuple:
+        """(job name, job lines, matrix lines) of the one job with a strategy.matrix."""
+        found = []
+        for name, job in self.jobs().items():
+            strategy = get(job, "strategy")
+            matrix = get(strategy[1], "matrix") if strategy else None
+            if matrix:
+                found.append((name, job, matrix))
+        self.assertEqual(len(found), 1, "exactly one job runs over a matrix")
+        name, job, (value, kids) = found[0]
+        self.assertEqual("", value, "the matrix must be listed in the workflow, not computed: %s" % value)
+        return name, job, kids
+
+    def test_the_matrix_lists_exactly_the_scoped_files_once_each(self) -> None:
+        for rel in SCOPE:
+            self.assertTrue((PLUGIN / rel).is_file(), "scoped file missing: %s" % rel)
+        _, job, matrix = self.matrix_job()
+        named = collections.Counter(m.rstrip(".,'\"") for m in PLUGIN_PATH.findall(joined(matrix)))
+        self.assertEqual(SCOPE, set(named), "the matrix names exactly the scoped files (no bin/, no glob)")
+        self.assertEqual({rel: 1 for rel in SCOPE}, dict(named), "one matrix entry per file")
+        strategy = get(job, "strategy")[1]
+        fail_fast = get(strategy, "fail-fast")
+        self.assertIsNotNone(fail_fast, "a survivor in one file must not cancel the other files' runs")
+        self.assertEqual("false", fail_fast[0].strip("\"'"))
+
+    def test_no_month_rotation_or_shards(self) -> None:
+        text = joined(self.lines)
+        self.assertEqual([], re.findall(r".*%m\b.*", text), "no month number is read")
+        self.assertEqual([], re.findall(r".*\bshift\s+\$\(\(.*", text), "no rotation over a list")
+        self.assertEqual([], re.findall(r"(?i).*\bshard.*", text)[:3], "no shards")
+
+    def test_checkout_has_the_whole_history(self) -> None:
+        _, job, _ = self.matrix_job()
+        steps = split_steps(get(job, "steps")[1])
+        checkout = [s for s in steps if re.search(r"uses:\s*actions/checkout@", joined(s))]
+        self.assertTrue(checkout, "the matrix job checks nothing out")
+        self.assertRegex(joined(checkout[0]), r"(?m)^fetch-depth:\s*[\"']?0[\"']?$", "fetch-depth: 0")
+
+    def test_schedule_mutates_changed_lines_and_full_decides_the_exit(self) -> None:
+        _, job, _ = self.matrix_job()
+        text = joined(job)
+        steps = split_steps(get(job, "steps")[1])
+        runner = [s for s in steps if "scripts/mutate.py run" in joined(s)]
+        self.assertTrue(runner, "the matrix job runs no scripts/mutate.py run")
+        run_text = joined(runner[0])
+        self.assertIn("--changed", run_text, "the schedule mutates only changed lines")
+        self.assertRegex(joined(self.lines), r"(?i)\b35[\s.]*days?\b|\bdays?\W{0,3}35\b", "the base is 35 days back")
+        self.assertRegex(run_text, r"(?i)full", "the run and its exit handling depend on the `full` input")
+        self.assertRegex(text, r"inputs\.full", "the `full` input is read by the matrix job")
+        self.assertRegex(text, r"inputs\.file", "the `file` input picks the matrix entry")
+        self.assertIn("matrix.", run_text, "the runner mutates its matrix entry's file")
+
+    def test_survivors_go_to_the_job_summary(self) -> None:
+        _, job, _ = self.matrix_job()
+        steps = split_steps(get(job, "steps")[1])
+        runner = [i for i, s in enumerate(steps) if "scripts/mutate.py run" in joined(s)]
+        self.assertTrue(runner)
+        summary = [i for i, s in enumerate(steps) if "GITHUB_STEP_SUMMARY" in joined(s)]
+        self.assertTrue(summary, "no step writes $GITHUB_STEP_SUMMARY")
+        self.assertGreaterEqual(max(summary), runner[0], "the summary is written at or after the run")
+
+    def test_each_matrix_entry_uploads_its_own_artifact(self) -> None:
+        _, job, _ = self.matrix_job()
+        steps = split_steps(get(job, "steps")[1])
+        uploads = [s for s in steps if re.search(r"uses:\s*actions/upload-artifact@", joined(s))]
+        self.assertTrue(uploads, "no step uploads an artifact")
+        for step in uploads:
+            name = re.search(r"^name:\s*(.+)$", joined(step), re.M)
+            self.assertTrue(name and "matrix." in name.group(1), "artifact names must differ per matrix entry")
 
     def test_never_runs_on_a_pull_request_or_a_push(self) -> None:
         text = joined(self.lines)
@@ -153,14 +235,16 @@ class MutationWorkflowTest(unittest.TestCase):
         top = get(self.lines, "permissions")
         self.assertIsNotNone(top, "no top-level permissions")
         self.assertEqual("", top[0], "permissions must be a block, not write-all/read-all")
-        self.assertEqual([("contents", "read")],
-                         [tuple(re.split(r"\s*:\s*", t)) for _, t in top[1]], "only `contents: read`")
+        # #502's kill rule may read earlier runs, so `actions: read` is allowed beside `contents: read`
+        granted = [tuple(re.split(r"\s*:\s*", t)) for _, t in top[1]]
+        self.assertIn(("contents", "read"), granted)
+        self.assertLessEqual(set(granted), {("contents", "read"), ("actions", "read")}, "read-only scopes only")
         for i, (_, text) in enumerate(self.lines):  # a job may not widen it either
             if re.match(r"^permissions\s*:", text):
                 value = text.split(":", 1)[1].strip()
                 scope = [t for _, t in children(self.lines, i)]
                 self.assertFalse(value and value != "{}", "inline permissions: %s" % text)
-                self.assertTrue(all(re.match(r"^contents\s*:\s*read$", t) for t in scope), scope)
+                self.assertTrue(all(re.match(r"^(contents|actions)\s*:\s*read$", t) for t in scope), scope)
         self.assertNotRegex(joined(self.lines), r"secrets\s*[.\[]")
         self.assertNotRegex(joined(self.lines), r"^secrets\s*:", "no `secrets:` key either")
 

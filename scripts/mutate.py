@@ -6,7 +6,8 @@
 Run from the repository root. Each PATH is a file or a directory walked (default: the plugin's hooks, lib and bin);
 the files mutated are `.py` files and files whose first line is a python3 shebang, never a test file (under
 `tests/`, `test_*.py`, `*_support.py`). A site is one operator or literal from mutator's Python set, found with
-`ast`. Each mutant runs in a full copy of the tree in a temporary directory (`cp -c` on macOS), so a test that finds
+`ast`. `--changed REF` keeps only the sites on lines new or changed in `git diff REF` (the working tree against REF);
+with `--lines` too, a site must be on both. Each mutant runs in a full copy of the tree in a temporary directory (`cp -c` on macOS), so a test that finds
 its code through its own real path imports the mutant; the checkout is never written and every copy is removed.
 
 A file's tests: `--tests` (test module file names in plugins/harness/tests, or repo-relative globs), else the
@@ -47,6 +48,7 @@ SWAP = {"==": "!=", "!=": "==", "<": "<=", "<=": "<", ">": ">=", ">=": ">", "+":
         "and": "or", "or": "and"}
 CONVENTION = re.compile(r"^(?P<base>(?:.*/)?)(?:lib/harness_lib/(?P<lib>\w+)\.py|hooks/(?P<hook>\w+)\.py"
                         r"|bin/harness-(?P<tool>[\w-]+))$")
+HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 # Each write in a copy gets a fresh mtime, so a cached .pyc of the same size never stands in for the new source.
 STAMPS = itertools.count(1_000_000_000)
 
@@ -195,13 +197,36 @@ def mutants(root: str, rel: str, lines: set[int] | None) -> list[dict]:
     found = []
     for start, stop, repl, change, line, function in sorted(set(sites.found)):
         mutated = data[:start] + repl + data[stop:]
-        if lines and line not in lines:
+        if lines is not None and line not in lines:
             continue
         try:
             compile(mutated, rel, "exec", dont_inherit=True)
         except (SyntaxError, ValueError):
             continue
         found.append(dict(path=rel, line=line, change=change, function=function, source=data, mutated=mutated))
+    return found
+
+
+def changed_lines(root: str, ref: str) -> dict[str, set[int]]:
+    """The lines new or changed in each file of `git diff REF` (the working tree against REF), read from the hunk
+    headers of a diff without context; a file whose diff only deletes lines maps to an empty set."""
+    diff = subprocess.run(["git", "-C", root, "diff", "-U0", "--no-color", "--no-ext-diff", "--src-prefix=a/",
+                           "--dst-prefix=b/", ref, "--"], capture_output=True, text=True)
+    if diff.returncode:
+        sys.exit(f"mutate: git diff {ref} failed: {diff.stderr.strip()}")
+    found: dict[str, set[int]] = {}
+    path = None
+    for text in diff.stdout.splitlines():
+        if text.startswith("+++ "):
+            path = text[len("+++ b/"):] if text.startswith("+++ b/") else None  # +++ /dev/null: a deleted file
+            if path is not None:
+                found.setdefault(path, set())
+        elif path is not None and text.startswith("@@ "):
+            hunk = HUNK.match(text)
+            if not hunk:
+                continue
+            start, count = int(hunk.group(1)), 1 if hunk.group(2) is None else int(hunk.group(2))
+            found[path].update(range(start, start + count))
     return found
 
 
@@ -335,23 +360,17 @@ def tally_text(tally: dict) -> str:
 
 def run(args: argparse.Namespace) -> int:
     root = os.path.realpath(os.getcwd())
-    paths = args.paths
-    if args.changed:
-        diff = subprocess.run(["git", "-C", root, "diff", "--name-only", args.changed, "--"], capture_output=True,
-                              text=True)
-        if diff.returncode:
-            sys.exit(f"mutate: git diff {args.changed} failed: {diff.stderr.strip()}")
-        changed = {p for p in diff.stdout.split() if os.path.isfile(os.path.join(root, p))}
-        within = source_files(root, paths or DEFAULT_PATHS)
-        files = sorted(changed & set(within))
-    else:
-        files = source_files(root, paths or DEFAULT_PATHS)
+    files = source_files(root, args.paths or DEFAULT_PATHS)
     if args.tests and not tests_for(root, "", args.tests):
         sys.exit(f"mutate: no test module matches {' '.join(args.tests)}")
     lines = {int(n) for n in args.lines.split(",") if n.strip()} if args.lines else None
+    keep = {rel: lines for rel in files}
+    if args.changed:
+        changed = changed_lines(root, args.changed)
+        keep = {rel: changed[rel] if lines is None else changed[rel] & lines for rel in files if changed.get(rel)}
     jobs = []
-    for rel in files:
-        found = mutants(root, rel, lines)
+    for rel in sorted(keep):
+        found = mutants(root, rel, keep[rel])
         tests = tests_for(root, rel, args.tests)
         if found and not tests:
             print(f"mutate: skipped {rel}: no test module found", file=sys.stderr)
@@ -424,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     cmd = sub.add_parser("run", help="mutate the files and run their tests against each mutant")
     cmd.add_argument("paths", nargs="*", metavar="PATH")
-    cmd.add_argument("--changed", metavar="REF", help="only the files changed since REF")
+    cmd.add_argument("--changed", metavar="REF", help="only the sites on lines new or changed since REF")
     cmd.add_argument("--lines", metavar="N,N", help="only the sites on these lines")
     cmd.add_argument("--tests", nargs="+", metavar="PATTERN", help="the test modules to run for every file")
     cmd.add_argument("--workers", type=int, help="copies run at once (default: the cores)")

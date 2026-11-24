@@ -114,7 +114,8 @@ Why not the others:
 - **(d) None: not quite.** readonly_allow.py's 59 % score on its own tests, with 21 of 31 sites in `grep_reads` surviving, is a lead worth a look on a hook that decides what runs without a prompt. A run over the hooks every month or so finds such leads at no token cost until someone reads the report.
 
 How (c) works:
-- Monthly, one shard at a time, and on demand, on main. Where it runs ties to spike 1 (docs/research/off-mac-loop.md): Harness is public and its suite already passes on `ubuntu-latest`, so a scheduled GitHub Actions job runs it free, with no secret and no laptop, one shard per run within the 6-hour job limit. The report is a workflow artifact. On this Mac, or on the Mac mini that note recommends, the same command runs from a LaunchAgent at night.
+- Monthly and on demand, on main. Where it runs ties to spike 1 (docs/research/off-mac-loop.md): Harness is public and its suite already passes on `ubuntu-latest`, so a scheduled GitHub Actions job runs it free, with no secret and no laptop, within the 6-hour job limit. On this Mac, or on the Mac mini that note recommends, the same command runs from a LaunchAgent at night.
+- As built after the review (#502, which replaced #476's 24-month shard rotation over hooks/, lib/ and bin/): only the files that decide what runs without a prompt or what a tool destroys (branch_guard, backup_gate, tests_first, readonly_allow, readonly_bash, land_ask, `harness_lib/backups.py`, `harness_lib/shellwalk.py`), one parallel job each. The schedule mutates only the sites on lines changed since main's commit of 35 days ago, and a survivor there fails the run, so GitHub's failure email reaches the owner; survivors are listed in the job summary. A manual `full` run mutates whole files for a baseline and stays green. After three scheduled runs in a row with no survivor the summary says to remove the schedule; the script stays. docs/design.md, "Monthly report (#476, #502)", has the contract.
 - The report lists survivors by file and function. A function where no mutant was killed is listed apart, for the dead-code scan (#453), not as a test gap.
 - A person, or a session the owner starts, reads it. Only a survivor that changes what a hook allows or denies, or what a data-destroying tool deletes, becomes a `status:proposed` ticket. Equivalent mutants and defensive guards are dismissed. Nothing goes to the test-author automatically, and nothing blocks a ticket.
 
@@ -146,5 +147,6 @@ All are `status:proposed` under #439 and block nothing.
   - a scheduled and manual GitHub Actions workflow, one shard per run, the report as an artifact;
   - the triage rule written down: only survivors that change a hook's or a data-destroying tool's decision become proposed tickets.
   - It needs #475 first.
+  - #502 reworked it to the reviewed scope: the scoped hook and lib files only, changed lines on the schedule, a survivor fails the run.
 - #477 Triage readonly_allow.py's 119 surviving mutants, size S, a tests-only refactor. Pin only the ones that widen what the hook allows. The survivors come from the measured run above and can be reproduced with the recipe in Verified, or with #475.
 - #478 After three monthly reports, decide whether other projects get the same run, size S, docs only. It is one decision for all of them, not one ticket per project.
