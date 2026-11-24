@@ -35,9 +35,6 @@ BRANCH = "t/12-add-the-widget"
 PR_URL = "https://github.com/o/r/pull/34"
 SHA = "abc123def4567890abc123def4567890abc12345"
 REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
-# A Projects board's fields as the harness writes them (#447: fakegh.board answers ID lookups and ID edits on them).
-BOARD_FIELDS = {"Status": ["Ready", "In progress", "In review", "Blocked", "Needs input", "Done"],
-                "Priority": ["High", "Normal"]}
 HIGH_RISK = "High risk: review the data and live-system paths before merging."
 # What `land` reads of the PR before merging; headRefOid is the head the checks judge (#337), labels whether the PR
 # is manual-land (#451).
@@ -89,22 +86,6 @@ def write(path, text):
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
     return path
-
-
-def project_argv(argv):
-    """(subcommand, positionals, {option: value}) of a `gh project ...` argv, whatever the flag order."""
-    pos, opts, i = [], {}, 2
-    while i < len(argv):
-        name, eq, value = argv[i][2:].partition("=")
-        if not argv[i].startswith("--"):
-            pos.append(argv[i])
-        else:
-            if not eq:
-                i += 1
-                value = argv[i] if i < len(argv) else None
-            opts[name] = [opts[name], value] if name in opts else value
-        i += 1
-    return argv[1], pos, opts
 
 
 def executable(path, text):

@@ -859,14 +859,14 @@ class ForeignSessionEnvTests(HookTestCase):
         user = self.home / ".claude" / "settings.json"
         project = self.proj / ".claude" / "settings.json"
         local = self.proj / ".claude" / "settings.local.json"
-        harness_keys = ("HARNESS_PROJECT", "HARNESS_TEST_CMD", "HARNESS_WAVE_REVIEW", "CLAUDE_VERIFY_CMD",
+        harness_keys = ("HARNESS_CODE_TIER", "HARNESS_TEST_CMD", "HARNESS_WAVE_REVIEW", "CLAUDE_VERIFY_CMD",
                         "CLAUDE_VERIFY_TIMEOUT")
         self.assertBriefNames(self.plain_brief(self.proj), dropped=[], not_named=harness_keys)
         for name, sets in (
-            ("user settings", {user: ["HARNESS_PROJECT"]}),
+            ("user settings", {user: ["HARNESS_CODE_TIER"]}),
             ("project settings", {project: ["HARNESS_TEST_CMD"]}),
             ("local settings", {local: ["CLAUDE_VERIFY_CMD"]}),
-            ("all three", {user: ["HARNESS_PROJECT"], project: ["HARNESS_WAVE_REVIEW"],
+            ("all three", {user: ["HARNESS_CODE_TIER"], project: ["HARNESS_WAVE_REVIEW"],
                            local: ["CLAUDE_VERIFY_TIMEOUT", "HARNESS_TEST_CMD"]}),
         ):
             with self.subTest(name):
@@ -893,13 +893,13 @@ class ForeignSessionEnvTests(HookTestCase):
         user = self.home / ".claude" / "settings.json"
         project = self.proj / ".claude" / "settings.json"
         local = self.proj / ".claude" / "settings.local.json"
-        kept = {"HARNESS_PROJECT": "reads HARNESS_REVIEW_TIER", "HARNESS_TEST_CMD_EXTRA": "--verbose",
+        kept = {"HARNESS_CODE_TIER": "reads HARNESS_REVIEW_TIER", "HARNESS_TEST_CMD_EXTRA": "--verbose",
                 "HARNESS_X" + uuid.uuid4().hex[:6].upper(): "CLAUDE_VERIFY_TIMEOUT=60"}
         extra_key = [k for k in kept if k.startswith("HARNESS_X")][0]
         self.write(user, json.dumps({
             "permissions": {"allow": ["Bash(HARNESS_TEST_CMD=* harness-red run)"]},
             "statusLine": {"type": "command", "command": "echo $HARNESS_WAVE_REVIEW"},
-            "env": {"HARNESS_PROJECT": kept["HARNESS_PROJECT"]},
+            "env": {"HARNESS_CODE_TIER": kept["HARNESS_CODE_TIER"]},
         }))
         self.write(project, json.dumps({
             "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [

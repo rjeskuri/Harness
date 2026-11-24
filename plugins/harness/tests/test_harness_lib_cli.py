@@ -355,8 +355,8 @@ class CliOutput(unittest.TestCase):
 
     def test_warn_is_prog_warning_and_one_line_on_stderr(self):
         cases = [
-            ("harness-board", "the Projects board acme/3 was not updated: show",
-             "harness-board: warning: the Projects board acme/3 was not updated: show\n"),
+            ("harness-board", "the tier setting x is not valid: show",
+             "harness-board: warning: the tier setting x is not valid: show\n"),
             ("harness-pr", "could not post\n  the comment\t(502)",
              "harness-pr: warning: could not post the comment (502)\n"),
             ("tool-w", "  café  ", "tool-w: warning: café\n"),
@@ -2415,21 +2415,6 @@ class ToolsRunTheLib(unittest.TestCase):
             board.parser().parse_args(["show", "zero"])
         self.assertEqual(self.given("issue_number"), ["#5", "17", "zero"])
 
-    def test_board_warns_through_the_lib_with_its_own_spelling_byte_for_byte(self):
-        value = "acme/x y"
-        message = f"HARNESS_PROJECT={value!r} is not OWNER/NUMBER; the Projects board is not updated"
-        board = load_tool(BIN / "harness-board")
-        with mock.patch.dict(os.environ, {"HARNESS_PROJECT": value, "HOME": self.tmp}):
-            got, out, err = capture(board.project_setting)
-        self.assertIsNone(got)
-        self.assertEqual(out, "")
-        self.assertEqual(err, f"harness-board: warning: {message}\n")
-        board = load_tool(BIN / "harness-board")
-        self.spy(board, self.cli.warn, "warn")
-        with mock.patch.dict(os.environ, {"HARNESS_PROJECT": value, "HOME": self.tmp}):
-            capture(board.project_setting)
-        self.assertEqual([args for args, _ in self.called("warn")], [("harness-board", message)])
-
     def test_board_emits_through_the_lib_with_a_bool(self):
         for as_json in (True, False):
             with self.subTest(as_json=as_json):
@@ -2515,23 +2500,12 @@ class ToolsRunTheLib(unittest.TestCase):
         self.assertEqual([args for args, _ in self.called("read_text")], [(missing, "evidence file")])
 
     def test_board_finds_its_files_under_home_through_the_lib(self):
-        """settings_project, load_projects and Repo.ticket_path: every path under HOME comes from the lib."""
+        """Repo.ticket_path: the path under HOME comes from the lib."""
         board = load_tool(BIN / "harness-board")
         self.spy(board, self.text.home, "home")
         self.spy(board, self.text.harness_home, "harness_home", required=False)
         for home in (os.path.join(self.tmp, "h1"), os.path.join(self.tmp, "Other Home")):
             with self.subTest(home=home), mock.patch.dict(os.environ, {"HOME": home}):
-                rel = os.path.relpath(home, self.tmp)
-                self.put(os.path.join(rel, ".claude", "settings.json"),
-                         json.dumps({"env": {"HARNESS_PROJECT": "acme/7"}}))
-                self.put(os.path.join(rel, ".claude", "harness", "projects.json"), json.dumps(
-                    {"version": 1, "projects": [{"path": "/p/a"}, {"path": " "}, {"path": "/p/b"}, "x"]}))
-                self.calls.clear()
-                self.assertEqual(board.settings_project(), "acme/7")
-                self.assertGreaterEqual(len(self.called("home")), 1, "settings_project found the file without the lib")
-                self.calls.clear()
-                self.assertEqual(board.load_projects(), ["/p/a", "/p/b"])
-                self.assertGreaterEqual(self.homed(), 1, "load_projects found the registry without the lib")
                 repo = object.__new__(board.Repo)
                 repo.key = "0123456789ab"
                 self.calls.clear()
@@ -2625,27 +2599,6 @@ class ToolsRunTheLib(unittest.TestCase):
                 board.gh(None, ["issue", "view", "7", "--json", "labels"])
         self.assertEqual(str(ctx.exception), "gh issue view 7 failed: HTTP 502: bad gateway")
         self.assertEqual(self.given("first_line"), [out, created, "\n  HTTP 502: bad gateway\nretry later\n"])
-
-    def test_board_project_sync_reports_a_failed_write_on_one_line_through_the_lib(self):
-        board = load_tool(BIN / "harness-board")
-        self.spy(board, self.text.one_line, "one_line")
-        repo = argparse.Namespace(main="/p/main", root="/p/main", name="main")
-        board.open_repo = lambda path=None: repo
-        board.gh_json = lambda r, args: {"items": [], "totalCount": 0}
-        board.open_issues = lambda r: [{"url": "https://x/issues/1", "labels": [{"name": "status:ready"}]}]
-
-        def gh(r, args, stdin=None):
-            raise board.Problem("gh project item-add failed:\n   HTTP 502\n\tBad Gateway")
-
-        board.gh = gh
-        with mock.patch.dict(os.environ, {"HARNESS_PROJECT": "acme/3"}):
-            code, out, err = capture(board.cmd_project_sync, argparse.Namespace(all_projects=False, dry_run=False))
-        self.assertEqual(code, 1)
-        self.assertEqual(out, "")
-        self.assertEqual(err.splitlines()[0], "harness-board: https://x/issues/1: gh project item-add failed: "
-                                              "HTTP 502 Bad Gateway; its Status and Priority are not set")
-        self.assertTrue(any(isinstance(given, Exception) and "HTTP 502" in str(given)
-                            for given in self.given("one_line")), self.calls)
 
     def test_board_main_ends_a_problem_as_one_line(self):
         """main() is the zero-argument callable run_main takes; a Problem under it ends as `harness-board: <one

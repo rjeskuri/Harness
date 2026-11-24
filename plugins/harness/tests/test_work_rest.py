@@ -1,18 +1,13 @@
 """Ticket #447 (epic #446): the harness's own gh calls stay inside GitHub's GraphQL quota. harness-board and
-harness-work read and edit issues through REST (`gh api`, the core bucket), read an issue once per command, and the
-Projects mirror resolves the board's IDs once and keeps them under ~/.claude/harness/.
+harness-work read and edit issues through REST (`gh api`, the core bucket) and read an issue once per command.
 
 The contract these tests read from the ticket:
 - One ticket's run (dispatch, start, three stages, tier, the status changes, a comment, answers, the sweep, close and
   the epic check) logs no `gh issue ...` call from either tool, and at most 30% of the GraphQL calls the same run made
   before #447 (MAIN_GRAPHQL, counted on main at 8cbcb78 over this scenario: 70% fewer).
 - One command that needs an issue twice (park, promote of a task or an epic) reads it once.
-- With HARNESS_PROJECT set, the first status change resolves the board's IDs and keeps them in a file under
-  ~/.claude/harness/; a later status change of the same issue makes one gh call to the board, an item-edit by IDs
-  (--id, --project-id, --field-id, --single-select-option-id); an ID the board refuses is resolved again once, and a
-  board that refuses again is one warning, the labels still changed.
 
-The fake gh is fakegh.py's REST layer (issues, pull requests, the board) behind work_support's wrappers; the call log
+The fake gh is fakegh.py's REST layer (issues, pull requests) behind work_support's wrappers; the call log
 is HOME's ~/.claude/harness/gh/calls-<date>.jsonl (harness_lib/ghlimit.py). Expected values are written out here.
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p test_work_rest.py -v
@@ -67,20 +62,13 @@ class RestCase(WorkTest):
                 out += [json.loads(line) for line in fh if line.strip()]
         return out
 
-    def world(self, *issues, ready=(), prs=(), project=None):
-        """The fake GitHub: these issues (and their sub-issues), the ready list, pull requests, the board."""
+    def world(self, *issues, ready=(), prs=()):
+        """The fake GitHub: these issues (and their sub-issues), the ready list, pull requests."""
         self.scenario(issues=list(issues), ready=list(ready), prs=list(prs))
-        if project is not None:
-            data = self.read_json(self.scenario_path)
-            data["project"] = project
-            write(self.scenario_path, json.dumps(data))
 
     def since(self, start):
         """The gh calls after the first `start` log entries, REST writes as gh commands (fakegh.gh_view)."""
         return fakegh.gh_view(self.gh_entries()[start:], self.scenario_path)
-
-    def project_calls(self, start=0):
-        return [a for a in self.since(start) if a[:1] == ["project"]]
 
 
 # ======================================================================= one ticket's run
@@ -167,101 +155,6 @@ class ReadOnce(RestCase):
                 for n in once:
                     self.assertEqual(fakegh.issue_gets(self.gh_entries()[start:], n), 1,
                                      f"#{n} read more than once by one command: {calls}")
-
-
-# ======================================================================= the Projects mirror's IDs
-class MirrorIds(RestCase):
-    def kept(self, *ids):
-        """The files under ~/.claude/harness/ (the call log aside) that hold every one of `ids`."""
-        root = os.path.join(self.home, ".claude", "harness")
-        found = []
-        for folder, _, names in os.walk(root):
-            for name in names:
-                path = os.path.join(folder, name)
-                if os.sep + "gh" + os.sep in path:
-                    continue
-                try:
-                    with open(path, encoding="utf-8", errors="replace") as fh:
-                        text = fh.read()
-                except OSError:
-                    continue
-                if all(i in text for i in ids):
-                    found.append(path)
-        return found
-
-    def ids(self, board, field, option):
-        f = next(x for x in board["fields"] if x["name"] == field)
-        return board["id"], f["id"], next(o["id"] for o in f["options"] if o["name"] == option)
-
-    def assertIdEdit(self, argv, board, item, field, option):
-        """One `gh project item-edit` by IDs: the item, the board, the field and the option."""
-        project_id, field_id, option_id = self.ids(board, field, option)
-        opts, _ = fakegh.options(argv[2:])
-        self.assertEqual(argv[:2], ["project", "item-edit"], argv)
-        self.assertEqual((opts.get("--id"), opts.get("--project-id"), opts.get("--field-id"),
-                          opts.get("--single-select-option-id")), (item, project_id, field_id, option_id), argv)
-
-    def test_a_status_change_after_the_first_makes_one_call_to_the_board(self):
-        rows = [("acme-org/23", 12, ("in-progress", "In progress"), ("in-review", "In review")),
-                ("rjeskuri/7", 40, ("blocked", "Blocked"), ("ready", "Ready"))]
-        for project, n, (first, first_title), (second, second_title) in rows:
-            with self.subTest(project=project, ticket=n):
-                url = f"https://github.com/o/r/issues/{n}"
-                board = fakegh.board(project, BOARD_FIELDS, [url])
-                self.world(issue(n, labels=("task", "status:ready")), project=[board])
-                env = self.env(HARNESS_PROJECT=project)
-                start = len(self.gh_entries())
-                p = self.board("status", n, first, env=env)
-                self.assertEqual(p.stderr, "")
-                self.assertEqual(fakegh.board_writes(self.gh_entries()[start:], self.scenario_path),
-                                 [("item-edit", project, url, "Status", first_title)])
-                self.assertTrue(self.kept(*self.ids(board, "Status", first_title)),
-                                "the board's IDs are kept under ~/.claude/harness/")
-
-                log_before, start = len(self.call_log()), len(self.gh_entries())
-                p = self.board("status", n, second, env=env)
-                self.assertEqual(p.stderr, "")
-                board_calls = self.project_calls(start)
-                self.assertEqual(len(board_calls), 1, board_calls)
-                self.assertIdEdit(board_calls[0], board, board["items"][url], "Status", second_title)
-                graphql = [x["cmd"] for x in self.call_log()[log_before:] if x["kind"] == "graphql"]
-                self.assertEqual(graphql, ["project item-edit"], "one GraphQL call: the board's; the labels are REST")
-                self.assertEqual(fakegh.board_writes(self.gh_entries()[start:], self.scenario_path),
-                                 [("item-edit", project, url, "Status", second_title)])
-
-    def test_an_id_the_board_refuses_is_resolved_again_once(self):
-        project, url = "acme-org/23", URL
-        old = fakegh.board(project, BOARD_FIELDS, [url], generation=1)
-        self.world(issue(labels=("task", "status:ready")), project=[old])
-        env = self.env(HARNESS_PROJECT=project)
-        self.board("status", "12", "in-progress", env=env)
-        # the Status field was made again on the board: new field and option IDs, the cached ones stale
-        new = fakegh.board(project, BOARD_FIELDS, [url], generation=2)
-        self.world(issue(labels=("task", "status:in-progress")), project=[new])
-        start = len(self.gh_entries())
-        p = self.board("status", "12", "in-review", env=env)
-        self.assertEqual(p.stderr, "", "a stale ID resolved again is not a failure")
-        edits = [a for a in self.project_calls(start) if a[1:2] == ["item-edit"]]
-        self.assertEqual(len(edits), 2, edits)
-        stale = self.ids(old, "Status", "In review")
-        self.assertIn(stale[1], edits[0], "the first edit used the kept, stale field ID")
-        self.assertIdEdit(edits[1], new, new["items"][url], "Status", "In review")
-        self.assertEqual(fakegh.board_writes(self.gh_entries()[start:], self.scenario_path),
-                         [("item-edit", project, url, "Status", "In review")])
-        self.assertTrue(self.kept(*self.ids(new, "Status", "In review")), "the IDs resolved again are kept")
-
-        # a board that refuses again: one warning, the labels changed, no third try
-        refusing = dict(new, refuse=True)
-        self.world(issue(labels=("task", "status:in-review")), project=[refusing])
-        start = len(self.gh_entries())
-        p = self.board("status", "12", "blocked", env=env)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        warnings = [line for line in p.stderr.splitlines() if line.strip()]
-        self.assertEqual(len(warnings), 1, p.stderr)
-        self.assertIn(f"the Projects board {project} was not updated", warnings[0])
-        self.assertIn(["issue", "edit", "12", "--add-label", "status:blocked", "--remove-label", "status:in-review"],
-                      self.since(start), "the labels still changed")
-        self.assertLessEqual(len([a for a in self.project_calls(start) if a[1:2] == ["item-edit"]]), 2)
 
 
 if __name__ == "__main__":

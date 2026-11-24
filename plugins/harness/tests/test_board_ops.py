@@ -37,7 +37,7 @@ FAKEGH = os.path.join(HERE, "fakegh.py")
 REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
 OWNER = {"match": ["api", "user"], "stdout": "rjeskuri\n"}
 DROPPED = ("CLAUDE_PROJECT_DIR", "HARNESS_GH", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "HARNESS_NOTIFY_APP",
-           "HARNESS_NOTIFY_SOUND", "HARNESS_PROJECT", "HARNESS_SESSION_PROJECT", "HARNESS_CODE_TIER",
+           "HARNESS_NOTIFY_SOUND", "HARNESS_SESSION_PROJECT", "HARNESS_CODE_TIER",
            "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER", "HARNESS_WAVE_REVIEW")
 OPS_KEYS = ("request", "change", "source_of_truth", "apply", "verify", "rollback", "context")
 
