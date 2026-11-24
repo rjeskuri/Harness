@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""
+Dead-code candidates in a Harness checkout, each with its evidence, for the daily job to batch into a ticket.
+It proposes and removes nothing. The rules and their reasons: docs/design.md, harness-deadcode, and
+docs/research/dead-code-agent.md (False positives, Recommendation).
+
+Usage:
+    harness-deadcode scan [--lines FILE ...] [--json] [--repo PATH]
+
+A candidate is a top-level function, class or constant, a non-dunder method, a harness_lib module, an unwired
+hook file or a bin tool's flag parsed and never read, that nothing outside tests/ and docs/design.md uses.
+Subcommands and flags no skill, agent, doc, setting or other tool calls are listed apart, as `no_caller`.
+--lines takes coverage.py-shaped line data ({"meta": {...}, "files": {path: {"executed_lines": [...]}}}),
+repeatable: data whose meta.kind is "real" (a loop run) drops a candidate whose body ran; other data is the
+suite's and only marks each candidate's `ran_in_suite`.
+"""
+from __future__ import annotations
+
+import ast
+import builtins
+import hashlib
+import importlib
+import importlib.util
+import os
+import re
+import sys
+import sysconfig
+
+_LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+try:
+    from harness_lib.cli import Parser, Problem, emit, run_main
+    from harness_lib.text import read_json
+except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
+    sys.exit(f"harness-deadcode: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
+
+P = "plugins/harness/"
+WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+KEEP = re.compile(r"#\s*deadcode:\s*keep\s*\([^)]*\w[^)]*\)")
+HEADING = re.compile(r"^(#+)\s+(.*)")
+# Folders and files whose text can name code (docs/design.md is the contract, docs/research names nothing).
+TEXT_DIRS = (P + "skills", P + "agents", P + "templates", "user", ".githooks", ".github")
+TEXT_FILES = (P + "hooks/hooks.json", "docs/guide.md", "CLAUDE.md")
+CODE_DIRS = (P + "bin", P + "hooks", P + "lib/harness_lib", P + "tests", "scripts")
+ARGPARSE_DEFS = {"add_argument", "add_parser", "add_subparsers", "add_argument_group",
+                 "add_mutually_exclusive_group", "set_defaults"}
+
+
+# --------------------------------------------------------------- reading the tree
+def role(rel):
+    """What a file is to the scan: bin, hooks, lib, scripts or tests code, text, or None."""
+    base = os.path.basename(rel)
+    if rel.startswith(P + "tests/"):
+        return "tests" if rel.endswith(".py") else None
+    if rel.startswith(P + "bin/") and "." not in base and rel.count("/") == 3:
+        return "bin"
+    if rel.startswith(P + "hooks/") and rel.endswith(".py") and rel.count("/") == 3:
+        return "hooks"
+    if rel.startswith(P + "lib/harness_lib/") and rel.endswith(".py"):
+        return "lib"
+    if rel.startswith("scripts/"):
+        return "scripts" if rel.endswith(".py") else "text" if rel.endswith(".sh") else None
+    if rel.startswith(TEXT_DIRS) or rel in TEXT_FILES:
+        return "text"
+    return None
+
+
+def read(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def files(root):
+    """(rel, role, text) for every file the scan reads, in a stable order."""
+    rels = [f for f in TEXT_FILES if os.path.isfile(os.path.join(root, f))]
+    for top in CODE_DIRS + TEXT_DIRS:
+        for dirpath, dirnames, names in os.walk(os.path.join(root, top)):
+            dirnames[:] = sorted(d for d in dirnames if d not in ("__pycache__", "node_modules", ".git"))
+            rels += [os.path.relpath(os.path.join(dirpath, n), root).replace(os.sep, "/") for n in sorted(names)]
+    for rel in dict.fromkeys(rels):   # hooks.json is both a listed file and in a walked folder
+        kind = role(rel)
+        text = read(os.path.join(root, rel)) if kind else None
+        if text is not None:
+            yield rel, kind, text
+
+
+class Code:
+    """One parsed Python file: its references and its own argparse and definition facts."""
+
+    def __init__(self, rel, kind, text):
+        self.rel, self.kind, self.text = rel, kind, text
+        self.lines = text.splitlines()
+        self.words, self.attrs, self.imports = set(), set(), set()
+        self.strings = []   # string constants outside docstrings and argparse definitions
+        try:
+            self.tree = ast.parse(text, filename=rel)
+        except (SyntaxError, ValueError):
+            self.tree = None
+            self.words = set(WORD.findall(text))
+            return
+        docs = {id(n.body[0].value) for n in ast.walk(self.tree)
+                if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.body and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
+        defining = {id(c) for n in ast.walk(self.tree) if isinstance(n, ast.Call) and attr_of(n) in ARGPARSE_DEFS
+                    for c in ast.walk(n) if isinstance(c, ast.Constant)}
+        package = rel[len(P + "lib/"):-3].split("/")[:-1] if kind == "lib" else []
+        for n in ast.walk(self.tree):
+            if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Store):
+                self.words.add(n.id)
+            elif isinstance(n, ast.Attribute) and not isinstance(n.ctx, ast.Store):
+                self.words.add(n.attr)
+                self.attrs.add(n.attr)
+            elif isinstance(n, ast.Import):
+                for a in n.names:
+                    self.imports.add(a.name)
+                    self.words.update(a.name.split("."))
+            elif isinstance(n, ast.ImportFrom):
+                parts = (package[:len(package) - n.level + 1] if n.level else []) + (n.module or "").split(".")
+                module = ".".join(p for p in parts if p)
+                self.imports.add(module)
+                self.words.update(module.split("."))
+                for a in n.names:
+                    self.imports.add(f"{module}.{a.name}")
+                    self.words.add(a.name)
+            elif isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docs:
+                self.words.update(WORD.findall(n.value))
+                if id(n) not in defining:
+                    self.strings.append(n.value)
+
+    def segment(self, node, start=None):
+        """The node's source text, from `start` (a line) when given."""
+        first = start or node.lineno
+        lines = self.lines[first - 1:node.end_lineno]
+        if not lines:
+            return ""
+        lines[-1] = lines[-1][:node.end_col_offset]
+        if first == node.lineno:
+            lines[0] = lines[0][node.col_offset:]
+        return "\n".join(lines)
+
+    def kept_file(self):
+        first = self.tree.body[0].lineno if self.tree and self.tree.body else len(self.lines) + 1
+        return any(KEEP.search(line) for line in self.lines[:first - 1])
+
+    def kept(self, node):
+        top = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+        above = self.lines[top - 2].strip() if top > 1 else ""
+        return bool(KEEP.search(self.lines[node.lineno - 1]) or (above.startswith("#") and KEEP.search(above)))
+
+
+def attr_of(call):
+    return call.func.attr if isinstance(call.func, ast.Attribute) else None
+
+
+def dotted(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        head = dotted(node.value)
+        return f"{head}.{node.attr}" if head else None
+    return None
+
+
+# --------------------------------------------------------------- definitions
+def is_dunder(name):
+    return name.startswith("__") and name.endswith("__")
+
+
+def top_statements(body):
+    """Module-level statements, into `if` and `try` bodies, but not `if __name__ == "__main__"` (an entry point)
+    nor a `try`'s handlers (the fail-open fallbacks of a harness_lib import)."""
+    for node in body:
+        if isinstance(node, ast.If):
+            if "__name__" not in ast.dump(node.test):
+                yield from top_statements(node.body + node.orelse)
+        elif isinstance(node, ast.Try):
+            yield from top_statements(node.body + node.orelse + node.finalbody)
+        else:
+            yield node
+
+
+def is_stdlib(top):
+    names = getattr(sys, "stdlib_module_names", None)
+    if names is not None:
+        return top in names
+    if top in sys.builtin_module_names:
+        return True
+    try:
+        spec = importlib.util.find_spec(top)
+    except (ImportError, ValueError):
+        return False
+    if spec is None or not spec.origin:
+        return False
+    if spec.origin in ("built-in", "frozen"):
+        return True
+    origin, stdlib = os.path.realpath(spec.origin), os.path.realpath(sysconfig.get_paths()["stdlib"])
+    return origin.startswith(stdlib + os.sep) and "site-packages" not in origin
+
+
+def library_names(cls, aliases):
+    """The attribute names of the standard-library classes `cls` derives from: a method that overrides one
+    (argparse's `error`) is the library's protocol, called from inside the library."""
+    names = set()
+    for base in cls.bases:
+        path = dotted(base)
+        if not path:
+            continue
+        head, _, rest = path.partition(".")
+        full = ".".join(p for p in (aliases.get(head, ""), rest) if p)
+        obj = None
+        if not full and hasattr(builtins, head):
+            obj = getattr(builtins, head)
+        elif full and is_stdlib(full.split(".")[0]):
+            parts = full.split(".")
+            for cut in range(len(parts), 0, -1):
+                try:
+                    obj = importlib.import_module(".".join(parts[:cut]))
+                except ImportError:
+                    continue
+                for part in parts[cut:]:
+                    obj = getattr(obj, part, None)
+                break
+        if obj is not None:
+            names.update(dir(obj))
+    return names
+
+
+def body_lines(stmts):
+    if stmts and isinstance(stmts[0], ast.Expr) and isinstance(stmts[0].value, ast.Constant):
+        stmts = stmts[1:]
+    return {n for s in stmts for n in range(s.lineno, s.end_lineno + 1)}
+
+
+def definitions(code):
+    """(node, kind, name, body lines) for the file's functions, classes, constants and methods, keeps left out."""
+    aliases = {}
+    for node in code.tree.body:
+        if isinstance(node, ast.Import):
+            aliases.update({a.asname or a.name.split(".")[0]: a.name if a.asname else a.name.split(".")[0]
+                            for a in node.names})
+        elif isinstance(node, ast.ImportFrom) and not node.level:
+            aliases.update({a.asname or a.name: f"{node.module}.{a.name}" for a in node.names})
+    out = []
+    for node in top_statements(code.tree.body):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name != "main" and not is_dunder(node.name):
+                out.append((node, "function", node.name, body_lines(node.body)))
+        elif isinstance(node, ast.ClassDef):
+            methods = [m for m in node.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            if code.kept(node):
+                continue   # a kept class keeps its methods
+            out.append((node, "class", node.name, set().union(*(body_lines(m.body) for m in methods))))
+            protocol = library_names(node, aliases) if node.bases else set()
+            out += [(m, "method", f"{node.name}.{m.name}", body_lines(m.body)) for m in methods
+                    if not is_dunder(m.name) and m.name not in protocol]
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                for n in ([t] if isinstance(t, ast.Name) else getattr(t, "elts", [])):
+                    if isinstance(n, ast.Name) and not is_dunder(n.id):
+                        out.append((node, "constant", n.id, set(range(node.lineno, node.end_lineno + 1))))
+    return [d for d in out if not code.kept(d[0])]
+
+
+# --------------------------------------------------------------- the argparse surface
+def scopes(tree):
+    """The module and each function, every one with its own nodes (nested functions not descended into)."""
+    for scope in [tree] + [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        nodes, todo = [], list(ast.iter_child_nodes(scope))
+        while todo:
+            n = todo.pop()
+            nodes.append(n)
+            if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                todo.extend(ast.iter_child_nodes(n))
+        yield nodes
+
+
+def surface(code):
+    """([(path, call)] subcommands, [(path, options, dest, call)] flags) of a bin tool's argparse parsers."""
+    subs, flags = [], []
+    for nodes in scopes(code.tree):
+        target = {id(n.value): n.targets[0].id for n in nodes
+                  if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)}
+        env, result = {}, {}
+
+        def owner(expr):
+            if isinstance(expr, ast.Name):
+                return env.get(expr.id, ())
+            return result.get(id(expr), ())
+
+        calls = sorted((n for n in nodes if isinstance(n, ast.Call)),
+                       key=lambda c: (c.lineno, c.col_offset, c.end_lineno, c.end_col_offset))
+        for call in calls:
+            what, path = attr_of(call), ()
+            consts = [a.value for a in call.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+            if what in ("add_subparsers", "add_argument_group", "add_mutually_exclusive_group"):
+                path = owner(call.func.value)
+            elif what == "add_parser" and consts:
+                path = owner(call.func.value) + (consts[0],)
+                subs.append((path, call))
+            elif what == "add_argument":
+                options = [c for c in consts if c.startswith("-")]
+                kw = {k.arg: k.value for k in call.keywords}
+                action, dest = kw.get("action"), kw.get("dest")
+                if options and not (
+                        isinstance(action, ast.Constant) and action.value in ("help", "version")):
+                    if isinstance(dest, ast.Constant):
+                        name = dest.value
+                    elif dest is not None:
+                        name = None   # argparse.SUPPRESS or computed: not judged
+                    else:
+                        long = [o for o in options if o.startswith("--")]
+                        name = (long or options)[0].lstrip("-").replace("-", "_")
+                    if name:
+                        flags.append((owner(call.func.value), options, name, call))
+            result[id(call)] = path
+            if id(call) in target:
+                env[target[id(call)]] = path
+    return subs, flags
+
+
+def flag_name(path, options):
+    long = [o for o in options if o.startswith("--")]
+    return " ".join(path + ((long or options)[0],))
+
+
+def bounded(word):
+    return re.compile(r"(?<![\w-])" + re.escape(word) + r"(?![\w-])")
+
+
+# --------------------------------------------------------------- line data
+def load_lines(paths, rels):
+    """({rel: lines} from real runs, {rel: lines} from the suite, whether any suite data was given)."""
+    real, suite, any_suite = {}, {}, False
+    for path in paths:
+        data = read_json(path)
+        if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
+            raise Problem(f"{path}: not line data (a JSON object with `files`)")
+        meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+        into = real if meta.get("kind") == "real" else suite
+        any_suite = any_suite or into is suite
+        for name, entry in data["files"].items():
+            lines = entry.get("executed_lines") if isinstance(entry, dict) else None
+            name = str(name).replace("\\", "/")
+            rel = name if name in rels else next(
+                (name[i + 1:] for i, ch in enumerate(name) if ch == "/" and name[i + 1:] in rels), None)
+            if rel and isinstance(lines, list):
+                into.setdefault(rel, set()).update(n for n in lines if isinstance(n, int))
+    return real, suite, any_suite
+
+
+# --------------------------------------------------------------- the scan
+def scan(root, line_files=()):
+    codes, texts, design = [], [], ""
+    for rel, kind, text in files(root):
+        if kind == "text":
+            texts.append(text)
+        else:
+            codes.append(Code(rel, kind, text))
+    if os.path.isfile(os.path.join(root, "docs", "design.md")):
+        design = read(os.path.join(root, "docs", "design.md")) or ""
+    prod = [c for c in codes if c.kind != "tests"]
+    tests = [c for c in codes if c.kind == "tests"]
+    used = set().union(*(c.words for c in prod), *(set(WORD.findall(t)) for t in texts))
+    design_words = set(WORD.findall(design))
+    caller_lines = [line for t in texts for line in t.splitlines()]
+    real, suite, any_suite = load_lines(line_files, {c.rel for c in prod})
+    candidates, no_caller = [], []
+
+    def refs(test_files, contract):
+        kinds = (["test"] if test_files else []) + (["contract"] if contract else [])
+        return "+".join(kinds) or "none"
+
+    def add(code, line, kind, name, source, lines, test_files, contract):
+        if lines & real.get(code.rel, set()) and kind not in ("constant", "flag"):
+            return   # a real loop run executed it
+        c = {"path": code.rel, "line": line, "kind": kind, "name": name, "refs": refs(test_files, contract),
+             "tests": sorted(test_files),
+             "fingerprint": {"path": code.rel, "kind": kind, "name": name,
+                             "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest()}}
+        if any_suite:
+            c["ran_in_suite"] = bool(lines & suite.get(code.rel, set()))
+        candidates.append(c)
+
+    for code in prod:
+        if code.tree is None or code.kept_file():
+            continue
+        for node, kind, name, lines in definitions(code):
+            own = name.split(".")[-1]
+            if own not in used:
+                start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+                add(code, node.lineno, kind, name, code.segment(node, start), lines,
+                    [t.rel for t in tests if own in t.words], own in design_words)
+        module_check(code, prod, texts, tests, design, add)
+        if code.kind == "bin":
+            tool_surface(code, prod, caller_lines, tests, design, add, no_caller)
+    order = {"subcommand": 0, "flag": 1}
+    no_caller.sort(key=lambda e: (e["path"], e["line"], order[e["kind"]]))
+    return {"candidates": sorted(candidates, key=lambda c: (c["path"], c["line"], c["name"])),
+            "no_caller": no_caller}
+
+
+def module_check(code, prod, texts, tests, design, add):
+    """A harness_lib module no code imports, or a hook file nothing wires, names or imports."""
+    base = os.path.basename(code.rel)
+    if code.kind == "lib" and base != "__init__.py":
+        module = "harness_lib." + code.rel[len(P + "lib/harness_lib/"):-3].replace("/", ".")
+        named = re.compile(r"(?<![\w.])" + re.escape(module).replace(r"\.", r"[./]") + r"(?![\w-])")
+        contract = bool(bounded(base).search(design) or named.search(design))
+    elif code.kind == "hooks":
+        module = base[:-3]   # imported by its name from the hooks folder (tests_first.py imports branch_guard)
+        named = bounded(base)
+        contract = bool(named.search(design))
+    else:
+        return
+    others = [c for c in prod if c is not code]
+    if any(module in c.imports or any(named.search(s) for s in c.strings) for c in others) or any(
+            named.search(t) for t in texts):
+        return
+    hits = [t.rel for t in tests if module in t.imports or any(named.search(s) for s in t.strings)]
+    add(code, 1, "module", module, code.text, set(range(1, len(code.lines) + 1)), hits, contract)
+
+
+def tool_surface(code, prod, caller_lines, tests, design, add, no_caller):
+    """A bin tool's flags parsed and never read (candidates), and its subcommands and flags no one calls."""
+    tool = os.path.basename(code.rel)
+    subs, flags = surface(code)
+    others = [c for c in prod if c is not code]
+    read = set().union(*(c.attrs for c in prod)) | set(code.strings)
+    called_lines = caller_lines + [s for c in others for s in c.strings]
+    other_strings = {s for c in others for s in c.strings}
+    in_tool = bounded(tool)
+    heading_level, section = 0, []
+    for line in design.splitlines():
+        m = HEADING.match(line)
+        if m and (not heading_level or len(m.group(1)) <= heading_level):
+            heading_level = len(m.group(1)) if in_tool.search(m.group(2)) else 0
+        if heading_level:
+            section.append(line)
+    section = "\n".join(section)
+    for path, call in subs:
+        spoken = re.compile(r"(?<![\w-])" + re.escape(tool) + r"\s+" + r"\s+".join(map(re.escape, path)) + r"(?![\w-])")
+        if path[-1] not in other_strings and not any(spoken.search(line) for line in called_lines):
+            no_caller.append({"path": code.rel, "line": call.lineno, "kind": "subcommand", "name": " ".join(path)})
+    for path, options, dest, call in flags:
+        name, marks = flag_name(path, options), [bounded(o) for o in options]
+        if dest not in read:
+            if code.kept(call):
+                continue
+            hits = [t.rel for t in tests if any(m.search(s) for s in t.strings for m in marks)]
+            add(code, call.lineno, "flag", name, code.segment(call), set(range(call.lineno, call.end_lineno + 1)),
+                hits, any(m.search(section) for m in marks))
+            continue
+        called = any(s == o or s.startswith(o + "=") for s in other_strings for o in options) or any(
+            m.search(line[hit.end():]) for line in called_lines for hit in in_tool.finditer(line) for m in marks)
+        if not called:
+            no_caller.append({"path": code.rel, "line": call.lineno, "kind": "flag", "name": name})
+
+
+# --------------------------------------------------------------- output
+def text_report(out):
+    lines = [f"{len(out['candidates'])} candidates (proposed for removal; nothing is removed)"]
+    for c in out["candidates"]:
+        extra = f"  tests: {', '.join(c['tests'])}" if c["tests"] else ""
+        ran = f"  ran_in_suite: {'yes' if c['ran_in_suite'] else 'no'}" if "ran_in_suite" in c else ""
+        lines.append(f"  {c['path']}:{c['line']}  {c['kind']}  {c['name']}  refs: {c['refs']}{extra}{ran}")
+    lines.append(f"{len(out['no_caller'])} with no caller (the owner's typed surface: reported, never proposed)")
+    lines += [f"  {e['path']}:{e['line']}  {e['kind']}  {e['name']}" for e in out["no_caller"]]
+    return "\n".join(lines)
+
+
+def find_root(start):
+    here = os.path.abspath(start)
+    while True:
+        if os.path.exists(os.path.join(here, ".git")):
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            return os.path.abspath(start)
+        here = parent
+
+
+def main():
+    ap = Parser(prog="harness-deadcode", description="Dead-code candidates in a Harness checkout, with evidence.")
+    sub = ap.add_subparsers(dest="cmd", metavar="{scan}")
+    sub.required = True
+    sc = sub.add_parser("scan", help="print the candidates and the subcommands and flags with no caller")
+    sc.add_argument("--lines", action="append", default=[], metavar="FILE",
+                    help='line data, coverage.py JSON shape; meta.kind "real" marks a loop run (repeatable)')
+    sc.add_argument("--json", action="store_true", help='print {"candidates", "no_caller"}')
+    sc.add_argument("--repo", metavar="PATH", help="the checkout (default: the one holding the cwd)")
+    args = ap.parse_args()
+    root = os.path.abspath(args.repo) if args.repo else find_root(os.getcwd())
+    if not os.path.isdir(os.path.join(root, P)):
+        raise Problem(f"{root} is not a Harness checkout (no {P})")
+    out = scan(root, args.lines)
+    emit(args.json, out, text_report(out))
+
+
+if __name__ == "__main__":
+    run_main("harness-deadcode", main)
