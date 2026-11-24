@@ -274,8 +274,8 @@ def refusal(data: dict, command: str, notes: list) -> str | None:
             if loop:
                 return (
                     f"Cannot tell whether {what} is manual-land and the owner asked for it ({err}), so this --loop "
-                    f"land is refused: harness-pr land --loop refuses a manual-land PR anyway. Retry it when gh "
-                    f"answers, or leave the PR for the owner's /harness:land {selector}."
+                    f"land is refused: harness-pr land --loop refuses a manual-land PR anyway. Retry it, or leave "
+                    f"the PR for the owner's /harness:land {selector}."
                 )
             notes.append(f"cannot tell whether {what} is manual-land and the owner asked for it ({err}); "
                          "the land was let through unchecked")
