@@ -326,6 +326,10 @@ ENDED_STATES = {"done": "ok", "failed": "error", "stopped": "stopped"}   # outco
 # `blocked` when its summary of the final reply suggests a next step for the user (#123), so the ticket decides. In
 # review with an open ready pull request of the run's branch is not over: the run is before its land (#422).
 FINISHED_STATUSES = ("status:in-review", "status:needs-input", "status:blocked")   # blocked: parked (#387)
+# A manual-land ticket is landed only by the owner's /harness:land (#451): in review, no run is before its land, and
+# its `--bg` session is over once its turn is (an ended state, or one of these), not while it still works.
+MANUAL_LAND = "manual-land"
+TURN_OVER_STATES = ("blocked", "idle")
 PID_SLACK = 120               # seconds: a process younger than its run record by more is a recycled pid
 # The dispatching session's own identity, which a detached run must not inherit.
 SESSION_ENV = ("CLAUDECODE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION",
@@ -1148,7 +1152,9 @@ def sweep(records, agents, as_json=False, dry_run=False):
     `dry_run` (dispatch --dry-run, #335) such a session is not stopped and its record is closed in memory only, with
     a `would stop session <id> (#N <state>)` line, so the plan still counts its slot free. A session whose ticket is
     before its land (before_landing, #422) is not finished: `blocked` (its turn over, #123) is stopped as above and
-    ends `early`, `done` ends `early`, any other live state keeps its record open. Every unended bg record's
+    ends `early`, `done` ends `early`, any other live state keeps its record open. A manual-land ticket in review
+    (#451) is never before its land: its session is finished once `blocked`, `idle` or ended (ticket_finished), and
+    a working one keeps its record open. Every unended bg record's
     transcript is read for a usage-limit refusal, which marks the subscription budget (note_usage_limit): a limited
     session stays `blocked`, a live state."""
     repos, logins = {}, {}
@@ -1169,7 +1175,7 @@ def sweep(records, agents, as_json=False, dry_run=False):
             entry = listing.get(str(record.get("bg_id")))
             state = entry.get("state") if entry else None
             if entry is not None and state != "stopped":
-                finished = ticket_finished(record, repos)
+                finished = ticket_finished(record, repos, state)
             stop = bool(finished) or (finished is False and state == "blocked" and ticket_landing(record, repos))
             if entry is not None and not state_ended(state) and not stop:
                 continue
@@ -1353,16 +1359,23 @@ def finished_as(issue):
     return next((lb for lb in labels if lb in FINISHED_STATUSES), "finished")
 
 
-def ticket_finished(record, repos):
+def ticket_finished(record, repos, state=None):
     """Whether the ticket of a run is finished (issue_finished), never while it is before its land (before_landing,
-    #422); None, with a warning, when the repository or gh cannot tell (the issue, or the pull requests of an
-    in-review ticket's branch), so the session is neither stopped nor counted ended."""
+    #422), nor, in review with `manual-land` (#451), while its session's `state` is live and not TURN_OVER_STATES (a
+    revise pass still working); None, with a warning, when the repository or gh cannot tell (the issue, or the pull
+    requests of an in-review ticket's branch), so the session is neither stopped nor counted ended."""
     n = record.get("ticket")
     if not isinstance(n, int):
         return None
     try:
         repo = record_repo(record, repos)
-        return issue_finished(ticket_issue(repo, n)) and before_landing(repo, n, record.get("branch")) is None
+        issue = ticket_issue(repo, n)
+        if not issue_finished(issue) or before_landing(repo, n, record.get("branch")) is not None:
+            return False
+        labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
+        working = state in LIVE_STATES and state not in TURN_OVER_STATES
+        return not (working and str(issue.get("state", "")).upper() == "OPEN" and "status:in-review" in labels
+                    and MANUAL_LAND in labels)
     except Problem as err:
         warn(f"#{n}: cannot tell whether its ticket is finished: {err}")
         return None
@@ -1761,9 +1774,10 @@ def ask_without_pr(repo, n, branch):
 
 
 def before_landing(repo, n, branch):
-    """The issue of ticket n when it is OPEN and status:in-review and `branch` has an open pull request that is not a
-    draft, else None; its `ready_pr` is the newest such PR's number. `harness-pr ready` sets in-review before
-    /harness:work lands (#383), so a run that ended there ended before its land (#422). A failing gh call, or a PR
+    """The issue of ticket n when it is OPEN and status:in-review without manual-land and `branch` has an open pull
+    request that is not a draft, else None; its `ready_pr` is the newest such PR's number. `harness-pr ready` sets
+    in-review before /harness:work lands (#383), so a run that ended there ended before its land (#422); a
+    manual-land ticket's run ends there, since only the owner lands it (#451). A failing gh call, or a PR
     answer that is not a list, raises Problem. One command asks gh once per ticket and branch, as without_pr does."""
     key = (repo.main, n, branch)
     if key not in LANDING:
@@ -1782,7 +1796,7 @@ def ask_before_landing(repo, n, branch):
     if not isinstance(issue, dict) or str(issue.get("state", "")).upper() != "OPEN":
         return None
     labels = [lb.get("name") for lb in issue.get("labels") or [] if isinstance(lb, dict)]
-    if "status:in-review" not in labels:
+    if "status:in-review" not in labels or MANUAL_LAND in labels:      # manual-land: the owner lands it (#451)
         return None
     ready = [pr.get("number") for pr in branch_prs(repo, branch, strict=True)    # newest first
              if str(pr.get("state", "")).upper() == "OPEN" and pr.get("isDraft") is not True]

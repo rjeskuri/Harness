@@ -34,8 +34,10 @@ PR_URL = "https://github.com/o/r/pull/34"
 SHA = "abc123def4567890abc123def4567890abc12345"
 REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
 HIGH_RISK = "High risk: review the data and live-system paths before merging."
-# What `land` reads of the PR before merging; headRefOid is the head the checks judge (#337).
-LAND_FIELDS = "isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state"
+# What `land` reads of the PR before merging; headRefOid is the head the checks judge (#337), labels whether the PR
+# is manual-land (#451).
+LAND_FIELDS = ("isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state,"
+               "labels")
 
 STUB = """import json, os, sys
 name, argv = os.path.basename(sys.argv[1]), sys.argv[2:]
@@ -661,10 +663,11 @@ HEAD_SHA = harness_review(1, at(1))[0]["commit_id"]
 
 
 def land_view(**over):
-    """What `gh pr view --json LAND_FIELDS` answers: the head's sha is HEAD_SHA unless `over` names another."""
+    """What `gh pr view --json LAND_FIELDS` answers: the head's sha is HEAD_SHA unless `over` names another; no labels
+    unless `over` gives some."""
     view = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": BRANCH, "headRefOid": HEAD_SHA,
             "closingIssuesReferences": [{"number": 12}], "statusCheckRollup": GREEN, "title": "Add the widget (#12)",
-            "url": PR_URL, "state": "OPEN"}
+            "url": PR_URL, "state": "OPEN", "labels": []}
     view.update(over)
     return view
 
