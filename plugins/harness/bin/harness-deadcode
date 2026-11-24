@@ -6,6 +6,9 @@ docs/research/dead-code-agent.md (False positives, Recommendation).
 
 Usage:
     harness-deadcode scan [--lines FILE ...] [--json] [--repo PATH]
+    harness-deadcode daily [--dry-run] [--repo PATH]     # file one manual-land `Remove dead code` ticket
+    harness-deadcode daily --install-launchd [--repo PATH]   # run daily at 03:30 (a LaunchAgent)
+    harness-deadcode daily --uninstall-launchd
 
 A candidate is a top-level function, class or constant, a non-dunder method, a harness_lib module, an unwired
 hook file or a bin tool's flag parsed and never read, that nothing outside tests/ and docs/design.md uses.
@@ -13,25 +16,42 @@ Subcommands and flags no skill, agent, doc, setting or other tool calls are list
 --lines takes coverage.py-shaped line data ({"meta": {...}, "files": {path: {"executed_lines": [...]}}}),
 repeatable: data whose meta.kind is "real" (a loop run) drops a candidate whose body ran; other data is the
 suite's and only marks each candidate's `ran_in_suite`.
+
+`daily` (#455) adds the fingerprints of closed, unmerged dead-code PRs to
+~/.claude/harness/deadcode/<repo-key>/rejected.json, scans (with the newest complete lines.json of
+scripts/collect_lines.py), and files at most one ticket a day, none while one is open, under the epic
+HARNESS_DEADCODE_EPIC names (the environment, else `env` in the repository's .claude/settings.json).
+gh is HARNESS_GH when set, else `gh` on PATH; launchctl is HARNESS_LAUNCHCTL when set.
 """
 from __future__ import annotations
 
 import ast
 import builtins
+import glob
 import hashlib
 import importlib
 import importlib.util
+import json
 import os
+import plistlib
 import re
+import shutil
+import subprocess
 import sys
 import sysconfig
+import tempfile
+import time
 
 _LIB = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "lib"))
 if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 try:
     from harness_lib.cli import Parser, Problem, emit, run_main
-    from harness_lib.text import read_json
+    from harness_lib.gh import gh_json
+    from harness_lib.paths import repo_key
+    from harness_lib.repo import main_checkout
+    from harness_lib.settings import setting, settings_env
+    from harness_lib.text import first_line, harness_home, home, read_json, write_json
 except Exception as exc:  # one line, exit 1 (docs/design.md, the shared lib)
     sys.exit(f"harness-deadcode: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -375,10 +395,11 @@ def scan(root, line_files=()):
         kinds = (["test"] if test_files else []) + (["contract"] if contract else [])
         return "+".join(kinds) or "none"
 
-    def add(code, line, kind, name, source, lines, test_files, contract):
+    def add(code, line, end, kind, name, source, lines, test_files, contract):
         if lines & real.get(code.rel, set()) and kind not in ("constant", "flag"):
             return   # a real loop run executed it
-        c = {"path": code.rel, "line": line, "kind": kind, "name": name, "refs": refs(test_files, contract),
+        c = {"path": code.rel, "line": line, "end_line": end, "kind": kind, "name": name,
+             "refs": refs(test_files, contract),
              "tests": sorted(test_files),
              "fingerprint": {"path": code.rel, "kind": kind, "name": name,
                              "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest()}}
@@ -393,7 +414,7 @@ def scan(root, line_files=()):
             own = name.split(".")[-1]
             if own not in used:
                 start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
-                add(code, node.lineno, kind, name, code.segment(node, start), lines,
+                add(code, node.lineno, node.end_lineno, kind, name, code.segment(node, start), lines,
                     [t.rel for t in tests if own in t.words], own in design_words)
         module_check(code, prod, texts, tests, design, add)
         if code.kind == "bin":
@@ -404,12 +425,17 @@ def scan(root, line_files=()):
             "no_caller": no_caller}
 
 
+def module_named(module):
+    """`harness_lib.x` or `harness_lib/x` in a text."""
+    return re.compile(r"(?<![\w.])" + re.escape(module).replace(r"\.", r"[./]") + r"(?![\w-])")
+
+
 def module_check(code, prod, texts, tests, design, add):
     """A harness_lib module no code imports, or a hook file nothing wires, names or imports."""
     base = os.path.basename(code.rel)
     if code.kind == "lib" and base != "__init__.py":
         module = "harness_lib." + code.rel[len(P + "lib/harness_lib/"):-3].replace("/", ".")
-        named = re.compile(r"(?<![\w.])" + re.escape(module).replace(r"\.", r"[./]") + r"(?![\w-])")
+        named = module_named(module)
         contract = bool(bounded(base).search(design) or named.search(design))
     elif code.kind == "hooks":
         module = base[:-3]   # imported by its name from the hooks folder (tests_first.py imports branch_guard)
@@ -422,7 +448,20 @@ def module_check(code, prod, texts, tests, design, add):
             named.search(t) for t in texts):
         return
     hits = [t.rel for t in tests if module in t.imports or any(named.search(s) for s in t.strings)]
-    add(code, 1, "module", module, code.text, set(range(1, len(code.lines) + 1)), hits, contract)
+    add(code, 1, max(len(code.lines), 1), "module", module, code.text, set(range(1, len(code.lines) + 1)), hits,
+        contract)
+
+
+def tool_section(design, tool):
+    """[(line number, line)] of docs/design.md under the headings that name `tool`."""
+    in_tool, heading_level, section = bounded(tool), 0, []
+    for number, line in enumerate(design.splitlines(), 1):
+        m = HEADING.match(line)
+        if m and (not heading_level or len(m.group(1)) <= heading_level):
+            heading_level = len(m.group(1)) if in_tool.search(m.group(2)) else 0
+        if heading_level:
+            section.append((number, line))
+    return section
 
 
 def tool_surface(code, prod, caller_lines, tests, design, add, no_caller):
@@ -434,14 +473,7 @@ def tool_surface(code, prod, caller_lines, tests, design, add, no_caller):
     called_lines = caller_lines + [s for c in others for s in c.strings]
     other_strings = {s for c in others for s in c.strings}
     in_tool = bounded(tool)
-    heading_level, section = 0, []
-    for line in design.splitlines():
-        m = HEADING.match(line)
-        if m and (not heading_level or len(m.group(1)) <= heading_level):
-            heading_level = len(m.group(1)) if in_tool.search(m.group(2)) else 0
-        if heading_level:
-            section.append(line)
-    section = "\n".join(section)
+    section = "\n".join(line for _, line in tool_section(design, tool))
     for path, call in subs:
         spoken = re.compile(r"(?<![\w-])" + re.escape(tool) + r"\s+" + r"\s+".join(map(re.escape, path)) + r"(?![\w-])")
         if path[-1] not in other_strings and not any(spoken.search(line) for line in called_lines):
@@ -452,8 +484,8 @@ def tool_surface(code, prod, caller_lines, tests, design, add, no_caller):
             if code.kept(call):
                 continue
             hits = [t.rel for t in tests if any(m.search(s) for s in t.strings for m in marks)]
-            add(code, call.lineno, "flag", name, code.segment(call), set(range(call.lineno, call.end_lineno + 1)),
-                hits, any(m.search(section) for m in marks))
+            add(code, call.lineno, call.end_lineno, "flag", name, code.segment(call),
+                set(range(call.lineno, call.end_lineno + 1)), hits, any(m.search(section) for m in marks))
             continue
         called = any(s == o or s.startswith(o + "=") for s in other_strings for o in options) or any(
             m.search(line[hit.end():]) for line in called_lines for hit in in_tool.finditer(line) for m in marks)
@@ -484,19 +516,405 @@ def find_root(start):
         here = parent
 
 
+def checkout(repo):
+    root = os.path.abspath(repo) if repo else find_root(os.getcwd())
+    if not os.path.isdir(os.path.join(root, P)):
+        raise Problem(f"{root} is not a Harness checkout (no {P})")
+    return root
+
+
+# --------------------------------------------------------------- the daily run (#455)
+TITLE = "Remove dead code"
+GATE = "manual-land"
+LABEL = "com.ryaneskuri.harness-deadcode"
+MAX_CANDIDATES, MAX_LINES = 5, 150   # one ticket's batch (docs/research/dead-code-agent.md, Batch size)
+DEAD_BRANCH = re.compile(r"^t/(\d+)-remove-dead-code$")
+FINGERPRINTS = re.compile(r"<!--\s*harness-deadcode fingerprints\s*(\[.*?\])\s*-->", re.S)
+FP_KEYS = ("path", "kind", "name", "sha256")
+
+
+def fp_key(fp):
+    return tuple(str(fp.get(k, "")) for k in FP_KEYS)
+
+
+def span(c):
+    return c["end_line"] - c["line"] + 1
+
+
+def newest_lines(folder):
+    """The newest lines.json scripts/collect_lines.py wrote for this repository from a complete run, or None."""
+    found = []
+    for path in glob.glob(os.path.join(folder, "*", "lines.json")):
+        data = read_json(path)
+        if isinstance(data, dict) and data.get("returncode") == 0 and isinstance(data.get("files"), dict):
+            try:
+                found.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+    return max(found)[1] if found else None
+
+
+def listed(body):
+    """The fingerprints a dead-code ticket's body records."""
+    m = FINGERPRINTS.search(body or "")
+    try:
+        items = json.loads(m.group(1)) if m else []
+    except ValueError:
+        return []
+    return [{k: str(i[k]) for k in FP_KEYS} for i in items if isinstance(i, dict) and all(k in i for k in FP_KEYS)]
+
+
+def add_rejections(root, rejected):
+    """Add the fingerprints listed by the ticket of each closed, unmerged dead-code PR not seen before to
+    `rejected` ({"fingerprints", "prs"}); whether anything changed."""
+    # Unlabelled: the loop opens the PR bare and only the ticket carries GATE; DEAD_BRANCH picks the PRs out.
+    prs = gh_json(["pr", "list", "--state", "closed", "--limit", "100",
+                   "--json", "number,headRefName,state,mergedAt"], root)
+    have = {fp_key(f) for f in rejected["fingerprints"]}
+    changed = False
+    for pr in prs if isinstance(prs, list) else []:
+        m = DEAD_BRANCH.match(str(pr.get("headRefName") or "")) if isinstance(pr, dict) else None
+        if not m or pr.get("state") == "MERGED" or pr.get("mergedAt") or pr.get("number") in rejected["prs"]:
+            continue
+        ticket = int(m.group(1))
+        issue = gh_json(["issue", "view", str(ticket), "--json", "body"], root)
+        for fp in listed(issue.get("body") if isinstance(issue, dict) else ""):
+            if fp_key(fp) not in have:
+                have.add(fp_key(fp))
+                rejected["fingerprints"].append(dict(fp, ticket=ticket, pr=pr.get("number")))
+        rejected["prs"].append(pr.get("number"))
+        changed = True
+    return changed
+
+
+def open_ticket(root):
+    items = gh_json(["issue", "list", "--state", "open", "--label", GATE, "--limit", "100",
+                     "--json", "number,title,url"], root)
+    return next((i for i in items if isinstance(i, dict) and i.get("title") == TITLE), None) \
+        if isinstance(items, list) else None
+
+
+def batch(candidates):
+    """(the batch, its removed lines): at most MAX_CANDIDATES and MAX_LINES, test-only candidates last."""
+    ordered = [c for c in candidates if c["refs"] != "test"] + [c for c in candidates if c["refs"] == "test"]
+    chosen, total = [], 0
+    for c in ordered:
+        if len(chosen) < MAX_CANDIDATES and total + span(c) <= MAX_LINES:
+            chosen.append(c)
+            total += span(c)
+    return chosen, total
+
+
+def own_name(c):
+    return c["name"].split(".")[-1]
+
+
+def live_names(root, chosen):
+    """The names of the functions, classes and module-level constants in non-test code outside the batch."""
+    names = set()
+    for _, kind, text in files(root):
+        if kind in ("tests", "text"):
+            continue
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            continue
+        names.update(n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                                                       ast.ClassDef)))
+        names.update(t.id for n in top_statements(tree.body) if isinstance(n, ast.Assign)
+                     for t in n.targets if isinstance(t, ast.Name))
+    return {n for n in names if not is_dunder(n)} - {own_name(c) for c in chosen if c["kind"] != "flag"}
+
+
+def code_words(node):
+    out = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name):
+            out.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            out.add(n.attr)
+        elif isinstance(n, ast.alias):
+            out.update(n.name.split("."))
+    return out
+
+
+def reach(node, c, live, helpers):
+    """None when the test function `node` does not name candidate `c`; else whether it reaches only the batch:
+    neither it nor the test file's helpers it calls (`helpers`, name to node) name a live definition. A case
+    passing a flag always reaches the code that parses it."""
+    strings = [n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    if c["kind"] == "flag":
+        mark = bounded(c["name"].split()[-1])
+        return False if any(mark.search(s) for s in strings) else None
+    code = code_words(node)
+    if own_name(c) not in code | {w for s in strings for w in WORD.findall(s)}:
+        return None
+    seen, todo = set(), [w for w in code if w in helpers]
+    while todo:
+        name = todo.pop()
+        if name not in seen:
+            seen.add(name)
+            more = code_words(helpers[name])
+            code |= more
+            todo += [w for w in more if w in helpers]
+    return not (code & live)
+
+
+def test_cases(root, rel, c, live):
+    """([cases that reach only the batch], [cases that also reach code that stays]) of the test file `rel` naming
+    candidate `c`, each `Class.test_x`."""
+    try:
+        tree = ast.parse(read(os.path.join(root, rel)) or "", filename=rel)
+    except (SyntaxError, ValueError):
+        return [], []
+    only, also = [], []
+    helpers = {n.name: n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and not n.name.startswith("test")}
+
+    def visit(body, prefix):
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                visit(node.body, prefix + node.name + ".")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                alone = reach(node, c, live, helpers)
+                if alone is not None:
+                    (only if alone else also).append(prefix + node.name)
+
+    visit(tree.body, "")
+    return only, also
+
+
+def design_lines(design, c):
+    """The numbers of the docs/design.md lines that name candidate `c` (a flag: in its tool's section)."""
+    if "contract" not in c["refs"]:
+        return []
+    if c["kind"] == "flag":
+        mark = bounded(c["name"].split()[-1])
+        return [n for n, line in tool_section(design, os.path.basename(c["path"])) if mark.search(line)]
+    if c["kind"] == "module":
+        marks = [bounded(os.path.basename(c["path"]))] + (
+            [module_named(c["name"])] if c["name"].startswith("harness_lib.") else [])
+    else:
+        marks = [re.compile(r"(?<![\w])" + re.escape(own_name(c)) + r"(?![\w])")]
+    return [n for n, line in enumerate(design.splitlines(), 1) if any(m.search(line) for m in marks)]
+
+
+def ticket_body(root, chosen, total, lines_file):
+    """The ticket, in templates/ticket_task.md's sections, with each candidate's evidence and its fingerprints."""
+    design = read(os.path.join(root, "docs", "design.md")) or ""
+    out = ["## Request",
+           f"`harness-deadcode daily` found {len(chosen)} dead-code candidates ({total} lines of code) on "
+           f"{time.strftime('%Y-%m-%d')}: nothing outside plugins/harness/tests/ and docs/design.md uses them. Remove "
+           "them, the docs/design.md lines that name them and the test cases that reach only them. A role that finds "
+           "a real use keeps that candidate and says why in the PR.", "",
+           "## Outline",
+           "1. Test-author: delete the test cases listed under Tests that must pass as removed with the code.",
+           "2. Coder: remove each candidate below and update the docs/design.md lines listed with it.",
+           "3. Reviewer: check each removal against its evidence, and that each deleted case pinned only removed "
+           "code.", "",
+           "### Candidates"]
+    removed, edited, modules = [], [], []
+    live = live_names(root, chosen) if any(c["tests"] for c in chosen) else set()
+    for i, c in enumerate(chosen, 1):
+        out.append(f"{i}. `{c['name']}`, a {c['kind']} in `{c['path']}`, lines {c['line']}-{c['end_line']} "
+                   f"({span(c)} lines)")
+        out.append(f"   - references: {c['refs']}" + (f" ({', '.join(c['tests'])})" if c["tests"] else ""))
+        if "ran_in_suite" in c:
+            out.append(f"   - ran in the suite: {'yes' if c['ran_in_suite'] else 'no'}")
+        named = design_lines(design, c)
+        if named:
+            out.append(f"   - docs/design.md: line{'s' if len(named) > 1 else ''} {', '.join(map(str, named))}")
+        for rel in c["tests"]:
+            only, also = test_cases(root, rel, c, live)
+            removed += [f"- `{rel}::{case}`: reaches only `{c['name']}`" for case in only]
+            edited += [f"- `{rel}::{case}`: names `{c['name']}` and reaches code that stays" for case in also]
+            if not only and not also:
+                edited.append(f"- `{rel}`: names `{c['name']}` outside a test case")
+            modules.append(rel)
+    out += ["", "## Definition of done",
+            "- [ ] Each candidate above is removed, or kept with the reason in the PR's Notes.",
+            "- [ ] docs/design.md names no removed candidate.",
+            "- [ ] The test cases listed as removed with the code are gone, and the suite passes.", "",
+            "## Tests that must pass",
+            "Removed with the code (the test-author deletes these before any source changes):"]
+    out += removed or ["- none: no test case reaches only a candidate"]
+    if edited:
+        out += ["Edited with the code (the test-author drops the reference and keeps what the case pins otherwise; "
+                "the reviewer checks each):"] + edited
+    out += ["Stay green:"] + [f"- `python3 -m unittest discover -s plugins/harness/tests -p {os.path.basename(rel)}`"
+                              for rel in dict.fromkeys(modules)]
+    out += ["- the existing suite, `python3 scripts/run_suite.py`", "",
+            "## Context",
+            "- Filed by `harness-deadcode daily` from `harness-deadcode scan --json`"
+            + (f" with the line data in `{lines_file}`" if lines_file else " without line data") + ".",
+            f"- `{GATE}`: the owner lands it with /harness:land. Closing its PR unmerged rejects these candidates "
+            "until their source changes; close this ticket as not planned with it, or no later batch is filed. "
+            "`# deadcode: keep (<reason>)` keeps one for good.", "",
+            "<!-- harness-deadcode fingerprints",
+            json.dumps([c["fingerprint"] for c in chosen], indent=1),
+            "-->", ""]
+    return "\n".join(out)
+
+
+def file_ticket(root, folder, body, epic, size):
+    """`harness-board task create` the ticket under `epic`; (number, url, the error or None)."""
+    board = os.path.join(os.path.dirname(os.path.realpath(__file__)), "harness-board")
+    os.makedirs(folder, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="ticket-", suffix=".md", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        done = subprocess.run([sys.executable, board, "task", "create", "--repo", root, "--json", "--title", TITLE,
+                               "--body-file", path, "--parent", epic, "--type", "refactor", "--size", size,
+                               "--risk", "low", "--label", GATE], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=600)
+    finally:
+        os.remove(path)
+    try:
+        made = json.loads(done.stdout)
+    except ValueError:
+        made = {}
+    error = None if done.returncode == 0 else (first_line(done.stderr) or f"harness-board exit {done.returncode}")
+    return made.get("number"), made.get("url"), error
+
+
+def daily(args):
+    root = os.path.realpath(checkout(args.repo))
+    if args.install_launchd:
+        return install_launchd(os.path.realpath(main_checkout(root) or root))   # not a ticket worktree
+    folder = harness_home("deadcode", repo_key(main_checkout(root) or root))
+    today = time.strftime("%Y-%m-%d")
+    head = "harness-deadcode: dry run: " if args.dry_run else "harness-deadcode: "
+    last = read_json(os.path.join(folder, "daily.json"))
+    if isinstance(last, dict) and last.get("date") == today:
+        print(f"{head}#{last.get('number')} was filed today already; nothing to file until tomorrow")
+        return
+    rejected_path = os.path.join(folder, "rejected.json")
+    rejected = read_json(rejected_path)
+    if not (isinstance(rejected, dict) and isinstance(rejected.get("fingerprints"), list)
+            and isinstance(rejected.get("prs"), list)):
+        rejected = {"fingerprints": [], "prs": []}
+    if add_rejections(root, rejected) and not args.dry_run:
+        write_json(rejected_path, rejected, prefix=".rejected-")
+    found = open_ticket(root)
+    if found:
+        print(f"{head}#{found.get('number')} ({TITLE}, {GATE}) is open; nothing to file while it is")
+        return
+    lines_file = newest_lines(folder)
+    gone = {fp_key(f) for f in rejected["fingerprints"]}
+    candidates = [c for c in scan(root, [lines_file] if lines_file else [])["candidates"]
+                  if fp_key(c["fingerprint"]) not in gone]
+    chosen, total = batch(candidates)
+    if not chosen:
+        print(f"{head}no candidates to file ({len(candidates)} left after the rejected, none within "
+              f"{MAX_LINES} lines)" if candidates else f"{head}no candidates to file")
+        return
+    size = "S" if len(chosen) <= 2 else "M"
+    epic = setting("HARNESS_DEADCODE_EPIC", settings_env(root))
+    body = ticket_body(root, chosen, total, lines_file)
+    if args.dry_run:
+        print(f"{head}would file `{TITLE}` (refactor, size:{size}, risk:low, {GATE}, status:ready) under "
+              f"#{epic or '<HARNESS_DEADCODE_EPIC unset>'}: {len(chosen)} candidates, {total} lines\n")
+        print(body)
+        return
+    if not epic or not epic.isdigit():
+        raise Problem(f"HARNESS_DEADCODE_EPIC is {'not an issue number' if epic else 'not set'} (the environment, "
+                      f"or env in {root}/.claude/settings.json): the standing epic the ticket goes under")
+    number, url, error = file_ticket(root, folder, body, epic, size)
+    if number:
+        write_json(os.path.join(folder, "daily.json"),
+                   {"date": today, "number": number, "url": url,
+                    "fingerprints": [c["fingerprint"] for c in chosen]}, prefix=".daily-")
+    if error:
+        raise Problem(f"harness-board task create: {error}" + (f" (#{number} was created)" if number else ""))
+    print(f"{head}filed #{number} {url}: {len(chosen)} candidates, {total} lines, size:{size}, under #{epic}")
+
+
+# --------------------------------------------------------------- launchd
+def plist_path():
+    return home("Library", "LaunchAgents", f"{LABEL}.plist")
+
+
+def launchctl(args):
+    """(exit code, first line of output) of a launchctl call; never raises."""
+    exe = os.environ.get("HARNESS_LAUNCHCTL") or "launchctl"
+    try:
+        done = subprocess.run([exe] + args, capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as err:
+        return 1, str(getattr(err, "strerror", None) or err)
+    return done.returncode, first_line(done.stderr) or first_line(done.stdout) or f"exit {done.returncode}"
+
+
+def install_launchd(root):
+    """Write and load the LaunchAgent that runs `daily --repo <root>` at 03:30, as harness-digest's does."""
+    path = plist_path()
+    script = os.path.realpath(os.path.abspath(__file__))
+    job_path = ":".join(["/opt/homebrew/bin", "/usr/local/bin", home(".local", "bin"), "/usr/bin", "/bin"])
+    python = shutil.which("python3", path=job_path) or sys.executable    # the python3 the job's own PATH finds
+    log = harness_home("deadcode", "launchd.log")
+    job = {"Label": LABEL, "ProgramArguments": [python, script, "daily", "--repo", root],
+           "StartCalendarInterval": {"Hour": 3, "Minute": 30}, "EnvironmentVariables": {"PATH": job_path},
+           "StandardOutPath": log, "StandardErrorPath": log, "RunAtLoad": False}
+    try:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            plistlib.dump(job, fh)
+    except OSError as err:
+        raise Problem(f"cannot write {path}: {err.strerror or err}")
+    domain = f"gui/{os.getuid()}"
+    launchctl(["bootout", f"{domain}/{LABEL}"])          # an older copy; failing means none was loaded
+    code, why = launchctl(["bootstrap", domain, path])
+    if code == 0:
+        print(f"harness-deadcode: wrote {path} and loaded it (launchctl bootstrap {domain}); it runs daily at 03:30 "
+              f"on {root}, log {log}")
+        return
+    code2, why2 = launchctl(["load", "-w", path])
+    if code2 == 0:
+        print(f"harness-deadcode: wrote {path}; launchctl bootstrap failed ({why}), loaded it with launchctl load -w "
+              f"instead; it runs daily at 03:30 on {root}, log {log}")
+        return
+    raise Problem(f"wrote {path} but could not load it: launchctl bootstrap: {why}; launchctl load -w: {why2}")
+
+
+def uninstall_launchd():
+    path = plist_path()
+    code, why = launchctl(["bootout", f"gui/{os.getuid()}/{LABEL}"])
+    unloaded = "unloaded it (launchctl bootout)" if code == 0 else f"it was not loaded ({why})"
+    try:
+        os.remove(path)
+        removed = f"removed {path}"
+    except FileNotFoundError:
+        removed = f"no {path} to remove"
+    except OSError as err:
+        raise Problem(f"{unloaded}; cannot remove {path}: {err.strerror or err}")
+    print(f"harness-deadcode: {unloaded}; {removed}")
+
+
 def main():
     ap = Parser(prog="harness-deadcode", description="Dead-code candidates in a Harness checkout, with evidence.")
-    sub = ap.add_subparsers(dest="cmd", metavar="{scan}")
+    sub = ap.add_subparsers(dest="cmd", metavar="{scan,daily}")
     sub.required = True
     sc = sub.add_parser("scan", help="print the candidates and the subcommands and flags with no caller")
     sc.add_argument("--lines", action="append", default=[], metavar="FILE",
                     help='line data, coverage.py JSON shape; meta.kind "real" marks a loop run (repeatable)')
     sc.add_argument("--json", action="store_true", help='print {"candidates", "no_caller"}')
     sc.add_argument("--repo", metavar="PATH", help="the checkout (default: the one holding the cwd)")
+    dy = sub.add_parser("daily", help=f"file one {GATE} `{TITLE}` ticket of new candidates (once a day)")
+    dy.add_argument("--repo", metavar="PATH", help="the checkout (default: the one holding the cwd)")
+    mode = dy.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="print the batch it would file, file nothing")
+    mode.add_argument("--install-launchd", action="store_true", help="run it daily at 03:30 (a LaunchAgent)")
+    mode.add_argument("--uninstall-launchd", action="store_true", help="remove the LaunchAgent")
     args = ap.parse_args()
-    root = os.path.abspath(args.repo) if args.repo else find_root(os.getcwd())
-    if not os.path.isdir(os.path.join(root, P)):
-        raise Problem(f"{root} is not a Harness checkout (no {P})")
+    if args.cmd == "daily":
+        if args.uninstall_launchd:
+            uninstall_launchd()
+        else:
+            daily(args)
+        return
+    root = checkout(args.repo)
     out = scan(root, args.lines)
     emit(args.json, out, text_report(out))
 
