@@ -106,6 +106,7 @@ try:
                                   now_iso, read_text, write_json, write_text)
     from harness_lib.notify import notify
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
+    from harness_lib.issues import Issues, Rest
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
     from harness_lib.canary import SMOKE, run_canary
     from harness_lib.autoland import (CONVERSATION, at_head, behind_main, check_entries as lib_check_entries,
@@ -346,6 +347,12 @@ def gh(args, cwd, stdin=None, timeout=GH_TIMEOUT):
 def gh_json(args, cwd):
     """gh's output decoded as JSON (through this module's gh); Problem when it is not JSON."""
     return lib_gh_json(args, cwd, pick=first_line, via=gh)
+
+
+def issues(cwd):
+    """A ticket's issue read and label edit through REST in `cwd` (harness_lib.issues, #447), worded as the gh issue
+    command each replaces."""
+    return Issues(Rest(cwd, pick=first_line, timeout=GH_TIMEOUT))
 
 
 def sibling(name):
@@ -1744,8 +1751,9 @@ def land_ticket(repo, number, sha, pr, resolution, url=None, landed_by="hand"):
     `url`; a reopened ticket's earlier pass leaves its own, which
     do not, so its second landing gets a Resolution and `Landed in` of its own. (summary, error)."""
     done = []
+    ticket = issues(repo.main)
     try:
-        info = gh_json(["issue", "view", str(number), "--json", "state,labels,comments"], repo.main)
+        info = ticket.view(number, "state,labels,comments")
         info = info if isinstance(info, dict) else {}
         if str(info.get("state", "")).upper() != "CLOSED":
             board(repo, "close", str(number))
@@ -1755,10 +1763,7 @@ def land_ticket(repo, number, sha, pr, resolution, url=None, landed_by="hand"):
         statuses = [label.get("name") for label in as_list(info.get("labels"))
                     if str(label.get("name") or "").startswith("status:")]
         if statuses:
-            cmd = ["issue", "edit", str(number)]
-            for name in statuses:
-                cmd += ["--remove-label", name]
-            gh(cmd, repo.main)
+            ticket.edit_labels(number, remove=statuses)
             done.append("status labels removed")
         bodies = [(c.get("body") or "").lstrip() for c in as_list(info.get("comments"))]
         mine = [b for b in bodies if resolution_here(b, url)]

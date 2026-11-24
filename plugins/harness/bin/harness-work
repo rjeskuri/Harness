@@ -247,6 +247,7 @@ try:
     from harness_lib.text import write_json as _write_json
     from harness_lib import gh as ghlib
     from harness_lib import ghlimit
+    from harness_lib.issues import Issues, Rest
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-work: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
 
@@ -460,6 +461,7 @@ def open_repo(path):
 
 BOARD_WARNING = "harness-board: warning:"
 REPORTED = set()    # routing problems this process already printed; board() drops the same warning from its children
+BOARD_WRITES = ("status", "needs-input", "park", "comment", "close", "promote", "retype", "epic-check")
 
 
 def board(repo, *args):
@@ -468,6 +470,8 @@ def board(repo, *args):
     stderr stays hidden."""
     env = dict(os.environ, CLAUDE_PROJECT_DIR=repo.main)
     done = run([sibling("harness-board")] + [str(a) for a in args], cwd=repo.main, env=env, timeout=TOOL_TIMEOUT)
+    if str(args[0]) in BOARD_WRITES and len(args) > 1 and str(args[1]).isdigit():
+        issues(repo).drop(int(args[1]))         # the board changed it: a later read here asks GitHub again
     if done.returncode != 0:
         why = last_line(done.stderr) or last_line(done.stdout) or f"exit {done.returncode}"
         if why.startswith("harness-board: "):
@@ -501,6 +505,18 @@ def gh_json(repo, args):
     """gh's JSON output (None when it printed nothing), run in the main checkout; Problem with gh's last stderr line."""
     return ghlib.gh_json(args, repo.main, pick=last_line, empty_ok=True, errors="surrogateescape", timeout=GH_TIMEOUT,
                          describe=lambda a: " ".join(a[:2]), texts=WORK_GH_TEXTS)
+
+
+REST = {}           # main checkout: its Issues, this command's REST reads with each issue read once (#447)
+
+
+def issues(repo):
+    """The repository's issues and branch pull requests through REST (harness_lib.issues), a failure worded as the
+    gh command it replaces, as gh_json words it (`gh issue view failed: ...`)."""
+    if repo.main not in REST:
+        REST[repo.main] = Issues(Rest(repo.main, pick=last_line, describe=lambda a: " ".join(a[:2]),
+                                      texts=WORK_GH_TEXTS, errors="surrogateescape", timeout=GH_TIMEOUT))
+    return REST[repo.main]
 
 
 def api_key_cmd():
@@ -697,7 +713,7 @@ def hostname():
 
 
 def issue_labels(repo, number):
-    issue = gh_json(repo, ["issue", "view", str(number), "--json", "labels"])
+    issue = issues(repo).view(number, "labels")
     labels = issue.get("labels") if isinstance(issue, dict) else None
     return [lb.get("name") for lb in labels or [] if isinstance(lb, dict)]
 
@@ -1245,8 +1261,7 @@ def branch_merged(repo, branch, since):
     the run started is an earlier run's, and one without a readable mergedAt does not count (#295)."""
     if not branch:
         return False
-    prs = gh_json(repo, ["pr", "list", "--head", str(branch), "--state", "all", "--json", "number,state,mergedAt",
-                         "--limit", str(PR_ROWS)])
+    prs = issues(repo).pulls(branch, "all", PR_ROWS)
     rows = prs if isinstance(prs, list) else []
     for pr in rows:
         if not isinstance(pr, dict) or str(pr.get("state", "")).upper() != "MERGED":
@@ -1269,7 +1284,7 @@ def sweep_cloud(record, repos, logins):
     started = parse_iso(record.get("started_at")) or now()
     try:
         repo = record_repo(record, repos)
-        issue = gh_json(repo, ["issue", "view", str(n), "--json", "number,title,state,labels,comments"])
+        issue = issues(repo).view(n, "number,title,state,labels,comments")
         if not isinstance(issue, dict):
             raise Problem(f"gh issue view {n} printed no issue")
         marker = cloud_marker(issue, gh_login(repo, logins), started)
@@ -1485,8 +1500,7 @@ def launch(repo, ticket, venue, effort=None):
 
 def started_comments(repo, n):
     """How many "Started on" comments ticket n carries."""
-    issue = gh_json(repo, ["issue", "view", str(n), "--json", "comments"])
-    comments = issue.get("comments") if isinstance(issue, dict) else None
+    comments = issues(repo).comments(n, fresh=True)     # each look asks again: the wait is for a new one
     return sum(1 for c in comments or [] if isinstance(c, dict) and str(c.get("body") or "").startswith("Started on"))
 
 
@@ -1695,7 +1709,7 @@ def ticket_issue(repo, n):
     key = (repo.main, n)
     if key not in ISSUES:
         try:
-            ISSUES[key] = gh_json(repo, ["issue", "view", str(n), "--json", "number,title,state,stateReason,labels"])
+            ISSUES[key] = issues(repo).view(n, "number,title,state,stateReason,labels")
         except Problem as err:
             ISSUES[key] = err
     found = ISSUES[key]
@@ -1724,8 +1738,7 @@ def without_pr(repo, n, branch):
 def branch_prs(repo, branch, strict=False):
     """The pull requests of `branch` in any state, newest first (a failing gh call raises Problem; with `strict` so
     does an answer that is not a list, which otherwise reads as none)."""
-    prs = gh_json(repo, ["pr", "list", "--head", str(branch), "--state", "all", "--json", "number,state,isDraft",
-                         "--limit", str(PR_ROWS)]) if branch else []
+    prs = issues(repo).pulls(branch, "all", PR_ROWS) if branch else []
     if strict and not isinstance(prs, list):
         raise Problem(f"gh pr list --head {branch} printed no list of pull requests")
     return [pr for pr in prs if isinstance(pr, dict)] if isinstance(prs, list) else []
@@ -2047,11 +2060,12 @@ PR_FIELDS = "number,url,createdAt,mergedAt,headRefName"
 RUN_FIELDS = "databaseId,status,conclusion,createdAt,startedAt,updatedAt"
 
 
-def gh_part(repo, args, shape):
-    """gh's JSON for one part of the cost record, or None with one warning line naming the call when gh fails or
-    prints something other than a `shape`."""
+def gh_part(repo, args, shape, fetch=None):
+    """gh's JSON for one part of the cost record (with `fetch`, what fetch() reads in place of the gh call `args`,
+    which still names it), or None with one warning line naming the call when gh fails or prints something other
+    than a `shape`."""
     try:
-        data = gh_json(repo, args)
+        data = gh_json(repo, args) if fetch is None else fetch()
     except Problem as err:
         warn(str(err))
         return None
@@ -2071,8 +2085,7 @@ def cost_extras(repo, record, cache):
     if pr is not None:
         info = gh_part(repo, ["pr", "view", str(pr), "--json", PR_FIELDS], dict)
     elif branch:
-        found = gh_part(repo, ["pr", "list", "--head", branch, "--state", "all", "--json", PR_FIELDS,
-                               "--limit", "10"], list)
+        found = gh_part(repo, ["pr", "list", "--head", branch], list, lambda: issues(repo).pulls(branch, "all", 10))
         info = cost.pick_pr(found)
         pr = record["pr"] = info["number"] if info else None
     info = info or {}
@@ -2089,7 +2102,7 @@ def cost_extras(repo, record, cache):
             runs = gh_part(repo, ["run", "list", "--branch", head, "--json", RUN_FIELDS, "--limit", "100"], list)
             if runs is not None:
                 record["ci"] = cost.ci_summary(runs)
-    issue = gh_part(repo, ["issue", "view", str(n), "--json", "comments,labels"], dict)
+    issue = gh_part(repo, ["issue", "view", str(n)], dict, lambda: issues(repo).view(n, "comments,labels"))
     comments = issue.get("comments") if issue and isinstance(issue.get("comments"), list) else None
     if issue is not None:
         record["needs_input"] = cost.needs_input_count(comments)
@@ -2346,8 +2359,7 @@ def autodispatch_repo(project):
     repo = Repo(project.path)
     if setting_from(AUTODISPATCH, committed_env(repo.main)) != "1":
         return None, f"not opted in ({AUTODISPATCH} is not 1 in .claude/settings.json at origin/main)"
-    found = gh_json(repo, ["issue", "list", "--label", "incident", "--state", "open", "--json", "number,title"])
-    incidents = [f"#{i.get('number')}" for i in found if isinstance(i, dict)] if isinstance(found, list) else []
+    incidents = [f"#{i.get('number')}" for i in issues(repo).list(["incident"], "open")]
     if incidents:
         return None, f"incident {', '.join(incidents)} open"
     return repo, None
@@ -2477,7 +2489,7 @@ def cmd_waves(repo, args):
             if statuses[n] in waves.DONE:
                 continue
             try:
-                found = gh_json(repo, ["issue", "view", str(n), "--json", "state,labels"])
+                found = issues(repo).view(n, "state,labels")
             except Problem as err:
                 warn(f"#{n}: cannot refresh its status; the cache's stands: {err}")
                 continue
@@ -2683,8 +2695,7 @@ def cmd_worktrees(repo, args):
         branch = entry.branch
         if branch and gh_failed is None:
             try:
-                found = gh_json(repo, ["pr", "list", "--head", branch, "--state", "all", "--json",
-                                       "number,state,isDraft", "--limit", "1"])
+                found = issues(repo).pulls(branch, "all", 1)
                 if isinstance(found, list) and found and isinstance(found[0], dict):
                     pr = {"number": found[0].get("number"), "state": str(found[0].get("state") or "").upper(),
                           "draft": bool(found[0].get("isDraft"))}

@@ -121,8 +121,9 @@ class LandCanary(WorktreeTest):
             {"match": ["pr", "view", "34", "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": sha}}},
             {"match": ["pr", "view", "34", "--json", LAND_FIELDS], "stdout_json": land_view()},
             REPO_VIEW, {"match": ["pr", "merge", "34"], "stdout": ""},
-            {"match": ["issue", "view", "12", "--json", "state,labels,comments"], "stdout_json": before},
-            {"match": ["issue", "edit", "12"], "stdout": ""},
+            # #447: land's ticket read and status-label edit through REST; revert's gh issue calls below stay
+            *fakegh.as_rest([{"match": ["issue", "view", "12", "--json", "state,labels,comments"],
+                              "stdout_json": before}]),
             {"match": ["api", f"repos/o/r/commits/{sha}/pulls"],
              "stdout_json": [{"number": 34, "title": merged["title"], "html_url": merged["url"],
                               "merge_commit_sha": sha, "merged_at": "2026-11-15T10:00:00Z"}]},
@@ -136,14 +137,14 @@ class LandCanary(WorktreeTest):
             {"contains": ["repos/o/r/issues/12/comments"], "stdout_json": []}]
 
     def land(self, sha, cwd=None, **env):
-        self.scenario(self.calls(sha))
+        self.scenario(self.calls(sha), rest=False)      # calls() moved land's own fixtures to REST already
         return self.pr("land", "34", cwd=cwd or self.main, **env)
 
     def bounded_land(self, sha, **env):
         """self.land's run from the main checkout, given BOUND seconds to return: still running then, it is killed
         with its process group and the test fails, so a canary that never ends cannot hang the suite. Its output goes
         to files, not pipes, so the land's own exit is timed, not that of whatever still holds its output."""
-        self.scenario(self.calls(sha))
+        self.scenario(self.calls(sha), rest=False)
         argv = [sys.executable, TOOL, "land", "34"]
         out_path, err_path = os.path.join(self.tmp, "land.out"), os.path.join(self.tmp, "land.err")
         start = time.monotonic()

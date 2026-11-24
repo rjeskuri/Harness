@@ -2354,6 +2354,27 @@ class ToolsRunTheLib(unittest.TestCase):
         os.chmod(path, 0o755)
         return path
 
+    def rest_world(self, calls):
+        """os.environ for a tool run in this process against fakegh with `calls` (gh issue fixtures moved to its REST
+        layer, #447): HARNESS_GH, the scenario and its log, HOME here so the gh call log stays in tmp."""
+        if str(TESTS) not in sys.path:
+            sys.path.insert(0, str(TESTS))
+        import fakegh
+        scenario = self.put("world/scenario.json", json.dumps({"calls": fakegh.as_rest(calls)}))
+        for leftover in (os.path.join(self.tmp, "gh.log"), scenario + ".state.json"):
+            if os.path.exists(leftover):
+                os.unlink(leftover)
+        gh = self.fake_exe("gh", f'exec "{sys.executable}" "{TESTS / "fakegh.py"}" "$@"\n')
+        return {"HARNESS_GH": gh, "FAKEGH_SCENARIO": scenario, "FAKEGH_LOG": os.path.join(self.tmp, "gh.log"),
+                "HOME": self.tmp}
+
+    def rest_writes(self):
+        """The writes the REST world saw, as the gh commands they stand for (fakegh.gh_view)."""
+        import fakegh
+        return [a for a in fakegh.gh_view(fakegh.log_entries(os.path.join(self.tmp, "gh.log")),
+                                          os.path.join(self.tmp, "world", "scenario.json"))
+                if not fakegh.is_world_read(a)]
+
     # ---- both tools: Problem
 
     def test_board_and_pr_raise_and_catch_the_one_problem(self):
@@ -2384,7 +2405,9 @@ class ToolsRunTheLib(unittest.TestCase):
             raise self.cli.Problem("gh issue view 3 failed: HTTP 404")
 
         board.gh_json = failing
-        self.assertEqual(board.task_resolutions(None, [{"number": 3, "state": "CLOSED"}]), {})
+        unreadable = [{"match": ["issue", "view", "3"], "stderr": "HTTP 404: Not Found\n", "exit": 1}]
+        with mock.patch.dict(os.environ, self.rest_world(unreadable)):     # #447: or the REST read of #3 fails
+            self.assertEqual(board.task_resolutions(None, [{"number": 3, "state": "CLOSED"}]), {})
         cwd = os.getcwd()
         os.chdir(self.tmp)
         try:
@@ -2446,17 +2469,17 @@ class ToolsRunTheLib(unittest.TestCase):
     def test_board_ready_reads_lists_and_prints_a_table_through_the_lib(self):
         items = [
             {"number": 5, "title": "Beta", "labels": [{"name": "task"}, {"name": "status:ready"}],
-             "blockedBy": {"nodes": [{"state": "CLOSED"}]}},
+             "blockedBy": [{"number": 1, "state": "CLOSED"}]},
             {"number": 3, "title": "Alpha", "labels": [{"name": "bug"}, {"name": "status:ready"}],
              "blockedBy": []},
             {"number": 9, "title": "Waiting", "labels": [{"name": "task"}, {"name": "status:ready"}],
-             "blockedBy": {"nodes": [{"state": "OPEN"}]}},
+             "blockedBy": [{"number": 2, "state": "OPEN"}]},
         ]
         board = load_tool(BIN / "harness-board")
-        board.gh_json = lambda *args, **kwargs: copy.deepcopy(items)
         self.spy(board, self.cli.table, "table")
         self.spy(board, self.text.as_list, "as_list")
-        _, out, _ = capture(board.cmd_ready, None, argparse.Namespace(json=False))
+        with mock.patch.dict(os.environ, self.rest_world([{"match": ["issue", "list"], "stdout_json": items}])):
+            _, out, _ = capture(board.cmd_ready, None, argparse.Namespace(json=False))     # #447: through REST
         self.assertEqual(len(self.called("table")), 1)
         self.assertGreaterEqual(len(self.called("as_list")), 3)
         self.assertIn("Alpha", out)
@@ -2476,30 +2499,23 @@ class ToolsRunTheLib(unittest.TestCase):
             self.assertEqual(json.load(fh)["title"], "T40 — café")
 
     def test_board_reads_a_comment_body_file_through_the_lib(self):
-        """cmd_comment --body-file: read_text reads it, the comment reaches gh with the marker, first_line picks
-        the URL gh printed, emit prints it as text or JSON."""
+        """cmd_comment --body-file: read_text reads it, the comment reaches GitHub with the marker (#447: through
+        REST), emit prints the comment's URL GitHub answered with, as text or JSON."""
         path = self.put("notes/body.md", "Fixed — see the PR.\n\nDetails here.\n")
         url = "https://github.com/o/r/issues/12#issuecomment-99"
         for as_json in (False, True):
             with self.subTest(as_json=as_json):
                 self.calls.clear()
                 board = load_tool(BIN / "harness-board")
-                seen = []
-
-                def gh(repo, args, stdin=None):
-                    seen.append((list(args), stdin))
-                    return f"\n{url}\n"
-
-                board.gh = gh
                 self.spy(board, self.text.read_text, "read_text")
-                self.spy(board, self.text.first_line, "first_line")
                 self.spy(board, self.cli.emit, "emit")
                 ns = argparse.Namespace(number=12, body=None, body_file=path, json=as_json)
-                _, out, err = capture(board.cmd_comment, None, ns)
-                self.assertEqual(seen, [(["issue", "comment", "12", "--body-file", "-"],
-                                         "Fixed — see the PR.\n\nDetails here.\n\n<!-- harness -->")])
+                world = self.rest_world([{"match": ["issue", "comment", "12"], "stdout": f"\n{url}\n"}])
+                with mock.patch.dict(os.environ, world):
+                    _, out, err = capture(board.cmd_comment, None, ns)
+                self.assertEqual(self.rest_writes(), [["issue", "comment", "12", "--body",
+                                                       "Fixed — see the PR.\n\nDetails here.\n\n<!-- harness -->"]])
                 self.assertEqual([args for args, _ in self.called("read_text")], [(path, "body file")])
-                self.assertEqual(self.given("first_line"), [url])
                 self.assertEqual(len(self.called("emit")), 1)
                 self.assertEqual(err, "")
                 self.assertEqual(json.loads(out) if as_json else out,
@@ -2548,11 +2564,11 @@ class ToolsRunTheLib(unittest.TestCase):
                  "parent": None, "blockedBy": [],
                  "comments": [{"author": {"login": "ryan"}, "createdAt": "2026-10-16T10:00:00Z", "body": "go"}]}
         board = load_tool(BIN / "harness-board")
-        board.gh_json = lambda repo, args: copy.deepcopy(issue)
         self.spy(board, self.text.now_iso, "now_iso")
         # a blank routing variable counts as unset, so the developer's own HARNESS_CODE_TIER cannot replace the labels
         routing = {k: "" for k in ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER",
                                    "HARNESS_ULTRAREVIEW", "HARNESS_WAVE_REVIEW")}
+        routing.update(self.rest_world([{"match": ["issue", "view", "7"], "stdout_json": issue}]))   # #447: REST
         before = int(time.time())
         with mock.patch.dict(os.environ, routing):
             record = board.fetch_record(None, 7)
@@ -2586,10 +2602,12 @@ class ToolsRunTheLib(unittest.TestCase):
             with self.subTest(since=since):
                 self.calls.clear()
                 board = load_tool(BIN / "harness-board")
-                board.gh = lambda repo, args, stdin=None: "Ryan\n"
-                board.gh_json = lambda repo, args: {"comments": copy.deepcopy(comments)}
                 self.spy(board, self.text.parse_iso, "parse_iso")
-                _, out, _ = capture(board.cmd_answers, None, argparse.Namespace(number=12, since=since))
+                world = self.rest_world([{"match": ["api", "user"], "stdout": "Ryan\n"},       # #447: through REST
+                                         {"match": ["issue", "view", "12"], "stdout_json": {
+                                             "comments": copy.deepcopy(comments)}}])
+                with mock.patch.dict(os.environ, world):
+                    _, out, _ = capture(board.cmd_answers, None, argparse.Namespace(number=12, since=since))
                 self.assertEqual([c["body"] for c in json.loads(out)], want)
                 parsed = set(self.given("parse_iso"))
                 self.assertTrue({c["createdAt"] for c in comments[:3]} <= parsed, parsed)

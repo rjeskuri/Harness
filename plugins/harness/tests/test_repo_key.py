@@ -303,9 +303,10 @@ class KeyFixture(unittest.TestCase):
                 "body": "## Request\nFix it.\n\n## Definition of done\n- [ ] it works\n",
                 "labels": [{"name": n} for n in ("task", "status:in-progress", "size:M", "risk:low")],
                 "state": "OPEN", "parent": None, "blockedBy": [], "comments": []}
-        write(self.scenario, json.dumps({"calls": [
+        import fakegh  # the REST layer harness-board reads issues through (#447)
+        write(self.scenario, json.dumps({"calls": fakegh.as_rest([
             {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}},
-            {"match": ["issue", "view", str(number)], "stdout_json": data}]}))
+            {"match": ["issue", "view", str(number)], "stdout_json": data}])}))
 
     def put_ticket(self, state, number=12, **fields):
         ticket = {"number": number, "title": "Fix login", "type": "task", "status": "in-progress",

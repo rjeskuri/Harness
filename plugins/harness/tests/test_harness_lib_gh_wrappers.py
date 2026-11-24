@@ -86,6 +86,8 @@ FAKEGH = TESTS / "fakegh.py"
 BOARD = BIN / "harness-board"
 PR = BIN / "harness-pr"
 WORK = BIN / "harness-work"
+sys.path.insert(0, str(TESTS))
+import fakegh  # noqa: E402  (#447: the board's issue calls are REST; the fixtures move to its REST layer)
 
 WRAPPERS = ("describe", "gh_run", "gh", "gh_json")
 GH_ENV_EXPECTED = {"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"}
@@ -1072,6 +1074,10 @@ class Routed(Case):
         patcher = mock.patch.multiple(gh, gh_exe=lambda: W["gh"], **{n: recorder(n) for n in reals})
         patcher.start()
         self.addCleanup(patcher.stop)
+        # #447: harness_lib.issues takes the wrappers by name when it is imported, as the tools do, so it is
+        # imported again under the recorders, as the tool is (and dropped again after, so no later test holds them)
+        sys.modules.pop("harness_lib.issues", None)
+        self.addCleanup(sys.modules.pop, "harness_lib.issues", None)
         return load(path, name)
 
     def seen(self, *fns):
@@ -1088,34 +1094,36 @@ class BoardRoutesThroughTheLibTests(Routed):
         return {"number": 12, "title": title, "url": "https://github.com/x/y/issues/12", "labels": [{"name": "epic"}],
                 "state": "OPEN", "body": "## Goal\nShip it.\n", "comments": [], "parent": None, "blockedBy": []}
 
-    def test_fetch_record_runs_issue_view_repo_view_and_api_through_the_lib(self):
+    def test_fetch_record_runs_the_issue_and_sub_issue_reads_through_the_lib(self):
+        """#447: the epic's read and its sub-issues' are REST (`gh api`), both through the lib's gh/gh_json."""
         for slug in self.SLUGS:
             with self.subTest(slug=slug):
                 self.calls.clear()
                 title = f"Epic for {slug}"
                 sub = f"repos/{slug}/issues/12/sub_issues?per_page=100"
-                self.routed_scenario({"calls": [
+                self.routed_scenario({"calls": fakegh.as_rest([
                     {"match": ["issue", "view", "12"], "stdout_json": self.epic(title)},
                     {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": slug}},
                     {"match": ["api", sub], "stdout_json": [{"number": 13, "title": "t13", "labels": [], "state": "OPEN"},
-                                                            {"number": 14, "title": "t14", "labels": [], "state": "OPEN"}]}]})
+                                                            {"number": 14, "title": "t14", "labels": [], "state": "OPEN"}]}])})
                 board = self.route(BOARD, f"harness_board_routed_{len(slug)}")
                 record = board.fetch_record(board.Repo(self.repo_path), 12)
                 self.assertEqual((record["title"], [t["number"] for t in record["tasks"]]), (title, [13, 14]))
                 top = self.seen("gh", "gh_json")
-                for prefix in (["issue", "view", "12"], ["repo", "view"], ["api", sub]):
-                    self.assertTrue(any(a[:len(prefix)] == prefix for a in top), f"{prefix} not through the lib: {top}")
+                for route in ("issues/12", "issues/12/sub_issues"):
+                    self.assertTrue(any((fakegh.parse_api(a) or {}).get("route") == route for a in top),
+                                    f"GET {route} not through the lib: {top}")
                 self.assertTrue(self.seen("gh_run"), "the lib's gh/gh_json reach gh_run")
                 self.assertNoPoison()
 
     def test_board_failures_name_the_call_with_ghs_first_stderr_line(self):
         for slug, token in zip(self.SLUGS, ("t-a1", "t-b2")):
             with self.subTest(slug=slug):
-                self.routed_scenario({"calls": [
+                self.routed_scenario({"calls": fakegh.as_rest([      # #447: the issue's read is REST
                     {"match": ["issue", "view", "12"], "stderr": f"GraphQL: Could not resolve ({token})\nsecond\n", "exit": 1},
                     {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": slug}},
                     {"match": ["api", f"repos/{slug}/issues/5"], "stderr": f"\nHTTP 403: Forbidden ({token})\nmore\n",
-                     "exit": 1}]})
+                     "exit": 1}])})
                 board = self.route(BOARD, f"harness_board_routed_fail_{token}")
                 repo = board.Repo(self.repo_path)
                 with self.assertRaises(self.Problem) as caught:
@@ -1130,13 +1138,14 @@ class BoardRoutesThroughTheLibTests(Routed):
 
     def test_board_commands_run_gh_only_through_the_lib(self):
         """Whole commands through board's main(): every gh call they make goes through the lib (none reaches the
-        poison), with the calls and output they make today."""
+        poison), with the calls and output they make today. #447: those calls are REST (`gh api`); `made` is what
+        the call does on GitHub, as fakegh.gh_view reads it back."""
         url = "https://github.com/acme/widget/issues/12#issuecomment-77"
         cases = [
             (["ready", "--json"],
              [{"match": ["issue", "list"], "stdout_json": [{"number": 21, "title": "T21", "blockedBy": [],
                                                             "labels": [{"name": "status:ready"}, {"name": "task"}]}]}],
-             ["issue", "list", "--state", "open", "--label", "status:ready"], '"number": 21'),
+             ("list", ["status:ready"], "open"), '"number": 21'),
             (["status", "12", "in-progress", "--comment", "moving"],
              [{"match": ["issue", "view", "12"], "stdout_json": {"labels": [{"name": "status:ready"}, {"name": "task"}]}},
               {"match": ["issue", "edit", "12"], "stdout": ""},
@@ -1150,9 +1159,18 @@ class BoardRoutesThroughTheLibTests(Routed):
         ]
         self.routed_scenario({"default": {"stdout": ""}})
         board = self.route(BOARD, "harness_board_routed_main")
+
+        def does(made, entries):
+            """Whether one of the logged calls does `made` (its gh_view prefix, or a list query)."""
+            if made[0] == "list":
+                return any(sorted(labels) == made[1] and (state or "open") == made[2]
+                           for labels, state in fakegh.list_queries(entries))
+            return any(a[:len(made)] == made for a in fakegh.gh_view(entries, self.scenario_path))
+
         for argv, calls, made, printed in cases:
             with self.subTest(cmd=argv[0]):
-                self.routed_scenario({"calls": calls})
+                self.routed_scenario({"calls": fakegh.as_rest(calls)})
+                self.calls.clear()
                 out = io.StringIO()
                 with mock.patch.object(sys, "argv", ["harness-board"] + argv + ["--repo", self.repo_path]), \
                         contextlib.redirect_stdout(out):
@@ -1161,10 +1179,10 @@ class BoardRoutesThroughTheLibTests(Routed):
                     except SystemExit as stop:
                         self.assertIn(stop.code, (None, 0), f"harness-board {' '.join(argv)}: {stop.code}")
                 self.assertIn(printed, out.getvalue())
-                argvs = [c["argv"] for c in self.lines(self.ghlog)]
-                self.assertTrue(any(a[:len(made)] == made for a in argvs), f"{made} not in {argvs}")
-                self.assertTrue(any(a[:len(made)] == made for a in self.seen("gh", "gh_json")),
-                                f"{made} not through the lib's gh/gh_json")
+                logged = self.lines(self.ghlog)
+                self.assertTrue(does(made, logged), f"{made} not in {[c['argv'] for c in logged]}")
+                through = [{"argv": a, "stdin": "", "exit": 0} for a in self.seen("gh", "gh_json")]
+                self.assertTrue(does(made, through), f"{made} not through the lib's gh/gh_json: {self.seen('gh')}")
                 self.assertNoPoison()
 
 
