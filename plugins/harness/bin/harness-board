@@ -24,9 +24,7 @@ Usage:
     harness-board epic-check N
     harness-board board
     harness-board tier N [--stage review]
-    harness-board project check
-    harness-board project sync [--repo PATH | --all-projects] [--dry-run]
-    Every subcommand but `project` takes --repo PATH (default: CLAUDE_PROJECT_DIR, else the cwd's repository)
+    Every subcommand takes --repo PATH (default: CLAUDE_PROJECT_DIR, else the cwd's repository)
     and --json.
 
 Every comment posted here ends with the line `<!-- harness -->` (hidden on GitHub), so `answers` can tell the
@@ -37,21 +35,10 @@ ops` labels it `ops` and `needs-local` (once), and `show` parses its sections (R
 Apply, Verify, Rollback, Context) in place of a task's. `retype` swaps the type label for --type, keeps every other
 label and comments the reason; --reason is required.
 
-With HARNESS_PROJECT=OWNER/NUMBER (the environment first, where an empty value means off; else `env` in
-~/.claude/settings.json), `epic create` and `task create` add the issue to that GitHub Projects board with
-Status Ready (and Priority High for `task create --priority`), and every status change sets the item's Status.
-`status:proposed` has no Status on the board: a `--proposed` create only adds the item, `status N proposed` writes
-no Status, and `project sync` leaves a proposed issue's Status as it is.
-The labels stay the source of truth: a failed project call is one warning on stderr and never fails the command.
-`project check` (gh project field-list) names each Status or Priority option the board lacks and exits 1 if any.
-`project sync` reads the board (gh project item-list) and the open issues of the repository, or of every project
-in ~/.claude/harness/projects.json with --all-projects, adds the missing issues and corrects Status and Priority
-drift from the labels (an unset Priority counts as Normal, so only High against Normal is drift), one line per
-change; --dry-run prints the lines and writes nothing. Both need the setting.
+The labels are the whole board: there is no GitHub Projects board to mirror them to.
 
 gh is HARNESS_GH when set, else `gh` on PATH. Issues are read and changed through REST (`gh api`, harness_lib/issues.py:
-GitHub's core rate-limit bucket, not GraphQL), each issue read once per command; the board's IDs are kept in
-~/.claude/harness/boards/<owner>-<number>.json, so a status change after the first is one `gh project item-edit`.
+GitHub's core rate-limit bucket, not GraphQL), each issue read once per command.
 """
 from __future__ import annotations
 
@@ -68,11 +55,10 @@ if _LIB not in sys.path:
 try:
     from harness_lib.paths import adopt_old_state, canonical_path, path_key, repo_key, same_entry
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table, warn
-    from harness_lib.text import (as_list, first_line, harness_home, home, now_iso, one_line, parse_iso, read_json,
+    from harness_lib.text import (as_list, first_line, harness_home, now_iso, one_line, parse_iso, read_json,
                                   read_text, write_json)
     from harness_lib.notify import notify
     from harness_lib.repo import RepoError, repo_facts
-    from harness_lib.registry import load_registry
     from harness_lib.gh import describe, gh as lib_gh, gh_json as lib_gh_json
     from harness_lib.issues import Issues, Rest
     from harness_lib.routing import cached_code_route, code_route, label_tier, load_routing, review_route
@@ -112,7 +98,6 @@ CREATE_TYPES = TASK_TYPES + ("ops",)
 STATUSES = ("ready", "in-progress", "in-review", "blocked", "needs-input", "proposed")
 STATUS_TITLES = {"ready": "Ready", "in-progress": "In progress", "in-review": "In review", "blocked": "Blocked",
                  "needs-input": "Needs input", "proposed": "Proposed"}
-MIRRORED = tuple(s for s in STATUSES if s != "proposed")   # the statuses with a Status option on the Projects board
 FLAGS = ("no-tests", "needs-local", "priority:high")
 TIERS = ("sonnet", "opus", "fable")
 SECTIONS = [("Request", "request"), ("Outline", "outline"), ("Definition of done", "definition_of_done"),
@@ -138,13 +123,6 @@ FOLLOW_UP_TITLE = 60    # characters of the reason's first line in the follow-up
 LIST_LIMIT = "200"
 GH_TIMEOUT = 60         # seconds per gh call
 LINK_RETRY_DELAY = 1.0  # seconds before the one retry of a sub-issue link
-PROJECT_SETTING = "HARNESS_PROJECT"   # OWNER/NUMBER of the Projects board the status is mirrored to
-PROJECT_VALUE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[1-9][0-9]*")
-PROJECT_FIELDS = (("Status", [STATUS_TITLES[s] for s in MIRRORED] + ["Done"]), ("Priority", ["High", "Normal"]))
-FIELD_LIMIT = "100"     # a project holds at most 50 fields
-REFUSED_ID = re.compile(r"Could not resolve to a node with the global id")   # a kept board ID gone stale (#447)
-ITEM_LIMIT = "1000"     # the board items project sync reads
-ISSUE_LIMIT = "1000"    # the open issues per repository project sync reads
 CHECKBOX = re.compile(r"^[-*+]\s+\[[ xX]\]")
 BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*\S)")
 HEADING = re.compile(r"^##\s+(.*?)\s*#*\s*$")
@@ -269,113 +247,6 @@ def by_harness(body):
     """Was this comment posted by the harness? The marker, or (older comments) a body the harness writes."""
     body = body or ""
     return MARKER in body or body.lstrip().startswith(HARNESS_PREFIXES)
-
-
-# --------------------------------------------------------------- the Projects board mirror
-def settings_project():
-    """env.HARNESS_PROJECT of ~/.claude/settings.json when that parses as a JSON object and it is a string."""
-    try:
-        data = read_json(home(".claude", "settings.json"))
-    except RecursionError:                      # deeply nested JSON: read_json lets it through
-        return None
-    env = data.get("env") if isinstance(data, dict) else None
-    value = env.get(PROJECT_SETTING) if isinstance(env, dict) else None
-    return value if isinstance(value, str) else None
-
-
-def project_value():
-    """HARNESS_PROJECT as set: the environment first (an empty value is off), else the settings file."""
-    value = os.environ.get(PROJECT_SETTING)
-    return settings_project() if value is None else value
-
-
-def project_setting():
-    """(owner, number) of the board to mirror to, or None: the environment first (an empty value is off), else
-    the settings file. A value that is not OWNER/NUMBER is one warning and no mirroring."""
-    value = project_value()
-    if not value:
-        return None
-    if not PROJECT_VALUE.fullmatch(value):
-        warn("harness-board", f"{PROJECT_SETTING}={value!r} is not OWNER/NUMBER; the Projects board is not updated")
-        return None
-    owner, number = value.split("/")
-    return owner, number
-
-
-def board_ids_path(project):
-    """Where the board's IDs are kept (#447): ~/.claude/harness/boards/<owner>-<number>.json."""
-    return harness_home("boards", f"{project[0]}-{project[1]}.json")
-
-
-def board_ids(repo, project, ids, url, fields, add, again):
-    """`ids` ({id, fields: {name: {id, options: {name: id}}}, items: {url: id}}) with what the edits need filled in:
-    the board's ID (gh project view), its fields' and options' (gh project field-list) and the issue's item (gh
-    project item-add, which returns the item already there). `add` adds the item whatever is kept; `again` resolves
-    everything afresh. Kept in board_ids_path when anything changed; Problem naming what the board lacks."""
-    owner, number = project
-    target = [number, "--owner", owner]
-    old = dict(ids)
-    if again or not isinstance(ids.get("id"), str):
-        data = gh_json(repo, ["project", "view"] + target + ["--format", "json"])
-        found = data.get("id") if isinstance(data, dict) else None
-        if not isinstance(found, str) or not found:
-            raise Problem(f"gh project view {number} named no board ID")
-        same = found == ids.get("id")           # a board made again: its fields and items are new too
-        ids = {"id": found, "fields": ids.get("fields") if same else {}, "items": ids.get("items") if same else {}}
-    have = ids.get("fields") if isinstance(ids.get("fields"), dict) else {}
-    if again or any(value not in ((have.get(field) or {}).get("options") or {}) for field, value in fields):
-        data = gh_json(repo, ["project", "field-list"] + target + ["--format", "json", "--limit", FIELD_LIMIT])
-        have = {f["name"]: {"id": f["id"], "options": {o.get("name"): o.get("id") for o in as_list(f.get("options"))}}
-                for f in as_list(data.get("fields") if isinstance(data, dict) else None)
-                if isinstance(f.get("name"), str) and isinstance(f.get("id"), str)}
-    ids = dict(ids, fields=have, items=dict(ids.get("items") or {}))
-    if add or again or not isinstance(ids["items"].get(url), str):
-        data = gh_json(repo, ["project", "item-add"] + target + ["--url", url, "--format", "json"])
-        item = data.get("id") if isinstance(data, dict) else None
-        if not isinstance(item, str) or not item:
-            raise Problem(f"gh project item-add {number} named no item ID")
-        ids["items"][url] = item
-    if ids != old:
-        try:
-            write_json(board_ids_path(project), ids, prefix=".board-")
-        except OSError:
-            pass                        # best effort: the next change resolves them again
-    for field, value in fields:
-        if not ((ids["fields"].get(field) or {}).get("options") or {}).get(value):
-            raise Problem(f"it has no {field} option {value} (harness-board project check names what it lacks)")
-    return ids
-
-
-def mirror(repo, project, url, fields, add=False):
-    """Add the issue at `url` to the board (when `add`), then set each (field, option) with gh project item-edit by
-    IDs, resolved once and kept (board_ids; #447). An ID the board refuses resolves them all again, once; another
-    failure, or a second refusal, stops the rest with one warning. The labels already changed, so this never fails
-    the command."""
-    owner, number = project
-    kept = read_json(board_ids_path(project))
-    ids = kept if isinstance(kept, dict) else {}
-    try:
-        for again in (False, True):
-            try:
-                ids = board_ids(repo, project, ids, url, fields, add, again)
-                for field, value in fields:
-                    spec = ids["fields"][field]
-                    gh(repo, ["project", "item-edit", "--id", ids["items"][url], "--project-id", ids["id"],
-                              "--field-id", spec["id"], "--single-select-option-id", spec["options"][value]])
-                return
-            except Problem as err:
-                if again or not REFUSED_ID.search(str(err)):
-                    raise
-    except Problem as err:
-        warn("harness-board", f"the Projects board {owner}/{number} was not updated: {err}")
-
-
-def mirror_created(repo, url, priority=False, proposed=False):
-    """Add a new issue to the board with Status Ready; a proposed one gets no Status."""
-    project = project_setting()
-    if project:
-        mirror(repo, project, url, ([] if proposed else [("Status", "Ready")])
-               + ([("Priority", "High")] if priority else []), add=True)
 
 
 # --------------------------------------------------------------- labels, tiers, the cache
@@ -729,7 +600,6 @@ def cmd_epic_create(repo, args):
         + ([f"risk:{args.risk}"] if args.risk else [])
     out = gh(repo, ["issue", "create", "--title", args.title, "--body-file", path] + label_args(labels), stdin)
     number, url = created_issue(out)
-    mirror_created(repo, url, proposed=args.proposed)
     emit(args.json, {"number": number, "url": url}, f"#{number} {url}")
 
 
@@ -767,12 +637,10 @@ def link_sub_issue(repo, parent, number):
     return error, issue_id
 
 
-def create_issue(repo, title, path, stdin, labels, priority=False, proposed=False):
-    """`gh issue create` with the body from `path` (`-`: `stdin`), then the Projects board item; (number, url)."""
+def create_issue(repo, title, path, stdin, labels):
+    """`gh issue create` with the body from `path` (`-`: `stdin`); (number, url)."""
     out = gh(repo, ["issue", "create", "--title", title, "--body-file", path] + label_args(labels), stdin)
-    number, url = created_issue(out)
-    mirror_created(repo, url, priority, proposed)
-    return number, url
+    return created_issue(out)
 
 
 def cmd_task_create(repo, args):
@@ -784,7 +652,7 @@ def cmd_task_create(repo, args):
     labels = [args.type, initial_status(args)] + ([f"size:{args.size}"] if args.size else []) \
         + ([f"risk:{args.risk}"] if args.risk else []) + (["no-tests"] if args.no_tests else []) \
         + (["needs-local"] if needs_local else []) + (["priority:high"] if args.priority else [])
-    number, url = create_issue(repo, args.title, path, stdin, labels, args.priority, args.proposed)
+    number, url = create_issue(repo, args.title, path, stdin, labels)
     result = {"number": number, "url": url, "parent": args.parent, "linked": None, "blocked_by": []}
 
     def fail(message):
@@ -869,21 +737,12 @@ def cmd_ready(repo, args):
 
 
 def set_status(repo, number, status, comment=None):
-    """Swap the status label (remove every other status:*, add the new one), mirror it to the Projects board when
-    one is configured (proposed has no Status there), comment when asked."""
-    project = project_setting() if status in MIRRORED else None
-    data = issues(repo).view(number, "labels,url" if project else "labels")
+    """Swap the status label (remove every other status:*, add the new one), comment when asked."""
+    data = issues(repo).view(number, "labels")
     names = label_names(data.get("labels") if isinstance(data, dict) else None)
     new = "status:" + status
     removed = [name for name in names if name.startswith("status:") and name != new]
     issues(repo).edit_labels(number, add=[new], remove=removed)
-    if project:
-        url = data.get("url") if isinstance(data, dict) else None
-        if isinstance(url, str) and url.strip():
-            mirror(repo, project, url.strip(), [("Status", STATUS_TITLES[status])])
-        else:
-            warn("harness-board",
-                 f"gh issue view {number} gave no url; the Projects board {'/'.join(project)} is not updated")
     if comment:
         issues(repo).comment(number, marked(comment))
     labels = [name for name in names if name not in removed] + ([new] if new not in names else [])
@@ -1022,7 +881,7 @@ def park(repo, number, reason, evidence=None, follow_ups=None):
         risk = "risk:high" if "risk:high" in names else "risk:low"
         title = f"Unstick #{number}: {reason_first[:FOLLOW_UP_TITLE].rstrip()}"
         m, _url = create_issue(repo, title, "-", follow_up_body(number, reason, evidence),
-                               ["task", "status:proposed", "size:S", risk], proposed=True)
+                               ["task", "status:proposed", "size:S", risk])
         follow_ups = [m]
         if epic:
             error, issue_id = link_sub_issue(repo, epic, m)
@@ -1159,169 +1018,6 @@ def cmd_tier(repo, args):
          found["tier"])
 
 
-# --------------------------------------------------------------- project check, project sync
-def required_project():
-    """(owner, number) from HARNESS_PROJECT, or Problem naming the setting: these commands need a board."""
-    value = project_value()
-    if not value:
-        raise Problem(f"{PROJECT_SETTING} is not set; set it to OWNER/NUMBER of the Projects board (in the "
-                      "environment or under env in ~/.claude/settings.json)")
-    if not PROJECT_VALUE.fullmatch(value):
-        raise Problem(f"{PROJECT_SETTING}={value!r} is not OWNER/NUMBER")
-    owner, number = value.split("/")
-    return owner, number
-
-
-def cmd_project_check(args):
-    owner, number = required_project()
-    data = gh_json(None, ["project", "field-list", number, "--owner", owner, "--format", "json",
-                          "--limit", FIELD_LIMIT])
-    fields = {f.get("name"): f for f in as_list(data.get("fields") if isinstance(data, dict) else None)}
-    missing = []
-    for name, options in PROJECT_FIELDS:
-        field = fields.get(name)
-        if field is None:
-            missing.append(f"missing field: {name} (a single select with the options {', '.join(options)})")
-            continue
-        present = {o.get("name") for o in as_list(field.get("options"))}
-        missing += [f"missing option: {name} {option}" for option in options if option not in present]
-    if missing:
-        print("\n".join(missing))
-        print(f"harness-board: the Projects board {owner}/{number} lacks {len(missing)} of the fields and options "
-              "the harness writes", file=sys.stderr)
-        return 1
-    print(f"The Projects board {owner}/{number} has every Status and Priority option the harness writes.")
-    return 0
-
-
-def load_projects():
-    """The registered project paths, in registry order (the registry harness-standup and harness-digest read)."""
-    return [p.path for p in load_registry(path=harness_home("projects.json"))]
-
-
-def label_status(url, names):
-    """The Status option an issue's labels give, or None: no status label means no Status write, and an unknown
-    or doubled one is one warning naming the issue and no Status write; status:proposed has no Status: None."""
-    found = [name for name in names if name.startswith("status:")]
-    if not found or found == ["status:proposed"]:
-        return None
-    if len(found) == 1 and found[0][len("status:"):] in MIRRORED:
-        return STATUS_TITLES[found[0][len("status:"):]]
-    what = f"the status labels {', '.join(found)}" if len(found) > 1 else f"{found[0]}, not a harness status,"
-    warn("harness-board", f"{url} has {what} so its Status on the board is left as it is")
-    return None
-
-
-def open_issues(repo):
-    issues = gh_json(repo, ["issue", "list", "--state", "open", "--json", "number,url,labels,state",
-                            "--limit", ISSUE_LIMIT])
-    if not isinstance(issues, list):
-        raise Problem("gh issue list printed no list")
-    return [i for i in issues if isinstance(i, dict) and str(i.get("state") or "OPEN").upper() == "OPEN"
-            and isinstance(i.get("url"), str) and i["url"]]
-
-
-def cmd_project_sync(args):
-    """Add the open issues missing from the board and correct Status and Priority drift, by the labels; an unset
-    Priority is Normal, so an added issue gets a Priority write only for High. Exit 1
-    when a write fails, a repository is skipped or a read was cut at its limit; the rest still runs."""
-    owner, number = required_project()
-    if args.all_projects and getattr(args, "repo", None):
-        raise Problem("--repo and --all-projects cannot be combined")
-    failed = False
-    if args.all_projects:
-        repos, seen = [], set()
-        for path in load_projects():
-            try:
-                repo = Repo(path)
-            except Problem as err:
-                warn("harness-board", f"the registered project {path} is skipped: {err}")
-                failed = True
-                continue
-            if repo.main not in seen:
-                seen.add(repo.main)
-                repos.append(repo)
-        if not repos:
-            print("No registered projects to sync.")
-            return 1 if failed else 0
-        board_repo = None
-    else:
-        repos = [open_repo(getattr(args, "repo", None))]
-        board_repo = repos[0]
-    data = gh_json(board_repo, ["project", "item-list", number, "--owner", owner, "--format", "json",
-                                "--limit", ITEM_LIMIT])
-    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-        raise Problem(f"gh project item-list {number} printed no items")
-    items = as_list(data["items"])
-    on_board = {}
-    for item in items:
-        url = item.get("content", {}).get("url") if isinstance(item.get("content"), dict) else None
-        if isinstance(url, str) and url:
-            on_board[url] = item
-    total = data.get("totalCount")
-    total = total if isinstance(total, int) and not isinstance(total, bool) else None
-    truncated = total > len(items) if total is not None else len(items) >= int(ITEM_LIMIT)
-    if truncated:
-        warn("harness-board",
-             f"the Projects board {owner}/{number} holds {total if total is not None else 'at least ' + ITEM_LIMIT} "
-             f"items and item-list read {len(items)}, so no issue is added; archive Done items, then sync again")
-        failed = True
-    changes, errors, synced = 0, 0, 0
-    for repo in repos:
-        try:
-            issues = open_issues(repo)
-        except Problem as err:
-            if not args.all_projects:
-                raise
-            warn("harness-board", f"{repo.main} is skipped: {err}")
-            failed = True
-            continue
-        if len(issues) >= int(ISSUE_LIMIT):
-            warn("harness-board",
-                 f"{repo.main}: gh issue list stopped at its limit of {ISSUE_LIMIT}; later open issues are not synced")
-            failed = True
-        synced += len(issues)
-        for issue in issues:
-            url = issue["url"]
-            names = label_names(issue.get("labels"))
-            status = label_status(url, names)
-            priority = "High" if "priority:high" in names else "Normal"
-            item = on_board.get(url)
-            if item is None and truncated:
-                continue
-            target = [number, "--owner", owner, "--url", url]
-            steps = [] if item is not None else [(["project", "item-add"] + target, f"{url}: add to the board")]
-            for field, value in (("Status", status), ("Priority", priority)):
-                old = item.get(field.lower()) if item is not None else None
-                # an unset Priority is Normal, so only High against Normal is drift (and an add sets only High)
-                current = (old or "Normal") if field == "Priority" else old
-                if value and current != value:
-                    steps.append((["project", "item-edit"] + target + ["--field", field, "--value", value],
-                                  f"{url}: {field} {old or '(unset)'} -> {value}"))
-            for call, line in steps:
-                changes += 1
-                if not args.dry_run:
-                    try:
-                        gh(repo, call)
-                    except Problem as err:
-                        errors += 1
-                        added = "; its Status and Priority are not set" if call[1] == "item-add" else ""
-                        print(f"harness-board: {url}: {one_line(err)}{added}", file=sys.stderr)
-                        if call[1] == "item-add":
-                            break
-                        continue
-                print(line)
-    where = (f"the Projects board {owner}/{number} ({synced} open issues in {len(repos)} "
-             f"{'repository' if len(repos) == 1 else 'repositories'})")
-    if args.dry_run:
-        print(f"--dry-run: {changes} changes to {where}, none made.")
-    elif errors:
-        print(f"harness-board: {errors} of the {changes} changes to {where} failed", file=sys.stderr)
-    else:
-        print(f"{changes} changes made to {where}." if changes else f"No changes: {where} agrees with the labels.")
-    return 1 if failed or errors else 0
-
-
 # --------------------------------------------------------------- arguments
 def parser():
     repo_help = "the project (default: CLAUDE_PROJECT_DIR, else the cwd's repository)"
@@ -1332,7 +1028,7 @@ def parser():
     ap.add_argument("--repo", metavar="PATH", help=repo_help)
     ap.add_argument("--json", action="store_true", help="print JSON")
     sub = ap.add_subparsers(dest="cmd", metavar="{labels,epic,task,show,retype,ready,status,promote,comment,"
-                                               "needs-input,park,answers,close,epic-check,board,tier,project}")
+                                               "needs-input,park,answers,close,epic-check,board,tier}")
     sub.required = True
 
     labels = sub.add_parser("labels", help="the board's label set")
@@ -1365,7 +1061,7 @@ def parser():
     tc.add_argument("--blocked-by", action="append", metavar="N[,N]", help="issues that must close first")
     tc.add_argument("--no-tests", action="store_true", help="docs or config only; exempt from tests-first")
     tc.add_argument("--needs-local", action="store_true", help="needs this Mac's files or credentials")
-    tc.add_argument("--priority", action="store_true", help="label priority:high (and Priority High on the board)")
+    tc.add_argument("--priority", action="store_true", help="label priority:high")
     tc.add_argument("--proposed", action="store_true", help="label status:proposed in place of status:ready")
 
     show = sub.add_parser("show", parents=[common], help="fetch a ticket, write its cache, print it")
@@ -1431,17 +1127,6 @@ def parser():
     tier.add_argument("--stage", choices=("review",),
                       help="the review stage: HARNESS_REVIEW_TIER when set, else opus (at effort xhigh for a "
                            "risk:high ticket)")
-
-    project = sub.add_parser("project", help=f"the Projects board named by {PROJECT_SETTING}")
-    project_sub = project.add_subparsers(dest="action", metavar="{check,sync}")
-    project_sub.required = True
-    project_sub.add_parser("check", help="name each Status or Priority field or option the board lacks (exit 1)")
-    ps = project_sub.add_parser("sync", help="add missing open issues, correct Status and Priority from the labels")
-    where = ps.add_mutually_exclusive_group()
-    where.add_argument("--repo", metavar="PATH", default=argparse.SUPPRESS, help=repo_help)
-    where.add_argument("--all-projects", action="store_true",
-                       help="every project in ~/.claude/harness/projects.json")
-    ps.add_argument("--dry-run", action="store_true", help="print the changes, make none")
     return ap
 
 
@@ -1450,15 +1135,12 @@ COMMANDS = {"labels ensure": cmd_labels_ensure, "epic create": cmd_epic_create, 
             "comment": cmd_comment,
             "needs-input": cmd_needs_input, "park": cmd_park, "answers": cmd_answers, "close": cmd_close,
             "epic-check": cmd_epic_check, "board": cmd_board, "tier": cmd_tier}
-PROJECT_COMMANDS = {"project check": cmd_project_check, "project sync": cmd_project_sync}   # open their own repos
 
 
 def main():
     args = parser().parse_args()
     name = args.cmd + (f" {args.action}" if getattr(args, "action", None) else "")
     try:
-        if name in PROJECT_COMMANDS:
-            sys.exit(PROJECT_COMMANDS[name](args))
         COMMANDS[name](open_repo(getattr(args, "repo", None)), args)
     except Problem as err:
         sys.exit(f"harness-board: {one_line(err)}")
