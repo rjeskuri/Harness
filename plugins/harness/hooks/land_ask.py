@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# deadcode: keep (a silent stub for sessions that started before #385 unwired it)
 """Retired PreToolUse hook (was matcher: Bash, #330): a silent stub; nothing asks before a land.
 
 land_ask.py asked before a session landed a risk:high ticket's PR. Epic #383 (ticket #385) retired it:
