@@ -1,0 +1,150 @@
+name: Mutation
+
+# Monthly and by hand, on main's default branch. Never on a pull request or a push: a run takes hours and only
+# reports, it blocks nothing (docs/design.md, "Mutation runner"; docs/research/mutation-testing.md, option (c)).
+# One shard per run keeps it under the job limit: the schedule takes the shard from the month number, a manual
+# dispatch from its `shard` input (auto does what the schedule does). A big file is split into parts holding equal
+# numbers of mutation sites (the `--lines N,N` list is computed from the file), sized so a part's estimated run is
+# well under the job limit; the table and its arithmetic are in docs/design.md, "Monthly report (#476)".
+on:
+  schedule:
+    - cron: "17 3 1 * *"
+  workflow_dispatch:
+    inputs:
+      shard:
+        description: "What this run mutates (auto: the shard for this month)"
+        type: choice
+        default: auto
+        options:
+          - auto
+          - hooks-guard-1
+          - hooks-guard-2
+          - hooks-guard-3
+          - hooks-tests-first-1
+          - hooks-tests-first-2
+          - hooks-backup-gate
+          - hooks-readonly
+          - hooks-rest
+          - lib-1
+          - lib-2
+          - bin-work-1
+          - bin-work-2
+          - bin-work-3
+          - bin-work-4
+          - bin-work-5
+          - bin-work-6
+          - bin-work-7
+          - bin-pr-1
+          - bin-pr-2
+          - bin-pr-3
+          - bin-pr-4
+          - bin-scaffold
+          - bin-red
+          - bin-rest
+
+concurrency:
+  group: mutation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mutate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v7
+      - name: Pick the shard
+        id: shard
+        env:
+          SHARD_INPUT: ${{ inputs.shard }}
+        run: |
+          shard="$SHARD_INPUT"
+          if [ -z "$shard" ] || [ "$shard" = auto ]; then
+            set -- hooks-guard-1 hooks-guard-2 hooks-guard-3 hooks-tests-first-1 hooks-tests-first-2 hooks-backup-gate hooks-readonly hooks-rest lib-1 lib-2 bin-work-1 bin-work-2 bin-work-3 bin-work-4 bin-work-5 bin-work-6 bin-work-7 bin-pr-1 bin-pr-2 bin-pr-3 bin-pr-4 bin-scaffold bin-red bin-rest
+            # months counted continuously, so every shard comes up once in every $# months, across years too
+            shift $(( ($(date -u +%Y) * 12 + 10#$(date -u +%m)) % $# ))
+            shard="$1"
+          fi
+          echo "shard=$shard" >> "$GITHUB_OUTPUT"
+      - name: Mutate the shard
+        env:
+          SHARD: ${{ steps.shard.outputs.shard }}
+        run: |
+          p=plugins/harness
+          part=
+          case "$SHARD" in
+            hooks-guard-*) set -- "$p"/hooks/branch_guard.py; part="${SHARD##*-} 3" ;;
+            hooks-tests-first-*) set -- "$p"/hooks/tests_first.py; part="${SHARD##*-} 2" ;;
+            hooks-backup-gate) set -- "$p"/hooks/backup_gate.py ;;
+            hooks-readonly) set -- "$p"/hooks/readonly_*.py ;;
+            hooks-rest) set -- $(ls "$p"/hooks/*.py | grep -v -e /branch_guard.py -e /tests_first.py -e /backup_gate.py -e /readonly_) ;;
+            lib-1) set -- "$p"/lib/harness_lib/[a-o]*.py ;;
+            lib-2) set -- "$p"/lib/harness_lib/[p-z_]*.py ;;
+            bin-work-*) set -- "$p"/bin/harness-work; part="${SHARD##*-} 7" ;;
+            bin-pr-*) set -- "$p"/bin/harness-pr; part="${SHARD##*-} 4" ;;
+            bin-scaffold) set -- "$p"/bin/harness-scaffold ;;
+            bin-red) set -- "$p"/bin/harness-red ;;
+            bin-rest) set -- $(ls "$p"/bin/harness-* | grep -v -e '/harness-work$' -e '/harness-pr$' -e '/harness-scaffold$' -e '/harness-red$') ;;
+            *) echo "unknown shard: $SHARD"; exit 1 ;;
+          esac
+          if [ -n "$part" ]; then
+            # part N of M: the lines that hold the Nth M-th of the file's mutation sites, as mutate.py's `--lines N,N`
+            lines=$(python3 - "$1" $part <<'PY'
+          import os, sys
+          sys.path.insert(0, "scripts")
+          import mutate
+          rel, part, parts = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+          sites = {}
+          for m in mutate.mutants(os.getcwd(), rel, None):
+              sites[m["line"]] = sites.get(m["line"], 0) + 1
+          total, before, chosen = sum(sites.values()), 0, []
+          for line in sorted(sites):
+              if before * parts // total == part - 1:
+                  chosen.append(str(line))
+              before += sites[line]
+          print(",".join(chosen))
+          PY
+            )
+            [ -n "$lines" ] || { echo "no sites in part $part of $1"; exit 1; }
+            set -- "$@" --lines "$lines"
+          fi
+          echo "shard $SHARD: $*"
+          status=0
+          python3 scripts/mutate.py run "$@" --json > mutation.json || status=$?
+          # 3 means survivors were found: that is the report, not a failure
+          if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then exit "$status"; fi
+      - name: Write the text report
+        run: |
+          python3 - "$SHARD" <<'PY' > mutation.txt
+          import json, sys
+          data = json.load(open("mutation.json"))
+          print("shard %s: %d killed (%d timed out), %d survived" % (sys.argv[1], data["killed"], data["timed_out"], data["survived"]))
+          print()
+          print("Survivors")
+          for s in data["survivors"]:
+              print("  %s:%d in %s: %s" % (s["path"], s["line"], s["function"], s["change"]))
+          print()
+          print("Functions where every mutant survived: unreached or unasserted (check them against the line data, docs/design.md)")
+          for f in data["files"]:
+              for name, c in sorted(f["functions"].items()):
+                  if c["survived"] and not c["killed"]:
+                      print("  %s %s: %d survived" % (f["path"], name, c["survived"]))
+          print()
+          print("Per file")
+          for f in data["files"]:
+              print("  %s: %d killed, %d survived" % (f["path"], f["killed"], f["survived"]))
+          PY
+          cat mutation.txt
+        env:
+          SHARD: ${{ steps.shard.outputs.shard }}
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-${{ steps.shard.outputs.shard }}
+          path: |
+            mutation.json
+            mutation.txt
+          if-no-files-found: ignore
