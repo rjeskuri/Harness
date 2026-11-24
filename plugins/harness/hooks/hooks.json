@@ -24,6 +24,7 @@
           { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/branch_guard.py"], "timeout": 10 },
           { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/tests_first.py"], "timeout": 10 },
           { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/backup_gate.py"], "timeout": 30 },
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/land_owner.py"], "timeout": 30 },
           { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/readonly_allow.py"], "timeout": 10 }
         ]
       },
