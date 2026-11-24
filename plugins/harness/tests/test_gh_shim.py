@@ -286,7 +286,15 @@ class PassThrough(Case):
             with self.subTest(label):
                 p = self.shim(["auth", "status"], path=dirs + ["/usr/bin", "/bin"])
                 self.assertEqual((p.stdout, p.returncode), (out, code), p.stderr)
-        p = self.shim(["auth", "status"], path=[M["pybin"], SHIM_DIR, "/usr/bin", "/bin"])
+        # no other gh: a PATH of test-made folders only (the host may have a real gh in /usr/bin, as CI does),
+        # with the system tools the shim's start needs linked in
+        nogh = os.path.join(self.tmp, "nogh-bin")
+        os.makedirs(nogh)
+        for tool in ("sh", "env"):
+            found = shutil.which(tool, path="/usr/bin:/bin")
+            if found:
+                os.symlink(found, os.path.join(nogh, tool))
+        p = self.shim(["auth", "status"], path=[M["pybin"], SHIM_DIR, nogh])
         self.assertEqual(p.returncode, 127, p.stderr)
         self.assertEqual(p.stdout, b"")
         self.assertEqual(len(p.stderr.decode("utf-8", "replace").strip().splitlines()), 1, p.stderr)
