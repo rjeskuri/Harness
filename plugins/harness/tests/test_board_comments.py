@@ -42,7 +42,7 @@ REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
 # dropped from the inherited environment, as test_board does
 DROPPED = ("CLAUDE_PROJECT_DIR", "HARNESS_GH", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "HARNESS_NOTIFY_APP",
            "HARNESS_NOTIFY_SOUND", "HARNESS_PROJECT", "HARNESS_SESSION_PROJECT", "HARNESS_CODE_TIER",
-           "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER", "HARNESS_ULTRAREVIEW", "HARNESS_WAVE_REVIEW")
+           "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER", "HARNESS_WAVE_REVIEW")
 ANY_COUNT = re.compile(r"comments? from other accounts not shown")
 COUNTED = re.compile(r"(\d+) comments? from other accounts not shown: gh issue view (\d+) --comments")
 

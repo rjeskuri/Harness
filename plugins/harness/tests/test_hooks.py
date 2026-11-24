@@ -35,6 +35,13 @@ from unittest import mock
 from gitrepo_support import copy_repo, make_template
 
 HOOKS = Path(__file__).resolve().parent.parent / "hooks"
+SHIM_DIR = HOOKS.parent / "shim"
+
+
+def without_shim_path(text: str) -> str:
+    """The env file's text without the line session_brief adds to put the gh shim's folder on PATH (#448)."""
+    return "".join(ln for ln in text.splitlines(keepends=True) if str(SHIM_DIR) not in ln)
+
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Secret-shaped samples, split so that no line of this file matches a pattern.
@@ -526,7 +533,7 @@ class SessionProjectExportTests(HookTestCase):
     def assertOneExportAppended(self, env_file: Path, before: str, project: Path) -> None:
         after = env_file.read_text(encoding="utf-8")
         self.assertTrue(after.startswith(before), f"earlier content was not kept: {after!r}")
-        added = after[len(before):]
+        added = without_shim_path(after[len(before):])
         self.assertEqual(added.count("\n"), 1, f"not exactly one line appended: {added!r}")
         self.assertTrue(added.endswith("\n"), added)
         self.assertTrue(added.startswith("export HARNESS_SESSION_PROJECT="), added)
@@ -638,7 +645,8 @@ class SessionProjectExportTests(HookTestCase):
         readonly = self.env_file()
         readonly.chmod(0o444)
         self.addCleanup(readonly.chmod, 0o644)
-        # With nothing to export (CLAUDE_PROJECT_DIR unset or blank), a writable env file is left as it was.
+        # With nothing to export (CLAUDE_PROJECT_DIR unset or blank), a writable env file gains no export (the
+        # shim's PATH line aside, #448).
         writable = self.env_file()
         cases = [("unset", None, str(project)), ("blank", "", str(project)),
                  ("missing directory", missing_dir, str(project)), ("a directory", a_dir, str(project)),
@@ -657,7 +665,7 @@ class SessionProjectExportTests(HookTestCase):
                 self.assertFalse(missing_dir.parent.exists(), "a folder was created for the env file")
                 self.assertEqual(list(a_dir.iterdir()), [])
                 self.assertEqual(readonly.read_text(encoding="utf-8"), self.EARLIER)
-                self.assertEqual(writable.read_text(encoding="utf-8"), self.EARLIER)
+                self.assertEqual(without_shim_path(writable.read_text(encoding="utf-8")), self.EARLIER)
 
     # ---- the registration: every source a Bash call can follow gets the export
 
@@ -826,7 +834,7 @@ class ForeignSessionEnvTests(HookTestCase):
                 strays = {
                     "HARNESS_TEST_CMD": f"npm test -- {{files}} --shard={n}",
                     "HARNESS_TEST_TIMEOUT": str(600 + n),
-                    ("HARNESS_ULTRAREVIEW" if n == 1 else "HARNESS_REVIEW_TIER"): ("1" if n == 1 else "sonnet"),
+                    ("HARNESS_WAVE_REVIEW" if n == 1 else "HARNESS_REVIEW_TIER"): ("opus" if n == 1 else "sonnet"),
                     "CLAUDE_VERIFY_CMD": f"scripts/verify-{n}.sh",
                     "CLAUDE_VERIFY_TIMEOUT": str(900 + n),
                     random_key: uuid.uuid4().hex,
@@ -851,14 +859,14 @@ class ForeignSessionEnvTests(HookTestCase):
         user = self.home / ".claude" / "settings.json"
         project = self.proj / ".claude" / "settings.json"
         local = self.proj / ".claude" / "settings.local.json"
-        harness_keys = ("HARNESS_PROJECT", "HARNESS_TEST_CMD", "HARNESS_ULTRAREVIEW", "CLAUDE_VERIFY_CMD",
+        harness_keys = ("HARNESS_PROJECT", "HARNESS_TEST_CMD", "HARNESS_WAVE_REVIEW", "CLAUDE_VERIFY_CMD",
                         "CLAUDE_VERIFY_TIMEOUT")
         self.assertBriefNames(self.plain_brief(self.proj), dropped=[], not_named=harness_keys)
         for name, sets in (
             ("user settings", {user: ["HARNESS_PROJECT"]}),
             ("project settings", {project: ["HARNESS_TEST_CMD"]}),
             ("local settings", {local: ["CLAUDE_VERIFY_CMD"]}),
-            ("all three", {user: ["HARNESS_PROJECT"], project: ["HARNESS_ULTRAREVIEW"],
+            ("all three", {user: ["HARNESS_PROJECT"], project: ["HARNESS_WAVE_REVIEW"],
                            local: ["CLAUDE_VERIFY_TIMEOUT", "HARNESS_TEST_CMD"]}),
         ):
             with self.subTest(name):
@@ -890,7 +898,7 @@ class ForeignSessionEnvTests(HookTestCase):
         extra_key = [k for k in kept if k.startswith("HARNESS_X")][0]
         self.write(user, json.dumps({
             "permissions": {"allow": ["Bash(HARNESS_TEST_CMD=* harness-red run)"]},
-            "statusLine": {"type": "command", "command": "echo $HARNESS_ULTRAREVIEW"},
+            "statusLine": {"type": "command", "command": "echo $HARNESS_WAVE_REVIEW"},
             "env": {"HARNESS_PROJECT": kept["HARNESS_PROJECT"]},
         }))
         self.write(project, json.dumps({
@@ -902,7 +910,7 @@ class ForeignSessionEnvTests(HookTestCase):
             "permissions": {"deny": ["Bash(export CLAUDE_VERIFY_TIMEOUT=*)"]},
             "env": {extra_key: kept[extra_key]},
         }))
-        strays = {"HARNESS_TEST_CMD": "npm test -- {files}", "HARNESS_ULTRAREVIEW": "1",
+        strays = {"HARNESS_TEST_CMD": "npm test -- {files}", "HARNESS_WAVE_REVIEW": "opus",
                   "HARNESS_REVIEW_TIER": "sonnet", "CLAUDE_VERIFY_CMD": "scripts/verify.sh",
                   "CLAUDE_VERIFY_TIMEOUT": "900"}
         inherited = dict(strays, **kept, HARNESS_SESSION_PROJECT=str(self.other))

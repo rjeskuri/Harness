@@ -811,7 +811,7 @@ class TestsFirstMainMergeTests(GuardTestCase):
         self.assertSourceDenied(wt)
         self.assertEqual(self.status(wt), "current: no")
 
-    # ---- ultrareview round (#231): SHA-256 repositories, and the hook's deadline
+    # ---- the #231 review round: SHA-256 repositories, and the hook's deadline
 
     def require_sha256(self) -> None:
         probe = self.tmp / "sha256-probe"

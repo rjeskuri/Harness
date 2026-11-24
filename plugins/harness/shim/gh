@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""The gh shim: logs the gh calls no harness tool makes (an agent's own `gh` in Bash, a poller).
+
+session_brief.py puts this folder first on PATH for a session's Bash calls. The shim runs the first
+executable `gh` on PATH whose folder (real path) is not its own, with its arguments unchanged and
+stdin, stdout and stderr inherited, waits, and exits with that gh's exit code (128+N for a gh killed
+by signal N). With no other gh on PATH: one line on stderr, exit 127. After the call it appends one
+line through harness_lib.ghlimit.log_call with tool "agent", unless HARNESS_GH_LOGGED is set and not
+empty (a harness tool's runner, which logs the call itself). A lib that cannot be loaded or a log
+that cannot be written is skipped silently: the call's output and exit never change. The lib is
+loaded only after the call, so a call pays no import before it starts.
+
+Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def real_gh() -> str | None:
+    """The first executable gh on PATH outside the shim's own folder (compared by real path)."""
+    for folder in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        folder = folder or os.curdir
+        exe = os.path.join(folder, "gh")
+        if os.path.isfile(exe) and os.access(exe, os.X_OK) and os.path.realpath(folder) != HERE:
+            return exe
+    return None
+
+
+def run(exe: str, args: list[str]) -> int:
+    """Run exe with args on the shim's own stdin, stdout and stderr; its exit code. SIGINT reaches the gh
+    from the terminal itself (same process group), so the shim ignores it while it waits; SIGTERM and SIGHUP
+    are passed on."""
+    try:
+        proc = subprocess.Popen([exe] + args)
+    except OSError as err:
+        sys.stderr.write(f"gh (harness shim): cannot run {exe}: {err.strerror or err}\n")
+        return 126
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: proc.send_signal(signum))
+    code = proc.wait()
+    return 128 - code if code < 0 else code
+
+
+def log(args: list[str], code: int, ms: int) -> None:
+    """One agent line in the gh call log; any failure is skipped."""
+    if os.environ.get("HARNESS_GH_LOGGED"):
+        return
+    try:
+        lib = os.path.join(os.path.dirname(HERE), "lib")
+        if lib not in sys.path:
+            sys.path.insert(0, lib)
+        from harness_lib.ghlimit import log_call
+
+        log_call(args, cwd=None, exit=code, ms=ms, tool="agent")
+    except Exception:
+        pass
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    exe = real_gh()
+    if exe is None:
+        sys.stderr.write(f"gh (harness shim): no gh on PATH besides the shim in {HERE}\n")
+        return 127
+    started = time.monotonic()
+    code = run(exe, args)
+    log(args, code, int((time.monotonic() - started) * 1000))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

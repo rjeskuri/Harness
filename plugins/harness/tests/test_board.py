@@ -42,9 +42,8 @@ REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
 # The gh login show keeps comments from (#334: the owner's, the harness's under the same login, and the bot's).
 OWNER = {"match": ["api", "user"], "stdout": "rjeskuri\n"}
 MARK = "\n\n<!-- harness -->"      # the last line of every comment harness-board posts
-# The five routing settings (docs/design.md, Settings): dropped from the inherited environment like HARNESS_PROJECT.
-ROUTING_KEYS = ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER", "HARNESS_ULTRAREVIEW",
-                "HARNESS_WAVE_REVIEW")
+# The routing settings (docs/design.md, Settings): dropped from the inherited environment like HARNESS_PROJECT.
+ROUTING_KEYS = ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER", "HARNESS_WAVE_REVIEW")
 
 # The label table from docs/design.md, the source of truth for `labels ensure`.
 SPEC_COLORS = {

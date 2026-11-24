@@ -49,9 +49,10 @@ KEYS = (
     "HARNESS_CODE_TIER",
     "HARNESS_CODE_EFFORT",
     "HARNESS_REVIEW_TIER",
-    "HARNESS_ULTRAREVIEW",
     "HARNESS_WAVE_REVIEW",
 )
+# #443 removed ultrareview: a settings file or environment that still names it is ignored, with no problem line.
+RETIRED = ("HARNESS_ULTRAREVIEW",)
 TIERS = ("sonnet", "opus", "fable")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
@@ -59,7 +60,6 @@ DEFAULTS = {
     "code_tier": None,
     "code_effort": None,
     "review_tier": None,
-    "ultrareview": True,
     "wave_tier": None,
     "wave_effort": None,
     "problems": [],
@@ -68,14 +68,13 @@ OKINAWA_ENV = {
     "HARNESS_CODE_TIER": "opus",
     "HARNESS_CODE_EFFORT": "xhigh",
     "HARNESS_REVIEW_TIER": "opus",
-    "HARNESS_ULTRAREVIEW": "off",
+    "HARNESS_ULTRAREVIEW": "off",  # still in older settings files; ignored since #443
     "HARNESS_WAVE_REVIEW": "fable",
 }
 OKINAWA = {
     "code_tier": "opus",
     "code_effort": "xhigh",
     "review_tier": "opus",
-    "ultrareview": False,
     "wave_tier": "fable",
     "wave_effort": "xhigh",
     "problems": [],
@@ -117,7 +116,7 @@ class RoutingCase(unittest.TestCase):
         patcher = mock.patch.dict(os.environ)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for key in KEYS:
+        for key in KEYS + RETIRED:
             os.environ.pop(key, None)
         self.routing = load_routing_module()
 
@@ -205,8 +204,8 @@ class LoadRouting(RoutingCase):
             ("HARNESS_CODE_EFFORT", "max", {"code_effort": "max"}),
             ("HARNESS_REVIEW_TIER", "sonnet", {"review_tier": "sonnet"}),
             ("HARNESS_REVIEW_TIER", "fable", {"review_tier": "fable"}),
-            ("HARNESS_ULTRAREVIEW", "on", {"ultrareview": True}),
-            ("HARNESS_ULTRAREVIEW", "off", {"ultrareview": False}),
+            ("HARNESS_ULTRAREVIEW", "on", {}),  # #443: no key any more, so nothing changes
+            ("HARNESS_ULTRAREVIEW", "off", {}),
             ("HARNESS_WAVE_REVIEW", "sonnet", {"wave_tier": "sonnet", "wave_effort": "xhigh"}),
             ("HARNESS_WAVE_REVIEW", "opus", {"wave_tier": "opus", "wave_effort": "xhigh"}),
         ]
@@ -233,19 +232,47 @@ class LoadRouting(RoutingCase):
                 self.assertEqual(got["code_effort"], effort)
                 self.assertEqual(got["problems"], [])
 
-    def test_ultrareview_truthy_and_falsy_words(self):
-        for value in ("on", "1", "true", "yes"):
-            with self.subTest(value=value):
+    def test_ultrareview_is_no_setting_and_any_value_of_it_is_ignored(self):
+        """#443: load_routing has no `ultrareview` key, and HARNESS_ULTRAREVIEW, in the settings file or the
+        environment, with a value the old switch took, an invalid one, a blank one or a non-text JSON value, changes
+        nothing and adds no problem line."""
+        texts = ("on", "1", "true", "yes", "off", "0", "false", "no", "OFF", " Yes ", "maybe", "fable", "", "  ")
+        for value in texts + (0, 1, 2.5, True, False, None, ["off"], {"on": 1}):
+            with self.subTest(source="file", value=value):
                 self.write_settings({"HARNESS_ULTRAREVIEW": value})
                 got = self.load()
-                self.assertIs(got["ultrareview"], True)
-                self.assertEqual(got["problems"], [])
-        for value in ("off", "0", "false", "no"):
-            with self.subTest(value=value):
-                self.write_settings({"HARNESS_ULTRAREVIEW": value})
-                got = self.load()
-                self.assertIs(got["ultrareview"], False)
-                self.assertEqual(got["problems"], [])
+                self.assertNotIn("ultrareview", got)
+                self.assertEqual(got, DEFAULTS)
+        self.write_settings({})
+        for value in texts:
+            with self.subTest(source="environment", value=value):
+                os.environ["HARNESS_ULTRAREVIEW"] = value
+                try:
+                    got = self.load()
+                finally:
+                    del os.environ["HARNESS_ULTRAREVIEW"]
+                self.assertNotIn("ultrareview", got)
+                self.assertEqual(got, DEFAULTS)
+
+    def test_ultrareview_beside_the_other_keys_leaves_them_as_they_are(self):
+        """The other keys load as without it, their own problems included; it adds none and no key of its own."""
+        cases = [
+            (OKINAWA_ENV, OKINAWA),
+            ({"HARNESS_REVIEW_TIER": "fable", "HARNESS_ULTRAREVIEW": "maybe"}, dict(DEFAULTS, review_tier="fable")),
+            ({"HARNESS_CODE_TIER": "gpt", "HARNESS_ULTRAREVIEW": "sometimes"},
+             dict(DEFAULTS, problems=["HARNESS_CODE_TIER='gpt' is not one of sonnet, opus, fable; ignored"])),
+            ({"HARNESS_WAVE_REVIEW": "opus", "HARNESS_ULTRAREVIEW": "on"},
+             dict(DEFAULTS, wave_tier="opus", wave_effort="xhigh")),
+        ]
+        for env, want in cases:
+            with self.subTest(env=env):
+                self.write_settings(env)
+                self.assertEqual(self.load(), want)
+                os.environ["HARNESS_ULTRAREVIEW"] = "not-a-word"  # and from the environment too
+                try:
+                    self.assertEqual(self.load(), want)
+                finally:
+                    del os.environ["HARNESS_ULTRAREVIEW"]
 
     def test_wave_review_off_words_mean_unset(self):
         for value in ("off", "0", "false", "no"):
@@ -257,13 +284,12 @@ class LoadRouting(RoutingCase):
                 self.assertEqual(got["problems"], [])
 
     def test_json_numbers_in_the_file_read_as_their_text(self):
-        self.write_settings({"HARNESS_ULTRAREVIEW": 0, "HARNESS_WAVE_REVIEW": 0})
+        self.write_settings({"HARNESS_WAVE_REVIEW": 0})
         got = self.load()
-        self.assertIs(got["ultrareview"], False)
         self.assertIsNone(got["wave_tier"])
         self.assertEqual(got["problems"], [])
-        self.write_settings({"HARNESS_ULTRAREVIEW": 1})
-        self.assertIs(self.load()["ultrareview"], True)
+        self.write_settings({"HARNESS_CODE_TIER": 7})
+        self.assertEqual(self.load()["problems"], ["HARNESS_CODE_TIER='7' is not one of sonnet, opus, fable; ignored"])
 
     def test_environment_wins_when_not_blank(self):
         self.write_settings(OKINAWA_ENV)
@@ -273,7 +299,6 @@ class LoadRouting(RoutingCase):
         # the other keys still come from the file
         self.assertEqual(got["code_effort"], "xhigh")
         self.assertEqual(got["review_tier"], "opus")
-        self.assertIs(got["ultrareview"], False)
         self.assertEqual(got["wave_tier"], "fable")
 
         # a blank environment value falls through to the file
@@ -296,7 +321,6 @@ class LoadRouting(RoutingCase):
                 "code_tier": "fable",
                 "code_effort": "low",
                 "review_tier": "sonnet",
-                "ultrareview": False,
                 "wave_tier": "opus",
                 "wave_effort": "xhigh",
                 "problems": [],
@@ -316,9 +340,10 @@ class LoadRouting(RoutingCase):
         self.assertEqual(got["code_tier"], "fable")
         self.assertEqual(got["code_effort"], "low")
         self.assertEqual(got["review_tier"], "sonnet")
-        self.assertIs(got["ultrareview"], True)
         self.assertIsNone(got["wave_tier"])
         self.assertIsNone(got["wave_effort"])
+        self.assertNotIn("ultrareview", got)
+        self.assertEqual(got["problems"], [])
 
     def test_settings_local_json_is_never_read(self):
         # alone: nothing is read
@@ -359,7 +384,6 @@ class LoadRouting(RoutingCase):
                 "code_tier": "opus",
                 "code_effort": "xhigh",
                 "review_tier": "fable",
-                "ultrareview": False,
                 "wave_tier": "sonnet",
                 "wave_effort": "xhigh",
                 "problems": [],
@@ -379,7 +403,6 @@ class LoadRouting(RoutingCase):
                 "code_tier": "sonnet",
                 "code_effort": "max",
                 "review_tier": "opus",
-                "ultrareview": True,
                 "wave_tier": None,
                 "wave_effort": None,
                 "problems": [],
@@ -391,7 +414,6 @@ class LoadRouting(RoutingCase):
             ("HARNESS_CODE_TIER", "gpt", "code_tier", None),
             ("HARNESS_CODE_EFFORT", "extreme", "code_effort", None),
             ("HARNESS_REVIEW_TIER", "haiku", "review_tier", None),
-            ("HARNESS_ULTRAREVIEW", "maybe", "ultrareview", True),
             ("HARNESS_WAVE_REVIEW", "yes", "wave_tier", None),
         ]
         for key, value, field, today in cases:
@@ -438,11 +460,8 @@ class LoadRouting(RoutingCase):
             self.load()["problems"],
             ["HARNESS_REVIEW_TIER='haiku' is not one of sonnet, opus, fable; ignored"],
         )
-        self.write_settings({"HARNESS_ULTRAREVIEW": "maybe"})
-        self.assertEqual(
-            self.load()["problems"],
-            ["HARNESS_ULTRAREVIEW='maybe' is not one of on, 1, true, yes, off, 0, false, no; ignored"],
-        )
+        self.write_settings({"HARNESS_ULTRAREVIEW": "maybe"})  # #443: no setting, so no problem either
+        self.assertEqual(self.load()["problems"], [])
         self.write_settings({"HARNESS_WAVE_REVIEW": "yes"})
         self.assertEqual(
             self.load()["problems"],
@@ -474,15 +493,15 @@ class LoadRouting(RoutingCase):
                 "code_tier": None,
                 "code_effort": None,
                 "review_tier": "opus",
-                "ultrareview": True,
                 "wave_tier": None,
                 "wave_effort": None,
             },
         )
-        self.assertEqual(len(got["problems"]), 4)
-        for key in ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_ULTRAREVIEW", "HARNESS_WAVE_REVIEW"):
+        self.assertEqual(len(got["problems"]), 3)
+        for key in ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_WAVE_REVIEW"):
             self.assertEqual(sum(key in line for line in got["problems"]), 1, key)
-        self.assertFalse(any("HARNESS_REVIEW_TIER" in line for line in got["problems"]))
+        for key in ("HARNESS_REVIEW_TIER", "HARNESS_ULTRAREVIEW"):
+            self.assertFalse(any(key in line for line in got["problems"]), key)
 
     # Malformed settings files: settings_env skips a file it cannot read, parse or use, and
     # setting() takes only a string or number (never a bool, null or list) from the file.
@@ -555,8 +574,7 @@ class LoadRouting(RoutingCase):
         self.assertEqual(self.load()["review_tier"], "opus")
         self.write_settings({"HARNESS_REVIEW_TIER": "fable", "HARNESS_ULTRAREVIEW": "off"})
         got = self.load()
-        self.assertEqual(got["review_tier"], "fable")
-        self.assertIs(got["ultrareview"], False)
+        self.assertEqual(got, dict(DEFAULTS, review_tier="fable"))
         (self.main / ".claude" / "settings.json").unlink()
         self.assertEqual(self.load(), DEFAULTS)
 
@@ -672,7 +690,7 @@ class Routes(RoutingCase):
                 )
 
     def test_code_route_ignores_the_review_and_wave_settings(self):
-        routing = dict(DEFAULTS, review_tier="sonnet", ultrareview=False, wave_tier="fable", wave_effort="xhigh")
+        routing = dict(DEFAULTS, review_tier="sonnet", wave_tier="fable", wave_effort="xhigh")
         self.assertEqual(
             self.routing.code_route("task", "M", "low", routing),
             {"tier": "opus", "effort": None, "from": "labels", "labels_tier": "opus"},
@@ -703,8 +721,7 @@ class Routes(RoutingCase):
                     )
 
     def test_review_route_reads_review_settings_only(self):
-        routing = dict(DEFAULTS, code_tier="sonnet", code_effort="max", ultrareview=False, wave_tier="opus",
-                       wave_effort="xhigh")
+        routing = dict(DEFAULTS, code_tier="sonnet", code_effort="max", wave_tier="opus", wave_effort="xhigh")
         self.assertEqual(
             self.routing.review_route("high", routing),
             {"tier": "opus", "effort": "xhigh", "from": "labels", "labels_tier": "opus"},
@@ -841,7 +858,7 @@ class Module(RoutingCase):
                 )
                 self.assertNotIn("site-packages", str(origin))
 
-    def test_design_md_lists_the_five_settings(self):
+    def test_design_md_lists_the_routing_settings(self):
         text = (PLUGIN.parent.parent / "docs" / "design.md").read_text(encoding="utf-8")
         design = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)  # a comment documents nothing
         lines = design.splitlines()
@@ -850,7 +867,6 @@ class Module(RoutingCase):
             "HARNESS_CODE_TIER": TIERS,
             "HARNESS_CODE_EFFORT": EFFORTS,
             "HARNESS_REVIEW_TIER": TIERS,
-            "HARNESS_ULTRAREVIEW": ("on", "off"),
             "HARNESS_WAVE_REVIEW": TIERS + ("off",),
         }
         for key in KEYS:

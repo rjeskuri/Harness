@@ -1438,7 +1438,7 @@ exit 254
         self.git(self.wt, "reset", "-q", "--hard", head)
         self.assertEqual(self.current(), "current: yes")
 
-    # ultrareview round (#231): a SHA-256 repository, whose commit ids are 64 hex digits
+    # the #231 review round: a SHA-256 repository, whose commit ids are 64 hex digits
     def use_sha256_repo(self):
         """Swap the fixture for the same layout in SHA-256: a bare origin, a main checkout pushing to it (a clone
         of an empty SHA-256 repository comes out SHA-1 in older git), the branch in a linked worktree. Skips the
@@ -1688,6 +1688,101 @@ class NoTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(p.stdout.splitlines()[0], "red (assertion): 1 test files, exit 1")
         self.assertTrue(os.path.isfile(self.record_path))
+
+
+# #454: test files main has that pin code a refactor ticket removes; the ticket's branch deletes them whole.
+DEAD_TESTS = {
+    "tests/test_sub.py": TEST_SUB,
+    "tests/legacy/test_old_sub.py": TEST_SUB.replace("SubTest", "OldSubTest"),
+    "tests/legacy/old_support.py": "OLD = 1\n",
+}
+
+
+@unittest.skipUnless(GIT, "git is not installed")
+class RemovedTests(unittest.TestCase):
+    """#454: on a refactor ticket (its cache's `type`) whose only test changes are deleted test files, check and
+    reprove write a record of kind `removed` listing the deleted paths and exit 0; any other ticket keeps the
+    refusal. Same fixture as RedTest (borrowed, so its tests are not run again here)."""
+    setUp = RedTest.setUp
+    git = RedTest.git
+    red = RedTest.red
+    put = RedTest.put
+    record = RedTest.record
+    assertOneLineError = RedTest.assertOneLineError
+    second_worktree = NoTests.second_worktree
+
+    def cache(self, number, ticket_type):
+        write(os.path.join(self.state, "tickets", f"{number}.json"),
+              json.dumps({"number": number, "title": "Remove dead code", "type": ticket_type, "flags": [],
+                          "labels": [ticket_type, "status:in-progress"]}))
+
+    def tests_on_main(self):
+        """Main gains DEAD_TESTS; t/12-slug catches up with it (worktrees made later start from it)."""
+        for rel, text in DEAD_TESTS.items():
+            self.put(rel, text, root=self.repo)
+        self.git(self.repo, "add", "-A")
+        self.git(self.repo, "commit", "-q", "-m", "tests that pin sub")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        self.git(self.wt, "merge", "-q", "--ff-only", "origin/main")
+
+    def assertRemoved(self, p, record_path, branch, deleted):
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(record_path, encoding="utf-8") as fh:
+            rec = json.load(fh)
+        self.assertEqual(rec["kind"], "removed")
+        self.assertEqual(rec["branch"], branch)
+        self.assertEqual(sorted(rec["test_files"]), sorted(deleted))
+
+    def test_a_refactor_ticket_that_only_deletes_test_files_gets_a_removed_record(self):
+        self.tests_on_main()
+        self.cache(12, "refactor")
+        # A refactor ticket with no test change at all, or an exempt file deleted, is still refused.
+        self.assertOneLineError(self.red("check"), "No test changes on this branch")
+        os.remove(os.path.join(self.wt, "README.md"))
+        self.assertOneLineError(self.red("check"), "No test changes on this branch")
+        self.assertFalse(os.path.exists(self.record_path))
+
+        # A committed git rm of one test module, beside the exempt deletion.
+        self.git(self.wt, "rm", "-q", "tests/test_sub.py")
+        self.git(self.wt, "commit", "-q", "-m", "drop the tests of sub")
+        self.assertRemoved(self.red("check"), self.record_path, BRANCH, ["tests/test_sub.py"])
+
+        # Another ticket: a test module and its support module removed from the working tree, not committed.
+        self.cache(47, "refactor")
+        wt = self.second_worktree(47, "legacy")
+        gone = ["tests/legacy/test_old_sub.py", "tests/legacy/old_support.py"]
+        for rel in gone:
+            os.remove(os.path.join(wt, rel))
+        self.assertRemoved(self.red("check", cwd=wt), os.path.join(self.state, "red", "t-47-legacy.json"),
+                           "t/47-legacy", gone)
+
+        # reprove, on a branch that also has the coder's removal of the code (a branch brought home with no record).
+        self.cache(58, "refactor")
+        wt = self.second_worktree(58, "drop-sub")
+        gone = ["tests/test_sub.py", "tests/legacy/test_old_sub.py"]
+        self.git(wt, "rm", "-q", *gone)
+        self.put("calc.py", "def add(a, b):\n    return None\n", root=wt)
+        self.git(wt, "commit", "-q", "-am", "remove sub and its tests")
+        self.assertRemoved(self.red("reprove", cwd=wt), os.path.join(self.state, "red", "t-58-drop-sub.json"),
+                           "t/58-drop-sub", gone)
+
+    def test_any_other_ticket_that_only_deletes_test_files_is_still_refused(self):
+        self.tests_on_main()
+        self.git(self.wt, "rm", "-q", "tests/test_sub.py")
+        tickets = os.path.join(self.state, "tickets")
+        # No cache (a task without flags), each other type, and a refactor cache of another ticket.
+        for caches in ({}, {12: "task"}, {12: "bug"}, {12: "chore"}, {12: "ops"}, {13: "refactor"}):
+            shutil.rmtree(tickets, ignore_errors=True)
+            for number, ticket_type in caches.items():
+                self.cache(number, ticket_type)
+            for sub in ("check", "reprove"):
+                with self.subTest(caches=caches, sub=sub):
+                    self.assertOneLineError(self.red(sub), "No test changes on this branch")
+                    self.assertFalse(os.path.exists(self.record_path))
+        # The same branch on a refactor ticket gets its record: the type decides, not the fixture.
+        self.cache(12, "refactor")
+        self.assertRemoved(self.red("check"), self.record_path, BRANCH, ["tests/test_sub.py"])
 
 
 class RedHelpers(unittest.TestCase):

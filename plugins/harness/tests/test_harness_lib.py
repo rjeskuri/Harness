@@ -1836,7 +1836,7 @@ FAKE_ISSUE = {
 class ToolTestCase(LoaderTestCase):
     """Runs the three tools from a temporary plugin tree: the checkout's bin/, hooks/ and
     templates (everything but tests/ and lib/), and a lib/ that is real, instrumented,
-    missing or broken. gh is fakegh.py; claude answers ultrareview with an empty list."""
+    missing or broken. gh is fakegh.py; claude prints an empty findings list."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -1947,7 +1947,7 @@ class ToolTestCase(LoaderTestCase):
         """One state-touching command per tool, each writing under repos/<key>/."""
         return (
             ("harness-board", ("show", "12")),
-            ("harness-pr", ("ultra", "34")),
+            ("harness-pr", ("learn", "--mark")),
             ("harness-work", ("attempt", "12", "tests", "pass")),
         )
 
@@ -2027,7 +2027,7 @@ class ToolsFollowTheLibTests(ToolTestCase):
                 r = self.run_tool(root / "bin" / tool, args, repo)
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.state_dirs(), [adopt])
-        self.assertTrue((self.state(adopt) / "ultra" / "34.json").is_file())
+        self.assertTrue((self.state(adopt) / "learn.json").is_file())
         attempts = json.loads((self.state(adopt) / "tickets" / "12.json").read_text())["attempts"]
         self.assertEqual([(a["stage"], a["result"]) for a in attempts], [("tests", "pass")])
 
@@ -2044,7 +2044,7 @@ class ToolsFollowTheLibTests(ToolTestCase):
         """Guards against a private sha1 key kept alive beside the lib's, as an "old key"
         fallback or a second copy: with a lib whose adopt_old_state names another key,
         repos/<sha1-12 of the main tree> holds a ticket cache (title, tier and one code
-        failure of its own) and an ultrareview that no lib function names. Each tool
+        failure of its own) and a learn record that no lib function names. Each tool
         must behave as if they were not there: harness-work finds no cache under the
         lib's key and refuses, naming that key; harness-board writes a fresh cache under
         the lib's key with none of the old attempts; harness-work then counts one failure
@@ -2060,7 +2060,7 @@ class ToolsFollowTheLibTests(ToolTestCase):
             self.state(old) / "tickets" / "12.json",
             self.cached_ticket(title=f"Old {self.token}", tier="sonnet", attempts=[old_attempt]),
         )
-        self.write_json(self.state(old) / "ultra" / "34.json", {"findings": [{"old": self.token}]})
+        self.write_json(self.state(old) / "learn.json", {"last_run": "2026-01-01T00:00:00Z"})
         before = self.snapshot(self.state(old))
         work, board, pr = (root / "bin" / t for t in ("harness-work", "harness-board", "harness-pr"))
         lib_cache = self.state(adopt) / "tickets" / "12.json"
@@ -2089,9 +2089,10 @@ class ToolsFollowTheLibTests(ToolTestCase):
         self.assertEqual([(a["stage"], a["result"]) for a in attempts], [("code", "fail")])
         self.assertNotEqual(attempts[0]["tier"], "sonnet")  # the old cache's tier is not read
 
-        r = self.run_tool(pr, ("ultra", "34"), repo)
+        r = self.run_tool(pr, ("learn", "--mark"), repo)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual(json.loads((self.state(adopt) / "ultra" / "34.json").read_text()), {"findings": []})
+        stamp = json.loads((self.state(adopt) / "learn.json").read_text())["last_run"]
+        self.assertGreater(stamp, "2026-01-01T00:00:00Z")  # a fresh record, not the old key's
 
         self.assertEqual(self.state_dirs(), sorted([adopt, old]))
         self.assertEqual(self.snapshot(self.state(old)), before)
@@ -2109,9 +2110,9 @@ class ToolsFollowTheLibTests(ToolTestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         cache = json.loads((self.state(key) / "tickets" / "12.json").read_text())
         self.assertEqual(cache["title"], "Board title")
-        r = self.run_tool(root / "bin" / "harness-pr", ("ultra", "34"), repo)
+        r = self.run_tool(root / "bin" / "harness-pr", ("learn", "--mark"), repo)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual(json.loads((self.state(key) / "ultra" / "34.json").read_text()), {"findings": []})
+        self.assertIn("last_run", json.loads((self.state(key) / "learn.json").read_text()))
         r = self.run_tool(root / "bin" / "harness-work", ("attempt", "12", "tests", "pass"), repo)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         attempts = json.loads((self.state(key) / "tickets" / "12.json").read_text())["attempts"]
@@ -2129,14 +2130,14 @@ class ToolsFollowTheLibTests(ToolTestCase):
         cache = json.loads((self.state(self.sentinel_key(repo)) / "tickets" / "12.json").read_text())
         self.assertEqual(cache["title"], f"From gh {self.token}")
 
-    def test_pr_saves_ultrareview_under_the_libs_key(self):
+    def test_pr_saves_its_learn_record_under_the_libs_key(self):
         root = self.tree("sentinel", "real", SENTINEL_PATHS)
         repo = self.make_repo()
-        r = self.run_tool(root / "bin" / "harness-pr", ("ultra", "34"), repo)
+        r = self.run_tool(root / "bin" / "harness-pr", ("learn", "--mark"), repo)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.state_dirs(), [self.sentinel_key(repo)])
-        saved = self.state(self.sentinel_key(repo)) / "ultra" / "34.json"
-        self.assertEqual(json.loads(saved.read_text()), {"findings": []})
+        saved = self.state(self.sentinel_key(repo)) / "learn.json"
+        self.assertIn("last_run", json.loads(saved.read_text()))
 
     def test_work_reads_and_writes_the_cache_under_the_libs_key(self):
         root = self.tree("sentinel", "real", SENTINEL_PATHS)
@@ -2169,7 +2170,7 @@ class ToolsFollowTheLibTests(ToolTestCase):
                 r = self.run_tool(root / "bin" / tool, args, repo)
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.state_dirs(), [key])
-        self.assertTrue((self.state(key) / "ultra" / "34.json").is_file())
+        self.assertTrue((self.state(key) / "learn.json").is_file())
 
     def test_the_lib_is_found_from_the_tools_real_path(self):
         """A symlink to a tool in a tree with the instrumented lib, placed next to a

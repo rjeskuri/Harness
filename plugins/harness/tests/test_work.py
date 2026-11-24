@@ -619,11 +619,11 @@ class Budget(WorkTest):
     def test_status_exhaust_and_reset(self):
         self.assertEqual(self.ok("budget").stdout.splitlines(),
                          ["api: available", "cloud: available", "subscription: available"])
-        p = self.ok("budget", "exhaust", "cloud", "--reason", "ultrareview: out of credits", "--hours", "2")
-        self.assertRegex(p.stdout.strip(), r"^cloud: exhausted until \S+Z \(ultrareview: out of credits\)$")
+        p = self.ok("budget", "exhaust", "cloud", "--reason", "cloud sessions: out of credits", "--hours", "2")
+        self.assertRegex(p.stdout.strip(), r"^cloud: exhausted until \S+Z \(cloud sessions: out of credits\)$")
         saved = self.read_json(self.budgets_path())
         self.iso_close_to(saved["cloud"]["exhausted_until"], dt.timedelta(hours=2))
-        self.assertEqual(saved["cloud"]["reason"], "ultrareview: out of credits")
+        self.assertEqual(saved["cloud"]["reason"], "cloud sessions: out of credits")
 
         status = self.ok_json("budget", "status", "--json")
         self.assertTrue(status["cloud"]["exhausted"])

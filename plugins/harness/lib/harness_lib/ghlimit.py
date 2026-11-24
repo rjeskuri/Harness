@@ -23,6 +23,10 @@ DAY_FILE = re.compile(r"^calls-(\d{4}-\d\d-\d\d)\.jsonl$")
 TICKET_DIR = re.compile(r"/\.claude/worktrees/t-(\d+)-")
 WORKTREES = "/.claude/worktrees/"
 HEX = re.compile(r"^[0-9a-fA-F]{7,40}$")
+# Estimated GraphQL points of one logged call by call_name, from the costs measured in
+# docs/research/github-quota.md; any other graphql call is 1 and a REST call 0. The item-edit entry drops once
+# the board mirror edits by ID (#447).
+POINTS = {"project item-edit": 104, "project item-list": 101}
 
 
 def gh_dir():
@@ -72,6 +76,13 @@ def call_name(args):
     return " ".join(words)
 
 
+def call_points(line):
+    """Estimated GraphQL points of a logged line: 0 unless its kind is graphql, else POINTS[cmd], default 1."""
+    if line.get("kind") != "graphql":
+        return 0
+    return POINTS.get(line.get("cmd"), 1)
+
+
 def ticket_of(cwd):
     """N of the ticket worktree .claude/worktrees/t-N-... in PWD, else in `cwd` (None: the current directory);
     else None."""
@@ -91,12 +102,14 @@ def repo_of(cwd):
     return os.path.basename(path.rstrip("/"))
 
 
-def log_call(args, *, cwd, exit, ms, waited_ms=0, refused=False):
+def log_call(args, *, cwd, exit, ms, waited_ms=0, refused=False, tool=None):
     """Append the call's line to today's file; the first line of a day drops the files over KEEP_DAYS days
-    old. Any OSError is skipped silently."""
+    old. `tool` names the caller (None: the basename of sys.argv[0]). Any OSError is skipped silently."""
     try:
         at = now_iso()
-        line = {"at": at, "tool": os.path.basename(sys.argv[0]) if sys.argv else "", "cmd": call_name(args),
+        if tool is None:
+            tool = os.path.basename(sys.argv[0]) if sys.argv else ""
+        line = {"at": at, "tool": tool, "cmd": call_name(args),
                 "kind": call_kind(args), "repo": repo_of(cwd), "ticket": ticket_of(cwd), "exit": exit,
                 "ms": int(ms), "waited_ms": int(waited_ms), "refused": bool(refused)}
         folder = gh_dir()
