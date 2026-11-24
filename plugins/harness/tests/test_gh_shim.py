@@ -131,6 +131,15 @@ def setUpModule():
         executable(os.path.join(M["pybin"], "python3"), PYTHON3.format(python=sys.executable))
         M["githome"] = os.path.join(root, "githome")
         os.makedirs(M["githome"])
+        # a second checkout's shim folder (a copy with the lib beside it, as a checkout has it) and a third one
+        # (the shim alone): different real paths from the shim under test, the same script
+        for key, name, with_lib in (("shim2", "checkout2", True), ("shim3", "checkout3", False)):
+            plugin = os.path.join(root, name, "plugins", "harness")
+            os.makedirs(os.path.join(plugin, "shim"))
+            shutil.copy2(SHIM, os.path.join(plugin, "shim", "gh"))
+            if with_lib:
+                shutil.copytree(LIB, os.path.join(plugin, "lib"), ignore=shutil.ignore_patterns("__pycache__"))
+            M[key] = os.path.join(plugin, "shim")
         # path-only checkouts for the shim's repo and ticket (no git needed: both come from the path)
         M["wt12"] = os.path.join(root, "acme-widget", ".claude", "worktrees", "t-12-add-the-widget")
         M["beta"] = os.path.join(root, "beta-tool")
@@ -196,13 +205,13 @@ class Case(unittest.TestCase):
         env.update(extra)
         return env
 
-    def shim(self, args, stdin=b"", cwd=None, exe=SHIM, **env):
+    def shim(self, args, stdin=b"", cwd=None, exe=SHIM, timeout=60, **env):
         """Run the shim as a program (its shebang, its folder's real path) with `stdin` bytes."""
         self.assertTrue(os.path.isfile(exe) and os.access(exe, os.X_OK), f"no executable shim at {exe}")
         cwd = cwd or M["beta"]
         env.setdefault("PWD", cwd)
         return subprocess.run([exe] + list(args), input=stdin, capture_output=True, cwd=cwd,
-                              env=self.env(**env), timeout=60)
+                              env=self.env(**env), timeout=timeout)
 
     def records(self):
         if not os.path.exists(self.record):
@@ -379,6 +388,83 @@ class Logged(Case):
                               SHIMTEST_ERR="checks failed\n")
                 self.assertEqual((p.stdout, p.stderr, p.returncode), expected)
                 self.assertEqual([r["argv"] for r in self.records()], [args])
+
+
+# ==================================================================== two checkouts' shims on PATH
+class TwoShims(Case):
+    """A session of one checkout can start a session that loads another checkout's plugin, so PATH holds two shim
+    folders (different real paths) ahead of the real gh. One gh call must reach the real gh once, whichever shim is
+    started and whichever folder comes first, instead of one shim running the other without end."""
+
+    def run_through(self, entry_dir, dirs, args, code, *, home=None):
+        try:
+            return self.shim(args, exe=os.path.join(entry_dir, "gh"), timeout=15, home=home,
+                             path=[M["pybin"]] + dirs + [M["realbin"], "/usr/bin", "/bin"],
+                             SHIMTEST_EXIT=str(code), SHIMTEST_ERR="e" + str(code))
+        except subprocess.TimeoutExpired:
+            self.fail(f"the shim in {entry_dir} did not finish with {dirs} on PATH (shims calling each other?)")
+
+    def test_two_shims_run_the_real_gh_once_and_log_once(self):
+        """Either shim started, either folder first: the real gh ran once with the argv unchanged, its stdout,
+        stderr and exit come through, and the log holds one agent line for the one call."""
+        orders = [("A then B", SHIM_DIR, M["shim2"]), ("B then A", M["shim2"], SHIM_DIR)]
+        cases = [(["issue", "view", "489", "--json", "title"], 0, "issue view"),
+                 (["pr", "checks", "7"], 8, "pr checks"),
+                 (["api", "user"], 3, "api user")]
+        for label, first, second in orders:
+            for entry in (SHIM_DIR, M["shim2"]):
+                for args, code, cmd in cases:
+                    with self.subTest(order=label, started=entry, args=args):
+                        if os.path.exists(self.record):
+                            os.unlink(self.record)
+                        home = self.new_home()
+                        p = self.run_through(entry, [first, second], args, code, home=home)
+                        self.assertEqual(p.stdout, b"out:" + json.dumps(args).encode("utf-8") + b"|", p.stderr)
+                        self.assertEqual(p.stderr, b"err:e" + str(code).encode("utf-8"))
+                        self.assertEqual(p.returncode, code)
+                        self.assertEqual([r["argv"] for r in self.records()], [args])
+                        lines = self.logged(home)
+                        self.assertEqual(len(lines), 1, lines)
+                        self.assertAgentLine(lines[0], cmd=cmd, exit=code)
+
+    def test_two_shims_pass_stdin_through(self):
+        """The one real gh gets the caller's stdin whole (a nested shim must not eat or duplicate it)."""
+        try:
+            p = self.shim(["pr", "create", "--body-file", "-"], stdin=b"body line\n", exe=SHIM, timeout=15,
+                          path=[M["pybin"], SHIM_DIR, M["shim2"], M["realbin"], "/usr/bin", "/bin"])
+        except subprocess.TimeoutExpired:
+            self.fail("the shim did not finish with two shim folders on PATH")
+        self.assertEqual((p.stdout, p.returncode), (b'out:["pr", "create", "--body-file", "-"]|body line\n', 0))
+        self.assertEqual(len(self.records()), 1)
+
+    def test_three_shims_and_a_shim_without_lib_still_run_the_real_gh_once(self):
+        """Three shim folders (one with no lib beside it) ahead of the real gh, in every rotation: one real call,
+        its exit, and at most one agent line."""
+        folders = [SHIM_DIR, M["shim2"], M["shim3"]]
+        for i in range(3):
+            order = folders[i:] + folders[:i]
+            for entry in folders:
+                with self.subTest(order=[os.path.basename(os.path.dirname(os.path.dirname(d))) for d in order],
+                                  started=entry):
+                    if os.path.exists(self.record):
+                        os.unlink(self.record)
+                    home = self.new_home()
+                    p = self.run_through(entry, order, ["run", "list"], 4, home=home)
+                    self.assertEqual((p.stdout, p.returncode), (b'out:["run", "list"]|', 4), p.stderr)
+                    self.assertEqual([r["argv"] for r in self.records()], [["run", "list"]])
+                    self.assertLessEqual(len(self.logged(home)), 1, self.logged(home))
+
+    def test_only_shims_are_skipped_the_first_real_gh_runs(self):
+        """With two shims first, the first real gh on PATH runs, not a later one."""
+        later = os.path.join(self.tmp, "later")
+        executable(os.path.join(later, "gh"), "#!/bin/sh\necho later-gh\nexit 9\n")
+        try:
+            p = self.shim(["auth", "status"], exe=os.path.join(M["shim2"], "gh"), timeout=15,
+                          path=[M["pybin"], M["shim2"], SHIM_DIR, M["realbin"], later, "/usr/bin", "/bin"])
+        except subprocess.TimeoutExpired:
+            self.fail("the shim did not finish with two shim folders on PATH")
+        self.assertEqual((p.stdout, p.returncode), (b'out:["auth", "status"]|', 0), p.stderr)
+        self.assertEqual(len(self.records()), 1)
 
 
 # ==================================================================== no double logging
