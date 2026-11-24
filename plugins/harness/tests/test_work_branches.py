@@ -199,7 +199,10 @@ class BranchTest(WorkTest):
         self.write_scenario({"calls": calls})
 
     def write_scenario(self, scenario):
-        write(self.scenario_path, json.dumps(scenario))
+        if scenario.get("calls"):
+            self.put_scenario(scenario)          # #447: issues and pull requests through REST
+            return
+        write(self.scenario_path, json.dumps(scenario))     # GH_DOWN: every call, REST too, fails
         state = self.scenario_path + ".state.json"
         if os.path.exists(state):
             os.unlink(state)

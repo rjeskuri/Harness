@@ -28,6 +28,7 @@ import unittest
 sys.dont_write_bytecode = True  # loading the lib and the tool must not leave __pycache__ in the checkout
 
 from gitrepo_support import GIT, run_in_process  # noqa: E402
+import fakegh  # noqa: E402  (#447: the gh issue fixtures move to its REST layer)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(os.path.dirname(HERE), "bin", "harness-board")
@@ -204,7 +205,7 @@ class OpsBoardTest(unittest.TestCase):
         return env
 
     def scenario(self, calls, default=None):
-        data = {"calls": calls}
+        data = {"calls": fakegh.as_rest(calls)}     # #447: issue reads and writes through gh api REST
         if default is not None:
             data["default"] = default
         write(self.scenario_path, json.dumps(data))
@@ -232,7 +233,8 @@ class OpsBoardTest(unittest.TestCase):
             return [json.loads(line) for line in fh if line.strip()]
 
     def calls(self):
-        return [e["argv"] for e in self.entries()]
+        """Each gh call's argv, a REST issue write as the gh command it stands for (fakegh.gh_view)."""
+        return fakegh.gh_view(self.entries(), self.scenario_path)
 
     def body_of(self, entry):
         """The body a logged gh call carried: --body/-b, --body-file - (stdin) or --body-file PATH (recorded)."""
@@ -254,7 +256,7 @@ class OpsBoardTest(unittest.TestCase):
         self.fail(f"no body found for gh {argv}")
 
     def comments_on(self, n):
-        return [self.body_of(e) for e in self.entries() if e["argv"][:3] == ["issue", "comment", str(n)]]
+        return [argv[4] for argv in self.calls() if argv[:4] == ["issue", "comment", str(n), "--body"]]
 
     def label_changes(self, n):
         """(added, removed) label names over every `gh issue edit N` the tool made."""

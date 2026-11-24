@@ -10,7 +10,7 @@ Usage:
     harness-board epic create --title T --body-file F [--size S|M|L] [--risk low|high] [--proposed]
     harness-board task create --title T --body-file F [--parent N] [--type task|bug|chore|refactor|ops]
                               [--size S|M|L] [--risk low|high] [--blocked-by N[,N]]
-                              [--no-tests] [--needs-local] [--priority] [--proposed]
+                              [--no-tests] [--needs-local] [--priority] [--proposed] [--label NAME ...]
     harness-board show N [--markdown]
     harness-board retype N --type task|bug|chore|refactor --reason TEXT   # an ops ticket that needs code after all
     harness-board ready
@@ -49,7 +49,9 @@ in ~/.claude/harness/projects.json with --all-projects, adds the missing issues 
 drift from the labels (an unset Priority counts as Normal, so only High against Normal is drift), one line per
 change; --dry-run prints the lines and writes nothing. Both need the setting.
 
-gh is HARNESS_GH when set, else `gh` on PATH.
+gh is HARNESS_GH when set, else `gh` on PATH. Issues are read and changed through REST (`gh api`, harness_lib/issues.py:
+GitHub's core rate-limit bucket, not GraphQL), each issue read once per command; the board's IDs are kept in
+~/.claude/harness/boards/<owner>-<number>.json, so a status change after the first is one `gh project item-edit`.
 """
 from __future__ import annotations
 
@@ -72,6 +74,7 @@ try:
     from harness_lib.repo import RepoError, repo_facts
     from harness_lib.registry import load_registry
     from harness_lib.gh import describe, gh as lib_gh, gh_json as lib_gh_json
+    from harness_lib.issues import Issues, Rest
     from harness_lib.routing import cached_code_route, code_route, label_tier, load_routing, review_route
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-board: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
@@ -139,6 +142,7 @@ PROJECT_SETTING = "HARNESS_PROJECT"   # OWNER/NUMBER of the Projects board the s
 PROJECT_VALUE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[1-9][0-9]*")
 PROJECT_FIELDS = (("Status", [STATUS_TITLES[s] for s in MIRRORED] + ["Done"]), ("Priority", ["High", "Normal"]))
 FIELD_LIMIT = "100"     # a project holds at most 50 fields
+REFUSED_ID = re.compile(r"Could not resolve to a node with the global id")   # a kept board ID gone stale (#447)
 ITEM_LIMIT = "1000"     # the board items project sync reads
 ISSUE_LIMIT = "1000"    # the open issues per repository project sync reads
 CHECKBOX = re.compile(r"^[-*+]\s+\[[ xX]\]")
@@ -214,6 +218,18 @@ def gh_json(repo, args):
     return lib_gh_json(args, repo.root if repo else None, pick=first_line, via=lambda a, c: gh(repo, a))
 
 
+ISSUES = {}     # checkout (None: the cwd): its Issues, this command's REST reads with each issue read once (#447)
+
+
+def issues(repo):
+    """The repository's issues through REST (harness_lib.issues), a failure worded as the gh issue command it
+    replaces (`gh issue view 12 failed: ...`)."""
+    root = repo.root if repo else None
+    if root not in ISSUES:
+        ISSUES[root] = Issues(Rest(root, pick=first_line, timeout=GH_TIMEOUT))
+    return ISSUES[root]
+
+
 def created_issue(out):
     """(number, url) from `gh issue create` output: the last issue URL it printed."""
     found = re.findall(r"https?://\S+/issues/(\d+)", out)
@@ -286,19 +302,72 @@ def project_setting():
     return owner, number
 
 
-def mirror(repo, project, url, fields, add=False):
-    """Add the issue at `url` to the board (when `add`), then set each (field, option) by name. The first failing
-    call stops the rest with one warning; the labels already changed, so this never fails the command."""
+def board_ids_path(project):
+    """Where the board's IDs are kept (#447): ~/.claude/harness/boards/<owner>-<number>.json."""
+    return harness_home("boards", f"{project[0]}-{project[1]}.json")
+
+
+def board_ids(repo, project, ids, url, fields, add, again):
+    """`ids` ({id, fields: {name: {id, options: {name: id}}}, items: {url: id}}) with what the edits need filled in:
+    the board's ID (gh project view), its fields' and options' (gh project field-list) and the issue's item (gh
+    project item-add, which returns the item already there). `add` adds the item whatever is kept; `again` resolves
+    everything afresh. Kept in board_ids_path when anything changed; Problem naming what the board lacks."""
     owner, number = project
-    target = [number, "--owner", owner, "--url", url]
-    calls = ([["project", "item-add"] + target] if add else []) + \
-        [["project", "item-edit"] + target + ["--field", field, "--value", value] for field, value in fields]
-    for call in calls:
+    target = [number, "--owner", owner]
+    old = dict(ids)
+    if again or not isinstance(ids.get("id"), str):
+        data = gh_json(repo, ["project", "view"] + target + ["--format", "json"])
+        found = data.get("id") if isinstance(data, dict) else None
+        if not isinstance(found, str) or not found:
+            raise Problem(f"gh project view {number} named no board ID")
+        same = found == ids.get("id")           # a board made again: its fields and items are new too
+        ids = {"id": found, "fields": ids.get("fields") if same else {}, "items": ids.get("items") if same else {}}
+    have = ids.get("fields") if isinstance(ids.get("fields"), dict) else {}
+    if again or any(value not in ((have.get(field) or {}).get("options") or {}) for field, value in fields):
+        data = gh_json(repo, ["project", "field-list"] + target + ["--format", "json", "--limit", FIELD_LIMIT])
+        have = {f["name"]: {"id": f["id"], "options": {o.get("name"): o.get("id") for o in as_list(f.get("options"))}}
+                for f in as_list(data.get("fields") if isinstance(data, dict) else None)
+                if isinstance(f.get("name"), str) and isinstance(f.get("id"), str)}
+    ids = dict(ids, fields=have, items=dict(ids.get("items") or {}))
+    if add or again or not isinstance(ids["items"].get(url), str):
+        data = gh_json(repo, ["project", "item-add"] + target + ["--url", url, "--format", "json"])
+        item = data.get("id") if isinstance(data, dict) else None
+        if not isinstance(item, str) or not item:
+            raise Problem(f"gh project item-add {number} named no item ID")
+        ids["items"][url] = item
+    if ids != old:
         try:
-            gh(repo, call)
-        except Problem as err:
-            warn("harness-board", f"the Projects board {owner}/{number} was not updated: {err}")
-            return
+            write_json(board_ids_path(project), ids, prefix=".board-")
+        except OSError:
+            pass                        # best effort: the next change resolves them again
+    for field, value in fields:
+        if not ((ids["fields"].get(field) or {}).get("options") or {}).get(value):
+            raise Problem(f"it has no {field} option {value} (harness-board project check names what it lacks)")
+    return ids
+
+
+def mirror(repo, project, url, fields, add=False):
+    """Add the issue at `url` to the board (when `add`), then set each (field, option) with gh project item-edit by
+    IDs, resolved once and kept (board_ids; #447). An ID the board refuses resolves them all again, once; another
+    failure, or a second refusal, stops the rest with one warning. The labels already changed, so this never fails
+    the command."""
+    owner, number = project
+    kept = read_json(board_ids_path(project))
+    ids = kept if isinstance(kept, dict) else {}
+    try:
+        for again in (False, True):
+            try:
+                ids = board_ids(repo, project, ids, url, fields, add, again)
+                for field, value in fields:
+                    spec = ids["fields"][field]
+                    gh(repo, ["project", "item-edit", "--id", ids["items"][url], "--project-id", ids["id"],
+                              "--field-id", spec["id"], "--single-select-option-id", spec["options"][value]])
+                return
+            except Problem as err:
+                if again or not REFUSED_ID.search(str(err)):
+                    raise
+    except Problem as err:
+        warn("harness-board", f"the Projects board {owner}/{number} was not updated: {err}")
 
 
 def mirror_created(repo, url, priority=False, proposed=False):
@@ -448,7 +517,7 @@ def keep_trusted(record, owner):
 def fetch_record(repo, number):
     """The ticket as the cache schema has it (plus `goal` and `tasks` for an epic), fetched now, every comment
     included: `show` filters them with `keep_trusted`."""
-    data = gh_json(repo, ["issue", "view", str(number), "--json", ISSUE_FIELDS])
+    data = issues(repo).view(number, ISSUE_FIELDS)
     if not isinstance(data, dict):
         raise Problem(f"gh issue view {number} printed no issue")
     names = label_names(data.get("labels"))
@@ -461,10 +530,7 @@ def fetch_record(repo, number):
               "sections": parse_sections(data.get("body"), kind["type"]), "comments": [],
               "fetched_at": now_iso()}
     parent = data.get("parent")
-    if isinstance(parent, dict) and parent.get("number"):
-        if parent.get("body") is None:          # gh's parent field carries no body: the goal needs it
-            pdata = gh_json(repo, ["issue", "view", str(parent["number"]), "--json", "number,title,body"])
-            parent = dict(parent, **(pdata if isinstance(pdata, dict) else {}))
+    if isinstance(parent, dict) and parent.get("number"):       # REST's parent carries its body, the goal's source
         record["parent"] = {"number": int(parent["number"]), "title": parent.get("title") or "",
                             "goal": first_paragraph(split_sections(parent.get("body")).get("goal", ""))}
     for b in as_list(data.get("blockedBy")):
@@ -475,8 +541,7 @@ def fetch_record(repo, number):
                                    "body": c.get("body") or ""})
     if record["type"] == "epic":
         record["goal"] = first_paragraph(split_sections(record["body"]).get("goal", ""))
-        subs = gh_json(repo, ["api", f"repos/{repo.slug()}/issues/{number}/sub_issues?per_page=100"])
-        record["tasks"] = [task_entry(repo, s) for s in (subs if isinstance(subs, list) else []) if isinstance(s, dict)]
+        record["tasks"] = [task_entry(repo, s) for s in issues(repo).sub_issues(number)]
     return record
 
 
@@ -528,10 +593,9 @@ def task_resolutions(repo, tasks, owner=None):
         if t["state"] != "CLOSED" or not t.get("number"):
             continue
         try:
-            data = gh_json(repo, ["issue", "view", str(t["number"]), "--json", "comments"])
+            comments = issues(repo).comments(t["number"])
         except Problem:
             continue
-        comments = as_list(data.get("comments")) if isinstance(data, dict) else []
         _, lines = newest_resolution([c for c in comments if from_trusted(comment_login(c), owner)])
         if lines:
             out[t["number"]] = lines
@@ -720,6 +784,7 @@ def cmd_task_create(repo, args):
     labels = [args.type, initial_status(args)] + ([f"size:{args.size}"] if args.size else []) \
         + ([f"risk:{args.risk}"] if args.risk else []) + (["no-tests"] if args.no_tests else []) \
         + (["needs-local"] if needs_local else []) + (["priority:high"] if args.priority else [])
+    labels += [name for name in dict.fromkeys(args.label) if name not in labels]
     number, url = create_issue(repo, args.title, path, stdin, labels, args.priority, args.proposed)
     result = {"number": number, "url": url, "parent": args.parent, "linked": None, "blocked_by": []}
 
@@ -764,25 +829,21 @@ def cmd_retype(repo, args):
     reason = (args.reason or "").strip()
     if not reason:
         raise Problem(f"--reason is required: say why #{args.number} changes type; nothing changed")
-    data = gh_json(repo, ["issue", "view", str(args.number), "--json", "labels"])
+    data = issues(repo).view(args.number, "labels")
     names = label_names(data.get("labels") if isinstance(data, dict) else None)
     if "epic" in names:
         raise Problem(f"#{args.number} is an epic; only a task can be retyped")
     removed = [name for name in names if name in TYPES and name != args.type]
-    cmd = ["issue", "edit", str(args.number), "--add-label", args.type]
-    for name in removed:
-        cmd += ["--remove-label", name]
-    gh(repo, cmd)
+    issues(repo).edit_labels(args.number, add=[args.type], remove=removed)
     old = ", ".join(removed) or "no type"
-    gh(repo, ["issue", "comment", str(args.number), "--body", marked(f"Retyped from {old} to {args.type}: {reason}")])
+    issues(repo).comment(args.number, marked(f"Retyped from {old} to {args.type}: {reason}"))
     labels = [name for name in names if name not in removed] + ([args.type] if args.type not in names else [])
     refresh_cache(repo, args.number, labels=labels)
     emit(args.json, {"number": args.number, "type": args.type, "removed": removed}, f"#{args.number} type {args.type}")
 
 
 def cmd_ready(repo, args):
-    items = gh_json(repo, ["issue", "list", "--state", "open", "--label", "status:ready", "--json",
-                           "number,title,labels,blockedBy", "--limit", LIST_LIMIT])
+    items = issues(repo).list(["status:ready"], "open", blocked=True)[:int(LIST_LIMIT)]
     rows = []
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
@@ -812,14 +873,11 @@ def set_status(repo, number, status, comment=None):
     """Swap the status label (remove every other status:*, add the new one), mirror it to the Projects board when
     one is configured (proposed has no Status there), comment when asked."""
     project = project_setting() if status in MIRRORED else None
-    data = gh_json(repo, ["issue", "view", str(number), "--json", "labels,url" if project else "labels"])
+    data = issues(repo).view(number, "labels,url" if project else "labels")
     names = label_names(data.get("labels") if isinstance(data, dict) else None)
     new = "status:" + status
     removed = [name for name in names if name.startswith("status:") and name != new]
-    cmd = ["issue", "edit", str(number), "--add-label", new]
-    for name in removed:
-        cmd += ["--remove-label", name]
-    gh(repo, cmd)
+    issues(repo).edit_labels(number, add=[new], remove=removed)
     if project:
         url = data.get("url") if isinstance(data, dict) else None
         if isinstance(url, str) and url.strip():
@@ -828,7 +886,7 @@ def set_status(repo, number, status, comment=None):
             warn("harness-board",
                  f"gh issue view {number} gave no url; the Projects board {'/'.join(project)} is not updated")
     if comment:
-        gh(repo, ["issue", "comment", str(number), "--body", marked(comment)])
+        issues(repo).comment(number, marked(comment))
     labels = [name for name in names if name not in removed] + ([new] if new not in names else [])
     refresh_cache(repo, number, labels=labels, status=status)
     return removed
@@ -843,7 +901,7 @@ def cmd_status(repo, args):
 def cmd_promote(repo, args):
     """A proposed ticket to ready through set_status: an epic's open proposed sub-issues first, then the epic."""
     n = args.number
-    data = gh_json(repo, ["issue", "view", str(n), "--json", "labels,state"])
+    data = issues(repo).view(n, "labels,state")
     data = data if isinstance(data, dict) else {}
     names = label_names(data.get("labels"))
     if str(data.get("state", "")).upper() == "CLOSED":
@@ -854,9 +912,8 @@ def cmd_promote(repo, args):
                       "nothing promoted")
     tasks = []
     if "epic" in names:
-        subs = gh_json(repo, ["api", f"repos/{repo.slug()}/issues/{n}/sub_issues?per_page=100"])
-        tasks = sorted(int(s["number"]) for s in (subs if isinstance(subs, list) else [])
-                       if isinstance(s, dict) and s.get("number") and str(s.get("state", "")).upper() != "CLOSED"
+        tasks = sorted(int(s["number"]) for s in issues(repo).sub_issues(n)
+                       if s.get("number") and str(s.get("state", "")).upper() != "CLOSED"
                        and "status:proposed" in label_names(s.get("labels")))
     done = []
     for number in tasks + [n]:
@@ -873,12 +930,11 @@ def cmd_promote(repo, args):
 
 def cmd_comment(repo, args):
     if args.body is not None:
-        out = gh(repo, ["issue", "comment", str(args.number), "--body", marked(args.body)])
+        text = args.body
     else:
         path, stdin = body_file(args.body_file)
         text = stdin if path == "-" else read_text(path, "body file")
-        out = gh(repo, ["issue", "comment", str(args.number), "--body-file", "-"], marked(text))
-    url = first_line(out.strip().splitlines()[-1] if out.strip() else "")
+    url = issues(repo).comment(args.number, marked(text))
     emit(args.json, {"number": args.number, "url": url}, url or f"commented on #{args.number}")
 
 
@@ -910,9 +966,7 @@ def cmd_needs_input(repo, args):
         raise Problem("--question is empty")
     evidence = read_text(args.evidence_file, "evidence file") if args.evidence_file else None
     set_status(repo, args.number, "needs-input")
-    out = gh(repo, ["issue", "comment", str(args.number), "--body",
-                    needs_input_body(args.number, args.question, evidence)])
-    url = first_line(out.strip().splitlines()[-1] if out.strip() else "")
+    url = issues(repo).comment(args.number, needs_input_body(args.number, args.question, evidence))
     notified = notify(f"{repo.name} #{args.number} needs input", f"harness-{repo.key}-{args.number}")
     emit(args.json, {"number": args.number, "url": url, "notified": notified}, url or f"#{args.number} needs input")
 
@@ -952,7 +1006,7 @@ def park(repo, number, reason, evidence=None, follow_ups=None):
     if not reason_first:
         raise Problem(f"--reason is empty; #{number} not parked")
     follow_ups = list(follow_ups or [])
-    data = gh_json(repo, ["issue", "view", str(number), "--json", "number,title,url,labels,state,parent"])
+    data = issues(repo).view(number, "number,title,url,labels,state,parent")
     data = data if isinstance(data, dict) else {}
     names = label_names(data.get("labels"))
     if str(data.get("state", "")).upper() == "CLOSED":
@@ -978,9 +1032,7 @@ def park(repo, number, reason, evidence=None, follow_ups=None):
                 id_hint = issue_id or f"$(gh api repos/{slug}/issues/{m} --jq .id)"
                 warn("harness-board", f"#{m} was not linked under #{epic}: {error}; link it with: "
                      f"gh api -X POST repos/{slug}/issues/{epic}/sub_issues -F sub_issue_id={id_hint}")
-    out = gh(repo, ["issue", "comment", str(number), "--body",
-                    park_body(number, reason, evidence, follow_ups, created)])
-    url = first_line(out.strip().splitlines()[-1] if out.strip() else "")
+    url = issues(repo).comment(number, park_body(number, reason, evidence, follow_ups, created))
     notified = notify(f"{repo.name} #{number} parked: {reason_first}", f"harness-{repo.key}-{number}")
     return {"number": number, "follow_up": follow_ups, "url": url, "notified": notified}
 
@@ -1004,9 +1056,8 @@ def cmd_answers(repo, args):
     login = gh(repo, ["api", "user", "--jq", ".login"]).strip()
     if not login:
         raise Problem("gh api user printed no login")
-    data = gh_json(repo, ["issue", "view", str(args.number), "--json", "comments"])
     mine, asked = [], []
-    for c in as_list(data.get("comments") if isinstance(data, dict) else None):
+    for c in issues(repo).comments(args.number):
         author = (c.get("author") or {}).get("login") if isinstance(c.get("author"), dict) else None
         body, when = c.get("body") or "", parse_iso(c.get("createdAt"))
         question = when is not None and body.lstrip().startswith(NEEDS_INPUT)
@@ -1027,13 +1078,13 @@ def cmd_answers(repo, args):
 
 
 def cmd_close(repo, args):
-    gh(repo, ["issue", "close", str(args.number)] + (["--comment", marked(args.comment)] if args.comment else []))
+    issues(repo).close(args.number, marked(args.comment) if args.comment else None)
     refresh_cache(repo, args.number, status="closed")
     emit(args.json, {"number": args.number, "closed": True}, f"closed #{args.number}")
 
 
 def cmd_epic_check(repo, args):
-    data = gh_json(repo, ["issue", "view", str(args.number), "--json", "state,subIssuesSummary"])
+    data = issues(repo).view(args.number, "state,subIssuesSummary")
     data = data if isinstance(data, dict) else {}
     summary = data.get("subIssuesSummary") if isinstance(data.get("subIssuesSummary"), dict) else {}
     total, completed = int(summary.get("total") or 0), int(summary.get("completed") or 0)
@@ -1042,7 +1093,7 @@ def cmd_epic_check(repo, args):
         result["closed"] = True
         emit(args.json, result, f"#{args.number} is already closed")
     elif total > 0 and completed == total:
-        gh(repo, ["issue", "close", str(args.number), "--comment", marked(EPIC_DONE)])
+        issues(repo).close(args.number, marked(EPIC_DONE))
         refresh_cache(repo, args.number, status="closed")
         result["closed"] = True
         emit(args.json, result, f"closed epic #{args.number}: all {total} tasks landed")
@@ -1051,8 +1102,7 @@ def cmd_epic_check(repo, args):
 
 
 def cmd_board(repo, args):
-    items = gh_json(repo, ["issue", "list", "--state", "open", "--json", "number,title,labels,subIssuesSummary",
-                           "--limit", LIST_LIMIT])
+    items = issues(repo).list(state="open")[:int(LIST_LIMIT)]
     groups = {"epics": []}
     groups.update({s: [] for s in STATUSES})
     groups["no-status"] = []
@@ -1103,7 +1153,7 @@ def cmd_tier(repo, args):
         # no labels to route: the cached tier stands in for the labels' tier, and the setting still decides
         found, source = cached_code_route(cached["tier"], routing), "cache"
     else:
-        data = gh_json(repo, ["issue", "view", str(args.number), "--json", "labels"])
+        data = issues(repo).view(args.number, "labels")
         found, source = route(label_names(data.get("labels") if isinstance(data, dict) else None)), "github"
     emit(args.json, {"number": args.number, "tier": found["tier"], "source": source, "stage": args.stage or "code",
                      "from": found["from"], "labels_tier": found["labels_tier"], "effort": found["effort"]},
@@ -1318,6 +1368,8 @@ def parser():
     tc.add_argument("--needs-local", action="store_true", help="needs this Mac's files or credentials")
     tc.add_argument("--priority", action="store_true", help="label priority:high (and Priority High on the board)")
     tc.add_argument("--proposed", action="store_true", help="label status:proposed in place of status:ready")
+    tc.add_argument("--label", action="append", default=[], metavar="NAME",
+                    help="a further label the issue is created with (repeatable; e.g. manual-land)")
 
     show = sub.add_parser("show", parents=[common], help="fetch a ticket, write its cache, print it")
     show.add_argument("number", type=issue_number, metavar="N")

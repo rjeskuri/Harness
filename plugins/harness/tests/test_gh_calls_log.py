@@ -46,6 +46,9 @@ from unittest import mock
 
 sys.dont_write_bytecode = True  # loading the lib and the tools must not leave __pycache__ in the checkout
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fakegh  # noqa: E402  (#447: the REST layer the issue fixtures move to)
+
 TESTS = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = os.path.dirname(TESTS)
 BIN = os.path.join(PLUGIN, "bin")
@@ -229,14 +232,26 @@ class Case(unittest.TestCase):
     def new_home(self):
         return tempfile.mkdtemp(prefix="home-", dir=self.tmp)
 
-    def scenario(self, calls, default=None):
-        data = {"calls": calls}
+    def scenario(self, calls, default=None, rest=False, pulls=True):
+        """`rest`: the gh issue fixtures move to fakegh's REST layer, and with `pulls` the pr list ones too (#447:
+        harness-board and harness-work read issues and a branch's pull requests through gh api; harness-pr open
+        keeps gh pr list); the hooks' stay gh calls."""
+        data = {"calls": fakegh.as_rest(calls, pulls=pulls) if rest else calls}
         if default is not None:
             data["default"] = default
         write(self.scenario_path, json.dumps(data))
         for leftover in (self.scenario_path + ".state.json", self.fakegh_log):
             if os.path.exists(leftover):
                 os.unlink(leftover)
+
+    def assertShowCalls(self, lines):
+        """`harness-board show`'s calls (#447): all REST, the issue's own read first, the one `gh api user` (#334)
+        last."""
+        cmds = [x["cmd"] for x in lines]
+        self.assertEqual({x["kind"] for x in lines}, {"rest"}, lines)
+        self.assertEqual(cmds[0], "api repos/:owner/:repo/issues/:n", cmds)
+        self.assertEqual(cmds[-1], "api user", cmds)
+        self.assertEqual(cmds.count("api user"), 1, cmds)
 
     def env(self, home=None, **extra):
         """A clean environment: the temporary HOME, the fake gh, no PWD (unless given), nothing of the caller's
@@ -344,52 +359,53 @@ class ToolCallsAreLogged(Case):
     def test_each_gh_call_of_a_board_command_is_one_line(self):
         """`harness-board show N --json`: one line per gh call (as many as fakegh saw), in call order, each with
         tool harness-board, its own cmd and kind, exit 0, the repo and no ticket from the main checkout. The
-        record's fetch comes first, then the one `gh api user` (#334), a rest call."""
-        parent = {"number": 3, "title": "Widgets"}     # no body: show fetches the parent's goal (a second call)
+        record's fetch comes first, then the one `gh api user` (#334), a rest call. #447: every call is REST, the
+        parent's read (with its body) and an epic's sub-issues among them."""
+        parent = {"number": 3, "title": "Widgets"}
         cases = [
-            ("a task", "12", [{"match": ["issue", "view", "12"], "stdout_json": issue(12)}, OWNER],
-             [("issue view", "graphql"), ("api user", "rest")]),
+            ("a task", "12", [{"match": ["issue", "view", "12"], "stdout_json": issue(12)}, OWNER], []),
             ("a task with a parent", "12",
              [{"match": ["issue", "view", "12"], "stdout_json": issue(12, parent=parent)},
               {"match": ["issue", "view", "3"], "stdout_json": {"number": 3, "title": "Widgets", "body": EPIC_BODY}},
               OWNER],
-             [("issue view", "graphql"), ("issue view", "graphql"), ("api user", "rest")]),
+             ["api repos/:owner/:repo/issues/:n/parent"]),
             ("an epic", "3",
              [{"match": ["issue", "view", "3"],
-               "stdout_json": issue(3, labels=("epic", "status:ready"), body=EPIC_BODY)},
+               "stdout_json": dict(issue(3, labels=("epic", "status:ready"), body=EPIC_BODY),
+                                   sub_issues=[{"number": 12, "title": "Ticket 12", "state": "OPEN", "labels": []}])},
               {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "acme/widget"}},
-              OWNER,                                   # before the sub_issues entry: its `api` prefix fits both
-              {"match": ["api"], "stdout_json": [{"number": 12, "title": "Ticket 12", "state": "OPEN", "labels": []}]}],
-             [("issue view", "graphql"), ("repo view", "graphql"),
-              ("api repos/:owner/:repo/issues/:n/sub_issues", "rest"), ("api user", "rest")]),
+              OWNER],
+             ["api repos/:owner/:repo/issues/:n/sub_issues"]),
         ]
         for label, number, calls, expected in cases:
             with self.subTest(label):
                 home = self.new_home()
-                self.scenario(calls)
+                self.scenario(calls, rest=True)
                 started = self.window()
                 p = self.run_tool(BOARD, "show", number, "--json", cwd=W["main"], home=home)
                 ended = self.window()
                 self.assertEqual(p.returncode, 0, p.stderr)
                 lines = self.logged(home)
                 self.assertEqual(len(lines), len(self.fakegh_argv()), lines)
-                self.assertEqual([(x["cmd"], x["kind"]) for x in lines], expected)
+                self.assertShowCalls(lines)
+                for cmd in expected:
+                    self.assertIn(cmd, [x["cmd"] for x in lines])
                 for line in lines:
                     self.assertLine(line, started, ended, tool="harness-board", exit=0, repo=MAIN_NAME, ticket=None)
                 # a second run appends: twice the lines, the first ones unchanged
                 self.run_tool(BOARD, "show", number, "--json", cwd=W["main"], home=home)
                 again = self.logged(home)
-                self.assertEqual(len(again), 2 * len(expected))
+                self.assertEqual(len(again), 2 * len(lines))
                 self.assertEqual(again[:len(lines)], lines)
 
     def test_pr_and_work_calls_carry_their_tool(self):
-        """harness-pr checks 34 (a pr view and a run view for the failed check) and harness-work worktrees (a pr
-        list per ticket worktree) each log their own name as the tool."""
+        """harness-pr checks 34 (a pr view and a run view for the failed check) and harness-work worktrees (a
+        branch's pull requests per ticket worktree, #447: through REST) each log their own name as the tool."""
         failing = [check_run("test", "FAILURE", "https://github.com/acme/widget/actions/runs/987/job/654"),
                    check_run("lint")]
         self.scenario([{"match": ["pr", "view", "34"], "stdout_json": {"statusCheckRollup": failing}},
                        {"match": ["run", "view", "987"], "stdout": "boom\n"},
-                       {"match": ["pr", "list"], "stdout_json": []}])
+                       {"match": ["pr", "list"], "stdout_json": []}], rest=True)
         started = self.window()
         p = self.run_tool(PR, "checks", "34", cwd=W["main"])
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)    # checks failed: the tool's own exit, untouched
@@ -401,7 +417,8 @@ class ToolCallsAreLogged(Case):
         self.assertEqual(len(lines), len(argv), lines)
         self.assertEqual([(x["tool"], x["cmd"], x["kind"]) for x in lines],
                          [("harness-pr", "pr view", "graphql"), ("harness-pr", "run view", "rest"),
-                          ("harness-work", "pr list", "graphql"), ("harness-work", "pr list", "graphql")])
+                          ("harness-work", "api repos/:owner/:repo/pulls", "rest"),
+                          ("harness-work", "api repos/:owner/:repo/pulls", "rest")])
         for line in lines:
             self.assertLine(line, started, ended, exit=0, repo=MAIN_NAME, ticket=None)
 
@@ -424,7 +441,7 @@ class ToolCallsAreLogged(Case):
                        {"match": ["pr", "list"], "stdout_json": []},
                        {"match": ["pr", "create"], "stdout": url + "\n"},
                        {"match": ["issue", "comment", "12"],
-                        "stdout": "https://github.com/acme/shop-front/issues/12#c1\n"}])
+                        "stdout": "https://github.com/acme/shop-front/issues/12#c1\n"}], rest=True, pulls=False)
         started = self.window()
         p = self.run_tool(PR, "open", "12", "--json", cwd=wt, PWD=wt)
         ended = self.window()
@@ -433,14 +450,17 @@ class ToolCallsAreLogged(Case):
         argv = self.fakegh_argv()
         lines = self.logged()
         self.assertEqual(len(lines), len(argv), lines)
-        self.assertEqual(sorted(x["cmd"] for x in lines), sorted(" ".join(a[:2]) for a in argv))
-        board_calls = {"issue view": "graphql", "api user": "rest", "issue comment": "graphql"}
+        # #447: the board's calls (show's reads, its `gh api user`, the comment) are REST; harness-pr's own are not
         for line in lines:
-            tool = "harness-board" if line["cmd"] in board_calls else "harness-pr"
-            kind = board_calls.get(line["cmd"], "graphql")
-            self.assertLine(line, started, ended, tool=tool, kind=kind, exit=0, repo="shop-front", ticket=12)
-        self.assertEqual(sorted(x["cmd"] for x in lines if x["tool"] == "harness-board"),
-                         ["api user", "issue comment", "issue view"])
+            board = line["cmd"] == "api user" or line["cmd"].startswith(("api repos/:owner/:repo/issues",
+                                                                         "api POST repos/:owner/:repo/issues"))
+            self.assertLine(line, started, ended, tool="harness-board" if board else "harness-pr",
+                            kind="rest" if board else "graphql", exit=0, repo="shop-front", ticket=12)
+        board_cmds = [x["cmd"] for x in lines if x["tool"] == "harness-board"]
+        self.assertEqual(board_cmds.count("api user"), 1, board_cmds)
+        self.assertTrue([c for c in board_cmds if c.endswith("repos/:owner/:repo/issues/:n/comments")], board_cmds)
+        posted = fakegh.gh_view(fakegh.log_entries(self.fakegh_log), self.scenario_path)
+        self.assertEqual(len([a for a in posted if a[:3] == ["issue", "comment", "12"]]), 1, posted)
         self.assertEqual(sorted(x["cmd"] for x in lines if x["tool"] == "harness-pr"), ["pr create", "pr list"])
 
     def test_standup_and_digest_batch_calls_are_logged(self):
@@ -551,13 +571,15 @@ class LineFields(Case):
         for code in (1, 4, 42):
             with self.subTest(code=code):
                 home = self.new_home()
-                self.scenario([{"match": ["issue", "view", "12"], "stderr": "HTTP 502: Bad Gateway\n", "exit": code}])
+                self.scenario([{"match": ["issue", "view", "12"], "stderr": "HTTP 502: Bad Gateway\n", "exit": code}],
+                              rest=True)
                 p = self.run_tool(BOARD, "show", "12", "--json", cwd=W["main"], home=home)
                 self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
                 self.assertIn("HTTP 502", p.stderr)
                 lines = self.logged(home)
                 self.assertEqual(len(lines), 1, lines)
-                self.assertLine(lines[0], tool="harness-board", cmd="issue view", kind="graphql", exit=code)
+                self.assertLine(lines[0], tool="harness-board", cmd="api repos/:owner/:repo/issues/:n", kind="rest",
+                                exit=code)
         # harness-pr: the failed run log fetch is exit 3, the view before it exit 0
         home = self.new_home()
         failing = [check_run("test", "FAILURE", "https://github.com/acme/widget/actions/runs/555/job/1")]
@@ -658,7 +680,7 @@ class LineFields(Case):
             os.chdir(here)
 
         # through harness-board: the cwd's worktree, or the PWD's when it has one, on both of show's calls
-        self.scenario([{"match": ["issue", "view", "12"], "stdout_json": issue(12)}, OWNER])
+        self.scenario([{"match": ["issue", "view", "12"], "stdout_json": issue(12)}, OWNER], rest=True)
         runs = [(W["wt12"], None, 12), (W["wt12"], W["wt40"], 40), (W["main"], W["wt40"], 40),
                 (W["main"], None, None), (W["wt40"], self.tmp, 40)]
         for cwd, pwd_value, expected in runs:
@@ -668,8 +690,7 @@ class LineFields(Case):
                 p = self.run_tool(BOARD, "show", "12", "--json", cwd=cwd, home=home, **extra)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 lines = self.logged(home)
-                self.assertEqual([(x["cmd"], x["kind"]) for x in lines],
-                                 [("issue view", "graphql"), ("api user", "rest")])
+                self.assertShowCalls(lines)
                 for line in lines:
                     self.assertLine(line, tool="harness-board", ticket=expected, repo=MAIN_NAME)
 
@@ -698,20 +719,22 @@ class LineFields(Case):
 
         # through the tools: from the main checkout and from a worktree of it, and another project; both of
         # show's calls (the issue view, then api user) carry the repo
-        self.scenario([{"match": ["issue", "view", "12"], "stdout_json": issue(12)}, OWNER])
+        self.scenario([{"match": ["issue", "view", "12"], "stdout_json": issue(12)}, OWNER], rest=True)
         for cwd, expected in ((W["main"], MAIN_NAME), (W["wt12"], MAIN_NAME), (W["wt40"], MAIN_NAME)):
             with self.subTest(tool_cwd=cwd):
                 home = self.new_home()
                 p = self.run_tool(BOARD, "show", "12", "--json", cwd=cwd, home=home)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 lines = self.logged(home)
-                self.assertEqual([x["cmd"] for x in lines], ["issue view", "api user"])
+                self.assertShowCalls(lines)
                 for line in lines:
                     self.assertLine(line, repo=expected)
         home = self.new_home()
         p = self.run_tool(BOARD, "show", "12", "--json", cwd=W["beta"], home=home)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual([x["repo"] for x in self.logged(home)], [BETA_NAME, BETA_NAME])
+        repos = [x["repo"] for x in self.logged(home)]
+        self.assertEqual(repos, [BETA_NAME] * len(repos))
+        self.assertGreaterEqual(len(repos), 2)
 
 
 # ==================================================================== cmd and kind
@@ -857,7 +880,7 @@ class Files(Case):
 
         # through a tool: the first call of the day creates today's file and drops the files over 14 days old;
         # show's two calls (the issue view, then api user) are today's two lines
-        self.scenario([{"match": ["issue", "view", "12"], "stdout_json": issue(12)}, OWNER])
+        self.scenario([{"match": ["issue", "view", "12"], "stdout_json": issue(12)}, OWNER], rest=True)
         home = self.new_home()
         seed(home, (1, 2, 7, 13, 14, 15, 16, 30, 400))
         p = self.run_tool(BOARD, "show", "12", "--json", cwd=W["main"], home=home)
@@ -865,7 +888,7 @@ class Files(Case):
         kept = sorted([f"calls-{day(k)}.jsonl" for k in (0, 1, 2, 7, 13, 14)] + ["notes.txt", "pause.json"])
         self.assertEqual(remaining(home), kept)
         with open(os.path.join(self.gh_dir(home), f"calls-{day(0)}.jsonl"), encoding="utf-8") as fh:
-            self.assertEqual([json.loads(x)["cmd"] for x in fh if x.strip()], ["issue view", "api user"])
+            self.assertShowCalls([json.loads(x) for x in fh if x.strip()])
         with open(os.path.join(self.gh_dir(home), f"calls-{day(7)}.jsonl"), encoding="utf-8") as fh:
             self.assertEqual(fh.read(), json.dumps({"at": f"{day(7)}T12:00:00Z"}) + "\n")     # kept as it was
 
@@ -936,7 +959,7 @@ class Files(Case):
 
     def test_unwritable_log_never_fails_a_command(self):
         show_scenario = [{"match": ["issue", "view", "12"], "stdout_json": issue(12)}, OWNER]
-        self.scenario(show_scenario)
+        self.scenario(show_scenario, rest=True)
 
         def shown(p):
             data = json.loads(p.stdout)
@@ -946,7 +969,7 @@ class Files(Case):
         base = self.run_tool(BOARD, "show", "12", "--json", cwd=W["main"], home=self.new_home())
         self.assertEqual(base.returncode, 0, base.stderr)
         base_argv = self.fakegh_argv()
-        self.assertEqual([a[:2] for a in base_argv], [["issue", "view"], ["api", "user"]])
+        self.assertEqual((base_argv[0][:1], base_argv[-1][:2]), (["api"], ["api", "user"]))     # #447: REST reads
 
         def gh_is_a_file(home):
             write(self.gh_dir(home), "not a folder\n")
@@ -963,7 +986,7 @@ class Files(Case):
             with self.subTest(breakage.__name__):
                 home = self.new_home()
                 breakage(home)
-                self.scenario(show_scenario)
+                self.scenario(show_scenario, rest=True)
                 p = self.run_tool(BOARD, "show", "12", "--json", cwd=W["main"], home=home)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 self.assertEqual(shown(p), shown(base))
