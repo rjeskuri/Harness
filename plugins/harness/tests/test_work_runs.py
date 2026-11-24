@@ -154,10 +154,7 @@ class RedispatchCap(WorkTest):
 
     def with_prs(self, *branches):
         """Add to the scenario, ahead of its generic `pr list` answer: a pull request for each of these branches."""
-        data = self.read_json(self.scenario_path)
-        data["calls"] = [{"match": ["pr", "list", "--head", b], "stdout_json": [{"number": 99}]}
-                         for b in branches] + data["calls"]
-        write(self.scenario_path, json.dumps(data))
+        self.add_calls(*[{"match": ["pr", "list", "--head", b], "stdout_json": [{"number": 99}]} for b in branches])
 
     def live_run_of(self, ticket):
         live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"/harness:work {ticket}"])
@@ -334,11 +331,8 @@ class RedispatchCap(WorkTest):
         self.three(12), self.three(13)
         control = self.three(15)
         self.scenario(issues=[issue(n, labels=IN_PROGRESS, title=f"T{n}") for n in (12, 13, 15)])
-        data = self.read_json(self.scenario_path)
         gone = {"stderr": "HTTP 502: Bad gateway (https://api.github.com/graphql)\n", "exit": 1}
-        data["calls"] = [dict(gone, contains=["pr", "list", "--head", "t/12-x"]),
-                         dict(gone, match=["issue", "view", "13"])] + data["calls"]
-        write(self.scenario_path, json.dumps(data))
+        self.add_calls(dict(gone, contains=["pr", "list", "--head", "t/12-x"]), dict(gone, match=["issue", "view", "13"]))
         self.assertEqual(self.marked(), {15: [control[-1]["id"]]})
         capped, data = self.skipped_by_cap()
         self.assertEqual(capped, [15])
@@ -349,9 +343,8 @@ class RedispatchCap(WorkTest):
             self.assertNotIn(f"skip #{n}:", p.stdout)
 
     def asked_about(self, ticket):
-        """The gh calls that look the ticket up: its `issue view` and its branch's `pr list`."""
-        return [c for c in self.gh_calls()
-                if c[:3] == ["issue", "view", str(ticket)] or (c[:2] == ["pr", "list"] and f"t/{ticket}-x" in c)]
+        """The gh calls that look the ticket up: its issue read and its branch's pull requests (#447: through REST)."""
+        return ["issue"] * self.issue_reads(ticket) + ["pulls"] * self.pr_reads(f"t/{ticket}-x")
 
     def test_runs_asks_gh_only_about_tickets_at_the_cap(self):
         # #13 (two ended runs) and #16 (three, one outside the window: two inside) are under the cap, so `runs`
@@ -944,10 +937,7 @@ class EndedEarly(WorkTest):
             {"match": ["pr", "list"], "stdout_json": []},
             {"match": ["api", "user"], "stdout": "rjeskuri\n"},
         ]
-        write(self.scenario_path, json.dumps({"calls": calls}))
-        state = self.scenario_path + ".state.json"
-        if os.path.exists(state):
-            os.unlink(state)
+        self.put_scenario({"calls": calls})
 
     def ended_run(self, n, result, warning=True, **fields):
         """A headless run of ticket n whose process is gone, with `result` (a dict, or raw text) as its log, after the
@@ -1126,11 +1116,8 @@ class EndedEarly(WorkTest):
                 # Early needs both facts: the ticket's labels and every PR of its branch, merged and closed included.
                 calls = self.gh_calls()
                 for n in (n for n, o in expected.items() if o == "early"):
-                    self.assertTrue(any(a[:3] == ["issue", "view", str(n)] for a in calls), (n, calls))
-                    self.assertTrue(any(a[:2] == ["pr", "list"] and "--head" in a
-                                        and a[a.index("--head") + 1] == branches[n]
-                                        and "--state" in a and a[a.index("--state") + 1] == "all"
-                                        for a in calls), (n, calls))
+                    self.assertTrue(self.issue_reads(n), (n, calls))
+                    self.assertTrue(self.pr_reads(branches[n], "all"), (n, calls))
 
     def test_a_run_without_a_repo_stays_ok_and_asks_gh_nothing(self):
         # A record with no repo (the key absent, empty or null) cannot say which repository's issue it ran: the sweep
@@ -1159,9 +1146,9 @@ class EndedEarly(WorkTest):
         calls = self.gh_calls()
         for n in (7, 8, 9):
             with self.subTest(ticket=n):
-                self.assertFalse([a for a in calls if a[:3] == ["issue", "view", str(n)]], calls)
-                self.assertFalse([a for a in calls if a[:2] == ["pr", "list"] and f"t/{n}-x" in a], calls)
-        self.assertTrue([a for a in calls if a[:3] == ["issue", "view", "10"]], calls)
+                self.assertEqual(self.issue_reads(n), 0, calls)
+                self.assertEqual(self.pr_reads(f"t/{n}-x"), 0, calls)
+        self.assertTrue(self.issue_reads(10), calls)
 
     def test_dispatch_asks_gh_about_a_freshly_ended_run_once(self):
         # Three headless runs ended ok since the last sweep: #7 in progress with no PR (early, dispatched again), #8 in
@@ -1182,13 +1169,11 @@ class EndedEarly(WorkTest):
         calls = self.gh_calls()
         for n in (7, 8, 9):
             with self.subTest(ticket=n):
-                views = [a for a in calls if a[:3] == ["issue", "view", str(n)]]
-                heads = [a for a in calls if a[:2] == ["pr", "list"] and "--head" in a
-                         and a[a.index("--head") + 1] == f"t/{n}-x"]
-                self.assertLessEqual(len(views), 1, calls)
-                self.assertLessEqual(len(heads), 1, calls)
+                views, heads = self.issue_reads(n), self.pr_reads(f"t/{n}-x")
+                self.assertLessEqual(views, 1, calls)
+                self.assertLessEqual(heads, 1, calls)
                 if n == 7:                                  # early needs both facts: asked exactly once each
-                    self.assertEqual((len(views), len(heads)), (1, 1), calls)
+                    self.assertEqual((views, heads), (1, 1), calls)
 
     # ---- #42: a draft pull request is not a ready one
     def test_a_draft_pull_request_does_not_make_an_early_end_ok(self):
@@ -1356,13 +1341,11 @@ class EndedEarly(WorkTest):
         calls = self.gh_calls()
         for n in (7, 8, 10, 11):
             with self.subTest(ticket=n):
-                views = [a for a in calls if a[:3] == ["issue", "view", str(n)]]
-                heads = [a for a in calls if a[:2] == ["pr", "list"] and "--head" in a
-                         and a[a.index("--head") + 1] == f"t/{n}-x"]
-                self.assertLessEqual(len(views), 1, calls)
-                self.assertLessEqual(len(heads), 1, calls)
+                views, heads = self.issue_reads(n), self.pr_reads(f"t/{n}-x")
+                self.assertLessEqual(views, 1, calls)
+                self.assertLessEqual(heads, 1, calls)
                 if n != 8:                                  # early needs both facts: asked exactly once each
-                    self.assertEqual((len(views), len(heads)), (1, 1), calls)
+                    self.assertEqual((views, heads), (1, 1), calls)
 
     def test_every_pull_request_of_the_branch_counts_and_the_open_draft_is_named(self):
         # A branch can have several PRs (gh lists them newest first). Early means none of them, in any state, is

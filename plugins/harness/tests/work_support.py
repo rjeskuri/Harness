@@ -22,6 +22,8 @@ import unittest
 sys.dont_write_bytecode = True
 
 import gitrepo_support  # noqa: E402
+import fakegh  # noqa: E402  (#447: issue and pull request reads through gh api REST, and gh_view to read writes)
+from gitrepo_support import copy_repo, run_in_process  # noqa: E402  (RowsInProcess, CopiedProject)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(os.path.dirname(HERE), "bin", "harness-work")
@@ -35,6 +37,9 @@ SECRET = "fake-key-value-7f3a9c"   # what the key command prints; must never rea
 DEFAULT_KEY_CMD = "security find-generic-password -s harness-anthropic -w"
 TEN_DAYS_AGO = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%S+0000")
 MARK = "\n\n<!-- harness -->"      # the last line of every comment harness-board posts
+# A Projects board's fields as the harness writes them (#447: fakegh.board answers ID lookups and ID edits on them).
+BOARD_FIELDS = {"Status": ["Ready", "In progress", "In review", "Blocked", "Needs input", "Done"],
+                "Priority": ["High", "Normal"]}
 QUESTION = "**Needs your input**\n\nWhich base?\n\nReply in a comment; /harness:work 12 picks it up." + MARK
 CREDENTIALS = {"ANTHROPIC_API_KEY": "sk-ant-fake", "ANTHROPIC_AUTH_TOKEN": "fake-token",
                "CLAUDE_CODE_OAUTH_TOKEN": "fake-oauth"}
@@ -131,8 +136,13 @@ def post_started():
     with open(path, encoding="utf-8") as fh:
         scenario = json.load(fh)
     for call in scenario.get("calls", []):
+        target = None
         if call.get("match") == ["issue", "view", number] and isinstance(call.get("stdout_json"), dict):
-            call["stdout_json"].setdefault("comments", []).append({{
+            target = call["stdout_json"]
+        elif str(call.get("issue")) == number and isinstance(call.get("data"), dict):     # fakegh's REST layer
+            target = call["data"]
+        if target is not None:
+            target.setdefault("comments", []).append({{
                 "author": {{"login": "rjeskuri"}}, "createdAt": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "url": "https://github.com/o/r/issues/" + number + "#issuecomment-started",
                 "body": "Started on " + branch + " (fakehost, session)\\n\\n<!-- harness -->"}})
@@ -367,16 +377,38 @@ class WorkTest(unittest.TestCase):
             {"match": ["api", "user"], "stdout": "rjeskuri\n"},
             {"match": ["api"], "stdout_json": list(sub_issues)},
         ]
-        write(self.scenario_path, json.dumps({"calls": calls}))
+        calls += [fakegh.issue_entry(i["number"], sub_issues=list(sub_issues)) for i in issues if sub_issues]
+        self.put_scenario({"calls": calls})
+
+    def put_scenario(self, data):
+        """The fake gh's answers, the gh issue and pr list fixtures moved to its REST layer (#447: harness-work and
+        harness-board read and write issues, and harness-work lists a branch's pull requests, through gh api)."""
+        data = dict(data, calls=fakegh.as_rest(data.get("calls") or [], pulls=True))
+        write(self.scenario_path, json.dumps(data))
         state = self.scenario_path + ".state.json"
         if os.path.exists(state):
             os.unlink(state)
 
+    def gh_entries(self):
+        return fakegh.log_entries(self.gh_log)
+
     def gh_calls(self):
-        if not os.path.exists(self.gh_log):
-            return []
-        with open(self.gh_log, encoding="utf-8") as fh:
-            return [json.loads(line)["argv"] for line in fh if line.strip()]
+        """Each gh call's argv, a REST issue write as the gh command it stands for (fakegh.gh_view)."""
+        return fakegh.gh_view(self.gh_entries(), self.scenario_path)
+
+    def issue_reads(self, number=12):
+        """How many times issue `number` itself was read."""
+        return fakegh.issue_gets(self.gh_entries(), number)
+
+    def pr_reads(self, branch, state=None):
+        """How many times the pull requests of `branch` were listed (with `state` when given)."""
+        return sum(1 for b, s in fakegh.pull_queries(self.gh_entries()) if b == branch and state in (None, s))
+
+    def add_calls(self, *calls):
+        """Put `calls` ahead of the scenario's own, gh issue and pr list fixtures moved to the REST layer."""
+        data = self.read_json(self.scenario_path)
+        data["calls"] = fakegh.as_rest(list(calls), pulls=True) + data["calls"]
+        write(self.scenario_path, json.dumps(data))
 
     def claude_calls(self):
         if not os.path.exists(self.claude_log):
@@ -558,28 +590,11 @@ class CloudTest(WorkTest):
             {"match": ["api", "user"], "stdout": ME + "\n"},
             {"match": ["api"], "stdout_json": []},
         ]
-        write(self.scenario_path, json.dumps({"calls": calls}))
-        state = self.scenario_path + ".state.json"
-        if os.path.exists(state):
-            os.unlink(state)
-
-    def gh_entries(self):
-        if not os.path.exists(self.gh_log):
-            return []
-        with open(self.gh_log, encoding="utf-8") as fh:
-            return [json.loads(line) for line in fh if line.strip()]
+        self.put_scenario({"calls": calls})
 
     def comment_bodies(self, n):
-        """The bodies of every `gh issue comment n` (--body or --body-file -)."""
-        out = []
-        for entry in self.gh_entries():
-            argv = entry["argv"]
-            if argv[:3] == ["issue", "comment", str(n)]:
-                if "--body" in argv:
-                    out.append(argv[argv.index("--body") + 1])
-                elif "--body-file" in argv:
-                    out.append(entry.get("stdin") or "")
-        return out
+        """The bodies of every comment on n (#447: a REST comment as gh_view reads it, --body or --body-file -)."""
+        return [argv[4] for argv in self.gh_calls() if argv[:4] == ["issue", "comment", str(n), "--body"]]
 
     def added_labels(self, n):
         edits = [a for a in self.gh_calls() if a[:3] == ["issue", "edit", str(n)]]
@@ -770,7 +785,7 @@ class ProjectsTest(WorkTest):
             {"match": ["api"], "stdout_json": []},
         ]
         path = self.scenario_of(name)
-        write(path, json.dumps({"calls": calls}))
+        write(path, json.dumps({"calls": fakegh.as_rest(calls, pulls=True)}))    # #447: issues through REST
         if os.path.exists(path + ".state.json"):
             os.unlink(path + ".state.json")
 
@@ -839,11 +854,8 @@ class ProjectsTest(WorkTest):
         return out
 
     def project_gh_calls(self, name):
-        path = self.gh_log_of(name)
-        if not os.path.exists(path):
-            return []
-        with open(path, encoding="utf-8") as fh:
-            return [json.loads(line)["argv"] for line in fh if line.strip()]
+        """Project `name`'s gh calls, a REST issue write as the gh command it stands for (fakegh.gh_view)."""
+        return fakegh.gh_view(fakegh.log_entries(self.gh_log_of(name)), self.scenario_of(name))
 
     def started_in(self, name):
         """What starting a ticket leaves in project `name`: a ticket worktree, or a gh issue edit or comment."""
@@ -934,6 +946,108 @@ def transcript_start(lines):
 def epoch_iso(seconds):
     """A Unix time as the budgets' UTC stamp, from first principles."""
     return dt.datetime.fromtimestamp(seconds, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ===================================================================== the rows of a test run in this process (#378)
+class RowsInProcess:
+    """A test's first `harness-work` run is a process of its own, as WorkTest.work runs it: the exit code and the
+    output of the process contract. Every later run, the rows of its table and the runs that only set up a later one,
+    runs the tool in this process (gitrepo_support.run_in_process) with the same argv, cwd and environment, so a row
+    pays for neither a Python start nor a compile of the tool; a call of setUp inside a test (a fresh project) does not
+    make the next run a process again. What the tool runs (git, gh, harness-board, the fake claude) is still its own
+    process either way, and a run that starts a headless session is always a process of its own: the `claude -p` it
+    launches (start_new_session) outlives the run and must not be left a child of this process."""
+
+    ran_a_process = False            # each test is a new instance, so each test's first run is a process
+
+    @staticmethod
+    def starts_a_headless_session(args):
+        """`dispatch --venue headless` or `dispatch --api`, not a dry run: it may launch `claude -p` in the background."""
+        return (tuple(args[:1]) == ("dispatch",) and "--dry-run" not in args
+                and any(a == "--api" or "headless" in a for a in args))
+
+    def work(self, *args, env=None, cwd=None):
+        if not self.ran_a_process or self.starts_a_headless_session(args):
+            self.ran_a_process = True
+            return super().work(*args, env=env, cwd=cwd)
+        p = run_in_process(TOOL, args=args, cwd=cwd or self.repo, env=env or self.env())
+        self.assertNotIn("Traceback", p.stderr)
+        return p
+
+
+# ===================================================================== the repositories, built once per class (#378)
+class CopiedProject:
+    """WorkTest.setUp (work_support) with its repositories built once per test class and copied for each setUp: the
+    bare origin and the main checkout `proj` (README.md, a .gitignore of .env and *.log, a .worktreeinclude naming
+    .env and .env.*, all committed as "First" ten days ago) pushed to it. A class whose every setUp makes more
+    repositories adds them in `extend_template`, run once on the template; every folder in the template is copied.
+
+    The template is built with git's background gc and maintenance off (on the command line and in each repository's
+    config, so its copies carry it too): nothing changes under a copy while it is taken (#365). A copy's origin remote
+    is rewritten to name the copied origin, as `git remote set-url` would. The rest is WorkTest.setUp's own: a fresh
+    folder, home, logs and scenario, and the key of the copy's path, on every call (tests call setUp again for a
+    fresh project)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        root = os.path.realpath(tempfile.mkdtemp(prefix="harness-work-template-"))
+        cls.addClassCleanup(shutil.rmtree, root, True)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("CLAUDE", "HARNESS_", "GIT_", "FAKEGH_", "FAKECLAUDE_"))}
+        env.update(HOME=os.path.join(root, "home"), PATH=os.pathsep.join(["/usr/bin", "/bin"]),
+                   GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@localhost",
+                   GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@localhost")
+
+        def git(repo, *args, **extra):
+            p = subprocess.run([GIT, "-C", repo, "-c", "commit.gpgsign=false", "-c", "maintenance.auto=false",
+                                "-c", "gc.auto=0", *args], env=dict(env, **extra), capture_output=True, text=True)
+            if p.returncode != 0:
+                raise AssertionError(f"template: git {' '.join(args)}: {p.stderr}")
+            return p.stdout.strip()
+
+        def init(repo, *flags):
+            os.makedirs(repo)
+            git(repo, "init", "-q", *flags, "-b", "main")
+            git(repo, "config", "gc.auto", "0")
+            git(repo, "config", "maintenance.auto", "false")
+
+        origin, repo = os.path.join(root, "origin.git"), os.path.join(root, "proj")
+        init(origin, "--bare")
+        init(repo)
+        write(os.path.join(repo, "README.md"), "# proj\n")
+        write(os.path.join(repo, ".gitignore"), ".env\n*.log\n")
+        write(os.path.join(repo, ".worktreeinclude"), "# copied into new worktrees\n.env\n.env.*\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "First", GIT_AUTHOR_DATE=TEN_DAYS_AGO, GIT_COMMITTER_DATE=TEN_DAYS_AGO)
+        git(repo, "remote", "add", "origin", origin)
+        git(repo, "push", "-q", "-u", "origin", "main")
+        cls.extend_template(root, git, init)
+        cls.template_root = root
+
+    @classmethod
+    def extend_template(cls, root, git, init):
+        """More repositories every setUp of the class starts with, made in `root`; `git(repo, *args)` runs git on
+        the template and `init(repo)` makes a repository there as the template's own are made."""
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="harness-work-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = self.mk("home")
+        self.scenario_path = os.path.join(self.tmp, "scenario.json")
+        self.gh_log = os.path.join(self.tmp, "gh.log")
+        self.claude_log = os.path.join(self.tmp, "claude.log")
+        root = type(self).template_root
+        for name in sorted(os.listdir(root)):
+            if name != "home":
+                copy_repo(os.path.join(root, name), os.path.join(self.tmp, name))
+        self.origin, self.repo = os.path.join(self.tmp, "origin.git"), os.path.join(self.tmp, "proj")
+        config = os.path.join(self.repo, ".git", "config")
+        with open(config, encoding="utf-8") as fh:
+            text = fh.read()
+        write(config, text.replace(os.path.join(root, "origin.git"), self.origin))
+        self.key = hashlib.sha1(os.path.realpath(self.repo).encode("utf-8")).hexdigest()[:12]
+        self.scenario()
 
 
 # Everything above, underscored names included, for `from work_support import *`.

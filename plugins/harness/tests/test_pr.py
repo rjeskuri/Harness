@@ -151,7 +151,7 @@ class Open(WorktreeTest):
         self.assertIn("- `tests/test_widget.py::test_frob`: frobs twice", create["stdin"])
         self.assertIn("Red run before implementation (assertion, exit 1):", create["stdin"])
         self.assertIn(["issue", "comment", "12", "--body", f"Pull request: {PR_URL}\n\n<!-- harness -->"],
-                      [c["argv"] for c in calls])
+                      self.gh_argv())             # #447: the board's comment, through REST, as gh_view reads it
         self.assertTrue(os.path.isfile(self.state_path("tickets", "12.json")))
 
 
@@ -617,17 +617,18 @@ class Ready(PrTest):
                        {"match": ["issue", "view", "12"], "stdout_json": {
                            "number": 12, "url": url, "labels": [{"name": "task"}, {"name": "status:in-progress"}]}},
                        {"match": ["issue", "edit", "12"], "stdout": url + "\n"},
-                       {"match": ["issue", "comment", "12"], "stdout": url + "#issuecomment-1\n"},
-                       {"match": ["project"], "stdout": ""}])
+                       {"match": ["issue", "comment", "12"], "stdout": url + "#issuecomment-1\n"}])
+        with open(self.scenario_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["project"] = [fakegh.board("rjeskuri/7", BOARD_FIELDS, [url])]     # #447: the board resolves IDs
+        write(self.scenario_path, json.dumps(data))
         p = self.ok("ready", "34", stubs=False, HARNESS_PROJECT="rjeskuri/7")
         self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
         argvs = self.gh_argv()
         self.assertIn(["issue", "edit", "12", "--add-label", "status:in-review", "--remove-label",
                        "status:in-progress"], argvs)
-        projects = [a for a in argvs if a[:1] == ["project"]]
-        self.assertEqual(len(projects), 1, projects)
-        self.assertEqual(project_argv(projects[0]), ("item-edit", ["7"], {"owner": "rjeskuri", "url": url,
-                                                                           "field": "Status", "value": "In review"}))
+        self.assertEqual(fakegh.board_writes(self.gh_calls(), self.scenario_path),
+                         [("item-edit", "rjeskuri/7", url, "Status", "In review")])
 
     # ------------------------------------------------- #69: harness-board's Projects warning reaches the user
     def real_board_scenario(self, project_call):
@@ -639,6 +640,12 @@ class Ready(PrTest):
                        {"match": ["issue", "edit", "12"], "stdout": url + "\n"},
                        {"match": ["issue", "comment", "12"], "stdout": url + "#issuecomment-1\n"},
                        dict(project_call, match=["project"])])
+        if not project_call.get("exit", 0):     # #447: a board that answers resolves its IDs, then sets them
+            with open(self.scenario_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            data["calls"] = [c for c in data["calls"] if c.get("match") != ["project"]]
+            data["project"] = [fakegh.board(p, BOARD_FIELDS, [url]) for p in ("rjeskuri/7", "some-org/42", "acme/3")]
+            write(self.scenario_path, json.dumps(data))
 
     def test_ready_passes_the_board_warning_through_when_the_project_item_edit_fails(self):
         """Real harness-board, a failing `gh project item-edit`: ready still exits 0 with its usual stdout, and
@@ -657,9 +664,11 @@ class Ready(PrTest):
                     p = self.ok("ready", "34", stubs=False, HARNESS_PROJECT=project)
                 owner, number = project.split("/")
                 self.assertEqual(p.stdout, f"PR #34 ready for review: {PR_URL}\n")
-                self.assertEqual(p.stderr.splitlines(), [f"harness-board: warning: the Projects board {owner}/{number} "
-                                                         f"was not updated: gh project item-edit {number} failed: "
-                                                         f"{why}"], p.stderr)
+                # #447: the call refused may be one that resolves the board's IDs: any gh project call
+                self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
+                self.assertRegex(p.stderr.splitlines()[0], "^" + re.escape(
+                    f"harness-board: warning: the Projects board {owner}/{number} was not updated: gh project ")
+                    + r"[a-z-]+\b.* failed: " + re.escape(why) + "$")
                 self.assertIn(["issue", "edit", "12", "--add-label", "status:in-review", "--remove-label",
                                "status:in-progress"], self.gh_argv(), "the labels still changed")
                 self.assertEqual(len(self.notifications()), 1 if source == "env" else 2)

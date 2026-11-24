@@ -1154,7 +1154,8 @@ class CostExtras(CostBase):
     """Ticket #114: lines, elapsed, ci, needs_input, landed_at and the labels from gh, and their four lines."""
 
     def scenario(self, *calls):
-        write(self.scenario_path, json.dumps({"calls": list(calls), "default": {
+        import fakegh  # #447: harness-work reads the issue and the branch's pull requests through gh api REST
+        write(self.scenario_path, json.dumps({"calls": fakegh.as_rest(list(calls), pulls=True), "default": {
             "stderr": "fakegh: not scripted in this test\n", "exit": 1}}))
         state = self.scenario_path + ".state.json"
         if os.path.exists(state):

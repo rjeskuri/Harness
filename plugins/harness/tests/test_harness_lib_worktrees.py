@@ -75,6 +75,7 @@ DAY = 86400
 _COUNTER = [0]
 _REAL_TMP = tempfile.gettempdir()   # taken before any test points TMPDIR into its own folder
 _FAKE_GIT = []
+_FAKE_GH = []
 
 
 # ================================================================ helpers
@@ -157,6 +158,30 @@ def fake_git_dir() -> str:
         os.chmod(script, 0o755)
         _FAKE_GIT.append(folder)
     return _FAKE_GIT[0]
+
+
+def fakegh_module():
+    if str(TESTS) not in sys.path:
+        sys.path.insert(0, str(TESTS))
+    import fakegh
+    return fakegh
+
+
+def no_pulls_world(folder: str):
+    """An environment whose gh is fakegh (its executable written once for the module) answering every branch's pull
+    request lookup, now a REST read (#447: GET .../pulls?head=OWNER:BRANCH), with none; and the log fakegh keeps."""
+    if not _FAKE_GH:
+        tools = tempfile.mkdtemp(prefix="harness-fakegh-", dir=_REAL_TMP)
+        atexit.register(shutil.rmtree, tools, True)
+        script = os.path.join(tools, "gh")
+        with open(script, "w") as fh:
+            fh.write(f'#!/bin/sh\nexec "{sys.executable}" "{TESTS / "fakegh.py"}" "$@"\n')
+        os.chmod(script, 0o755)
+        _FAKE_GH.append(script)
+    scenario, log = os.path.join(folder, "gh-scenario.json"), os.path.join(folder, "gh-calls.log")
+    with open(scenario, "w", encoding="utf-8") as fh:
+        json.dump({"calls": fakegh_module().as_rest([{"match": ["pr", "list"], "stdout_json": []}], pulls=True)}, fh)
+    return {"HARNESS_GH": _FAKE_GH[0], "FAKEGH_SCENARIO": scenario, "FAKEGH_LOG": log}, log
 
 
 def completed(returncode, stdout="", stderr=""):
@@ -648,19 +673,20 @@ class CallersBuildOnTheLibTests(GitCase):
         listing = [self.W(repo.main, "main", "a" * 40), self.W(live, "t/1-live", "b" * 40),
                    self.W(gone, "t/2-gone", "c" * 40, prunable=True), self.W(detached, None, "d" * 40),
                    self.W(bare_dir, None, None, bare=True), self.W(outside, "t/5-out", "e" * 40)]
-        asked, heads = [], []
+        asked = []
 
         def stand_in(path, git, *rest, **kw):
             asked.append(path)
             return list(listing)
 
-        def gh_json(repo_, args):
-            heads.append(args[args.index("--head") + 1])
-            return []
-
-        with mock.patch.object(mod, "worktree_entries", stand_in), mock.patch.object(mod, "gh_json", gh_json):
+        world, log = no_pulls_world(self.tmp)
+        with mock.patch.object(mod, "worktree_entries", stand_in), mock.patch.dict(os.environ, world):
             as_json = json.loads(self.run_quiet(mod.cmd_worktrees, repo, types.SimpleNamespace(stale=7, json=True)))
             as_text = self.run_quiet(mod.cmd_worktrees, repo, types.SimpleNamespace(stale=7, json=False))
+        fakegh = fakegh_module()
+        calls = fakegh.log_entries(log)
+        heads = [branch for branch, _state in fakegh.pull_queries(calls)]
+        self.assertEqual(len(heads), len(calls), f"only the pull request lookups reach gh: {calls}")
         self.assertEqual(set(asked), {repo.main})
         self.assertEqual([(r["path"], r["branch"], r["missing"]) for r in as_json],
                          [(os.path.realpath(live), "t/1-live", False), (os.path.realpath(gone), "t/2-gone", True),
@@ -675,8 +701,9 @@ class CallersBuildOnTheLibTests(GitCase):
         mod, repo = self.work_repo("wk-none")
         real = self.add_worktree(repo.main, os.path.join(repo.worktrees_dir, "t-8-real"), "t/8-real")
         self.assertTrue(os.path.isdir(real))
+        world, _log = no_pulls_world(self.tmp)
         with mock.patch.object(mod, "worktree_entries", lambda *a, **kw: [self.W(repo.main, "main", "a" * 40)]), \
-                mock.patch.object(mod, "gh_json", lambda *a, **kw: []):
+                mock.patch.dict(os.environ, world):
             self.assertEqual(self.run_quiet(mod.cmd_worktrees, repo, types.SimpleNamespace(stale=7, json=False)),
                              "No ticket worktrees.\n")
 
@@ -763,7 +790,7 @@ class OneListingPerReadTests(GitCase):
         b = self.add_worktree(repo.main, os.path.join(repo.worktrees_dir, "t-2-b"), "t/2-b")
         self.reset_log()
         out = io.StringIO()
-        with mock.patch.object(mod, "gh_json", lambda *a_, **kw: []), contextlib.redirect_stdout(out):
+        with mock.patch.dict(os.environ, no_pulls_world(self.tmp)[0]), contextlib.redirect_stdout(out):
             mod.cmd_worktrees(repo, types.SimpleNamespace(stale=7, json=True))
         self.assertEqual(sorted(r["path"] for r in json.loads(out.getvalue())),
                          sorted([os.path.realpath(a), os.path.realpath(b)]))
