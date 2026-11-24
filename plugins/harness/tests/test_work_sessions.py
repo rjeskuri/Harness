@@ -41,10 +41,7 @@ class BgSessions:
                 {"match": ["issue", "comment"], "stdout": "https://github.com/o/r/issues/12#issuecomment-1\n"},
                 {"match": ["api"], "stdout_json": []},
             ]
-        write(self.scenario_path, json.dumps({"calls": calls}))
-        state = self.scenario_path + ".state.json"
-        if os.path.exists(state):
-            os.unlink(state)
+        self.put_scenario({"calls": calls})
 
     def bg_sessions(self, cases):
         """cases: {n: (bg id, `claude agents` state)}. Writes an unended bg run record per ticket and returns the
@@ -215,8 +212,8 @@ class StopFinishedSessions(BgSessions, WorkTest):
                 self.assertEqual(self.stops(), {bg_id: 1 for bg_id in finished})
 
     def issue_views(self, n):
-        """How many times gh was asked for `issue view n`."""
-        return sum(1 for argv in self.gh_calls() if argv[:3] == ["issue", "view", str(n)])
+        """How many times issue n was read (#447: through REST)."""
+        return self.issue_reads(n)
 
     # ---- review of the fix: a stopped session, an unreadable done one, one issue read per command
     def test_a_stopped_session_is_never_stopped_again_and_its_ticket_is_not_read(self):
@@ -640,10 +637,7 @@ class RedispatchDraft(WorkTest):
             {"match": ["api", "user"], "stdout": "rjeskuri\n"},
             {"match": ["api"], "stdout_json": []},
         ]
-        write(self.scenario_path, json.dumps({"calls": calls}))
-        state = self.scenario_path + ".state.json"
-        if os.path.exists(state):
-            os.unlink(state)
+        self.put_scenario({"calls": calls})
 
     def ended_run(self, n, branch, worktree, result=None, **fields):
         record = self.write_run(n, pid=self.dead_pid(), branch=branch, worktree=worktree, **fields)
@@ -651,15 +645,8 @@ class RedispatchDraft(WorkTest):
         return record
 
     def comment_bodies(self, n):
-        """The text of every `gh issue comment n` call: its --body, else what came on stdin (--body-file -)."""
-        bodies = []
-        with open(self.gh_log, encoding="utf-8") as fh:
-            for line in fh:
-                entry = json.loads(line)
-                argv = entry["argv"]
-                if argv[:3] == ["issue", "comment", str(n)]:
-                    bodies.append(argv[argv.index("--body") + 1] if "--body" in argv else entry.get("stdin") or "")
-        return bodies
+        """The text of every comment on n (#447: a REST comment as gh_view reads it, --body or --body-file -)."""
+        return [argv[4] for argv in self.gh_calls() if argv[:4] == ["issue", "comment", str(n), "--body"]]
 
     def test_dispatch_picks_the_ticket_up_again_and_names_the_pull_request(self):
         other = os.path.join(self.repo, ".claude", "worktrees", "t-15-x")
@@ -1097,11 +1084,8 @@ class CloudSweep(CloudTest):
 
     def with_prs(self, prs):
         """Put {branch: `gh pr list --head <branch>` rows} ahead of the scenario's empty pr list."""
-        with open(self.scenario_path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        data["calls"][:0] = [{"contains": ["pr", "list", "--head", branch], "stdout_json": rows}
-                             for branch, rows in prs.items()]
-        write(self.scenario_path, json.dumps(data))
+        self.add_calls(*[{"contains": ["pr", "list", "--head", branch], "stdout_json": rows}
+                         for branch, rows in prs.items()])
 
     def test_a_status_label_alone_never_ends_a_live_cloud_run(self):
         """#295: the sweep ends a cloud run `ok` only on a done marker by the gh user after its start, a closed

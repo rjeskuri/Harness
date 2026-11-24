@@ -498,13 +498,17 @@ class HarnessCalls(Case):
         """HARNESS_GH unset, the shim first on PATH: `harness-board show 12 --json` reaches fakegh through the
         shim and the log holds only the board's own lines; an agent's `gh` in a shell with the same PATH adds one
         agent line."""
-        scenario = write(os.path.join(self.tmp, "scenario.json"), json.dumps({"calls": [
-            {"match": ["issue", "view", "12"], "stdout_json": {
-                "number": 12, "title": "Ticket 12", "url": "https://github.com/acme/shop-front/issues/12",
-                "body": "## Request\nAdd it.\n\n## Definition of done\n- [ ] It works\n",
-                "labels": [{"name": "task"}, {"name": "status:ready"}], "state": "OPEN", "parent": None,
-                "blockedBy": [], "comments": []}},
-            {"match": ["api", "user"], "stdout": "rjeskuri\n"}]}))
+        sys.path.insert(0, TESTS)
+        import fakegh
+        ticket = {"match": ["issue", "view", "12"], "stdout_json": {
+            "number": 12, "title": "Ticket 12", "url": "https://github.com/acme/shop-front/issues/12",
+            "body": "## Request\nAdd it.\n\n## Definition of done\n- [ ] It works\n",
+            "labels": [{"name": "task"}, {"name": "status:ready"}], "state": "OPEN", "parent": None,
+            "blockedBy": [], "comments": []}}
+        # #447: the board reads the ticket through REST (fakegh's REST world); the agent's own `gh issue view` below
+        # is a gh issue command, answered as before
+        scenario = write(os.path.join(self.tmp, "scenario.json"), json.dumps({"calls": [ticket] + fakegh.as_rest([
+            ticket, {"match": ["api", "user"], "stdout": "rjeskuri\n"}])}))
         dirs = [M["pybin"], SHIM_DIR, M["fakebin"]]
         if os.path.dirname(GIT) not in ("/usr/bin", "/bin"):
             dirs.append(os.path.dirname(GIT))
@@ -516,11 +520,16 @@ class HarnessCalls(Case):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(json.loads(p.stdout)["number"], 12)
         calls = self.records()
-        self.assertEqual([c["argv"][:2] for c in calls], [["issue", "view"], ["api", "user"]])
-        self.assertEqual([c["logged"] for c in calls], ["1", "1"], calls)
+        # #447: the record's REST reads (the issue itself first), then the one `gh api user`
+        self.assertEqual([c["argv"][:1] for c in calls], [["api"]] * len(calls), calls)
+        self.assertEqual(fakegh.parse_api(calls[0]["argv"])["route"], "issues/12", calls)
+        self.assertEqual(calls[-1]["argv"][:2], ["api", "user"], calls)
+        self.assertEqual([c["logged"] for c in calls], ["1"] * len(calls), calls)
         lines = self.logged()
-        self.assertEqual(sorted((x["tool"], x["cmd"]) for x in lines),
-                         [("harness-board", "api user"), ("harness-board", "issue view")])
+        self.assertEqual(len(lines), len(calls), lines)                      # each call logged once
+        self.assertEqual({x["tool"] for x in lines}, {"harness-board"}, lines)
+        self.assertEqual(sorted(x["cmd"] for x in lines if x["cmd"] in ("api user", "api repos/:owner/:repo/issues/:n")),
+                         ["api repos/:owner/:repo/issues/:n", "api user"], lines)
 
         # an agent's own gh in a later Bash call, same PATH: one agent line more
         s = subprocess.run(["/bin/sh", "-c", 'gh issue view 12 --json title'], cwd=M["main"],
@@ -530,7 +539,7 @@ class HarnessCalls(Case):
         agent = [x for x in self.logged() if x["tool"] == "agent"]
         self.assertEqual(len(agent), 1, self.logged())
         self.assertAgentLine(agent[0], cmd="issue view", kind="graphql", exit=0, repo="shop-front", ticket=None)
-        self.assertEqual(len(self.logged()), 3)
+        self.assertEqual(len(self.logged()), len(lines) + 1)
 
 
 # ==================================================================== the session puts the shim on PATH

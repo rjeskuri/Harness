@@ -21,6 +21,8 @@ import unittest
 sys.dont_write_bytecode = True
 
 import gitrepo_support  # noqa: E402
+import fakegh  # noqa: E402  (#447: issue fixtures move to its REST layer; gh_view reads writes back)
+from gitrepo_support import copy_repo, run_in_process  # noqa: E402  (RowsInProcess, CopiedWorktree)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(os.path.dirname(HERE), "bin", "harness-pr")
@@ -33,6 +35,9 @@ BRANCH = "t/12-add-the-widget"
 PR_URL = "https://github.com/o/r/pull/34"
 SHA = "abc123def4567890abc123def4567890abc12345"
 REPO_VIEW = {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}}
+# A Projects board's fields as the harness writes them (#447: fakegh.board answers ID lookups and ID edits on them).
+BOARD_FIELDS = {"Status": ["Ready", "In progress", "In review", "Blocked", "Needs input", "Done"],
+                "Priority": ["High", "Normal"]}
 HIGH_RISK = "High risk: review the data and live-system paths before merging."
 # What `land` reads of the PR before merging; headRefOid is the head the checks judge (#337), labels whether the PR
 # is manual-land (#451).
@@ -217,8 +222,11 @@ class PrTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, f"git {' '.join(args)}: {p.stderr}")
         return p.stdout.strip()
 
-    def scenario(self, calls, default=None):
-        data = {"calls": calls}
+    def scenario(self, calls, default=None, rest=True):
+        """The fake gh's answers. #447: the gh issue fixtures move to the REST layer (fakegh.as_rest): land's ticket
+        read and label edit, and the real harness-board's, go through `gh api`; `rest=False` keeps them as gh
+        commands (revert stays on gh issue)."""
+        data = {"calls": fakegh.as_rest(calls) if rest else calls}
         if default is not None:
             data["default"] = default
         write(self.scenario_path, json.dumps(data))
@@ -263,7 +271,13 @@ class PrTest(unittest.TestCase):
         return self.jsonl(self.gh_log)
 
     def gh_argv(self):
-        return [c["argv"] for c in self.gh_calls()]
+        """Each gh call's argv, a REST issue write as the gh command it stands for (fakegh.gh_view)."""
+        return fakegh.gh_view(self.gh_calls(), self.scenario_path)
+
+    def issue_reads(self):
+        """The reads of issues (#447: REST GETs of repos/{o}/{r}/issues..., or a gh issue view or list)."""
+        return [a for a in self.gh_argv() if fakegh.is_world_read(a) and (a[:1] == ["issue"] or (
+            fakegh.parse_api(a) or {}).get("route", "").startswith("issues"))]
 
     def stub_calls(self, tool):
         return [c["argv"] for c in self.jsonl(self.stub_log) if c["tool"] == tool]
@@ -284,6 +298,24 @@ class PrTest(unittest.TestCase):
             if line.startswith(prefix):
                 return i
         self.fail(f"no call starting with {prefix!r} in:\n" + "\n".join(lines))
+
+    def position_of_rest(self, kind, number, label=None):
+        """The order-log line of the first `gh api` call that reads issue `number` (kind "read": GET
+        repos/{o}/{r}/issues/N) or drops `label` from it (kind "drop": a DELETE of that label, or a PUT or PATCH of
+        labels without it), #447: land's ticket read and status-label edit through REST, whatever the argv form."""
+        lines = self.order()
+        for i, line in enumerate(lines):
+            argv = line.split(" ")
+            req = fakegh.parse_api(argv[1:]) if argv[:1] == ["gh"] else None
+            if req is None:
+                continue
+            if kind == "read" and req["method"] == "GET" and req["route"] == f"issues/{number}":
+                return i
+            write = fakegh.issue_write(req)
+            if kind == "drop" and write and write[1] == str(number) and (
+                    (write[0] == "remove" and label in write[2]) or (write[0] == "set" and label not in write[2])):
+                return i
+        self.fail(f"no gh api call that does {kind} on #{number} in:\n" + "\n".join(lines))
 
     def notifications(self):
         return self.jsonl(self.notify_log)
@@ -846,6 +878,145 @@ NOTES_TEXTS = [
     ("Out of scope: the parser fixture.\n\n```\n\n## Definition of done\n## not a heading\n```\n"
      "Tail line after the fence."),
 ]
+
+
+# ------------------------------------------------------------------ the rows of a test run in this process (#378)
+class RowsInProcess:
+    """A test's first `harness-pr` run is a process of its own, as PrTest.pr runs it: the exit code and the output of
+    the process contract. Every later run, the rows of its table and the runs that only set up a later one, runs the
+    tool in this process (gitrepo_support.run_in_process) with the same argv, cwd and environment, so a row pays for
+    neither a Python start nor a compile of the tool. What the tool runs (git, gh, harness-board and the stubs) is still
+    its own process either way."""
+
+    ran_a_process = False            # each test is a new instance, so each test's first run is a process
+
+    def pr(self, *args, cwd=None, stubs=True, **env):
+        if not self.ran_a_process:
+            self.ran_a_process = True
+            return super().pr(*args, cwd=cwd, stubs=stubs, **env)
+        return run_in_process(TOOL, args=args, cwd=cwd or self.main, env=self.env(stubs=stubs, **env))
+
+
+# ------------------------------------------------------------------ the repositories, built once per class (#378)
+class CopiedWorktree:
+    """WorktreeTest's repositories (pr_support), built once per test class and copied into each test's folder: the
+    bare origin; the main checkout `proj` (README.md, `.claude/worktrees/` in .git/info/exclude, the commit "First")
+    pushed to it; the ticket worktree on BRANCH at proj/.claude/worktrees/t-12-add-the-widget from origin/main, with
+    widget.py and tests/test_widget.py committed as "Add the widget". A class whose every test starts from more history
+    adds it in `extend_template`, run once on the template.
+
+    The template is built with git's background gc and maintenance off (on the command line and in each repository's
+    config, so its copies carry it too): nothing changes under a copy while it is taken (#365). A copy's links that
+    name the template by its path (the origin remote, the worktree's .git file, the main checkout's record of the
+    worktree, FETCH_HEAD) are rewritten to name the copy, which is what `git worktree repair` and `git remote set-url`
+    would write."""
+
+    WORKTREE = "t-12-add-the-widget"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        root = os.path.realpath(tempfile.mkdtemp(prefix="harness-pr-land-template-"))
+        cls.addClassCleanup(shutil.rmtree, root, True)
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("HARNESS_", "FAKEGH_", "GIT_", "CLAUDE_"))}
+        env.update(HOME=os.path.join(root, "home"), PATH=os.pathsep.join(["/usr/bin", "/bin"]),
+                   GIT_CEILING_DIRECTORIES=root, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Test",
+                   GIT_AUTHOR_EMAIL="test@localhost", GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@localhost")
+
+        def git(repo, *args):
+            p = subprocess.run([GIT, "-C", repo, "-c", "commit.gpgsign=false", "-c", "maintenance.auto=false",
+                                "-c", "gc.auto=0", *args], env=env, capture_output=True, text=True)
+            if p.returncode != 0:
+                raise AssertionError(f"template: git {' '.join(args)}: {p.stderr}")
+            return p.stdout.strip()
+
+        origin, main = os.path.join(root, "origin.git"), os.path.join(root, "proj")
+        wt = os.path.join(main, ".claude", "worktrees", cls.WORKTREE)
+        os.makedirs(origin)
+        os.makedirs(main)
+        git(origin, "init", "-q", "--bare", "-b", "main")
+        git(main, "init", "-q", "-b", "main")
+        for repo in (origin, main):
+            git(repo, "config", "gc.auto", "0")
+            git(repo, "config", "maintenance.auto", "false")
+        write(os.path.join(main, "README.md"), "# proj\n")
+        write(os.path.join(main, ".git", "info", "exclude"), ".claude/worktrees/\n")
+        git(main, "add", "-A")
+        git(main, "commit", "-q", "-m", "First")
+        git(main, "remote", "add", "origin", origin)
+        git(main, "push", "-q", "-u", "origin", "main")
+        git(main, "worktree", "add", "-q", "-b", BRANCH, wt, "origin/main")
+        write(os.path.join(wt, "widget.py"), "def frob():\n    return 2\n")
+        write(os.path.join(wt, "tests", "test_widget.py"), "def test_frob():\n    assert True\n")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "Add the widget")
+        cls.extend_template(git, origin, main, wt)
+        cls.template_root = root
+
+    @classmethod
+    def extend_template(cls, git, origin, main, wt):
+        """More history every test of the class starts from; `git(repo, *args)` runs git on the template."""
+
+    def make_repos(self):
+        root = type(self).template_root
+        for name in ("origin.git", "proj"):
+            copy_repo(os.path.join(root, name), os.path.join(self.tmp, name))
+        self.origin, self.main = os.path.join(self.tmp, "origin.git"), os.path.join(self.tmp, "proj")
+        self.wt = os.path.join(self.main, ".claude", "worktrees", self.WORKTREE)
+        admin = os.path.join(self.main, ".git", "worktrees", self.WORKTREE)
+        for path in (os.path.join(self.main, ".git", "config"), os.path.join(self.main, ".git", "FETCH_HEAD"),
+                     os.path.join(self.wt, ".git"), os.path.join(admin, "gitdir"), os.path.join(admin, "FETCH_HEAD")):
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as fh:
+                    text = fh.read()
+                write(path, text.replace(root + os.sep, self.tmp + os.sep))
+
+
+class LandBase(RowsInProcess, CopiedWorktree, WorktreeTest):
+    """The land conversation and the ticket's cache, without tests of its own: Land and LandResolution each run only
+    their own tests on it (LandResolution once inherited Land's and ran each of them a second time, unchanged)."""
+
+    def land_calls(self, views=None, issue_state="OPEN", comments=(), reviews=(), commits=None, head=None,
+                   behind=0, fx=None, pr_labels=(), ticket_labels=()):
+        """The land conversation: the review gate's reads first (no harness review by default, so the gate
+        passes; `head` (HEAD_SHA unless given) and `behind` the compare of main with the head), then the land; the
+        last entries answer the PR's body and files, the ticket's other fields and a comment posted straight through
+        gh, so the land may read and post the Resolution either way. `fx` (FIXTURE_A unless given) is the PR landed,
+        its number and its files; `pr_labels` are the labels of the PR's land view and `ticket_labels` are added to
+        ticket #12's, in every answer gh gives about it (#451). The gh issue entries reach the land through
+        scenario()'s REST layer (#447)."""
+        fx = FIXTURE_A if fx is None else fx
+        pr = str(fx["pr"])
+        head = HEAD_SHA if head is None else head
+        views = views or [land_view(headRefOid=head, url=f"https://github.com/o/r/pull/{pr}",
+                                    labels=[{"name": n} for n in pr_labels])]
+        commits = [pr_commit("a", at(9))] if commits is None else commits
+        issue = {"state": issue_state, "comments": list(comments),
+                 "labels": [{"name": n} for n in ("task", "status:in-review", *ticket_labels)]}
+        return land_gate_calls(reviews, commits, pull=f"repos/o/r/pulls/{pr}", head=head, behind=behind) + [
+                {"match": ["pr", "view", pr, "--json", "mergeCommit"], "stdout_json": {"mergeCommit": {"oid": SHA}}},
+                {"match": ["pr", "view", pr, "--json", LAND_FIELDS],
+                 "responses": [{"stdout_json": v} for v in views]},
+                REPO_VIEW, {"match": ["pr", "merge", pr], "stdout": ""},
+                {"match": ["issue", "view", "12", "--json", "state,labels,comments"], "stdout_json": issue},
+                {"match": ["issue", "edit", "12"], "stdout": ""},
+                {"match": ["pr", "view", pr], "stdout_json": pr_data(fx)},
+                *files_calls(fx["pr"], fx["files"]),
+                {"match": ["issue", "view", "12"],
+                 "stdout_json": dict(issue, number=12, title="Add the widget", body=TICKET_12_BODY,
+                                     url="https://github.com/o/r/issues/12")},
+                {"match": ["issue", "comment", "12"], "stdout": "https://github.com/o/r/issues/12#issuecomment-1\n"},
+                {"contains": ["repos/o/r/issues/12/comments"], "stdout_json": []}]
+
+    def setUp(self):
+        super().setUp()
+        self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}}})
+        write(self.state_path("tickets", "12.json"),
+              json.dumps({"number": 12, "parent": {"number": 3, "title": "Widgets", "goal": ""}}))
+
+    def branch_exists(self):
+        return subprocess.run([GIT, "-C", self.main, "rev-parse", "--verify", "--quiet", f"refs/heads/{BRANCH}"],
+                              capture_output=True, env=self.env()).returncode == 0
 
 
 # Everything above, underscored names included, for `from pr_support import *`.

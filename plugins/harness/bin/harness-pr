@@ -110,6 +110,7 @@ try:
                                   now_iso, read_text, write_json, write_text)
     from harness_lib.notify import notify
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
+    from harness_lib.issues import Issues, Rest
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
     from harness_lib.canary import SMOKE, run_canary
     from harness_lib.autoland import (CONVERSATION, at_head, behind_main, check_entries as lib_check_entries,
@@ -351,6 +352,12 @@ def gh_json(args, cwd):
     return lib_gh_json(args, cwd, pick=first_line, via=gh)
 
 
+def issues(cwd):
+    """A ticket's issue read and label edit through REST in `cwd` (harness_lib.issues, #447), worded as the gh issue
+    command each replaces."""
+    return Issues(Rest(cwd, pick=first_line, timeout=GH_TIMEOUT))
+
+
 def sibling(name):
     """A sibling bin tool: on PATH, else next to this script."""
     found = shutil.which(name)
@@ -413,9 +420,9 @@ def closing_numbers(view):
     return out
 
 
-def manual_land(view, tickets, cwd, fields="labels"):
-    """Whether `manual-land` (#451) is on the PR (its view's labels) or on one of `tickets`, each read with `gh issue
-    view N --json <fields>` until one has it. A failed read raises Problem naming the ticket."""
+def manual_land(view, tickets, cwd):
+    """Whether `manual-land` (#451) is on the PR (its view's labels) or on one of `tickets`, each one's labels read
+    through REST (issues(), #447) until one has it. A failed read raises Problem naming the ticket."""
     def labelled(labels):
         return any(label.get("name") == MANUAL_LAND for label in as_list(labels))
 
@@ -423,7 +430,7 @@ def manual_land(view, tickets, cwd, fields="labels"):
         return True
     for n in tickets:
         try:
-            issue = gh_json(["issue", "view", str(n), "--json", fields], cwd)
+            issue = issues(cwd).view(n, "labels")
         except Problem as err:
             raise Problem(f"ticket #{n}: {err}") from None
         if isinstance(issue, dict) and labelled(issue.get("labels")):
@@ -1673,8 +1680,9 @@ def land_ticket(repo, number, sha, pr, resolution, url=None, landed_by="hand"):
     `url`; a reopened ticket's earlier pass leaves its own, which
     do not, so its second landing gets a Resolution and `Landed in` of its own. (summary, error)."""
     done = []
+    ticket = issues(repo.main)
     try:
-        info = gh_json(["issue", "view", str(number), "--json", TICKET_FIELDS], repo.main)
+        info = ticket.view(number, TICKET_FIELDS)
         info = info if isinstance(info, dict) else {}
         if str(info.get("state", "")).upper() != "CLOSED":
             board(repo, "close", str(number))
@@ -1684,10 +1692,7 @@ def land_ticket(repo, number, sha, pr, resolution, url=None, landed_by="hand"):
         statuses = [label.get("name") for label in as_list(info.get("labels"))
                     if str(label.get("name") or "").startswith("status:")]
         if statuses:
-            cmd = ["issue", "edit", str(number)]
-            for name in statuses:
-                cmd += ["--remove-label", name]
-            gh(cmd, repo.main)
+            ticket.edit_labels(number, remove=statuses)
             done.append("status labels removed")
         bodies = [(c.get("body") or "").lstrip() for c in as_list(info.get("comments"))]
         mine = [b for b in bodies if resolution_here(b, url)]
@@ -2008,7 +2013,7 @@ def cmd_land(args):
     view = pr_view(repo, number, LAND_FIELDS, main)
     if args.loop:                             # only the owner lands a manual-land PR (#451): before anything merges
         try:
-            gated = manual_land(view, closing_numbers(view), main, TICKET_FIELDS)
+            gated = manual_land(view, closing_numbers(view), main)
         except Problem as err:
             raise Problem(f"cannot tell whether PR #{number} is manual-land: {err}; nothing landed") from None
         if gated:

@@ -103,8 +103,9 @@ class StateDirGuardTests(GuardTestCase):
         issue = {"number": 14, "title": "Red tool", "url": "https://github.com/o/r/issues/14", "body": "",
                  "labels": [{"name": "task"}, {"name": "status:in-progress"}], "state": "OPEN",
                  "parent": None, "blockedBy": [], "comments": []}
-        scenario = {"calls": [{"match": ["issue", "view", "14"], "stdout_json": issue},
-                              {"match": ["api", "user"], "stdout": "owner\n"}]}
+        import fakegh  # the REST layer harness-board reads issues through (#447)
+        scenario = {"calls": fakegh.as_rest([{"match": ["issue", "view", "14"], "stdout_json": issue},
+                                             {"match": ["api", "user"], "stdout": "owner\n"}])}
         fx.write(fx.tmp / "scenario.json", json.dumps(scenario))
         cls.env = dict(
             fx.env,

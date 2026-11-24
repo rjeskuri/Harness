@@ -1916,13 +1916,15 @@ class ToolTestCase(LoaderTestCase):
         return sorted(p.name for p in repos.iterdir()) if repos.is_dir() else []
 
     def issue_scenario(self, title: str = "Fix login") -> None:
+        import fakegh  # the REST layer harness-board reads issues through (#447)
+
         self.write_json(
             self.scenario,
             {
-                "calls": [
+                "calls": fakegh.as_rest([
                     {"match": ["repo", "view"], "stdout_json": {"nameWithOwner": "o/r"}},
                     {"match": ["issue", "view", "12"], "stdout_json": dict(FAKE_ISSUE, title=title)},
-                ]
+                ])
             },
         )
 
