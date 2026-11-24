@@ -135,19 +135,46 @@ VS Code had no GitHub session and spent none of the quota. There is no need to c
 - **The gh shim** (`plugins/harness/shim/gh`, design.md "The gh shim"). Each session's SessionStart line in `CLAUDE_ENV_FILE` puts it first on PATH. It runs the real gh unchanged and logs one `tool: "agent"` line per call. The harness runners mark their gh children `HARNESS_GH_LOGGED=1`, so a harness call through the shim is logged once. That covers section 5's agent gh in Bash. It does not cover the jotform poller, which runs outside a Claude session, nor VS Code or other apps.
 - **`harness-work budget calls`** now makes one `gh api -i graphql -f query=query{rateLimit{limit used remaining resetAt}}` after reading the log. `--json` gains `github`: the header's used, limit, remaining and reset, the window start (reset − 1 h), the body's `rateLimit.used`, the logged GraphQL calls in that window, and `gap` = used − logged. The text adds one line with the same figures.
 - **Read the gap in points, not calls.** The log counts calls, so a gap of a few thousand with item-edits in the window is section 4's cost, not missing lines. One item-edit is worth ~104 logged calls.
-- **`budget calls`' own rate-limit call is not logged.** It costs about 1 point a run: three consecutive reads went 1487 → 1488 → 1489. A line stamped with the real clock would prune a log read under a pinned `HARNESS_NOW`, and one stamped with the pinned clock would count in the next report. Each run therefore adds 1 to the next run's gap.
+- **`budget calls`' own rate-limit call is not logged.** It was thought to cost about 1 point a run (three consecutive reads went 1487 → 1488 → 1489); section 9 measured about 0 over 198 reads. A line stamped with the real clock would prune a log read under a pinned `HARNESS_NOW`, and one stamped with the pinned clock would count in the next report. Taken at 1, each run would add 1 to the next run's gap.
 - **Single readings.** Section 3 applies to `budget calls`: one reading can come from the lagging counter. Run it two or three times and take the agreeing figure.
+
+## 9. An hour with the shim on (#468)
+
+Measured 2026-11-24 by the orchestrating session, with the shim first on PATH (`command -v gh` = `plugins/harness/shim/gh`). The sampler wrote `~/.claude/harness/gh/quota-samples-2026-11-24.jsonl` from 10:52:20Z to 12:04:22Z. Each minute it made three `gh api -i graphql rateLimit` reads (header `X-Ratelimit-Used`, header reset, body `rateLimit.used`) and one free REST `gh api rate_limit`. It called `/opt/homebrew/bin/gh` directly, so its reads are not in the call log.
+
+**The hour.** GitHub's counters rolled over at 11:03:22Z and again by 12:03:22Z, so the hour is 11:03:22–12:03:22Z. The two counters of section 3 both persisted all hour. A read's reset header told them apart: the high counter read 12:03:13Z, the low one 12:03:28Z. 66 sampler ticks fall in the window: 198 reads, 142 on the high counter and 56 on the low one. The high counter's value is the max of a tick's reads that share its reset, and the reads agreed.
+
+| | Value | |
+|---|---|---|
+| Header, high counter, last read 12:02:22Z | **351** | **Verified**; the next tick, 12:03:22Z, was already in the new window |
+| Header, low counter, same tick | 106 | **Verified**, 30 % of the high one; REST `rate_limit` mostly read this one |
+| Logged GraphQL calls, 11:03:22–12:02:22Z | 359 | **Verified**; 363 to 12:03:22Z, 363 (to 12:02:22Z) if the window starts at the high counter's own reset, 11:03:13Z |
+| Logged REST calls, whole hour | 3,190 | **Verified**; no GraphQL points. harness-board 2,145, harness-work 807, harness-pr 198, unit tests 24, agent 16 |
+| Points-weighted log | 359 (363 to 12:03:22Z) | **Verified**: no `project item-edit` and no `project item-list` ran, so every weight is 1 |
+| Sampler points | 198 reads, about 0 points | **Verified**, see below |
+| Raw remainder, header minus log | 351 − 359 = **−8** (−2.3 %) | the log is over, not short; −12 (−3.4 %) against the 363 |
+
+Logged GraphQL by tool (to 12:03:22Z, 363): harness-pr 287, land_owner.py 26, python3 -m unittest 16, agent 11, harness-work 10, harness-deadcode 8, harness-board 3, session_brief.py 2. Top commands: `pr view` 214, `repo view` 34, `pr list` 26, `issue view` 17, `pr merge` 12, `pr diff` 11, `pr create` 11, `pr ready` 10, `issue list` 9, `pr review` 7. By repo: HorseTrackBetting 218, Harness 127, proj 16, Assistant 2. **Verified:** no line is refused or waited (`refused` false, `waited_ms` 0). Two failed (`pr merge` exit 1, `pr checks` exit 8); both still sent their request, so both count.
+
+**What the log adds up to.** The high counter tracked the log call for call: its rise per minute equals the logged GraphQL calls of that minute, within a few. The hour ends within 8 points of the log, 2.3 % of the header count, the log being over. Two named items and the counter's lag explain it:
+
+- **The log is over by 16: unit-test lines that never reached GitHub. Inferred.** At 11:15:03–11:15:05Z the log holds 16 lines from `python3 -m unittest`, repo `proj`, ticket 476, 30–40 ms each, in four repeats of `pr view`, `issue list`, `issue view`, `api graphql`. That is a test suite driving a fake `gh` through the shim. In that interval the log rose by 32 and the counter by 13. Without them the log is 343, 8 *below* the header.
+- **The log is short by 5: direct `gh` in the orchestrating Harness session. Inferred.** Its transcript has five GraphQL calls before 12:02:22Z that are not in the log: `issue view 489` and `pr list` at 11:07:07Z, `issue view 455` and `pr list` at 11:32:51Z, `pr view 495` at 11:32:57Z. Every other direct `gh` of the hour in the transcripts matches a log line, so that session most likely started before the shim was on its PATH. Two more (12:02:33Z) fall after the last read. With both items the log is 348 against 351: a remainder of +3, under 1 %.
+- **The counter lags.** It moves in steps (section 3). Early in the hour it ran 9–18 ahead of the log (11:03–11:14Z); the 32-call burst at 11:15Z closed that. The last read also has up to a minute of uncertainty: 4 logged and 2 direct calls fall between 12:02:22Z and the reset.
+- **Not found: `harness-work budget calls`.** No transcript ran it in the window. The jotform-glow-sync poller of section 5 (about 60 points an hour) does not show either: the remainder leaves no room for it.
+
+**The sampler's reads cost nothing.** If each of the 198 reads cost 1 point, the high counter would read about 500 (359 calls plus the 142 reads that landed on it). It read 351. Six reads in a row at 11:40:58–11:41:08Z moved neither counter. Section 8's "about 1 point a run" was therefore other calls landing between its reads, and `budget calls`' own unlogged read adds about 0 to the next gap. **Not checked:** what the GraphQL docs say about a `rateLimit`-only query.
+
+**The previous window, for the "take the agreeing value" rule.** `harness-work budget calls --hours 1 --json` at about 10:51Z reported header used 383 (a low-counter read) against `logged_graphql` 1,383, a gap of −1,000 from the lagging counter alone. The sampler's reads from 10:52Z show both counters in that window: the high at 1,508–1,545 and the low at 384–403. The high counter's 1,545 at 11:02:28Z against the points-weighted log of 1,535 (1,432 calls, one `project item-edit` at 10:07:59Z worth 104) leaves +10, 0.6 %.
+
+**Result.** The header count is 351, the log 359 calls and 359 points, and the remainder is −8 (−2.3 %): under 10 %, and it is the log that is over. Named: 16 test lines that never reached GitHub, 5 calls the log missed because one session ran without the shim, and the counter's lag. For the sessions that had the shim on PATH, it logged what GitHub counted.
+
+**Observed, not settled.** The low counter rose 1 → 106 against the high one's 10 → 351, and 28 % of the sampler's reads landed on it, close to the 30 % ratio. Which counter refuses is not answered: nothing was refused, and the high one peaked at 351 of 5,000. The REST core counter was not sampled. The 3,190 logged REST calls are 64 % of its 5,000 an hour if they all count against it, which is worth one sample.
 
 ## Needs the owner's measurement
 
-- **Pending: an hour of real runs with the shim on** (the definition of done's item 2). It can only run once this lands, in sessions started after it, so that their `CLAUDE_ENV_FILE` puts the shim on PATH. Compare the header count with the logged calls, weighting item-edit by points. Sample once a minute:
-
-  ```sh
-  while sleep 60; do date -u +%FT%TZ; gh api -i graphql -f query='query{rateLimit{used resetAt}}' | grep -i '^x-ratelimit-used'; gh api rate_limit --jq .resources.graphql.used; done >> ~/.claude/harness/gh/quota-samples.log
-  ```
-
-  Or run `harness-work budget calls --hours 1 --json` each minute, which reads the same header and the log.
+- **Done (#468): an hour of real runs with the shim on**, in section 9: header 351, log 359 calls and points, remainder -8 (-2.3 %), named.
 - One real `gh project item-edit` with a dry-run cost of its item-by-URL query, to settle 75 against 101 + 3.
-- ~10 minutes of `gh api -i graphql` `rateLimit` samples with no harness activity, to see whether the two counters converge and which one refuses.
+- Whether the two counters converge and which one refuses. Section 9's hour shows both persisting for an hour, the low one at about 30 % of the high one, and nothing refused. Samples from a saturated hour would settle it.
 - https://github.com/settings/applications (owner only): any other OAuth or GitHub App acting as rjeskuri.
 - Which gh commands send the cached feature-detection query, beyond `pr checks` (section 7, not confirmed).
