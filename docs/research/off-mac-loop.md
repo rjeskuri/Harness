@@ -1,6 +1,6 @@
 # Research notes: running the harness loop while this laptop is off
 
-Gathered 2026-11-24 for #440 (epic #439) on the MacBook Pro (M1 Pro, 8 cores, 16 GB, macOS 26.5.2), with Claude Code 2.1.331 and gh 2.99.0. Sources: this Mac, read only (the LaunchAgents, `~/.claude/harness/`, the run records, the transcripts under `~/.claude/projects/`, `ps`, `pmset`, `claude auth status`, `gh auth status`, `harness-runner list`, `harness-projects list`, the 2.1.331 binary, the plugin source); two `gh search issues` calls; and the price pages and docs quoted below, all fetched 2026-11-24. The counting scripts lived in the job's scratch directory, outside the repository. No account, trial, VPS, cloud session, scheduled task (routine) or LaunchAgent was created, nothing was bought, and no secret was moved, created or printed. This note names credentials but holds none of their values, and no account ids.
+Gathered 2026-11-24 for #440 (epic #439) on the MacBook Pro (M1 Pro, 8 cores, 16 GB, macOS 26.5.2), with Claude Code 2.1.331 and gh 2.99.0. Sources: this Mac, read only (the LaunchAgents, `~/.claude/harness/`, the run records, the transcripts under `~/.claude/projects/`, `ps`, `pmset`, `claude auth status`, `gh auth status`, `gh auth login --help`, `gh help environment`, `harness-runner list`, `harness-projects list`, the 2.1.331 binary, the plugin source); two `gh search issues` calls; and the price pages and docs quoted below, all fetched 2026-11-24. The counting scripts lived in the job's scratch directory, outside the repository. No account, trial, VPS, cloud session, scheduled task (routine) or LaunchAgent was created, nothing was bought, and no secret was moved, created or printed. This note names credentials but holds none of their values, and no account ids.
 
 ## Verified
 
@@ -10,7 +10,9 @@ Gathered 2026-11-24 for #440 (epic #439) on the MacBook Pro (M1 Pro, 8 cores, 16
 - **State:** `~/.claude/harness/` (86 MB) holds `backups budgets.json digest gh projects.json repos runner runs smoke`. That is 922 files in `runs/` (463 run records and their logs) and 13 folders in `repos/`. `repo-key` is the sha1 of the main checkout's canonical path (docs/design.md, State), so a machine with other paths gets other keys.
 - **Transcripts:** `~/.claude/projects/` is 2.5 GB in 253 folders, 239 of them worktree folders. `harness-worklog` reads a repository's own folder plus its worktree folders, named from the absolute path (docs/design.md, harness-worklog), and `harness-work cost` reads the same transcripts.
 - **Logins:**
-  - `gh auth status`: "Logged in to github.com account <login> (keyring)", with scopes `gist, project, read:org, repo, workflow`.
+  - `gh auth status`: "Logged in to github.com account <login> (keyring)", with scopes `gist, project, read:org, repo, workflow`. harness-board needs `project`: it calls `gh project item-add`, `item-edit`, `field-list` and `item-list` (`plugins/harness/bin/harness-board`).
+  - Where gh keeps that token (`gh auth login --help`, gh 2.99.0, read 2026-11-24): "an authentication token will be stored securely in the system credential store. If a credential store is not found or there is an issue using it gh will fallback to writing the token to a plain text file. See `gh auth status` for its stored location." `--insecure-storage` saves it "in plain text instead of credential store". "To use gh in GitHub Actions, add `GH_TOKEN: ${{ github.token }}` to `env`."
+  - `gh help environment` (same version and date): `GH_TOKEN`, `GITHUB_TOKEN` "takes precedence over previously stored credentials"; `GH_CONFIG_DIR` defaults to `$XDG_CONFIG_HOME/gh` or `$HOME/.config/gh`.
   - `claude auth status --json` (only these keys were printed): `{"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "max"}`.
 - **API key:** `HARNESS_API_KEY_CMD` is unset (no `env` entry in `~/.claude/settings.json` but `HARNESS_PROJECT`), so the default applies: `security find-generic-password -s harness-anthropic -w` (`plugins/harness/bin/harness-work`, `DEFAULT_KEY_CMD`). `security find-generic-password -s harness-anthropic >/dev/null; echo $?` printed 0, so the item exists. It was not read. It matters only for headless dispatch, and `budgets.json` has `api` (and `cloud`) "exhausted_until": "2027-11-20T04:45:57Z" ("Ryan, 2026-11-20: ... off for all repos until he resets it"). `subscription` is not exhausted.
 - **CI runners (#420):** `harness-runner list` lists five private repositories: accessible-iceland, kalshi-markets, edu, a-chance-for-glory and Assistant. The first four are `exited`, Assistant's is `running`, and all five are `offline` on GitHub, "PRs queue for up to 24 h".
@@ -55,7 +57,7 @@ How it was counted: every record was parsed (463, none unreadable). "Month" is t
   - headless: median 22 min, p90 94 min.
   - cloud records: median 3 min, p90 52 min (the record is about the launch, and the work runs elsewhere).
 - **Peak live runs:**
-  - Active spans peak at 12 bg runs at once, on 2026-10-24 09:56Z and again on 2026-11-19 13:50Z, both before the cap of 8.
+  - Active spans peak at 12 bg runs at once, on 2026-10-24 09:56Z and again on 2026-11-19 13:50Z, both before the cross-project cap of 8 (`dispatch --all-projects --max`, `ALL_PROJECTS_MAX`; per-repository dispatch defaults to 10, `DISPATCH_MAX`, and interactive launches have no cap). The October figure covers only runs whose transcripts survive, so a later recount may differ.
   - By record it is 24 on 2026-10-24, from records closed late.
   - Hours at each level of concurrency (active spans): 1: 45 h, 2: 23 h, 3: 17 h, 4-8: 24 h, 9-12: 23 h. Most of the time the count is 0.
 - **Rhythm:** runs started on 22 of the 43 days, with a median of 14.5 and a maximum of 59 runs on an active day. Start hours (Asia/Tokyo) spread from 10:00 to 02:00 and peak at 16:00 and 18:00.
@@ -150,6 +152,9 @@ How it was counted: every record was parsed (463, none unreadable). "Month" is t
 - Whether GitHub pushes or emails a self-mention, or a comment by the account that posted it, once "Your own updates" is turned on.
 - Whether a plugin added at claude.ai/customize/plugins can come from this repository's GitHub marketplace, and whether its hooks run in a cloud session.
 - The cost of each GitHub Actions option below assumes every active run-hour becomes 2-core Linux minutes. No job was run.
+- gh on a headless Linux box: that it finds no credential store there and so writes the token to a plain-text file (said to be `hosts.yml` under `~/.config/gh`), rather than to a Secret Service keyring. The help text above names only "a plain text file"; nothing was installed to check.
+- Whether a workflow's `GITHUB_TOKEN` can edit a user-owned Projects board. If it cannot, the Actions option needs a personal access token with `project` scope as a repository secret. Also which GitHub token a Codespace or a Daytona sandbox would carry.
+- Which GitHub credential a cloud session's proxy uses; none of the quotes above involves the owner's gh token.
 
 ## Comparison at the measured volume
 
@@ -157,45 +162,46 @@ Volume: about 300 active run-hours a month (239 h from Nov 1 to 24, scaled), wit
 
 | Option | Monthly cost | What moves off the MacBook | Billing | Within ~$50? |
 |---|---|---|---|---|
-| Keep the MacBook awake (baseline) | $0 | nothing | nothing new | yes, but it runs only while the laptop is open on power at home |
-| **Mac mini (M6, 16 GB) at home, macOS** | **≈ $27** (¥149,800 / 36 = ¥4,161, plus 4 W × 730 h × ¥40.54 = ¥118) | the bg loop for non-local tickets, the hourly dispatch and digest LaunchAgents, the five runner containers, `~/.claude/harness` (new on the mini), transcripts of its runs | Apple, once; TEPCO; Claude on the same Max login | **yes: recommended** |
-| Linux VPS, Hetzner CX33 / CX43 (EU) | ≈ $10 / $18 + VAT | as above, plus porting: launchd to systemd timers or cron, keychain to `~/.claude/.credentials.json` or a `setup-token` token, no notifications | Hetzner monthly, with a cap; Max login | yes on price; not recommended (unavailable on 2026-11-24, porting, the terms are less clear, a token on a third-party host) |
-| Linux VPS, DigitalOcean or Linode 4 vCPU / 8 GB | $48 (loop only); $96 / $192 with runners | as above | DO or Akamai monthly | loop only, at the edge; not recommended |
-| Hosted Mac: Scaleway M1-M 8 GiB / M2-M 16 GiB | ≈ $82 / $126 | as for the Mac mini | Scaleway, 24 h minimum | no |
-| Hosted Mac: MacStadium M2.S | $109 | as for the Mac mini | MacStadium monthly prepaid | no |
-| Hosted Mac: AWS mac2.metal | ≈ $475 + EBS | as for the Mac mini | AWS, 24 h minimum | no |
-| Daytona sandbox, 1 vCPU / 4 GiB, always on | ≈ $84 | the loop, ported to Linux, plus a token | Daytona per second | no |
-| GitHub Codespaces | not possible (12 h lifetime) | | GitHub | no |
-| Cloud sessions / scheduled tasks | $0 extra (plan usage) | the work only; the harness plugin, `gh issue`/`gh pr` and the tests-first gate do not come along | Max subscription; `cloud` budget marked off by the owner | yes on price; not recommended (no harness there) |
-| GitHub Actions running Claude Code per ticket | $0 for Harness (public); about $96 if all ~300 h ran in private repos ($0.006 × 18,000 min − $12) | each run's state and transcript (ephemeral unless uploaded), a `CLAUDE_CODE_OAUTH_TOKEN` secret per repository | GitHub minutes plus the Max subscription | Harness only; not recommended (no `~/.claude/harness` state, a 6 h job cap, private minutes, hosted jobs refused on 2026-11-20) |
+| Keep the MacBook awake (baseline) | $0 | nothing; the claude and gh logins stay in this Mac's keychain | nothing new | yes, but it runs only while the laptop is open on power at home |
+| **Mac mini (M6, 16 GB) at home, macOS** | **≈ $27** (¥149,800 / 36 = ¥4,161, plus 4 W × 730 h × ¥40.54 = ¥118) | the bg loop for non-local tickets, the hourly dispatch and digest LaunchAgents, the five runner containers, `~/.claude/harness` (new on the mini), transcripts of its runs; a new claude browser login and a new `gh auth login` (same scopes), each in the mini's keychain | Apple, once; TEPCO; Claude on the same Max login | **yes: recommended** |
+| Linux VPS, Hetzner CX33 / CX43 (EU) | ≈ $10 / $18 + VAT | as above, plus porting: launchd to systemd timers or cron, keychain to `~/.claude/.credentials.json` or a `setup-token` token, a gh token in a plain-text file (or `GH_TOKEN`) on the provider's disk, no notifications | Hetzner monthly, with a cap; Max login | yes on price; not recommended (unavailable on 2026-11-24, porting, the terms are less clear, a token on a third-party host) |
+| Linux VPS, DigitalOcean or Linode 4 vCPU / 8 GB | $48 (loop only); $96 / $192 with runners | as above, gh token included | DO or Akamai monthly | loop only, at the edge; not recommended |
+| Hosted Mac: Scaleway M1-M 8 GiB / M2-M 16 GiB | ≈ $82 / $126 | as for the Mac mini, with the claude and gh logins in a keychain on the provider's machine | Scaleway, 24 h minimum | no |
+| Hosted Mac: MacStadium M2.S | $109 | as for the Mac mini, both logins on the provider's machine | MacStadium monthly prepaid | no |
+| Hosted Mac: AWS mac2.metal | ≈ $475 + EBS | as for the Mac mini, both logins on the provider's machine | AWS, 24 h minimum | no |
+| Daytona sandbox, 1 vCPU / 4 GiB, always on | ≈ $84 | the loop, ported to Linux, plus a claude token and a gh token inside the sandbox | Daytona per second | no |
+| GitHub Codespaces | not possible (12 h lifetime) | (would be: the loop, ported, and a gh token in the codespace) | GitHub | no |
+| Cloud sessions / scheduled tasks | $0 extra (plan usage) | the work only; no gh login moves (GitHub goes through the hosted proxy); the harness plugin, `gh issue`/`gh pr` and the tests-first gate do not come along | Max subscription; `cloud` budget marked off by the owner | yes on price; not recommended (no harness there) |
+| GitHub Actions running Claude Code per ticket | $0 for Harness (public); about $96 if all ~300 h ran in private repos ($0.006 × 18,000 min − $12) | each run's state and transcript (ephemeral unless uploaded), a `CLAUDE_CODE_OAUTH_TOKEN` secret per repository; gh on the job's `GITHUB_TOKEN` (`GH_TOKEN: ${{ github.token }}`), plus a personal access token secret if the board needs one | GitHub minutes plus the Max subscription | Harness only; not recommended (no `~/.claude/harness` state, a 6 h job cap, private minutes, hosted jobs refused on 2026-11-20) |
 
 ### Each option, the five questions
 
 - **Mac mini at home:**
-  - Login: the same unmodified binary, logged in by browser like this laptop.
+  - Login: the same unmodified binary, logged in by browser like this laptop. gh: a fresh `gh auth login` on the mini with the scopes above, so its token sits in the mini's keychain; nothing is copied from this Mac.
   - Notifications: the tools notify the mini's own screen, which nobody watches.
   - Needs-input: answers stay ticket comments.
   - Private CI: moves there and stays online.
   - State and transcripts: on the mini, under the same home path, if the projects are cloned to the same paths.
   - Stays on the MacBook: needs-local, ops, interactive work.
 - **Linux VPS:**
-  - Login: a credentials file or a one-year `setup-token` token on a third-party host. The token "can't ... fetch claude.ai connectors".
+  - Login: a credentials file or a one-year `setup-token` token on a third-party host. The token "can't ... fetch claude.ai connectors". gh: a `gh auth login` there falls back to a plain-text token file when it finds no credential store (see Not verified for Linux), or a `GH_TOKEN` in the service's environment; either way a token with `repo` and `workflow` scope on a disk the provider holds.
   - Notifications: none (the bell only).
   - Needs-input: comments, as now.
   - Private CI: the runners can move (the image is Linux).
   - State and transcripts: on the VPS, and identical paths need `/Users/<name>` to be created there.
   - Stays on the MacBook: the same as for the Mac mini.
-- **Hosted Mac:** the same as the Mac mini, at a monthly price, with credentials on a provider's machine.
+- **Hosted Mac:** the same as the Mac mini, at a monthly price, with credentials on a provider's machine: the claude login and a fresh `gh auth login`, both in that Mac's keychain.
+- **Daytona (and Codespaces, were it possible):** as for the Linux VPS, with the claude token and a gh token inside the sandbox.
 - **Cloud sessions and scheduled tasks:**
-  - Login: native and on the subscription.
+  - Login: native and on the subscription. gh: no login of the owner's moves; GitHub calls go through the hosted proxy, which refuses GraphQL.
   - Notifications: marker comments only.
   - Private CI: unchanged.
   - State: none of `~/.claude/harness`, and the transcripts stay at claude.ai, so cost and worklog miss them.
   - Stays on the MacBook: everything that needs the plugin.
 - **GitHub Actions:**
-  - Login: the documented subscription token, as a repository secret.
+  - Login: the documented subscription token, as a repository secret. gh: the job's `GITHUB_TOKEN`, passed as `GH_TOKEN`, scoped to that repository and job; the board's `gh project` calls may need a personal access token with `project` scope as a further secret (not verified).
   - State and transcripts: lost after the job unless uploaded.
-- **Keeping the MacBook awake:** nothing changes, but nothing runs while the lid is closed or the laptop travels.
+- **Keeping the MacBook awake:** nothing changes and both logins stay in this Mac's keychain, but nothing runs while the lid is closed or the laptop travels.
 
 ### Credentials: moving needs-local and ops tickets
 
@@ -216,7 +222,7 @@ The recommendation keeps all of it on the MacBook. The mini runs only tickets wi
 
 ## Recommendation
 
-Put an always-on Mac mini (base M6, 16 GB) at home as a second dispatch machine. It costs about $27 a month over 36 months, power included. It is the only option under about $50 that runs the harness unchanged, because it is the same OS, so launchd, the keychain, notifications, Docker Desktop and the plugin all work as they do now. The login is the browser login, as on this laptop, so it is the ordinary use the legal page describes. Its hourly `harness-work dispatch --all-projects --max 8` LaunchAgent takes the tickets that need nothing local. The MacBook keeps needs-local and ops tickets and interactive work.
+Put an always-on Mac mini (base M6, 16 GB) at home as a second dispatch machine. It costs about $27 a month over 36 months, power included. It is the only option under about $50 that runs the harness unchanged, because it is the same OS, so launchd, the keychain, notifications, Docker Desktop and the plugin all work as they do now. The login is the browser login, as on this laptop, which reads as the ordinary use the legal page describes (a judgment, not a quote; see Not verified). gh gets its own `gh auth login` into the mini's keychain. Its hourly `harness-work dispatch --all-projects --max 8` LaunchAgent takes the tickets that need nothing local. The MacBook keeps needs-local and ops tickets and interactive work.
 
 Tradeoffs:
 - **Cost:** ¥149,800 is paid up front, where a Hetzner VPS costs a third as much per month. The VPS was unavailable on 2026-11-24, needs Linux porting, and would hold a long-lived subscription token on a third-party host.
