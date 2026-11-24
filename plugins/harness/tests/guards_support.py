@@ -589,7 +589,7 @@ def content_hash(root: Path, files) -> str:
     return h.hexdigest()
 
 
-# The hook's deadline (#231 ultrareview): hooks.json gives tests_first.py a timeout; a hook
+# The hook's deadline (#231 review round): hooks.json gives tests_first.py a timeout; a hook
 # Claude Code kills at it prints nothing, and the write goes through. Interpreter start and
 # imports come out of the same timeout, so the hook's own work must end this much sooner.
 STARTUP_ALLOWANCE = 0.5

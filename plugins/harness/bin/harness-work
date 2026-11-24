@@ -50,7 +50,7 @@ stage: records as attempt does (the same code, store and answer), then prints `n
 (--json: attempt's object plus "next"). retry and escalate repeat the stage; park names park; done
 goes tests -> breaker (risk:high) or code, breaker (pass or fail) -> code, code -> review,
 review and fix -> fix while the latest review round (harness_lib.reviews) has blocking findings, else ci,
-ci -> `ultra, then ready` (risk:high) or ready. Risk and flags come from the ticket cache (risk,
+ci -> ready at every risk. Risk and flags come from the ticket cache (risk,
 flags, labels). Refused, exit 1 and nothing recorded: tests or breaker on a no-tests ticket, breaker on one that is
 not risk:high, review or fix with no review round, fix pass while the latest round has blocking findings and fix
 fail while it has none.
@@ -275,6 +275,7 @@ UNCOUNTED = ("billing", "auth")   # outcomes of runs that do not count toward RE
 EXHAUST_HOURS = 24.0
 CALLS_HOURS = 24.0            # budget calls: the default window
 CALLS_TOP = 15                # budget calls: rows of the text COMMAND table
+RATE_LIMIT_QUERY = "query=query{rateLimit{limit used remaining resetAt}}"   # budget calls: GitHub's own count
 REASON_MAX = 200
 DIRTY_SHOWN = 10
 GIT_TIMEOUT = 120
@@ -2024,7 +2025,7 @@ def next_step(data, marks, found):
         return "fix" if found else "ci"
     high = "risk:high" in marks
     return {"tests": "breaker" if high else "code", "breaker": "code", "code": "review",
-            "ci": "ultra, then ready" if high else "ready"}[stage]
+            "ci": "ready"}[stage]
 
 
 def cmd_stage(repo, args):
@@ -2562,9 +2563,45 @@ def ranked(groups, keys):
     return [{k: row[k] for k in keys} for _, row in sorted(groups.items(), key=lambda kv: (-kv[1]["calls"], kv[0]))]
 
 
+def rate_limit():
+    """GitHub's own count of this hour's graphql points, from one `gh api -i graphql` reading rateLimit, not logged
+    (a line stamped by the real clock would prune a log read under a pinned HARNESS_NOW, and one stamped by the
+    pinned clock would count in the next report): {"used", "limit", "remaining", "reset" (an aware datetime),
+    "rate_limit_used" (the body's data.rateLimit.used, None without it)}; None when the call fails or its answer
+    lacks a header."""
+    try:
+        done = ghlib.gh_run(["api", "-i", "graphql", "-f", RATE_LIMIT_QUERY], None, timeout=GH_TIMEOUT, log=False)
+    except Problem:
+        return None
+    if done.returncode != 0:
+        return None
+    head, _, body = done.stdout.replace("\r\n", "\n").partition("\n\n")
+    headers = {}
+    for raw in head.split("\n")[1:]:
+        name, sep, value = raw.partition(":")
+        if sep:
+            headers[name.strip().lower()] = value.strip()
+    try:
+        figures = {key: int(headers["x-ratelimit-" + key]) for key in ("used", "limit", "remaining", "reset")}
+    except (KeyError, ValueError):
+        return None
+    try:
+        figures["reset"] = dt.datetime.fromtimestamp(figures["reset"], dt.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    try:
+        used = json.loads(body)["data"]["rateLimit"]["used"]
+    except (ValueError, KeyError, TypeError):
+        used = None
+    figures["rate_limit_used"] = used if isinstance(used, int) and not isinstance(used, bool) else None
+    return figures
+
+
 def cmd_budget_calls(args):
-    """The gh call log of the last --hours hours (ghlimit.read_calls): totals, by tool, command, ticket and hour,
-    and the busiest minute. Reads the log only; no gh call."""
+    """The gh call log of the last --hours hours (ghlimit.read_calls, up to now): totals, by tool, command, ticket
+    and hour, and the busiest minute; then one gh call for GitHub's own count of the graphql hour (rate_limit),
+    beside the logged graphql calls of that hour (github, null when the call fails). The log is read before the
+    call and the call is not logged, so the report's own call counts in none of its figures."""
     try:
         hours = float(args.hours)
     except ValueError:
@@ -2576,7 +2613,19 @@ def cmd_budget_calls(args):
         since = until - dt.timedelta(hours=hours)
     except OverflowError:
         raise Problem(f"--hours must be a number more than 0, not {args.hours!r}") from None
-    lines = ghlimit.read_calls(since)
+    read_from = min(since, until - dt.timedelta(hours=1))   # GitHub's graphql window ends within the hour
+    read = ghlimit.read_calls(read_from)
+    lines = [line for line in read if parse_iso(line["at"]) >= since]
+    github = rate_limit()
+    if github is not None:
+        window_start = github["reset"] - dt.timedelta(hours=1)
+        if window_start < read_from:   # a reset more than an hour ahead: the part of its window not read yet
+            read += [line for line in ghlimit.read_calls(window_start) if parse_iso(line["at"]) < read_from]
+        logged = sum(1 for line in read if line.get("kind") == "graphql" and parse_iso(line["at"]) >= window_start)
+        github = {"used": github["used"], "limit": github["limit"], "remaining": github["remaining"],
+                  "reset": iso(github["reset"]), "window_start": iso(window_start),
+                  "rate_limit_used": github["rate_limit_used"], "logged_graphql": logged,
+                  "gap": github["used"] - logged}
     totals = {"graphql": 0, "rest": 0, "refused": 0, "failed": 0}
     waited_ms = 0
     tools, commands, tickets, by_hour, minutes = {}, {}, {}, {}, {}
@@ -2613,16 +2662,23 @@ def cmd_budget_calls(args):
             "by_ticket": ranked(tickets, ("repo", "ticket", "calls", "graphql")),
             "by_hour": [{k: row[k] for k in ("hour", "calls", "graphql", "rest")}
                         for _, row in sorted(by_hour.items())]}
+    data["github"] = github
     if wants_json(args):
         emit(True, data, "")
         return
     window = str(int(hours)) if hours.is_integer() else repr(hours)   # 24, 0.5, 1234567: never 1.23457e+06
+    github_line = ""
+    if github is not None:
+        body = github["rate_limit_used"] if github["rate_limit_used"] is not None else "n/a"
+        github_line = (f"\nGitHub graphql since {github['window_start'][11:16]}Z (resets {github['reset'][11:16]}Z): "
+                       f"{github['used']} of {github['limit']} counted (rateLimit.used {body}), "
+                       f"{github['logged_graphql']} logged, gap {github['gap']}")
     if not lines:
-        print(f"No gh calls logged in the last {window} h.")
+        print(f"No gh calls logged in the last {window} h.{github_line}")
         return
     parts = [f"gh calls in the last {window} h: {data['total']} (graphql {data['graphql']}, rest {data['rest']}), "
              f"{data['refused']} refused, {data['failed']} failed, {int(data['waited_seconds'])} s waiting; "
-             f"peak {peak[1]} in one minute ({peak[0][:16]}Z)",
+             f"peak {peak[1]} in one minute ({peak[0][:16]}Z){github_line}",
              table([("TOOL", "CALLS", "GRAPHQL", "REST", "REFUSED")]
                    + [(r["tool"], str(r["calls"]), str(r["graphql"]), str(r["rest"]), str(r["refused"]))
                       for r in data["by_tool"]]),

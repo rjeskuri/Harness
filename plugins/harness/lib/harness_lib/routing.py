@@ -1,6 +1,5 @@
-"""Model routing every harness tool agrees on: the tier rubric, the five routing settings
-(HARNESS_CODE_TIER, HARNESS_CODE_EFFORT, HARNESS_REVIEW_TIER, HARNESS_ULTRAREVIEW and
-HARNESS_WAVE_REVIEW), each stage's route and where an escalation goes. See docs/design.md
+"""Model routing every harness tool agrees on: the tier rubric, the four routing settings
+(HARNESS_CODE_TIER, HARNESS_CODE_EFFORT, HARNESS_REVIEW_TIER and HARNESS_WAVE_REVIEW), each stage's route and where an escalation goes. See docs/design.md
 (Settings, harness_lib).
 
 No rule here picks fable: the labels give sonnet or opus (opus at effort xhigh for `size:L` or
@@ -20,14 +19,12 @@ KEYS = (
     "HARNESS_CODE_TIER",
     "HARNESS_CODE_EFFORT",
     "HARNESS_REVIEW_TIER",
-    "HARNESS_ULTRAREVIEW",
     "HARNESS_WAVE_REVIEW",
 )
 WAVE_EFFORT = "xhigh"
 REVIEW_FABLE_EFFORT = "xhigh"
 LABEL_EFFORT = "xhigh"  # size:L or risk:high, a risk:high review, and an escalation from opus
 
-_ON = ("on", "1", "true", "yes")
 _OFF = ("off", "0", "false", "no")
 
 
@@ -67,22 +64,21 @@ def _choice(key, file_env, allowed, problems):
 def load_routing(main):
     """The routing settings of the project whose main checkout is `main`: the environment
     when not blank, else `env` in <main>/.claude/settings.json (settings.local.json is never
-    read). Keys: code_tier, code_effort, review_tier (a tier or None), ultrareview (a bool,
-    on by default), wave_tier (a tier or None) and wave_effort (WAVE_EFFORT with a wave_tier,
-    else None), and problems (one line per invalid value, which is ignored)."""
+    read). Keys: code_tier, code_effort, review_tier (a tier or None), wave_tier (a tier or
+    None) and wave_effort (WAVE_EFFORT with a wave_tier, else None), and problems (one line
+    per invalid value, which is ignored). Any other key, a retired one included (#443), is
+    not read and adds no problem."""
     file_env = settings_env(main, ("settings.json",))
     problems = []
     code_tier = _choice("HARNESS_CODE_TIER", file_env, TIERS, problems)
     code_effort = _choice("HARNESS_CODE_EFFORT", file_env, EFFORTS, problems)
     review_tier = _choice("HARNESS_REVIEW_TIER", file_env, TIERS, problems)
-    switch = _choice("HARNESS_ULTRAREVIEW", file_env, _ON + _OFF, problems)
     wave = _choice("HARNESS_WAVE_REVIEW", file_env, TIERS + _OFF, problems)
     wave_tier = wave if wave in TIERS else None
     return {
         "code_tier": code_tier,
         "code_effort": code_effort,
         "review_tier": review_tier,
-        "ultrareview": switch not in _OFF,
         "wave_tier": wave_tier,
         "wave_effort": WAVE_EFFORT if wave_tier else None,
         "problems": problems,

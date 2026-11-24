@@ -6,8 +6,8 @@
 - a breaker failure answers done, every time and at any tier, and goes to code (#375: one breaker round, its gaps
   go to the coder as requirements); it never answers park;
 - done: tests -> breaker (risk:high) or code; breaker (pass or fail) -> code; code -> review; review and fix -> fix while the
-  latest review round (harness_lib.reviews.latest_round) has blocking findings, else ci; ci -> `ultra, then ready`
-  (risk:high) or ready;
+  latest review round (harness_lib.reviews.latest_round) has blocking findings, else ci; ci -> ready at any risk
+  (#443 removed the ultrareview step that once came first on risk:high);
 - refused, exit 1, nothing recorded: review or fix with no review round; fix pass while the latest round has
   blocking findings and fix fail while it has none; tests or breaker on a no-tests ticket; breaker on a ticket that
   is not risk:high.
@@ -198,11 +198,11 @@ class Stage(tw.WorkTest):
 
             with self.subTest(risk=risk, row="ci pass"):
                 n = self.put_ticket(risk)
-                self.assertEqual(self.stage(n, "ci", "pass"), ("done", "ultra, then ready" if high else "ready"))
+                self.assertEqual(self.stage(n, "ci", "pass"), ("done", "ready"))  # #443: no ultra step
 
         # the risk the step depends on is the ticket's own: a high and a low ticket side by side
         low, high = self.put_ticket("low", size="S"), self.put_ticket("high", size="L")
-        for stage, low_next, high_next in (("tests", "code", "breaker"), ("ci", "ready", "ultra, then ready")):
+        for stage, low_next, high_next in (("tests", "code", "breaker"), ("ci", "ready", "ready")):
             with self.subTest(side_by_side=stage):
                 self.assertEqual(self.stage(low, stage, "pass"), ("done", low_next))
                 self.assertEqual(self.stage(high, stage, "pass"), ("done", high_next))
@@ -378,7 +378,7 @@ class Stage(tw.WorkTest):
         self.assertEqual(self.stage(n, "fix", "fail"), ("park", "park"))
         self.save_round(n, 0)
         self.assertEqual(self.stage(n, "fix", "pass"), ("done", "ci"))
-        self.assertEqual(self.stage(n, "ci", "pass"), ("done", "ultra, then ready"))
+        self.assertEqual(self.stage(n, "ci", "pass"), ("done", "ready"))
 
         # a review failure repeats the review whatever the round holds
         for blocking in (0, 2):
@@ -471,7 +471,7 @@ class Stage(tw.WorkTest):
             self.assertEqual(self.attempts(n), [])
             # the rest of the loop still runs on a no-tests ticket
             self.assertEqual(self.stage(n, "code", "pass"), ("done", "review"))
-            after_ci = "ultra, then ready" if risk == "high" else "ready"
+            after_ci = "ready"
             self.assertEqual(self.stage(n, "ci", "pass"), ("done", after_ci))
 
         # the same ticket without the flag takes tests (and breaker on risk:high)
@@ -493,7 +493,7 @@ class Stage(tw.WorkTest):
             (["fix", "fail"], None, "fix"),
             (["fix", "pass"], 0, "ci"),
             (["ci", "fail"], None, "ci"),
-            (["ci", "pass"], None, "ultra, then ready"),
+            (["ci", "pass"], None, "ready"),
         ]
         low = [
             (["tests", "pass"], None, "code"),

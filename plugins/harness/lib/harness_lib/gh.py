@@ -21,6 +21,7 @@ from harness_lib.ghlimit import log_call, ms_since
 from harness_lib.text import first_line
 
 GH_ENV = {"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"}
+LOGGED = "HARNESS_GH_LOGGED"   # "1" in each gh child's environment: logged here, so the gh shim logs it not again
 
 
 def gh_exe() -> str:
@@ -95,26 +96,30 @@ def _text(texts, key, args, describe, exe, **fields):
     return template.format(exe=exe, call=describe(args), args=args, **values)
 
 
-def gh_run(args, cwd, stdin=None, timeout=60, *, errors="replace", env=None, describe=describe, texts=None):
+def gh_run(args, cwd, stdin=None, timeout=60, *, errors="replace", env=None, describe=describe, texts=None,
+           log=True):
     """Run gh_exe() with `args` in `cwd` (None: the current directory), `stdin` as its input (None: /dev/null), in
-    os.environ plus `env` (None: prompts disabled). The CompletedProcess, output decoded as utf-8 with `errors`,
-    whatever the exit; Problem when gh is missing, cannot start or runs past `timeout` seconds. A call that ran
-    is logged (ghlimit), with exit null when it timed out."""
+    os.environ plus `env` (None: prompts disabled) plus HARNESS_GH_LOGGED=1 (so the gh shim does not log it). The
+    CompletedProcess, output decoded as utf-8 with `errors`, whatever the exit; Problem when gh is missing, cannot
+    start or runs past `timeout` seconds. A call that ran is logged (ghlimit), with exit null when it timed out,
+    unless `log` is false."""
     exe = gh_exe()
     io = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
     extra = env if env is not None else {"GH_PROMPT_DISABLED": "1"}
     started = time.monotonic()
     try:
         done = subprocess.run([exe] + list(args), cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-                              errors=errors, timeout=timeout, env=dict(os.environ, **extra), **io)
+                              errors=errors, timeout=timeout, env={**os.environ, **extra, LOGGED: "1"}, **io)
     except FileNotFoundError:
         raise Problem(_text(texts, "not_found", args, describe, exe)) from None
     except OSError as err:
         raise Problem(_text(texts, "cannot_run", args, describe, exe, why=err.strerror or err)) from None
     except subprocess.TimeoutExpired:
-        log_call(args, cwd=cwd, exit=None, ms=ms_since(started))
+        if log:
+            log_call(args, cwd=cwd, exit=None, ms=ms_since(started))
         raise Problem(_text(texts, "timed_out", args, describe, exe, timeout=timeout)) from None
-    log_call(args, cwd=cwd, exit=done.returncode, ms=ms_since(started))
+    if log:
+        log_call(args, cwd=cwd, exit=done.returncode, ms=ms_since(started))
     return done
 
 
@@ -148,13 +153,14 @@ def gh_json(args, cwd, *, pick=first_line, empty_ok=False, via=None, **kw):
 class GhBatch:
     """gh calls started side by side; results() waits for each until the shared deadline.
     `budget_seconds` is only named in a timeout's message (the caller's own budget). Each call is logged
-    (ghlimit) once: when results() reads it, else when close() releases it (exit null when it was stopped)."""
+    (ghlimit) once: when results() reads it, else when close() releases it (exit null when it was stopped); each
+    child gets GH_ENV and HARNESS_GH_LOGGED=1 over the caller's environment."""
 
     def __init__(self, gh, calls, cwd, deadline, *, budget_seconds, describe=describe_list_call):
         self.calls, self.deadline, self.procs = calls, deadline, []
         self.budget_seconds, self.describe = budget_seconds, describe
         self.cwd, self.started, self.logged = cwd, [], set()
-        env = dict(os.environ, **GH_ENV)
+        env = {**os.environ, **GH_ENV, LOGGED: "1"}
         try:
             for args in calls:
                 self.started.append(time.monotonic())

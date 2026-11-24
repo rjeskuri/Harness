@@ -14,7 +14,7 @@ variants, so no fixed table of names can stand in for asking the file system. Gi
 the spelling the worktree's `.git` file names, so rewriting that file with every component below the system
 temp root case-swapped gives a worktree whose `git rev-parse --git-common-dir` is a non-canonical spelling:
 the way a second spelling reaches every tool and hook. HOME is temporary. `fakebin`, first on PATH and written
-once for the module, holds gh (fakegh.py), claude (answers ultrareview and `agents --json`), silent
+once for the module, holds gh (fakegh.py), claude (answers `agents --json`), silent
 terminal-notifier and osascript, and python3.
 
 Two spellings of one path exist only on a case-insensitive file system, so those tests are skipped on a
@@ -355,7 +355,7 @@ class KeyFixture(unittest.TestCase):
         self.ok("harness-work", "attempt", "12", "tests", "pass")
         self.gh_issue()
         self.ok("harness-board", "show", "12")
-        self.ok("harness-pr", "ultra", "34")
+        self.ok("harness-pr", "learn", "--mark")
 
 
 # ================================================================ the canonical spelling keeps its key
@@ -366,7 +366,7 @@ class CanonicalSpellingKeepsItsKey(KeyFixture):
         self.run_every_tool()
         self.assertEqual(self.state_dirs(), [self.canon_key])
         self.assertTrue(os.path.isfile(os.path.join(self.canon, "red", SLUG + ".json")))
-        self.assertTrue(os.path.isfile(os.path.join(self.canon, "ultra", "34.json")))
+        self.assertTrue(os.path.isfile(os.path.join(self.canon, "learn.json")))
         cache = read_json(os.path.join(self.canon, "tickets", "12.json"))
         self.assertEqual(cache["title"], "Fix login")
         self.assertEqual([(a["stage"], a["result"]) for a in cache["attempts"]], [("tests", "pass")])
@@ -429,9 +429,9 @@ class OtherSpellingOneKey(KeyFixture):
         self.assertEqual(read_json(os.path.join(self.canon, "tickets", "12.json"))["title"], "Board title")
 
     def test_harness_pr_saves_under_the_canonical_key(self):
-        self.ok("harness-pr", "ultra", "34")
+        self.ok("harness-pr", "learn", "--mark")
         self.assertEqual(self.state_dirs(), [self.canon_key])
-        self.assertEqual(read_json(os.path.join(self.canon, "ultra", "34.json")), {"findings": []})
+        self.assertIn("last_run", read_json(os.path.join(self.canon, "learn.json")))
 
     def test_every_tool_shares_one_state_directory(self):
         self.run_every_tool()
@@ -580,8 +580,8 @@ class WorktreeOutsideTheMainTree(KeyFixture):
         self.assertEqual(read_json(os.path.join(self.canon, "red", self.SLUG2 + ".json"))["branch"], self.BRANCH2)
         self.ok("harness-work", "attempt", "14", "code", "fail", cwd=self.wt2)
         self.assertEqual(len(read_json(os.path.join(self.canon, "tickets", "14.json"))["attempts"]), 1)
-        self.ok("harness-pr", "ultra", "35", cwd=self.wt2)
-        self.assertTrue(os.path.isfile(os.path.join(self.canon, "ultra", "35.json")))
+        self.ok("harness-pr", "learn", "--mark", cwd=self.wt2)
+        self.assertTrue(os.path.isfile(os.path.join(self.canon, "learn.json")))
         lines = self.brief(self.wt2)
         self.assertIn("Ticket #14: Outside ticket (in-progress, tier opus)", lines)
         self.assertTrue(any(line.startswith("Red run: assertion at ") for line in lines), lines)
@@ -658,10 +658,10 @@ class Migration(KeyFixture):
 
     def test_harness_pr_moves_the_old_state(self):
         self.put_ticket(self.old, title="Old for pr")
-        self.ok("harness-pr", "ultra", "34")
+        self.ok("harness-pr", "learn", "--mark")
         self.assertMoved()
         self.assertEqual(read_json(os.path.join(self.canon, "tickets", "12.json"))["title"], "Old for pr")
-        self.assertTrue(os.path.isfile(os.path.join(self.canon, "ultra", "34.json")))
+        self.assertTrue(os.path.isfile(os.path.join(self.canon, "learn.json")))
 
     def test_session_brief_moves_and_shows_the_old_state(self):
         self.put_ticket(self.old, title="Old brief ticket")

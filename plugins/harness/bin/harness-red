@@ -438,6 +438,10 @@ def test_map(repo):
     return pairs
 
 
+# The scaffold's files to copy into other projects (test_smoke.py, smoke.test.js): never tests of this repo.
+TEMPLATES_DIR = "plugins/harness/templates/"
+
+
 def own_files(repo, base):
     """{"base", "files", "changed_tests", "mapped", "unmapped"}: the changed runnable test files, and for
     every other changed path the runnable test modules its name rule or HARNESS_TEST_MAP gives."""
@@ -445,7 +449,7 @@ def own_files(repo, base):
     changed = repo.changed_paths(merge_base_of(repo, base))
     listed = git(repo.top, "ls-files", "-z", "--cached", "--others", "--exclude-standard").stdout
     candidates = {p: subject(p) for p in sorted(set(listed.split("\0")))
-                  if p and repo.classify(p) == "test" and runnable_name(p)
+                  if p and repo.classify(p) == "test" and runnable_name(p) and not p.startswith(TEMPLATES_DIR)
                   and os.path.isfile(os.path.join(repo.top, p))}
     changed_tests, mapped, unmapped = [], {}, []
     for path in changed:

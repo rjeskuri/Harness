@@ -1,4 +1,4 @@
-"""Shared by test_pr, test_pr_land, test_pr_ultra: the fixtures, helpers and base classes of the
+"""Shared by test_pr, test_pr_land, test_pr_land_cost: the fixtures, helpers and base classes of the
 test_pr suite, split by test class so no one module bounds the parallel suite. Not a test
 module (no `test_` prefix): discovery and scripts/run_suite.py skip it. Each test module
 imports everything here, `setUpModule` and `tearDownModule` included, so each still builds its
@@ -650,103 +650,8 @@ def iso_ago(**delta):
     return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(**delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-ULTRA_OUT = json.dumps({"summary": "done", "findings": [{"severity": "high"}, {"severity": "low"}]})
 WARNING = "harness-pr: warning:"
 LIB = os.path.join(os.path.dirname(HERE), "lib")
-# What each routing key accepts, in the words of the warning (routing.py's "%s=%r is not one of %s; ignored").
-ACCEPTS = {
-    "HARNESS_CODE_TIER": "sonnet, opus, fable",
-    "HARNESS_CODE_EFFORT": "low, medium, high, xhigh, max",
-    "HARNESS_REVIEW_TIER": "sonnet, opus, fable",
-    "HARNESS_ULTRAREVIEW": "on, 1, true, yes, off, 0, false, no",
-    "HARNESS_WAVE_REVIEW": "sonnet, opus, fable, off, 0, false, no",
-}
-
-
-def off_line(number):
-    return f"ultrareview PR #{number}: off for this project (HARNESS_ULTRAREVIEW=off); nothing run"
-
-
-def bad(key, shown):
-    """The exact problem text for `key` given the (stripped) value `shown`."""
-    return f"{key}={shown!r} is not one of {ACCEPTS[key]}; ignored"
-
-
-class UltraSettingBase:
-    """Helpers for the HARNESS_ULTRAREVIEW switch: settings files in the main checkout, the cloud budget and the
-    saved ultra state, watched the way the Ultra tests watch them."""
-
-    def claude(self, stdout=ULTRA_OUT, stderr="", code=0):
-        return {"CLAUDE_STDOUT": write(os.path.join(self.tmp, "claude.out"), stdout),
-                "CLAUDE_STDERR": write(os.path.join(self.tmp, "claude.err"), stderr), "CLAUDE_EXIT": str(code)}
-
-    def budgets_path(self):
-        return os.path.join(self.home, ".claude", "harness", "budgets.json")
-
-    def settings(self, env, name="settings.json", root=None):
-        write(os.path.join(root or self.main, ".claude", name), json.dumps({"env": env}))
-
-    def go(self, number, file_env=None, raw=None, environ=None, flags=(), local=None):
-        """A fresh run: call logs cleared, the main checkout's settings files replaced by `file_env` (or the
-        exact text `raw`) and `local` (settings.local.json), then `harness-pr ultra <number>`."""
-        self.scenario([])
-        for name in ("settings.json", "settings.local.json"):
-            path = os.path.join(self.main, ".claude", name)
-            if os.path.exists(path):
-                os.unlink(path)
-        if raw is not None:
-            write(os.path.join(self.main, ".claude", "settings.json"), raw)
-        elif file_env is not None:
-            self.settings(file_env)
-        if local is not None:
-            self.settings(local, name="settings.local.json")
-        return self.pr("ultra", str(number), *flags, **(environ or {}), **self.claude())
-
-    def warnings(self, p):
-        return [line for line in p.stderr.splitlines() if line.startswith(WARNING)]
-
-    def routing_problems(self, environ):
-        """load_routing's problems for the main checkout as it is on disk now, under exactly `environ` as the
-        HARNESS_* environment (the oracle for the warning text)."""
-        if LIB not in sys.path:
-            sys.path.insert(0, LIB)
-        from harness_lib import routing
-        saved = dict(os.environ)
-        try:
-            for name in [n for n in os.environ if n.startswith("HARNESS_")]:
-                del os.environ[name]
-            os.environ.update(environ)
-            return routing.load_routing(self.main)["problems"]
-        finally:
-            os.environ.clear()
-            os.environ.update(saved)
-
-    def assertWarnings(self, p, problems, environ=None):
-        """The `harness-pr: warning:` lines are exactly `problems`, in order, one each; `problems` is hand-written
-        and must agree with load_routing's."""
-        expected = [WARNING + " " + text for text in problems]
-        self.assertEqual([WARNING + " " + t for t in self.routing_problems(environ or {})], expected,
-                         "the test's expected problems disagree with load_routing")
-        self.assertNotIn("Traceback", p.stderr)
-        self.assertEqual(self.warnings(p), expected, p.stderr)
-
-    def assertNothingRan(self, p, number):
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertNotIn("Traceback", p.stderr)
-        self.assertEqual(p.stdout.strip(), off_line(number))
-        self.assertEqual(self.stub_calls("claude"), [])
-        self.assertEqual(self.gh_argv(), [])
-        self.assertFalse(os.path.exists(self.state_path("ultra", f"{number}.json")))
-        self.assertFalse(os.path.exists(self.budgets_path()))
-
-    def assertRan(self, p, number, *flags):
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertEqual(self.stub_calls("claude"),
-                         [["ultrareview", str(number), "--json", "--timeout", "30", *flags]])
-        self.assertNotIn("off for this project", p.stdout)
-        self.assertIn("2 findings (1 high, 1 low)", p.stdout)
-        with open(self.state_path("ultra", f"{number}.json"), encoding="utf-8") as fh:
-            self.assertEqual(fh.read(), ULTRA_OUT)
 
 
 # =========================================================================== land
