@@ -1438,7 +1438,7 @@ exit 254
         self.git(self.wt, "reset", "-q", "--hard", head)
         self.assertEqual(self.current(), "current: yes")
 
-    # ultrareview round (#231): a SHA-256 repository, whose commit ids are 64 hex digits
+    # the #231 review round: a SHA-256 repository, whose commit ids are 64 hex digits
     def use_sha256_repo(self):
         """Swap the fixture for the same layout in SHA-256: a bare origin, a main checkout pushing to it (a clone
         of an empty SHA-256 repository comes out SHA-1 in older git), the branch in a linked worktree. Skips the

@@ -95,7 +95,7 @@ Hooks run outside the sandbox with your permissions. Point `CLAUDE_VERIFY_CMD` a
 | `harness-board` | The board: labels, epics, tasks, status, comments, needs-input, tier |
 | `harness-work` | Start a ticket's branch and worktree, record attempts, dispatch runs, budgets, worktrees |
 | `harness-red` | Prove the branch's tests fail before the implementation; the breaker's scratch copy |
-| `harness-pr` | Open, review, check, mark ready, ultrareview and land pull requests |
+| `harness-pr` | Open, review, check, mark ready and land pull requests |
 | `harness-scaffold` | Set up a new or existing repo for the harness |
 | `harness-digest` | The daily digest across projects; installs its launchd job |
 | `harness-projects` | The project registry |
@@ -126,9 +126,8 @@ Machine-wide, under `env` in `~/.claude/settings.json`: `HARNESS_API_KEY_CMD` (d
 | Interactive sessions, including `/harness:work N` | The Max subscription |
 | Dispatched runs, `/harness:work` (the default) | The Max subscription |
 | Dispatched headless runs, `/harness:work --api` or `--venue headless` | The API key, read from the keychain |
-| Ultrareview on `risk:high` PRs, unless the project sets `HARNESS_ULTRAREVIEW=off` | claude.ai usage credits, about 5 to 25 dollars a run |
 
-When a headless run fails on billing or auth, the API budget is marked exhausted for 24 hours, and until then `--api` and `--venue headless` are refused; dispatch without them still runs on the subscription. A credits failure on ultrareview marks the cloud budget the same way. `harness-work budget status` shows the state; `harness-work budget reset api` clears it after a top-up.
+When a headless run fails on billing or auth, the API budget is marked exhausted for 24 hours, and until then `--api` and `--venue headless` are refused; dispatch without them still runs on the subscription. `harness-work budget status` shows the state; `harness-work budget reset api` clears it after a top-up.
 
 ## Troubleshooting
 

@@ -2087,7 +2087,7 @@ class FixturesLiveInPrSupport(unittest.TestCase):
         for name in ("LAND_FIELDS", "land_view", "gate_calls", "PrTest"):  # the parser sees pr_support's fixtures
             self.assertIn(name, shared)
         shared |= set(MOVED)  # the head-check fixtures #348 moves there, whether or not they are there yet
-        for module in ("test_pr_land.py", "test_pr_ultra.py", "test_pr_land_canary.py"):
+        for module in ("test_pr_land.py", "test_pr_land_cost.py", "test_pr_land_canary.py"):
             with self.subTest(module=module):
                 self.assertEqual(sorted(bound(module) & shared), [])
 

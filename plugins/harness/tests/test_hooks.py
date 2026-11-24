@@ -826,7 +826,7 @@ class ForeignSessionEnvTests(HookTestCase):
                 strays = {
                     "HARNESS_TEST_CMD": f"npm test -- {{files}} --shard={n}",
                     "HARNESS_TEST_TIMEOUT": str(600 + n),
-                    ("HARNESS_ULTRAREVIEW" if n == 1 else "HARNESS_REVIEW_TIER"): ("1" if n == 1 else "sonnet"),
+                    ("HARNESS_WAVE_REVIEW" if n == 1 else "HARNESS_REVIEW_TIER"): ("opus" if n == 1 else "sonnet"),
                     "CLAUDE_VERIFY_CMD": f"scripts/verify-{n}.sh",
                     "CLAUDE_VERIFY_TIMEOUT": str(900 + n),
                     random_key: uuid.uuid4().hex,
@@ -851,14 +851,14 @@ class ForeignSessionEnvTests(HookTestCase):
         user = self.home / ".claude" / "settings.json"
         project = self.proj / ".claude" / "settings.json"
         local = self.proj / ".claude" / "settings.local.json"
-        harness_keys = ("HARNESS_PROJECT", "HARNESS_TEST_CMD", "HARNESS_ULTRAREVIEW", "CLAUDE_VERIFY_CMD",
+        harness_keys = ("HARNESS_PROJECT", "HARNESS_TEST_CMD", "HARNESS_WAVE_REVIEW", "CLAUDE_VERIFY_CMD",
                         "CLAUDE_VERIFY_TIMEOUT")
         self.assertBriefNames(self.plain_brief(self.proj), dropped=[], not_named=harness_keys)
         for name, sets in (
             ("user settings", {user: ["HARNESS_PROJECT"]}),
             ("project settings", {project: ["HARNESS_TEST_CMD"]}),
             ("local settings", {local: ["CLAUDE_VERIFY_CMD"]}),
-            ("all three", {user: ["HARNESS_PROJECT"], project: ["HARNESS_ULTRAREVIEW"],
+            ("all three", {user: ["HARNESS_PROJECT"], project: ["HARNESS_WAVE_REVIEW"],
                            local: ["CLAUDE_VERIFY_TIMEOUT", "HARNESS_TEST_CMD"]}),
         ):
             with self.subTest(name):
@@ -890,7 +890,7 @@ class ForeignSessionEnvTests(HookTestCase):
         extra_key = [k for k in kept if k.startswith("HARNESS_X")][0]
         self.write(user, json.dumps({
             "permissions": {"allow": ["Bash(HARNESS_TEST_CMD=* harness-red run)"]},
-            "statusLine": {"type": "command", "command": "echo $HARNESS_ULTRAREVIEW"},
+            "statusLine": {"type": "command", "command": "echo $HARNESS_WAVE_REVIEW"},
             "env": {"HARNESS_PROJECT": kept["HARNESS_PROJECT"]},
         }))
         self.write(project, json.dumps({
@@ -902,7 +902,7 @@ class ForeignSessionEnvTests(HookTestCase):
             "permissions": {"deny": ["Bash(export CLAUDE_VERIFY_TIMEOUT=*)"]},
             "env": {extra_key: kept[extra_key]},
         }))
-        strays = {"HARNESS_TEST_CMD": "npm test -- {files}", "HARNESS_ULTRAREVIEW": "1",
+        strays = {"HARNESS_TEST_CMD": "npm test -- {files}", "HARNESS_WAVE_REVIEW": "opus",
                   "HARNESS_REVIEW_TIER": "sonnet", "CLAUDE_VERIFY_CMD": "scripts/verify.sh",
                   "CLAUDE_VERIFY_TIMEOUT": "900"}
         inherited = dict(strays, **kept, HARNESS_SESSION_PROJECT=str(self.other))

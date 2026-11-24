@@ -60,8 +60,7 @@ One session per project. `claude agents` in a terminal lists every session, incl
 | Review | `reviewer`, Opus (xhigh for risk:high), unless the project sets `HARNESS_REVIEW_TIER` | Checks the branch against the definition of done. High and medium findings go back to the coder, at most twice |
 | PR | `harness-pr open`, `harness-pr review` | Pushes the branch, opens a draft PR, posts the findings as a review |
 | CI | `harness-pr checks <P> --wait` | Waits for checks. Failures go back to the coder, at most twice |
-| Ultrareview | `harness-pr ultra <P> --post` | Only on `risk:high`; posts a cloud review to the PR. With `HARNESS_ULTRAREVIEW=off` in the project's settings it prints one line saying ultrareview is off and runs nothing |
-| Ready | `reviewer`, `harness-pr ready <P>` | When commits other than clean merges of main came after the latest harness review (CI, ultrareview or revise fixes, or a merge of main that conflicted), the reviewer reviews the head again first, since `harness-pr land` refuses a head no review covers. A merge counts as clean, whoever made it, as `harness-pr land` judges it: `git merge-tree` of its two parents merges without a conflict into the merge's own tree. Then marks the PR ready, sets `status:in-review`, notifies you, and goes straight on to Land |
+| Ready | `reviewer`, `harness-pr ready <P>` | When commits other than clean merges of main came after the latest harness review (CI or revise fixes, or a merge of main that conflicted), the reviewer reviews the head again first, since `harness-pr land` refuses a head no review covers. A merge counts as clean, whoever made it, as `harness-pr land` judges it: `git merge-tree` of its two parents merges without a conflict into the merge's own tree. Then marks the PR ready, sets `status:in-review`, notifies you, and goes straight on to Land |
 | Land | `harness-pr land <P> --catch-up` | At any risk, with no question to you: merges main into the branch when it is behind and that merge is clean, pushes and waits for CI, then merges the PR, removes the worktree and branch, closes the ticket and runs the canary. A conflict with main goes to the coder (after `harness-red reprove` on a branch with no red record, such as one from the cloud), then CI and the head review again. A land it still cannot finish parks the ticket |
 
 Every stage reports pass or fail to `harness-work attempt`. A first failure retries at the same tier and effort. A second re-runs one step up: Sonnet goes to Opus, Opus goes to Opus at effort xhigh, and a second failure already at Opus xhigh (or max), or on an explicitly named Fable run, parks the ticket instead. A third parks it: `status:blocked`, a **Parked** comment with the stage, the reason and the evidence, a proposed follow-up, and a notification; then the loop launches the next ready ticket. A land that hits its caps, or a refusal the loop cannot handle, parks the same way. No escalation goes to Fable.
@@ -124,7 +123,6 @@ Turn it off by removing `HARNESS_PROJECT` from `~/.claude/settings.json`, or for
 | Your interactive sessions, including `/harness:work N` | The Max subscription | Wait for the window; `/usage` shows the five-hour and seven-day limits |
 | `/harness:work` dispatch (the default), and the hourly dispatch | The Max subscription: one background session per ticket | A background session that hits the usage limit marks the `subscription` budget exhausted until the reset its refusal names (else 5 hours after it), found by the next sweep. Until then background dispatch, the hourly one included, starts nothing and says until when; `--api` still runs |
 | `/harness:work --api` (or `--venue headless`) dispatch | The API key in the keychain | A billing or auth failure marks the `api` budget exhausted for 24 hours. Until then `--api` and `--venue headless` are refused; dispatch without them still runs on the subscription |
-| Ultrareview on `risk:high` PRs | claude.ai usage credits, about 5 to 25 dollars a run | A credits failure marks the `cloud` budget exhausted for 24 hours |
 
 `harness-work budget status` shows the three budgets. After a top-up, `harness-work budget reset api` clears the mark; `harness-work budget reset subscription` clears the usage-limit hold early (the same refusal never marks it again; a new one does). `harness-work budget exhaust api --reason <text>` marks it exhausted by hand, which stops `--api` runs. The session brief and the standup name an exhausted budget.
 
@@ -138,8 +136,6 @@ Off until you opt a project in and install the job. Once both are done, minute 0
 4. **Uninstall.** `harness-work dispatch --uninstall-launchd` unloads the job and removes the file.
 
 The Mac must be awake for a tick to run: lid open on power, or closed with an external display attached. Hours missed while it slept run once when it wakes (the job uses `StartCalendarInterval`), not once per missed hour. While the `subscription` budget is exhausted each tick starts nothing, until the reset.
-
-A project that sets `HARNESS_ULTRAREVIEW=off` gets no ultrareview: `harness-pr ultra` prints one line and runs nothing, so its pull requests spend no usage credits.
 
 ## Changing the loop itself
 

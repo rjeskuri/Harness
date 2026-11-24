@@ -1603,24 +1603,6 @@ class ToolsHaveNoCopyOfAnyExport(unittest.TestCase):
             with self.subTest(tool=tool):
                 self.assertEqual(list(tool_findings(tool)), [], f"{tool} carries a copy of a harness_lib function")
 
-    def enclosing_calls(self, tool: str, name: str) -> list:
-        """The names of the functions in `tool` that call `name(...)`, one entry per call."""
-        tree = ast.parse((BIN / tool).read_text(encoding="utf-8"))
-        found = []
-        for fn in ast.walk(tree):
-            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                found += [fn.name for sub in ast.walk(fn) if isinstance(sub, ast.Call)
-                          and isinstance(sub.func, ast.Name) and sub.func.id == name]
-        return found
-
-    def test_the_budgets_file_is_written_by_write_json_and_not_by_write_text(self):
-        """Pretty JSON and a newline is write_json (the owner's note on the #82 review: the budgets file is written by
-        write_json with the same bytes); write_text is for text that is not JSON. However the JSON text is held
-        (a variable, +=, an f-string), mark_cloud_exhausted calls write_json and never write_text. Other callers of
-        either are not this test's business: a later state file written through the lib is welcome."""
-        self.assertIn("mark_cloud_exhausted", self.enclosing_calls("harness-pr", "write_json"))
-        self.assertNotIn("mark_cloud_exhausted", self.enclosing_calls("harness-pr", "write_text"))
-
     def test_board_and_pr_write_no_file_by_hand(self):
         """No write-mode open, Path.write_text, mkstemp, os.replace, json.dump or indented json.dumps in either
         tool: files are written by the lib, and the tools have no write that could stand in for it."""
@@ -2552,7 +2534,7 @@ class ToolsRunTheLib(unittest.TestCase):
         self.spy(board, self.text.now_iso, "now_iso")
         # a blank routing variable counts as unset, so the developer's own HARNESS_CODE_TIER cannot replace the labels
         routing = {k: "" for k in ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER",
-                                   "HARNESS_ULTRAREVIEW", "HARNESS_WAVE_REVIEW")}
+                                   "HARNESS_WAVE_REVIEW")}
         before = int(time.time())
         with mock.patch.dict(os.environ, routing):
             record = board.fetch_record(None, 7)
@@ -2670,93 +2652,6 @@ class ToolsRunTheLib(unittest.TestCase):
     def test_pr_builds_its_parser_from_the_lib(self):
         pr = load_tool(BIN / "harness-pr")
         self.assertIs(type(pr.parser()), self.cli.Parser)
-
-    def test_pr_writes_the_budgets_file_through_write_json_with_the_same_bytes(self):
-        """mark_cloud_exhausted is write_json(path, data, prefix=".harness-pr-"): the file is indented JSON, non-ASCII
-        kept, one newline at the end, other keys kept, and write_text is not the way it is written."""
-        pr = load_tool(BIN / "harness-pr")
-        budgets = os.path.join(self.tmp, ".claude", "harness", "budgets.json")
-        os.makedirs(os.path.dirname(budgets))
-        with open(budgets, "w", encoding="utf-8") as fh:
-            json.dump({"api": {"exhausted_until": "2030-01-01T00:00:00Z"}, "note": "café"}, fh)
-        self.spy(pr, self.text.read_json, "read_json")
-        self.spy(pr, self.text.write_json, "write_json")
-        self.spy(pr, self.text.write_text, "write_text")
-        untils = []
-        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
-            for reason in ("weekly limit", "quota (token-7) ☃"):
-                until = pr.mark_cloud_exhausted(reason)
-                untils.append(until)
-                want = {"api": {"exhausted_until": "2030-01-01T00:00:00Z"}, "note": "café",
-                        "cloud": {"exhausted_until": until, "reason": reason}}
-                with open(budgets, "rb") as fh:
-                    raw = fh.read()
-                self.assertEqual(raw, (json.dumps(want, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
-                self.assertRegex(until, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-        self.assertEqual(self.given("write_json"), [budgets, budgets])
-        self.assertEqual([kwargs for _, kwargs in self.called("write_json")], [{"prefix": ".harness-pr-"}] * 2)
-        # the data it was given is the whole budgets document, not a stand-in
-        self.assertEqual([args[1] for args, _ in self.called("write_json")], [
-            {"api": {"exhausted_until": "2030-01-01T00:00:00Z"}, "note": "café",
-             "cloud": {"exhausted_until": untils[0], "reason": "weekly limit"}},
-            {"api": {"exhausted_until": "2030-01-01T00:00:00Z"}, "note": "café",
-             "cloud": {"exhausted_until": untils[1], "reason": "quota (token-7) ☃"}}])
-        self.assertEqual(self.called("write_text"), [], "the budgets file is JSON: write_json, not write_text")
-        self.assertEqual(self.given("read_json"), [budgets, budgets])
-        self.assertEqual([n for n in os.listdir(os.path.dirname(budgets)) if n.startswith(".harness-pr-")], [])
-
-    def test_pr_budgets_file_is_whatever_write_json_leaves_and_nothing_after_it(self):
-        """With write_json replaced by a stand-in that writes a marker, the file holds the marker and only the marker
-        after mark_cloud_exhausted: nothing else writes the file before, after or instead of write_json, and
-        write_json is handed the real document (not an empty one) and the return value is its `exhausted_until`."""
-        for reason in ("weekly limit", "plan limit ☃"):
-            with self.subTest(reason=reason):
-                pr = load_tool(BIN / "harness-pr")
-                folder = os.path.join(self.tmp, reason[:4], ".claude", "harness")
-                budgets = os.path.join(folder, "budgets.json")
-                os.makedirs(folder)
-                with open(budgets, "w", encoding="utf-8") as fh:
-                    json.dump({"keep": [1, 2]}, fh)
-                given = []
-
-                def stand_in(path, data, **kwargs):
-                    given.append((path, copy.deepcopy(data), kwargs))
-                    with open(path, "w", encoding="utf-8") as fh:
-                        fh.write("MARKER\n")
-
-                with mock.patch.dict(os.environ, {"HOME": os.path.dirname(os.path.dirname(folder))}), \
-                        mock.patch.object(pr, "write_json", stand_in, create=True):
-                    until = pr.mark_cloud_exhausted(reason)
-                with open(budgets, encoding="utf-8") as fh:
-                    self.assertEqual(fh.read(), "MARKER\n")
-                self.assertEqual(given, [(budgets, {"keep": [1, 2], "cloud": {"exhausted_until": until,
-                                                                              "reason": reason}},
-                                          {"prefix": ".harness-pr-"})])
-                self.assertEqual(os.listdir(folder), ["budgets.json"])
-
-    def test_pr_writes_the_ultrareview_output_through_write_text(self):
-        """Text that is not (known to be) JSON is written as given through write_text, in a `.harness-pr-` temporary
-        file: cmd_ultra saves claude's stdout byte for byte."""
-        pr = load_tool(BIN / "harness-pr")
-        self.spy(pr, self.text.write_text, "write_text")
-        saved = os.path.join(self.tmp, "state", "ultra", "9.json")
-        out = '{"findings": [], "note": "\u2603"}\n\n'
-        claude = self.fake_exe("claude", f"printf '%s' '{out}'\n")
-        # cmd_ultra reads the routing settings of repo.main first; with no settings file there, ultrareview is on
-        repo = mock.Mock(root=self.tmp, main=self.tmp)
-        repo.state = lambda *parts: os.path.join(self.tmp, "state", *parts)
-        args = argparse.Namespace(number=9, post=False, force=False)
-        # a blank routing variable counts as unset, so the developer's own HARNESS_* settings cannot switch the run off
-        routing = {k: "" for k in ("HARNESS_CODE_TIER", "HARNESS_CODE_EFFORT", "HARNESS_REVIEW_TIER",
-                                   "HARNESS_ULTRAREVIEW", "HARNESS_WAVE_REVIEW")}
-        with mock.patch.dict(os.environ, {**routing, "HARNESS_CLAUDE": claude, "HOME": self.tmp}), \
-                mock.patch.object(pr, "open_repo", lambda: repo):
-            _, printed, _ = capture(pr.cmd_ultra, args)
-        self.assertIn("no findings", printed)
-        self.assertEqual(self.given("write_text"), [saved])
-        self.assertEqual(self.called("write_text")[0][1], {"prefix": ".harness-pr-"})
-        with open(saved, encoding="utf-8") as fh:
-            self.assertEqual(fh.read(), out)
 
     def test_pr_warns_through_the_lib_with_its_own_spelling_byte_for_byte(self):
         """`harness-pr: warning: <message on one line>`: the prog name is harness-pr and the message is the tool's
@@ -2926,7 +2821,7 @@ class ToolsRunTheLib(unittest.TestCase):
                          [v.get("closingIssuesReferences") for v, _ in closing] + [rollup, files])
 
     def test_pr_finds_its_state_files_under_home_through_the_lib(self):
-        """mark_cloud_exhausted, registry_projects and Repo.state: every path under HOME comes from the lib."""
+        """registry_projects and Repo.state: every path under HOME comes from the lib."""
         pr = load_tool(BIN / "harness-pr")
         self.spy(pr, self.text.home, "home")
         self.spy(pr, self.text.harness_home, "harness_home", required=False)
@@ -2939,19 +2834,11 @@ class ToolsRunTheLib(unittest.TestCase):
                 self.assertEqual(pr.registry_projects(), [("harness", os.path.join(home, "portfolio", "Harness")),
                                                           ("y", "/x/y/")])
                 self.assertGreaterEqual(self.homed(), 1, "registry_projects found the registry without the lib")
-                self.calls.clear()
-                before = dt.datetime.now(UTC)
-                until = pr.mark_cloud_exhausted("weekly limit")
-                self.assertGreaterEqual(self.homed(), 1, "mark_cloud_exhausted built its path without the lib")
-                expected = before + dt.timedelta(hours=24)
-                self.assertLessEqual(abs((self.text.parse_iso(until) - expected).total_seconds()), 5, until)
-                with open(os.path.join(home, ".claude", "harness", "budgets.json"), encoding="utf-8") as fh:
-                    self.assertEqual(json.load(fh)["cloud"], {"exhausted_until": until, "reason": "weekly limit"})
                 repo = object.__new__(pr.Repo)
                 repo.key = "0123456789ab"
                 self.calls.clear()
-                self.assertEqual(repo.state("ultra", "9.json"), os.path.join(
-                    home, ".claude", "harness", "repos", "0123456789ab", "ultra", "9.json"))
+                self.assertEqual(repo.state("tickets", "9.json"), os.path.join(
+                    home, ".claude", "harness", "repos", "0123456789ab", "tickets", "9.json"))
                 self.assertGreaterEqual(self.homed(), 1, "Repo.state built the path without the lib")
 
     def test_pr_shortens_text_and_tool_failures_through_the_lib_one_line(self):
@@ -3172,14 +3059,13 @@ class ToolsWithoutTheLib(unittest.TestCase):
 class RoutingEnvironmentDoesNotLeak(unittest.TestCase):
     """#243: tests whose expected route comes from the ticket's labels or a missing settings file pass however the
     developer's shell sets the routing variables. Each runs in a child `python3 -m unittest` with every routing
-    variable exported to a value that changes its outcome (the labels give sonnet; ultrareview is on by default)."""
+    variable exported to a value that changes its outcome (the labels give sonnet)."""
 
     # One value per routing variable that differs from what the labels and the defaults give these tests.
     EXPORTED = {"HARNESS_CODE_TIER": "opus", "HARNESS_CODE_EFFORT": "xhigh", "HARNESS_REVIEW_TIER": "opus",
-                "HARNESS_ULTRAREVIEW": "off", "HARNESS_WAVE_REVIEW": "opus"}
+                "HARNESS_WAVE_REVIEW": "opus"}
     SENSITIVE = (
         "test_harness_lib_cli.ToolsRunTheLib.test_board_stamps_a_fetched_ticket_through_the_lib_now_iso",
-        "test_harness_lib_cli.ToolsRunTheLib.test_pr_writes_the_ultrareview_output_through_write_text",
     )
 
     def test_routing_sensitive_tests_pass_with_the_routing_variables_exported(self):
