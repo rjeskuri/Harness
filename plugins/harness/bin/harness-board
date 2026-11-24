@@ -10,7 +10,7 @@ Usage:
     harness-board epic create --title T --body-file F [--size S|M|L] [--risk low|high] [--proposed]
     harness-board task create --title T --body-file F [--parent N] [--type task|bug|chore|refactor|ops]
                               [--size S|M|L] [--risk low|high] [--blocked-by N[,N]]
-                              [--no-tests] [--needs-local] [--priority] [--proposed]
+                              [--no-tests] [--needs-local] [--priority] [--proposed] [--label NAME ...]
     harness-board show N [--markdown]
     harness-board retype N --type task|bug|chore|refactor --reason TEXT   # an ops ticket that needs code after all
     harness-board ready
@@ -784,6 +784,7 @@ def cmd_task_create(repo, args):
     labels = [args.type, initial_status(args)] + ([f"size:{args.size}"] if args.size else []) \
         + ([f"risk:{args.risk}"] if args.risk else []) + (["no-tests"] if args.no_tests else []) \
         + (["needs-local"] if needs_local else []) + (["priority:high"] if args.priority else [])
+    labels += [name for name in dict.fromkeys(args.label) if name not in labels]
     number, url = create_issue(repo, args.title, path, stdin, labels, args.priority, args.proposed)
     result = {"number": number, "url": url, "parent": args.parent, "linked": None, "blocked_by": []}
 
@@ -1367,6 +1368,8 @@ def parser():
     tc.add_argument("--needs-local", action="store_true", help="needs this Mac's files or credentials")
     tc.add_argument("--priority", action="store_true", help="label priority:high (and Priority High on the board)")
     tc.add_argument("--proposed", action="store_true", help="label status:proposed in place of status:ready")
+    tc.add_argument("--label", action="append", default=[], metavar="NAME",
+                    help="a further label the issue is created with (repeatable; e.g. manual-land)")
 
     show = sub.add_parser("show", parents=[common], help="fetch a ticket, write its cache, print it")
     show.add_argument("number", type=issue_number, metavar="N")
