@@ -10,10 +10,12 @@ the files mutated are `.py` files and files whose first line is a python3 sheban
 its code through its own real path imports the mutant; the checkout is never written and every copy is removed.
 
 A file's tests: `--tests` (test module file names in plugins/harness/tests, or repo-relative globs), else the
-`HARNESS_TEST_MAP` entries its path matches plus `test_<name>.py` beside it for `lib/harness_lib/<name>.py`,
-`hooks/<name>.py` and `bin/harness-<name>`. Each test set runs once unmutated first; a failing baseline stops the
-run with exit 2. A mutant whose tests fail, or run past 10 times the baseline (at least 2 s), is killed. Exit 0
-when nothing survived, 3 when a mutant did.
+`HARNESS_TEST_MAP` entries its path matches plus, for `lib/harness_lib/<name>.py`, `hooks/<name>.py` and
+`bin/harness-<name>`, the `test_*.py` beside it that harness-red's name rule gives (a subject that is a `_`-token
+suffix of the path or a directory name: `test_<name>.py`, `test_harness_lib_<name>.py`, `test_harness_lib.py`,
+`test_hooks.py`) and the split suites `test_<suffix>_*.py` of those suffixes. Each test set runs once unmutated
+first; a failing baseline stops the run with exit 2. A mutant whose tests fail, or run past 10 times the baseline
+(at least 2 s), is killed. Exit 0 when nothing survived, 3 when a mutant did, 1 on a bad invocation.
 """
 from __future__ import annotations
 
@@ -219,6 +221,20 @@ def find_tests(root: str, pattern: str) -> set[str]:
     return {os.path.relpath(p, root).replace(os.sep, "/") for p in glob.glob(full, recursive=True) if p.endswith(".py")}
 
 
+def normalise(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def name_keys(rel: str) -> tuple[set[str], set[str]]:
+    """harness-red's name rule, mirrored: the test subjects that name rel (each `_`-token suffix of its normalised
+    path without the extension, and each directory's normalised name), and the suffixes alone, whose split suites
+    `test_<suffix>_*.py` name it too."""
+    *dirs, base = rel.split("/")
+    tokens = normalise("/".join(dirs + [os.path.splitext(base)[0]])).split("_")
+    suffixes = {"_".join(tokens[i:]) for i in range(len(tokens))} - {""}
+    return suffixes | ({normalise(d) for d in dirs} - {""}), suffixes
+
+
 def tests_for(root: str, rel: str, patterns: list[str] | None) -> tuple:
     if patterns:
         return tuple(sorted(set().union(*(find_tests(root, p) for p in patterns))))
@@ -229,8 +245,11 @@ def tests_for(root: str, rel: str, patterns: list[str] | None) -> tuple:
             found |= find_tests(root, tests.strip())
     match = CONVENTION.match(rel)
     if match:
-        name = (match.group("lib") or match.group("hook") or match.group("tool")).replace("-", "_")
-        found |= find_tests(root, f"{match.group('base')}tests/test_{name}.py")
+        names, suffixes = name_keys(rel)
+        for test in find_tests(root, f"{match.group('base')}tests/test_*.py"):
+            subject = normalise(test.rsplit("/", 1)[-1][len("test_"):-len(".py")])
+            if subject in names or any(subject.startswith(key + "_") for key in suffixes):
+                found.add(test)
     return tuple(sorted(found))
 
 
@@ -392,8 +411,16 @@ def run(args: argparse.Namespace) -> int:
     return 3 if result["survived"] else 0
 
 
+class Parser(argparse.ArgumentParser):
+    """A usage error exits 1 like every other bad invocation, not argparse's 2 (a failing baseline)."""
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="mutate.py", description=__doc__.split("\n\n")[0])
+    parser = Parser(prog="mutate.py", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     cmd = sub.add_parser("run", help="mutate the files and run their tests against each mutant")
     cmd.add_argument("paths", nargs="*", metavar="PATH")
