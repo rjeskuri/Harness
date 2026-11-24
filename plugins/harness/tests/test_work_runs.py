@@ -1271,6 +1271,69 @@ class EndedEarly(WorkTest):
         self.assertEqual([row["number"] for row in data["plan"]], [23, 26])
         self.assertEqual(data["skipped"], [])
 
+    def test_a_run_that_ended_at_ready_on_a_manual_land_ticket_is_finished_and_not_run_again(self):
+        # #451: a manual-land ticket is landed only by the owner (/harness:land), so the loop's turn ends after
+        # `harness-pr ready`, the ticket in review with its ready PR open. That run ended normally: the sweep closes
+        # its record `ok`, a bg session that ended its turn (blocked, idle or done) stopped as any finished ticket's,
+        # and dispatch never runs the ticket again, nor one whose run an earlier sweep closed `early`. Each has a
+        # twin without the label, in review with its own ready PR: before its land (#422), it ends early and goes
+        # again, or, idle, stays a live run.
+        manual = IN_REVIEW + ("manual-land",)
+        cases = {   # n: (bg id, `claude agents` state; None, None: a headless run that exited), labels, ready PR
+            70: (None, None, manual, 170),
+            71: (None, None, IN_REVIEW, 171),
+            72: ("s-ml72", "blocked", manual, 172),
+            73: ("s-ml73", "blocked", IN_REVIEW, 173),
+            74: ("s-ml74", "done", manual, 174),
+            75: ("s-ml75", "done", IN_REVIEW, 175),
+            76: ("s-ml76", "idle", manual, 176),
+            77: ("s-ml77", "idle", IN_REVIEW, 177),
+        }
+        swept = {   # n: (outcome, state shown); None: the record stays open
+            70: ("ok", "ended ok"), 71: ("early", "ended before landing (PR #171)"),
+            72: ("ok", "ended ok"), 73: ("early", "ended before landing (PR #173)"),
+            74: ("ok", "ended ok"), 75: ("early", "ended before landing (PR #175)"),
+            76: ("ok", "ended ok"), 77: None,
+        }
+        for n, (bg_id, *_rest) in cases.items():
+            if bg_id is None:
+                self.ended_run(n, ROUND2_RESULT)
+        agents = self.bg_runs({n: c[:2] for n, c in cases.items() if c[0]})
+        # closed `early` by an earlier sweep, an hour ago, each in review with its ready PR; only #79 lacks the label
+        earlier = {78: (manual, 178), 79: (IN_REVIEW, 179)}
+        for n, (_labels, pr) in earlier.items():
+            self.write_run(n, venue="bg", bg_id=f"s-old{n}", log=None, started_at=iso_ago(hours=3),
+                           ended_at=iso_ago(hours=1), outcome="early", ready_pr=pr)
+        board = {n: (c[2], ready_pr(c[3]), ready_pr(c[3])) for n, c in cases.items()}
+        board.update({n: (labels, ready_pr(pr), ready_pr(pr)) for n, (labels, pr) in earlier.items()})
+        self.write_scenario(board)
+        env = self.env(FAKECLAUDE_AGENTS=agents)
+
+        p = self.work("runs", "--sweep", "--json", env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rows = {r["ticket"]: r for r in json.loads(p.stdout)}
+        saved = {r["ticket"]: r for r in self.run_records()}
+        for n, want in swept.items():
+            with self.subTest(ticket=n, state=cases[n][1] or "headless exited", labels=cases[n][2]):
+                if want is None:
+                    self.assertIsNone(saved[n]["ended_at"], saved[n])
+                    continue
+                self.assertTrue(saved[n]["ended_at"], saved[n])
+                self.assertEqual((saved[n]["outcome"], rows[n]["outcome"], rows[n]["state"]), (want[0], *want),
+                                 rows[n])
+                self.assertEqual(saved[n].get("ready_pr"), cases[n][3] if want[0] == "early" else None, saved[n])
+        stopped = [arg for call in self.claude_calls() if call["argv"][:1] == ["stop"]
+                   for arg in call["argv"][1:] if not arg.startswith("-")]
+        with self.subTest("stopped"):
+            for bg_id in ("s-ml72", "s-ml76"):              # a live state, the turn over: stopped, once
+                self.assertEqual(stopped.count(bg_id), 1, (bg_id, p.stdout + p.stderr))
+            self.assertNotIn("s-ml77", stopped)
+
+        with self.subTest("dispatch"):
+            data = self.ok_json("dispatch", "--dry-run", "--max", "10", "--json", env=env)
+            self.assertEqual(sorted(row["number"] for row in data["plan"]), [71, 73, 75, 79], data)
+            self.assertEqual(data["skipped"], [])
+
     def test_dispatch_asks_gh_about_a_freshly_ended_draft_run_once(self):
         # The draft case of the gh-once guarantee: #10 and #11 in progress with only a draft PR each (#43, #44),
         # #7 with no PR, #8 with a ready PR. One dispatch sweeps all four (early, early, early, ok) and redispatches
