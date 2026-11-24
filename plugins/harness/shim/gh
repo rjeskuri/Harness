@@ -2,9 +2,10 @@
 """The gh shim: logs the gh calls no harness tool makes (an agent's own `gh` in Bash, a poller).
 
 session_brief.py puts this folder first on PATH for a session's Bash calls. The shim runs the first
-executable `gh` on PATH whose folder (real path) is not its own, with its arguments unchanged and
-stdin, stdout and stderr inherited, waits, and exits with that gh's exit code (128+N for a gh killed
-by signal N). With no other gh on PATH: one line on stderr, exit 127. After the call it appends one
+executable `gh` on PATH that is not a harness gh shim (its folder's real path is not its own, and its
+first bytes do not hold this docstring's first words: another checkout's shim, which would run this
+one again, is skipped too), with its arguments unchanged and stdin, stdout and stderr inherited,
+waits, and exits with that gh's exit code (128+N for a gh killed by signal N). With no other gh on PATH: one line on stderr, exit 127. After the call it appends one
 line through harness_lib.ghlimit.log_call with tool "agent", unless HARNESS_GH_LOGGED is set and not
 empty (a harness tool's runner, which logs the call itself). A lib that cannot be loaded or a log
 that cannot be written is skipped silently: the call's output and exit never change. The lib is
@@ -22,14 +23,28 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
+# The words of this file's second line, which every shim since #448 carries (an older one too): a candidate gh
+# whose first bytes hold them is a shim. Do not reword that line.
+MARKER = b"The gh shim: logs the gh calls"
+
+
+def is_shim(exe: str) -> bool:
+    """True when exe is a harness gh shim: its first 256 bytes hold MARKER (a read error counts as no)."""
+    try:
+        with open(exe, "rb") as f:
+            return MARKER in f.read(256)
+    except OSError:
+        return False
 
 
 def real_gh() -> str | None:
-    """The first executable gh on PATH outside the shim's own folder (compared by real path)."""
+    """The first executable gh on PATH that is not a harness shim: not in the shim's own folder (compared by
+    real path) and not marked as a shim (another checkout's copy)."""
     for folder in os.environ.get("PATH", os.defpath).split(os.pathsep):
         folder = folder or os.curdir
         exe = os.path.join(folder, "gh")
-        if os.path.isfile(exe) and os.access(exe, os.X_OK) and os.path.realpath(folder) != HERE:
+        if (os.path.isfile(exe) and os.access(exe, os.X_OK) and os.path.realpath(folder) != HERE
+                and not is_shim(exe)):
             return exe
     return None
 
