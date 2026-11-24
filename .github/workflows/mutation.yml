@@ -1,0 +1,105 @@
+name: Mutation
+
+# Monthly and by hand, on main's default branch. Never on a pull request or a push: a run takes hours and only
+# reports, it blocks nothing (docs/design.md, "Mutation runner"; docs/research/mutation-testing.md, option (c)).
+# One shard per run keeps it under the job limit: the schedule takes the shard from the month number, a manual
+# dispatch from its `shard` input (auto does what the schedule does).
+on:
+  schedule:
+    - cron: "17 3 1 * *"
+  workflow_dispatch:
+    inputs:
+      shard:
+        description: "What this run mutates (auto: the shard for this month)"
+        type: choice
+        default: auto
+        options:
+          - auto
+          - hooks-1
+          - hooks-2
+          - lib-1
+          - lib-2
+          - bin-1
+          - bin-2
+          - bin-3
+          - bin-4
+
+concurrency:
+  group: mutation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mutate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v7
+      - name: Pick the shard
+        id: shard
+        env:
+          SHARD_INPUT: ${{ inputs.shard }}
+        run: |
+          shard="$SHARD_INPUT"
+          if [ -z "$shard" ] || [ "$shard" = auto ]; then
+            set -- hooks-1 hooks-2 lib-1 lib-2 bin-1 bin-2 bin-3 bin-4
+            shift $(( (10#$(date -u +%m) - 1) % 8 ))
+            shard="$1"
+          fi
+          echo "shard=$shard" >> "$GITHUB_OUTPUT"
+      - name: Mutate the shard
+        env:
+          SHARD: ${{ steps.shard.outputs.shard }}
+        run: |
+          p=plugins/harness
+          case "$SHARD" in
+            hooks-1) set -- "$p"/hooks/b*.py ;;
+            hooks-2) set -- "$p"/hooks/[!b]*.py ;;
+            lib-1) set -- "$p"/lib/harness_lib/[a-o]*.py ;;
+            lib-2) set -- "$p"/lib/harness_lib/[p-z_]*.py ;;
+            bin-1) set -- "$p"/bin/harness-work ;;
+            bin-2) set -- "$p"/bin/harness-pr ;;
+            bin-3) set -- "$p"/bin/harness-board "$p"/bin/harness-scaffold "$p"/bin/harness-red ;;
+            bin-4) set -- $(ls "$p"/bin/harness-* | grep -v -e '/harness-work$' -e '/harness-pr$' -e '/harness-board$' -e '/harness-scaffold$' -e '/harness-red$') ;;
+            *) echo "unknown shard: $SHARD"; exit 1 ;;
+          esac
+          echo "shard $SHARD: $*"
+          status=0
+          python3 scripts/mutate.py run "$@" --json > mutation.json || status=$?
+          # 3 means survivors were found: that is the report, not a failure
+          if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then exit "$status"; fi
+      - name: Write the text report
+        run: |
+          python3 - "$SHARD" <<'PY' > mutation.txt
+          import json, sys
+          data = json.load(open("mutation.json"))
+          print("shard %s: %d killed (%d timed out), %d survived" % (sys.argv[1], data["killed"], data["timed_out"], data["survived"]))
+          print()
+          print("Survivors")
+          for s in data["survivors"]:
+              print("  %s:%d in %s: %s" % (s["path"], s["line"], s["function"], s["change"]))
+          print()
+          print("Functions where no mutant was killed (for the dead-code scan, not test gaps)")
+          for f in data["files"]:
+              for name, c in sorted(f["functions"].items()):
+                  if c["survived"] and not c["killed"]:
+                      print("  %s %s: %d survived" % (f["path"], name, c["survived"]))
+          print()
+          print("Per file")
+          for f in data["files"]:
+              print("  %s: %d killed, %d survived" % (f["path"], f["killed"], f["survived"]))
+          PY
+          cat mutation.txt
+        env:
+          SHARD: ${{ steps.shard.outputs.shard }}
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-${{ steps.shard.outputs.shard }}
+          path: |
+            mutation.json
+            mutation.txt
+          if-no-files-found: ignore

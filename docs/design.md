@@ -40,6 +40,7 @@ Harness/
   scripts/loop_smoke.py                 the loop smoke run's check and reset on the harness-sandbox clone (see Canary)
   scripts/collect_lines.py              the lines the suite and a loop smoke run, for the dead-code scanner (see Canary)
   scripts/mutate.py                     the dev-only mutation runner (see Mutation runner)
+  .github/workflows/mutation.yml        the monthly report-only mutation run on main (see Mutation runner)
   docs/design.md docs/guide.md docs/verification.md docs/research/
 ```
 
@@ -693,6 +694,14 @@ Line collection for the dead-code scanner (#474, `docs/research/dead-code-agent.
 - Workers: `--workers` (default the cores) copies of the tree in temporary directories (`cp -c` on macOS, a plain copy elsewhere; `.git` and `.claude/worktrees` left out), each removed at the end, so `realpath(__file__)` finds the mutant and the checkout is never written. A copy runs one mutant at a time, writes it, runs its tests and restores the file; every write gets a fresh mtime so a cached `.pyc` never stands in for it.
 - A baseline of each test set runs first; one failing stops the run with exit 2 before any mutant. A mutant is killed when its tests fail or run past 10 times their baseline (at least 2 s; the process group is killed), and survives when they pass.
 - Report: killed, survived and timed out per file and per function, and each survivor's path, line, change and function; `--json` prints `{"killed", "survived", "timed_out", "files": [{"path", "killed", "survived", "timed_out", "functions": {name: counts}}], "survivors": [{"path", "line", "change", "function"}]}`. Exit 0 when nothing survived, 3 when something did, 2 on a failing baseline, 1 on a bad invocation.
+
+### Monthly report (#476)
+
+`.github/workflows/mutation.yml`: on `schedule` (`17 3 1 * *`, 03:17 UTC on the 1st of each month) and `workflow_dispatch`, never on a pull request or a push. It runs on `ubuntu-latest` (Harness is public, so hosted minutes are free) with `permissions: contents: read`, no secret, one job with `timeout-minutes: 345` (under the 6-hour limit), concurrency group `mutation` without cancelling a run in progress.
+- Shards: all of hooks/, lib/ and bin/ is about 8,000 sites, about 8 hours on 8 cores and about twice that on the 4 cores a hosted runner has, so a run mutates one of eight shards: `hooks-1` (`hooks/b*.py`: branch_guard, backup_gate), `hooks-2` (the other hooks), `lib-1` (`harness_lib/[a-o]*.py`), `lib-2` (`harness_lib/[p-z_]*.py`), `bin-1` (harness-work), `bin-2` (harness-pr), `bin-3` (harness-board, harness-scaffold, harness-red), `bin-4` (the other bin tools). The shards are globs, so a new file lands in one of them. The schedule, and a dispatch whose `shard` input is `auto` (the default), pick the shard from the UTC month number (`(month - 1) mod 8`, in the order above), so one cycle takes eight months; a dispatch with a named shard runs that one, which is how to go faster or to re-run one. The sizes are estimates: a shard that hits the timeout is cancelled with no report, and the fix is to split it.
+- The report: the step runs `python3 scripts/mutate.py run <shard files> --json > mutation.json`; exit 3 (survivors) is the report, not a failure, any other non-zero exit fails the job. A second step writes `mutation.txt` from the JSON (survivors, the unreached list below, a per-file tally), and the last step, `if: always()`, uploads both as the artifact `mutation-<shard>`. Read it with `gh run list --workflow mutation.yml` and `gh run download <run-id>`.
+- Triage, by a person or a session the owner starts, never by the loop: a survivor becomes a `status:proposed` ticket under a standing epic only when it changes what a hook allows or denies, or what a data-destroying tool removes. Equivalent mutants and defensive guards (inputs no caller passes) are dismissed, as epic #374 says. Nothing goes to the test-author automatically and nothing blocks a ticket.
+- Sites no test reaches are not tickets. The runner has no coverage step, so such a site simply survives; the report lists apart every function whose mutants all survived (`killed` 0 and `survived` above 0 in the file's `functions` entry), for the dead-code scan (#453).
 
 ## Daily use
 
