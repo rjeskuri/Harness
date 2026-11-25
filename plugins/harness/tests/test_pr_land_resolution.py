@@ -61,7 +61,7 @@ class LandResolution(LandBase):
 
     def land(self, fx, **scenario):
         self.scenario(self.resolution_calls(fx, **scenario))
-        return self.ok("land", str(fx["pr"]), "--yes", cwd=self.main, stubs=False)
+        return self.ok("land", str(fx["pr"]), cwd=self.main, stubs=False)
 
     def posted(self, number=None):
         """(index in the gh log, issue number, body) of every comment posted: `gh issue comment N`, `gh issue close
@@ -595,7 +595,7 @@ class LandResolution(LandBase):
         no comment at all on the ticket, since `Landed in` alone would keep a resume from adding the Resolution,
         and land fails naming the step. A second land on the merged PR posts one Resolution, then `Landed in`."""
         self.scenario(self.resolution_calls(FIXTURE_A, after={"stderr": "GraphQL: something\n", "exit": 1}))
-        p = self.pr("land", "34", "--yes", cwd=self.main, stubs=False)
+        p = self.pr("land", "34", cwd=self.main, stubs=False)
         self.assertOneLineError(p, "PR #34 is merged", "#12", "gh pr view 34", "GraphQL: something")
         self.assertRegex(p.stderr, r"(?i)\bresolution\b", "the error names the step that failed: the Resolution")
         argv = self.gh_argv()

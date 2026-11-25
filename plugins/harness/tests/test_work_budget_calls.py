@@ -61,7 +61,7 @@ FAKEGH = os.path.join(HERE, "fakegh.py")
 DESIGN = os.path.join(os.path.dirname(os.path.dirname(PLUGIN)), "docs", "design.md")
 UTC = dt.timezone.utc
 STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-KEYS = {"since", "until", "hours", "total", "graphql", "rest", "points", "refused", "failed", "waited_seconds",
+REPORT_FIELDS = {"since", "until", "hours", "total", "graphql", "rest", "points", "refused", "failed", "waited_seconds",
         "peak_minute", "by_tool", "by_command", "by_ticket", "by_hour", "github"}
 ACTIONS = "api repos/:owner/:repo/actions/runs"
 
@@ -201,7 +201,7 @@ class CallsTest(unittest.TestCase):
         """`budget calls <args> --json`, checked for shape and a window that ends at the pinned clock."""
         data = json.loads(self.ok("budget", "calls", *args, "--json").stdout)
         self.assertIsInstance(data, dict)
-        self.assertEqual(set(data), KEYS, data)
+        self.assertEqual(set(data), REPORT_FIELDS, data)
         for key in ("since", "until"):
             self.assertRegex(data[key], STAMP)
         self.assertEqual(data["until"], stamp(self.clock), data)

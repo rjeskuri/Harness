@@ -70,12 +70,6 @@ def global_store():
     return Path(harness_home("backups"))
 
 
-def store_dir(main):
-    """Where a snapshot of `main`'s project (the main checkout, or None) goes: <git common dir>/harness-backups/
-    when the project has any sensitive pattern, else ~/.claude/harness/backups/."""
-    return _store(main, sensitive_patterns(main))
-
-
 def _store(main, pats):
     if main and pats:
         common = _common_dir(main)
@@ -596,7 +590,7 @@ def restore(main, snapshot_id, *, only=None, to=None, force=False, cwd=None, com
     the items at or under it. `only` and `to` are taken from `cwd` (default: the process's). Every target is checked
     before anything is written; an existing one refuses the restore unless `force`, which first snapshots the
     existing targets with the snapshot's repo: into its project store when the snapshot sat in one, else into the
-    store that repo's snapshots go to now (store_dir). The manifest's refs come back too (not with `only`), checked
+    store that repo's snapshots go to now (_store). The manifest's refs come back too (not with `only`), checked
     with the items and never touching a working tree (_ref_plan, _restore_refs); `force` replaces items only, never
     a branch. `progress(kind, value)` hears ("saved", that snapshot's manifest), ("restored", target) and ("ref",
     a line) as each happens. Returns {id, restored, replaced, saved, refs}."""

@@ -14,7 +14,7 @@ Usage:
     harness-pr comments P [--since ISO] [--unresolved] [--json]
     harness-pr learn [--since ISO] [--json] | learn --mark
     harness-pr awaiting [--all-projects] [--json]
-    harness-pr land P [--yes] [--discard] [--accept-findings] [--catch-up [--rounds 3] [--timeout 420]]
+    harness-pr land P [--discard] [--accept-findings] [--catch-up [--rounds 3] [--timeout 420]]
     harness-pr gate P [--json]
     harness-pr revert P|SHA [--reason TEXT] [--evidence-file F] [--json]
 
@@ -2556,7 +2556,6 @@ def parser():
 
     ld = sub.add_parser("land", help="squash-merge, remove the worktree and branch, update main, close the ticket")
     ld.add_argument("number", type=number_arg, metavar="P")
-    ld.add_argument("--yes", action="store_true", help="accepted and ignored (the land skill confirms)")
     ld.add_argument("--discard", action="store_true", help="remove the worktree even with uncommitted changes")
     ld.add_argument("--accept-findings", action="store_true",
                     help="land even though the latest harness review has high or medium findings at the head")

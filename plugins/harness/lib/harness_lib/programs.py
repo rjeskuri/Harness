@@ -76,8 +76,6 @@ BUN_SUBCOMMANDS = set(
     "add build create i init install link outdated patch pm publish remove repl run test uninstall unlink "
     "update upgrade x".split()
 )
-# Modules of the standard library that run a program file or a module they are given.
-FILE_RUNNERS = {"pdb", "cProfile", "profile", "trace", "doctest"}
 # Python 3.10 lists the standard library itself; before that, what a loop is likely to run.
 STDLIB = frozenset(
     "__future__ abc argparse ast asyncio base64 collections compileall cProfile csv dataclasses datetime "

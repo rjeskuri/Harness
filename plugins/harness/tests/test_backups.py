@@ -721,7 +721,6 @@ class Stores(BackupTest):
         mine = sorted([".claude/worktrees/*/inner/**", "*.pem", "secrets/**"])
         with self.lib() as backups:
             self.assertEqual(sorted(backups.sensitive_patterns(main)), mine)
-            self.assertEqual(real(backups.store_dir(main)), real(store))
         with self.lib({"HARNESS_SENSITIVE_PATHS": "extra/**"}) as backups:
             self.assertEqual(sorted(backups.sensitive_patterns(main)), sorted(mine + ["extra/**"]))
 
@@ -837,8 +836,13 @@ class Stores(BackupTest):
         plain = self.make_repo("plain")
         with self.lib() as backups:
             self.assertEqual(backups.sensitive_patterns(plain), [])
-            self.assertEqual(real(backups.store_dir(plain)), real(self.global_store()))
-            self.assertEqual(real(backups.store_dir(None)), real(self.global_store()))
+        for path, owner in ((os.path.join(plain, "p.txt"), plain), (os.path.join(self.mk("no-repo"), "l.txt"), None)):
+            data = self.put(path)
+            m = self.create([path], main=owner, cwd=os.path.dirname(path))
+            self.assertFalse(m["sensitive"], path)
+            self.assertTrue(os.path.isfile(os.path.join(self.global_store(), m["id"], "manifest.json")), path)
+            self.assertTrue(holds(os.path.join(self.global_store(), m["id"]), data), path)
+        self.assertFalse(os.path.lexists(self.project_store(plain)))
 
     def test_force_snapshot_follows_the_projects_marking_now(self):
         """PR #333 review: restore --force stores what it replaces where the project's snapshots go now (its own

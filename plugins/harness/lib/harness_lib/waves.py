@@ -196,10 +196,3 @@ def wave_state(wave, statuses):
 def wave_marker(wave_id):
     """The HTML comment a wave review's PR comment carries: <!-- harness-wave-review <id> -->."""
     return f"<!-- harness-wave-review {wave_id} -->"
-
-
-def has_wave_review(reviews, wave_id):
-    """Whether any review dict's `body` contains the wave's marker."""
-    marker = wave_marker(wave_id)
-    return any(isinstance(r, dict) and isinstance(r.get("body"), str) and marker in r["body"]
-               for r in reviews or ())

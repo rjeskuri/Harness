@@ -45,7 +45,7 @@ PLUGIN = TESTS.parent
 LIB = PLUGIN / "lib"
 ROUTING_PY = LIB / "harness_lib" / "routing.py"
 
-KEYS = (
+SETTINGS = (  # the four routing settings load_routing reads
     "HARNESS_CODE_TIER",
     "HARNESS_CODE_EFFORT",
     "HARNESS_REVIEW_TIER",
@@ -116,7 +116,7 @@ class RoutingCase(unittest.TestCase):
         patcher = mock.patch.dict(os.environ)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for key in KEYS + RETIRED:
+        for key in SETTINGS + RETIRED:
             os.environ.pop(key, None)
         self.routing = load_routing_module()
 
@@ -539,7 +539,7 @@ class LoadRouting(RoutingCase):
 
     def test_null_list_object_and_bool_values_in_the_file_count_as_unset(self):
         for value in (None, ["opus"], {"tier": "opus"}, True, False):
-            for key in KEYS:
+            for key in SETTINGS:
                 with self.subTest(key=key, value=value):
                     self.write_settings({key: value})
                     self.assertEqual(self.load(), DEFAULTS)
@@ -827,7 +827,6 @@ class Module(RoutingCase):
     def test_constants(self):
         self.assertEqual(self.routing.TIERS, TIERS)
         self.assertEqual(self.routing.EFFORTS, EFFORTS)
-        self.assertEqual(self.routing.KEYS, KEYS)
         self.assertEqual(self.routing.WAVE_EFFORT, "xhigh")
 
     def test_imports_only_the_standard_library_and_harness_lib(self):
@@ -869,7 +868,7 @@ class Module(RoutingCase):
             "HARNESS_REVIEW_TIER": TIERS,
             "HARNESS_WAVE_REVIEW": TIERS + ("off",),
         }
-        for key in KEYS:
+        for key in SETTINGS:
             with self.subTest(setting=key):
                 rows = [ln for ln in lines if ln.lstrip().startswith("| `%s` |" % key)]
                 self.assertEqual(len(rows), 1, "want one Settings-table row for %s, found %d" % (key, len(rows)))

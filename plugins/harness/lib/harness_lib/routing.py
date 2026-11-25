@@ -15,12 +15,6 @@ from harness_lib.settings import setting, settings_env
 
 TIERS = ("sonnet", "opus", "fable")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
-KEYS = (
-    "HARNESS_CODE_TIER",
-    "HARNESS_CODE_EFFORT",
-    "HARNESS_REVIEW_TIER",
-    "HARNESS_WAVE_REVIEW",
-)
 WAVE_EFFORT = "xhigh"
 REVIEW_FABLE_EFFORT = "xhigh"
 LABEL_EFFORT = "xhigh"  # size:L or risk:high, a risk:high review, and an escalation from opus
