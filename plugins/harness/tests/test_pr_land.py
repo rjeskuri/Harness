@@ -189,7 +189,7 @@ class BranchHistory:
 class Land(LandBase):
     def test_land_merges_then_cleans_up_in_order(self):
         self.scenario(self.land_calls(views=[land_view(mergeable="UNKNOWN"), land_view()]))
-        p = self.ok("land", "34", "--yes", cwd=self.wt)
+        p = self.ok("land", "34", cwd=self.wt)
         m = self.main
         steps = [self.position("gh pr merge 34 -R o/r --squash --delete-branch"),
                  self.position(f"git -C {m} worktree remove {self.wt}"),
@@ -228,7 +228,7 @@ class Land(LandBase):
         self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}},
                         "harness-work": {"dispatch --after": {"stdout": said}}})
         self.scenario(self.land_calls())
-        p = self.ok("land", "34", "--yes", cwd=self.wt)       # from the worktree the land removes
+        p = self.ok("land", "34", cwd=self.wt)       # from the worktree the land removes
         self.assertFalse(os.path.exists(self.wt))
         self.assertDispatchedOnce(12)
         # after the ticket steps, the last thing the land runs
@@ -275,7 +275,7 @@ class Land(LandBase):
                 self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}},
                                 "harness-work": {"dispatch --after": answer}})
                 self.scenario(self.land_calls())
-                p = self.ok("land", "34", "--yes", cwd=self.main)
+                p = self.ok("land", "34", cwd=self.main)
                 self.assertDispatchedOnce(12)
                 tail = self.dispatch_tail(p.stdout)
                 self.assertRegex(tail, r"#12\b", p.stdout)
@@ -288,7 +288,7 @@ class Land(LandBase):
                         "harness-work": {"dispatch --after": {"exit": 3, "stdout": "half done\n",
                                                               "stderr": "no capacity left\nsecond line\n"}}})
         self.scenario(self.land_calls())
-        p = self.ok("land", "34", "--yes", cwd=self.wt)
+        p = self.ok("land", "34", cwd=self.wt)
         self.assertDispatchedOnce(12)
         said = [line for line in p.stderr.splitlines() if "dispatch after" in line]
         self.assertEqual(said, ["harness-pr: warning: dispatch after #12: no capacity left"], p.stderr)
@@ -299,7 +299,7 @@ class Land(LandBase):
         self.outputs(**{"harness-board": {"epic-check": {"stdout": "#3: 1 of 2 tasks closed; left open\n"}},
                         "harness-work": {"dispatch --after": {"exit": 7}}})
         self.scenario(self.land_calls())
-        p = self.ok("land", "34", "--yes", cwd=self.main)
+        p = self.ok("land", "34", cwd=self.main)
         self.assertEqual([line for line in p.stderr.splitlines() if "dispatch after" in line],
                          ["harness-pr: warning: dispatch after #12: exit 7"], p.stderr)
 
@@ -1388,7 +1388,7 @@ class OpenNotes(RowsInProcess, CopiedWorktree, WorktreeTest):
             body = text + "\n\n" + section.rstrip("\n") + "\n"
         self.assertEqual(body.count("## Notes\n"), 1)
         self.scenario(self.resolution_calls(dict(fx, body=body)))
-        self.ok("land", str(fx["pr"]), "--yes", cwd=self.main, stubs=False)
+        self.ok("land", str(fx["pr"]), cwd=self.main, stubs=False)
         found = self.resolutions()
         self.assertEqual(len(found), 1, f"want one Resolution comment, got {len(found)}: {self.posted()}")
         return found[0][2]
@@ -1446,7 +1446,7 @@ class OpenNotes(RowsInProcess, CopiedWorktree, WorktreeTest):
 
     def test_resolution_without_notes_has_no_notes(self):
         self.scenario(self.resolution_calls(FIXTURE_A))
-        self.ok("land", "34", "--yes", cwd=self.main, stubs=False)
+        self.ok("land", "34", cwd=self.main, stubs=False)
         found = self.resolutions()
         self.assertEqual(len(found), 1)
         self.assertNotIn("Notes", found[0][2])

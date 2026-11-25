@@ -80,7 +80,7 @@ def dedent(text: str) -> str:
 
 
 def last(name: str) -> str:
-    """The definition's own name: the last part of `Class.method`, `harness_lib.mod.NAME` or `land --yes`."""
+    """The definition's own name: the last part of `Class.method`, `harness_lib.mod.NAME` or `land --dry-run`."""
     return re.split(r"[\s.:]+", name.strip())[-1]
 
 
@@ -515,7 +515,7 @@ class KeepComment(ScanCase):
                 sub = ap.add_subparsers(dest="cmd")
                 sub.required = True
                 ld = sub.add_parser("land")
-                ld.add_argument("--yes", action="store_true")  # deadcode: keep (old sessions still pass it)
+                ld.add_argument("--legacy", action="store_true")  # deadcode: keep (old sessions still pass it)
                 # deadcode: keep (the owner's muscle memory)
                 ld.add_argument("--force", action="store_true")
                 ld.add_argument("--quiet", action="store_true")
@@ -655,7 +655,7 @@ class SubcommandsAndFlags(ScanCase):
                 sub.required = True
                 ld = sub.add_parser("land", help="land a PR")
                 ld.add_argument("number", type=int)
-                ld.add_argument("--yes", action="store_true", help="accepted and ignored")
+                ld.add_argument("--ignored", action="store_true", help="accepted and ignored")
                 ld.add_argument("--dry-run", action="store_true")
                 ld.add_argument("--max-rounds", dest="rounds", type=int, default=3)
                 args = ap.parse_args()
@@ -710,7 +710,7 @@ class SubcommandsAndFlags(ScanCase):
             BIN + "harness-work": work,
             BIN + "harness-runner": runner,
             P + "skills/land/SKILL.md": "---\nname: land\n---\nRun `harness-pr land P --dry-run`, then harness-runner and harness-board.\n",
-            T + "test_pr.py": "import unittest\n\nARGS = ['land', '34', '--yes']\n",
+            T + "test_pr.py": "import unittest\n\nARGS = ['land', '34', '--ignored']\n",
             "docs/design.md": dedent('''
                 # Harness design
 
@@ -718,7 +718,7 @@ class SubcommandsAndFlags(ScanCase):
 
                 ### harness-pr
 
-                - `land P [--yes] [--dry-run]`: lands the PR.
+                - `land P [--ignored] [--dry-run]`: lands the PR.
 
                 ### harness-runner
 
@@ -728,10 +728,10 @@ class SubcommandsAndFlags(ScanCase):
         out = self.scan(self.tree(files))
         # The one candidate: a flag parsed and never read. --dry-run is read; --max-rounds is read through its dest.
         self.assertEqual(len(out["candidates"]), 1, out["candidates"])
-        yes = out["candidates"][0]
-        self.assertEqual((yes["path"], yes["kind"], last(yes["name"])), (BIN + "harness-pr", "flag", "--yes"))
-        self.assertEqual(yes["refs"], "test+contract")
-        self.assertEqual(yes["tests"], [T + "test_pr.py"])
+        dead = out["candidates"][0]
+        self.assertEqual((dead["path"], dead["kind"], last(dead["name"])), (BIN + "harness-pr", "flag", "--ignored"))
+        self.assertEqual(dead["refs"], "test+contract")
+        self.assertEqual(dead["tests"], [T + "test_pr.py"])
         # The owner's typed surface: reported as having no caller, never a candidate.
         for path, kind, name in ((BIN + "harness-board", "subcommand", "orphan"),
                                  (BIN + "harness-board", "flag", "--lonely"),
@@ -853,25 +853,9 @@ class Lines(ScanCase):
 # ====================================================================== today's Harness
 class RealTree(ScanCase):
     def test_todays_harness(self):
-        """The note's five measured dead candidates, and none of its false positives."""
+        """None of the research note's false positives on the real tree, and no test file or wired hook proposed."""
         out = self.scan(ROOT)
         cands = out["candidates"]
-        file_runners = "FILE_" + "RUNNERS"  # spelled apart so this test file does not reference it
-        expected = (  # path, name, kind, refs, a test file that must be listed
-            (LIB + "programs.py", file_runners, "constant", "none", None),
-            (LIB + "backups.py", "store_dir", "function", "test+contract", T + "test_backups.py"),
-            (LIB + "routing.py", "KEYS", "constant", "test+contract", T + "test_harness_lib_routing.py"),
-            (LIB + "waves.py", "has_wave_review", "function", "test+contract", T + "test_harness_lib_waves.py"),
-            (BIN + "harness-pr", "--yes", "flag", "test+contract", T + "test_pr_land.py"),
-        )
-        for path, name, kind, refs, test in expected:
-            c = self.one(out, path, name)
-            self.assertEqual((c["kind"], c["refs"]), (kind, refs), c)
-            if test is None:
-                self.assertEqual(c["tests"], [], c)
-            else:
-                self.assertIn(test, c["tests"], c)
-
         with open(os.path.join(ROOT, HOOKS, "hooks.json"), encoding="utf-8") as fh:
             wired = set(re.findall(r"hooks/([a-z_]+\.py)", fh.read()))
         bins = set(os.listdir(os.path.join(ROOT, BIN)))

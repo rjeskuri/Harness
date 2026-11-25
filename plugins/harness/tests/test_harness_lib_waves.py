@@ -12,7 +12,7 @@ A wave is the set of tickets one `harness-work dispatch` launched. Its record li
 - ticket_statuses(key, tickets) from repos/<key>/tickets/<n>.json's `status`; progress(wave, statuses):
   in-review and closed are done, anything else (no cache included) waits; complete when the wave has
   tickets and none waits. wave_state: empty, working, due, reviewing, reviewed.
-- drop_ticket moves a ticket from `tickets` to `dropped`; wave_marker / has_wave_review agree on
+- drop_ticket moves a ticket from `tickets` to `dropped`; wave_marker writes
   `<!-- harness-wave-review <id> -->`.
 
 Every fixture is written here, in a temporary HOME. Expected values are computed here from the schema
@@ -67,7 +67,7 @@ UTC = dt.timezone.utc
 STATUSES = ("ready", "in-progress", "in-review", "blocked", "needs-input", "closed", None)
 DONE_STATUSES = ("in-review", "closed")
 PUBLIC = ("waves_dir", "wave_path", "create_wave", "load_wave", "load_waves", "save_wave", "wave_of",
-          "ticket_statuses", "progress", "wave_state", "drop_ticket", "wave_marker", "has_wave_review")
+          "ticket_statuses", "progress", "wave_state", "drop_ticket", "wave_marker")
 
 
 def load_waves_module() -> types.ModuleType:
@@ -616,40 +616,11 @@ class WaveState(Base):
 
 # =============================================================== marker
 class Marker(Base):
-    def test_marker_and_has_wave_review(self):
+    def test_wave_marker(self):
         ids = ["w20261022140859", "w20261022140859-2", "w20270101000000-10", "w19991231235959"]
         for ident in ids:
             with self.subTest(ident=ident):
                 self.assertEqual(self.w.wave_marker(ident), marker(ident))
-
-        base, second = "w20261022140859", "w20261022140859-2"
-        reviews = [
-            {"body": "Looks fine.", "state": "COMMENTED", "author": {"login": "rjeskuri"}},
-            {"body": None, "state": "APPROVED"},
-            {"state": "COMMENTED"},
-            {"body": f"## Wave review\n\nFindings below.\n\n{marker(second)}\n", "state": "COMMENTED"},
-        ]
-        self.assertTrue(self.w.has_wave_review(reviews, second))
-        self.assertFalse(self.w.has_wave_review(reviews, base))           # -2's marker is not the base's
-        self.assertFalse(self.w.has_wave_review(reviews, "w20261022140859-20"))
-        self.assertFalse(self.w.has_wave_review([], base))
-        self.assertFalse(self.w.has_wave_review(reviews[:3], second))
-
-        with_base = reviews + [{"body": f"prefix {marker(base)} suffix", "state": "COMMENTED"}]
-        self.assertTrue(self.w.has_wave_review(with_base, base))
-        self.assertTrue(self.w.has_wave_review(with_base, second))
-        self.assertFalse(self.w.has_wave_review([{"body": f"prefix {marker(base)} suffix"}], second))
-
-        # what wave_marker writes, has_wave_review finds, for each id and only that id
-        for ident in ids:
-            body = f"Wave {ident} review.\n{self.w.wave_marker(ident)}"
-            for other in ids:
-                with self.subTest(ident=ident, other=other):
-                    self.assertEqual(self.w.has_wave_review([{"body": body}], other), other == ident)
-        # the id alone, or a near-miss spelling, is not the marker
-        self.assertFalse(self.w.has_wave_review([{"body": f"reviewed {base}"}], base))
-        self.assertFalse(self.w.has_wave_review([{"body": f"<!-- harness-wave-review {base}-->"}], base))
-        self.assertFalse(self.w.has_wave_review([{"body": f"<!-- harness-review {base} -->"}], base))
 
 
 # =============================================================== drop_ticket

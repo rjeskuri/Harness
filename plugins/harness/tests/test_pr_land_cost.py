@@ -67,7 +67,7 @@ class LandCost(WorktreeTest):
     def land(self, fx, tickets, cwd=None, flags=(), **scenario):
         self.fresh_worktree()
         self.scenario(self.cost_calls(fx, tickets, **scenario))
-        p = self.pr("land", str(fx["pr"]), "--yes", *flags, cwd=cwd or self.main)
+        p = self.pr("land", str(fx["pr"]), *flags, cwd=cwd or self.main)
         self.assertNotIn("Traceback", p.stderr)
         return p
 
@@ -139,7 +139,7 @@ class LandCost(WorktreeTest):
         path = os.pathsep.join([BINS["stubbin"], nowork, "/usr/bin", "/bin"])
         self.fresh_worktree()
         self.scenario(self.cost_calls(fx, tickets))
-        p = subprocess.run([sys.executable, os.path.join(bindir, "harness-pr"), "land", str(fx["pr"]), "--yes"],
+        p = subprocess.run([sys.executable, os.path.join(bindir, "harness-pr"), "land", str(fx["pr"])],
                            cwd=self.main, env=self.env(PATH=path), capture_output=True, text=True, timeout=120)
         self.assertNotIn("Traceback", p.stderr)
         return p
@@ -207,7 +207,7 @@ class LandCost(WorktreeTest):
             self.costs({n: {"stdout": cost_block(n, fx["pr"]) + "\n", "read_stdin": seen} for n in tickets})
             self.fresh_worktree()
             self.scenario(self.cost_calls(fx, tickets))
-            p = subprocess.run([sys.executable, TOOL, "land", pr, "--yes"], cwd=self.main, env=self.env(),
+            p = subprocess.run([sys.executable, TOOL, "land", pr], cwd=self.main, env=self.env(),
                                input="typed at the land\n", capture_output=True, text=True, timeout=120)
             self.assertNotIn("Traceback", p.stderr)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
@@ -284,7 +284,7 @@ class LandCost(WorktreeTest):
             path = os.pathsep.join([broken, BINS["stubbin"], BINS["fakebin"], "/usr/bin", "/bin"])
             self.fresh_worktree()
             self.scenario(self.cost_calls(fx, tickets))
-            p = self.pr("land", str(fx["pr"]), "--yes", cwd=self.main, PATH=path)
+            p = self.pr("land", str(fx["pr"]), cwd=self.main, PATH=path)
             self.assertNotIn("Traceback", p.stderr)
             self.assertEqual(p.returncode, before.returncode, p.stdout + p.stderr)
             self.assertEqual(self.without_dispatch_block(p.stdout), self.without_dispatch_block(before.stdout))
