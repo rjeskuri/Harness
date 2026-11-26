@@ -695,6 +695,16 @@ exit 254
         with open(counter) as fh:
             self.assertEqual(fh.read().splitlines(), ["run", "run", "run"])
 
+    def test_explicit_runner_config_disables_reuse(self):
+        self.put("tests/test_calc.py", TEST_ADD)
+        counter = os.path.join(self.tmp, "config-counter")
+        command = f"echo run >> {shlex.quote(counter)}; python3 -c 'raise AssertionError(1)'"
+        for flags in [(), ("--reuse",)]:
+            run = self.red("check", *flags, HARNESS_TEST_CMD=command)
+            self.assertEqual(run.returncode, 0, run.stderr)
+        with open(counter) as fh:
+            self.assertEqual(fh.read().splitlines(), ["run", "run"])
+
     def test_green_refused_but_recorded(self):
         self.put("tests/test_sub.py", TEST_SUB)
         p = self.red("check")

@@ -70,9 +70,7 @@ def include(name, patterns):
     path = Path(name)
     parts = [p.lower() for p in path.parts]
     if (secret(name) or set(parts) & PRIVATE or any(ord(c) < 32 for c in name)
-            or (PRIVATE_NAME.search(path.stem.lower()) and
-                (path.suffix.lower() in {".yaml", ".yml", ".toml", ".json", ".ini", ".cfg", ".xml"}
-                 or PRIVATE_NAME.fullmatch(path.stem.lower()))) or path.name.lower() in {".envrc", "kubeconfig"}):
+            or PRIVATE_NAME.search(path.stem.lower()) or path.name.lower() in {".envrc", "kubeconfig"}):
         return False
     if any(glob_match(pattern, parent.as_posix()) for pattern in patterns for parent in (path, *path.parents)):
         return False
@@ -159,7 +157,7 @@ def ask(mode, folder, prompt, conversation=False, resume=None):
         schema.write_text(json.dumps(SCHEMA))
         args.extend(["--output-schema", str(schema)])
     proc = subprocess.run(args + ["-"], input=prompt, cwd=folder, text=True, stdout=subprocess.PIPE if conversation else subprocess.DEVNULL,
-                          stderr=subprocess.PIPE, timeout=960 if mode == "check" else 480)
+                          stderr=subprocess.PIPE, timeout=420 if mode == "check" else 480)
     if proc.returncode or not output.is_file() or not output.read_text().strip():
         # Codex diagnostics can include the entire prompt. Do not replay them into ticket logs.
         raise ValueError(f"Codex {model} returned no usable answer (exit {proc.returncode}); check Codex login/model access")

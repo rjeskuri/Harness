@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
+from unittest.mock import patch
 import shlex
 from pathlib import Path
 import subprocess
@@ -62,6 +64,27 @@ pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[],"prior_fixed
         self.assertFalse(any(".env" in x or "credentials" in x or "service-account" in x or "secrets.yaml" in x or "private.py" in x for x in call["files"]))
         self.assertIn("gpt-6-astra", call["args"])
         self.assertIn("never", call["args"])
+
+    def test_snapshot_rejects_credential_documents_before_reading_blobs(self):
+        module = runpy.run_path(str(TOOL))
+        original = module["git"]
+        forbidden = set()
+        names = ["prod-credentials.md", "service-account-prod-us.yaml"]
+        for name in names:
+            (self.repo / name).write_text("test fixture for " + name)
+            self.git("add", name)
+            forbidden.add(self.git("rev-parse", ":" + name))
+        self.git("commit", "-qm", "credential filename fixtures")
+
+        def traced(repo, *argv):
+            if argv[:2] == ("cat-file", "blob"):
+                self.assertNotIn(argv[2], forbidden)
+            return original(repo, *argv)
+
+        with patch.dict(module["snapshot"].__globals__, git=traced):
+            files, _ = module["snapshot"](self.repo, self.git("rev-parse", "HEAD"), self.root / "copy", [])
+        self.assertIn("app.py", files)
+        self.assertTrue(set(names).isdisjoint(files))
 
     def test_architect_for_a_new_directory(self):
         p = self.call("architect", "--repo", str(self.root / "future"), "--brief", "Python task tracker")

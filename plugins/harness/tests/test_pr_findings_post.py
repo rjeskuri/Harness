@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import stat
 import subprocess
@@ -539,6 +540,12 @@ class Post(PostTest):
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(len(self.posts()), 1)
         self.assertTrue(json.loads(first.stdout)["blocking"])
+        scenario = json.loads(Path(self.scenario_path).read_text())
+        posted_body = json.loads(self.posts()[0]["stdin"])["body"]
+        scenario["calls"].append({"match": ["api", "--paginate", "repos/o/r/pulls/34/reviews"],
+                                  "stdout_json": [{"id": 55, "body": posted_body, "commit_id": first_head,
+                                                   "submitted_at": "2026-01-01T00:00:00Z"}]})
+        self.scenario(scenario["calls"])
         retry = self.pr(*args, "--head", self.head())
         self.assertEqual(retry.returncode, 0, retry.stderr)
         self.assertEqual(len(self.posts()), 1)
@@ -548,6 +555,26 @@ class Post(PostTest):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(json.loads(second.stdout)["record"], {"stage": "fix", "result": "pass"})
         self.assertEqual(len(self.posts()), 2)
+
+    def test_unresolved_finding_survives_a_rename(self):
+        self.open_pr(34)
+        exe = os.path.join(BINS["fakebin"], "harness-gpt")
+        self.addCleanup(lambda: os.path.exists(exe) and os.unlink(exe))
+        executable(exe, f"#!{sys.executable}\nimport json, sys\n"
+                        "prior = json.load(sys.stdin)['prior_blockers']\n"
+                        "print(json.dumps(dict(head=sys.argv[sys.argv.index('--head')+1], model='gpt-6.2-sol', "
+                        "prior_fixed=[False]*len(prior), findings=[])))\n")
+        old, new = "tests/test_app.py", "tests/test_renamed.py"
+        finding = {"path": old, "line": 2, "severity": "medium", "body": "assertion is unconditional"}
+        args = ["findings", "12", "--worktree", self.wt, "--gpt-check", "--json"]
+        first = self.pr(*args, "--head", self.head(), "--review", self.review_file([finding]))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.git(self.wt, "mv", old, new)
+        self.git(self.wt, "commit", "-qm", "rename")
+        self.open_pr(34)
+        second = self.pr(*args, "--head", self.head())
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout)["blocking"], [dict(finding, path=new)])
 
     def test_ticket_secrets_rejected_before_encoding(self):
         ticket = epic_ticket(12, self.EPIC)

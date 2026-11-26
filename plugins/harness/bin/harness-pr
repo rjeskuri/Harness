@@ -1011,7 +1011,7 @@ def record_findings(args, repo=None):
         raise Problem("the reviewed head or working tree changed; review the clean pushed head again")
     fork = merge_base(repo.root)
     model, checked = args.model, DEFAULT_CHECKED
-    reviewers = []
+    reviewers, unresolved = [], []
     if args.gpt_check:
         branch = TICKET_BRANCH.match(current_branch(repo.root) or "")
         if not args.head or not branch or int(branch.group(1)) != number:
@@ -1024,11 +1024,15 @@ def record_findings(args, repo=None):
         receipt = read_json(receipt_path)
         previous = latest_round(repo.key, number)
         recovering = isinstance(receipt, dict)
-        if recovering and receipt.get("posted") and previous and previous.get("head") != head:
-            # The branch has returned to a previously reviewed SHA after a later review.
-            recovering = False
+        if recovering:
+            current = latest_harness_review(api_list(repo, f"repos/{repo.slug()}/pulls/{pr}/reviews"))
+            if current and current.get("commit_id") == head and receipt["marker"] in current["body"]:
+                receipt.update(posted=True, review_id=current.get("id"))
+            else:
+                receipt.update(posted=False, review_id=None)
         if recovering:
             findings, reviewers = receipt["findings"], receipt["reviewers"]
+            unresolved = receipt.get("unresolved", [])
         else:
             if not args.review and not (previous and previous.get("head") != head):
                 raise Problem("a first review requires the Claude findings file; check --latest before retrying")
@@ -1051,7 +1055,7 @@ def record_findings(args, repo=None):
                     if base_covered and git(repo.root, "merge-base", "--is-ancestor", prior, head).returncode == 0:
                         review_base = prior
             reply = tool("harness-gpt", ["check", "--head", head, "--base", review_base, "--brief-stdin"],
-                         repo.root, stdin=json.dumps(brief), timeout=1080)
+                         repo.root, stdin=json.dumps(brief), timeout=540)
             try:
                 report = json.loads(reply.stdout)
                 if report["head"] != head or report["model"] != "gpt-6.2-sol" or not isinstance(report["findings"], list):
@@ -1061,14 +1065,21 @@ def record_findings(args, repo=None):
                 if (not isinstance(fixed, list) or len(fixed) != len(prior_blockers)
                         or any(type(value) is not bool for value in fixed)):
                     raise ValueError()
-                findings.extend(f for f, resolved in zip(prior_blockers, fixed) if not resolved and f not in findings)
+                unresolved = [dict(f) for f, resolved in zip(prior_blockers, fixed) if not resolved]
+                if unresolved and review_base != fork:
+                    fields = nul_fields(git_ok(repo.root, "diff", "--find-renames", "--name-status", "--diff-filter=R",
+                                               "-z", review_base, head))
+                    renames = dict(zip(fields[1::3], fields[2::3]))
+                    for f in unresolved:
+                        f["path"] = renames.get(f["path"], f["path"])
+                findings.extend(f for f in unresolved if f not in findings)
                 for f in report["findings"]:
                     if f not in findings:
                         findings.append(f)
             except (KeyError, TypeError, ValueError):
                 raise Problem("GPT check did not return findings for the requested head") from None
             reviewers = ([args.model] if args.review else []) + [report["model"]]
-            receipt = {"findings": findings, "reviewers": reviewers,
+            receipt = {"findings": findings, "reviewers": reviewers, "unresolved": unresolved,
                        "marker": f"<!-- harness-gpt-{uuid.uuid4()} -->"}
             write_json(receipt_path, receipt, prefix=".gpt-")
         model = " + ".join(reviewers)
@@ -1076,6 +1087,10 @@ def record_findings(args, repo=None):
         if git_ok(repo.root, "rev-parse", "HEAD").strip() != head or dirty_files(repo.root):
             raise Problem("the reviewed head or working tree changed during the GPT check")
     blocking, low, outside = split_findings(findings, touched_files(repo.root, fork))
+    for f in unresolved:
+        if f in outside:
+            outside.remove(f)
+            blocking.append(f)
     pr = branch_pr(repo, number, head)                 # refuses before anything is posted or recorded
     if args.gpt_check and pr != expected_pr:
         raise Problem("the open PR changed during the GPT check")
@@ -1087,11 +1102,6 @@ def record_findings(args, repo=None):
     review_id = None
     inline, off = [], []
     if args.gpt_check:
-        if recovering and not receipt.get("posted"):
-            for row in api_list(repo, f"repos/{repo.slug()}/pulls/{pr}/reviews"):
-                if row.get("commit_id") == head and receipt["marker"] in (row.get("body") or ""):
-                    receipt.update(posted=True, review_id=row.get("id"))
-                    break
         if receipt.get("posted"):
             review_id = receipt.get("review_id")
         else:

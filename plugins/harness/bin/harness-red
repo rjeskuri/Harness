@@ -586,7 +586,7 @@ def run_red(repo, args, tests, run_files, cwd, again):
 def save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output, kind=None, reuse_eligible=False):
     """Write the side file, then the record, of this run; print it. Returns its kind."""
     kind = kind or kind_of(code, output)
-    record = {"reuse_eligible": reuse_eligible, "branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
+    record = {"reuse_eligible": "test-only-v2" if reuse_eligible else None, "branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
               "test_hash": tests_hash(contents), "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),
               "at": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
     save_red_files(repo.record_path, contents)       # first: a record never names files the side file lacks
@@ -675,13 +675,14 @@ def cmd_check(repo, args):
     if reuse_eligible:
         # Alternate/ignored runner configuration can affect results without appearing in changed paths.
         command = repo.test_command(run_files, repo.top)
-        uses_config = re.search(r"(?:^|\s)(?:-c|--config(?:-file)?)(?:=|\s|$)", command)
+        uses_config = bool(os.environ.get("PYTEST_ADDOPTS")) or any(
+            word.startswith(("-c", "--config")) for word in shlex.split(command))
         ignored_config = git(repo.top, "ls-files", "--others", "--ignored", "--exclude-standard", "--", *TEST_CONFIG)
         reuse_eligible = not uses_config and not ignored_config.stdout
     if args.reuse and reuse_eligible:
         record = read_json(repo.record_path)
         if (isinstance(record, dict) and record.get("kind") in ("assertion", "import", "error")
-                and record.get("reuse_eligible") is True
+                and record.get("reuse_eligible") == "test-only-v2"
                 and record.get("branch") == repo.branch and record.get("base_sha") == merge_base
                 and record.get("test_files") == tests and record.get("run_files") == run_files
                 and record.get("test_hash") == tests_hash(contents)
