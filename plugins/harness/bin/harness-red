@@ -68,7 +68,7 @@ try:
     from harness_lib.redproof import read_files, record_current, save_red_files, tests_hash
     from harness_lib.repo import NotARepository, RepoError, repo_facts
     from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
-    from harness_lib.settings import other_project, project_setting
+    from harness_lib.settings import TEST_CONFIG, other_project, project_setting
     from harness_lib.settings import DEFAULT_TEST_PATTERNS as TEST_PATTERNS  # also read by tests/test_red.py
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT as SOURCE_EXEMPT  # also read by tests/test_red.py
     from harness_lib.cli import Parser, Problem, run_main, warn  # Problem also caught by tests/test_red.py
@@ -672,6 +672,12 @@ def cmd_check(repo, args):
     run_files = runnable(tests)
     contents = read_files(repo.top, tests)         # the bytes the run proves, hashed and kept beside the record
     reuse_eligible = all(repo.classify(p) == "test" for p in changed) and not deleted_tests(repo, changed)
+    if reuse_eligible:
+        # Alternate/ignored runner configuration can affect results without appearing in changed paths.
+        command = repo.test_command(run_files, repo.top)
+        uses_config = re.search(r"(?:^|\s)(?:-c|--config(?:-file)?)(?:=|\s|$)", command)
+        ignored_config = git(repo.top, "ls-files", "--others", "--ignored", "--exclude-standard", "--", *TEST_CONFIG)
+        reuse_eligible = not uses_config and not ignored_config.stdout
     if args.reuse and reuse_eligible:
         record = read_json(repo.record_path)
         if (isinstance(record, dict) and record.get("kind") in ("assertion", "import", "error")

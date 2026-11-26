@@ -30,7 +30,7 @@ PRIVATE = {"data", "backups", "credentials", "secrets", ".ssh", ".aws", ".codex"
 # Ignore credential documents before asking Git for their contents.
 PRIVATE_NAME = re.compile(
     r"(?:^|[-_.])(?:credentials?|secrets?|service[-_]?account|api[-_]?keys?|access[-_]?tokens?|"
-    r"private[-_]?keys?)(?:$|[-_.](?:prod|production|dev|test|staging|local|backup)$)"
+    r"private[-_]?keys?)(?=$|[-_.])"
 )
 EXTENSIONS = set("py js ts tsx jsx mjs cjs rb go rs c h cpp hpp cs java kt kts swift scala php sh bash zsh "
                  "sql md rst yaml yml toml css scss html vue svelte lua dart ex exs tf proto gradle xml".split())
@@ -42,16 +42,20 @@ PROMPTS = {
                    "trigger, impact and a targeted fix. Separate refinements from bugs. State the areas examined "
                    "and coverage gaps. Report when no actionable bug is found.",
     "check": "Independently review the entire patch in changes.diff, using source/ for surrounding code. "
-             "Check requirements, regressions, logic and tests. Check prior blockers against this revision. "
+             "Check requirements, regressions, logic and tests. Verify prior blockers against this revision. "
+             "For each new finding identify the changed line and a realistic user-visible failure in this patch. "
+             "Keep speculative hardening and unrelated pre-existing problems out of the ticket findings. "
              "Return up to ten concrete findings, each with repo-relative path, line, severity and actionable body. "
-             "Use an empty array only after completing the review."
+             "For every prior blocker in the supplied order, put true in prior_fixed only when fixed, otherwise false. "
+             "Return only new issues in findings. Use an empty array only after completing the review."
 }
 FINDING = {"type": "object", "additionalProperties": False, "required": ["path", "line", "severity", "body"],
            "properties": {"path": {"type": "string"}, "line": {"type": "integer", "minimum": 1},
                           "severity": {"type": "string", "enum": ["high", "medium", "low"]},
                           "body": {"type": "string"}}}
-SCHEMA = {"type": "object", "additionalProperties": False, "required": ["findings"],
-          "properties": {"findings": {"type": "array", "items": FINDING}}}
+SCHEMA = {"type": "object", "additionalProperties": False, "required": ["findings", "prior_fixed"],
+          "properties": {"findings": {"type": "array", "items": FINDING},
+                         "prior_fixed": {"type": "array", "items": {"type": "boolean"}}}}
 
 
 def git(repo, *args):
@@ -66,7 +70,9 @@ def include(name, patterns):
     path = Path(name)
     parts = [p.lower() for p in path.parts]
     if (secret(name) or set(parts) & PRIVATE or any(ord(c) < 32 for c in name)
-            or PRIVATE_NAME.search(path.stem.lower()) or path.name.lower() in {".envrc", "kubeconfig"}):
+            or (PRIVATE_NAME.search(path.stem.lower()) and
+                (path.suffix.lower() in {".yaml", ".yml", ".toml", ".json", ".ini", ".cfg", ".xml"}
+                 or PRIVATE_NAME.fullmatch(path.stem.lower()))) or path.name.lower() in {".envrc", "kubeconfig"}):
         return False
     if any(glob_match(pattern, parent.as_posix()) for pattern in patterns for parent in (path, *path.parents)):
         return False
@@ -114,7 +120,9 @@ def snapshot(repo, sha, folder, patterns, wanted=None):
 
 
 def changed_inputs(repo, base, head, allowed, patterns, folder):
-    names = {os.fsdecode(n) for n in git(repo, "diff", "--no-ext-diff", "--no-renames", "--name-only",
+    diff_args = ("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=none",
+                 "--submodule=short", "--text", "--no-color")
+    names = {os.fsdecode(n) for n in git(repo, *diff_args, "--name-only",
                                          "-z", base, head, "--").split(b"\0") if n}
     with tempfile.TemporaryDirectory() as tmp:
         old = Path(tmp)
@@ -124,8 +132,7 @@ def changed_inputs(repo, base, head, allowed, patterns, folder):
             raise ValueError("the patch contains excluded or unreadable files; GPT check incomplete")
         # Both sides of every changed path passed the filter. Ask Git to preserve file modes,
         # line endings and missing-final-newline markers in the patch the reviewer reads.
-        patch = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color",
-                    "--ignore-submodules=none", "--src-prefix=a/", "--dst-prefix=b/", base, head, "--")
+        patch = git(repo, *diff_args, "--src-prefix=a/", "--dst-prefix=b/", base, head, "--")
         (folder / "changes.diff").write_bytes(patch)
     return names
 
@@ -206,7 +213,7 @@ def chat(session):
 
 def open_terminal(folder, session, workspace):
     command = "cd " + shlex.quote(str(folder)) + " && exec " + shlex.join(
-        [sys.executable, str(Path(__file__).resolve()), "_chat", session])
+        ["env", "TMPDIR=" + str(folder.parent), sys.executable, str(Path(__file__).resolve()), "_chat", session])
     argv = ["cmux", "new-split", "right", "--workspace", workspace, "--focus", "false"]
     if os.environ.get("CMUX_SURFACE_ID"):
         argv.extend(["--surface", os.environ["CMUX_SURFACE_ID"]])
@@ -270,7 +277,10 @@ def run(args):
                     or type(f.get("line")) is not int or f["line"] < 1 or not isinstance(f.get("body"), str)
                     or not f["body"].strip() or f.get("severity") not in ("high", "medium", "low")):
                 raise ValueError("invalid GPT finding")
-        return json.dumps({"head": head, "model": SOL, "findings": rows})
+        prior_fixed = result.get("prior_fixed")
+        if not isinstance(prior_fixed, list) or any(type(fixed) is not bool for fixed in prior_fixed):
+            raise ValueError("missing prior blocker dispositions")
+        return json.dumps({"head": head, "model": SOL, "findings": rows, "prior_fixed": prior_fixed})
     finally:
         if not terminal_owns_folder:
             shutil.rmtree(folder)

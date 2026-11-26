@@ -32,12 +32,12 @@ if (root / "changes.diff").exists():
 pathlib.Path(__file__).with_name("call.json").write_text(json.dumps(receipt))
 if "--json" in args:
     print(json.dumps({"type": "thread.started", "thread_id": "550e8400-e29b-41d4-a716-446655440000"}))
-pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[]}' if "--output-schema" in args else "Architecture advice")
+pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[],"prior_fixed":[]}' if "--output-schema" in args else "Architecture advice")
 """)
         fake.chmod(0o755)
         self.env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"])
         self.git("init", "-q", "-b", "main")
-        for name in ("app.py", ".env", "credentials/example.py", "secrets.yaml", "aws-credentials.toml"):
+        for name in ("app.py", ".env", "credentials/example.py", "secrets.yaml", "aws-credentials.toml", "service-account-prod-us.yaml"):
             p = self.repo / name
             p.parent.mkdir(exist_ok=True)
             p.write_text("example = 1\n")
@@ -59,7 +59,7 @@ pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[]}' if "--outp
         self.assertEqual(p.returncode, 0, p.stderr)
         call = json.loads(self.log.read_text())
         self.assertIn("source/app.py", call["files"])
-        self.assertFalse(any(".env" in x or "credentials" in x or "secrets.yaml" in x or "private.py" in x for x in call["files"]))
+        self.assertFalse(any(".env" in x or "credentials" in x or "service-account" in x or "secrets.yaml" in x or "private.py" in x for x in call["files"]))
         self.assertIn("gpt-6-astra", call["args"])
         self.assertIn("never", call["args"])
 
@@ -83,7 +83,7 @@ pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[]}' if "--outp
         command = argv[argv.index("--command") + 1]
         self.assertNotIn("touch nope", command)
         folder = Path(shlex.split(command)[1])
-        reply = subprocess.run(["/bin/sh", "-c", command], env=self.env, input="What about storage?\n/exit\n",
+        reply = subprocess.run(["/bin/sh", "-c", command], env=dict(self.env, TMPDIR="/tmp"), input="What about storage?\n/exit\n",
                                capture_output=True, text=True)
         self.assertEqual(reply.returncode, 0, reply.stderr)
         call = json.loads(self.log.read_text())
@@ -105,6 +105,8 @@ pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[]}' if "--outp
         self.assertNotIn("source/app.py", json.loads(self.log.read_text())["files"])
 
     def test_check_preserves_missing_final_newline(self):
+        (self.repo / ".gitattributes").write_text("app.py -diff\n")
+        self.git("add", ".gitattributes")
         (self.repo / "app.py").write_bytes(b"first")
         self.git("commit", "-qam", "no final newline")
         base = self.git("rev-parse", "HEAD")

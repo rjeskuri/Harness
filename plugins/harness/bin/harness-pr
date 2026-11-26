@@ -1022,32 +1022,46 @@ def record_findings(args, repo=None):
         expected_pr = pr
         receipt_path = str(Path(reviews_dir(repo.key, number)) / f"gpt-{pr}-{head}.json")
         receipt = read_json(receipt_path)
+        previous = latest_round(repo.key, number)
         recovering = isinstance(receipt, dict)
+        if recovering and receipt.get("posted") and previous and previous.get("head") != head:
+            # The branch has returned to a previously reviewed SHA after a later review.
+            recovering = False
         if recovering:
             findings, reviewers = receipt["findings"], receipt["reviewers"]
         else:
-            previous = latest_round(repo.key, number)
             if not args.review and not (previous and previous.get("head") != head):
                 raise Problem("a first review requires the Claude findings file; check --latest before retrying")
             ticket = show_ticket(repo, number)
             sections = ticket.get("sections") or {}
             brief = {key: sections.get(key) for key in ("request", "definition_of_done", "tests")}
-            brief["prior_blockers"] = previous.get("blocking", []) if previous else []
+            paired = previous and previous.get("reviewers")
+            if previous and not paired and not args.review:
+                raise Problem("previous review was local only; continue locally or obtain a fresh paired review")
+            brief["prior_blockers"] = previous.get("blocking", []) if paired else []
             raw = "\n".join(flatten_brief(brief))
             if any(pattern.search(raw) for _, pattern in COMPILED):
                 raise Problem("ticket context contains a secret-shaped value; GPT check incomplete")
             review_base = fork
-            if previous:
+            if paired:
                 prior = previous.get("head") or ""
-                if re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", prior) and prior != head and git(
-                        repo.root, "merge-base", "--is-ancestor", prior, head).returncode == 0:
-                    review_base = prior
+                if re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", prior) and prior != head:
+                    base_covered = previous.get("fork") == fork or git(
+                        repo.root, "merge-base", "--is-ancestor", fork, prior).returncode == 0
+                    if base_covered and git(repo.root, "merge-base", "--is-ancestor", prior, head).returncode == 0:
+                        review_base = prior
             reply = tool("harness-gpt", ["check", "--head", head, "--base", review_base, "--brief-stdin"],
                          repo.root, stdin=json.dumps(brief), timeout=1080)
             try:
                 report = json.loads(reply.stdout)
                 if report["head"] != head or report["model"] != "gpt-6.2-sol" or not isinstance(report["findings"], list):
                     raise ValueError()
+                fixed = report["prior_fixed"]
+                prior_blockers = brief["prior_blockers"]
+                if (not isinstance(fixed, list) or len(fixed) != len(prior_blockers)
+                        or any(type(value) is not bool for value in fixed)):
+                    raise ValueError()
+                findings.extend(f for f, resolved in zip(prior_blockers, fixed) if not resolved and f not in findings)
                 for f in report["findings"]:
                     if f not in findings:
                         findings.append(f)
@@ -1093,7 +1107,7 @@ def record_findings(args, repo=None):
     base = earlier[-1].get("head") if earlier else fork
     rnd = save_round(key, number, {"at": now_iso(), "head": head, "base": base, "blocking": blocking, "low": low,
                                    "outside": outside, "pr": pr, "review_id": review_id,
-                                   **({"reviewers": reviewers} if reviewers else {})})
+                                   **({"reviewers": reviewers, "fork": fork} if reviewers else {})})
     k = rnd["round"]
     folder = reviews_dir(key, number)
     files = {"blocking": os.path.join(folder, f"round-{k}-blocking.json"),

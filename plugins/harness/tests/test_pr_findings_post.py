@@ -534,7 +534,7 @@ class Post(PostTest):
                         "head = sys.argv[sys.argv.index('--head') + 1]\n"
                         "brief = json.load(sys.stdin)\n"
                         f"if brief['prior_blockers']: assert sys.argv[sys.argv.index('--base') + 1] == {first_head!r}\n"
-                        "print(json.dumps(dict(head=head, model='gpt-6.2-sol', findings=[])))\n")
+                        "print(json.dumps(dict(head=head, model='gpt-6.2-sol', findings=[], prior_fixed=[True]*len(brief['prior_blockers']))))\n")
         first = self.pr(*args, *initial)
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(len(self.posts()), 1)
