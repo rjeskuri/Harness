@@ -537,12 +537,26 @@ class Post(PostTest):
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(len(self.posts()), 1)
         self.assertTrue(json.loads(first.stdout)["blocking"])
+        retry = self.pr(*args, "--head", self.head())
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(len(self.posts()), 1)
         self.commit("src/app.py", "fixed = True\n")
         self.open_pr(34)
         second = self.pr(*args, "--head", self.head())
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(json.loads(second.stdout)["record"], {"stage": "fix", "result": "pass"})
         self.assertEqual(len(self.posts()), 2)
+
+    def test_ticket_secrets_rejected_before_encoding(self):
+        ticket = epic_ticket(12, self.EPIC)
+        ticket["sections"]["tests"] = ['token = "' + "a" * 32 + '"']
+        self.board_conf(show={"12": ticket})
+        self.open_pr(34)
+        p = self.pr("findings", "12", "--worktree", self.wt, "--gpt-check", "--head", self.head(),
+                    "--review", self.review_file([]))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("secret-shaped", p.stderr)
+        self.assertEqual(self.posts(), [])
 
     def assertPosted(self, sent, findings, model, app_changes):
         """The POST payload for one round, derived: inline comments for the review findings on the diff, the rest

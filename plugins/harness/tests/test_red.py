@@ -34,7 +34,7 @@ BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
 TOOL = os.path.join(BIN, "harness-red")
 GIT = shutil.which("git")
 BRANCH, SLUG = "t/12-slug", "t-12-slug"
-RECORD_KEYS = {"branch", "base_sha", "test_files", "run_files", "test_hash", "cmd", "exit", "kind", "tail", "at"}
+RECORD_KEYS = {"reuse_eligible", "branch", "base_sha", "test_files", "run_files", "test_hash", "cmd", "exit", "kind", "tail", "at"}
 GREEN = "Tests pass before the implementation; they do not test this change."
 
 CALC = "def add(a, b):\n    return None\n\n\ndef sub(a, b):\n    return a - b\n"
@@ -690,8 +690,10 @@ exit 254
             self.assertEqual(run.returncode, 0, run.stderr)
         self.put("tests/test_extra.py", TEST_ADD)
         self.assertEqual(check("--reuse").returncode, 0)
+        self.put("pytest.ini", "[pytest]\n")
+        self.assertEqual(check("--reuse").returncode, 0)
         with open(counter) as fh:
-            self.assertEqual(fh.read().splitlines(), ["run", "run"])
+            self.assertEqual(fh.read().splitlines(), ["run", "run", "run"])
 
     def test_green_refused_but_recorded(self):
         self.put("tests/test_sub.py", TEST_SUB)

@@ -583,10 +583,10 @@ def run_red(repo, args, tests, run_files, cwd, again):
     return cmd, code, output
 
 
-def save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output, kind=None):
+def save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output, kind=None, reuse_eligible=False):
     """Write the side file, then the record, of this run; print it. Returns its kind."""
     kind = kind or kind_of(code, output)
-    record = {"branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
+    record = {"reuse_eligible": reuse_eligible, "branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
               "test_hash": tests_hash(contents), "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),
               "at": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
     save_red_files(repo.record_path, contents)       # first: a record never names files the side file lacks
@@ -671,9 +671,11 @@ def cmd_check(repo, args):
         return save_removed(repo, args, merge_base, changed)
     run_files = runnable(tests)
     contents = read_files(repo.top, tests)         # the bytes the run proves, hashed and kept beside the record
-    if args.reuse and not deleted_tests(repo, changed):
+    reuse_eligible = all(repo.classify(p) == "test" for p in changed) and not deleted_tests(repo, changed)
+    if args.reuse and reuse_eligible:
         record = read_json(repo.record_path)
         if (isinstance(record, dict) and record.get("kind") in ("assertion", "import", "error")
+                and record.get("reuse_eligible") is True
                 and record.get("branch") == repo.branch and record.get("base_sha") == merge_base
                 and record.get("test_files") == tests and record.get("run_files") == run_files
                 and record.get("test_hash") == tests_hash(contents)
@@ -684,7 +686,8 @@ def cmd_check(repo, args):
                 print(f"Reused red ({record['kind']}) at {record.get('at')}")
             return 0
     cmd, code, output = run_red(repo, args, tests, run_files, repo.top, "check")
-    if save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output) == "green":
+    if save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output,
+                   reuse_eligible=reuse_eligible) == "green":
         raise Problem(GREEN)
     return 0
 

@@ -27,6 +27,8 @@ import json, pathlib, sys
 args = sys.argv[1:]
 root = pathlib.Path.cwd()
 receipt = {"args": args, "input": sys.stdin.read(), "files": sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())}
+if (root / "changes.diff").exists():
+    receipt["patch"] = (root / "changes.diff").read_bytes().decode()
 pathlib.Path(__file__).with_name("call.json").write_text(json.dumps(receipt))
 if "--json" in args:
     print(json.dumps({"type": "thread.started", "thread_id": "550e8400-e29b-41d4-a716-446655440000"}))
@@ -35,7 +37,7 @@ pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[]}' if "--outp
         fake.chmod(0o755)
         self.env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"])
         self.git("init", "-q", "-b", "main")
-        for name in ("app.py", ".env", "credentials/example.py"):
+        for name in ("app.py", ".env", "credentials/example.py", "secrets.yaml", "aws-credentials.toml"):
             p = self.repo / name
             p.parent.mkdir(exist_ok=True)
             p.write_text("example = 1\n")
@@ -57,7 +59,7 @@ pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[]}' if "--outp
         self.assertEqual(p.returncode, 0, p.stderr)
         call = json.loads(self.log.read_text())
         self.assertIn("source/app.py", call["files"])
-        self.assertFalse(any(".env" in x or "credentials" in x or "private.py" in x for x in call["files"]))
+        self.assertFalse(any(".env" in x or "credentials" in x or "secrets.yaml" in x or "private.py" in x for x in call["files"]))
         self.assertIn("gpt-6-astra", call["args"])
         self.assertIn("never", call["args"])
 
@@ -90,6 +92,30 @@ pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[]}' if "--outp
         self.assertEqual(call["args"][call["args"].index("resume") + 1], "550e8400-e29b-41d4-a716-446655440000")
         self.assertEqual(call["input"], "What about storage?")
         self.assertFalse(folder.exists())
+
+    def test_committed_sensitive_rule_survives_worktree_edit(self):
+        settings = self.repo / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text(json.dumps({"env": {"HARNESS_SENSITIVE_PATHS": "app.py"}}))
+        self.git("add", ".claude/settings.json")
+        self.git("commit", "-qm", "protected source")
+        settings.write_text("{}")
+        p = self.call("repo-review")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("source/app.py", json.loads(self.log.read_text())["files"])
+
+    def test_check_preserves_missing_final_newline(self):
+        (self.repo / "app.py").write_bytes(b"first")
+        self.git("commit", "-qam", "no final newline")
+        base = self.git("rev-parse", "HEAD")
+        (self.repo / "app.py").write_bytes(b"second")
+        self.git("commit", "-qam", "change")
+        p = self.call("check", "--head", self.git("rev-parse", "HEAD"), "--base", base)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        patch = json.loads(self.log.read_text())["patch"]
+        self.assertIn("-first\n", patch)
+        self.assertIn("+second\n", patch)
+        self.assertEqual(patch.count("No newline at end of file"), 2)
 
     def test_check_uses_sol_and_refuses_unreviewable_change(self):
         (self.repo / "app.py").write_text("example = 2\n")
