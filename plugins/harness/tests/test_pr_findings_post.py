@@ -525,13 +525,15 @@ class Post(PostTest):
         exe = os.path.join(BINS["fakebin"], "harness-gpt")
         self.addCleanup(lambda: os.path.exists(exe) and os.unlink(exe))
         args = ["findings", "12", "--worktree", self.wt, "--gpt-check", "--json"]
-        initial = ["--head", self.head(), "--review", self.review_file(POST_R1[:1])]
+        first_head = self.head()
+        initial = ["--head", first_head, "--review", self.review_file(POST_R1[:1])]
         executable(exe, "#!/bin/sh\nexit 1\n")
         self.assertNotEqual(self.pr(*args, *initial).returncode, 0)
         self.assertEqual(self.posts(), [])
         executable(exe, f"#!{sys.executable}\nimport json, sys\n"
                         "head = sys.argv[sys.argv.index('--head') + 1]\n"
                         "brief = json.load(sys.stdin)\n"
+                        f"if brief['prior_blockers']: assert sys.argv[sys.argv.index('--base') + 1] == {first_head!r}\n"
                         "print(json.dumps(dict(head=head, model='gpt-6.2-sol', findings=[])))\n")
         first = self.pr(*args, *initial)
         self.assertEqual(first.returncode, 0, first.stderr)

@@ -112,6 +112,7 @@ try:
     from harness_lib.text import (as_list, first_line, harness_home, home, last_line, one_line, parse_iso, read_json,
                                   now_iso, read_text, write_json, write_text)
     from harness_lib.timeline import remember as remember_milestone
+    from harness_lib.secret_patterns import COMPILED
     from harness_lib.notify import notify
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
     from harness_lib.issues import Issues, Rest
@@ -1032,12 +1033,17 @@ def record_findings(args, repo=None):
             sections = ticket.get("sections") or {}
             brief = {key: sections.get(key) for key in ("request", "definition_of_done", "tests")}
             brief["prior_blockers"] = previous.get("blocking", []) if previous else []
-            from harness_lib.secret_patterns import COMPILED
             raw = "\n".join(flatten_brief(brief))
             if any(pattern.search(raw) for _, pattern in COMPILED):
                 raise Problem("ticket context contains a secret-shaped value; GPT check incomplete")
-            reply = tool("harness-gpt", ["check", "--head", head, "--base", fork, "--brief-stdin"],
-                         repo.root, stdin=json.dumps(brief), timeout=600)
+            review_base = fork
+            if previous:
+                prior = previous.get("head") or ""
+                if re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", prior) and prior != head and git(
+                        repo.root, "merge-base", "--is-ancestor", prior, head).returncode == 0:
+                    review_base = prior
+            reply = tool("harness-gpt", ["check", "--head", head, "--base", review_base, "--brief-stdin"],
+                         repo.root, stdin=json.dumps(brief), timeout=1080)
             try:
                 report = json.loads(reply.stdout)
                 if report["head"] != head or report["model"] != "gpt-6.2-sol" or not isinstance(report["findings"], list):

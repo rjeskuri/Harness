@@ -152,7 +152,7 @@ def ask(mode, folder, prompt, conversation=False, resume=None):
         schema.write_text(json.dumps(SCHEMA))
         args.extend(["--output-schema", str(schema)])
     proc = subprocess.run(args + ["-"], input=prompt, cwd=folder, text=True, stdout=subprocess.PIPE if conversation else subprocess.DEVNULL,
-                          stderr=subprocess.PIPE, timeout=480)
+                          stderr=subprocess.PIPE, timeout=960 if mode == "check" else 480)
     if proc.returncode or not output.is_file() or not output.read_text().strip():
         # Codex diagnostics can include the entire prompt. Do not replay them into ticket logs.
         raise ValueError(f"Codex {model} returned no usable answer (exit {proc.returncode}); check Codex login/model access")
