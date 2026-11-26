@@ -680,7 +680,7 @@ exit 254
     def test_reuse_requires_same_red_inputs(self):
         self.put("tests/test_calc.py", TEST_ADD)
         counter = os.path.join(self.tmp, "red-calls")
-        command = f"echo run >> {shlex.quote(counter)}; python3 -m unittest discover -s tests"
+        command = f"echo run >> {shlex.quote(counter)}; python3 -m unittest discover -s tests # don't run the full suite"
 
         def check(*flags):
             return self.red("check", *flags, HARNESS_TEST_CMD=command)

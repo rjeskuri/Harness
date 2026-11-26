@@ -1028,13 +1028,15 @@ def record_findings(args, repo=None):
             current = latest_harness_review(api_list(repo, f"repos/{repo.slug()}/pulls/{pr}/reviews"))
             if current and current.get("commit_id") == head and receipt["marker"] in current["body"]:
                 receipt.update(posted=True, review_id=current.get("id"))
+            elif receipt.get("posted") or (current and previous and current.get("commit_id") != previous.get("head")):
+                recovering = False
             else:
                 receipt.update(posted=False, review_id=None)
         if recovering:
             findings, reviewers = receipt["findings"], receipt["reviewers"]
             unresolved = receipt.get("unresolved", [])
         else:
-            if not args.review and not (previous and previous.get("head") != head):
+            if not args.review and not (previous and (previous.get("head") != head or receipt)):
                 raise Problem("a first review requires the Claude findings file; check --latest before retrying")
             ticket = show_ticket(repo, number)
             sections = ticket.get("sections") or {}
@@ -1055,7 +1057,7 @@ def record_findings(args, repo=None):
                     if base_covered and git(repo.root, "merge-base", "--is-ancestor", prior, head).returncode == 0:
                         review_base = prior
             reply = tool("harness-gpt", ["check", "--head", head, "--base", review_base, "--brief-stdin"],
-                         repo.root, stdin=json.dumps(brief), timeout=540)
+                         repo.root, stdin=json.dumps(brief), timeout=1080)
             try:
                 report = json.loads(reply.stdout)
                 if report["head"] != head or report["model"] != "gpt-6.2-sol" or not isinstance(report["findings"], list):
@@ -1071,7 +1073,9 @@ def record_findings(args, repo=None):
                                                "-z", review_base, head))
                     renames = dict(zip(fields[1::3], fields[2::3]))
                     for f in unresolved:
-                        f["path"] = renames.get(f["path"], f["path"])
+                        if f["path"] in renames:
+                            f["path"] = renames[f["path"]]
+                            f["line"] = None  # without a verified line mapping, include it in the review body
                 findings.extend(f for f in unresolved if f not in findings)
                 for f in report["findings"]:
                     if f not in findings:

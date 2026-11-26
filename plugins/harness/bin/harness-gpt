@@ -40,7 +40,7 @@ PROMPTS = {
     "repo-review": "Perform an independent static repository review. Trace important entry points and their callers. "
                    "Prioritize reproducible bugs, logic errors and missing behavior. Give severity, file and line, "
                    "trigger, impact and a targeted fix. Separate refinements from bugs. State the areas examined "
-                   "and coverage gaps. Report when no actionable bug is found.",
+                   "and coverage gaps. Cite repository-relative paths. Report when no actionable bug is found.",
     "check": "Independently review the entire patch in changes.diff, using source/ for surrounding code. "
              "Check requirements, regressions, logic and tests. Verify prior blockers against this revision. "
              "For each new finding identify the changed line and a realistic user-visible failure in this patch. "
@@ -157,7 +157,7 @@ def ask(mode, folder, prompt, conversation=False, resume=None):
         schema.write_text(json.dumps(SCHEMA))
         args.extend(["--output-schema", str(schema)])
     proc = subprocess.run(args + ["-"], input=prompt, cwd=folder, text=True, stdout=subprocess.PIPE if conversation else subprocess.DEVNULL,
-                          stderr=subprocess.PIPE, timeout=420 if mode == "check" else 480)
+                          stderr=subprocess.PIPE, timeout=960 if mode == "check" else 480)
     if proc.returncode or not output.is_file() or not output.read_text().strip():
         # Codex diagnostics can include the entire prompt. Do not replay them into ticket logs.
         raise ValueError(f"Codex {model} returned no usable answer (exit {proc.returncode}); check Codex login/model access")
@@ -265,6 +265,8 @@ def run(args):
         elif getattr(args, "terminal", False):
             answer += "\n\nNo cmux workspace was attached; the consultation ran here."
         if args.mode != "check":
+            if head:
+                answer = answer.replace(str(source) + "/", str(repo) + "/")
             return f"GPT-6 Astra · {head or 'new project'} · {len(allowed)} files available, {skipped} excluded\n\n{answer}"
         result = json.loads(answer)
         rows = result.get("findings") if isinstance(result, dict) else None

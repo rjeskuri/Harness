@@ -675,8 +675,12 @@ def cmd_check(repo, args):
     if reuse_eligible:
         # Alternate/ignored runner configuration can affect results without appearing in changed paths.
         command = repo.test_command(run_files, repo.top)
+        try:
+            words = shlex.split(command, comments=True)
+        except ValueError:
+            words = ["--config"]  # leave parsing to the actual shell and require a fresh red run
         uses_config = bool(os.environ.get("PYTEST_ADDOPTS")) or any(
-            word.startswith(("-c", "--config")) for word in shlex.split(command))
+            word.startswith(("-c", "--config")) for word in words)
         ignored_config = git(repo.top, "ls-files", "--others", "--ignored", "--exclude-standard", "--", *TEST_CONFIG)
         reuse_eligible = not uses_config and not ignored_config.stdout
     if args.reuse and reuse_eligible:

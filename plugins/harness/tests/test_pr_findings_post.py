@@ -574,7 +574,7 @@ class Post(PostTest):
         self.open_pr(34)
         second = self.pr(*args, "--head", self.head())
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(json.loads(second.stdout)["blocking"], [dict(finding, path=new)])
+        self.assertEqual(json.loads(second.stdout)["blocking"], [dict(finding, path=new, line=None)])
 
     def test_ticket_secrets_rejected_before_encoding(self):
         ticket = epic_ticket(12, self.EPIC)
