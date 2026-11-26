@@ -53,12 +53,12 @@ One session per project. `claude agents` in a terminal lists every session, incl
 | Stage | Who | What happens |
 | --- | --- | --- |
 | Start | `harness-work start N` | Branch `t/N-<slug>`, a worktree under `.claude/worktrees/`, label `status:in-progress`, a comment on the ticket |
-| Tests | `test-author` at the ticket's tier | Writes the tests the ticket names, broad behavior first, and runs them |
-| Red proof | `harness-red check` | Runs the new tests against unchanged source. They must fail; the record is written |
+| Tests | `test-author` at the ticket's tier | Writes the tests the ticket names and runs the canonical red check |
+| Red proof | `harness-red check --reuse` | Confirms the author’s proof against the current inputs and runs the check if they changed |
 | Break | `test-breaker` | In a scratch copy, tries once to pass the tests with a cheat, only on a risk:high ticket that changes a hook's decision path or a tool that destroys or rewrites data. Its gaps go to the coder as requirements and to the reviewer as check items |
 | Code | `coder` at the tier | Changes source only, until the new tests and the ticket's own tests pass, and commits |
-| Review | `reviewer`, Opus (xhigh for risk:high), unless the project sets `HARNESS_REVIEW_TIER` | Checks the branch against the definition of done. High and medium findings go back to the coder, at most twice |
-| PR | `harness-pr open`, `harness-pr review` | Pushes the branch, opens a draft PR, posts the findings as a review |
+| Draft | `harness-pr open` | Pushes the green commit and opens the draft so PR-triggered CI can run during review |
+| Review | `reviewer` at the review tier | Checks the pushed head against the definition of done. `harness-pr findings --head` posts the review and prepares the fix list and notes. `harness-work stage` selects the next stage |
 | CI | `harness-pr checks <P> --wait` | Waits for checks. Failures go back to the coder, at most twice |
 | Ready | `reviewer`, `harness-pr ready <P>` | When commits other than clean merges of main came after the latest harness review (CI or revise fixes, or a merge of main that conflicted), the reviewer reviews the head again first, since `harness-pr land` refuses a head no review covers. A merge counts as clean, whoever made it, as `harness-pr land` judges it: `git merge-tree` of its two parents merges without a conflict into the merge's own tree. Then marks the PR ready, sets `status:in-review`, notifies you, and goes straight on to Land |
 | Land | `harness-pr land <P> --catch-up` | At any risk, with no question to you: merges main into the branch when it is behind and that merge is clean, pushes and waits for CI, then merges the PR, removes the worktree and branch, closes the ticket and runs the canary. A conflict with main goes to the coder (after `harness-red reprove` on a branch with no red record, such as one from the cloud), then CI and the head review again. A land it still cannot finish parks the ticket |

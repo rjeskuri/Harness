@@ -677,6 +677,22 @@ exit 254
         self.assertOneLineError(p, "No runnable test files among the test changes: tests/fixtures/data.json")
         self.assertFalse(os.path.exists(self.record_path))
 
+    def test_reuse_requires_same_red_inputs(self):
+        self.put("tests/test_calc.py", TEST_ADD)
+        counter = os.path.join(self.tmp, "red-calls")
+        command = f"echo run >> {shlex.quote(counter)}; python3 -m unittest discover -s tests"
+
+        def check(*flags):
+            return self.red("check", *flags, HARNESS_TEST_CMD=command)
+
+        for flags in [(), ("--reuse",)]:
+            run = check(*flags)
+            self.assertEqual(run.returncode, 0, run.stderr)
+        self.put("tests/test_extra.py", TEST_ADD)
+        self.assertEqual(check("--reuse").returncode, 0)
+        with open(counter) as fh:
+            self.assertEqual(fh.read().splitlines(), ["run", "run"])
+
     def test_green_refused_but_recorded(self):
         self.put("tests/test_sub.py", TEST_SUB)
         p = self.red("check")

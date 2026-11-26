@@ -241,7 +241,7 @@ try:
     from harness_lib.settings import committed_env, other_project, project_setting, setting_from
     from harness_lib.registry import load_registry
     from harness_lib.cli import Parser, Problem, emit, issue_number, run_main, table
-    from harness_lib import backups, cost, reviews, waves
+    from harness_lib import backups, cost, reviews, timeline, waves
     from harness_lib.text import age_text as ago_text
     from harness_lib.text import first_line, harness_home, last_line, one_line, parse_iso, parse_iso_seconds
     from harness_lib.text import read_json
@@ -855,7 +855,7 @@ def runs_dir():
     return harness_home("runs")
 
 
-def load_runs():
+def load_runs(ticket=None):
     folder = runs_dir()
     try:
         names = sorted(n for n in os.listdir(folder) if n.endswith(".json") and not n.startswith("."))
@@ -863,6 +863,8 @@ def load_runs():
         return []
     records = []
     for name in names:
+        if ticket is not None and f"-{ticket}-" not in name:
+            continue
         data = read_json(os.path.join(folder, name))
         if isinstance(data, dict):
             data.setdefault("id", name[:-len(".json")])
@@ -2058,7 +2060,7 @@ def stage_refusal(n, stage, result, marks, found):
     return None
 
 
-def next_step(data, marks, found):
+def next_step(data, marks, found, breaker_required):
     """The work loop's step after the attempt `data`: the same stage on retry or escalate, park, or the
     stage done leads to (a breaker failure is done: code, with the gaps as requirements)."""
     stage, action = data["stage"], data["action"]
@@ -2069,7 +2071,7 @@ def next_step(data, marks, found):
     if stage in ("review", "fix"):
         return "fix" if found else "ci"
     high = "risk:high" in marks
-    return {"tests": "breaker" if high else "code", "breaker": "code", "code": "review",
+    return {"tests": "breaker" if high and breaker_required else "code", "breaker": "code", "code": "review",
             "ci": "ready"}[stage]
 
 
@@ -2077,6 +2079,8 @@ def cmd_stage(repo, args):
     n = args.number
     cache = ticket_cache(repo, n)
     marks = ticket_marks(cache)
+    if args.breaker_required and (args.stage != "tests" or "risk:high" not in marks):
+        raise Problem("--breaker-required is for the tests stage of a risk:high ticket")
     found = None
     if args.stage in ("review", "fix"):
         rnd = reviews.latest_round(repo.key, n)
@@ -2085,7 +2089,17 @@ def cmd_stage(repo, args):
     if why:
         raise Problem(why)
     data = record_attempt(repo, cache, args)
-    data["next"] = next_step(data, marks, found)
+    worktree = cache.get("worktree")
+    if args.stage == "code" and args.result == "pass" and worktree and os.path.isdir(worktree):
+        commit = git(worktree, "show", "--no-show-signature", "-s", "--format=%H %cI", "HEAD")
+        if commit.returncode == 0:
+            fields = commit.stdout.strip().split()
+            if len(fields) == 2:
+                try:
+                    timeline.remember(repo.key, n, "coder commit", fields[0], fields[1])
+                except OSError as err:
+                    warn(f"could not record commit time: {err}")
+    data["next"] = next_step(data, marks, found, args.breaker_required)
     emit(wants_json(args), data, f"{answer_text(data)}\nnext: {data['next']}")
 
 
@@ -2115,6 +2129,7 @@ def cost_extras(repo, record, cache):
     n, pr = record["ticket"], record["pr"]
     branch = cache.get("branch") if cache and isinstance(cache.get("branch"), str) else None
     info = None
+    runs = []
     if pr is not None:
         info = gh_part(repo, ["pr", "view", str(pr), "--json", PR_FIELDS], dict)
     elif branch:
@@ -2149,6 +2164,9 @@ def cost_extras(repo, record, cache):
     landed = info.get("mergedAt") or None
     record["elapsed"] = cost.elapsed(started, info.get("createdAt") or None, ready, landed)
     record["landed_at"] = landed
+    workers = [r for r in load_runs(ticket=n) if r.get("ticket") == n and of_repo(r, repo)]
+    record["timeline"] = timeline.collect(repo.key, n, record["elapsed"] or {}, reviews.load_rounds(repo.key, n),
+                                          runs or [], workers)
 
 
 def cmd_cost(repo, args):
@@ -3228,6 +3246,8 @@ def parser():
     stage.add_argument("number", type=issue_number, metavar="N")
     stage.add_argument("stage", choices=STAGES)
     stage.add_argument("result", choices=("pass", "fail"))
+    stage.add_argument("--breaker-required", action="store_true",
+                       help="the high-risk change affects a hook decision or a data-destructive operation")
     stage.add_argument("--tier", choices=TIERS, help="the tier this attempt ran at (default: the stage's route)")
     stage.add_argument("--effort", choices=EFFORTS,
                        help="the effort this attempt ran at (default: the stage route's effort when it ran at that "

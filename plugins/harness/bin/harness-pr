@@ -109,6 +109,7 @@ try:
     from harness_lib.cli import Parser, Problem, emit, run_main, table, warn
     from harness_lib.text import (as_list, first_line, harness_home, home, last_line, one_line, parse_iso, read_json,
                                   now_iso, read_text, write_json, write_text)
+    from harness_lib.timeline import remember as remember_milestone
     from harness_lib.notify import notify
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
     from harness_lib.issues import Issues, Rest
@@ -710,16 +711,21 @@ def review_body(model, findings, outside):
     return "\n\n".join(parts)
 
 
-def post_review(repo, number, findings, model, checked):
+def post_review(repo, number, findings, model, checked, head=None):
     """Post `findings` on PR `number` as one COMMENT review carrying the harness marker, inline where they sit on
     the diff, the rest listed in its body; no findings posts `Harness review: no findings. Checked: <checked>`.
     Returns (review_id, inline, outside): the id GitHub gave the review (None for a no-findings post, or when the
     reply names none) and the findings posted inline and in the body. Problem when the post fails."""
-    if not findings:
+    if not findings and head is None:
         gh(["pr", "review", str(number), "--comment", "-b",
             f"Harness review: no findings. Checked: {checked}\n\n{MARKER}"], repo.root)
         return None, [], []
     slug = repo.slug()
+    if head and not findings:
+        body = f"Harness review: no findings. Checked: {checked}\n\n{MARKER}"
+        gh(["api", "-X", "POST", f"repos/{slug}/pulls/{number}/reviews", "--input", "-"], repo.root,
+           stdin=json.dumps({"event": "COMMENT", "body": body, "commit_id": head}))
+        return None, [], []
     diff = gh_run(["pr", "diff", str(number)], repo.root)
     if diff.returncode != 0:
         warn("harness-pr", f"gh pr diff {number} failed ({first_line(diff.stderr) or f'exit {diff.returncode}'}); "
@@ -734,13 +740,15 @@ def post_review(repo, number, findings, model, checked):
                  "body": f"[{f['severity']}] {f['body']}\n\n{MARKER}"} for f in inline]
     call = ["api", "-X", "POST", f"repos/{slug}/pulls/{number}/reviews", "--input", "-"]
     payload = {"event": "COMMENT", "body": review_body(model, findings, outside), "comments": comments}
+    if head:
+        payload["commit_id"] = head
     done = gh_run(call, repo.root, stdin=json.dumps(payload))
     if done.returncode != 0 and comments:
         warn("harness-pr",
              f"GitHub refused the inline comments ({first_line(done.stderr) or f'exit {done.returncode}'}); "
              "posting every finding in the review body")
         inline, outside = [], findings
-        payload = {"event": "COMMENT", "body": review_body(model, findings, outside), "comments": []}
+        payload.update(body=review_body(model, findings, outside), comments=[])
         done = gh_run(call, repo.root, stdin=json.dumps(payload))
     if done.returncode != 0:
         raise Problem(f"{describe(call)} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
@@ -976,12 +984,19 @@ def cmd_findings(args):
         print(f"{args.review}: no findings array; the review stage failed", file=sys.stderr)
         return 1
     head = git_ok(repo.root, "rev-parse", "HEAD").strip()
+    if args.head and (head != args.head or dirty_files(repo.root)):
+        raise Problem("the reviewed head or working tree changed; review the clean pushed head again")
     fork = merge_base(repo.root)
     blocking, low, outside = split_findings(findings, touched_files(repo.root, fork))
     pr = branch_pr(repo, number, head)                 # refuses before anything is posted or recorded
+    if args.head and pr is None:
+        raise Problem("open the draft PR before publishing the review")
+    published = blocking + low
+    if args.head:
+        published.extend(f for f in outside if f["severity"] == "low")
     review_id = None
     if pr is not None:                                 # a failed post raises, and nothing is recorded
-        review_id, inline, off = post_review(repo, pr, blocking + low, args.model, DEFAULT_CHECKED)
+        review_id, inline, off = post_review(repo, pr, published, args.model, DEFAULT_CHECKED, args.head)
 
     key = repo.key
     rounds = load_rounds(key, number)
@@ -995,7 +1010,7 @@ def cmd_findings(args):
              "review": os.path.join(folder, f"round-{k}-review.json"),
              "notes": os.path.join(folder, "notes.md")}
     write_json(files["blocking"], blocking, prefix=".findings-")
-    write_json(files["review"], blocking + low, prefix=".findings-")
+    write_json(files["review"], published, prefix=".findings-")
     all_rulings = add_rulings(key, number, rulings)
     tickets = ticket_outside(repo, key, number, pr) if pr is not None else []
     write_text(files["notes"], notes_text(load_rounds(key, number), all_rulings, load_tickets(key, number)),
@@ -1008,8 +1023,8 @@ def cmd_findings(args):
     lines = [f"#{number} review round {k}: {len(blocking)} blocking, {len(low)} low, "
              f"{len(outside)} outside; record: harness-work stage {number} {stage} {result}"]
     if pr is not None:
-        lines.append(f"PR #{pr}: review posted, " + (f"{plural(len(blocking + low), 'finding')} ({len(inline)} "
-                                                     f"inline, {len(off)} in the body)" if blocking + low
+        lines.append(f"PR #{pr}: review posted, " + (f"{plural(len(published), 'finding')} ({len(inline)} "
+                                                     f"inline, {len(off)} in the body)" if published
                                                      else "no findings"))
     if tickets:
         lines.append("out-of-scope tickets: " + ", ".join(f"#{n}" for n in tickets))
@@ -1855,6 +1870,12 @@ def merge_main_into(repo, number, branch, head):
         raise Problem(f"git push origin {branch} failed: {last_line(pushed.stderr) or f'exit {pushed.returncode}'}; "
                       + ("the merge was undone, nothing pushed" if undone else f"the merge {sha[:7]} is in {wt}, "
                                                                                "not pushed"))
+    ticket = TICKET_BRANCH.match(branch)
+    if ticket:
+        try:
+            remember_milestone(repo.key, int(ticket.group(1)), "catch-up pushed", sha, now_iso())
+        except OSError as err:
+            warn("harness-pr", f"could not record catch-up time: {err}")
     print(f"Merged origin/main ({tip[:7]}) into {branch} as {sha[:7]} and pushed it.")
     sys.stdout.flush()
     return sha
@@ -2522,6 +2543,7 @@ def parser():
     fd = sub.add_parser("findings", help="split a review by the ticket's changed files, record the round, notes")
     fd.add_argument("number", type=number_arg, metavar="N", help="the ticket")
     fd.add_argument("--worktree", metavar="PATH", help="the ticket worktree (default: the cwd)")
+    fd.add_argument("--head", help="require a clean worktree and open PR at the reviewed commit; pin the review to it")
     fd.add_argument("--review", metavar="F", help="the reviewer's output: its findings array, then the verdict")
     fd.add_argument("--rulings", metavar="R", help="a file whose `Ruling:` lines go in the notes")
     fd.add_argument("--model", metavar="NAME", default="opus", help="the reviewer's model, named in the posted review")

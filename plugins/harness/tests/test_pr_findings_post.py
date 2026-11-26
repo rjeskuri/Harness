@@ -583,6 +583,20 @@ class Post(PostTest):
         self.assertEqual([(r["round"], r["pr"], r["review_id"]) for r in self.load_rounds()],
                          [(1, 34, 7300112), (2, 34, 7300999)])
 
+    def test_pinned_review_only_posts_for_the_reviewed_clean_head(self):
+        head = self.head()
+        self.open_pr(52)
+        args = ["findings", "12", "--worktree", self.wt, "--review", self.review_file([]), "--head"]
+        stale = self.pr(*args, self.merge_base)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertEqual(self.posts(), [])
+        posted = self.pr(*args, head)
+        self.assertEqual(posted.returncode, 0, posted.stderr)
+        self.assertEqual(json.loads(self.posts()[0]["stdin"])["commit_id"], head)
+        write(os.path.join(self.wt, "dirty.txt"), "new input")
+        self.assertNotEqual(self.pr(*args, head).returncode, 0)
+        self.assertEqual(len(self.posts()), 1)
+
     def test_empty_round_posts_no_findings(self):
         # What `harness-pr review` posts for an empty list, as the reference.
         empty = write(os.path.join(self.tmp, "empty.json"), "[]")
