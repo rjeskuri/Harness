@@ -519,6 +519,31 @@ POST_R1 = [
 class Post(PostTest):
     EPIC = 87
 
+    def test_independent_check_before_single_post_and_after_fix(self):
+        self.board_conf(show={"12": epic_ticket(12, self.EPIC)})
+        self.open_pr(34)
+        exe = os.path.join(BINS["fakebin"], "harness-gpt")
+        self.addCleanup(lambda: os.path.exists(exe) and os.unlink(exe))
+        args = ["findings", "12", "--worktree", self.wt, "--gpt-check", "--json"]
+        initial = ["--head", self.head(), "--review", self.review_file(POST_R1[:1])]
+        executable(exe, "#!/bin/sh\nexit 1\n")
+        self.assertNotEqual(self.pr(*args, *initial).returncode, 0)
+        self.assertEqual(self.posts(), [])
+        executable(exe, f"#!{sys.executable}\nimport json, sys\n"
+                        "head = sys.argv[sys.argv.index('--head') + 1]\n"
+                        "brief = json.load(sys.stdin)\n"
+                        "print(json.dumps(dict(head=head, model='gpt-6.2-sol', findings=[])))\n")
+        first = self.pr(*args, *initial)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertTrue(json.loads(first.stdout)["blocking"])
+        self.commit("src/app.py", "fixed = True\n")
+        self.open_pr(34)
+        second = self.pr(*args, "--head", self.head())
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout)["record"], {"stage": "fix", "result": "pass"})
+        self.assertEqual(len(self.posts()), 2)
+
     def assertPosted(self, sent, findings, model, app_changes):
         """The POST payload for one round, derived: inline comments for the review findings on the diff, the rest
         listed in the body, outside findings nowhere."""

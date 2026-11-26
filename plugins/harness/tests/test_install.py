@@ -187,7 +187,7 @@ def snippet_lists(test):
     test.assertIn("permissions", snippet, "the snippet carries no permissions")
     test.assertIn("autoMode", snippet, "the snippet carries no autoMode")
     perms, auto = snippet["permissions"], snippet["autoMode"]
-    test.assertEqual(sorted(perms.get("allow", [])), sorted(nine))
+    test.assertEqual(sorted(perms.get("allow", [])), sorted(nine + ["Bash(harness-gpt architect *)", "Bash(harness-gpt repo-review *)"]))
     test.assertEqual(perms.get("ask"), ASK_RULES)
     test.assertEqual(snippet.get("retired"), RETIRED)
     test.assertEqual(set(perms), {"allow", "ask"})

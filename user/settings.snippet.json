@@ -10,6 +10,8 @@
   "permissions": {
     "allow": [
       "Bash(harness-pr:*)",
+      "Bash(harness-gpt architect *)",
+      "Bash(harness-gpt repo-review *)",
       "Bash(harness-board:*)",
       "Bash(harness-work:*)",
       "Bash(harness-red:*)",
