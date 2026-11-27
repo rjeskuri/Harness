@@ -96,6 +96,8 @@ import os
 import re
 import shutil
 import subprocess
+import fcntl
+import uuid
 import sys
 import tempfile
 import time
@@ -109,6 +111,8 @@ try:
     from harness_lib.cli import Parser, Problem, emit, run_main, table, warn
     from harness_lib.text import (as_list, first_line, harness_home, home, last_line, one_line, parse_iso, read_json,
                                   now_iso, read_text, write_json, write_text)
+    from harness_lib.timeline import remember as remember_milestone
+    from harness_lib.secret_patterns import COMPILED
     from harness_lib.notify import notify
     from harness_lib.gh import describe, gh_run, gh as lib_gh, gh_json as lib_gh_json
     from harness_lib.issues import Issues, Rest
@@ -370,16 +374,16 @@ def sibling(name):
     raise Problem(f"{name} not found on PATH or in {HERE}")
 
 
-def tool(name, args, cwd, check=True, stdin=None):
+def tool(name, args, cwd, check=True, stdin=None, timeout=TOOL_TIMEOUT):
     """A sibling tool's CompletedProcess; `stdin` is the text it reads, else it gets none."""
     feed = {"stdin": subprocess.DEVNULL} if stdin is None else {"input": stdin}
     try:
         done = subprocess.run([sibling(name)] + list(args), cwd=cwd, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=TOOL_TIMEOUT, **feed)
+                              encoding="utf-8", errors="replace", timeout=timeout, **feed)
     except OSError as err:
         raise Problem(f"cannot run {name}: {err.strerror or err}") from None
     except subprocess.TimeoutExpired:
-        raise Problem(f"{name} {args[0]} timed out after {TOOL_TIMEOUT} s") from None
+        raise Problem(f"{name} {args[0]} timed out after {timeout} s") from None
     if check and done.returncode != 0:
         why = one_line(done.stderr) or one_line(done.stdout) or f"exit {done.returncode}"
         raise Problem(f"{name} {' '.join(args[:2])} failed: {why}")
@@ -710,16 +714,22 @@ def review_body(model, findings, outside):
     return "\n\n".join(parts)
 
 
-def post_review(repo, number, findings, model, checked):
+def post_review(repo, number, findings, model, checked, head=None, receipt_marker=None):
     """Post `findings` on PR `number` as one COMMENT review carrying the harness marker, inline where they sit on
     the diff, the rest listed in its body; no findings posts `Harness review: no findings. Checked: <checked>`.
     Returns (review_id, inline, outside): the id GitHub gave the review (None for a no-findings post, or when the
     reply names none) and the findings posted inline and in the body. Problem when the post fails."""
-    if not findings:
+    suffix = "\n\n" + receipt_marker if receipt_marker else ""
+    if not findings and head is None:
         gh(["pr", "review", str(number), "--comment", "-b",
             f"Harness review: no findings. Checked: {checked}\n\n{MARKER}"], repo.root)
         return None, [], []
     slug = repo.slug()
+    if head and not findings:
+        body = f"Harness review: no findings. Checked: {checked}\n\n{MARKER}" + suffix
+        gh(["api", "-X", "POST", f"repos/{slug}/pulls/{number}/reviews", "--input", "-"], repo.root,
+           stdin=json.dumps({"event": "COMMENT", "body": body, "commit_id": head}))
+        return None, [], []
     diff = gh_run(["pr", "diff", str(number)], repo.root)
     if diff.returncode != 0:
         warn("harness-pr", f"gh pr diff {number} failed ({first_line(diff.stderr) or f'exit {diff.returncode}'}); "
@@ -733,14 +743,16 @@ def post_review(repo, number, findings, model, checked):
     comments = [{"path": f["path"], "line": f["line"], "side": "RIGHT",
                  "body": f"[{f['severity']}] {f['body']}\n\n{MARKER}"} for f in inline]
     call = ["api", "-X", "POST", f"repos/{slug}/pulls/{number}/reviews", "--input", "-"]
-    payload = {"event": "COMMENT", "body": review_body(model, findings, outside), "comments": comments}
+    payload = {"event": "COMMENT", "body": review_body(model, findings, outside) + suffix, "comments": comments}
+    if head:
+        payload["commit_id"] = head
     done = gh_run(call, repo.root, stdin=json.dumps(payload))
-    if done.returncode != 0 and comments:
+    if done.returncode != 0 and comments and (not receipt_marker or "422" in done.stderr):
         warn("harness-pr",
              f"GitHub refused the inline comments ({first_line(done.stderr) or f'exit {done.returncode}'}); "
              "posting every finding in the review body")
         inline, outside = [], findings
-        payload = {"event": "COMMENT", "body": review_body(model, findings, outside), "comments": []}
+        payload.update(body=review_body(model, findings, outside) + suffix, comments=[])
         done = gh_run(call, repo.root, stdin=json.dumps(payload))
     if done.returncode != 0:
         raise Problem(f"{describe(call)} failed: {first_line(done.stderr) or f'exit {done.returncode}'}")
@@ -950,10 +962,29 @@ def ticket_outside(repo, key, number, pr):
     return made
 
 
+def flatten_brief(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, (dict, list)):
+        for child in (value.values() if isinstance(value, dict) else value):
+            yield from flatten_brief(child)
+
+
 def cmd_findings(args):
+    if not args.gpt_check or args.latest:
+        return record_findings(args)
+    repo = open_repo(args.worktree)
+    folder = Path(reviews_dir(repo.key, args.number))
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "gpt.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return record_findings(args, repo)
+
+
+def record_findings(args, repo=None):
     number = args.number
     if args.latest:
-        if args.review or args.rulings:
+        if args.review or args.rulings or args.gpt_check:
             raise Problem("--latest takes no --review or --rulings")
         repo = open_repo(args.worktree)
         rnd = latest_round(repo.key, number)
@@ -962,12 +993,12 @@ def cmd_findings(args):
             return 1
         emit(args.json, rnd, round_text(number, rnd))
         return 0
-    if not args.review:
+    if not args.review and not args.gpt_check:
         raise Problem("findings needs --review F (or --latest)")
-    repo = open_repo(args.worktree)
+    repo = repo or open_repo(args.worktree)
     rulings = ruling_lines(read_text(args.rulings, "rulings file")) if args.rulings else []
-    findings = None
-    if read_text(args.review, "review file").strip():      # an empty file is a reviewer that wrote nothing
+    findings = [] if not args.review else None
+    if args.review and read_text(args.review, "review file").strip():      # an empty file is a reviewer that wrote nothing
         try:
             findings = load_findings(args.review)
         except Problem:
@@ -976,26 +1007,128 @@ def cmd_findings(args):
         print(f"{args.review}: no findings array; the review stage failed", file=sys.stderr)
         return 1
     head = git_ok(repo.root, "rev-parse", "HEAD").strip()
+    if args.head and (head != args.head or dirty_files(repo.root)):
+        raise Problem("the reviewed head or working tree changed; review the clean pushed head again")
     fork = merge_base(repo.root)
+    model, checked = args.model, DEFAULT_CHECKED
+    reviewers, unresolved = [], []
+    if args.gpt_check:
+        branch = TICKET_BRANCH.match(current_branch(repo.root) or "")
+        if not args.head or not branch or int(branch.group(1)) != number:
+            raise Problem("--gpt-check requires the pinned head of this ticket's branch")
+        pr = branch_pr(repo, number, head)
+        if pr is None:
+            raise Problem("open the draft PR before requesting the GPT check")
+        expected_pr = pr
+        receipt_path = str(Path(reviews_dir(repo.key, number)) / f"gpt-{pr}-{head}.json")
+        receipt = read_json(receipt_path)
+        previous = latest_round(repo.key, number)
+        recovering = isinstance(receipt, dict)
+        if recovering:
+            current = latest_harness_review(api_list(repo, f"repos/{repo.slug()}/pulls/{pr}/reviews"))
+            if current and current.get("commit_id") == head and receipt["marker"] in current["body"]:
+                receipt.update(posted=True, review_id=current.get("id"))
+            elif receipt.get("posted") or (current and previous and current.get("commit_id") != previous.get("head")):
+                recovering = False
+            else:
+                receipt.update(posted=False, review_id=None)
+        if recovering:
+            findings, reviewers = receipt["findings"], receipt["reviewers"]
+            unresolved = receipt.get("unresolved", [])
+        else:
+            if not args.review and not (previous and (previous.get("head") != head or receipt)):
+                raise Problem("a first review requires the Claude findings file; check --latest before retrying")
+            ticket = show_ticket(repo, number)
+            sections = ticket.get("sections") or {}
+            brief = {key: sections.get(key) for key in ("request", "definition_of_done", "tests")}
+            paired = previous and previous.get("reviewers")
+            if previous and not paired and not args.review:
+                raise Problem("previous review was local only; continue locally or obtain a fresh paired review")
+            brief["prior_blockers"] = previous.get("blocking", []) if paired else []
+            raw = "\n".join(flatten_brief(brief))
+            if any(pattern.search(raw) for _, pattern in COMPILED):
+                raise Problem("ticket context contains a secret-shaped value; GPT check incomplete")
+            review_base = fork
+            if paired:
+                prior = previous.get("head") or ""
+                if re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", prior) and prior != head:
+                    base_covered = previous.get("fork") == fork or git(
+                        repo.root, "merge-base", "--is-ancestor", fork, prior).returncode == 0
+                    if base_covered and git(repo.root, "merge-base", "--is-ancestor", prior, head).returncode == 0:
+                        review_base = prior
+            reply = tool("harness-gpt", ["check", "--head", head, "--base", review_base, "--brief-stdin"],
+                         repo.root, stdin=json.dumps(brief), timeout=1080)
+            try:
+                report = json.loads(reply.stdout)
+                if report["head"] != head or report["model"] != "gpt-6.2-sol" or not isinstance(report["findings"], list):
+                    raise ValueError()
+                fixed = report["prior_fixed"]
+                prior_blockers = brief["prior_blockers"]
+                if (not isinstance(fixed, list) or len(fixed) != len(prior_blockers)
+                        or any(type(value) is not bool for value in fixed)):
+                    raise ValueError()
+                unresolved = [dict(f) for f, resolved in zip(prior_blockers, fixed) if not resolved]
+                if unresolved and review_base != fork:
+                    fields = nul_fields(git_ok(repo.root, "diff", "--find-renames", "--name-status", "--diff-filter=R",
+                                               "-z", review_base, head))
+                    renames = dict(zip(fields[1::3], fields[2::3]))
+                    for f in unresolved:
+                        if f["path"] in renames:
+                            f["path"] = renames[f["path"]]
+                            f["line"] = None  # without a verified line mapping, include it in the review body
+                findings.extend(f for f in unresolved if f not in findings)
+                for f in report["findings"]:
+                    if f not in findings:
+                        findings.append(f)
+            except (KeyError, TypeError, ValueError):
+                raise Problem("GPT check did not return findings for the requested head") from None
+            reviewers = ([args.model] if args.review else []) + [report["model"]]
+            receipt = {"findings": findings, "reviewers": reviewers, "unresolved": unresolved,
+                       "marker": f"<!-- harness-gpt-{uuid.uuid4()} -->"}
+            write_json(receipt_path, receipt, prefix=".gpt-")
+        model = " + ".join(reviewers)
+        checked += f" (reviewed by {model})"
+        if git_ok(repo.root, "rev-parse", "HEAD").strip() != head or dirty_files(repo.root):
+            raise Problem("the reviewed head or working tree changed during the GPT check")
     blocking, low, outside = split_findings(findings, touched_files(repo.root, fork))
+    for f in unresolved:
+        if f in outside:
+            outside.remove(f)
+            blocking.append(f)
     pr = branch_pr(repo, number, head)                 # refuses before anything is posted or recorded
+    if args.gpt_check and pr != expected_pr:
+        raise Problem("the open PR changed during the GPT check")
+    if args.head and pr is None:
+        raise Problem("open the draft PR before publishing the review")
+    published = blocking + low
+    if args.head:
+        published.extend(f for f in outside if f["severity"] == "low")
     review_id = None
-    if pr is not None:                                 # a failed post raises, and nothing is recorded
-        review_id, inline, off = post_review(repo, pr, blocking + low, args.model, DEFAULT_CHECKED)
+    inline, off = [], []
+    if args.gpt_check:
+        if receipt.get("posted"):
+            review_id = receipt.get("review_id")
+        else:
+            review_id, inline, off = post_review(repo, pr, published, model, checked, head, receipt["marker"])
+            receipt.update(posted=True, review_id=review_id)
+        write_json(receipt_path, receipt, prefix=".gpt-")
+    elif pr is not None:
+        review_id, inline, off = post_review(repo, pr, published, model, checked, args.head)
 
     key = repo.key
     rounds = load_rounds(key, number)
     earlier = rounds[:-1] if rounds and rounds[-1].get("head") == head else rounds
     base = earlier[-1].get("head") if earlier else fork
     rnd = save_round(key, number, {"at": now_iso(), "head": head, "base": base, "blocking": blocking, "low": low,
-                                   "outside": outside, "pr": pr, "review_id": review_id})
+                                   "outside": outside, "pr": pr, "review_id": review_id,
+                                   **({"reviewers": reviewers, "fork": fork} if reviewers else {})})
     k = rnd["round"]
     folder = reviews_dir(key, number)
     files = {"blocking": os.path.join(folder, f"round-{k}-blocking.json"),
              "review": os.path.join(folder, f"round-{k}-review.json"),
              "notes": os.path.join(folder, "notes.md")}
     write_json(files["blocking"], blocking, prefix=".findings-")
-    write_json(files["review"], blocking + low, prefix=".findings-")
+    write_json(files["review"], published, prefix=".findings-")
     all_rulings = add_rulings(key, number, rulings)
     tickets = ticket_outside(repo, key, number, pr) if pr is not None else []
     write_text(files["notes"], notes_text(load_rounds(key, number), all_rulings, load_tickets(key, number)),
@@ -1008,8 +1141,8 @@ def cmd_findings(args):
     lines = [f"#{number} review round {k}: {len(blocking)} blocking, {len(low)} low, "
              f"{len(outside)} outside; record: harness-work stage {number} {stage} {result}"]
     if pr is not None:
-        lines.append(f"PR #{pr}: review posted, " + (f"{plural(len(blocking + low), 'finding')} ({len(inline)} "
-                                                     f"inline, {len(off)} in the body)" if blocking + low
+        lines.append(f"PR #{pr}: review posted, " + (f"{plural(len(published), 'finding')} ({len(inline)} "
+                                                     f"inline, {len(off)} in the body)" if published
                                                      else "no findings"))
     if tickets:
         lines.append("out-of-scope tickets: " + ", ".join(f"#{n}" for n in tickets))
@@ -1855,6 +1988,12 @@ def merge_main_into(repo, number, branch, head):
         raise Problem(f"git push origin {branch} failed: {last_line(pushed.stderr) or f'exit {pushed.returncode}'}; "
                       + ("the merge was undone, nothing pushed" if undone else f"the merge {sha[:7]} is in {wt}, "
                                                                                "not pushed"))
+    ticket = TICKET_BRANCH.match(branch)
+    if ticket:
+        try:
+            remember_milestone(repo.key, int(ticket.group(1)), "catch-up pushed", sha, now_iso())
+        except OSError as err:
+            warn("harness-pr", f"could not record catch-up time: {err}")
     print(f"Merged origin/main ({tip[:7]}) into {branch} as {sha[:7]} and pushed it.")
     sys.stdout.flush()
     return sha
@@ -2522,9 +2661,11 @@ def parser():
     fd = sub.add_parser("findings", help="split a review by the ticket's changed files, record the round, notes")
     fd.add_argument("number", type=number_arg, metavar="N", help="the ticket")
     fd.add_argument("--worktree", metavar="PATH", help="the ticket worktree (default: the cwd)")
+    fd.add_argument("--head", help="require a clean worktree and open PR at the reviewed commit; pin the review to it")
     fd.add_argument("--review", metavar="F", help="the reviewer's output: its findings array, then the verdict")
     fd.add_argument("--rulings", metavar="R", help="a file whose `Ruling:` lines go in the notes")
     fd.add_argument("--model", metavar="NAME", default="opus", help="the reviewer's model, named in the posted review")
+    fd.add_argument("--gpt-check", action="store_true", help="run an independent Sol check before publishing")
     fd.add_argument("--latest", action="store_true", help="print the latest recorded round; write nothing")
     fd.add_argument("--json", action="store_true")
 

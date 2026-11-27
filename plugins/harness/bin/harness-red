@@ -68,7 +68,7 @@ try:
     from harness_lib.redproof import read_files, record_current, save_red_files, tests_hash
     from harness_lib.repo import NotARepository, RepoError, repo_facts
     from harness_lib.settings import glob_match, patterns, setting, settings_env  # also read by tests/test_red.py
-    from harness_lib.settings import other_project, project_setting
+    from harness_lib.settings import TEST_CONFIG, other_project, project_setting
     from harness_lib.settings import DEFAULT_TEST_PATTERNS as TEST_PATTERNS  # also read by tests/test_red.py
     from harness_lib.settings import DEFAULT_SOURCE_EXEMPT as SOURCE_EXEMPT  # also read by tests/test_red.py
     from harness_lib.cli import Parser, Problem, run_main, warn  # Problem also caught by tests/test_red.py
@@ -583,10 +583,10 @@ def run_red(repo, args, tests, run_files, cwd, again):
     return cmd, code, output
 
 
-def save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output, kind=None):
+def save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output, kind=None, reuse_eligible=False):
     """Write the side file, then the record, of this run; print it. Returns its kind."""
     kind = kind or kind_of(code, output)
-    record = {"branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
+    record = {"reuse_eligible": "test-only-v2" if reuse_eligible else None, "branch": repo.branch, "base_sha": merge_base, "test_files": tests, "run_files": run_files,
               "test_hash": tests_hash(contents), "cmd": cmd, "exit": code, "kind": kind, "tail": tail(output),
               "at": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
     save_red_files(repo.record_path, contents)       # first: a record never names files the side file lacks
@@ -671,8 +671,34 @@ def cmd_check(repo, args):
         return save_removed(repo, args, merge_base, changed)
     run_files = runnable(tests)
     contents = read_files(repo.top, tests)         # the bytes the run proves, hashed and kept beside the record
+    reuse_eligible = all(repo.classify(p) == "test" for p in changed) and not deleted_tests(repo, changed)
+    if reuse_eligible:
+        # Alternate/ignored runner configuration can affect results without appearing in changed paths.
+        command = repo.test_command(run_files, repo.top)
+        try:
+            words = shlex.split(command, comments=True)
+        except ValueError:
+            words = ["--config"]  # leave parsing to the actual shell and require a fresh red run
+        uses_config = bool(os.environ.get("PYTEST_ADDOPTS")) or any(
+            word.startswith(("-c", "--config")) for word in words)
+        ignored_config = git(repo.top, "ls-files", "--others", "--ignored", "--exclude-standard", "--", *TEST_CONFIG)
+        reuse_eligible = not uses_config and not ignored_config.stdout
+    if args.reuse and reuse_eligible:
+        record = read_json(repo.record_path)
+        if (isinstance(record, dict) and record.get("kind") in ("assertion", "import", "error")
+                and record.get("reuse_eligible") == "test-only-v2"
+                and record.get("branch") == repo.branch and record.get("base_sha") == merge_base
+                and record.get("test_files") == tests and record.get("run_files") == run_files
+                and record.get("test_hash") == tests_hash(contents)
+                and record.get("cmd") == repo.test_command(run_files, repo.top)):
+            if args.json:
+                print(json.dumps(record, ensure_ascii=False))
+            else:
+                print(f"Reused red ({record['kind']}) at {record.get('at')}")
+            return 0
     cmd, code, output = run_red(repo, args, tests, run_files, repo.top, "check")
-    if save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output) == "green":
+    if save_record(repo, args, merge_base, tests, run_files, contents, cmd, code, output,
+                   reuse_eligible=reuse_eligible) == "green":
         raise Problem(GREEN)
     return 0
 
@@ -833,6 +859,7 @@ def parser():
     ap.add_argument("--json", action="store_true", help="print JSON (check, reprove, status, files)")
     sub = ap.add_subparsers(dest="cmd", metavar="{check,reprove,status,files,run,scratch}")
     check = sub.add_parser("check", parents=[common, as_json], help="run the branch's test changes and record red")
+    check.add_argument("--reuse", action="store_true", help="reuse an identical successful red proof")
     check.add_argument("--base", metavar="REF", help="default: origin/main when it exists, else main")
     reprove = sub.add_parser("reprove", parents=[common, as_json],
                              help="re-prove the branch's test files against main's code at the merge base")

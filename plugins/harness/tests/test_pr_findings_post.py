@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import stat
 import subprocess
@@ -519,6 +520,73 @@ POST_R1 = [
 class Post(PostTest):
     EPIC = 87
 
+    def test_independent_check_before_single_post_and_after_fix(self):
+        self.board_conf(show={"12": epic_ticket(12, self.EPIC)})
+        self.open_pr(34)
+        exe = os.path.join(BINS["fakebin"], "harness-gpt")
+        self.addCleanup(lambda: os.path.exists(exe) and os.unlink(exe))
+        args = ["findings", "12", "--worktree", self.wt, "--gpt-check", "--json"]
+        first_head = self.head()
+        initial = ["--head", first_head, "--review", self.review_file(POST_R1[:1])]
+        executable(exe, "#!/bin/sh\nexit 1\n")
+        self.assertNotEqual(self.pr(*args, *initial).returncode, 0)
+        self.assertEqual(self.posts(), [])
+        executable(exe, f"#!{sys.executable}\nimport json, sys\n"
+                        "head = sys.argv[sys.argv.index('--head') + 1]\n"
+                        "brief = json.load(sys.stdin)\n"
+                        f"if brief['prior_blockers']: assert sys.argv[sys.argv.index('--base') + 1] == {first_head!r}\n"
+                        "print(json.dumps(dict(head=head, model='gpt-6.2-sol', findings=[], prior_fixed=[True]*len(brief['prior_blockers']))))\n")
+        first = self.pr(*args, *initial)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertTrue(json.loads(first.stdout)["blocking"])
+        scenario = json.loads(Path(self.scenario_path).read_text())
+        posted_body = json.loads(self.posts()[0]["stdin"])["body"]
+        scenario["calls"].append({"match": ["api", "--paginate", "repos/o/r/pulls/34/reviews"],
+                                  "stdout_json": [{"id": 55, "body": posted_body, "commit_id": first_head,
+                                                   "submitted_at": "2026-01-01T00:00:00Z"}]})
+        self.scenario(scenario["calls"])
+        retry = self.pr(*args, "--head", self.head())
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(len(self.posts()), 1)
+        self.commit("src/app.py", "fixed = True\n")
+        self.open_pr(34)
+        second = self.pr(*args, "--head", self.head())
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout)["record"], {"stage": "fix", "result": "pass"})
+        self.assertEqual(len(self.posts()), 2)
+
+    def test_unresolved_finding_survives_a_rename(self):
+        self.open_pr(34)
+        exe = os.path.join(BINS["fakebin"], "harness-gpt")
+        self.addCleanup(lambda: os.path.exists(exe) and os.unlink(exe))
+        executable(exe, f"#!{sys.executable}\nimport json, sys\n"
+                        "prior = json.load(sys.stdin)['prior_blockers']\n"
+                        "print(json.dumps(dict(head=sys.argv[sys.argv.index('--head')+1], model='gpt-6.2-sol', "
+                        "prior_fixed=[False]*len(prior), findings=[])))\n")
+        old, new = "tests/test_app.py", "tests/test_renamed.py"
+        finding = {"path": old, "line": 2, "severity": "medium", "body": "assertion is unconditional"}
+        args = ["findings", "12", "--worktree", self.wt, "--gpt-check", "--json"]
+        first = self.pr(*args, "--head", self.head(), "--review", self.review_file([finding]))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.git(self.wt, "mv", old, new)
+        self.git(self.wt, "commit", "-qm", "rename")
+        self.open_pr(34)
+        second = self.pr(*args, "--head", self.head())
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout)["blocking"], [dict(finding, path=new, line=None)])
+
+    def test_ticket_secrets_rejected_before_encoding(self):
+        ticket = epic_ticket(12, self.EPIC)
+        ticket["sections"]["tests"] = ['token = "' + "a" * 32 + '"']
+        self.board_conf(show={"12": ticket})
+        self.open_pr(34)
+        p = self.pr("findings", "12", "--worktree", self.wt, "--gpt-check", "--head", self.head(),
+                    "--review", self.review_file([]))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("secret-shaped", p.stderr)
+        self.assertEqual(self.posts(), [])
+
     def assertPosted(self, sent, findings, model, app_changes):
         """The POST payload for one round, derived: inline comments for the review findings on the diff, the rest
         listed in the body, outside findings nowhere."""
@@ -582,6 +650,20 @@ class Post(PostTest):
         self.assertEqual((out["round"], out["head"], out["pr"], out["review_id"]), (2, head2, 34, 7300999))
         self.assertEqual([(r["round"], r["pr"], r["review_id"]) for r in self.load_rounds()],
                          [(1, 34, 7300112), (2, 34, 7300999)])
+
+    def test_pinned_review_only_posts_for_the_reviewed_clean_head(self):
+        head = self.head()
+        self.open_pr(52)
+        args = ["findings", "12", "--worktree", self.wt, "--review", self.review_file([]), "--head"]
+        stale = self.pr(*args, self.merge_base)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertEqual(self.posts(), [])
+        posted = self.pr(*args, head)
+        self.assertEqual(posted.returncode, 0, posted.stderr)
+        self.assertEqual(json.loads(self.posts()[0]["stdin"])["commit_id"], head)
+        write(os.path.join(self.wt, "dirty.txt"), "new input")
+        self.assertNotEqual(self.pr(*args, head).returncode, 0)
+        self.assertEqual(len(self.posts()), 1)
 
     def test_empty_round_posts_no_findings(self):
         # What `harness-pr review` posts for an empty list, as the reference.

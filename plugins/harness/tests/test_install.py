@@ -155,7 +155,7 @@ AUTO_ALLOW_OPENINGS = ["Writing or loading a com.ryaneskuri.harness-* LaunchAgen
 DEFAULTS = "$defaults"
 LISTS = (("permissions", "allow"), ("permissions", "ask"), ("autoMode", "environment"), ("autoMode", "allow"))
 # What a merge into a file holding none of the snippet's entries reports: every entry counted, "$defaults" not.
-ADDED_ALL = (f"added 9 permissions.allow, {len(ASK_RULES)} permissions.ask, "
+ADDED_ALL = (f"added 11 permissions.allow, {len(ASK_RULES)} permissions.ask, "
              f"{len(ENVIRONMENT_OPENINGS)} autoMode.environment, {len(AUTO_ALLOW_OPENINGS)} autoMode.allow")
 
 
@@ -187,7 +187,7 @@ def snippet_lists(test):
     test.assertIn("permissions", snippet, "the snippet carries no permissions")
     test.assertIn("autoMode", snippet, "the snippet carries no autoMode")
     perms, auto = snippet["permissions"], snippet["autoMode"]
-    test.assertEqual(sorted(perms.get("allow", [])), sorted(nine))
+    test.assertEqual(sorted(perms.get("allow", [])), sorted(nine + ["Bash(harness-gpt architect *)", "Bash(harness-gpt repo-review *)"]))
     test.assertEqual(perms.get("ask"), ASK_RULES)
     test.assertEqual(snippet.get("retired"), RETIRED)
     test.assertEqual(set(perms), {"allow", "ask"})
@@ -328,7 +328,7 @@ class Install(unittest.TestCase):
         for piece in ("~/.claude/settings.json: set model, effortLevel; ",
                       f'set modelSettings for {", ".join(snippet["modelSettings"])}',
                       'removed enabledPlugins["companion@ryan"]', ADDED_ALL,
-                      "added 9 permissions.allow, 1 permissions.ask, 8 autoMode.environment, 1 autoMode.allow",
+                      "added 11 permissions.allow, 1 permissions.ask, 8 autoMode.environment, 1 autoMode.allow",
                       f"(backup settings.json.bak-{today})"):
             self.assertIn(piece, line)
         self.assert_line_counts(line, removed={}, replaced={})                       # nothing retired or stale
@@ -366,7 +366,7 @@ class Install(unittest.TestCase):
         for piece in ("~/.claude/settings.json: set model, effortLevel; ",
                       f'set modelSettings for {", ".join(snippet["modelSettings"])}',
                       ADDED_ALL,
-                      "added 9 permissions.allow, 1 permissions.ask, 8 autoMode.environment, 1 autoMode.allow"):
+                      "added 11 permissions.allow, 1 permissions.ask, 8 autoMode.environment, 1 autoMode.allow"):
             self.assertIn(piece, line)
         self.assertTrue(line.endswith(" (created)"), line)
 
@@ -646,7 +646,7 @@ class Install(unittest.TestCase):
         # already holding its one prose entry, gains nothing and gets no count (only its sentinel moves).
         self.assertIn(f"added {len(allow) - 2} permissions.allow, {len(ask)} permissions.ask, "
                       f"{len(ENVIRONMENT_OPENINGS) - 1} autoMode.environment", line)
-        self.assertIn("added 7 permissions.allow, 1 permissions.ask, 7 autoMode.environment", line)
+        self.assertIn("added 9 permissions.allow, 1 permissions.ask, 7 autoMode.environment", line)
         self.assertNotRegex(line, r"\d+ autoMode\.allow")
         self.assert_line_counts(line, removed={"permissions.ask": 2}, replaced={})
         self.assertIn(" (backup settings.json.bak-", line)

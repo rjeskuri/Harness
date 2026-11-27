@@ -34,7 +34,7 @@ BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
 TOOL = os.path.join(BIN, "harness-red")
 GIT = shutil.which("git")
 BRANCH, SLUG = "t/12-slug", "t-12-slug"
-RECORD_KEYS = {"branch", "base_sha", "test_files", "run_files", "test_hash", "cmd", "exit", "kind", "tail", "at"}
+RECORD_KEYS = {"reuse_eligible", "branch", "base_sha", "test_files", "run_files", "test_hash", "cmd", "exit", "kind", "tail", "at"}
 GREEN = "Tests pass before the implementation; they do not test this change."
 
 CALC = "def add(a, b):\n    return None\n\n\ndef sub(a, b):\n    return a - b\n"
@@ -676,6 +676,34 @@ exit 254
         p = self.red("check")
         self.assertOneLineError(p, "No runnable test files among the test changes: tests/fixtures/data.json")
         self.assertFalse(os.path.exists(self.record_path))
+
+    def test_reuse_requires_same_red_inputs(self):
+        self.put("tests/test_calc.py", TEST_ADD)
+        counter = os.path.join(self.tmp, "red-calls")
+        command = f"echo run >> {shlex.quote(counter)}; python3 -m unittest discover -s tests # don't run the full suite"
+
+        def check(*flags):
+            return self.red("check", *flags, HARNESS_TEST_CMD=command)
+
+        for flags in [(), ("--reuse",)]:
+            run = check(*flags)
+            self.assertEqual(run.returncode, 0, run.stderr)
+        self.put("tests/test_extra.py", TEST_ADD)
+        self.assertEqual(check("--reuse").returncode, 0)
+        self.put("pytest.ini", "[pytest]\n")
+        self.assertEqual(check("--reuse").returncode, 0)
+        with open(counter) as fh:
+            self.assertEqual(fh.read().splitlines(), ["run", "run", "run"])
+
+    def test_explicit_runner_config_disables_reuse(self):
+        self.put("tests/test_calc.py", TEST_ADD)
+        counter = os.path.join(self.tmp, "config-counter")
+        command = f"echo run >> {shlex.quote(counter)}; python3 -c 'raise AssertionError(1)'"
+        for flags in [(), ("--reuse",)]:
+            run = self.red("check", *flags, HARNESS_TEST_CMD=command)
+            self.assertEqual(run.returncode, 0, run.stderr)
+        with open(counter) as fh:
+            self.assertEqual(fh.read().splitlines(), ["run", "run"])
 
     def test_green_refused_but_recorded(self):
         self.put("tests/test_sub.py", TEST_SUB)

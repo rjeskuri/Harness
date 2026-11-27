@@ -70,7 +70,7 @@ FABLE = "claude-fable-5"
 STAGES = ("tests", "breaker", "code", "review", "fix", "other", "orchestrator")
 RECORD_KEYS = {"ticket", "title", "repo", "computed_at", "type", "size", "risk", "tier", "pr", "rows", "totals",
                "by_model", "session_totals", "sessions", "rounds", "needs_input", "lines", "elapsed", "ci",
-               "landed_at", "landed_by", "coverage"}
+               "landed_at", "landed_by", "coverage", "timeline"}
 CACHE_KEYS = ("title", "type", "size", "risk", "tier")
 TOTAL_KEYS = ("input", "output", "cache_write", "cache_read", "total", "messages", "model_ms")
 
@@ -1253,6 +1253,32 @@ class CostExtras(CostBase):
                 self.assertIn(lines_line(want), out.splitlines())
 
     # ----------------------------------------------------------- elapsed
+    def test_observed_timeline_joins_the_ticket_runs_review_and_push(self):
+        self.ticket(101, branch="t/101-x", started_at="2026-10-20T08:00:00Z")
+
+        def at(minute):
+            return f"2026-10-20T08:{minute:02d}:00Z"
+
+        for ticket, start, end in [(101, 1, 7), (101, 38, 55), (21, 30, 35)]:
+            rid = f"{self.key}-{ticket}-{start}"
+            path = os.path.join(self.home, ".claude", "harness", "runs", rid + ".json")
+            write(path, json.dumps({"id": rid, "ticket": ticket, "repo": self.main,
+                                    "started_at": at(start), "ended_at": at(end)}))
+        for name, minute in [("coder commit", 3), ("catch-up pushed", 39)]:
+            write(self.state("timeline", "101", name + "-abc.json"),
+                  json.dumps({"event": name, "at": at(minute), "id": "abc"}))
+        write(self.state("reviews", "101", "rounds.json"), json.dumps([{"head": "abc", "at": at(5)}]))
+        self.scenario(gh_pr_view(pr_json(201, at(4), at(55), "t/101-x")), gh_issue(101, issue_json([])),
+                      gh_runs("t/101-x", [run_json(42, "completed", "success", at(40), at(41), at(45))]))
+        report = self.cost(101, "--pr", 201)
+        timeline = self.read_record(101)["timeline"]
+        self.assertEqual([e["event"] for e in timeline["events"]],
+                         ["ticket started", "worker launched", "coder commit", "PR opened", "first review completed",
+                          "worker exited", "worker resumed", "catch-up pushed", "CI queued", "CI started",
+                          "CI finished", "worker exited", "merged"])
+        self.assertEqual(timeline["longest_gap"]["seconds"], 31 * 60)
+        self.assertIn("Longest observed gap: worker exited", report)
+
     def test_elapsed_from_start_to_ready_and_to_land(self):
         # 101: the cache's started_at (an older Started on comment does not count), the earliest ready of PR #201
         self.ticket(101, branch="t/101-elapsed", started_at="2026-10-20T08:00:00Z")
@@ -1321,7 +1347,8 @@ class CostExtras(CostBase):
             "Lines: tests +746 -3, source +45 -2, other +24 -0",
             "Elapsed: start to ready 1h29m, start to land 2h12m",
             "CI: 3 runs (1 failed, 0 cancelled), 18m total, 5m median",
-            "Needs input: 0"))
+            "Needs input: 0",
+            "Longest observed gap: ticket started (2026-10-20T08:00:00Z) to PR opened (2026-10-20T09:05:00Z), 1h05m"))
         self.assertExtras(self.cost(101, "--pr", 201), [
             "Lines: tests +746 -3, source +45 -2, other +24 -0",
             "Elapsed: start to ready 1h29m, start to land 2h12m",

@@ -152,7 +152,7 @@ class Stage(tw.WorkTest):
 
             with self.subTest(risk=risk, row="tests pass"):
                 n = self.put_ticket(risk)
-                self.assertEqual(self.stage(n, "tests", "pass"), ("done", "breaker" if high else "code"))
+                self.assertEqual(self.stage(n, "tests", "pass"), ("done", "code"))
 
             with self.subTest(risk=risk, row="breaker pass"):
                 n = self.put_ticket(risk)
@@ -202,7 +202,7 @@ class Stage(tw.WorkTest):
 
         # the risk the step depends on is the ticket's own: a high and a low ticket side by side
         low, high = self.put_ticket("low", size="S"), self.put_ticket("high", size="L")
-        for stage, low_next, high_next in (("tests", "code", "breaker"), ("ci", "ready", "ready")):
+        for stage, low_next, high_next in (("tests", "code", "code"), ("ci", "ready", "ready")):
             with self.subTest(side_by_side=stage):
                 self.assertEqual(self.stage(low, stage, "pass"), ("done", low_next))
                 self.assertEqual(self.stage(high, stage, "pass"), ("done", high_next))
@@ -476,14 +476,14 @@ class Stage(tw.WorkTest):
 
         # the same ticket without the flag takes tests (and breaker on risk:high)
         n = self.put_ticket("high")
-        self.assertEqual(self.stage(n, "tests", "pass"), ("done", "breaker"))
+        self.assertEqual(self.stage(n, "tests", "pass", "--breaker-required"), ("done", "breaker"))
         self.assertEqual(self.stage(n, "breaker", "pass"), ("done", "code"))
 
     # ----------------------------------------------------------- --json
     def test_json_adds_next_to_the_attempt_object(self):
         # (argv, blocking count of a round saved just before, the expected next)
         high = [
-            (["tests", "pass"], None, "breaker"),
+            (["tests", "pass"], None, "code"),
             (["breaker", "fail"], None, "code"),
             (["breaker", "fail"], None, "code"),
             (["code", "fail", "--tier", "sonnet"], None, "code"),

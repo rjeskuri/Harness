@@ -1,0 +1,157 @@
+"""Exercise the GPT entry point with a real repository and a fake Codex executable."""
+from __future__ import annotations
+
+import json
+import os
+import runpy
+from unittest.mock import patch
+import shlex
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+PLUGIN = Path(__file__).resolve().parents[1]
+TOOL = PLUGIN / "bin" / "harness-gpt"
+
+
+class Gpt(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.repo = self.root / "project"
+        self.repo.mkdir()
+        self.log = self.root / "call.json"
+        fake = self.root / "codex"
+        fake.write_text("""#!/usr/bin/env python3
+import json, pathlib, sys
+args = sys.argv[1:]
+root = pathlib.Path.cwd()
+receipt = {"args": args, "input": sys.stdin.read(), "files": sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())}
+if (root / "changes.diff").exists():
+    receipt["patch"] = (root / "changes.diff").read_bytes().decode()
+pathlib.Path(__file__).with_name("call.json").write_text(json.dumps(receipt))
+if "--json" in args:
+    print(json.dumps({"type": "thread.started", "thread_id": "550e8400-e29b-41d4-a716-446655440000"}))
+pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[],"prior_fixed":[]}' if "--output-schema" in args else "Architecture advice")
+""")
+        fake.chmod(0o755)
+        self.env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"])
+        self.git("init", "-q", "-b", "main")
+        for name in ("app.py", ".env", "credentials/example.py", "secrets.yaml", "aws-credentials.toml", "service-account-prod-us.yaml"):
+            p = self.repo / name
+            p.parent.mkdir(exist_ok=True)
+            p.write_text("example = 1\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "baseline")
+        self.git("switch", "-qc", "t/1-example")
+
+    def git(self, *args):
+        return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                                        "-c", "commit.gpgsign=false", *args], cwd=self.repo, text=True).strip()
+
+    def call(self, *args):
+        return subprocess.run([str(TOOL), *args], cwd=self.repo, env=self.env,
+                              capture_output=True, text=True)
+
+    def test_repo_review_is_astra_and_only_sees_snapshot(self):
+        (self.repo / "private.py").write_text("ignored by snapshot")
+        p = self.call("repo-review")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        call = json.loads(self.log.read_text())
+        self.assertIn("source/app.py", call["files"])
+        self.assertFalse(any(".env" in x or "credentials" in x or "service-account" in x or "secrets.yaml" in x or "private.py" in x for x in call["files"]))
+        self.assertIn("gpt-6-astra", call["args"])
+        self.assertIn("never", call["args"])
+
+    def test_snapshot_rejects_credential_documents_before_reading_blobs(self):
+        module = runpy.run_path(str(TOOL))
+        original = module["git"]
+        forbidden = set()
+        names = ["prod-credentials.md", "service-account-prod-us.yaml"]
+        for name in names:
+            (self.repo / name).write_text("test fixture for " + name)
+            self.git("add", name)
+            forbidden.add(self.git("rev-parse", ":" + name))
+        self.git("commit", "-qm", "credential filename fixtures")
+
+        def traced(repo, *argv):
+            if argv[:2] == ("cat-file", "blob"):
+                self.assertNotIn(argv[2], forbidden)
+            return original(repo, *argv)
+
+        with patch.dict(module["snapshot"].__globals__, git=traced):
+            files, _ = module["snapshot"](self.repo, self.git("rev-parse", "HEAD"), self.root / "copy", [])
+        self.assertIn("app.py", files)
+        self.assertTrue(set(names).isdisjoint(files))
+
+    def test_architect_for_a_new_directory(self):
+        p = self.call("architect", "--repo", str(self.root / "future"), "--brief", "Python task tracker")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("Python task tracker", json.loads(self.log.read_text())["input"])
+        self.assertFalse((self.root / "future").exists())
+
+    def test_cmux_architect_continues_its_session_only(self):
+        cmux = self.root / "cmux"
+        cmux.write_text("#!/usr/bin/env python3\nimport json, pathlib, sys\n"
+                        "pathlib.Path(__file__).with_name('split.json').write_text(json.dumps(sys.argv[1:]))")
+        cmux.chmod(0o755)
+        self.env.update(CMUX_WORKSPACE_ID="workspace:17", CMUX_SURFACE_ID="surface:30", TMPDIR=str(self.root))
+        p = self.call("architect", "--terminal", "--brief", "A project; touch nope")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        argv = json.loads((self.root / "split.json").read_text())
+        self.assertIn("workspace:17", argv)
+        self.assertIn("surface:30", argv)
+        command = argv[argv.index("--command") + 1]
+        self.assertNotIn("touch nope", command)
+        folder = Path(shlex.split(command)[1])
+        reply = subprocess.run(["/bin/sh", "-c", command], env=dict(self.env, TMPDIR="/tmp"), input="What about storage?\n/exit\n",
+                               capture_output=True, text=True)
+        self.assertEqual(reply.returncode, 0, reply.stderr)
+        call = json.loads(self.log.read_text())
+        self.assertIn("--ignore-user-config", call["args"])
+        self.assertNotIn("--ephemeral", call["args"])
+        self.assertEqual(call["args"][call["args"].index("resume") + 1], "550e8400-e29b-41d4-a716-446655440000")
+        self.assertEqual(call["input"], "What about storage?")
+        self.assertFalse(folder.exists())
+
+    def test_committed_sensitive_rule_survives_worktree_edit(self):
+        settings = self.repo / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text(json.dumps({"env": {"HARNESS_SENSITIVE_PATHS": "app.py"}}))
+        self.git("add", ".claude/settings.json")
+        self.git("commit", "-qm", "protected source")
+        settings.write_text("{}")
+        p = self.call("repo-review")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("source/app.py", json.loads(self.log.read_text())["files"])
+
+    def test_check_preserves_missing_final_newline(self):
+        (self.repo / ".gitattributes").write_text("app.py -diff\n")
+        self.git("add", ".gitattributes")
+        (self.repo / "app.py").write_bytes(b"first")
+        self.git("commit", "-qam", "no final newline")
+        base = self.git("rev-parse", "HEAD")
+        (self.repo / "app.py").write_bytes(b"second")
+        self.git("commit", "-qam", "change")
+        p = self.call("check", "--head", self.git("rev-parse", "HEAD"), "--base", base)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        patch = json.loads(self.log.read_text())["patch"]
+        self.assertIn("-first\n", patch)
+        self.assertIn("+second\n", patch)
+        self.assertEqual(patch.count("No newline at end of file"), 2)
+
+    def test_check_uses_sol_and_refuses_unreviewable_change(self):
+        (self.repo / "app.py").write_text("example = 2\n")
+        self.git("commit", "-qam", "change")
+        p = self.call("check", "--head", self.git("rev-parse", "HEAD"), "--base", self.git("rev-parse", "main"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)["findings"], [])
+        self.assertIn("gpt-6.2-sol", json.loads(self.log.read_text())["args"])
+        (self.repo / ".env").write_text("fixture changed")
+        self.git("commit", "-qam", "excluded")
+        self.log.unlink()
+        p = self.call("check", "--head", self.git("rev-parse", "HEAD"), "--base", self.git("rev-parse", "main"))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertFalse(self.log.exists())

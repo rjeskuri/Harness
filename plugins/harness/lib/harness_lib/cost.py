@@ -514,6 +514,11 @@ def extras(record):
         out.append("CI: " + ", ".join(pieces))
     if record["needs_input"] is not None:
         out.append(f"Needs input: {record['needs_input']}")
+    gap = (record.get("timeline") or {}).get("longest_gap")
+    if gap:
+        left, right = gap["from"], gap["to"]
+        out.append(f"Longest observed gap: {left['event']} ({left['at']}) to {right['event']} ({right['at']}), "
+                   f"{duration_text(gap['seconds'] * 1000)}")
     return out
 
 
