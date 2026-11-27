@@ -190,9 +190,3 @@ def wave_state(wave, statuses):
     if review.get("launched_at"):
         return "reviewing"
     return "due"
-
-
-# --------------------------------------------------------------- the review marker
-def wave_marker(wave_id):
-    """The HTML comment a wave review's PR comment carries: <!-- harness-wave-review <id> -->."""
-    return f"<!-- harness-wave-review {wave_id} -->"
