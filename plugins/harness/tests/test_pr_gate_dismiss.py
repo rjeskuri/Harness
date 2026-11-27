@@ -42,6 +42,10 @@ RETRY = ("lib/cap.py", 17, "medium", "Cap is never checked on retry.")
 HANDLE = ("widget.py", 3, "medium", "Leaks the handle it opens.")        # a second finding at FROBS's place
 SHIFTED = ("widget.py", 5, "high", FROBS[3])                              # FROBS raised again two lines down
 LOW = ("docs/notes.md", 4, "low", "Mention the flag in the notes.")
+MOVED = ("widget.py", 12, "high", "Frobs twice when the cache is cold.")  # inline, posted at 12 (see posted)
+OLD = ("docs/old.md", None, "medium", "Still names the old flag.")      # listed with no line (posted)
+GONE = ("lib/gone.py", None, "high", "The moved helper lost its lock.")
+OLD_AT = ("docs/old.md", 4, "medium", "The example uses the old flag.")  # a lined finding at OLD's path
 LOGIN = {"match": ["api", "user"], "stdout": OWNER + "\n"}
 
 
@@ -62,6 +66,16 @@ def selector(finding):
 
 def owner_dismissal(finding, number=34, hour=11, why="out of scope, #500 owns it"):
     return note(OWNER, hour, dismiss(finding, why), number)
+
+
+def posted(rid, when, inline=(), body_only=(), now=None, **kw):
+    """pr_support.harness_review, then: a body finding whose line is None listed with no line (``- `path` [sev]
+    body``, as harness-pr findings lists one carried across a rename), and each inline comment whose (path, line as
+    posted) `now` maps sitting at that line on the head instead (a push moved it; its original_line stays)."""
+    review, comments = harness_review(rid, when, inline=inline, body_only=body_only, **kw)
+    review = dict(review, body=review["body"].replace(":None` [", "` ["))
+    now = now or {}
+    return review, [dict(c, line=now.get((c["path"], c["original_line"]), c["line"])) for c in comments]
 
 
 def snapshot_calls(reviews, pr=34):
@@ -137,10 +151,11 @@ class GateDismissals(LandBase):
         self.fail(f"no refusal naming the latest harness review in:\n{p.stdout}{p.stderr}")
 
     def assertBlocking(self, p, kept, gone=(), unlisted=0):
-        """The refusal names each finding `kept` and none `gone`, and counts the kept ones plus `unlisted`."""
+        """The refusal names each finding `kept` (one listed with no line by its path) and none `gone`, and counts
+        the kept ones plus `unlisted`."""
         listed = self.refusal(p)
         for path, line, _sev, body in kept:
-            self.assertIn(f"{path}:{line}", listed, p.stderr)
+            self.assertIn(path if line is None else f"{path}:{line}", listed, p.stderr)
             self.assertIn(body, listed, p.stderr)
         for finding in gone:
             self.assertNotIn(finding[3], listed, p.stderr)
@@ -462,6 +477,80 @@ class GateDismissals(LandBase):
                 self.assertNotLanded(p)
                 self.assertBlocking(p, [FROBS, STALE])
                 self.assertTrue([w for w in self.warnings(p) if FAILED in w], p.stderr)
+
+    def test_a_moved_inline_finding_is_named_where_a_selector_matches_it(self):
+        """A push (a clean catch-up merge, say) moved two inline findings: each comment sits lower on the head
+        (`line`) than where it was posted (`original_line`). Both refusals name them where they were posted, the
+        place a `dismiss` selector matches, not where they sit now; the owner's `dismiss` of those places (and of the
+        body finding) lets both gates through."""
+        reviews = [posted(101, at(10), inline=[MOVED, RETRY], body_only=[STALE],
+                          now={(MOVED[0], MOVED[1]): 14, (RETRY[0], RETRY[1]): 21})]
+        notes = {12: [owner_dismissal(STALE, 12, 11, "docs only")],
+                 34: [owner_dismissal(MOVED), owner_dismissal(RETRY, 34, 12, "capped upstream")]}
+        for gate, run, refused, passed in (("ready", self.ready, self.assertNotReady, self.assertReady),
+                                           ("land", self.land, self.assertNotLanded, self.assertLanded)):
+            with self.subTest(gate=gate, comments=False):
+                p = run(reviews)
+                refused(p)
+                self.assertBlocking(p, [MOVED, RETRY, STALE])
+                for now in ("widget.py:14", "lib/cap.py:21"):
+                    self.assertNotIn(now, self.refusal(p))
+            with self.subTest(gate=gate):
+                passed(run(reviews, notes))
+
+    def test_a_path_only_selector_dismisses_the_finding_listed_without_a_line(self):
+        """A finding the review lists with no line (``- `path` [sev] body``) is dismissed by the owner's standalone
+        `dismiss <path> <why>` (in backticks or not, a leading ./ dropped): it selects the line-less finding at that
+        path, never one with a line there, which stays blocking with one warning `no finding at <path> before the
+        comment`; with no reason it dismisses nothing (`no reason given`)."""
+        two = note(OWNER, 11, "Carried over from the rename.\ndismiss docs/old.md renamed in #510\n"
+                   "dismiss `./lib/gone.py` the lock moved with it", 12)
+        rows = [  # (name, inline, body_only, comments, left, dismissed, the one warning's needles)
+            ("two listed without a line, plain and in backticks", [FROBS], [OLD, GONE],
+             {12: [two], 34: [owner_dismissal(FROBS)]}, [], [FROBS, OLD, GONE], ()),
+            ("a line-less finding beside a lined one at its path", [OLD_AT], [OLD, STALE],
+             {34: [note(OWNER, 11, "dismiss docs/old.md renamed in #510", 34), owner_dismissal(STALE, 34, 12)]},
+             [OLD_AT], [OLD, STALE], ()),
+            ("a path-only selector where the finding has a line", [FROBS], [STALE],
+             {34: [owner_dismissal(FROBS), note(OWNER, 12, "dismiss docs/count.md docs only", 34)]}, [STALE],
+             [FROBS], ("no finding at docs/count.md before the comment",)),
+            ("no reason", [FROBS], [OLD],
+             {34: [owner_dismissal(FROBS), note(OWNER, 12, "dismiss docs/old.md", 34)]}, [OLD], [FROBS],
+             ("docs/old.md", "no reason given")),
+        ]
+        name, inline, body_only, notes = rows[0][:4]
+        first = [posted(101, at(10), inline=inline, body_only=body_only)]
+        with self.subTest(name, gate="ready", comments=False):
+            p = self.ready(first)
+            self.assertNotReady(p)
+            self.assertBlocking(p, [FROBS, OLD, GONE])
+        for name, inline, body_only, notes, left, dismissed, warned in rows:
+            with self.subTest(name, gate="ready"):
+                p = self.ready([posted(101, at(10), inline=inline, body_only=body_only)], notes)
+                if left:
+                    self.assertNotReady(p)
+                    self.assertBlocking(p, left, dismissed)
+                else:
+                    self.assertReady(p)
+                if warned:
+                    self.assertWarnsOf(p, *warned)
+        name, notes = rows[0][0], rows[0][3]
+        with self.subTest(name, gate="land", comments=False):
+            p = self.land(first)
+            self.assertNotLanded(p)
+            self.assertBlocking(p, [FROBS, OLD, GONE])
+        with self.subTest(name, gate="land"):
+            self.assertLanded(self.land(first, notes))
+
+    def test_accept_findings_lands_reading_no_dismissal(self):
+        """`land --accept-findings` accepts every finding, so dismissals cannot change whether it lands and none is
+        read: with the owner's dismissal of one of its two blockers on the PR, it lands, makes no dismissal read
+        before the merge, and its one findings warning names both blockers, the dismissed one too."""
+        reviews = [harness_review(101, at(10), inline=[FROBS], body_only=[STALE])]
+        p = self.land(reviews, {34: [owner_dismissal(FROBS)]}, flags=("--accept-findings",))
+        self.assertLanded(p)
+        self.assertEqual(self.dismissal_reads(before_merge=True), [])
+        self.assertWarnsOf(p, selector(FROBS), FROBS[3], selector(STALE), STALE[3])
 
 
 if __name__ == "__main__":
