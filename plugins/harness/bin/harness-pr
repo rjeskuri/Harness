@@ -52,11 +52,13 @@ or of a commit the head adds only clean merges of main to (autoland.at_head), an
 findings whatever the commit dates; a failed read of these refuses too. A finding without a recognisable severity
 counts as high; low findings never refuse, and ready names them in one warning line. When the review's summary
 counts more high plus medium findings than it lists, the refusal says how many more (counted before dismissals).
-A high or medium finding the owner dismissed (#516: his `dismiss <path>:<line> <why>` line on a ticket the gate
-reads or on the PR, harness_lib/dismissals.py, read only when such a finding is listed) refuses neither ready nor
-land; a request that dismisses nothing and a failed read are each one warning, and a failed read keeps every
-finding counted. --accept-findings on land overrides only the findings (and a failed read of the review's inline
-comments); ready has no override. land on a PR that is already merged skips every check.
+A high or medium finding the owner dismissed (#516: his `dismiss <path>:<line> <why>` line, or `dismiss <path>
+<why>` for one listed with no line, on a ticket the gate reads or on the PR, harness_lib/dismissals.py, read only
+when such a finding is listed) refuses neither ready nor land; a request that dismisses nothing and a failed read
+are each one warning, and a failed read keeps every finding counted. Both name an inline finding at the line it
+was posted on, the place a selector matches. --accept-findings on land overrides only the findings (and a failed
+read of the review's inline comments) and reads no dismissal; ready has no override. land on a PR that is already
+merged skips every check.
 
 findings splits a review by the files the ticket branch changed (`git diff --name-only` from the merge-base of HEAD
 and origin/main, else main): high and medium on a changed file block, low on one is low, anything else is outside.
@@ -1257,9 +1259,10 @@ def review_findings(repo, slug, number, review):
     """([finding], unlisted) of a harness review: its findings as posted, dismissals.review_findings' dicts (path,
     line, severity, body: the body's list and the inline comments, none when it says "no findings"; a finding
     without a recognisable severity is high), each with `text`, how a refusal names it (`path:line [severity] body`,
-    an inline comment as it reads, cut to 100 characters). unlisted is how many more high plus medium findings the
-    summary line counts than are listed, the counts read by autoland.review_counts (a summary it cannot read: how
-    many more findings of any severity the total counts, each as high)."""
+    an inline comment as it reads at the line it was posted on, original_line else line, the place a `dismiss`
+    selector matches; cut to 100 characters). unlisted is how many more high plus medium findings the summary line
+    counts than are listed, the counts read by autoland.review_counts (a summary it cannot read: how many more
+    findings of any severity the total counts, each as high)."""
     body = review.get("body") or ""
     if body.startswith("Harness review: no findings."):
         return [], 0
@@ -1270,9 +1273,8 @@ def review_findings(repo, slug, number, review):
     for f in found[:listed]:
         place = f"{f['path']}:{f['line']}" if f["path"] and f["line"] is not None else f["path"] or "(no path)"
         f["text"] = f"{place} [{f['severity']}] {short(f['body'])}"
-    for f, c in zip(found[listed:], comments):
-        line = c.get("line") or c.get("original_line")
-        place = f"{c.get('path') or '(no path)'}" + (f":{line}" if line else "")
+    for f, c in zip(found[listed:], comments):        # at the line a selector matches: where it was posted (#516)
+        place = f"{c.get('path') or '(no path)'}" + (f":{f['line']}" if f["line"] is not None else "")
         f["text"] = f"{place} {short((c.get('body') or '').replace(MARKER, '').strip())}"
     counts = review_counts(body)
     if counts is not None:
@@ -1311,10 +1313,10 @@ def review_gate(repo, number):
 
 def undismissed(repo, number, tickets, reviews, blocking):
     """The `blocking` findings the owner has not dismissed (#516, harness_lib.dismissals): his `dismiss <path>:<line>
-    <why>` lines on the tickets `tickets()` names and on PR `number`, each resolved in the PR's harness reviews
-    (`reviews` as the gate read them; each one's inline comments read again) and matched by finding_key. Any failed
-    read, `tickets()` included, is one warning naming it, and every finding still counts; each request that
-    dismisses nothing is one warning naming its selector and why."""
+    <why>` and `dismiss <path> <why>` lines on the tickets `tickets()` names and on PR `number`, each resolved in the
+    PR's harness reviews (`reviews` as the gate read them; each one's inline comments read again) and matched by
+    finding_key. Any failed read, `tickets()` included, is one warning naming it, and every finding still counts;
+    each request that dismisses nothing is one warning naming its selector and why."""
     try:
         requests = dismissals.read(repo.root, tickets(), number)
         snapshots = dismissals.github_snapshots(repo.root, number, reviews)
@@ -1909,8 +1911,8 @@ def land_gate(repo, number, view, accept):
     judged at the head whatever the commit dates (review_gate's date rule is ready's only), less those the owner
     dismissed (undismissed: the tickets the PR closes and the PR itself). No harness review proceeds; low findings
     never refuse. A failed read the head checks need refuses whatever the flags; --accept-findings turns only the
-    findings refusal, or a failed read of the review's inline comments, into a warning (a failed dismissal read is
-    a warning either way)."""
+    findings refusal, or a failed read of the review's inline comments, into a warning naming every listed high or
+    medium finding, and reads no dismissal (they cannot change whether it lands)."""
     main, head, branch = repo.main, str(view.get("headRefOid") or ""), str(view.get("headRefName") or "")
     try:
         if not head:
@@ -1950,7 +1952,7 @@ def land_gate(repo, number, view, accept):
              f"cannot check the harness review findings of PR #{number} ({err}); landing it (--accept-findings)")
         return
     blocking = [f for f in found if f["severity"] != "low"]
-    if blocking:                              # only a listed blocker reads the owner's dismissals (#516)
+    if blocking and not accept:               # a listed blocker, no override: read the owner's dismissals (#516)
         blocking = undismissed(repo, number, lambda: closing_numbers(view), reviews, blocking)
     if not blocking and not unlisted:
         return

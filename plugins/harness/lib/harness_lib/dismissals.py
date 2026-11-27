@@ -1,15 +1,18 @@
 """The owner's dismissals of review findings (#515): a standalone line `dismiss <path>:<line> <why>` in the owner's own
 comment on a ticket or its PR (owner_comments' rules: the authenticated login casefolded, the harness's own comments
 dropped) selects the finding at that place in the newest harness review posted before the comment, and that finding
-stops blocking by its finding_key ([path, body]) wherever it is raised again, whatever its line or severity. A
+stops blocking by its finding_key ([path, body]) wherever it is raised again, whatever its line or severity. A path
+with no `:<digits>` suffix alone, `dismiss <path> <why>` (#516), selects the finding listed with no line at that
+path (one carried across a rename, say), never one with a line there; a `(no path)` finding has no selector. A
 selector that names no finding, or several, or a line without a reason, dismisses nothing and is reported.
 
-A request is {"path", "line", "why", "at", "url", "source"}, `at` and `url` the comment's createdAt and url as given;
-a snapshot is {"at", "findings"}, one harness review's findings ({"path", "line", "severity", "body"}) and its
-submitted_at. A harness review is one by the authenticated account (anyone can type the marker) whose body ends with
-the trailer harness-pr appends. Times compare as parsed datetimes, a snapshot strictly older than the comment; a time
-that does not parse matches nothing. parse, resolve, apply and review_findings are pure; read and github_snapshots
-call gh through harness_lib.gh and harness_lib.issues and raise Problem on a failed read.
+A request is {"path", "line", "why", "at", "url", "source"}, `line` None for a path alone, `at` and `url` the
+comment's createdAt and url as given; a snapshot is {"at", "findings"}, one harness review's findings ({"path",
+"line", "severity", "body"}) and its submitted_at. A harness review is one by the authenticated account (anyone can
+type the marker) whose body ends with the trailer harness-pr appends. Times compare as parsed datetimes, a snapshot
+strictly older than the comment; a time that does not parse matches nothing. parse, resolve, apply and
+review_findings are pure; read and github_snapshots call gh through harness_lib.gh and harness_lib.issues and raise
+Problem on a failed read.
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -26,8 +29,9 @@ from harness_lib.issues import PAGE, REPO, Rest, rows
 from harness_lib.reviews import finding_key
 from harness_lib.text import first_line, parse_iso
 
-# `dismiss` first on its line, then path:line (in backticks or not, a leading ./ dropped), then the reason
-REQUEST = re.compile(r"[ \t]*dismiss[ \t]+(`?)(?:\./)?([^\s`]+):([0-9]+)\1(?:\s+(.*))?", re.I)
+# `dismiss` first on its line, then path:line, or a path alone with no :<digits> suffix (in backticks or not, a
+# leading ./ dropped), then the reason; the lazy path takes a :<digits> suffix as the line whenever there is one
+REQUEST = re.compile(r"[ \t]*dismiss[ \t]+(`?)(?:\./)?([^\s`]+?)(?::([0-9]+))?\1(?:\s+(.*))?", re.I)
 DIGITS = re.compile(r"[0-9]+")                 # ASCII only: str.isdigit() also passes digits int() refuses
 LISTED = "Not on a changed line:"            # review_body's heading over the findings in the body
 ENTRY = re.compile(r"- (`([^`]*)`|\(no path\)) (.*)")
@@ -41,14 +45,15 @@ TRAILER = re.compile(re.escape(INLINE_TRAILER)
 
 
 def parse(comments, login, source):
-    """One request per standalone `dismiss <path>:<line> <why>` line of the owner's own comments, in comment then
-    line order; `why` is "" when the line gives none."""
+    """One request per standalone `dismiss <path>:<line> <why>` or `dismiss <path> <why>` line of the owner's own
+    comments, in comment then line order; `line` is None for a path alone, `why` "" when the line gives none."""
     out = []
     for c in oc.owner_comments(comments, login):
         for line in (c.get("body") or "").splitlines():
             m = REQUEST.fullmatch(line)
             if m:
-                out.append({"path": m.group(2), "line": int(m.group(3)), "why": (m.group(4) or "").strip(),
+                out.append({"path": m.group(2), "line": None if m.group(3) is None else int(m.group(3)),
+                            "why": (m.group(4) or "").strip(),
                             "at": c.get("createdAt"), "url": c.get("url"), "source": source})
     return out
 
@@ -65,10 +70,11 @@ def _at(item):
 
 def resolve(requests, snapshots):
     """(dismissed, unmatched): each request, earliest first, matched in the newest snapshot strictly older than its
-    comment that holds a finding at its path and line. One finding_key there dismisses it ({"key", "path", "line",
-    "why", "at", "url", "source"}; a key already dismissed by an earlier request is not repeated); otherwise it is
-    unmatched ({"selector", "reason", "at", "url", "source"}): no reason given, no finding at the place before the
-    comment, or ambiguous, the findings at the place counted."""
+    comment that holds a finding at its path and line; a request whose line is None (a path alone) matches only the
+    findings with no line at its path. One finding_key there dismisses it ({"key", "path", "line", "why", "at",
+    "url", "source"}; a key already dismissed by an earlier request is not repeated); otherwise it is unmatched
+    ({"selector", "reason", "at", "url", "source"}, the selector `path:line`, or the path alone): no reason given,
+    no finding at the place before the comment, or ambiguous, the findings at the place counted."""
     timed = []
     for s in snapshots:
         when = parse_iso(s.get("at")) if isinstance(s, dict) else None
@@ -78,14 +84,16 @@ def resolve(requests, snapshots):
     dismissed, unmatched, keys = [], [], set()
     for req in sorted((r for r in requests if isinstance(r, dict)), key=_at):
         path, line = req.get("path"), _line(req.get("line"))
-        selector = f"{path}:{req.get('line')}"
+        alone = req.get("line") is None             # `dismiss <path> <why>`: the finding listed with no line there
+        selector = f"{path}" if alone else f"{path}:{req.get('line')}"
         why = (req.get("why") or "").strip()
         when = parse_iso(req.get("at"))
         found = []
-        if why and when is not None and line is not None:
+        if why and when is not None and (bool(path) if alone else line is not None):
             for at, findings in timed:
                 if at < when:
-                    found = [f for f in findings if f.get("path") == path and _line(f.get("line")) == line]
+                    found = [f for f in findings if f.get("path") == path
+                             and (f.get("line") is None if alone else _line(f.get("line")) == line)]
                     if found:
                         break
         distinct = {tuple(finding_key(f)) for f in found}
