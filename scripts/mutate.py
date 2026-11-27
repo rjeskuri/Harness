@@ -136,41 +136,49 @@ class Sites(ast.NodeVisitor):
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
+    # deadcode: keep (ast.NodeVisitor dispatches visit_<Node> by name)
     def visit_arguments(self, node: ast.arguments) -> None:
         for default in node.defaults + [d for d in node.kw_defaults if d is not None]:
             self.visit(default)
 
+    # deadcode: keep (ast.NodeVisitor dispatches visit_<Node> by name)
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         self.visit(node.target)
         if node.value is not None:
             self.visit(node.value)
 
+    # deadcode: keep (ast.NodeVisitor dispatches visit_<Node> by name)
     def visit_JoinedStr(self, node: ast.AST) -> None:
         pass  # inside an f-string: a string, and 3.9's positions there are unreliable
 
+    # deadcode: keep (ast.NodeVisitor dispatches visit_<Node> by name)
     def visit_Compare(self, node: ast.Compare) -> None:
         for left, op, right in zip([node.left] + node.comparators, node.ops, node.comparators):
             if type(op) in OPS:
                 self.token(left, right, OPS[type(op)], SWAP[OPS[type(op)]])
         self.generic_visit(node)
 
+    # deadcode: keep (ast.NodeVisitor dispatches visit_<Node> by name)
     def visit_BinOp(self, node: ast.BinOp) -> None:
         if type(node.op) in (ast.Add, ast.Sub, ast.Mult):
             self.token(node.left, node.right, OPS[type(node.op)], SWAP[OPS[type(node.op)]])
         self.generic_visit(node)
 
+    # deadcode: keep (ast.NodeVisitor dispatches visit_<Node> by name)
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         if type(node.op) in (ast.Add, ast.Sub, ast.Mult):
             text = OPS[type(node.op)]
             self.token(node.target, node.value, text + "=", SWAP[text] + "=")
         self.generic_visit(node)
 
+    # deadcode: keep (ast.NodeVisitor dispatches visit_<Node> by name)
     def visit_BoolOp(self, node: ast.BoolOp) -> None:
         text = OPS[type(node.op)]
         for left, right in zip(node.values, node.values[1:]):
             self.token(left, right, text, SWAP[text])
         self.generic_visit(node)
 
+    # deadcode: keep (ast.NodeVisitor dispatches visit_<Node> by name)
     def visit_UnaryOp(self, node: ast.UnaryOp) -> None:
         if isinstance(node.op, (ast.Not, ast.USub)):
             operand = self.data[self.pos(node.operand.lineno, node.operand.col_offset):
@@ -178,6 +186,7 @@ class Sites(ast.NodeVisitor):
             self.span(node, b"(" + operand + b")", ("not" if isinstance(node.op, ast.Not) else "-") + " -> (removed)")
         self.generic_visit(node)
 
+    # deadcode: keep (ast.NodeVisitor dispatches visit_<Node> by name)
     def visit_Constant(self, node: ast.Constant) -> None:
         if isinstance(node.value, bool):
             self.span(node, str(not node.value).encode(), f"{node.value} -> {not node.value}")

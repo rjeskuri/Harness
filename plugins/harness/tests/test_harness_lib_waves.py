@@ -1,4 +1,4 @@
-"""Tests for harness_lib/waves.py (ticket #179, epic #172): wave records, progress and the review marker.
+"""Tests for harness_lib/waves.py (ticket #179, epic #172): wave records and progress.
 
 A wave is the set of tickets one `harness-work dispatch` launched. Its record lives at
 ~/.claude/harness/repos/<key>/waves/<id>.json:
@@ -12,8 +12,7 @@ A wave is the set of tickets one `harness-work dispatch` launched. Its record li
 - ticket_statuses(key, tickets) from repos/<key>/tickets/<n>.json's `status`; progress(wave, statuses):
   in-review and closed are done, anything else (no cache included) waits; complete when the wave has
   tickets and none waits. wave_state: empty, working, due, reviewing, reviewed.
-- drop_ticket moves a ticket from `tickets` to `dropped`; wave_marker writes
-  `<!-- harness-wave-review <id> -->`.
+- drop_ticket moves a ticket from `tickets` to `dropped`.
 
 Every fixture is written here, in a temporary HOME. Expected values are computed here from the schema
 (ids from the UTC time of `at`, statuses from the fixture table), never by the code under test.
@@ -67,7 +66,7 @@ UTC = dt.timezone.utc
 STATUSES = ("ready", "in-progress", "in-review", "blocked", "needs-input", "closed", None)
 DONE_STATUSES = ("in-review", "closed")
 PUBLIC = ("waves_dir", "wave_path", "create_wave", "load_wave", "load_waves", "save_wave", "wave_of",
-          "ticket_statuses", "progress", "wave_state", "drop_ticket", "wave_marker")
+          "ticket_statuses", "progress", "wave_state", "drop_ticket")
 
 
 def load_waves_module() -> types.ModuleType:
@@ -107,10 +106,6 @@ def order_key(wave: dict):
     ident = wave["id"]
     n = int(ident.split("-", 1)[1]) if "-" in ident else 1
     return (wave["created_at"], n)
-
-
-def marker(ident: str) -> str:
-    return f"<!-- harness-wave-review {ident} -->"
 
 
 def expected_progress(tickets, statuses):
@@ -612,15 +607,6 @@ class WaveState(Base):
             want = after_complete[name] if all(s in DONE_STATUSES for s in combo) else "working"
             with self.subTest(statuses=statuses, review=name):
                 self.assertEqual(self.w.wave_state(wave, statuses), want)
-
-
-# =============================================================== marker
-class Marker(Base):
-    def test_wave_marker(self):
-        ids = ["w20261022140859", "w20261022140859-2", "w20270101000000-10", "w19991231235959"]
-        for ident in ids:
-            with self.subTest(ident=ident):
-                self.assertEqual(self.w.wave_marker(ident), marker(ident))
 
 
 # =============================================================== drop_ticket
