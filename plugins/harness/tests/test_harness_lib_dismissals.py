@@ -13,10 +13,14 @@ which review findings they stop from blocking.
 - apply(findings, dismissed) -> (kept, dropped): exactly the findings whose finding_key is dismissed are dropped,
   each with the dismissal's `why` and `url` added, whatever its line or severity;
 - review_findings(review, comments): the findings harness-pr posted (review_body and post_review), inline and in the
-  body, a multi-line body restored, a missing or unknown severity read as high;
+  body, a multi-line body restored, a missing or unknown severity read as high; an inline comment sits where it was
+  posted (original_line, else line), and only the trailer post_review appends is stripped from it, so a finding that
+  quotes the marker comes back with its own body and key;
 - read(cwd, tickets, pr) and github_snapshots(cwd, pr, reviews=None): the requests on the tickets and the PR ordered
-  by time, and one {"at", "findings"} per marked review on the PR, oldest first; every gh call goes through
-  harness_lib.gh (so the gh call log counts it), and a failed read raises Problem.
+  by time, and one {"at", "findings"} per harness review on the PR, oldest first: a review by the authenticated
+  account (gh api user, casefolded) whose body ends with the generated marker (then, optionally, the GPT receipt),
+  read from GitHub or given; every gh call goes through harness_lib.gh (so the gh call log counts it), and a failed
+  read raises Problem.
 
 The pure functions run in process on fixtures written here; the readers run against fakegh.py as HARNESS_GH (its REST
 world for the comments, rest entries for the reviews), in a temporary HOME. Orders the ticket leaves open (the
@@ -116,9 +120,13 @@ def review(rid, hhmm, body, login=OWNER):
             "commit_id": "a" * 40, "html_url": f"https://github.com/o/r/pull/7#pullrequestreview-{rid}"}
 
 
-def inline(cid, path, line, text, original_line=None):
-    """An inline review comment as post_review posts it: `[sev] body`, a blank line, the review marker."""
-    return {"id": cid, "path": path, "line": line, "original_line": original_line if original_line else line,
+SAME = object()
+
+
+def inline(cid, path, line, text, original_line=SAME):
+    """An inline review comment as post_review posts it: `[sev] body`, a blank line, the review marker. GitHub's
+    original_line is where it was posted (the line itself unless given), line where it sits on the PR's head now."""
+    return {"id": cid, "path": path, "line": line, "original_line": line if original_line is SAME else original_line,
             "side": "RIGHT", "body": f"{text}\n\n{REVIEW_MARK}"}
 
 
@@ -144,13 +152,13 @@ BODY_FINDINGS = [
 INLINE = [
     inline(1, "src/app.py", 7, "[high] Inline high."),
     inline(2, "src/app.py", None, "[medium] Outdated now.\nSecond line.", original_line=21),   # line null: outdated
-    inline(3, "lib/db.py", 3, "No severity prefix.", original_line=2),
-    inline(4, "lib/db.py", 9, "[low] Minor."),
+    inline(3, "lib/db.py", 3, "No severity prefix.", original_line=2),   # posted at 2, a push moved it to 3
+    inline(4, "lib/db.py", 9, "[low] Minor.", original_line=None),       # no original_line: at line
 ]
 INLINE_FINDINGS = [
     F("src/app.py", 7, "high", "Inline high."),
     F("src/app.py", 21, "medium", "Outdated now.\nSecond line."),
-    F("lib/db.py", 3, "high", "No severity prefix."),
+    F("lib/db.py", 2, "high", "No severity prefix."),
     F("lib/db.py", 9, "low", "Minor."),
 ]
 NO_FINDINGS = "Harness review: no findings. Checked: the diff against the ticket's definition of done"
@@ -386,6 +394,30 @@ class ReviewFindings(Base):
         self.assertEqual(self.apply(BODY_FINDINGS, dismissed),
                          ([BODY_FINDINGS[0]] + BODY_FINDINGS[2:], [dropped(BODY_FINDINGS[1], req)]))
 
+    def test_a_finding_that_quotes_the_marker_round_trips(self):
+        """Only the trailer post_review appends to an inline comment (a blank line, then the marker) is the marker:
+        a finding whose own text quotes it comes back with that text, so its finding_key is the original's."""
+        quoted = [F("src/review.py", 8, "medium", f"review_findings drops every {REVIEW_MARK}, quoted ones too."),
+                  F("src/review.py", 20, "high", f"A body may end with the marker:\n{REVIEW_MARK}")]
+        outside = F("src/review.py", 30, "low", f"Not inline, and it quotes {REVIEW_MARK} as well.")
+        findings = quoted + [outside]
+        # built as post_review builds them: `[sev] body`, a blank line, the marker; the rest listed as review_body does
+        comments = [{"id": 90 + i, "path": f["path"], "line": f["line"], "original_line": f["line"], "side": "RIGHT",
+                     "body": f"[{f['severity']}] {f['body']}\n\n{REVIEW_MARK}"} for i, f in enumerate(quoted)]
+        rv = review(109, "09:00", "\n\n".join([
+            "Harness review (claude-opus-5-5): 3 findings, 1 high, 1 medium, 1 low.",
+            f"Not on a changed line:\n- `src/review.py:30` [low] {outside['body']}", REVIEW_MARK]))
+        restored = self.d.review_findings(rv, comments)
+        self.assertEqual(bag(restored), bag(findings))
+        # the owner's dismissal from the rebuilt snapshot drops the finding as the findings JSON raises it again
+        for f in findings:
+            with self.subTest(f["body"]):
+                req = request(f["path"], f["line"], "quoting it is the point", "10:00")
+                dismissed, _ = self.resolve([req], [{"at": rv["submitted_at"], "findings": restored}])
+                self.assertEqual(dismissed, [dismissal(req, [f["path"], f["body"]])])
+                self.assertEqual(self.apply(findings, dismissed),
+                                 ([g for g in findings if g is not f], [dropped(f, req)]))
+
 
 class GitHub(Base):
     """read and github_snapshots against fakegh's REST world, in a temporary HOME."""
@@ -432,12 +464,26 @@ class GitHub(Base):
                                             REVIEW_MARK, RECEIPT]))
     R103 = review(103, "11:45", f"{NO_FINDINGS}\n\n{REVIEW_MARK}")
     R104 = review(104, "09:30", "Looks fine to me.", login="someone")       # no marker: no harness review
-    REVIEWS = [R103, R101, R104, R102]
-    COMMENTS = {101: [inline(11, "src/app.py", 12, "[high] V12 overflows.")],
-                102: [inline(21, "src/app.py", 14, "[high] V12 overflows."),
+    # another account's review written like a harness one: it would make the owner's 10:00 `dismiss src/app.py:12`
+    # waive "Leaks the handle." and leave "V12 overflows." blocking
+    R105 = review(105, "09:40", "\n\n".join(["Harness review (claude-opus-5-5): 1 finding, 1 high, 0 medium, 0 low.",
+                                            REVIEW_MARK]), login="someone")
+    # the owner's own reviews citing the marker, not ending with it: no harness reviews
+    R106 = review(106, "10:45", f"Read it by hand: harness-pr ends its reviews with {REVIEW_MARK}, so this one is "
+                                "not the loop's.\n\nOne question inline.")
+    R107 = review(107, "10:50", "\n\n".join(["Quoting the trailer the loop looks for:", REVIEW_MARK,
+                                            "This review is mine, not the loop's."]))
+    REVIEWS = [R103, R101, R106, R104, R105, R102, R107]
+    COMMENTS = {101: [inline(11, "src/app.py", 14, "[high] V12 overflows.", original_line=12)],   # posted at 12,
+                102: [inline(21, "src/app.py", 14, "[high] V12 overflows."),                     # pushed to 14 since
                       inline(22, "src/app.py", 12, "[high] Leaks the handle.")],
                 103: [],
-                104: [inline(41, "src/app.py", 12, "[high] Planted.")]}
+                104: [inline(41, "src/app.py", 12, "[high] Planted.")],
+                105: [inline(51, "src/app.py", 12, "[high] Leaks the handle.")],
+                106: [{"id": 61, "path": "src/app.py", "line": 14, "original_line": 14, "side": "RIGHT",
+                       "body": "Is this overflow reachable? I could not hit it."}],
+                107: [{"id": 71, "path": "src/app.py", "line": 14, "original_line": 14, "side": "RIGHT",
+                       "body": "Same question: is the overflow real?"}]}
     SNAPSHOTS = [
         (at("09:00"), [F("src/app.py", 30, "medium", "Unchecked None."), F("lib/db.py", 7, "low", "Slow query."),
                        F("src/app.py", 12, "high", "V12 overflows.")]),
@@ -507,6 +553,26 @@ class GitHub(Base):
         ran, logged = self.gh_calls()
         self.assertEqual(logged, ran, "every gh call goes through harness_lib.gh")
 
+    def test_only_the_owners_generated_reviews_are_snapshots(self):
+        """A stranger's review carrying the marker, and the owner's review citing it anywhere but as its trailer, are
+        no snapshots: the owner's dismissal still resolves to the harness finding it names."""
+        self.world()
+        r30, r12, r14, r7 = self.REQUESTS
+        latest = self.SNAPSHOTS[1][1]
+        cases = [("a stranger's marked review", self.R105, r12),
+                 ("the owner citing the marker in a sentence", self.R106, r14),
+                 ("the owner quoting the marker mid-review", self.R107, r14)]
+        for name, extra, req in cases:
+            with self.subTest(name):
+                snapshots = self.d.github_snapshots(self.tmp, 7, reviews=[extra, self.R102, self.R101])
+                self.assertEqual([self.parse_iso(s["at"]) for s in snapshots],
+                                 [self.parse_iso(at("09:00")), self.parse_iso(at("10:30"))])
+                dismissed, unmatched_ = self.resolve([req], snapshots)
+                self.assertEqual((dismissed, unmatched_), ([dismissal(req, ["src/app.py", "V12 overflows."])], []))
+                self.assertEqual(self.apply(latest, dismissed),
+                                 ([F("src/app.py", 12, "high", "Leaks the handle.")],
+                                  [dropped(F("src/app.py", 14, "high", "V12 overflows."), req)]))
+
     def test_a_failed_read_raises(self):
         self.world()                    # the fixture itself reads cleanly
         self.d.read(self.tmp, [12, 13], 7)
@@ -528,6 +594,7 @@ class GitHub(Base):
              [fakegh.rest_entry("pulls/7/reviews/102/comments", "GET", exact=True, **fail)], None),
             ("a given review's comments fail", "given",
              [fakegh.rest_entry("pulls/7/reviews/101/comments", "GET", exact=True, **fail)], None),
+            ("gh api user fails for the snapshots", "given", [], {"stderr": "HTTP 401: Bad credentials\n", "exit": 1}),
         ]
         reads["missing"] = lambda: self.d.read(self.tmp, [12, 99], 7)
         for name, which, overrides, login_answer in cases:

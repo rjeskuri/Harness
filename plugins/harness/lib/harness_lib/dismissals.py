@@ -6,9 +6,10 @@ selector that names no finding, or several, or a line without a reason, dismisse
 
 A request is {"path", "line", "why", "at", "url", "source"}, `at` and `url` the comment's createdAt and url as given;
 a snapshot is {"at", "findings"}, one harness review's findings ({"path", "line", "severity", "body"}) and its
-submitted_at. Times compare as parsed datetimes, a snapshot strictly older than the comment; a time that does not
-parse matches nothing. parse, resolve, apply and review_findings are pure; read and github_snapshots call gh through
-harness_lib.gh and harness_lib.issues and raise Problem on a failed read.
+submitted_at. A harness review is one by the authenticated account (anyone can type the marker) whose body ends with
+the trailer harness-pr appends. Times compare as parsed datetimes, a snapshot strictly older than the comment; a time
+that does not parse matches nothing. parse, resolve, apply and review_findings are pure; read and github_snapshots
+call gh through harness_lib.gh and harness_lib.issues and raise Problem on a failed read.
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -20,6 +21,7 @@ import re
 from harness_lib import owner_comments as oc
 from harness_lib.autoland import NO_FINDINGS, REVIEW_MARKER
 from harness_lib.cli import Problem
+from harness_lib.gh import gh
 from harness_lib.issues import PAGE, REPO, Rest, rows
 from harness_lib.reviews import finding_key
 from harness_lib.text import first_line, parse_iso
@@ -32,6 +34,10 @@ ENTRY = re.compile(r"- (`([^`]*)`|\(no path\)) (.*)")
 SEVERITY = re.compile(r"\[(\w+)\] ?(.*)", re.S)
 SEVERITIES = ("high", "medium", "low")
 CONTINUED = "  "                             # harness-pr's indented(): a body's further lines
+INLINE_TRAILER = "\n\n" + REVIEW_MARKER       # what post_review appends to an inline comment's `[sev] body`
+# a harness review body's end: the marker paragraph, then the GPT receipt (harness-pr's `harness-gpt-{uuid4()}`) or not
+TRAILER = re.compile(re.escape(INLINE_TRAILER)
+                     + r"(?:\n\n<!-- harness-gpt-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} -->)?\Z")
 
 
 def parse(comments, login, source):
@@ -130,8 +136,8 @@ def _finding(path, line, text):
 def review_findings(review, comments):
     """The findings of a harness review as harness-pr posted them: the ``- `path:line` [sev] body`` lines under the
     body's `Not on a changed line:` (their two-space continuation lines restored) and the inline `comments` (its
-    `.../reviews/<id>/comments`, `[sev] body` and the marker; at line, else original_line). [] for a review that
-    found nothing."""
+    `.../reviews/<id>/comments`, `[sev] body` and the trailer post_review appends, which alone is stripped; where
+    it was posted, original_line, else line). [] for a review that found nothing."""
     body = (review or {}).get("body") or ""
     if body.startswith(NO_FINDINGS):
         return []
@@ -158,8 +164,12 @@ def review_findings(review, comments):
     out = [_finding(path, line_no, "\n".join(text)) for path, line_no, text in found]
     for c in comments or []:
         if isinstance(c, dict):
-            text = (c.get("body") or "").replace(REVIEW_MARKER, "").strip()
-            out.append(_finding(c.get("path") or "", _line(c.get("line")) or _line(c.get("original_line")), text))
+            text = c.get("body") or ""
+            if text.endswith(INLINE_TRAILER):
+                text = text[:-len(INLINE_TRAILER)]
+            posted = _line(c.get("original_line"))
+            out.append(_finding(c.get("path") or "", posted if posted is not None else _line(c.get("line")),
+                                text.strip()))
     return out
 
 
@@ -169,15 +179,36 @@ def _list(rest, path):
     return rows(rest.json(args, args))
 
 
+def _login(cwd):
+    """The authenticated account's login casefolded, read as owner_comments.fetch reads it. Problem on a failed read
+    or an empty login."""
+    login = gh(["api", "user", "--jq", ".login"], cwd, pick=first_line).strip()
+    if not login:
+        raise Problem("gh api user printed no login")
+    return login.casefold()
+
+
+def _harness_review(r, login):
+    """Is `r` a harness review: by `login` (casefolded), its body ending with TRAILER, its submitted_at parsing?"""
+    if not isinstance(r, dict):
+        return False
+    user = r.get("user")
+    author = user.get("login") if isinstance(user, dict) else None
+    body = r.get("body")
+    return (isinstance(author, str) and author.casefold() == login and isinstance(body, str)
+            and TRAILER.search(body) is not None and parse_iso(r.get("submitted_at")) is not None)
+
+
 def github_snapshots(cwd, pr, reviews=None):
-    """One {"at", "findings"} per review on PR `pr` whose body carries the review marker, oldest first by
-    submitted_at (a review without one left out): `reviews` when given, else the PR's, each one's findings read
-    with its comments. Problem on a failed read."""
+    """One {"at", "findings"} per harness review on PR `pr`, oldest first by submitted_at: by the authenticated
+    account, its body ending with the marker (then the GPT receipt or not), any other review left out: `reviews`
+    when given, else the PR's, each one's findings read with its comments. Problem on a failed read, the login's
+    included."""
+    login = _login(cwd)
     rest = Rest(cwd, pick=first_line)
     if reviews is None:
         reviews = _list(rest, f"pulls/{pr}/reviews")
-    marked = [r for r in reviews if isinstance(r, dict) and REVIEW_MARKER in (r.get("body") or "")
-              and parse_iso(r.get("submitted_at")) is not None]
+    marked = [r for r in reviews if _harness_review(r, login)]
     marked.sort(key=lambda r: parse_iso(r.get("submitted_at")))
     out = []
     for r in marked:
