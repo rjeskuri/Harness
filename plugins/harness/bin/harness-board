@@ -61,6 +61,7 @@ try:
     from harness_lib.repo import RepoError, repo_facts
     from harness_lib.gh import describe, gh as lib_gh, gh_json as lib_gh_json
     from harness_lib.issues import Issues, Rest
+    from harness_lib.owner_comments import BOT_LOGINS, MARKER, NEEDS_INPUT, question_times, replies_since
     from harness_lib.routing import cached_code_route, code_route, label_tier, load_routing, review_route
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-board: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
@@ -106,13 +107,8 @@ OPS_SECTIONS = [("Request", "request"), ("Change", "change"), ("Source of truth"
                 ("Apply", "apply"), ("Verify", "verify"), ("Rollback", "rollback"), ("Context", "context")]
 ISSUE_FIELDS = "number,title,url,body,labels,state,parent,blockedBy,comments"
 PRESERVED = (("branch", None), ("worktree", None), ("started_at", None), ("attempts", []))
-NEEDS_INPUT = "**Needs your input**"
 PARKED = "**Parked**"           # the first line of the comment `park` posts
 RESOLUTION = "**Resolution**"   # the comment `harness-pr land` posts on a ticket it lands
-MARKER = "<!-- harness -->"     # the last line of every comment posted here
-BOT_LOGINS = ("github-actions[bot]", "github-actions")   # the deploy guard's author (REST, GraphQL), casefolded
-# the harness's own comments from before the marker, as their bodies start
-HARNESS_PREFIXES = (NEEDS_INPUT, "Started on ", "PR #", "Landed in ")
 EPIC_DONE = "All tasks landed."
 CONTEXT_LINES = 120     # the most lines `show --markdown` prints
 COMMENTS_SHOWN = 10     # the newest comments in the context
@@ -241,12 +237,6 @@ def marked(body):
     if lines and lines[-1].strip() == MARKER:
         return text
     return f"{text}\n\n{MARKER}" if text else MARKER
-
-
-def by_harness(body):
-    """Was this comment posted by the harness? The marker, or (older comments) a body the harness writes."""
-    body = body or ""
-    return MARKER in body or body.lstrip().startswith(HARNESS_PREFIXES)
 
 
 # --------------------------------------------------------------- labels, tiers, the cache
@@ -915,24 +905,12 @@ def cmd_answers(repo, args):
     login = gh(repo, ["api", "user", "--jq", ".login"]).strip()
     if not login:
         raise Problem("gh api user printed no login")
-    mine, asked = [], []
-    for c in issues(repo).comments(args.number):
-        author = (c.get("author") or {}).get("login") if isinstance(c.get("author"), dict) else None
-        body, when = c.get("body") or "", parse_iso(c.get("createdAt"))
-        question = when is not None and body.lstrip().startswith(NEEDS_INPUT)
-        if author and author.casefold() == login.casefold():
-            mine.append((author, c, body, when))
-            if question:
-                asked.append(when)
-        elif author and author.casefold() in BOT_LOGINS and question and MARKER in body:
-            asked.append(when)
+    comments = issues(repo).comments(args.number)
     if args.since is None:
+        asked = question_times(comments, login)
         since = max(asked) if asked else parse_iso((read_cache(repo, args.number) or {}).get("fetched_at"))
-    out = []
-    for author, c, body, when in mine:
-        if by_harness(body) or (since is not None and (when is None or when <= since)):
-            continue
-        out.append({"author": author, "created_at": c.get("createdAt"), "body": body, "url": c.get("url")})
+    out = [{"author": c["author"]["login"], "created_at": c.get("createdAt"), "body": c.get("body") or "",
+            "url": c.get("url")} for c in replies_since(comments, login, since)]
     emit(True, out, "")
 
 
