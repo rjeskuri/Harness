@@ -97,6 +97,7 @@ import re
 import shutil
 import subprocess
 import fcntl
+import hashlib
 import uuid
 import sys
 import tempfile
@@ -988,7 +989,8 @@ def gpt_brief(repo, number, ticket, rulings, review, prior_blockers):
     parent = ticket.get("parent") if isinstance(ticket.get("parent"), dict) else {}
     omitted, answers, ticket_context = [], [], sections.get("context") or ""
     if omit_private(repo.main):
-        omitted = [f"{key}: left out ({OMIT_PRIVATE})" for key in ("context.ticket_context", "binding.owner_answers")]
+        omitted = [f"context.ticket_context: left out ({OMIT_PRIVATE})",
+                   f"binding.owner_answers: the owner's answers withheld by the project setting {OMIT_PRIVATE}"]
         ticket_context = ""
     else:
         try:
@@ -1095,6 +1097,9 @@ def record_findings(args, repo=None):
         branch = TICKET_BRANCH.match(current_branch(repo.root) or "")
         if not args.head or not branch or int(branch.group(1)) != number:
             raise Problem("--gpt-check requires the pinned head of this ticket's branch")
+        field = secret_field({"context": {"rulings": rulings}})      # every path, a recovered post included
+        if field:
+            raise Problem(f"the brief's {field} holds a secret-shaped value; GPT check incomplete")
         pr = branch_pr(repo, number, head)
         if pr is None:
             raise Problem("open the draft PR before requesting the GPT check")
@@ -1111,16 +1116,16 @@ def record_findings(args, repo=None):
                 recovering = False
             else:
                 receipt.update(posted=False, review_id=None)
-        if recovering:
-            findings, reviewers = receipt["findings"], receipt["reviewers"]
-            unresolved = receipt.get("unresolved", [])
-        else:
-            if not args.review and not (previous and (previous.get("head") != head or receipt)):
-                raise Problem("a first review requires the Claude findings file; check --latest before retrying")
+        paired = previous and previous.get("reviewers")
+        refusal = None
+        if not args.review and not (previous and (previous.get("head") != head or receipt)):
+            refusal = "a first review requires the Claude findings file; check --latest before retrying"
+        elif previous and not paired and not args.review:
+            refusal = "previous review was local only; continue locally or obtain a fresh paired review"
+        if refusal and not recovering:
+            raise Problem(refusal)
+        if not (recovering and receipt["posted"]):                 # GitHub holds no review of this head yet
             ticket = show_ticket(repo, number)
-            paired = previous and previous.get("reviewers")
-            if previous and not paired and not args.review:
-                raise Problem("previous review was local only; continue locally or obtain a fresh paired review")
             prior_blockers = previous.get("blocking", []) if paired else []
             review_base = fork
             if paired:
@@ -1135,8 +1140,18 @@ def record_findings(args, repo=None):
             field = secret_field(brief)
             if field:
                 raise Problem(f"the brief's {field} holds a secret-shaped value; GPT check incomplete")
+            text = fitted_brief(brief)
+            digest = hashlib.sha256(text.encode()).hexdigest()
+            if recovering and receipt.get("brief_sha256") != digest:      # Sol checked other inputs: check again
+                if refusal:
+                    raise Problem(refusal)
+                recovering = False
+        if recovering:
+            findings, reviewers = receipt["findings"], receipt["reviewers"]
+            unresolved = receipt.get("unresolved", [])
+        else:
             reply = tool("harness-gpt", ["check", "--head", head, "--base", review_base, "--brief-stdin"],
-                         repo.root, stdin=fitted_brief(brief), timeout=1080)
+                         repo.root, stdin=text, timeout=1080)
             try:
                 report = json.loads(reply.stdout)
                 if report["head"] != head or report["model"] != "gpt-6.2-sol" or not isinstance(report["findings"], list):
@@ -1162,7 +1177,7 @@ def record_findings(args, repo=None):
                 raise Problem("GPT check did not return findings for the requested head") from None
             reviewers = ([args.model] if args.review else []) + [report["model"]]
             receipt = {"findings": findings, "reviewers": reviewers, "unresolved": unresolved,
-                       "marker": f"<!-- harness-gpt-{uuid.uuid4()} -->"}
+                       "brief_sha256": digest, "marker": f"<!-- harness-gpt-{uuid.uuid4()} -->"}
             write_json(receipt_path, receipt, prefix=".gpt-")
         model = " + ".join(reviewers)
         checked += f" (reviewed by {model})"
