@@ -4,7 +4,8 @@
 - load_rounds(key, ticket) reads rounds.json, [] when it is missing or broken;
 - save_round(key, ticket, rnd) appends the round and returns it numbered; a round whose head equals the
   latest round's replaces it and keeps its number (only the latest round is compared);
-- latest_round(key, ticket) is the last round or None; blocking(rnd) is the round's blocking findings.
+- latest_round(key, ticket) is the last round or None; blocking(rnd) is the round's blocking findings;
+- dismissed(rnd) is the round's optional `dismissed` findings (#515), [] when absent or broken.
 
 Choice the ticket left open, fixed here: save_round numbers the round itself (the caller's dict carries no
 `round`), so the number is the latest's plus one, or the latest's own on a replacement.
@@ -133,6 +134,36 @@ class Reviews(unittest.TestCase):
                 self.assertIsNone(r.latest_round(self.key, 12))
         self.assertEqual(r.save_round(self.key, 12, r2)["round"], 1)
         self.assertEqual(r.load_rounds(self.key, 12), [numbered(r2, 1)])
+
+    def test_dismissed_is_the_rounds_dismissed_findings(self):
+        # ticket #515: a round's optional `dismissed` list, each finding plus from, why and url
+        r = self.r
+        gone = dict(finding("src/app.py", 12, "high", "V12 overflows."),
+                    **{"from": "blocking", "why": "not reachable", "url": "https://github.com/o/r/issues/12#c-1"})
+        low = dict(finding("lib/db.py", 7, "low", "Slow query."),
+                   **{"from": "low", "why": "runs once a day", "url": "https://github.com/o/r/pull/7#c-2"})
+        kept = finding("src/app.py", 30, "medium", "Unchecked None.")
+        base = rnd("a" * 40, "m" * 40, blocking=[kept])
+        cases = [
+            ("two dismissed", dict(base, dismissed=[gone, low]), [gone, low]),
+            ("one dismissed", dict(base, dismissed=[low]), [low]),
+            ("absent", base, []),
+            ("empty", dict(base, dismissed=[]), []),
+            ("null", dict(base, dismissed=None), []),
+            ("not a list", dict(base, dismissed={"path": "src/app.py"}), []),
+            ("a string", dict(base, dismissed="src/app.py:12"), []),
+            ("entries that are no findings dropped", dict(base, dismissed=[gone, "x", None, 3, [], low]), [gone, low]),
+            ("no round", None, []),
+            ("a round that is no object", ["dismissed"], []),
+        ]
+        for name, value, want in cases:
+            with self.subTest(name):
+                self.assertEqual(r.dismissed(value), want)
+        # saved with the round and read back; blocking is unaffected
+        r.save_round(self.key, 21, dict(base, dismissed=[gone, low]))
+        latest = r.latest_round(self.key, 21)
+        self.assertEqual(r.dismissed(latest), [gone, low])
+        self.assertEqual(r.blocking(latest), [kept])
 
 
 if __name__ == "__main__":
