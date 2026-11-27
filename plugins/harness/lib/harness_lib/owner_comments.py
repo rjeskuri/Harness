@@ -94,8 +94,9 @@ def question_text(body):
 
 
 def evidence_start(lines):
-    """The index of the fenced block's opening line when the lines end with one (the evidence), else None. A fence
-    closes on a line of backticks alone at least as long as the one that opened it."""
+    """The index of the fenced block's opening line when the lines end with one opened by backticks alone (the
+    evidence: fenced_tail's fence carries no info string), else None. A fence closes on a line of backticks alone at
+    least as long as the one that opened it."""
     i, last = 0, None
     while i < len(lines):
         opened = FENCE.match(lines[i].strip())
@@ -112,7 +113,9 @@ def evidence_start(lines):
             return None                 # an unclosed fence is not an evidence block
         last = (i, j)
         i = j + 1
-    return last[0] if last and last[1] == len(lines) - 1 else None
+    if not last or last[1] != len(lines) - 1 or set(lines[last[0]].strip()) != {"`"}:
+        return None                     # a language-tagged block is the question's own, not evidence
+    return last[0]
 
 
 def answer_rounds(comments, login):

@@ -2311,6 +2311,7 @@ class ToolsRunTheLib(unittest.TestCase):
             return lib_obj(*args, **kwargs)
 
         for name in bound:
+            self.addCleanup(setattr, module, name, lib_obj)    # a shared lib module outlives the test
             setattr(module, name, recorder)
 
     def called(self, label: str) -> list:
@@ -2555,6 +2556,9 @@ class ToolsRunTheLib(unittest.TestCase):
             ("2026-10-16T07:00:00Z", ["the second"]),     # 09:30+02:00 is 07:30Z: newer
             ("2026-10-16T07:45:00Z", []),                 # and older than this
         ]
+        # the comment times are read in harness_lib.owner_comments (#513), which cmd_answers calls; spied once,
+        # as the shared module keeps the recorder until the test's cleanup
+        self.spy(lib_module("owner_comments"), self.text.parse_iso, "parse_iso")
         for since, want in cases:
             with self.subTest(since=since):
                 self.calls.clear()
@@ -2567,9 +2571,9 @@ class ToolsRunTheLib(unittest.TestCase):
                     _, out, _ = capture(board.cmd_answers, None, argparse.Namespace(number=12, since=since))
                 self.assertEqual([c["body"] for c in json.loads(out)], want)
                 parsed = set(self.given("parse_iso"))
-                self.assertTrue({c["createdAt"] for c in comments[:3]} <= parsed, parsed)
-                if since is not None:
-                    self.assertIn(since, parsed)
+                # the owner's replies are compared through it; the question's time when it is the bound
+                self.assertTrue({comments[0]["createdAt"], comments[2]["createdAt"]} <= parsed, parsed)
+                self.assertIn(since if since is not None else comments[1]["createdAt"], parsed)
         self.calls.clear()
         board = load_tool(BIN / "harness-board")
         board.gh = board.gh_json = lambda *args, **kwargs: self.fail("gh ran before --since was checked")

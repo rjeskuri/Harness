@@ -76,6 +76,7 @@ def round_(question, at, answers):
             "answers": [{"at": f"2026-10-13T{a}:00Z", "body": b} for a, b in answers]}
 
 
+OPTIONS_Q = "Which command should the deploy run?\n\n```sh\nmake deploy\nmake deploy-safe\n```"
 GUARD_Q = "The deploy of #12 failed its live check and was reverted. Retry, or change the approach?"
 
 
@@ -204,6 +205,8 @@ class Rules(unittest.TestCase):
              "Which base?\n\nmain is two weeks stale."),
             ("from before the marker", question_body("And the name?", marked=False), "And the name?"),
             ("the deploy guard's", question_body(GUARD_Q, "```\ncurl: 502\n```"), GUARD_Q),
+            # no --evidence-file: the question's own language-tagged block stays (fenced_tail's fence is bare)
+            ("a fenced example, no evidence", question_body(OPTIONS_Q), OPTIONS_Q),
         ]
         for name, body, want in cases:
             with self.subTest(name):
