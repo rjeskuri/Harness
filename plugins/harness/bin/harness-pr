@@ -123,7 +123,8 @@ try:
     from harness_lib.issues import Issues, Rest
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
     from harness_lib.canary import SMOKE, run_canary
-    from harness_lib import dismissals
+    from harness_lib.dismissals import (apply as apply_dismissals, github_snapshots, read as read_dismissals,
+                                        resolve as resolve_dismissals, review_findings as lib_review_findings)
     from harness_lib.autoland import (CONVERSATION, at_head, behind_main, check_entries as lib_check_entries,
                                       evaluate, fetch_origin, gate_settings, gather_facts, overall, review_counts)
     from harness_lib.reviews import (add_rulings, add_ticket, finding_key, latest_round, load_rounds, load_tickets,
@@ -1268,7 +1269,7 @@ def review_findings(repo, slug, number, review):
         return [], 0
     comments = [c for c in api_list(repo, f"repos/{slug}/pulls/{number}/reviews/{review.get('id')}/comments")
                 if isinstance(c, dict)]
-    found = dismissals.review_findings(review, comments)
+    found = lib_review_findings(review, comments)
     listed = len(found) - len(comments)               # the body's list first, then one per inline comment in order
     for f in found[:listed]:
         place = f"{f['path']}:{f['line']}" if f["path"] and f["line"] is not None else f["path"] or "(no path)"
@@ -1318,15 +1319,15 @@ def undismissed(repo, number, tickets, reviews, blocking):
     finding_key. Any failed read, `tickets()` included, is one warning naming it, and every finding still counts;
     each request that dismisses nothing is one warning naming its selector and why."""
     try:
-        requests = dismissals.read(repo.root, tickets(), number)
-        snapshots = dismissals.github_snapshots(repo.root, number, reviews)
+        requests = read_dismissals(repo.root, tickets(), number)
+        snapshots = github_snapshots(repo.root, number, reviews)
     except Problem as err:
         warn("harness-pr", f"PR #{number}: cannot read the owner's dismissals ({err}); every finding counts")
         return blocking
-    dismissed, unmatched = dismissals.resolve(requests, snapshots)
+    dismissed, unmatched = resolve_dismissals(requests, snapshots)
     for u in unmatched:
         warn("harness-pr", f"PR #{number}: dismiss {u['selector']} on {u['source']} dismisses nothing: {u['reason']}")
-    return dismissals.apply(blocking, dismissed)[0]
+    return apply_dismissals(blocking, dismissed)[0]
 
 
 def unaddressed(number, review, blocking, unlisted, after="no commit after it"):
