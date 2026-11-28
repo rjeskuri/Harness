@@ -531,7 +531,6 @@ class Private(BriefTest):
                 self.extra = env
                 self.show(t)
                 self.serve(comments)
-                calls = len(self.gh_calls())
                 self.checked(review=[], given=given)
                 got = self.brief()
                 review = {"mode": "full", "base": self.merge_base}
@@ -543,9 +542,9 @@ class Private(BriefTest):
                 self.assertEqual((got["review"], got["prior_blockers"]), (review, []))
                 for key in ("ticket_context", "owner_answers"):
                     self.assertNamed(got["omitted"], key)
-                reads = [c["argv"] for c in self.gh_calls()[calls:]]
-                self.assertEqual([a for a in reads if a[:2] == ["api", "user"]], [])
-                self.assertEqual([a for a in reads if any("issues/12/comments" in x for x in a)], [])
+                # The owner's dismissals are still read (#517), so the comments are; nothing private reaches Sol.
+                for private in ("Jane Roe", "account 4411", "4411-style"):
+                    self.assertNotIn(private, self.sent())
 
 
 if __name__ == "__main__":

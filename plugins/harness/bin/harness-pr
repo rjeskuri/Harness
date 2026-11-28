@@ -62,9 +62,12 @@ merged skips every check.
 
 findings splits a review by the files the ticket branch changed (`git diff --name-only` from the merge-base of HEAD
 and origin/main, else main): high and medium on a changed file block, low on one is low, anything else is outside.
-It records the round (harness_lib/reviews.py; the same HEAD replaces the latest round), writes
-round-<k>-blocking.json, round-<k>-review.json and notes.md (Low findings, Out of scope, Rulings, gathered over
-every round) under ~/.claude/harness/repos/<key>/reviews/N/, and prints the `harness-work stage` record: review
+With an open PR, a finding the owner dismissed (#517: his `dismiss` lines on ticket N or the PR, resolved against
+the local rounds, else the PR's harness reviews on GitHub) leaves blocking, low and outside for the round's
+`dismissed` and is neither posted nor ticketed; an unmatched request and a failed read are each one warning.
+It records the round (harness_lib/reviews.py; the same HEAD replaces the latest round, keeping its `at`), writes
+round-<k>-blocking.json, round-<k>-review.json and notes.md (Low findings, Out of scope, Dismissed, Rulings, gathered
+over every round) under ~/.claude/harness/repos/<key>/reviews/N/, and prints the `harness-work stage` record: review
 pass in round 1, then fix pass or fail. A review with no findings array exits 1 and records nothing; --latest
 prints the latest round and writes nothing (and makes no gh call). With an open PR for the branch (`gh pr list
 --head <branch> --state open`) it posts round-<k>-review.json there as `review` would (post_review) and records the
@@ -128,8 +131,8 @@ try:
     from harness_lib.autoland import (CONVERSATION, at_head, behind_main, check_entries as lib_check_entries,
                                       evaluate, fetch_origin, gate_settings, gather_facts, overall, review_counts)
     from harness_lib.owner_comments import answer_rounds, fetch as fetch_owner_comments
-    from harness_lib.reviews import (add_rulings, add_ticket, finding_key, latest_round, load_rounds, load_rulings,
-                                     load_tickets, reviews_dir, save_round, text_sha256)
+    from harness_lib.reviews import (add_rulings, add_ticket, dismissed as round_dismissed, finding_key, latest_round,
+                                     load_rounds, load_rulings, load_tickets, reviews_dir, save_round, text_sha256)
     from harness_lib.settings import setting, settings_env
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
@@ -825,10 +828,11 @@ def notes_line(f, outside):
 
 
 def notes_text(rounds, rulings, tickets=()):
-    """notes.md from every round and every ruling: Low findings, Out of scope, Rulings, each once and each left out
-    when empty. An out-of-scope line whose finding was ticketed ends in ` -> #<n>`."""
+    """notes.md from every round and every ruling: Low findings, Out of scope, Dismissed, Rulings, each once and each
+    left out when empty. An out-of-scope line whose finding was ticketed ends in ` -> #<n>`; a dismissed one ends in
+    `(dismissed: <why>)`."""
     numbers = {tuple(t["key"]): t["number"] for t in tickets}
-    low, out_of_scope = [], []
+    low, out_of_scope, gone = [], [], []
     for rnd in rounds:
         low += [notes_line(f, False) for f in as_findings(rnd.get("low"))]
         for f in as_findings(rnd.get("outside")):
@@ -837,7 +841,9 @@ def notes_text(rounds, rulings, tickets=()):
                 continue
             n = numbers.get(tuple(finding_key(f)))
             out_of_scope.append(notes_line(f, True) + (f" -> #{n}" if n else ""))
-    sections = [("Low findings", low), ("Out of scope", out_of_scope), ("Rulings", [f"- {r}" for r in rulings])]
+        gone += [f"{notes_line(f, False)} (dismissed: {one_line(f.get('why') or '')})" for f in round_dismissed(rnd)]
+    sections = [("Low findings", low), ("Out of scope", out_of_scope), ("Dismissed", gone),
+                ("Rulings", [f"- {r}" for r in rulings])]
     parts = [f"### {name}\n" + "\n".join(dict.fromkeys(lines)) for name, lines in sections if lines]
     return "\n\n".join(parts) + "\n" if parts else ""
 
@@ -942,12 +948,16 @@ def create_ticket(repo, f, epic, pr, number):
     return n
 
 
-def ticket_outside(repo, key, number, pr):
+def ticket_outside(repo, key, number, pr, held=()):
     """A ticket for each high or medium outside finding of any recorded round not ticketed yet (by path and body),
-    so one whose create failed is tried again even when no later review repeats it; the new numbers."""
+    so one whose create failed is tried again even when no later review repeats it; the new numbers. A finding whose
+    key any round dismissed, or one of `held` (this call's dismissals' keys), gets none."""
+    rounds = load_rounds(key, number)
     recorded = {tuple(t["key"]) for t in load_tickets(key, number)}
+    recorded |= {tuple(finding_key(f)) for rnd in rounds for f in round_dismissed(rnd)}
+    recorded |= {tuple(k) for k in held}
     wanted = []
-    for f in (f for rnd in load_rounds(key, number) for f in as_findings(rnd.get("outside"))):
+    for f in (f for rnd in rounds for f in as_findings(rnd.get("outside"))):
         k = tuple(finding_key(f))
         if f.get("severity") in ("high", "medium") and k not in recorded:
             recorded.add(k)
@@ -968,6 +978,40 @@ def ticket_outside(repo, key, number, pr):
             add_ticket(key, number, f, n)
             made.append(n)
     return made
+
+
+def owner_dismissals(repo, number, pr):
+    """(dismissed, unmatched) as dismissals.resolve gives them (#517): the owner's `dismiss <path>:<line> <why>` and
+    `dismiss <path> <why>` lines on ticket `number` and on PR `pr`, each resolved against the ticket's local rounds
+    (each round's `at` with its blocking, low, outside and dismissed findings) or, with no round recorded, the PR's
+    harness reviews on GitHub. A failed read is one warning and dismisses nothing; each request that dismisses
+    nothing is one warning naming its selector, the reason and the comment's URL."""
+    try:
+        requests = read_dismissals(repo.root, [number], pr)
+        if not requests:
+            return [], []
+        rounds = load_rounds(repo.key, number)
+        snapshots = ([{"at": rnd.get("at"), "findings": as_findings(rnd.get("blocking")) + as_findings(rnd.get("low"))
+                       + as_findings(rnd.get("outside")) + round_dismissed(rnd)} for rnd in rounds]
+                     if rounds else github_snapshots(repo.root, pr))
+    except Problem as err:
+        warn("harness-pr", f"PR #{pr}: cannot read the owner's dismissals ({err}); every finding counts")
+        return [], []
+    dismissed, unmatched = resolve_dismissals(requests, snapshots)
+    for u in unmatched:
+        warn("harness-pr", f"PR #{pr}: dismiss {u['selector']} on {u['source']} dismisses nothing: {u['reason']}"
+                           + (f" ({u['url']})" if u.get("url") else ""))
+    return dismissed, unmatched
+
+
+def without_dismissed(splits, dismissed):
+    """(kept, gone): each of the `splits` ({"blocking": [...], "low": [...], "outside": [...]}) without the findings
+    a dismissal holds, and those findings, each with `from` (its split), `why` and `url`."""
+    kept, gone = {}, []
+    for name, found in splits.items():
+        kept[name], dropped = apply_dismissals(found, dismissed)
+        gone += [dict(f, **{"from": name}) for f in dropped]
+    return kept, gone
 
 
 def flatten_brief(value):
@@ -1097,6 +1141,7 @@ def record_findings(args, repo=None):
     fork = merge_base(repo.root)
     model, checked = args.model, DEFAULT_CHECKED
     reviewers, unresolved = [], []
+    held, unmatched = None, []                          # the owner's dismissals, read once with an open PR
     if args.gpt_check:
         branch = TICKET_BRANCH.match(current_branch(repo.root) or "")
         if not args.head or not branch or int(branch.group(1)) != number:
@@ -1128,9 +1173,10 @@ def record_findings(args, repo=None):
             refusal = "previous review was local only; continue locally or obtain a fresh paired review"
         if refusal and not recovering:
             raise Problem(refusal)
+        held, unmatched = owner_dismissals(repo, number, pr)        # before the brief: no dismissed prior blocker
         if not (recovering and receipt["posted"]):                 # GitHub holds no review of this head yet
             ticket = show_ticket(repo, number)
-            prior_blockers = previous.get("blocking", []) if paired else []
+            prior_blockers = apply_dismissals(previous.get("blocking", []), held)[0] if paired else []
             review_base = fork
             if paired:
                 prior = previous.get("head") or ""
@@ -1197,6 +1243,10 @@ def record_findings(args, repo=None):
         raise Problem("the open PR changed during the GPT check")
     if args.head and pr is None:
         raise Problem("open the draft PR before publishing the review")
+    if pr is not None and held is None:                # the GPT check read them before its brief
+        held, unmatched = owner_dismissals(repo, number, pr)
+    kept, dismissed = without_dismissed({"blocking": blocking, "low": low, "outside": outside}, held or [])
+    blocking, low, outside = kept["blocking"], kept["low"], kept["outside"]
     published = blocking + low
     if args.head:
         published.extend(f for f in outside if f["severity"] == "low")
@@ -1214,10 +1264,14 @@ def record_findings(args, repo=None):
 
     key = repo.key
     rounds = load_rounds(key, number)
-    earlier = rounds[:-1] if rounds and rounds[-1].get("head") == head else rounds
+    replaced = rounds[-1] if rounds and rounds[-1].get("head") == head else None
+    earlier = rounds[:-1] if replaced else rounds
     base = earlier[-1].get("head") if earlier else fork
-    rnd = save_round(key, number, {"at": now_iso(), "head": head, "base": base, "blocking": blocking, "low": low,
-                                   "outside": outside, "pr": pr, "review_id": review_id,
+    # a same-head round keeps its first `at`: a dismissal made since still finds a snapshot older than its comment
+    at = replaced["at"] if replaced and parse_iso(replaced.get("at")) else now_iso()
+    rnd = save_round(key, number, {"at": at, "head": head, "base": base, "blocking": blocking, "low": low,
+                                   "outside": outside, **({"dismissed": dismissed} if dismissed else {}),
+                                   "pr": pr, "review_id": review_id,
                                    **({"reviewers": reviewers, "fork": fork} if reviewers else {})})
     k = rnd["round"]
     folder = reviews_dir(key, number)
@@ -1227,14 +1281,15 @@ def record_findings(args, repo=None):
     write_json(files["blocking"], blocking, prefix=".findings-")
     write_json(files["review"], published, prefix=".findings-")
     all_rulings = add_rulings(key, number, rulings)
-    tickets = ticket_outside(repo, key, number, pr) if pr is not None else []
+    tickets = ticket_outside(repo, key, number, pr, [d["key"] for d in held or []]) if pr is not None else []
     write_text(files["notes"], notes_text(load_rounds(key, number), all_rulings, load_tickets(key, number)),
                prefix=".findings-")
 
     stage, result = ("review", "pass") if k == 1 else ("fix", "fail" if blocking else "pass")
     out = {"ticket": number, "round": k, "head": head, "base": base, "review_base": head, "blocking": blocking,
            "low": low, "outside": outside, "files": files, "record": {"stage": stage, "result": result},
-           "pr": pr, "review_id": review_id, "tickets": tickets}
+           "pr": pr, "review_id": review_id, "tickets": tickets,
+           **({"dismissed": dismissed} if dismissed else {}), **({"unmatched": unmatched} if unmatched else {})}
     lines = [f"#{number} review round {k}: {len(blocking)} blocking, {len(low)} low, "
              f"{len(outside)} outside; record: harness-work stage {number} {stage} {result}"]
     if pr is not None:
