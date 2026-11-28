@@ -12,8 +12,9 @@ main checkout with `--worktree <wt>`.
 gh is fakegh.py behind a wrapper. `gh pr list` answers the open PR (or none) with a `headRefOid` the test picks;
 `gh pr diff P` answers the real `git diff <merge-base> HEAD` of the worktree, so the lines on the diff are known
 from the fixture: every changed line and 3 lines of context either side (git's default). With a PR open (open_pr),
-`gh api user` answers the owner's login and fakegh's REST world serves ticket 12's comments (none unless the test
-gives some), which the GPT check reads for the owner's answers (#514). harness-board is a stub in the same fakebin:
+`gh api user` answers the owner's login and fakegh's REST world serves ticket 12's comments and the PR's (none unless
+the test gives some), which the GPT check reads for the owner's answers (#514) and findings for the owner's
+dismissals (#517). harness-board is a stub in the same fakebin:
 `show N` prints the ticket JSON the test sets (its `parent` is the epic), `task create` reads its body from stdin,
 logs it, and prints `{"number", ...}` with numbers 501, 508, 515, ... (step 7, so a guessed `+1` fails), or fails
 for a title holding a string the test names.
@@ -341,10 +342,11 @@ class PostTest(unittest.TestCase):
     def no_pr(self):
         self.scenario([REPO_VIEW, {"contains": ["pr", "list"], "stdout_json": []}])
 
-    def open_pr(self, number, head=None, review_id=None, wt=None, comments=(), login=OWNER, calls=()):
+    def open_pr(self, number, head=None, review_id=None, wt=None, comments=(), login=OWNER, calls=(), pr_comments=()):
         """An open PR #number for the branch at `head` (default: the worktree's HEAD). `gh api user` answers `login`
-        and the REST world holds ticket 12 with `comments` (oldest first, in Issues.comments' shape); `calls` go
-        first, so a test can answer either read its own way or add issues of its own."""
+        and the REST world holds ticket 12 with `comments` and the PR itself (an issue with pull_request) with
+        `pr_comments` (each oldest first, in Issues.comments' shape), which the owner's dismissals are read from
+        (#517); `calls` go first, so a test can answer any read its own way or add issues of its own."""
         head = head or self.head(wt)
         self.scenario(list(calls) + [
             REPO_VIEW,
@@ -355,7 +357,10 @@ class PostTest(unittest.TestCase):
              "stdout_json": {"id": review_id, "node_id": "PRR_kwDO", "state": "COMMENTED"}},
             {"match": ["pr", "review", str(number)], "stdout": ""},
             {"match": ["api", "user"], "stdout": f"{login}\n"},
-            {"issue": 12, "data": {"number": 12, "title": "The ticket", "comments": list(comments)}}])
+            {"issue": 12, "data": {"number": 12, "title": "The ticket", "comments": list(comments)}},
+            {"issue": number, "data": {"number": number, "title": "The PR", "pull_request": True,
+                                       "url": f"https://github.com/o/r/pull/{number}",
+                                       "comments": list(pr_comments)}}])
 
     def board_conf(self, show=None, fail_titles=(), link_fail_titles=()):
         if show is None:
