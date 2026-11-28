@@ -124,7 +124,8 @@ try:
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
     from harness_lib.canary import SMOKE, run_canary
     from harness_lib.dismissals import (apply as apply_dismissals, github_snapshots, read as read_dismissals,
-                                        resolve as resolve_dismissals, review_findings as lib_review_findings)
+                                        resolve as resolve_dismissals, review_comments as lib_review_comments,
+                                        review_findings as lib_review_findings)
     from harness_lib.autoland import (CONVERSATION, at_head, behind_main, check_entries as lib_check_entries,
                                       evaluate, fetch_origin, gate_settings, gather_facts, overall, review_counts)
     from harness_lib.owner_comments import answer_rounds, fetch as fetch_owner_comments
@@ -1353,14 +1354,15 @@ def review_findings(repo, slug, number, review):
     line, severity, body: the body's list and the inline comments, none when it says "no findings"; a finding
     without a recognisable severity is high), each with `text`, how a refusal names it (`path:line [severity] body`,
     an inline comment as it reads at the line it was posted on, original_line else line, the place a `dismiss`
-    selector matches; cut to 100 characters). unlisted is how many more high plus medium findings the summary line
-    counts than are listed, the counts read by autoland.review_counts (a summary it cannot read: how many more
-    findings of any severity the total counts, each as high)."""
+    selector matches; cut to 100 characters). The inline comments are the review's in the PR's pulls/N/comments
+    (dismissals.review_comments): GitHub's reviews/<id>/comments gives them no line (#533). unlisted is how many
+    more high plus medium findings the summary line counts than are listed, the counts read by
+    autoland.review_counts (a summary it cannot read: how many more findings of any severity the total counts, each
+    as high)."""
     body = review.get("body") or ""
     if body.startswith("Harness review: no findings."):
         return [], 0
-    comments = [c for c in api_list(repo, f"repos/{slug}/pulls/{number}/reviews/{review.get('id')}/comments")
-                if isinstance(c, dict)]
+    comments = lib_review_comments(api_list(repo, f"repos/{slug}/pulls/{number}/comments"), review.get("id"))
     found = lib_review_findings(review, comments)
     listed = len(found) - len(comments)               # the body's list first, then one per inline comment in order
     for f in found[:listed]:
@@ -1407,7 +1409,7 @@ def review_gate(repo, number):
 def undismissed(repo, number, tickets, reviews, blocking):
     """The `blocking` findings the owner has not dismissed (#516, harness_lib.dismissals): his `dismiss <path>:<line>
     <why>` and `dismiss <path> <why>` lines on the tickets `tickets()` names and on PR `number`, each resolved in the
-    PR's harness reviews (`reviews` as the gate read them; each one's inline comments read again) and matched by
+    PR's harness reviews (`reviews` as the gate read them; the PR's review comments read again) and matched by
     finding_key. Any failed read, `tickets()` included, is one warning naming it, and every finding still counts;
     each request that dismisses nothing is one warning naming its selector and why."""
     try:

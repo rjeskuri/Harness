@@ -10,9 +10,11 @@ A request is {"path", "line", "why", "at", "url", "source"}, `line` None for a p
 comment's createdAt and url as given; a snapshot is {"at", "findings"}, one harness review's findings ({"path",
 "line", "severity", "body"}) and its submitted_at. A harness review is one by the authenticated account (anyone can
 type the marker) whose body ends with the trailer harness-pr appends. Times compare as parsed datetimes, a snapshot
-strictly older than the comment; a time that does not parse matches nothing. parse, resolve, apply and
-review_findings are pure; read and github_snapshots call gh through harness_lib.gh and harness_lib.issues and raise
-Problem on a failed read.
+strictly older than the comment; a time that does not parse matches nothing. A review's inline comments come from
+the PR's GET pulls/{n}/comments, picked by pull_request_review_id (review_comments): GitHub's
+pulls/{n}/reviews/{id}/comments gives them no line or original_line (#533). parse, resolve, apply, review_comments
+and review_findings are pure; read and github_snapshots call gh through harness_lib.gh and harness_lib.issues and
+raise Problem on a failed read.
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -141,11 +143,20 @@ def _finding(path, line, text):
             "body": (m.group(2) if m else text).strip()}
 
 
+def review_comments(comments, review_id):
+    """The inline comments of review `review_id` among `comments`, a PR's GET pulls/{n}/comments (every review's,
+    each with its line, original_line and pull_request_review_id), in that list's order; none for a review without
+    an id."""
+    if review_id is None:
+        return []
+    return [c for c in comments or [] if isinstance(c, dict) and c.get("pull_request_review_id") == review_id]
+
+
 def review_findings(review, comments):
     """The findings of a harness review as harness-pr posted them: the ``- `path:line` [sev] body`` lines under the
     body's `Not on a changed line:` (their two-space continuation lines restored) and the inline `comments` (its
-    `.../reviews/<id>/comments`, `[sev] body` and the trailer post_review appends, which alone is stripped; where
-    it was posted, original_line, else line). [] for a review that found nothing."""
+    comments in the PR's pulls/{n}/comments, review_comments; `[sev] body` and the trailer post_review appends,
+    which alone is stripped; where it was posted, original_line, else line). [] for a review that found nothing."""
     body = (review or {}).get("body") or ""
     if body.startswith(NO_FINDINGS):
         return []
@@ -210,22 +221,24 @@ def _harness_review(r, login):
 def github_snapshots(cwd, pr, reviews=None):
     """One {"at", "findings"} per harness review on PR `pr`, oldest first by submitted_at: by the authenticated
     account, its body ending with the marker (then the GPT receipt or not), any other review left out: `reviews`
-    when given, else the PR's, each one's findings read with its comments. Problem on a failed read, the login's
-    included."""
+    when given, else the PR's, each one's findings read with its inline comments from the PR's pulls/{n}/comments
+    (read once, when a harness review has findings). Problem on a failed read, the login's included."""
     login = _login(cwd)
     rest = Rest(cwd, pick=first_line)
     if reviews is None:
         reviews = _list(rest, f"pulls/{pr}/reviews")
     marked = [r for r in reviews if _harness_review(r, login)]
     marked.sort(key=lambda r: parse_iso(r.get("submitted_at")))
-    out = []
+    out, listed = [], None
     for r in marked:
         comments = []
         if not (r.get("body") or "").startswith(NO_FINDINGS):
             rid = r.get("id")
             if not isinstance(rid, int) or isinstance(rid, bool):
                 raise Problem(f"PR #{pr}: a harness review without an id")
-            comments = _list(rest, f"pulls/{pr}/reviews/{rid}/comments")
+            if listed is None:
+                listed = _list(rest, f"pulls/{pr}/comments")
+            comments = review_comments(listed, rid)
         out.append({"at": r.get("submitted_at"), "findings": review_findings(r, comments)})
     return out
 
