@@ -142,6 +142,26 @@ pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[],"prior_fixed
         self.assertIn("+second\n", patch)
         self.assertEqual(patch.count("No newline at end of file"), 2)
 
+    def test_sol_check_off_calls_no_codex_and_clears_prior_blockers(self):
+        (self.repo / "app.py").write_text("example = 2\n")
+        self.git("commit", "-qam", "change")
+        brief = json.dumps({"request": "r", "prior_blockers": [{"path": "app.py", "line": 1, "severity": "medium",
+                                                                 "body": "b"}] * 2})
+        home = self.root / "home"
+        for label, env in (("env switch", dict(self.env, HARNESS_SOL_CHECK="off")),
+                           ("file switch", dict(self.env, HOME=str(home)))):
+            with self.subTest(label):
+                if label == "file switch":
+                    (home / ".claude" / "harness").mkdir(parents=True)
+                    (home / ".claude" / "harness" / "sol-check-off").write_text("")
+                p = subprocess.run([str(TOOL), "check", "--head", self.git("rev-parse", "HEAD"),
+                                    "--base", self.git("rev-parse", "main"), "--brief-stdin"],
+                                   cwd=self.repo, env=env, input=brief, capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(json.loads(p.stdout), {"head": self.git("rev-parse", "HEAD"), "model": "gpt-6.2-sol",
+                                                        "findings": [], "prior_fixed": [True, True]})
+                self.assertFalse(self.log.exists())
+
     def test_check_uses_sol_and_refuses_unreviewable_change(self):
         (self.repo / "app.py").write_text("example = 2\n")
         self.git("commit", "-qam", "change")
