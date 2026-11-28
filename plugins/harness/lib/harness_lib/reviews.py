@@ -16,6 +16,7 @@ Standard library only; works with the python3 from Xcode's command line tools (3
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 from harness_lib.text import harness_home, read_json, write_json
@@ -105,6 +106,14 @@ def add_rulings(key, ticket, lines):
         rulings += new
         write_json(rulings_path(key, ticket), rulings, prefix=PREFIX)
     return rulings
+
+
+# --------------------------------------------------------------- the GPT check's brief
+def text_sha256(text):
+    """The sha256 hex digest of `text` encoded as UTF-8: harness-pr's `brief_sha256`, the digest of the
+    exact brief Sol checked, saved in the paired findings' receipt and compared before a saved result is
+    posted (#514). The tools make no digest themselves, so it lives here."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 # --------------------------------------------------------------- out-of-scope tickets

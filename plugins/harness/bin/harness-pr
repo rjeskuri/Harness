@@ -102,7 +102,6 @@ import re
 import shutil
 import subprocess
 import fcntl
-import hashlib
 import uuid
 import sys
 import tempfile
@@ -130,7 +129,7 @@ try:
                                       evaluate, fetch_origin, gate_settings, gather_facts, overall, review_counts)
     from harness_lib.owner_comments import answer_rounds, fetch as fetch_owner_comments
     from harness_lib.reviews import (add_rulings, add_ticket, finding_key, latest_round, load_rounds, load_rulings,
-                                     load_tickets, reviews_dir, save_round)
+                                     load_tickets, reviews_dir, save_round, text_sha256)
     from harness_lib.settings import setting, settings_env
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
@@ -1146,7 +1145,7 @@ def record_findings(args, repo=None):
             if field:
                 raise Problem(f"the brief's {field} holds a secret-shaped value; GPT check incomplete")
             text = fitted_brief(brief)
-            digest = hashlib.sha256(text.encode()).hexdigest()
+            digest = text_sha256(text)
             if recovering and receipt.get("brief_sha256") != digest:      # Sol checked other inputs: check again
                 if refusal:
                     raise Problem(refusal)
