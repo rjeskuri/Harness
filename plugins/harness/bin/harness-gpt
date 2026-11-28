@@ -80,6 +80,12 @@ SCHEMA = {"type": "object", "additionalProperties": False, "required": ["finding
                          "prior_fixed": {"type": "array", "items": {"type": "boolean"}}}}
 
 
+def sol_check_off():
+    """The owner's switch for Sol's ticket check: HARNESS_SOL_CHECK=off, or the file ~/.claude/harness/sol-check-off."""
+    return (os.environ.get("HARNESS_SOL_CHECK", "").strip().lower() == "off"
+            or Path(os.path.expanduser("~/.claude/harness/sol-check-off")).exists())
+
+
 def git(repo, *args):
     return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.DEVNULL, timeout=60)
 
@@ -257,6 +263,16 @@ def run(args):
     brief = sys.stdin.read(64001) if args.brief_stdin else args.brief
     if len(brief) > 64000 or has_secret(brief):
         raise ValueError("brief too large or contains a secret-shaped value")
+    if args.mode == "check" and sol_check_off():
+        # Owner's kill switch (2026-11-28): no Codex call; Claude's review stands alone and the coder's fixes of the
+        # prior blockers are taken as done, so a fix round never blocks on Sol.
+        try:
+            prior = json.loads(brief or "{}").get("prior_blockers") or []
+        except (ValueError, AttributeError):
+            prior = []
+        print("harness-gpt: Sol check is off (HARNESS_SOL_CHECK=off or ~/.claude/harness/sol-check-off): "
+              "no findings, prior blockers treated as fixed", file=sys.stderr)
+        return json.dumps({"head": head, "model": SOL, "findings": [], "prior_fixed": [True] * len(prior)})
     workspace = os.environ.get("CMUX_WORKSPACE_ID") if getattr(args, "terminal", False) else None
     folder = Path(tempfile.mkdtemp(prefix="harness-architect-" if workspace else "harness-gpt-")).resolve()
     terminal_owns_folder = False
