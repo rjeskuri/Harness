@@ -65,7 +65,8 @@ and origin/main, else main): high and medium on a changed file block, low on one
 With an open PR, a finding the owner dismissed (#517: his `dismiss` lines on ticket N or the PR, resolved against
 the local rounds, else the PR's harness reviews on GitHub) leaves blocking, low and outside for the round's
 `dismissed` and is neither posted nor ticketed; an unmatched request and a failed read are each one warning.
-It records the round (harness_lib/reviews.py; the same HEAD replaces the latest round, keeping its `at`), writes
+It records the round (harness_lib/reviews.py; the same HEAD replaces the latest round, replaced-snapshots.json keeping
+what that one raised and when, for the dismissals made against it), writes
 round-<k>-blocking.json, round-<k>-review.json and notes.md (Low findings, Out of scope, Dismissed, Rulings, gathered
 over every round) under ~/.claude/harness/repos/<key>/reviews/N/, and prints the `harness-work stage` record: review
 pass in round 1, then fix pass or fail. A review with no findings array exits 1 and records nothing; --latest
@@ -777,6 +778,20 @@ def post_review(repo, number, findings, model, checked, head=None, receipt_marke
     return review_id, inline, outside
 
 
+def update_review(repo, number, review_id, findings, inline, model, checked, receipt_marker):
+    """Rewrite the body of the harness review `review_id` on PR `number` (#517) to the one post_review would post
+    for `findings`, those in `inline` already posted inline and the rest listed, the receipt marker kept; its inline
+    comments stay as they are. Problem when the id is unknown or the PUT fails."""
+    if not isinstance(review_id, int) or isinstance(review_id, bool):
+        raise Problem("the review's id is unknown")
+    if findings:
+        body = review_body(model, findings, [f for f in findings if f not in inline])
+    else:
+        body = f"Harness review: no findings. Checked: {checked}\n\n{MARKER}"
+    gh(["api", "-X", "PUT", f"repos/{repo.slug()}/pulls/{number}/reviews/{review_id}", "--input", "-"], repo.root,
+       stdin=json.dumps({"body": body + "\n\n" + receipt_marker}))
+
+
 def cmd_review(args):
     repo = open_repo()
     number = args.number
@@ -987,18 +1002,19 @@ def raised(rnd):
             + [f for f in round_dismissed(rnd) if f.get("from") != "prior"])
 
 
-def places(findings):
-    """Each finding's (path, line, body), what a selector resolves against."""
-    return {(str(f.get("path") or ""), str(f.get("line")), str(f.get("body") or "")) for f in findings}
+def kept_snapshots(key, number, name):
+    """The snapshots reviews/N/<name> keeps ([] when it holds none)."""
+    older = read_json(os.path.join(reviews_dir(key, number), name))
+    return older if isinstance(older, list) else []
 
 
 def owner_dismissals(repo, number, pr):
     """(dismissed, unmatched) as dismissals.resolve gives them (#517): the owner's `dismiss <path>:<line> <why>` and
     `dismiss <path> <why>` lines on ticket `number` and on PR `pr`, each resolved against the ticket's local rounds
-    (each round's `at` with what it raised) and github-snapshots.json, or, with no round recorded, the PR's harness
-    reviews on GitHub, which that file keeps so a comment older than a rebuilt cache still resolves later. A failed
-    read is one warning and dismisses nothing; each request that dismisses nothing is one warning naming its
-    selector, the reason and the comment's URL."""
+    (each round's `at` with what it raised), the same-head rounds they replaced (replaced-snapshots.json) and
+    github-snapshots.json, or, with no round recorded, the PR's harness reviews on GitHub, which that file keeps so
+    a comment older than a rebuilt cache still resolves later. A failed read is one warning and dismisses nothing;
+    each request that dismisses nothing is one warning naming its selector, the reason and the comment's URL."""
     try:
         requests = read_dismissals(repo.root, [number], pr)
         if not requests:
@@ -1006,9 +1022,9 @@ def owner_dismissals(repo, number, pr):
         rounds = load_rounds(repo.key, number)
         kept = os.path.join(reviews_dir(repo.key, number), "github-snapshots.json")
         if rounds:
-            older = read_json(kept)
             snapshots = ([{"at": rnd.get("at"), "findings": raised(rnd)} for rnd in rounds]
-                         + (older if isinstance(older, list) else []))
+                         + kept_snapshots(repo.key, number, "replaced-snapshots.json")
+                         + kept_snapshots(repo.key, number, "github-snapshots.json"))
         else:
             snapshots = github_snapshots(repo.root, pr)
             write_json(kept, snapshots, prefix=".findings-")
@@ -1030,6 +1046,19 @@ def without_dismissed(splits, dismissed):
         kept[name], dropped = apply_dismissals(found, dismissed)
         gone += [dict(f, **{"from": name}) for f in dropped]
     return kept, gone
+
+
+def carried_dismissals(unresolved, origins, held):
+    """Each dismissal of `held` whose key is an unresolved prior blocker's key before a rename carried it
+    (`origins`, parallel to `unresolved`), again under the key the blocker carries now (#517), so a dismissal made
+    at its old path holds it on a receipt replay too."""
+    by_key = {tuple(d["key"]): d for d in held}
+    out = []
+    for f, origin in zip(unresolved, origins):
+        d = by_key.get(tuple(origin)) if isinstance(origin, list) else None
+        if d is not None and tuple(finding_key(f)) != tuple(origin):
+            out.append(dict(d, key=list(finding_key(f))))
+    return out
 
 
 def flatten_brief(value):
@@ -1170,7 +1199,7 @@ def record_findings(args, repo=None):
         raise Problem("the reviewed head or working tree changed; review the clean pushed head again")
     fork = merge_base(repo.root)
     model, checked = args.model, DEFAULT_CHECKED
-    reviewers, unresolved = [], []
+    reviewers, unresolved, origins = [], [], []        # origins: each unresolved blocker's key before a rename
     held, unmatched = None, []                          # the owner's dismissals, read once with an open PR
     if args.gpt_check:
         branch = TICKET_BRANCH.match(current_branch(repo.root) or "")
@@ -1228,7 +1257,7 @@ def record_findings(args, repo=None):
                 recovering = False
         if recovering:
             findings, reviewers = receipt["findings"], receipt["reviewers"]
-            unresolved = receipt.get("unresolved", [])
+            unresolved, origins = receipt.get("unresolved", []), receipt.get("unresolved_keys") or []
         else:
             reply = tool("harness-gpt", ["check", "--head", head, "--base", review_base, "--brief-stdin"],
                          repo.root, stdin=text, timeout=1080)
@@ -1241,6 +1270,7 @@ def record_findings(args, repo=None):
                         or any(type(value) is not bool for value in fixed)):
                     raise ValueError()
                 unresolved = [dict(f) for f, resolved in zip(prior_blockers, fixed) if not resolved]
+                origins = [finding_key(f) for f in unresolved]
                 if unresolved and review_base != fork:
                     fields = nul_fields(git_ok(repo.root, "diff", "--find-renames", "--name-status", "--diff-filter=R",
                                                "-z", review_base, head))
@@ -1257,7 +1287,7 @@ def record_findings(args, repo=None):
                 raise Problem("GPT check did not return findings for the requested head") from None
             reviewers = ([args.model] if args.review else []) + [report["model"]]
             receipt = {"findings": findings, "reviewers": reviewers, "unresolved": unresolved,
-                       "prior_blockers": prior_blockers, "brief_sha256": digest,
+                       "unresolved_keys": origins, "prior_blockers": prior_blockers, "brief_sha256": digest,
                        "marker": f"<!-- harness-gpt-{uuid.uuid4()} -->"}
             write_json(receipt_path, receipt, prefix=".gpt-")
         model = " + ".join(reviewers)
@@ -1276,7 +1306,8 @@ def record_findings(args, repo=None):
         raise Problem("open the draft PR before publishing the review")
     if pr is not None and held is None:                # the GPT check read them before its brief
         held, unmatched = owner_dismissals(repo, number, pr)
-    kept, dismissed = without_dismissed({"blocking": blocking, "low": low, "outside": outside}, held or [])
+    held = (held or []) + carried_dismissals(unresolved, origins, held or [])
+    kept, dismissed = without_dismissed({"blocking": blocking, "low": low, "outside": outside}, held)
     blocking, low, outside = kept["blocking"], kept["low"], kept["outside"]
     published = blocking + low
     if args.head:
@@ -1286,9 +1317,17 @@ def record_findings(args, repo=None):
     if args.gpt_check:
         if receipt.get("posted"):
             review_id = receipt.get("review_id")
+            if isinstance(receipt.get("published"), list) and receipt["published"] != published:
+                try:                                   # the dismissals changed since: the review shows what is left
+                    update_review(repo, pr, review_id, published, receipt.get("inline") or [], model, checked,
+                                  receipt["marker"])
+                    receipt["published"] = published
+                except Problem as err:
+                    warn("harness-pr", f"PR #{pr}: cannot update review {review_id} to the findings the owner's "
+                                       f"dismissals leave ({err}); it still shows the ones it posted")
         else:
             review_id, inline, off = post_review(repo, pr, published, model, checked, head, receipt["marker"])
-            receipt.update(posted=True, review_id=review_id)
+            receipt.update(posted=True, review_id=review_id, published=published, inline=inline)
         write_json(receipt_path, receipt, prefix=".gpt-")
     elif pr is not None:
         review_id, inline, off = post_review(repo, pr, published, model, checked, args.head)
@@ -1300,16 +1339,20 @@ def record_findings(args, repo=None):
     base = earlier[-1].get("head") if earlier else fork
     if args.gpt_check and earlier and earlier[-1].get("reviewers"):     # the prior blockers the owner dismissed
         seen = {tuple(finding_key(f)) for f in dismissed}
+        seen |= {tuple(o) for f, o in zip(unresolved, origins) if tuple(finding_key(f)) in seen}
         for f in apply_dismissals(as_findings(earlier[-1].get("blocking")), held or [])[1]:
             if tuple(finding_key(f)) not in seen:
                 seen.add(tuple(finding_key(f)))
                 dismissed.append(dict(f, **{"from": "prior"}))
+    if replaced is not None:        # its dated snapshot outlives it, for the dismissals made against what it raised
+        snapshot = {"at": replaced.get("at"), "findings": raised(replaced)}
+        older = kept_snapshots(key, number, "replaced-snapshots.json")
+        if snapshot not in older:
+            write_json(os.path.join(reviews_dir(key, number), "replaced-snapshots.json"), older + [snapshot],
+                       prefix=".findings-")
     found = {"blocking": blocking, "low": low, "outside": outside, **({"dismissed": dismissed} if dismissed else {})}
-    # a same-head round raising the same findings keeps its first `at`, so a dismissal made since still finds a
-    # snapshot older than its comment; one raising others is dated now, so no older comment resolves against them
-    same = replaced is not None and places(raised(replaced)) == places(raised(found))
-    at = replaced["at"] if same and parse_iso(replaced.get("at")) else now_iso()
-    rnd = save_round(key, number, {"at": at, "head": head, "base": base, **found, "pr": pr, "review_id": review_id,
+    rnd = save_round(key, number, {"at": now_iso(), "head": head, "base": base, **found, "pr": pr,
+                                   "review_id": review_id,
                                    **({"reviewers": reviewers, "fork": fork} if reviewers else {})})
     k = rnd["round"]
     folder = reviews_dir(key, number)
