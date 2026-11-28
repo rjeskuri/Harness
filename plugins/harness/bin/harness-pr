@@ -51,9 +51,14 @@ at the head (headRefOid) instead: it refuses a head behind main, a latest harnes
 or of a commit the head adds only clean merges of main to (autoland.at_head), and that review's high or medium
 findings whatever the commit dates; a failed read of these refuses too. A finding without a recognisable severity
 counts as high; low findings never refuse, and ready names them in one warning line. When the review's summary
-counts more high plus medium findings than it lists, the refusal says how many more. --accept-findings on land
-overrides only the findings (and a failed read of the review's inline comments); ready has no override. land on a
-PR that is already merged skips every check.
+counts more high plus medium findings than it lists, the refusal says how many more (counted before dismissals).
+A high or medium finding the owner dismissed (#516: his `dismiss <path>:<line> <why>` line, or `dismiss <path>
+<why>` for one listed with no line, on a ticket the gate reads or on the PR, harness_lib/dismissals.py, read only
+when such a finding is listed) refuses neither ready nor land; a request that dismisses nothing and a failed read
+are each one warning, and a failed read keeps every finding counted. Both name an inline finding at the line it
+was posted on, the place a selector matches. --accept-findings on land overrides only the findings (and a failed
+read of the review's inline comments) and reads no dismissal; ready has no override. land on a PR that is already
+merged skips every check.
 
 findings splits a review by the files the ticket branch changed (`git diff --name-only` from the merge-base of HEAD
 and origin/main, else main): high and medium on a changed file block, low on one is low, anything else is outside.
@@ -119,6 +124,8 @@ try:
     from harness_lib.issues import Issues, Rest
     from harness_lib.repo import RepoError, repo_facts, worktree_entries
     from harness_lib.canary import SMOKE, run_canary
+    from harness_lib.dismissals import (apply as apply_dismissals, github_snapshots, read as read_dismissals,
+                                        resolve as resolve_dismissals, review_findings as lib_review_findings)
     from harness_lib.autoland import (CONVERSATION, at_head, behind_main, check_entries as lib_check_entries,
                                       evaluate, fetch_origin, gate_settings, gather_facts, overall, review_counts)
     from harness_lib.owner_comments import answer_rounds, fetch as fetch_owner_comments
@@ -132,9 +139,7 @@ HERE = Path(__file__).resolve().parent
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 TICKET_BRANCH = re.compile(r"^t/(\d+)-")
 MARKER = "<!-- harness-review -->"
-BODY_FINDING = re.compile(r"^- (`[^`]*`|\(no path\)) \[(\w+)\] (.*)$")     # a finding listed in a review's body
 REVIEW_COUNT = re.compile(r"^Harness review \([^)]*\): (\d+) findings?\b")       # a review's summary line: the total only
-INLINE_SEVERITY = re.compile(r"^\[(\w+)\]")                                        # an inline finding's prefix
 LANDED = "Landed in"
 RESOLUTION = "**Resolution**"
 HIGH_RISK = "High risk: review the data and live-system paths before merging."
@@ -1344,53 +1349,48 @@ def short(text, n=100):
     return text if len(text) <= n else text[:n - 3] + "..."
 
 
-def gate_severity(value):
-    """A finding's severity for the review gate: one of SEVERITIES, else high (fail closed)."""
-    sev = str(value or "").lower()
-    return sev if sev in SEVERITIES else "high"
-
-
 def review_findings(repo, slug, number, review):
-    """([(severity, "path:line [severity] body")], unlisted) of a harness review: the body's list and the inline
-    comments, [] when it says "no findings"; a finding without a recognisable severity is high. unlisted is how
-    many more high plus medium findings the summary line counts than are listed, the counts read by
-    autoland.review_counts (a summary it cannot read: how many more findings of any severity the total counts,
-    each as high)."""
+    """([finding], unlisted) of a harness review: its findings as posted, dismissals.review_findings' dicts (path,
+    line, severity, body: the body's list and the inline comments, none when it says "no findings"; a finding
+    without a recognisable severity is high), each with `text`, how a refusal names it (`path:line [severity] body`,
+    an inline comment as it reads at the line it was posted on, original_line else line, the place a `dismiss`
+    selector matches; cut to 100 characters). unlisted is how many more high plus medium findings the summary line
+    counts than are listed, the counts read by autoland.review_counts (a summary it cannot read: how many more
+    findings of any severity the total counts, each as high)."""
     body = review.get("body") or ""
     if body.startswith("Harness review: no findings."):
         return [], 0
-    found = []
-    for line in body.splitlines():
-        m = BODY_FINDING.match(line)
-        if m:
-            found.append((gate_severity(m.group(2)), f"{m.group(1).strip('`')} [{m.group(2)}] {short(m.group(3))}"))
-    for c in api_list(repo, f"repos/{slug}/pulls/{number}/reviews/{review.get('id')}/comments"):
-        if not isinstance(c, dict):
-            continue
-        text = (c.get("body") or "").replace(MARKER, "").strip()
-        line = c.get("line") or c.get("original_line")
-        place = f"{c.get('path') or '(no path)'}" + (f":{line}" if line else "")
-        m = INLINE_SEVERITY.match(text)
-        found.append((gate_severity(m.group(1) if m else None), f"{place} {short(text)}"))
+    comments = [c for c in api_list(repo, f"repos/{slug}/pulls/{number}/reviews/{review.get('id')}/comments")
+                if isinstance(c, dict)]
+    found = lib_review_findings(review, comments)
+    listed = len(found) - len(comments)               # the body's list first, then one per inline comment in order
+    for f in found[:listed]:
+        place = f"{f['path']}:{f['line']}" if f["path"] and f["line"] is not None else f["path"] or "(no path)"
+        f["text"] = f"{place} [{f['severity']}] {short(f['body'])}"
+    for f, c in zip(found[listed:], comments):        # at the line a selector matches: where it was posted (#516)
+        place = f"{c.get('path') or '(no path)'}" + (f":{f['line']}" if f["line"] is not None else "")
+        f["text"] = f"{place} {short((c.get('body') or '').replace(MARKER, '').strip())}"
     counts = review_counts(body)
     if counts is not None:
-        listed = sum(1 for sev, _ in found if sev != "low")
-        return found, max(counts["high"] + counts["medium"] - listed, 0)
+        blockers = sum(1 for f in found if f["severity"] != "low")
+        return found, max(counts["high"] + counts["medium"] - blockers, 0)
     m = REVIEW_COUNT.match(body)
     return found, max(int(m.group(1)) - len(found), 0) if m else 0
 
 
 def review_gate(repo, number):
-    """(the latest harness review, its high and medium findings, its low findings, how many more high or medium
-    findings its summary counts than it lists) when that review has findings and no commit on the PR is newer than
-    it; else (review or None, [], [], 0). A failing gh call raises Problem."""
+    """(the latest harness review, its high and medium findings, its low findings (review_findings' dicts), how
+    many more high or medium findings its summary counts than it lists, the PR's reviews) when that review has
+    findings and no commit on the PR is newer than it; else (review or None, [], [], 0, the reviews). A failing gh
+    call raises Problem."""
     slug = repo.slug()
-    review = latest_harness_review(api_list(repo, f"repos/{slug}/pulls/{number}/reviews"))
+    reviews = api_list(repo, f"repos/{slug}/pulls/{number}/reviews")
+    review = latest_harness_review(reviews)
     if review is None:
-        return None, [], [], 0
+        return None, [], [], 0, reviews
     found, unlisted = review_findings(repo, slug, number, review)
     if not found and not unlisted:
-        return review, [], [], 0
+        return review, [], [], 0, reviews
     submitted = parse_iso(review.get("submitted_at"))
     for c in api_list(repo, f"repos/{slug}/pulls/{number}/commits"):
         meta = c.get("commit") if isinstance(c, dict) else None
@@ -1400,9 +1400,27 @@ def review_gate(repo, number):
             person = meta.get(who)
             when = when or (parse_iso(person.get("date")) if isinstance(person, dict) else None)
         if when is not None and when > submitted:
-            return review, [], [], 0
-    return (review, [text for sev, text in found if sev != "low"], [text for sev, text in found if sev == "low"],
-            unlisted)
+            return review, [], [], 0, reviews
+    return (review, [f for f in found if f["severity"] != "low"], [f for f in found if f["severity"] == "low"],
+            unlisted, reviews)
+
+
+def undismissed(repo, number, tickets, reviews, blocking):
+    """The `blocking` findings the owner has not dismissed (#516, harness_lib.dismissals): his `dismiss <path>:<line>
+    <why>` and `dismiss <path> <why>` lines on the tickets `tickets()` names and on PR `number`, each resolved in the
+    PR's harness reviews (`reviews` as the gate read them; each one's inline comments read again) and matched by
+    finding_key. Any failed read, `tickets()` included, is one warning naming it, and every finding still counts;
+    each request that dismisses nothing is one warning naming its selector and why."""
+    try:
+        requests = read_dismissals(repo.root, tickets(), number)
+        snapshots = github_snapshots(repo.root, number, reviews)
+    except Problem as err:
+        warn("harness-pr", f"PR #{number}: cannot read the owner's dismissals ({err}); every finding counts")
+        return blocking
+    dismissed, unmatched = resolve_dismissals(requests, snapshots)
+    for u in unmatched:
+        warn("harness-pr", f"PR #{number}: dismiss {u['selector']} on {u['source']} dismisses nothing: {u['reason']}")
+    return apply_dismissals(blocking, dismissed)[0]
 
 
 def unaddressed(number, review, blocking, unlisted, after="no commit after it"):
@@ -1418,11 +1436,15 @@ def cmd_ready(args):
     repo = open_repo()
     number = args.number
     try:
-        review, blocking, lows, unlisted = review_gate(repo, number)
+        review, blocking, lows, unlisted, reviews = review_gate(repo, number)
     except Problem as err:
         raise Problem(f"cannot check the harness review findings of PR #{number}: {err}") from None
+    if blocking:                              # only a listed blocker reads the owner's dismissals (#516)
+        def tickets():
+            return [args.ticket] if args.ticket else closing_numbers(pr_view(repo, number, "closingIssuesReferences"))
+        blocking = undismissed(repo, number, tickets, reviews, blocking)
     if blocking or unlisted:
-        raise Problem(unaddressed(number, review, blocking, unlisted)
+        raise Problem(unaddressed(number, review, [f["text"] for f in blocking], unlisted)
                       + f"; fix them, push, then harness-pr ready {number}")
     gh(["pr", "ready", str(number)], repo.root)
     view = pr_view(repo, number, "url,title,closingIssuesReferences,labels")
@@ -1446,7 +1468,8 @@ def cmd_ready(args):
     if waits:
         print(waits)
     if lows:
-        warn("harness-pr", f"PR #{number}: {plural(len(lows), 'low finding')} left for the owner: " + "; ".join(lows))
+        warn("harness-pr", f"PR #{number}: {plural(len(lows), 'low finding')} left for the owner: "
+             + "; ".join(f["text"] for f in lows))
     if not tickets:
         warn("harness-pr", f"PR #{number} names no ticket (no Closes #N, no --ticket); no status changed")
     if error:
@@ -1979,10 +2002,11 @@ def land_gate(repo, number, view, accept):
     """The head checks, autoland's rules that hold for any land, at the view's headRefOid: not behind main; the
     latest harness review at the head (of the head itself, or of a commit the head adds only clean merges of main
     to: autoland.at_head, after a fetch of origin in the main checkout); and that review's high or medium findings,
-    judged at the head whatever the commit dates (review_gate's date rule is ready's only). No harness review
-    proceeds; low findings never refuse. A failed read the head checks need refuses whatever the flags;
-    --accept-findings turns only the findings refusal, or a failed read of the review's inline comments, into a
-    warning."""
+    judged at the head whatever the commit dates (review_gate's date rule is ready's only), less those the owner
+    dismissed (undismissed: the tickets the PR closes and the PR itself). No harness review proceeds; low findings
+    never refuse. A failed read the head checks need refuses whatever the flags; --accept-findings turns only the
+    findings refusal, or a failed read of the review's inline comments, into a warning naming every listed high or
+    medium finding, and reads no dismissal (they cannot change whether it lands)."""
     main, head, branch = repo.main, str(view.get("headRefOid") or ""), str(view.get("headRefName") or "")
     try:
         if not head:
@@ -1996,7 +2020,8 @@ def land_gate(repo, number, view, accept):
                       f"into {branch or 'its branch'} and push, then harness-pr land {number} once the checks at "
                       "the new head are green")
     try:
-        review = latest_harness_review(api_list(repo, f"repos/{slug}/pulls/{number}/reviews"))
+        reviews = api_list(repo, f"repos/{slug}/pulls/{number}/reviews")
+        review = latest_harness_review(reviews)
         reviewed = str(review.get("commit_id") or "") if review else ""
         covered = review is None or reviewed == head
         if not covered:
@@ -2020,10 +2045,12 @@ def land_gate(repo, number, view, accept):
         warn("harness-pr",
              f"cannot check the harness review findings of PR #{number} ({err}); landing it (--accept-findings)")
         return
-    blocking = [text for sev, text in found if sev != "low"]
+    blocking = [f for f in found if f["severity"] != "low"]
+    if blocking and not accept:               # a listed blocker, no override: read the owner's dismissals (#516)
+        blocking = undismissed(repo, number, lambda: closing_numbers(view), reviews, blocking)
     if not blocking and not unlisted:
         return
-    said = unaddressed(number, review, blocking, unlisted,
+    said = unaddressed(number, review, [f["text"] for f in blocking], unlisted,
                        "no commit after it" if reviewed == head else "only clean merges of main after it")
     if not accept:
         raise Problem(said + f"; fix them and push, or harness-pr land {number} --accept-findings to land it anyway")

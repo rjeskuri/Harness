@@ -8,7 +8,8 @@ gathered so far) and `tickets.json` (the out-of-scope findings ticketed so far, 
      "blocking": [...], "low": [...], "outside": [...], "pr": null, "review_id": null}
 
 and each finding is {"path", "line", "severity", "body"} as harness-pr's load_findings normalises
-it. See docs/design.md (State).
+it. A round may also hold `dismissed` (#515): the findings the owner dismissed (dismissals.py),
+each with `from` (blocking, low or outside), `why` and `url` added. See docs/design.md (State).
 
 Standard library only; works with the python3 from Xcode's command line tools (3.9) or newer.
 """
@@ -79,6 +80,12 @@ def latest_round(key, ticket):
 def blocking(rnd):
     """The round's blocking findings (high or medium, on a file the ticket changed)."""
     found = rnd.get("blocking") if isinstance(rnd, dict) else None
+    return [f for f in found if isinstance(f, dict)] if isinstance(found, list) else []
+
+
+def dismissed(rnd):
+    """The round's dismissed findings (its optional `dismissed` list), [] when absent or broken."""
+    found = rnd.get("dismissed") if isinstance(rnd, dict) else None
     return [f for f in found if isinstance(f, dict)] if isinstance(found, list) else []
 
 
