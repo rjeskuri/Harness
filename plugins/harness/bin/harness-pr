@@ -1201,11 +1201,11 @@ def refresh_findings(args):
     pr = pr if isinstance(pr, int) and not isinstance(pr, bool) else branch_pr(repo, number, head)
     if pr is None:
         raise Problem(f"no PR to read the owner's dismissals on (harness-pr open {number} first)")
-    held, unmatched = owner_dismissals(repo, number, pr, strict=True)
+    owned, unmatched = owner_dismissals(repo, number, pr, strict=True)
     receipt = read_json(os.path.join(reviews_dir(key, number), f"gpt-{pr}-{head}.json"))
-    if isinstance(receipt, dict):                      # a blocker Sol carried across a rename
-        held = held + carried_dismissals(as_findings(receipt.get("unresolved")),
-                                         receipt.get("unresolved_keys") or [], held)
+    carried = (carried_dismissals(as_findings(receipt.get("unresolved")), receipt.get("unresolved_keys") or [], owned)
+               if isinstance(receipt, dict) else [])  # a blocker Sol carried across a rename
+    held = owned + carried
     splits = {name: as_findings(rnd.get(name)) for name in ("blocking", "low", "outside")}
     prior = []
     for f in round_dismissed(rnd):
