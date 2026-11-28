@@ -127,8 +127,9 @@ try:
                                         resolve as resolve_dismissals, review_findings as lib_review_findings)
     from harness_lib.autoland import (CONVERSATION, at_head, behind_main, check_entries as lib_check_entries,
                                       evaluate, fetch_origin, gate_settings, gather_facts, overall, review_counts)
-    from harness_lib.reviews import (add_rulings, add_ticket, finding_key, latest_round, load_rounds, load_tickets,
-                                     reviews_dir, save_round)
+    from harness_lib.owner_comments import answer_rounds, fetch as fetch_owner_comments
+    from harness_lib.reviews import (add_rulings, add_ticket, finding_key, latest_round, load_rounds, load_rulings,
+                                     load_tickets, reviews_dir, save_round, text_sha256)
     from harness_lib.settings import setting, settings_env
 except Exception as exc:  # no state key can be guessed without the lib: one line, exit 1
     sys.exit(f"harness-pr: cannot load harness_lib from {_LIB}: {' '.join(str(exc).split())}")
@@ -184,6 +185,8 @@ SMOKE_TIMEOUT = 300.0        # seconds it may take (HARNESS_SMOKE_TIMEOUT)
 CATCH_UP_ROUNDS = 3          # land --catch-up: merges of main at most
 CATCH_UP_TIMEOUT = 420.0     # land --catch-up: seconds for all its check waits, one call under the Bash tool's 600 s
 LEARN_DAYS = 7               # learn: the window without --since or a recorded run
+BRIEF_LIMIT = 64000          # characters of brief harness-gpt reads (its run refuses more)
+OMIT_PRIVATE = "HARNESS_GPT_OMIT_PRIVATE"    # 1 or true: no ticket Context section and no owner answers for Sol
 
 
 def plural(n, word):
@@ -975,6 +978,83 @@ def flatten_brief(value):
             yield from flatten_brief(child)
 
 
+def omit_private(main):
+    """HARNESS_GPT_OMIT_PRIVATE is 1 or true: the environment, else `env` in the main checkout's
+    .claude/settings.json."""
+    return (setting(OMIT_PRIVATE, settings_env(main, ("settings.json",))) or "").lower() in ("1", "true")
+
+
+def gpt_brief(repo, number, ticket, rulings, review, prior_blockers):
+    """Sol's brief, untrimmed: the ticket's binding sections and the owner's answers to every needs-input question
+    on it, the supporting context (Context section, epic goal, the saved rulings then this call's, each once), what
+    was left out, the review mode and the prior blockers. A failed read of the owner's login or the ticket's
+    comments is a Problem; with HARNESS_GPT_OMIT_PRIVATE neither is read and the Context section is left out."""
+    sections = ticket.get("sections") if isinstance(ticket.get("sections"), dict) else {}
+    parent = ticket.get("parent") if isinstance(ticket.get("parent"), dict) else {}
+    omitted, answers, ticket_context = [], [], sections.get("context") or ""
+    if omit_private(repo.main):
+        omitted = [f"context.ticket_context: left out ({OMIT_PRIVATE})",
+                   f"binding.owner_answers: the owner's answers withheld by the project setting {OMIT_PRIVATE}"]
+        ticket_context = ""
+    else:
+        try:
+            login, comments = fetch_owner_comments(repo.root, [number])
+        except Problem as err:
+            raise Problem(f"cannot read the owner's answers on #{number}: {err}; GPT check incomplete") from None
+        answers = answer_rounds(comments.get(number) or [], login)
+    return {"binding": {"request": sections.get("request") or "", "outline": sections.get("outline") or "",
+                        "definition_of_done": list(sections.get("definition_of_done") or []),
+                        "tests": list(sections.get("tests") or []), "owner_answers": answers},
+            "context": {"ticket_context": ticket_context, "epic_goal": parent.get("goal") or "",
+                        "rulings": list(dict.fromkeys(load_rulings(repo.key, number) + rulings))},
+            "omitted": omitted, "review": review, "prior_blockers": prior_blockers}
+
+
+def secret_field(brief):
+    """`<part>.<key>` of the first brief field holding a secret-shaped string, or None."""
+    for part, value in brief.items():
+        for key, child in (value.items() if isinstance(value, dict) else [("", value)]):
+            if any(pattern.search(text) for text in flatten_brief(child) for _, pattern in COMPILED):
+                return f"{part}.{key}" if key else part
+    return None
+
+
+def fitted_brief(brief, limit=BRIEF_LIMIT):
+    """The brief as the compact JSON harness-gpt reads, at most `limit` characters: the oldest rulings dropped (the
+    newest kept while it fits), then the ticket context and the epic goal cut, then the newest ruling dropped, each
+    trim named in `omitted`. binding, review and prior_blockers are never trimmed; when they alone exceed the limit,
+    a Problem naming the size."""
+    context = brief["context"]
+    rulings = context["rulings"]
+    kept = dict(context)
+
+    def encode():
+        notes = list(brief["omitted"])
+        dropped = len(rulings) - len(kept["rulings"])
+        if dropped:
+            notes.append(f"context.rulings: the {dropped} oldest of {len(rulings)} dropped")
+        for key in ("ticket_context", "epic_goal"):
+            if kept[key] != context[key]:
+                notes.append(f"context.{key}: cut to its first {len(kept[key])} of {len(context[key])} characters")
+        return json.dumps(dict(brief, context=dict(kept), omitted=notes), separators=(",", ":"))
+
+    text = encode()
+    while len(text) > limit and len(kept["rulings"]) > 1:
+        kept["rulings"] = kept["rulings"][1:]
+        text = encode()
+    for key in ("ticket_context", "epic_goal"):
+        while len(text) > limit and kept[key]:
+            kept[key] = kept[key][:max(0, len(kept[key]) - (len(text) - limit))]
+            text = encode()
+    if len(text) > limit and kept["rulings"]:
+        kept["rulings"] = []
+        text = encode()
+    if len(text) > limit:
+        raise Problem(f"GPT check incomplete: the brief is {len(text)} characters with nothing left to trim but its "
+                      f"binding part, review and prior blockers, over the {limit} harness-gpt reads")
+    return text
+
+
 def cmd_findings(args):
     if not args.gpt_check or args.latest:
         return record_findings(args)
@@ -1021,6 +1101,9 @@ def record_findings(args, repo=None):
         branch = TICKET_BRANCH.match(current_branch(repo.root) or "")
         if not args.head or not branch or int(branch.group(1)) != number:
             raise Problem("--gpt-check requires the pinned head of this ticket's branch")
+        field = secret_field({"context": {"rulings": rulings}})      # every path, a recovered post included
+        if field:
+            raise Problem(f"the brief's {field} holds a secret-shaped value; GPT check incomplete")
         pr = branch_pr(repo, number, head)
         if pr is None:
             raise Problem("open the draft PR before requesting the GPT check")
@@ -1037,22 +1120,17 @@ def record_findings(args, repo=None):
                 recovering = False
             else:
                 receipt.update(posted=False, review_id=None)
-        if recovering:
-            findings, reviewers = receipt["findings"], receipt["reviewers"]
-            unresolved = receipt.get("unresolved", [])
-        else:
-            if not args.review and not (previous and (previous.get("head") != head or receipt)):
-                raise Problem("a first review requires the Claude findings file; check --latest before retrying")
+        paired = previous and previous.get("reviewers")
+        refusal = None
+        if not args.review and not (previous and (previous.get("head") != head or receipt)):
+            refusal = "a first review requires the Claude findings file; check --latest before retrying"
+        elif previous and not paired and not args.review:
+            refusal = "previous review was local only; continue locally or obtain a fresh paired review"
+        if refusal and not recovering:
+            raise Problem(refusal)
+        if not (recovering and receipt["posted"]):                 # GitHub holds no review of this head yet
             ticket = show_ticket(repo, number)
-            sections = ticket.get("sections") or {}
-            brief = {key: sections.get(key) for key in ("request", "definition_of_done", "tests")}
-            paired = previous and previous.get("reviewers")
-            if previous and not paired and not args.review:
-                raise Problem("previous review was local only; continue locally or obtain a fresh paired review")
-            brief["prior_blockers"] = previous.get("blocking", []) if paired else []
-            raw = "\n".join(flatten_brief(brief))
-            if any(pattern.search(raw) for _, pattern in COMPILED):
-                raise Problem("ticket context contains a secret-shaped value; GPT check incomplete")
+            prior_blockers = previous.get("blocking", []) if paired else []
             review_base = fork
             if paired:
                 prior = previous.get("head") or ""
@@ -1061,14 +1139,28 @@ def record_findings(args, repo=None):
                         repo.root, "merge-base", "--is-ancestor", fork, prior).returncode == 0
                     if base_covered and git(repo.root, "merge-base", "--is-ancestor", prior, head).returncode == 0:
                         review_base = prior
+            review = {"mode": "full" if review_base == fork else "fix", "base": review_base}
+            brief = gpt_brief(repo, number, ticket, rulings, review, prior_blockers)
+            field = secret_field(brief)
+            if field:
+                raise Problem(f"the brief's {field} holds a secret-shaped value; GPT check incomplete")
+            text = fitted_brief(brief)
+            digest = text_sha256(text)
+            if recovering and receipt.get("brief_sha256") != digest:      # Sol checked other inputs: check again
+                if refusal:
+                    raise Problem(refusal)
+                recovering = False
+        if recovering:
+            findings, reviewers = receipt["findings"], receipt["reviewers"]
+            unresolved = receipt.get("unresolved", [])
+        else:
             reply = tool("harness-gpt", ["check", "--head", head, "--base", review_base, "--brief-stdin"],
-                         repo.root, stdin=json.dumps(brief), timeout=1080)
+                         repo.root, stdin=text, timeout=1080)
             try:
                 report = json.loads(reply.stdout)
                 if report["head"] != head or report["model"] != "gpt-6.2-sol" or not isinstance(report["findings"], list):
                     raise ValueError()
                 fixed = report["prior_fixed"]
-                prior_blockers = brief["prior_blockers"]
                 if (not isinstance(fixed, list) or len(fixed) != len(prior_blockers)
                         or any(type(value) is not bool for value in fixed)):
                     raise ValueError()
@@ -1089,7 +1181,7 @@ def record_findings(args, repo=None):
                 raise Problem("GPT check did not return findings for the requested head") from None
             reviewers = ([args.model] if args.review else []) + [report["model"]]
             receipt = {"findings": findings, "reviewers": reviewers, "unresolved": unresolved,
-                       "marker": f"<!-- harness-gpt-{uuid.uuid4()} -->"}
+                       "brief_sha256": digest, "marker": f"<!-- harness-gpt-{uuid.uuid4()} -->"}
             write_json(receipt_path, receipt, prefix=".gpt-")
         model = " + ".join(reviewers)
         checked += f" (reviewed by {model})"
