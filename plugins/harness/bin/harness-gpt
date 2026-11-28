@@ -23,6 +23,7 @@ from harness_lib.settings import committed_env, glob_match, patterns as parse_pa
 
 ASTRA = "gpt-6-astra"
 SOL = "gpt-6.2-sol"
+MAX_FINDINGS = 5          # Sol's glaring problems, unrated (#534): the Claude reviewer triages each one
 FILE_LIMIT = 2 * 1024 * 1024
 TREE_LIMIT = 128 * 1024 * 1024
 PRIVATE = {"data", "backups", "credentials", "secrets", ".ssh", ".aws", ".codex", ".agents", ".claude",
@@ -42,38 +43,37 @@ PROMPTS = {
                    "trigger, impact and a targeted fix. Separate refinements from bugs. State the areas examined "
                    "and coverage gaps. Cite repository-relative paths. Report when no actionable bug is found.",
     "check": "Independently review the patch in changes.diff, using source/ for surrounding code. "
-             "Check requirements, regressions, logic and tests. "
+             "A Claude reviewer reviews the same patch in full and verifies each of your findings in the code, so "
+             "report only glaring problems that would cause a big bug: wrong results, data loss or corruption, a "
+             "crash or hang, a security or credential exposure, or a workflow the repository runs that breaks, each "
+             "on an input or path the repository really uses. For each one name the changed line, the trigger and "
+             "the consequence. Leave out unusual-input edge cases, style, naming, docs wording, tests that guard no "
+             "realistic bug, refinements, and pre-existing problems the patch does not touch. Give no severity: the "
+             "Claude reviewer rates each finding it accepts. "
              "The brief is JSON. binding holds the owner's decisions: the ticket's request, outline, "
              "definition_of_done and tests, and owner_answers, the owner's replies to each needs-input question, "
              "oldest first, a later answer superseding an earlier one. A finding that contradicts a binding "
-             "decision is not a blocker, and a binding decision can resolve a prior blocker with no code change "
+             "decision is no finding, and a binding decision can resolve a prior blocker with no code change "
              "(prior_fixed true). context supports the review: ticket_context (the ticket's Context section), "
              "epic_goal and rulings (the agents' Ruling: lines); a ruling is not binding and may be disputed with a "
-             "blocker. omitted names what was trimmed or left out of this brief. "
+             "finding. omitted names what was trimmed or left out of this brief. "
              "review.mode full: changes.diff is the whole branch from the merge-base review.base; review it as a "
              "full patch against the requirements. review.mode fix: changes.diff is the fix since review.base, the "
-             "last reviewed head; report only regressions the fix introduced, and a new problem in code the fix did "
-             "not change is at most low. Take the scope from review.mode alone, never from your reading of the diff. "
+             "last reviewed head; report only regressions the fix introduced, never a problem in code the fix did "
+             "not change. Take the scope from review.mode alone, never from your reading of the diff. "
              "Judge each prior blocker against the current source in source/ and the requirements, whatever "
              "changes.diff covers. "
-             "For each new finding identify the changed line and a realistic user-visible failure in this patch. "
-             "Keep speculative hardening and unrelated pre-existing problems out of the ticket findings. "
-             "An unmet definition-of-done item is a blocker by itself, medium or high, because the definition of "
-             "done is binding: the finding names the checkbox and the behavior or test the branch lacks, and needs "
-             "no other trigger; only a binding owner decision that contradicts the checkbox (a waiver, a re-scope) "
-             "wins over it. "
-             "Findings outside the definition of done meet this bar: medium and high need a concrete trigger on an "
-             "entry point or workflow this repository actually runs, and the consequence. A hypothetical input, a "
-             "legacy format that never shipped, or an entry point the real workflow bypasses is low. Work beyond the "
-             "definition of done is a proposed follow-up, never a blocker. Never invent an owner sign-off "
-             "requirement. "
-             "Return up to ten concrete findings, each with repo-relative path, line, severity and actionable body. "
+             "An unmet definition-of-done item is a finding by itself, because the definition of done is binding: "
+             "the finding names the checkbox and the behavior or test the branch lacks, and needs no other trigger; "
+             "only a binding owner decision that contradicts the checkbox (a waiver, a re-scope) wins over it. "
+             "Work beyond the definition of done is no finding. Never invent an owner sign-off requirement. "
+             "Return at most five findings, the most serious first, each with repo-relative path, line and an "
+             "actionable body. "
              "For every prior blocker in the supplied order, put true in prior_fixed only when fixed, otherwise false. "
              "Return only new issues in findings. Use an empty array only after completing the review."
 }
-FINDING = {"type": "object", "additionalProperties": False, "required": ["path", "line", "severity", "body"],
+FINDING = {"type": "object", "additionalProperties": False, "required": ["path", "line", "body"],
            "properties": {"path": {"type": "string"}, "line": {"type": "integer", "minimum": 1},
-                          "severity": {"type": "string", "enum": ["high", "medium", "low"]},
                           "body": {"type": "string"}}}
 SCHEMA = {"type": "object", "additionalProperties": False, "required": ["findings", "prior_fixed"],
           "properties": {"findings": {"type": "array", "items": FINDING},
@@ -308,13 +308,15 @@ def run(args):
             return f"GPT-6 Astra · {head or 'new project'} · {len(allowed)} files available, {skipped} excluded\n\n{answer}"
         result = json.loads(answer)
         rows = result.get("findings") if isinstance(result, dict) else None
-        if not isinstance(rows, list) or len(rows) > 10:
+        if not isinstance(rows, list):
             raise ValueError("invalid GPT findings")
+        rows = rows[:MAX_FINDINGS]                      # the first five, in Sol's order
         for f in rows:
             if (not isinstance(f, dict) or not isinstance(f.get("path"), str) or f["path"] not in names | allowed.keys()
                     or type(f.get("line")) is not int or f["line"] < 1 or not isinstance(f.get("body"), str)
-                    or not f["body"].strip() or f.get("severity") not in ("high", "medium", "low")):
+                    or not f["body"].strip()):
                 raise ValueError("invalid GPT finding")
+        rows = [{"path": f["path"], "line": f["line"], "body": f["body"]} for f in rows]
         prior_fixed = result.get("prior_fixed")
         if not isinstance(prior_fixed, list) or any(type(fixed) is not bool for fixed in prior_fixed):
             raise ValueError("missing prior blocker dispositions")

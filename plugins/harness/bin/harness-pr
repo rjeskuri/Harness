@@ -68,19 +68,24 @@ the local rounds, else the PR's harness reviews on GitHub) leaves blocking, low 
 `dismissed` and is neither posted nor ticketed; an unmatched request and a failed read are each one warning.
 It records the round (harness_lib/reviews.py; the same HEAD replaces the latest round, replaced-snapshots.json keeping
 what that one raised and when, for the dismissals made against it), writes
-round-<k>-blocking.json, round-<k>-review.json and notes.md (Low findings, Out of scope, Dismissed, Rulings, gathered
-over every round) under ~/.claude/harness/repos/<key>/reviews/N/, and prints the `harness-work stage` record: review
-pass in round 1, then fix pass or fail. A review with no findings array exits 1 and records nothing; --latest
-prints the latest round and writes nothing (and makes no gh call). --refresh (#518), alone of the modes, applies the
-owner's current dismissals to the latest round again (its head the worktree's clean HEAD, its PR the round's else the
-branch's open one; otherwise, or on a failed read, exit 1 writing nothing): the same round rebuilt in place, its
-round-<k>-blocking.json and notes.md rewritten, nothing posted or ticketed, no harness-gpt, `record` null.
-With an open PR for the branch (`gh pr list --head <branch> --state open`) it posts round-<k>-review.json there as
-`review` would (post_review) and records the PR and the review id; a PR head that is not the worktree's HEAD (or gh
-failing) refuses before anything is posted or recorded; no open PR records the round with a warning and posts nothing. Then, with an open PR, each high or medium
+round-<k>-blocking.json, round-<k>-review.json and notes.md (Low findings, Out of scope, Dismissed, Set aside,
+Rulings, gathered over every round) under ~/.claude/harness/repos/<key>/reviews/N/, and prints the `harness-work
+stage` record: review pass in round 1, then fix pass or fail. A review with no findings array exits 1 and records
+nothing; --latest prints the latest round and writes nothing (and makes no gh call). --refresh (#518), alone of the
+modes, applies the owner's current dismissals to the latest round again (its head the worktree's clean HEAD, its PR
+the round's else the branch's open one; otherwise, or on a failed read, exit 1 writing nothing): the same round
+rebuilt in place, its round-<k>-blocking.json and notes.md rewritten, nothing posted or ticketed, no harness-gpt,
+`record` null. With an open PR for the branch (`gh pr list --head <branch> --state open`) it posts
+round-<k>-review.json there as `review` would (post_review) and records the PR and the review id; a PR head that is
+not the worktree's HEAD (or gh failing) refuses before anything is posted or recorded; no open PR records the round
+with a warning and posts nothing. Then, with an open PR, each high or medium
 outside finding of any recorded round not ticketed yet (by path and body, kept in tickets.json) becomes a proposed
 bug ticket under the ticket's epic (`harness-board task create`, the body on stdin, naming this round's PR), its
 number on the notes line; a failed create is a warning, and the next round with a PR tries it again.
+--gpt-check (#534) runs harness-gpt check, saves Sol's unrated candidates and its prior-blocker calls in the
+receipt and stops at a `triage` result naming the candidates file, posting and recording nothing; --gpt-triage V
+then takes the reviewer's verdicts on them, publishes the accepted ones beside the Claude findings and records the
+round, the set-aside ones and the overridden calls in notes.md under Set aside.
 
 learn lists the PRs merged since `since` (--since, else `last_run` in ~/.claude/harness/repos/<key>/learn.json, else
 7 days ago), each with its ticket (t/N- branch), its review rounds' findings and its conversation without the
@@ -196,7 +201,8 @@ CATCH_UP_ROUNDS = 3          # land --catch-up: merges of main at most
 CATCH_UP_TIMEOUT = 420.0     # land --catch-up: seconds for all its check waits, one call under the Bash tool's 600 s
 LEARN_DAYS = 7               # learn: the window without --since or a recorded run
 BRIEF_LIMIT = 64000          # characters of brief harness-gpt reads (its run refuses more)
-GPT_POLICY = 1               # the gpt receipt's policy: a receipt recorded under another is checked again (#519)
+GPT_POLICY = 2               # the gpt receipt's policy: a receipt recorded under another is checked again (#519;
+                             # 2: Sol's findings are unrated candidates for Opus's triage, #534)
 OMIT_PRIVATE = "HARNESS_GPT_OMIT_PRIVATE"    # 1 or true: no ticket Context section and no owner answers for Sol
 
 
@@ -876,13 +882,23 @@ def notes_line(f, outside):
     return f"{line} {OUTSIDE_NOTE}" if outside else line
 
 
+def set_aside_line(f):
+    """One `### Set aside` bullet (#534): a Sol candidate Opus set aside, or a prior blocker whose call by Sol it
+    overrode, with Opus's reason."""
+    if f.get("sol"):
+        return (f"- {where(f)} [{f.get('severity')}] {one_line(f.get('body') or '')} (Sol: {f['sol']}; Opus: "
+                f"{f.get('verdict')}, {one_line(f.get('why') or '')})")
+    return f"- {where(f)} {one_line(f.get('body') or '')} (set aside: {one_line(f.get('why') or '')})"
+
+
 def notes_text(rounds, rulings, tickets=()):
-    """notes.md from every round and every ruling: Low findings, Out of scope, Dismissed, Rulings, each once and each
-    left out when empty. An out-of-scope line whose finding was ticketed ends in ` -> #<n>`; a dismissed one ends in
-    `(dismissed: <why>)`."""
+    """notes.md from every round and every ruling: Low findings, Out of scope, Dismissed, Set aside, Rulings, each once
+    and each left out when empty. An out-of-scope line whose finding was ticketed ends in ` -> #<n>`; a dismissed one
+    ends in `(dismissed: <why>)`."""
     numbers = {tuple(t["key"]): t["number"] for t in tickets}
-    low, out_of_scope, gone = [], [], []
+    low, out_of_scope, gone, aside = [], [], [], []
     for rnd in rounds:
+        aside += [set_aside_line(f) for f in as_findings(rnd.get("set_aside"))]
         low += [notes_line(f, False) for f in as_findings(rnd.get("low"))]
         for f in as_findings(rnd.get("outside")):
             if f.get("severity") == "low":
@@ -891,7 +907,7 @@ def notes_text(rounds, rulings, tickets=()):
             n = numbers.get(tuple(finding_key(f)))
             out_of_scope.append(notes_line(f, True) + (f" -> #{n}" if n else ""))
         gone += [f"{notes_line(f, False)} (dismissed: {one_line(f.get('why') or '')})" for f in round_dismissed(rnd)]
-    sections = [("Low findings", low), ("Out of scope", out_of_scope), ("Dismissed", gone),
+    sections = [("Low findings", low), ("Out of scope", out_of_scope), ("Dismissed", gone), ("Set aside", aside),
                 ("Rulings", [f"- {r}" for r in rulings])]
     parts = [f"### {name}\n" + "\n".join(dict.fromkeys(lines)) for name, lines in sections if lines]
     return "\n\n".join(parts) + "\n" if parts else ""
@@ -1195,6 +1211,90 @@ def checked_but_dismissed(brief, receipt, held):
         return False
 
 
+def triage_candidates(number, head, receipt):
+    """The candidates file of a GPT check (#534): Sol's findings, unrated, and its call on each prior blocker sent
+    to it, each numbered from 1 in Sol's (the brief's) order."""
+    return {"ticket": number, "head": head,
+            "candidates": [{"id": i, **c} for i, c in enumerate(receipt["candidates"], 1)],
+            "prior": [{"id": i, **f, "sol": "fixed" if fixed else "unresolved"}
+                      for i, (f, fixed) in enumerate(zip(receipt["prior_blockers"], receipt["prior_fixed"]), 1)]}
+
+
+def triage_verdicts(path, receipt):
+    """Opus's verdicts (#534) on the receipt's candidates and prior blockers: ({id: verdict}, {id: verdict}), one
+    verdict per id; a Problem naming the first one missing, repeated, unknown or incomplete (an accept without a
+    severity, a set-aside or an override of Sol's call without a reason)."""
+    try:
+        data = json.loads(read_text(path, "verdicts file"))
+    except ValueError:
+        raise Problem(f"{path}: the verdicts are not JSON") from None
+    if not isinstance(data, dict):
+        raise Problem(f"{path}: the verdicts are not a JSON object")
+    sol = ["fixed" if fixed else "unresolved" for fixed in receipt["prior_fixed"]]
+    out = []
+    for part, count, choices in (("candidates", len(receipt["candidates"]), ("accept", "set-aside")),
+                                 ("prior", len(sol), ("fixed", "unresolved"))):
+        given = data.get(part, [])
+        if not isinstance(given, list):
+            raise Problem(f"{path}: {part} is not a list")
+        by_id = {}
+        for v in given:
+            i = v.get("id") if isinstance(v, dict) else None
+            if type(i) is not int or not 1 <= i <= count or i in by_id:
+                raise Problem(f"{path}: {part} verdict {one_line(json.dumps(v))[:80]} names no {part} id of the "
+                              "candidates file, or one already judged")
+            if v.get("verdict") not in choices:
+                raise Problem(f"{path}: {part} id {i}: the verdict is not {' or '.join(choices)}")
+            reason = v.get("reason")
+            reasoned = isinstance(reason, str) and bool(reason.strip())
+            if v["verdict"] == "accept" and v.get("severity") not in SEVERITIES:
+                raise Problem(f"{path}: candidates id {i}: an accept needs a severity, high, medium or low")
+            if v["verdict"] == "set-aside" and not reasoned:
+                raise Problem(f"{path}: candidates id {i}: a set-aside needs a reason")
+            if part == "prior" and v["verdict"] != sol[i - 1] and not reasoned:
+                raise Problem(f"{path}: prior id {i}: overriding Sol's call ({sol[i - 1]}) needs a reason")
+            by_id[i] = v
+        missing = [str(i) for i in range(1, count + 1) if i not in by_id]
+        if missing:
+            raise Problem(f"{path}: no verdict for {part} id {', '.join(missing)}")
+        out.append(by_id)
+    return out
+
+
+def triaged_findings(repo, receipt, verdicts, head, fork):
+    """(findings, unresolved, origins, set_aside) after Opus's verdicts (#534): the Claude findings the check saved,
+    then each prior blocker Opus calls unresolved (one renamed since the review base at its new path, its line
+    unknown; origins: each one's key before that), then each candidate Opus accepts, at the severity it gave, one
+    entry per finding_key (merged_findings). set_aside holds each candidate it set aside and each prior blocker whose
+    call by Sol it overrode, with its reason (`why`)."""
+    cands, prior = verdicts
+    blockers, calls = receipt["prior_blockers"], receipt["prior_fixed"]
+    unresolved = [dict(f) for i, f in enumerate(blockers, 1) if prior[i]["verdict"] == "unresolved"]
+    origins = [finding_key(f) for f in unresolved]
+    base = receipt["base"]
+    if unresolved and base != fork:
+        fields = nul_fields(git_ok(repo.root, "diff", "--find-renames", "--name-status", "--diff-filter=R", "-z",
+                                   base, head))
+        renames = dict(zip(fields[1::3], fields[2::3]))
+        for f in unresolved:
+            if f["path"] in renames:
+                f["path"] = renames[f["path"]]
+                f["line"] = None  # without a verified line mapping, include it in the review body
+    accepted, set_aside = [], []
+    for i, c in enumerate(receipt["candidates"], 1):
+        v = cands[i]
+        if v["verdict"] == "accept":
+            accepted.append({"path": c["path"], "line": c["line"], "severity": v["severity"], "body": c["body"]})
+        else:
+            set_aside.append({"path": c["path"], "line": c["line"], "body": c["body"], "why": one_line(v["reason"])})
+    findings = merged_findings([[dict(f) for f in receipt["findings"]], unresolved, accepted], unresolved)
+    for i, (f, fixed) in enumerate(zip(blockers, calls), 1):
+        sol = "fixed" if fixed else "unresolved"
+        if prior[i]["verdict"] != sol:
+            set_aside.append({**f, "sol": sol, "verdict": prior[i]["verdict"], "why": one_line(prior[i]["reason"])})
+    return findings, unresolved, origins, set_aside
+
+
 def round_files(key, number, k):
     """Round k's files under reviews/N: {"blocking", "review", "notes"}."""
     folder = reviews_dir(key, number)
@@ -1206,12 +1306,13 @@ def round_files(key, number, k):
 def refresh_findings(args):
     """findings N --refresh (#518): the owner's dismissals applied again to the latest round at its head, with no
     review, no post, no ticket and no stage to record. The round keeps its number, `at`, head, base, pr, review_id,
-    reviewers and fork; its blocking, low and outside are rebuilt from them plus its dismissed findings (each back
-    in its `from` list, a `prior` one in blocking), less what the current dismissals hold."""
+    reviewers, fork, mode and set_aside; its blocking, low and outside are rebuilt from them plus its dismissed
+    findings (each back in its `from` list, a `prior` one in blocking), less what the current dismissals hold."""
     number = args.number
     others = [flag for flag, given in (("--review", args.review), ("--gpt-check", args.gpt_check),
-                                       ("--head", args.head), ("--rulings", args.rulings),
-                                       ("--model", args.model), ("--latest", args.latest)) if given]
+                                       ("--gpt-triage", args.gpt_triage), ("--head", args.head),
+                                       ("--rulings", args.rulings), ("--model", args.model),
+                                       ("--latest", args.latest)) if given]
     if others:
         raise Problem(f"--refresh takes no {', '.join(others)}")
     repo = open_repo(args.worktree)
@@ -1232,7 +1333,7 @@ def refresh_findings(args):
     owned, unmatched = owner_dismissals(repo, number, pr, strict=True)
     receipt = read_json(os.path.join(reviews_dir(key, number), f"gpt-{pr}-{head}.json"))
     carried = (carried_dismissals(as_findings(receipt.get("unresolved")), receipt.get("unresolved_keys") or [], owned)
-               if isinstance(receipt, dict) else [])  # a blocker Sol carried across a rename
+               if isinstance(receipt, dict) else [])  # a prior blocker carried across a rename (the triage's)
     held = owned + carried
     splits = {name: as_findings(rnd.get(name)) for name in ("blocking", "low", "outside")}
     prior = []
@@ -1265,7 +1366,7 @@ def refresh_findings(args):
 def cmd_findings(args):
     if args.refresh:
         return refresh_findings(args)
-    if not args.gpt_check or args.latest:
+    if not (args.gpt_check or args.gpt_triage) or args.latest:
         return record_findings(args)
     repo = open_repo(args.worktree)
     folder = Path(reviews_dir(repo.key, args.number))
@@ -1278,7 +1379,7 @@ def cmd_findings(args):
 def record_findings(args, repo=None):
     number = args.number
     if args.latest:
-        if args.review or args.rulings or args.gpt_check:
+        if args.review or args.rulings or args.gpt_check or args.gpt_triage:
             raise Problem("--latest takes no --review or --rulings")
         repo = open_repo(args.worktree)
         rnd = latest_round(repo.key, number)
@@ -1287,7 +1388,11 @@ def record_findings(args, repo=None):
             return 1
         emit(args.json, rnd, round_text(number, rnd))
         return 0
-    if not args.review and not args.gpt_check:
+    if args.gpt_check and args.gpt_triage:
+        raise Problem("--gpt-check and --gpt-triage are two calls: the check, then Opus's triage of its candidates")
+    if args.gpt_triage and args.review:
+        raise Problem("--gpt-triage takes no --review: the --gpt-check call saved the Claude findings")
+    if not args.review and not args.gpt_check and not args.gpt_triage:
         raise Problem("findings needs --review F (or --latest)")
     repo = repo or open_repo(args.worktree)
     rulings = ruling_lines(read_text(args.rulings, "rulings file")) if args.rulings else []
@@ -1307,11 +1412,14 @@ def record_findings(args, repo=None):
     model, checked = args.model or DEFAULT_MODEL, DEFAULT_CHECKED
     reviewers, unresolved, origins = [], [], []        # origins: each unresolved blocker's key before a rename
     held, unmatched = None, []                          # the owner's dismissals, read once with an open PR
+    set_aside = []                                      # what Opus's triage set aside of Sol's claims (#534)
     mode = None                                         # the GPT check's scope: full or fix (#519)
-    if args.gpt_check:
+    gpt = args.gpt_check or bool(args.gpt_triage)
+    if gpt:
+        flag = "--gpt-check" if args.gpt_check else "--gpt-triage"
         branch = TICKET_BRANCH.match(current_branch(repo.root) or "")
         if not args.head or not branch or int(branch.group(1)) != number:
-            raise Problem("--gpt-check requires the pinned head of this ticket's branch")
+            raise Problem(f"{flag} requires the pinned head of this ticket's branch")
         field = secret_field({"context": {"rulings": rulings}})      # every path, a recovered post included
         if field:
             raise Problem(f"the brief's {field} holds a secret-shaped value; GPT check incomplete")
@@ -1321,10 +1429,15 @@ def record_findings(args, repo=None):
         expected_pr = pr
         receipt_path = str(Path(reviews_dir(repo.key, number)) / f"gpt-{pr}-{head}.json")
         receipt = read_json(receipt_path)
-        if isinstance(receipt, dict) and not (type(receipt.get("policy")) is int and receipt["policy"] == GPT_POLICY):
-            receipt = None                                         # an older policy's check: Sol checks this head again
+        if not (isinstance(receipt, dict) and type(receipt.get("policy")) is int and receipt["policy"] == GPT_POLICY
+                and isinstance(receipt.get("candidates"), list)):
+            receipt = None                     # none, or an older policy's check (#519, #534): Sol checks it again
+        if args.gpt_triage:
+            if receipt is None:
+                raise Problem(f"no --gpt-check ran for {head[:7]} on PR #{pr}; run it before --gpt-triage")
+            verdicts = triage_verdicts(args.gpt_triage, receipt)
         previous = latest_round(repo.key, number)
-        recovering = isinstance(receipt, dict)
+        recovering = receipt is not None
         if recovering:
             current = latest_harness_review(api_list(repo, f"repos/{repo.slug()}/pulls/{pr}/reviews"))
             if current and current.get("commit_id") == head and receipt["marker"] in current["body"]:
@@ -1333,6 +1446,22 @@ def record_findings(args, repo=None):
                 recovering = False
             else:
                 receipt.update(posted=False, review_id=None)
+    if args.gpt_triage:
+        if not recovering:
+            raise Problem(f"PR #{pr}'s latest harness review is not the one this check saved; run --gpt-check again")
+        held, unmatched = owner_dismissals(repo, number, pr)
+        findings, unresolved, origins, set_aside = triaged_findings(repo, receipt, verdicts, head, fork)
+        receipt.update(unresolved=unresolved, unresolved_keys=origins)   # what --refresh carries across a rename
+        mode = receipt["mode"]
+        if mode == "fix":                                  # a fix re-check judges what the fix changed (#519)
+            rounds = load_rounds(repo.key, number)
+            earlier = rounds[:-1] if rounds and rounds[-1].get("head") == head else rounds
+            prior = {tuple(finding_key(f)) for f in as_findings(earlier[-1].get("blocking") if earlier else None)
+                     + unresolved}
+            findings = off_fix_demoted(findings, fix_lines(repo.root, receipt["base"], head), prior)
+        reviewers = receipt["reviewers"]
+        rulings = list(dict.fromkeys(receipt.get("rulings", []) + rulings))
+    elif args.gpt_check:
         paired = previous and previous.get("reviewers")
         refusal = None
         if not args.review and not (previous and (previous.get("head") != head or receipt)):
@@ -1341,8 +1470,8 @@ def record_findings(args, repo=None):
             refusal = "previous review was local only; continue locally or obtain a fresh paired review"
         if refusal and not recovering:
             raise Problem(refusal)
-        held, unmatched = owner_dismissals(repo, number, pr)        # before the brief: no dismissed prior blocker
         if not (recovering and receipt["posted"]):                 # GitHub holds no review of this head yet
+            held, unmatched = owner_dismissals(repo, number, pr)    # before the brief: no dismissed prior blocker
             ticket = show_ticket(repo, number)
             prior_blockers = apply_dismissals(previous.get("blocking", []), held)[0] if paired else []
             review_base = fork
@@ -1364,10 +1493,7 @@ def record_findings(args, repo=None):
                 if refusal:                                                # Sol checked other inputs: check again
                     raise Problem(refusal)
                 recovering = False
-        if recovering:
-            findings, reviewers, mode = receipt["findings"], receipt["reviewers"], receipt["mode"]
-            unresolved, origins = receipt.get("unresolved", []), receipt.get("unresolved_keys") or []
-        else:
+        if not recovering:
             reply = tool("harness-gpt", ["check", "--head", head, "--base", review_base, "--brief-stdin"],
                          repo.root, stdin=text, timeout=1080)
             try:
@@ -1378,29 +1504,31 @@ def record_findings(args, repo=None):
                 if (not isinstance(fixed, list) or len(fixed) != len(prior_blockers)
                         or any(type(value) is not bool for value in fixed)):
                     raise ValueError()
-                unresolved = [dict(f) for f, resolved in zip(prior_blockers, fixed) if not resolved]
-                origins = [finding_key(f) for f in unresolved]
-                if unresolved and review_base != fork:
-                    fields = nul_fields(git_ok(repo.root, "diff", "--find-renames", "--name-status", "--diff-filter=R",
-                                               "-z", review_base, head))
-                    renames = dict(zip(fields[1::3], fields[2::3]))
-                    for f in unresolved:
-                        if f["path"] in renames:
-                            f["path"] = renames[f["path"]]
-                            f["line"] = None  # without a verified line mapping, include it in the review body
-                findings = merged_findings([findings, unresolved, report["findings"]], unresolved)
+                candidates = []                    # Sol's findings, unrated: Opus's triage rates or sets aside each
+                for f in report["findings"]:
+                    c = {"path": f["path"], "line": f["line"], "body": f["body"]}
+                    if c not in candidates:
+                        candidates.append(c)
             except (AttributeError, KeyError, TypeError, ValueError):
                 raise Problem("GPT check did not return findings for the requested head") from None
-            mode = review["mode"]
-            if mode == "fix":                                  # a fix re-check judges what the fix changed
-                prior = {tuple(finding_key(f)) for f in as_findings(previous.get("blocking")) + unresolved}
-                findings = off_fix_demoted(findings, fix_lines(repo.root, review_base, head), prior)
             reviewers = ([model] if args.review else []) + [report["model"]]
-            receipt = {"findings": findings, "reviewers": reviewers, "unresolved": unresolved,
-                       "unresolved_keys": origins, "prior_blockers": prior_blockers, "brief_sha256": digest,
-                       "mode": mode, "base": review_base, "policy": GPT_POLICY,
+            receipt = {"findings": findings, "reviewers": reviewers, "candidates": candidates,
+                       "prior_blockers": prior_blockers, "prior_fixed": fixed, "rulings": rulings,
+                       "brief_sha256": digest, "mode": review["mode"], "base": review_base, "policy": GPT_POLICY,
                        "marker": f"<!-- harness-gpt-{uuid.uuid4()} -->"}
             write_json(receipt_path, receipt, prefix=".gpt-")
+        if git_ok(repo.root, "rev-parse", "HEAD").strip() != head or dirty_files(repo.root):
+            raise Problem("the reviewed head or working tree changed during the GPT check")
+        cands = triage_candidates(number, head, receipt)       # Opus's triage comes next: nothing posted yet
+        cands_path = str(Path(reviews_dir(repo.key, number)) / f"gpt-{pr}-{head}-candidates.json")
+        write_json(cands_path, cands, prefix=".gpt-")
+        out = {"ticket": number, "head": head, "pr": pr, "result": "triage", "candidates_file": cands_path}
+        emit(args.json, out, f"#{number} GPT check at {head[:7]}: {plural(len(cands['candidates']), 'candidate')} "
+                             f"and {plural(len(cands['prior']), 'prior blocker')} for the reviewer's triage; then "
+                             f"harness-pr findings {number} --head {head} --gpt-triage <verdicts>\n"
+                             f"candidates: {short_home(cands_path)}")
+        return 0
+    if gpt:
         model = " + ".join(reviewers)
         checked += f" (reviewed by {model})"
         if git_ok(repo.root, "rev-parse", "HEAD").strip() != head or dirty_files(repo.root):
@@ -1411,7 +1539,7 @@ def record_findings(args, repo=None):
         outside.remove(f)
         blocking.append(f)
     pr = branch_pr(repo, number, head)                 # refuses before anything is posted or recorded
-    if args.gpt_check and pr != expected_pr:
+    if gpt and pr != expected_pr:
         raise Problem("the open PR changed during the GPT check")
     if args.head and pr is None:
         raise Problem("open the draft PR before publishing the review")
@@ -1425,11 +1553,11 @@ def record_findings(args, repo=None):
         published.extend(f for f in outside if f["severity"] == "low")
     review_id = None
     inline, off = [], []
-    if args.gpt_check:
+    if gpt:
         if receipt.get("posted"):
             review_id = receipt.get("review_id")
             if isinstance(receipt.get("published"), list) and receipt["published"] != published:
-                try:                                   # the dismissals changed since: the review shows what is left
+                try:                                   # the dismissals (or verdicts) changed: it shows what is left
                     update_review(repo, pr, review_id, published, receipt.get("inline") or [], model, checked,
                                   receipt["marker"])
                     receipt["published"] = published
@@ -1448,7 +1576,7 @@ def record_findings(args, repo=None):
     replaced = rounds[-1] if rounds and rounds[-1].get("head") == head else None
     earlier = rounds[:-1] if replaced else rounds
     base = earlier[-1].get("head") if earlier else fork
-    if args.gpt_check and earlier and earlier[-1].get("reviewers"):     # the prior blockers the owner dismissed
+    if gpt and earlier and earlier[-1].get("reviewers"):     # the prior blockers the owner dismissed
         seen = {tuple(finding_key(f)) for f in dismissed}
         seen |= {tuple(o) for f, o in zip(unresolved, origins) if tuple(finding_key(f)) in seen}
         for f in apply_dismissals(as_findings(earlier[-1].get("blocking")), held or [])[1]:
@@ -1461,7 +1589,8 @@ def record_findings(args, repo=None):
         if snapshot not in older:
             write_json(os.path.join(reviews_dir(key, number), "replaced-snapshots.json"), older + [snapshot],
                        prefix=".findings-")
-    found = {"blocking": blocking, "low": low, "outside": outside, **({"dismissed": dismissed} if dismissed else {})}
+    found = {"blocking": blocking, "low": low, "outside": outside, **({"dismissed": dismissed} if dismissed else {}),
+             **({"set_aside": set_aside} if set_aside else {})}
     rnd = save_round(key, number, {"at": now_iso(), "head": head, "base": base, **found, "pr": pr,
                                    "review_id": review_id,
                                    **({"reviewers": reviewers, "fork": fork, "mode": mode} if reviewers else {})})
@@ -3030,7 +3159,10 @@ def parser():
     fd.add_argument("--rulings", metavar="R", help="a file whose `Ruling:` lines go in the notes")
     fd.add_argument("--model", metavar="NAME",
                     help=f"the reviewer's model, named in the posted review ({DEFAULT_MODEL})")
-    fd.add_argument("--gpt-check", action="store_true", help="run an independent Sol check before publishing")
+    fd.add_argument("--gpt-check", action="store_true",
+                    help="run an independent Sol check and stop at its candidates for the reviewer's triage")
+    fd.add_argument("--gpt-triage", metavar="V",
+                    help="the reviewer's verdicts on the GPT check's candidates at --head: publish and record")
     fd.add_argument("--latest", action="store_true", help="print the latest recorded round; write nothing")
     fd.add_argument("--refresh", action="store_true",
                     help="apply the owner's dismissals to the latest round again, at its head; no review, no post")

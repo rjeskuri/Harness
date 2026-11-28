@@ -31,13 +31,19 @@ root = pathlib.Path.cwd()
 receipt = {"args": args, "input": sys.stdin.read(), "files": sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())}
 if (root / "changes.diff").exists():
     receipt["patch"] = (root / "changes.diff").read_bytes().decode()
+if "--output-schema" in args:
+    receipt["schema"] = json.loads(pathlib.Path(args[args.index("--output-schema") + 1]).read_text())
 pathlib.Path(__file__).with_name("call.json").write_text(json.dumps(receipt))
 if "--json" in args:
     print(json.dumps({"type": "thread.started", "thread_id": "550e8400-e29b-41d4-a716-446655440000"}))
-pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[],"prior_fixed":[]}' if "--output-schema" in args else "Architecture advice")
+reply = pathlib.Path(__file__).with_name("reply.json")
+checked = reply.read_text() if reply.exists() else '{"findings":[],"prior_fixed":[]}'
+pathlib.Path(args[args.index("-o") + 1]).write_text(checked if "--output-schema" in args else "Architecture advice")
 """)
         fake.chmod(0o755)
-        self.env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"])
+        # A fresh HOME and no HARNESS_SOL_CHECK, so the owner's Sol switch on this machine does not reach the tool.
+        self.env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"], HOME=str(self.root / "owner"))
+        self.env.pop("HARNESS_SOL_CHECK", None)
         self.git("init", "-q", "-b", "main")
         for name in ("app.py", ".env", "credentials/example.py", "secrets.yaml", "aws-credentials.toml", "service-account-prod-us.yaml"):
             p = self.repo / name
@@ -141,6 +147,34 @@ pathlib.Path(args[args.index("-o") + 1]).write_text('{"findings":[],"prior_fixed
         self.assertIn("-first\n", patch)
         self.assertIn("+second\n", patch)
         self.assertEqual(patch.count("No newline at end of file"), 2)
+
+    def test_check_keeps_five_unrated_findings_and_passes_prior_fixed(self):
+        """#534: Sol's findings carry no severity (the schema Codex is given asks for path, line and body), at most
+        five of them are kept in Sol's order, and prior_fixed is passed through as Sol gave it."""
+        (self.repo / "app.py").write_text("".join(f"v{i} = {i}\n" for i in range(1, 9)))
+        self.git("commit", "-qam", "eight values")
+        head, base = self.git("rev-parse", "HEAD"), self.git("rev-parse", "main")
+
+        def found(i):
+            return {"path": "app.py", "line": i, "body": f"v{i} is read before it is set, so the export is wrong."}
+
+        rows = [  # name, Sol's findings, its prior-blocker calls
+            ("seven findings", [found(i) for i in (4, 1, 7, 2, 8, 3, 6)], [True, False, True]),
+            ("three findings", [found(i) for i in (6, 2, 5)], [False]),
+            ("five findings", [found(i) for i in (3, 1, 4, 5, 2)], [False, False]),
+        ]
+        for name, findings, prior in rows:
+            with self.subTest(name):
+                (self.root / "reply.json").write_text(json.dumps({"findings": findings, "prior_fixed": prior}))
+                p = self.call("check", "--head", head, "--base", base)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                out = json.loads(p.stdout)
+                self.assertEqual((out["head"], out["model"]), (head, "gpt-6.2-sol"))
+                self.assertEqual(out["findings"], findings[:5])
+                self.assertEqual(out["prior_fixed"], prior)
+                item = json.loads(self.log.read_text())["schema"]["properties"]["findings"]["items"]
+                self.assertNotIn("severity", item["properties"])
+                self.assertEqual(sorted(item["required"]), ["body", "line", "path"])
 
     def test_sol_check_off_calls_no_codex_and_clears_prior_blockers(self):
         (self.repo / "app.py").write_text("example = 2\n")

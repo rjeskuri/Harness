@@ -13,8 +13,10 @@ Without an open PR nothing is read.
 
 Fixture: pr_findings_support's PostTest (the repositories, fakegh with ticket 12's and PR #34's comments in its REST
 world, the harness-board stub), plus a fake harness-gpt in the module's fakebin that logs its argv and the brief it
-read and prints {"head", "model": "gpt-6.2-sol", "findings": <conf findings>, "prior_fixed": [<conf fixed>] *
-len(prior_blockers)} from a file the test writes. Each test's first harness-pr run is a process of its own; later
+read and prints {"head", "model": "gpt-6.2-sol", "findings": <conf findings, unrated>, "prior_fixed": [<conf fixed>]
+* len(prior_blockers)} from a file the test writes; a GPT check that records its round is the check and then the
+`--gpt-triage` call with Opus accepting Sol's findings at the conf's severities (#534). Each test's first harness-pr
+run is a process of its own; later
 runs run the tool in this process (gitrepo_support.run_in_process), git, gh, harness-board and harness-gpt still
 their own processes.
 
@@ -86,7 +88,8 @@ try:
 except OSError:
     conf = {}
 prior = json.loads(text).get("prior_blockers") or []
-print(json.dumps({"head": argv[argv.index("--head") + 1], "model": "gpt-6.2-sol", "findings": conf.get("findings", []),
+found = [{k: f[k] for k in ("path", "line", "body") if k in f} for f in conf.get("findings", [])]   # unrated (#534)
+print(json.dumps({"head": argv[argv.index("--head") + 1], "model": "gpt-6.2-sol", "findings": found,
                   "prior_fixed": [conf.get("fixed", True)] * len(prior)}))
 '''
 
@@ -225,6 +228,9 @@ class DismissTest(PostTest):
         write(path, json.dumps(rounds))
 
     def sol(self, findings=(), fixed=True):
+        """Sol raises `findings` (printed unrated) and calls every prior blocker `fixed`; Opus's triage (`paired`)
+        accepts each at the severity given here."""
+        self.raised = list(findings)
         write(os.path.join(self.tmp, "gpt.json"), json.dumps({"findings": list(findings), "fixed": fixed}))
 
     # ----------------------------------------------------------- runs
@@ -249,6 +255,13 @@ class DismissTest(PostTest):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertNotIn("Traceback", p.stderr)
         return json.loads(p.stdout), p
+
+    def paired(self, review=None):
+        """The GPT check, then Opus's triage (#534) accepting each of Sol's findings at the severity `sol` gave it
+        and confirming Sol's calls: (the triage call's JSON, its process), the call that records the round."""
+        out, _p = self.check(review)
+        accept = {f["body"]: norm(f)["severity"] for f in getattr(self, "raised", [])}
+        return self.triaged(support.opus_verdicts(self.candidates(out), accept=accept))
 
     def gpt_runs(self):
         return self.jsonl(self.gpt_log)
@@ -671,7 +684,7 @@ class GptCheck(DismissTest):
         self.sol([S26])
         self.serve(review_id=7001)
         head = self.head()
-        out, _p = self.check([F1, F2])
+        out, _p = self.paired([F1, F2])
         self.assertRecorded(out, blocking=[F1, F2, S26])
         self.stamp()
         self.assertEqual((len(self.gpt_runs()), len(self.posts())), (1, 1))
@@ -690,7 +703,7 @@ class GptCheck(DismissTest):
         for name, ticket, pr, blocking, dismissed in steps:
             with self.subTest(name):
                 self.serve(ticket=ticket, pr=pr, calls=github, review_id=7001)
-                out, _p = self.check([F1, F2])
+                out, _p = self.paired([F1, F2])
                 self.assertEqual(out["head"], head)
                 self.assertEqual(out["round"], 1)
                 self.assertRecorded(out, blocking=blocking, dismissed=dismissed)
@@ -714,13 +727,13 @@ class GptCheck(DismissTest):
                 self.fresh()
                 self.sol([], fixed=False)
                 self.serve()
-                self.check([F1, F2])
+                self.paired([F1, F2])
                 self.stamp()
                 self.sol(raised, fixed=False)
                 self.serve(ticket=ticket, pr=pr)
                 self.advance()
                 runs = len(self.gpt_runs())
-                out, p = self.check()
+                out, p = self.paired()
                 self.assertEqual(len(self.gpt_runs()), runs + 1)
                 brief = json.loads(self.gpt_runs()[-1]["stdin"])
                 self.assertEqual(bag(brief["prior_blockers"]), bag(map(norm, prior)))
