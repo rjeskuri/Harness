@@ -141,9 +141,9 @@ def later(hours=1):
 
 
 def github_review(rid, when, inline, listed, login=OWNER):
-    """(a harness review as harness-pr posts it, its inline comments in REST form): the counts line, the `listed`
-    findings under `Not on a changed line:`, the marker; each inline comment at its posted line (original_line),
-    `line` where a later push moved it."""
+    """(a harness review as harness-pr posts it, its inline comments as GET pulls/{n}/comments lists them): the
+    counts line, the `listed` findings under `Not on a changed line:`, the marker; each inline comment with its
+    pull_request_review_id, at its posted line (original_line), `line` where a later push moved it."""
     found = [norm(f) for f in list(inline) + list(listed)]
     body = "\n\n".join([counts_line("opus", found),
                         "\n".join(["Not on a changed line:"] + [entry(norm(f)) for f in listed]), MARKER])
@@ -156,8 +156,12 @@ def github_review(rid, when, inline, listed, login=OWNER):
 
 
 def github_calls(review, comments, pr=34):
-    """The PR's reviews and that review's comments, as REST answers."""
-    return [fakegh.rest_entry(f"pulls/{pr}/reviews/{review['id']}/comments", "GET", exact=True, stdout_json=comments),
+    """The PR's reviews and that review's comments, as REST answers as GitHub gives them (#533): the review's own
+    pulls/{n}/reviews/{id}/comments with line and original_line null and only a diff position (never the line), the
+    PR's pulls/{n}/comments with their lines and pull_request_review_id."""
+    unlined = [dict(c, line=None, original_line=None, position=c["original_line"] + 4) for c in comments]
+    return [fakegh.rest_entry(f"pulls/{pr}/reviews/{review['id']}/comments", "GET", exact=True, stdout_json=unlined),
+            fakegh.rest_entry(f"pulls/{pr}/comments", "GET", exact=True, stdout_json=comments),
             fakegh.rest_entry(f"pulls/{pr}/reviews", "GET", exact=True, stdout_json=[review])]
 
 
