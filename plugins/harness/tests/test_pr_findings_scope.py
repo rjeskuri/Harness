@@ -13,9 +13,12 @@ interrupted-publication recovery (republish once, no harness-gpt run).
 
 Fixture: pr_findings_support's PostTest (src/app.py's 30 lines `V<i> = <i>`, the branch rewriting lines 3 and 25 and
 adding the 4-line tests/test_app.py; PR #34 open at the head), plus a fake harness-gpt in the module's fakebin that
-logs its argv and brief and prints {"head", "model": "gpt-6.2-sol", "findings": <conf findings>, "prior_fixed"}, each
-prior blocker fixed unless its body is in the conf's `unfixed`. GET pulls/34/reviews answers the reviews the test
-names (none by default). Each test's first harness-pr run is a process of its own, later runs run in this process
+logs its argv and brief and prints {"head", "model": "gpt-6.2-sol", "findings": <conf findings, unrated>,
+"prior_fixed"}, each prior blocker fixed unless its body is in the conf's `unfixed`. Since #534 a check is two calls:
+`--gpt-check`, which stops at a triage result naming the candidates file, then `--gpt-triage` with Opus's verdicts,
+which accept each Sol candidate at the severity the test wrote for it and judge each prior blocker as Sol called it;
+the triage posts the review and records the round. GET pulls/34/reviews answers the reviews the test names (none by
+default). Each test's first harness-pr run is a process of its own, later runs run in this process
 (gitrepo_support.run_in_process). Expected values are written out by hand from the fix commits each test makes.
 
 Choices the ticket left open, fixed here (each a `Ruling:` for the PR):
@@ -36,7 +39,8 @@ sys.dont_write_bytecode = True
 import fakegh  # noqa: E402
 import pr_findings_support as support  # noqa: E402
 from pr_findings_support import (BINS, BRANCH_CHANGES, OWNER, TEST_LINES, TOOL, PostTest, app_text,  # noqa: E402
-                                 executable, norm, tearDownModule, write)  # noqa: F401  (tearDownModule: unittest's)
+                                 executable, norm, opus_verdicts, tearDownModule,  # noqa: F401  (tearDownModule: unittest's)
+                                 write)
 from gitrepo_support import run_in_process  # noqa: E402
 
 APP, TESTS, NEW = "src/app.py", "tests/test_app.py", "src/new.py"
@@ -53,7 +57,8 @@ except OSError:
     conf = {}
 prior = json.loads(text).get("prior_blockers") or []
 unfixed = conf.get("unfixed", [])
-print(json.dumps({"head": argv[argv.index("--head") + 1], "model": "gpt-6.2-sol", "findings": conf.get("findings", []),
+found = [{k: f[k] for k in ("path", "line", "body") if k in f} for f in conf.get("findings", [])]
+print(json.dumps({"head": argv[argv.index("--head") + 1], "model": "gpt-6.2-sol", "findings": found,
                   "prior_fixed": [p.get("body") not in unfixed for p in prior]}))
 '''
 
@@ -105,6 +110,7 @@ class ScopeTest(PostTest):
     def setUp(self):
         super().setUp()
         self.start = self.head()     # the branch's own commit, where every row starts
+        self.accept = {}             # body -> the severity the test wrote for each finding Sol raises
 
     @property
     def gpt_log(self):
@@ -133,6 +139,9 @@ class ScopeTest(PostTest):
         self.open_pr(34, calls=calls)
 
     def sol(self, findings=(), unfixed=()):
+        """Sol raises `findings` (printed unrated; Opus accepts each at the severity written here) and calls every
+        prior blocker fixed except those in `unfixed`."""
+        self.accept.update({f["body"]: norm(f)["severity"] for f in findings})
         write(os.path.join(self.tmp, "gpt.json"),
               json.dumps({"findings": list(findings), "unfixed": [f["body"] for f in unfixed]}))
 
@@ -140,6 +149,7 @@ class ScopeTest(PostTest):
         """Back to the branch's own commit with no rounds, receipts or rulings: the next check is a first review."""
         self.git(self.wt, "reset", "-q", "--hard", self.start)
         shutil.rmtree(self.reviews_dir(), True)
+        self.accept = {}
 
     def fix(self, files, amend=False):
         """A commit on the branch writing `files` ({path: text}) (with amend: the last commit amended), the PR moved
@@ -164,11 +174,20 @@ class ScopeTest(PostTest):
             args += ["--review", self.review_file(list(review))]
         return self.pr(*args)
 
+    def run_paired(self, review=None):
+        """`--gpt-check`, which stops at triage, then Opus's `--gpt-triage` (each candidate accepted at the severity
+        the test wrote, each prior blocker as Sol called it): the triage call's process, which posts and records."""
+        p = self.run_check(review)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        return self.triage(opus_verdicts(self.candidates(json.loads(p.stdout)), accept=self.accept))
+
     def check(self, review=None, sol=None, unfixed=()):
-        """`harness-pr findings 12 --gpt-check --head HEAD --json` (--review F when given), Sol answering `sol`."""
+        """`harness-pr findings 12 --gpt-check --head HEAD --json` (--review F when given), Sol answering `sol`, then
+        its triage: the triage's findings JSON."""
         if sol is not None:
             self.sol(sol, unfixed)
-        p = self.run_check(review)
+        p = self.run_paired(review)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertNotIn("Traceback", p.stderr)
         return json.loads(p.stdout)
@@ -409,7 +428,7 @@ class Receipt(ScopeTest):
                 head = self.head()
                 self.serve(fail_post=interrupted)
                 self.sol([s1])
-                p = self.run_check([P1])
+                p = self.run_paired([P1])
                 self.assertEqual(p.returncode != 0, interrupted, p.stdout + p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
                 receipt = self.receipt(head)
@@ -446,7 +465,7 @@ class Receipt(ScopeTest):
                 self.serve(fail_post=True)
                 self.sol(sol)
                 runs = len(self.gpt_runs())
-                p = self.run_check(claude)
+                p = self.run_paired(claude)
                 self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
                 self.assertEqual(len(self.gpt_runs()), runs + 1)
