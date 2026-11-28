@@ -194,7 +194,7 @@ class Applied(RefreshTest):
         # A paired round (Claude + Sol) with its review posted: the refresh keeps its reviewers and fork.
         self.sol([S26])
         self.serve(review_id=RID)
-        self.check([F1, F2, O1])
+        self.paired([F1, F2, O1])                     # the check, then Opus's triage (#534), which records the round
         self.stamp()
         before = self.load_rounds()[-1]
         self.assertEqual(before.get("reviewers"), ["opus", "gpt-6.2-sol"])
@@ -335,9 +335,11 @@ class Refused(RefreshTest):
         by = note(OWNER, "11:00", dismiss(F1, WHY1))
         self.serve(ticket=[by], review_id=RID)
         rulings = write(os.path.join(self.tmp, "rulings-in", "r.md"), "Ruling: keep the scale factor.\n")
+        verdicts = write(os.path.join(self.tmp, "verdicts-in", "v.json"), json.dumps({"candidates": [], "prior": []}))
         rows = [
             ("--review", self.review_file([F1])),
             ("--gpt-check",),
+            ("--gpt-triage", verdicts),
             ("--head", self.head()),
             ("--rulings", rulings),
             ("--model", "sonnet"),
