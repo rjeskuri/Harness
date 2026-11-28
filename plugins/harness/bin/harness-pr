@@ -980,20 +980,38 @@ def ticket_outside(repo, key, number, pr, held=()):
     return made
 
 
+def raised(rnd):
+    """The findings a round's reviewers raised: its blocking, low and outside ones and the dismissed ones among them,
+    not a prior blocker dismissed before Sol was sent it (`from` `prior`)."""
+    return (as_findings(rnd.get("blocking")) + as_findings(rnd.get("low")) + as_findings(rnd.get("outside"))
+            + [f for f in round_dismissed(rnd) if f.get("from") != "prior"])
+
+
+def places(findings):
+    """Each finding's (path, line, body), what a selector resolves against."""
+    return {(str(f.get("path") or ""), str(f.get("line")), str(f.get("body") or "")) for f in findings}
+
+
 def owner_dismissals(repo, number, pr):
     """(dismissed, unmatched) as dismissals.resolve gives them (#517): the owner's `dismiss <path>:<line> <why>` and
     `dismiss <path> <why>` lines on ticket `number` and on PR `pr`, each resolved against the ticket's local rounds
-    (each round's `at` with its blocking, low, outside and dismissed findings) or, with no round recorded, the PR's
-    harness reviews on GitHub. A failed read is one warning and dismisses nothing; each request that dismisses
-    nothing is one warning naming its selector, the reason and the comment's URL."""
+    (each round's `at` with what it raised) and github-snapshots.json, or, with no round recorded, the PR's harness
+    reviews on GitHub, which that file keeps so a comment older than a rebuilt cache still resolves later. A failed
+    read is one warning and dismisses nothing; each request that dismisses nothing is one warning naming its
+    selector, the reason and the comment's URL."""
     try:
         requests = read_dismissals(repo.root, [number], pr)
         if not requests:
             return [], []
         rounds = load_rounds(repo.key, number)
-        snapshots = ([{"at": rnd.get("at"), "findings": as_findings(rnd.get("blocking")) + as_findings(rnd.get("low"))
-                       + as_findings(rnd.get("outside")) + round_dismissed(rnd)} for rnd in rounds]
-                     if rounds else github_snapshots(repo.root, pr))
+        kept = os.path.join(reviews_dir(repo.key, number), "github-snapshots.json")
+        if rounds:
+            older = read_json(kept)
+            snapshots = ([{"at": rnd.get("at"), "findings": raised(rnd)} for rnd in rounds]
+                         + (older if isinstance(older, list) else []))
+        else:
+            snapshots = github_snapshots(repo.root, pr)
+            write_json(kept, snapshots, prefix=".findings-")
     except Problem as err:
         warn("harness-pr", f"PR #{pr}: cannot read the owner's dismissals ({err}); every finding counts")
         return [], []
@@ -1099,6 +1117,18 @@ def fitted_brief(brief, limit=BRIEF_LIMIT):
     return text
 
 
+def checked_but_dismissed(brief, receipt, held):
+    """Did Sol check this brief but for prior blockers the owner has dismissed since (#517)? The receipt's prior
+    blockers, less those `held` dismisses, are the brief's, and the brief with the receipt's has its digest."""
+    sent, saved = receipt.get("prior_blockers"), receipt.get("brief_sha256")
+    if not isinstance(sent, list) or not saved or apply_dismissals(sent, held)[0] != brief["prior_blockers"]:
+        return False
+    try:
+        return text_sha256(fitted_brief(dict(brief, prior_blockers=sent))) == saved
+    except Problem:
+        return False
+
+
 def cmd_findings(args):
     if not args.gpt_check or args.latest:
         return record_findings(args)
@@ -1192,8 +1222,8 @@ def record_findings(args, repo=None):
                 raise Problem(f"the brief's {field} holds a secret-shaped value; GPT check incomplete")
             text = fitted_brief(brief)
             digest = text_sha256(text)
-            if recovering and receipt.get("brief_sha256") != digest:      # Sol checked other inputs: check again
-                if refusal:
+            if recovering and receipt.get("brief_sha256") != digest and not checked_but_dismissed(brief, receipt, held):
+                if refusal:                                                # Sol checked other inputs: check again
                     raise Problem(refusal)
                 recovering = False
         if recovering:
@@ -1227,7 +1257,8 @@ def record_findings(args, repo=None):
                 raise Problem("GPT check did not return findings for the requested head") from None
             reviewers = ([args.model] if args.review else []) + [report["model"]]
             receipt = {"findings": findings, "reviewers": reviewers, "unresolved": unresolved,
-                       "brief_sha256": digest, "marker": f"<!-- harness-gpt-{uuid.uuid4()} -->"}
+                       "prior_blockers": prior_blockers, "brief_sha256": digest,
+                       "marker": f"<!-- harness-gpt-{uuid.uuid4()} -->"}
             write_json(receipt_path, receipt, prefix=".gpt-")
         model = " + ".join(reviewers)
         checked += f" (reviewed by {model})"
@@ -1267,11 +1298,18 @@ def record_findings(args, repo=None):
     replaced = rounds[-1] if rounds and rounds[-1].get("head") == head else None
     earlier = rounds[:-1] if replaced else rounds
     base = earlier[-1].get("head") if earlier else fork
-    # a same-head round keeps its first `at`: a dismissal made since still finds a snapshot older than its comment
-    at = replaced["at"] if replaced and parse_iso(replaced.get("at")) else now_iso()
-    rnd = save_round(key, number, {"at": at, "head": head, "base": base, "blocking": blocking, "low": low,
-                                   "outside": outside, **({"dismissed": dismissed} if dismissed else {}),
-                                   "pr": pr, "review_id": review_id,
+    if args.gpt_check and earlier and earlier[-1].get("reviewers"):     # the prior blockers the owner dismissed
+        seen = {tuple(finding_key(f)) for f in dismissed}
+        for f in apply_dismissals(as_findings(earlier[-1].get("blocking")), held or [])[1]:
+            if tuple(finding_key(f)) not in seen:
+                seen.add(tuple(finding_key(f)))
+                dismissed.append(dict(f, **{"from": "prior"}))
+    found = {"blocking": blocking, "low": low, "outside": outside, **({"dismissed": dismissed} if dismissed else {})}
+    # a same-head round raising the same findings keeps its first `at`, so a dismissal made since still finds a
+    # snapshot older than its comment; one raising others is dated now, so no older comment resolves against them
+    same = replaced is not None and places(raised(replaced)) == places(raised(found))
+    at = replaced["at"] if same and parse_iso(replaced.get("at")) else now_iso()
+    rnd = save_round(key, number, {"at": at, "head": head, "base": base, **found, "pr": pr, "review_id": review_id,
                                    **({"reviewers": reviewers, "fork": fork} if reviewers else {})})
     k = rnd["round"]
     folder = reviews_dir(key, number)
