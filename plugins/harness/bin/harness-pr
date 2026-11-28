@@ -191,6 +191,7 @@ CATCH_UP_ROUNDS = 3          # land --catch-up: merges of main at most
 CATCH_UP_TIMEOUT = 420.0     # land --catch-up: seconds for all its check waits, one call under the Bash tool's 600 s
 LEARN_DAYS = 7               # learn: the window without --since or a recorded run
 BRIEF_LIMIT = 64000          # characters of brief harness-gpt reads (its run refuses more)
+GPT_POLICY = 1               # the gpt receipt's policy: a receipt recorded under another is checked again (#519)
 OMIT_PRIVATE = "HARNESS_GPT_OMIT_PRIVATE"    # 1 or true: no ticket Context section and no owner answers for Sol
 
 
@@ -716,6 +717,33 @@ def diff_lines(text):
     return found
 
 
+def fix_lines(root, base, head):
+    """{(path, new-side line)} of the lines `head` added or changed since `base`: the `+` lines of the zero-context
+    diff, no context lines (unlike the inline placement's diff_lines over the full diff)."""
+    return diff_lines(git_ok(root, "diff", "--unified=0", "--no-color", "--no-ext-diff", base, head))
+
+
+def merged_findings(groups, unresolved):
+    """The findings of `groups` in order, one entry per finding_key ([path, body]); an unresolved prior blocker's key
+    keeps the blocker as recorded, whichever reviewer repeated it."""
+    blockers = {tuple(finding_key(f)): f for f in unresolved}
+    merged, seen = [], set()
+    for group in groups:
+        for f in group:
+            k = tuple(finding_key(f))
+            if k not in seen:
+                seen.add(k)
+                merged.append(blockers.get(k, f))
+    return merged
+
+
+def off_fix_demoted(findings, lines, prior):
+    """`findings` with each new high or medium (its key not one of the `prior` blockers') whose (path, line) is not
+    in `lines` recorded as low (#519); a finding with no line is off the fix."""
+    return [dict(f, severity="low") if f["severity"] in ("high", "medium") and tuple(finding_key(f)) not in prior
+            and (f["path"], f["line"]) not in lines else f for f in findings]
+
+
 def review_body(model, findings, outside):
     c = severity_counts(findings)
     parts = [f"Harness review ({model}): {plural(len(findings), 'finding')}, {c['high']} high, "
@@ -1202,6 +1230,7 @@ def record_findings(args, repo=None):
     model, checked = args.model, DEFAULT_CHECKED
     reviewers, unresolved, origins = [], [], []        # origins: each unresolved blocker's key before a rename
     held, unmatched = None, []                          # the owner's dismissals, read once with an open PR
+    mode = None                                         # the GPT check's scope: full or fix (#519)
     if args.gpt_check:
         branch = TICKET_BRANCH.match(current_branch(repo.root) or "")
         if not args.head or not branch or int(branch.group(1)) != number:
@@ -1215,6 +1244,8 @@ def record_findings(args, repo=None):
         expected_pr = pr
         receipt_path = str(Path(reviews_dir(repo.key, number)) / f"gpt-{pr}-{head}.json")
         receipt = read_json(receipt_path)
+        if isinstance(receipt, dict) and not (type(receipt.get("policy")) is int and receipt["policy"] == GPT_POLICY):
+            receipt = None                                         # an older policy's check: Sol checks this head again
         previous = latest_round(repo.key, number)
         recovering = isinstance(receipt, dict)
         if recovering:
@@ -1257,7 +1288,7 @@ def record_findings(args, repo=None):
                     raise Problem(refusal)
                 recovering = False
         if recovering:
-            findings, reviewers = receipt["findings"], receipt["reviewers"]
+            findings, reviewers, mode = receipt["findings"], receipt["reviewers"], receipt["mode"]
             unresolved, origins = receipt.get("unresolved", []), receipt.get("unresolved_keys") or []
         else:
             reply = tool("harness-gpt", ["check", "--head", head, "--base", review_base, "--brief-stdin"],
@@ -1280,15 +1311,17 @@ def record_findings(args, repo=None):
                         if f["path"] in renames:
                             f["path"] = renames[f["path"]]
                             f["line"] = None  # without a verified line mapping, include it in the review body
-                findings.extend(f for f in unresolved if f not in findings)
-                for f in report["findings"]:
-                    if f not in findings:
-                        findings.append(f)
-            except (KeyError, TypeError, ValueError):
+                findings = merged_findings([findings, unresolved, report["findings"]], unresolved)
+            except (AttributeError, KeyError, TypeError, ValueError):
                 raise Problem("GPT check did not return findings for the requested head") from None
+            mode = review["mode"]
+            if mode == "fix":                                  # a fix re-check judges what the fix changed
+                prior = {tuple(finding_key(f)) for f in as_findings(previous.get("blocking")) + unresolved}
+                findings = off_fix_demoted(findings, fix_lines(repo.root, review_base, head), prior)
             reviewers = ([args.model] if args.review else []) + [report["model"]]
             receipt = {"findings": findings, "reviewers": reviewers, "unresolved": unresolved,
                        "unresolved_keys": origins, "prior_blockers": prior_blockers, "brief_sha256": digest,
+                       "mode": mode, "base": review_base, "policy": GPT_POLICY,
                        "marker": f"<!-- harness-gpt-{uuid.uuid4()} -->"}
             write_json(receipt_path, receipt, prefix=".gpt-")
         model = " + ".join(reviewers)
@@ -1296,10 +1329,10 @@ def record_findings(args, repo=None):
         if git_ok(repo.root, "rev-parse", "HEAD").strip() != head or dirty_files(repo.root):
             raise Problem("the reviewed head or working tree changed during the GPT check")
     blocking, low, outside = split_findings(findings, touched_files(repo.root, fork))
-    for f in unresolved:
-        if f in outside:
-            outside.remove(f)
-            blocking.append(f)
+    blocker_keys = {tuple(finding_key(f)) for f in unresolved}
+    for f in [f for f in outside if tuple(finding_key(f)) in blocker_keys]:
+        outside.remove(f)
+        blocking.append(f)
     pr = branch_pr(repo, number, head)                 # refuses before anything is posted or recorded
     if args.gpt_check and pr != expected_pr:
         raise Problem("the open PR changed during the GPT check")
@@ -1354,7 +1387,7 @@ def record_findings(args, repo=None):
     found = {"blocking": blocking, "low": low, "outside": outside, **({"dismissed": dismissed} if dismissed else {})}
     rnd = save_round(key, number, {"at": now_iso(), "head": head, "base": base, **found, "pr": pr,
                                    "review_id": review_id,
-                                   **({"reviewers": reviewers, "fork": fork} if reviewers else {})})
+                                   **({"reviewers": reviewers, "fork": fork, "mode": mode} if reviewers else {})})
     k = rnd["round"]
     folder = reviews_dir(key, number)
     files = {"blocking": os.path.join(folder, f"round-{k}-blocking.json"),
