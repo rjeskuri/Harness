@@ -9,6 +9,7 @@ Usage:
     harness-pr review P --findings F [--checked TEXT] [--model NAME]
     harness-pr findings N [--worktree PATH] --review F [--rulings R] [--model NAME] [--json]
     harness-pr findings N --latest [--json]
+    harness-pr findings N --refresh [--worktree PATH] [--json]
     harness-pr checks P [--wait] [--timeout 1200] [--json]
     harness-pr ready P [--ticket N]
     harness-pr comments P [--since ISO] [--unresolved] [--json]
@@ -70,10 +71,13 @@ what that one raised and when, for the dismissals made against it), writes
 round-<k>-blocking.json, round-<k>-review.json and notes.md (Low findings, Out of scope, Dismissed, Rulings, gathered
 over every round) under ~/.claude/harness/repos/<key>/reviews/N/, and prints the `harness-work stage` record: review
 pass in round 1, then fix pass or fail. A review with no findings array exits 1 and records nothing; --latest
-prints the latest round and writes nothing (and makes no gh call). With an open PR for the branch (`gh pr list
---head <branch> --state open`) it posts round-<k>-review.json there as `review` would (post_review) and records the
-PR and the review id; a PR head that is not the worktree's HEAD (or gh failing) refuses before anything is posted or
-recorded; no open PR records the round with a warning and posts nothing. Then, with an open PR, each high or medium
+prints the latest round and writes nothing (and makes no gh call). --refresh (#518), alone of the modes, applies the
+owner's current dismissals to the latest round again (its head the worktree's clean HEAD, its PR the round's else the
+branch's open one; otherwise, or on a failed read, exit 1 writing nothing): the same round rebuilt in place, its
+round-<k>-blocking.json and notes.md rewritten, nothing posted or ticketed, no harness-gpt, `record` null.
+With an open PR for the branch (`gh pr list --head <branch> --state open`) it posts round-<k>-review.json there as
+`review` would (post_review) and records the PR and the review id; a PR head that is not the worktree's HEAD (or gh
+failing) refuses before anything is posted or recorded; no open PR records the round with a warning and posts nothing. Then, with an open PR, each high or medium
 outside finding of any recorded round not ticketed yet (by path and body, kept in tickets.json) becomes a proposed
 bug ticket under the ticket's epic (`harness-board task create`, the body on stdin, naming this round's PR), its
 number on the notes line; a failed create is a warning, and the next round with a PR tries it again.
@@ -171,6 +175,7 @@ GH_TIMEOUT = 60
 PUSH_TIMEOUT = 180
 TOOL_TIMEOUT = 180
 DEFAULT_CHECKED = "the diff against the ticket's definition of done"
+DEFAULT_MODEL = "opus"       # findings' reviewer without --model
 LAND_FIELDS = ("isDraft,mergeable,headRefName,headRefOid,closingIssuesReferences,statusCheckRollup,title,url,state,"
                "labels")
 TICKET_FIELDS = "state,labels,comments"   # what land reads of each ticket the PR closes
@@ -1037,13 +1042,14 @@ def kept_snapshots(key, number, name):
     return older if isinstance(older, list) else []
 
 
-def owner_dismissals(repo, number, pr):
+def owner_dismissals(repo, number, pr, strict=False):
     """(dismissed, unmatched) as dismissals.resolve gives them (#517): the owner's `dismiss <path>:<line> <why>` and
     `dismiss <path> <why>` lines on ticket `number` and on PR `pr`, each resolved against the ticket's local rounds
     (each round's `at` with what it raised), the same-head rounds they replaced (replaced-snapshots.json) and
     github-snapshots.json, or, with no round recorded, the PR's harness reviews on GitHub, which that file keeps so
-    a comment older than a rebuilt cache still resolves later. A failed read is one warning and dismisses nothing;
-    each request that dismisses nothing is one warning naming its selector, the reason and the comment's URL."""
+    a comment older than a rebuilt cache still resolves later. A failed read is one warning and dismisses nothing
+    (Problem when `strict`); each request that dismisses nothing is one warning naming its selector, the reason and
+    the comment's URL."""
     try:
         requests = read_dismissals(repo.root, [number], pr)
         if not requests:
@@ -1058,6 +1064,8 @@ def owner_dismissals(repo, number, pr):
             snapshots = github_snapshots(repo.root, pr)
             write_json(kept, snapshots, prefix=".findings-")
     except Problem as err:
+        if strict:
+            raise Problem(f"PR #{pr}: cannot read the owner's dismissals ({err}); nothing refreshed") from None
         warn("harness-pr", f"PR #{pr}: cannot read the owner's dismissals ({err}); every finding counts")
         return [], []
     dismissed, unmatched = resolve_dismissals(requests, snapshots)
@@ -1187,7 +1195,76 @@ def checked_but_dismissed(brief, receipt, held):
         return False
 
 
+def round_files(key, number, k):
+    """Round k's files under reviews/N: {"blocking", "review", "notes"}."""
+    folder = reviews_dir(key, number)
+    return {"blocking": os.path.join(folder, f"round-{k}-blocking.json"),
+            "review": os.path.join(folder, f"round-{k}-review.json"),
+            "notes": os.path.join(folder, "notes.md")}
+
+
+def refresh_findings(args):
+    """findings N --refresh (#518): the owner's dismissals applied again to the latest round at its head, with no
+    review, no post, no ticket and no stage to record. The round keeps its number, `at`, head, base, pr, review_id,
+    reviewers and fork; its blocking, low and outside are rebuilt from them plus its dismissed findings (each back
+    in its `from` list, a `prior` one in blocking), less what the current dismissals hold."""
+    number = args.number
+    others = [flag for flag, given in (("--review", args.review), ("--gpt-check", args.gpt_check),
+                                       ("--head", args.head), ("--rulings", args.rulings),
+                                       ("--model", args.model), ("--latest", args.latest)) if given]
+    if others:
+        raise Problem(f"--refresh takes no {', '.join(others)}")
+    repo = open_repo(args.worktree)
+    key = repo.key
+    rnd = latest_round(key, number)
+    if rnd is None:
+        raise Problem(f"no review round recorded for #{number}")
+    head = git_ok(repo.root, "rev-parse", "HEAD").strip()
+    if rnd.get("head") != head:
+        raise Problem(f"the latest round is of {str(rnd.get('head') or '')[:7] or 'no known commit'}, the worktree "
+                      f"at {head[:7]}; record a review of this head instead")
+    if dirty_files(repo.root):
+        raise Problem("the working tree has uncommitted changes; commit or discard them first")
+    pr = rnd.get("pr")
+    pr = pr if isinstance(pr, int) and not isinstance(pr, bool) else branch_pr(repo, number, head)
+    if pr is None:
+        raise Problem(f"no PR to read the owner's dismissals on (harness-pr open {number} first)")
+    owned, unmatched = owner_dismissals(repo, number, pr, strict=True)
+    receipt = read_json(os.path.join(reviews_dir(key, number), f"gpt-{pr}-{head}.json"))
+    carried = (carried_dismissals(as_findings(receipt.get("unresolved")), receipt.get("unresolved_keys") or [], owned)
+               if isinstance(receipt, dict) else [])  # a blocker Sol carried across a rename
+    held = owned + carried
+    splits = {name: as_findings(rnd.get(name)) for name in ("blocking", "low", "outside")}
+    prior = []
+    for f in round_dismissed(rnd):
+        origin = f.get("from")
+        f = {name: value for name, value in f.items() if name not in ("from", "why", "url")}
+        (prior if origin == "prior" else splits.get(origin, splits["blocking"])).append(f)
+    kept, dismissed = without_dismissed(splits, held)
+    back, still = apply_dismissals(prior, held)
+    kept["blocking"] += back
+    dismissed += [dict(f, **{"from": "prior"}) for f in still]
+    saved = {name: value for name, value in rnd.items() if name not in ("round", "dismissed")}
+    saved.update(kept, **({"dismissed": dismissed} if dismissed else {}))
+    k = save_round(key, number, saved)["round"]
+    files = round_files(key, number, k)
+    blocking, low, outside = kept["blocking"], kept["low"], kept["outside"]
+    write_json(files["blocking"], blocking, prefix=".findings-")
+    write_text(files["notes"], notes_text(load_rounds(key, number), load_rulings(key, number),
+                                          load_tickets(key, number)), prefix=".findings-")
+    out = {"ticket": number, "round": k, "head": head, "base": rnd.get("base"), "review_base": head,
+           "blocking": blocking, "low": low, "outside": outside, "files": files, "record": None, "refreshed": True,
+           "pr": pr, "review_id": rnd.get("review_id"), "tickets": [],
+           **({"dismissed": dismissed} if dismissed else {}), **({"unmatched": unmatched} if unmatched else {})}
+    lines = [f"#{number} review round {k} refreshed: {len(blocking)} blocking, {len(dismissed)} dismissed; "
+             "no stage to record"]
+    emit(args.json, out, "\n".join(lines + [f"{name}: {short_home(path)}" for name, path in files.items()]))
+    return 0
+
+
 def cmd_findings(args):
+    if args.refresh:
+        return refresh_findings(args)
     if not args.gpt_check or args.latest:
         return record_findings(args)
     repo = open_repo(args.worktree)
@@ -1227,7 +1304,7 @@ def record_findings(args, repo=None):
     if args.head and (head != args.head or dirty_files(repo.root)):
         raise Problem("the reviewed head or working tree changed; review the clean pushed head again")
     fork = merge_base(repo.root)
-    model, checked = args.model, DEFAULT_CHECKED
+    model, checked = args.model or DEFAULT_MODEL, DEFAULT_CHECKED
     reviewers, unresolved, origins = [], [], []        # origins: each unresolved blocker's key before a rename
     held, unmatched = None, []                          # the owner's dismissals, read once with an open PR
     mode = None                                         # the GPT check's scope: full or fix (#519)
@@ -1318,7 +1395,7 @@ def record_findings(args, repo=None):
             if mode == "fix":                                  # a fix re-check judges what the fix changed
                 prior = {tuple(finding_key(f)) for f in as_findings(previous.get("blocking")) + unresolved}
                 findings = off_fix_demoted(findings, fix_lines(repo.root, review_base, head), prior)
-            reviewers = ([args.model] if args.review else []) + [report["model"]]
+            reviewers = ([model] if args.review else []) + [report["model"]]
             receipt = {"findings": findings, "reviewers": reviewers, "unresolved": unresolved,
                        "unresolved_keys": origins, "prior_blockers": prior_blockers, "brief_sha256": digest,
                        "mode": mode, "base": review_base, "policy": GPT_POLICY,
@@ -1389,10 +1466,7 @@ def record_findings(args, repo=None):
                                    "review_id": review_id,
                                    **({"reviewers": reviewers, "fork": fork, "mode": mode} if reviewers else {})})
     k = rnd["round"]
-    folder = reviews_dir(key, number)
-    files = {"blocking": os.path.join(folder, f"round-{k}-blocking.json"),
-             "review": os.path.join(folder, f"round-{k}-review.json"),
-             "notes": os.path.join(folder, "notes.md")}
+    files = round_files(key, number, k)
     write_json(files["blocking"], blocking, prefix=".findings-")
     write_json(files["review"], published, prefix=".findings-")
     all_rulings = add_rulings(key, number, rulings)
@@ -2954,9 +3028,12 @@ def parser():
     fd.add_argument("--head", help="require a clean worktree and open PR at the reviewed commit; pin the review to it")
     fd.add_argument("--review", metavar="F", help="the reviewer's output: its findings array, then the verdict")
     fd.add_argument("--rulings", metavar="R", help="a file whose `Ruling:` lines go in the notes")
-    fd.add_argument("--model", metavar="NAME", default="opus", help="the reviewer's model, named in the posted review")
+    fd.add_argument("--model", metavar="NAME",
+                    help=f"the reviewer's model, named in the posted review ({DEFAULT_MODEL})")
     fd.add_argument("--gpt-check", action="store_true", help="run an independent Sol check before publishing")
     fd.add_argument("--latest", action="store_true", help="print the latest recorded round; write nothing")
+    fd.add_argument("--refresh", action="store_true",
+                    help="apply the owner's dismissals to the latest round again, at its head; no review, no post")
     fd.add_argument("--json", action="store_true")
 
     ck = sub.add_parser("checks", help="the PR's checks: 0 green, 1 failed, 8 pending")
