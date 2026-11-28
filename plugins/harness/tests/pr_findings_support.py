@@ -17,7 +17,16 @@ the test gives some), which the GPT check reads for the owner's answers (#514) a
 dismissals (#517). harness-board is a stub in the same fakebin:
 `show N` prints the ticket JSON the test sets (its `parent` is the epic), `task create` reads its body from stdin,
 logs it, and prints `{"number", ...}` with numbers 501, 508, 515, ... (step 7, so a guessed `+1` fails), or fails
-for a title holding a string the test names.
+for a title holding a string the test names. With the PR open, `GET pulls/P/reviews` lists the harness reviews the
+test gives (none by default), which a GPT triage reads to reconcile an interrupted post (#534).
+
+The two-step GPT check (#534): `findings N --head H [--review F] --gpt-check --json` stops at a triage result
+naming the candidates file, `{"ticket", "head", "result": "triage", "candidates_file"}`; the file holds
+`{"ticket", "head", "candidates": [{"id", "path", "line", "body"}], "prior": [{"id", "path", "line", "severity",
+"body", "sol": "fixed"|"unresolved"}]}`. `findings N --head H --gpt-triage V --json` reads Opus's verdicts,
+`{"candidates": [{"id", "verdict": "accept", "severity"} | {"id", "verdict": "set-aside", "reason"}], "prior":
+[{"id", "verdict": "fixed"|"unresolved", "reason"?}]}`, and publishes and records as a --gpt-check call did before;
+`opus_verdicts` builds such a file from a candidates file, and PostTest.triage runs the call.
 """
 from __future__ import annotations
 
@@ -32,6 +41,8 @@ import tempfile
 import unittest
 
 sys.dont_write_bytecode = True
+
+import fakegh  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(os.path.dirname(HERE), "bin", "harness-pr")
@@ -240,6 +251,30 @@ def first_sentence(body):
     return text
 
 
+SET_ASIDE = "Not a problem on any path the repository runs."
+
+
+def unrated(findings):
+    """Sol's findings as harness-gpt check prints them since #534: path, line and body, no severity."""
+    return [{k: f[k] for k in ("path", "line", "body") if k in f} for f in findings]
+
+
+def opus_verdicts(cands, accept=None, prior=None, reason=SET_ASIDE):
+    """Opus's verdicts file (#534) for a candidates file: each candidate whose body `accept` maps to a severity
+    accepted at it, every other one set aside with `reason`; each prior blocker whose body `prior` maps to
+    (verdict, reason) judged so, every other one as Sol called it, with no reason."""
+    accept, prior = accept or {}, prior or {}
+    out = {"candidates": [], "prior": []}
+    for c in cands.get("candidates") or []:
+        severity = accept.get(c["body"])
+        out["candidates"].append({"id": c["id"], "verdict": "accept", "severity": severity} if severity else
+                                 {"id": c["id"], "verdict": "set-aside", "reason": reason})
+    for b in cands.get("prior") or []:
+        verdict, why = prior.get(b["body"], (b["sol"], None))
+        out["prior"].append(dict({"id": b["id"], "verdict": verdict}, **({"reason": why} if why else {})))
+    return out
+
+
 def epic_ticket(number, epic):
     parent = {"number": epic, "title": "The epic", "goal": "A goal."} if epic else None
     return {"number": number, "title": "The ticket", "url": f"https://github.com/o/r/issues/{number}",
@@ -342,11 +377,13 @@ class PostTest(unittest.TestCase):
     def no_pr(self):
         self.scenario([REPO_VIEW, {"contains": ["pr", "list"], "stdout_json": []}])
 
-    def open_pr(self, number, head=None, review_id=None, wt=None, comments=(), login=OWNER, calls=(), pr_comments=()):
+    def open_pr(self, number, head=None, review_id=None, wt=None, comments=(), login=OWNER, calls=(), pr_comments=(),
+                reviews=()):
         """An open PR #number for the branch at `head` (default: the worktree's HEAD). `gh api user` answers `login`
         and the REST world holds ticket 12 with `comments` and the PR itself (an issue with pull_request) with
         `pr_comments` (each oldest first, in Issues.comments' shape), which the owner's dismissals are read from
-        (#517); `calls` go first, so a test can answer any read its own way or add issues of its own."""
+        (#517), and `GET pulls/<number>/reviews` lists `reviews`; `calls` go first, so a test can answer any read its
+        own way or add issues of its own."""
         head = head or self.head(wt)
         self.scenario(list(calls) + [
             REPO_VIEW,
@@ -360,7 +397,8 @@ class PostTest(unittest.TestCase):
             {"issue": 12, "data": {"number": 12, "title": "The ticket", "comments": list(comments)}},
             {"issue": number, "data": {"number": number, "title": "The PR", "pull_request": True,
                                        "url": f"https://github.com/o/r/pull/{number}",
-                                       "comments": list(pr_comments)}}])
+                                       "comments": list(pr_comments)}},
+            fakegh.rest_entry(f"pulls/{number}/reviews", "GET", exact=True, stdout_json=list(reviews))])
 
     def board_conf(self, show=None, fail_titles=(), link_fail_titles=()):
         if show is None:
@@ -386,6 +424,28 @@ class PostTest(unittest.TestCase):
 
     def findings(self, review, **kw):
         p = self.run_findings(review, **kw)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        return json.loads(p.stdout), p
+
+    # ----------------------------------------------------------- the GPT triage (#534)
+    def candidates(self, out):
+        """The candidates file a `--gpt-check` triage result names, read."""
+        self.assertEqual(out.get("result"), "triage", out)
+        path = out.get("candidates_file")
+        self.assertTrue(isinstance(path, str) and os.path.isabs(path) and os.path.isfile(path), out)
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def triage(self, verdicts, head=None, ticket="12", wt=None):
+        """`findings 12 --head H --gpt-triage V --json` with Opus's `verdicts` written to V."""
+        self.n += 1
+        path = write(os.path.join(self.tmp, "verdicts-in", f"verdicts-{self.n}.json"), json.dumps(verdicts))
+        return self.pr("findings", ticket, "--worktree", wt or self.wt, "--head", head or self.head(wt),
+                       "--gpt-triage", path, "--json")
+
+    def triaged(self, verdicts, **kw):
+        p = self.triage(verdicts, **kw)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertNotIn("Traceback", p.stderr)
         return json.loads(p.stdout), p

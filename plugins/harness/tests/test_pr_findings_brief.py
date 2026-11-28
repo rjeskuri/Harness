@@ -18,8 +18,9 @@ owner's login or the ticket's comments. HARNESS_GPT_OMIT_PRIVATE (the environmen
 Fixture: pr_findings_support's PostTest (the repositories, fakegh, the harness-board stub). harness-gpt is a fake in
 the module's fakebin: it logs its argv and the exact text it read on stdin, one JSON line per run, and prints
 {"head": <--head>, "model": "gpt-6.2-sol", "findings": [], "prior_fixed": [<fixed>] * len(prior_blockers)}, `fixed`
-from a file the test writes (true by default). Expected briefs are built here from the ticket the stub serves and
-the comments the REST world serves; the owner's answers are written out by hand, never computed by the code under
+from a file the test writes (true by default). A check that must record its round (`checked`) is followed by the
+`--gpt-triage` call with Opus confirming Sol's calls (#534). Expected briefs are built here from the ticket the stub
+serves and the comments the REST world serves; the owner's answers are written out by hand, never computed by the code under
 test. Each test's first harness-pr run is a process of its own; later runs (table rows and setup rounds) run the
 tool in this process (gitrepo_support.run_in_process), with git, gh, harness-board and harness-gpt still their own
 processes.
@@ -47,7 +48,8 @@ sys.dont_write_bytecode = True
 
 import pr_findings_support as support  # noqa: E402
 from pr_findings_support import (BINS, BRANCH_CHANGES, OWNER, TOOL, PostTest, app_text, epic_ticket,  # noqa: E402
-                                 executable, norm, tearDownModule, write)  # noqa: F401  (tearDownModule: unittest's)
+                                 executable, norm, opus_verdicts, tearDownModule,  # noqa: F401  (tearDownModule: unittest's)
+                                 write)
 from gitrepo_support import run_in_process  # noqa: E402
 
 LIMIT = 64000
@@ -216,10 +218,13 @@ class BriefTest(PostTest):
         return self.pr(*args)
 
     def checked(self, **kw):
+        """A GPT check, then Opus's triage confirming Sol's calls (#534), so the round is recorded."""
         p = self.check(**kw)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertNotIn("Traceback", p.stderr)
-        return json.loads(p.stdout)
+        out = json.loads(p.stdout)
+        self.triaged(opus_verdicts(self.candidates(out)))
+        return out
 
     def plain(self, review, given):
         """A findings call without the GPT check, with --rulings."""

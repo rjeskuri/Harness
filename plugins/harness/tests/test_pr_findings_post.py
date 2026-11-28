@@ -73,8 +73,11 @@ class Post(PostTest):
                         "print(json.dumps(dict(head=head, model='gpt-6.2-sol', findings=[], prior_fixed=[True]*len(brief['prior_blockers']))))\n")
         first = self.pr(*args, *initial)
         self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.posts(), [])                     # the check stops at triage (#534)
+        verdicts = opus_verdicts(self.candidates(json.loads(first.stdout)))
+        published, _p = self.triaged(verdicts)
         self.assertEqual(len(self.posts()), 1)
-        self.assertTrue(json.loads(first.stdout)["blocking"])
+        self.assertTrue(published["blocking"])
         scenario = json.loads(Path(self.scenario_path).read_text())
         posted_body = json.loads(self.posts()[0]["stdin"])["body"]
         scenario["calls"].append({"match": ["api", "--paginate", "repos/o/r/pulls/34/reviews"],
@@ -83,12 +86,15 @@ class Post(PostTest):
         self.scenario(scenario["calls"])
         retry = self.pr(*args, "--head", self.head())
         self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.triaged(opus_verdicts(self.candidates(json.loads(retry.stdout))))
         self.assertEqual(len(self.posts()), 1)
         self.commit("src/app.py", "fixed = True\n")
         self.open_pr(34)
         second = self.pr(*args, "--head", self.head())
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(json.loads(second.stdout)["record"], {"stage": "fix", "result": "pass"})
+        self.assertEqual(len(self.posts()), 1)
+        fixed, _p = self.triaged(opus_verdicts(self.candidates(json.loads(second.stdout))))
+        self.assertEqual(fixed["record"], {"stage": "fix", "result": "pass"})
         self.assertEqual(len(self.posts()), 2)
 
     def test_unresolved_finding_survives_a_rename(self):
@@ -104,12 +110,14 @@ class Post(PostTest):
         args = ["findings", "12", "--worktree", self.wt, "--gpt-check", "--json"]
         first = self.pr(*args, "--head", self.head(), "--review", self.review_file([finding]))
         self.assertEqual(first.returncode, 0, first.stderr)
+        self.triaged(opus_verdicts(self.candidates(json.loads(first.stdout))))
         self.git(self.wt, "mv", old, new)
         self.git(self.wt, "commit", "-qm", "rename")
         self.open_pr(34)
         second = self.pr(*args, "--head", self.head())
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(json.loads(second.stdout)["blocking"], [dict(finding, path=new, line=None)])
+        out, _p = self.triaged(opus_verdicts(self.candidates(json.loads(second.stdout))))   # Opus agrees: unresolved
+        self.assertEqual(out["blocking"], [dict(finding, path=new, line=None)])
 
     def test_ticket_secrets_rejected_before_encoding(self):
         ticket = epic_ticket(12, self.EPIC)
