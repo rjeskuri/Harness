@@ -411,7 +411,10 @@ PENDING = [check_run("build", status="IN_PROGRESS", conclusion=""), check_run("l
 # What `harness-pr ready` and `harness-pr land` read to find the latest harness review and whether a commit came after
 # it, all through the REST API (gh api, with any flags such as --paginate, but these exact endpoint paths):
 #   repos/o/r/pulls/34/reviews                  [{id, user, body, state, submitted_at, commit_id}]
-#   repos/o/r/pulls/34/reviews/<id>/comments    that review's inline comments [{path, line, body, ...}]
+#   repos/o/r/pulls/34/reviews/<id>/comments    that review's inline comments as GitHub lists them there (#533):
+#                                               [{id, path, body, position, ...}], line and original_line null
+#   repos/o/r/pulls/34/comments                 every review's inline comments on the PR, with their lines:
+#                                               [{id, pull_request_review_id, path, line, original_line, body, ...}]
 #   repos/o/r/pulls/34/commits                  [{sha, commit: {author: {date}, committer: {date}}}]
 # A harness review is one whose body carries MARKER: `harness-pr review` posts "Harness review (<model>): N findings,
 # h high, m medium, l low." with the findings not on a changed line listed in the body ("- `path:line` [severity]
@@ -465,9 +468,26 @@ def pr_commit(char, when):
                                          "committer": {"name": "Test", "date": when}}}
 
 
+def review_endpoint(comments):
+    """Inline comments (as GET pulls/{n}/comments lists them, harness_review's) as GitHub's GET
+    pulls/{n}/reviews/{id}/comments gives them (#533): line and original_line null, only a position in the diff,
+    which is never the comment's line here."""
+    return [dict(c, line=None, original_line=None,
+                 position=c["original_line"] + 4 if isinstance(c.get("original_line"), int) else None)
+            for c in comments]
+
+
 def gate_calls(reviews=(), commits=(), pull=PULL):
-    """fakegh entries for the gate's reads: reviews is a list of (review, comments); `pull` the PR's endpoint."""
-    calls = [{"contains": ["api", f"{pull}/reviews/{r['id']}/comments"], "stdout_json": c} for r, c in reviews]
+    """fakegh entries for the gate's reads: reviews is a list of (review, comments), the comments as GET
+    pulls/{n}/comments lists them; `pull` the PR's endpoint. As on GitHub (#533), each review's own comments endpoint
+    answers them without a line (review_endpoint), and pulls/{n}/comments lists every review's with their lines and
+    pull_request_review_id; both are REST entries, so any argv form of the route (harness-pr's repos/o/r/...,
+    harness_lib's repos/{owner}/{repo}/...?per_page=...) gets the answer."""
+    route = pull.split("/", 3)[3]                      # pulls/<n>, after repos/<owner>/<name>/
+    calls = [fakegh.rest_entry(f"{route}/reviews/{r['id']}/comments", "GET", exact=True,
+                               stdout_json=review_endpoint(c)) for r, c in reviews]
+    calls.append(fakegh.rest_entry(f"{route}/comments", "GET", exact=True,
+                                   stdout_json=[x for _, c in reviews for x in c]))
     calls.append({"contains": ["api", f"{pull}/reviews"], "stdout_json": [r for r, _ in reviews]})
     calls.append({"contains": ["api", f"{pull}/commits"], "stdout_json": list(commits)})
     return calls
@@ -614,10 +634,11 @@ def gate_failure(entry):
     return dict(entry, stderr=GATE_FAILURE_TEXT + "\n", exit=1)
 
 
-# Each read the gate makes, failing; placed first in a scenario so it wins over the gate_calls answer.
+# Each read the gate makes, failing; placed first in a scenario so it wins over the gate_calls answer. The review
+# comments: GET pulls/34/comments, the read that gives an inline finding its line (#533), at any argv form.
 GATE_API_FAILURES = {
     "reviews": gate_failure({"contains": ["api", f"{PULL}/reviews"]}),
-    "review comments": gate_failure({"contains": ["api", f"{PULL}/reviews/101/comments"]}),
+    "review comments": gate_failure(fakegh.rest_entry("pulls/34/comments", "GET", exact=True)),
     "commits": gate_failure({"contains": ["api", f"{PULL}/commits"]}),
 }
 GATE_READ_FAILURES = dict(GATE_API_FAILURES, **{"repo view": gate_failure({"match": ["repo", "view"]})})

@@ -7,12 +7,16 @@ posted before the comment (harness_lib.dismissals, #515); that finding no longer
 ~/.claude/harness/repos/<key>/reviews/ folder in these tests. What is left refuses exactly as today (the findings
 named, `K more high or medium not listed` counted from the review as posted, before any dismissal), a selector that
 matches nothing exactly keeps its finding blocking with one warning naming it, and a failed read of the login, a
-ticket's or the PR's comments or a review's comments keeps every finding blocking with a warning naming the failure.
-A latest review that lists no high or medium finding reads no dismissal at all.
+ticket's or the PR's comments keeps every finding blocking with a warning naming the failure, and one of the PR's
+review comments (the gate's read too) refuses naming the failure. A latest review that lists no high or medium
+finding reads no dismissal at all.
 
 The fake gh answers the gate's reads as test_pr.py's ReadyGate and test_pr_land.py's LandGate do (pr_support's
 gate_calls and land_calls), the owner's comments from its REST world (issue entries, the PR's with pull_request)
 and the reviews and their inline comments in the REST form harness_lib reads them too (repos/{owner}/{repo}/...).
+As on GitHub (#533), GET pulls/{n}/reviews/{id}/comments gives an inline comment no line (line and original_line
+null, only its diff position) and GET pulls/{n}/comments lists every review's inline comments with their lines and
+pull_request_review_id.
 Each test's first harness-pr run is a process, its further rows run in process (RowsInProcess).
 
 Run: python3 -m unittest discover -s plugins/harness/tests -p "test_pr_gate_dismiss.py" -v
@@ -79,10 +83,13 @@ def posted(rid, when, inline=(), body_only=(), now=None, **kw):
 
 
 def snapshot_calls(reviews, pr=34):
-    """The PR's reviews and each one's inline comments as harness_lib reads them (repos/{owner}/{repo}/pulls/...),
-    answered by the world; gate_calls answers harness-pr's own repos/o/r/... reads of the same."""
-    calls = [fakegh.rest_entry(f"pulls/{pr}/reviews/{r['id']}/comments", "GET", exact=True, stdout_json=c)
-             for r, c in reviews]
+    """The PR's reviews and their inline comments as harness_lib reads them (repos/{owner}/{repo}/pulls/...), as
+    GitHub answers (#533): each review's comments endpoint without their lines (pr_support.review_endpoint), the PR's
+    comments list, every review's, with them; gate_calls answers harness-pr's own repos/o/r/... reads of the same."""
+    calls = [fakegh.rest_entry(f"pulls/{pr}/reviews/{r['id']}/comments", "GET", exact=True,
+                               stdout_json=review_endpoint(c)) for r, c in reviews]
+    calls.append(fakegh.rest_entry(f"pulls/{pr}/comments", "GET", exact=True,
+                                   stdout_json=[x for _, c in reviews for x in c]))
     calls.append(fakegh.rest_entry(f"pulls/{pr}/reviews", "GET", exact=True, stdout_json=[r for r, _ in reviews]))
     return calls
 
@@ -203,8 +210,8 @@ class GateDismissals(LandBase):
 
     def dismissal_reads(self, before_merge=False):
         """The gh calls only a dismissal read makes: `gh api user`, a GET of an issue's or the PR's comments, and a
-        second read of the PR's reviews or of one review's comments; with `before_merge`, only those before gh pr
-        merge (land reads its ticket's comments after it)."""
+        second read of the PR's reviews, of one review's comments or of the PR's review comments; with
+        `before_merge`, only those before gh pr merge (land reads its ticket's comments after it)."""
         argv = self.gh_argv()
         if before_merge:
             merges = [i for i, a in enumerate(argv) if a[:2] == ["pr", "merge"]]
@@ -216,7 +223,8 @@ class GateDismissals(LandBase):
                 out.append(a)
             elif req and req["method"] == "GET" and re.fullmatch(r"issues/\d+/comments", req["route"]):
                 out.append(a)
-            elif req and req["method"] == "GET" and req["route"].startswith("pulls/34/reviews"):
+            elif req and req["method"] == "GET" and (req["route"].startswith("pulls/34/reviews")
+                                                     or req["route"] == "pulls/34/comments"):
                 reviews[req["route"]] += 1
         return out + [f"{route} read {n} times" for route, n in reviews.items() if n > 1]
 
@@ -452,8 +460,8 @@ class GateDismissals(LandBase):
 
     def test_a_failed_dismissal_read_keeps_the_findings_blocking(self):
         """Every listed blocker dismissed, but one of the reads the dismissals need fails: the gate refuses naming
-        every finding, and a warning names the failure. The earlier review's comments are read only for the
-        dismissals (the gate reads the latest review's)."""
+        every finding, and a warning names the failure. The PR's review comments (GET pulls/34/comments, where an
+        inline finding's line comes from, #533) are the gate's read too: their failure refuses, naming it."""
         reviews = [harness_review(100, at(8), inline=[FROBS]),
                    harness_review(101, at(10), inline=[FROBS], body_only=[STALE])]
         notes = {12: [owner_dismissal(FROBS, 12)], 34: [owner_dismissal(STALE, 34, 12, "docs only")]}
@@ -462,8 +470,6 @@ class GateDismissals(LandBase):
             "the login": [gate_failure({"match": ["api", "user"]})],
             "the ticket's comments": [read_failure("issues/12/comments")],
             "the PR's comments": [read_failure("issues/34/comments")],
-            "an earlier review's comments": [gate_failure({"contains": ["api", f"{PULL}/reviews/100/comments"]}),
-                                             read_failure("pulls/34/reviews/100/comments")],
         }
         for what, first in failures.items():
             with self.subTest(what, gate="ready"):
@@ -471,6 +477,10 @@ class GateDismissals(LandBase):
                 self.assertNotReady(p)
                 self.assertBlocking(p, [FROBS, STALE])
                 self.assertTrue([w for w in self.warnings(p) if FAILED in w], p.stderr)
+        with self.subTest("the PR's review comments", gate="ready"):
+            p = self.ready(reviews, notes, first=[read_failure("pulls/34/comments")])
+            self.assertNotReady(p)
+            self.assertIn(FAILED, p.stderr)
         for what in ("the login", "the PR's comments"):
             with self.subTest(what, gate="land"):
                 p = self.land(reviews, notes, first=failures[what])
@@ -497,6 +507,33 @@ class GateDismissals(LandBase):
                     self.assertNotIn(now, self.refusal(p))
             with self.subTest(gate=gate):
                 passed(run(reviews, notes))
+
+    def test_an_inline_finding_github_lists_without_a_line_is_dismissed_at_its_line(self):
+        """#533, the PR #528 case: GitHub's reviews/{id}/comments gives the latest harness review's inline findings
+        no line, and pulls/34/comments lists them with their lines beside the comments of the PR's other reviews (an
+        earlier harness review's and another account's, at FROBS's place). Both refusals name the latest review's
+        inline findings at path:line and none of the other reviews' comments; the owner's `dismiss <path>:<line>` of
+        each finding lets both gates through, with no warning that a selector dismisses nothing."""
+        asked = "Is the empty input reachable at all?"
+        pal = ({"id": 201, "user": {"login": PAL}, "body": "One question inline.", "state": "COMMENTED",
+                "submitted_at": at(9), "commit_id": "c" * 40},
+               [{"id": 20100, "pull_request_review_id": 201, "user": {"login": PAL}, "path": FROBS[0],
+                 "line": FROBS[1], "original_line": FROBS[1], "side": "RIGHT", "body": asked, "created_at": at(9)}])
+        reviews = [harness_review(100, at(8), inline=[HANDLE]), pal,
+                   harness_review(101, at(10), inline=[FROBS, RETRY], body_only=[STALE])]
+        notes = {12: [owner_dismissal(STALE, 12, 11, "docs only")],
+                 34: [owner_dismissal(FROBS, 34, 11, "not reachable: the CLI validates first"),
+                      owner_dismissal(RETRY, 34, 12, "capped upstream")]}
+        for gate, run, refused, passed in (("ready", self.ready, self.assertNotReady, self.assertReady),
+                                           ("land", self.land, self.assertNotLanded, self.assertLanded)):
+            with self.subTest(gate=gate, comments=False):
+                p = run(reviews)
+                refused(p)
+                self.assertBlocking(p, [FROBS, RETRY, STALE], [HANDLE, (FROBS[0], FROBS[1], "", asked)])
+            with self.subTest(gate=gate):
+                p = run(reviews, notes)
+                passed(p)
+                self.assertEqual([w for w in self.warnings(p) if "dismisses nothing" in w], [])
 
     def test_a_path_only_selector_dismisses_the_finding_listed_without_a_line(self):
         """A finding the review lists with no line (``- `path` [sev] body``) is dismissed by the owner's standalone

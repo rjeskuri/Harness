@@ -20,7 +20,8 @@ which review findings they stop from blocking.
   by time, and one {"at", "findings"} per harness review on the PR, oldest first: a review by the authenticated
   account (gh api user, casefolded) whose body ends with the generated marker (then, optionally, the GPT receipt),
   read from GitHub or given; every gh call goes through harness_lib.gh (so the gh call log counts it), and a failed
-  read raises Problem.
+  read raises Problem. An inline finding's line comes from GET pulls/{n}/comments, the comment of that review there
+  (pull_request_review_id), since GitHub's pulls/{n}/reviews/{id}/comments gives it none (#533).
 
 The pure functions run in process on fixtures written here; the readers run against fakegh.py as HARNESS_GH (its REST
 world for the comments, rest entries for the reviews), in a temporary HOME. Orders the ticket leaves open (the
@@ -494,14 +495,21 @@ class GitHub(Base):
 
     def world(self, overrides=(), login_answer=None):
         """The scenario: `overrides` (rest entries, first match wins) before the reviews and their comments, the
-        issues above, and `gh api user` answering the owner's login."""
+        issues above, and `gh api user` answering the owner's login. The comments as GitHub gives them (#533): a
+        review's own endpoint, pulls/7/reviews/<id>/comments, with line and original_line null and only a diff
+        position (never the line); pulls/7/comments, every review's, with their lines and pull_request_review_id."""
         state = self.scenario_path + ".state.json"
         if os.path.exists(state):
             os.remove(state)
         calls = list(overrides)
         calls.append(fakegh.rest_entry("pulls/7/reviews", "GET", exact=True, stdout_json=self.REVIEWS))
         for rid, cs in self.COMMENTS.items():
-            calls.append(fakegh.rest_entry(f"pulls/7/reviews/{rid}/comments", "GET", exact=True, stdout_json=cs))
+            unlined = [dict(c, line=None, original_line=None, pull_request_review_id=rid,
+                            position=(c["original_line"] or c["line"]) + 4) for c in cs]
+            calls.append(fakegh.rest_entry(f"pulls/7/reviews/{rid}/comments", "GET", exact=True,
+                                           stdout_json=unlined))
+        calls.append(fakegh.rest_entry("pulls/7/comments", "GET", exact=True, stdout_json=[
+            dict(c, pull_request_review_id=rid) for rid, cs in self.COMMENTS.items() for c in cs]))
         calls.append(dict({"match": ["api", "user"]}, **(login_answer or {"stdout": "RJeskuri\n"})))
         with open(self.scenario_path, "w", encoding="utf-8") as fh:
             json.dump({"calls": calls, "issues": self.ISSUES}, fh)
@@ -590,10 +598,10 @@ class GitHub(Base):
              None),
             ("the reviews list is not JSON", "snapshots",
              [fakegh.rest_entry("pulls/7/reviews", "GET", exact=True, stdout="<html>unicorn</html>")], None),
-            ("a review's comments fail", "snapshots",
-             [fakegh.rest_entry("pulls/7/reviews/102/comments", "GET", exact=True, **fail)], None),
-            ("a given review's comments fail", "given",
-             [fakegh.rest_entry("pulls/7/reviews/101/comments", "GET", exact=True, **fail)], None),
+            ("the PR's review comments fail (#533: where an inline finding's line comes from)", "snapshots",
+             [fakegh.rest_entry("pulls/7/comments", "GET", exact=True, **fail)], None),
+            ("the PR's review comments fail, the reviews given", "given",
+             [fakegh.rest_entry("pulls/7/comments", "GET", exact=True, **fail)], None),
             ("gh api user fails for the snapshots", "given", [], {"stderr": "HTTP 401: Bad credentials\n", "exit": 1}),
         ]
         reads["missing"] = lambda: self.d.read(self.tmp, [12, 99], 7)
